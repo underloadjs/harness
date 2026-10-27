@@ -17,7 +17,13 @@
         "strict": true,
         "outDir": "./dist",
         "lib": ["decorators", "dom", "es5", "scripthost", "es2015.collection"],
-        "types": ["node", "vitest/globals"]
+        "types": ["node", "vitest/globals"],
+        // Tests import the package by name, never by relative path. Mirror the
+        // vitest alias here so the same specifier resolves for editors and for
+        // any typecheck that includes test files.
+        "paths": {
+            "@underload/harness": ["./src/harness.ts"]
+        }
     },
     "exclude": ["node_modules", "Temp", "**/*.test.ts", "**/dist/*", "**/lib/*"],
     "include": ["*.ts", "*.tsx", "**/*.ts", "**/*.tsx"]

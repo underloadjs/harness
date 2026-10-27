@@ -5,10 +5,10 @@
     "type": "module",
     "main": "./dist/underload-harness.mjs",
     "module": "./dist/underload-harness.mjs",
-    "types": "./dist/index.d.ts",
+    "types": "./dist/harness.d.ts",
     "exports": {
         ".": {
-            "types": "./dist/index.d.ts",
+            "types": "./dist/harness.d.ts",
             "import": "./dist/underload-harness.mjs"
         }
     },
@@ -33,6 +33,9 @@
     },
     "scripts": {
         "build": "vite build && tsc -p tsconfig.build.json",
+        "build:playground": "vite build --config playground/vite.config.ts",
+        "dev:playground": "vite --config playground/vite.config.ts",
+        "preview:playground": "vite preview --config playground/vite.config.ts",
         "prepublishOnly": "npm run typecheck && npm run test && npm run build",
         "test": "vitest run",
         "typecheck": "tsc --noEmit",

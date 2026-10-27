@@ -3,8 +3,8 @@
     // Extends the package tsconfig but:
     // - emits ONLY .d.ts into dist/ (JS comes from `vite build`);
     // - restricts the root to src/ so only the public source tree is described;
-    // - excludes tests and root-level tooling configs, which are never part of
-    //   the published package.
+    // - excludes tests, root-level tooling configs, and the playground, which are
+    //   never part of the published package.
     "extends": "./tsconfig.json",
     "compilerOptions": {
         "emitDeclarationOnly": true,
@@ -12,5 +12,13 @@
         "rootDir": "src",
         "outDir": "dist"
     },
-    "exclude": ["node_modules", "dist", "**/*.test.ts", "**/*.test.tsx", "vite.config.ts", "vitest.config.ts"]
+    "exclude": [
+        "node_modules",
+        "dist",
+        "**/*.test.ts",
+        "**/*.test.tsx",
+        "vite.config.ts",
+        "vitest.config.ts",
+        "playground"
+    ]
 }
