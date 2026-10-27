@@ -1,0 +1,33 @@
+# Dependencies - never commit these
+node_modules/
+
+# Build output
+dist/
+lib/
+
+# Turbo cache
+.turbo/
+
+# Tooling caches
+.eslintcache
+*.tsbuildinfo
+
+# Test coverage
+coverage/
+
+# Package-manager logs
+yarn-debug.log*
+yarn-error.log*
+npm-debug.log*
+
+# Local env / secrets
+.env
+.env.*
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editor state
+.idea/
+.vscode/

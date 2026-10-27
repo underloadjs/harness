@@ -1,0 +1,24 @@
+{
+    // Self-contained config (no `extends` outside the repo): this package is a
+    // standalone GitHub repo (git@github.com:underloadjs/harness) where
+    // ../../../tsconfig.json does not exist. Options mirror the noobscript
+    // workspace root tsconfig.json so behavior is identical when the package is
+    // developed inside the workspace.
+    "compilerOptions": {
+        "module": "ESNext",
+        "target": "ESNext",
+        "moduleResolution": "bundler",
+        "jsx": "react",
+        "skipLibCheck": true,
+        "allowJs": true,
+        "experimentalDecorators": true,
+        "declaration": true,
+        "esModuleInterop": true,
+        "strict": true,
+        "outDir": "./dist",
+        "lib": ["decorators", "dom", "es5", "scripthost", "es2015.collection"],
+        "types": ["node", "vitest/globals"]
+    },
+    "exclude": ["node_modules", "Temp", "**/*.test.ts", "**/dist/*", "**/lib/*"],
+    "include": ["*.ts", "*.tsx", "**/*.ts", "**/*.tsx"]
+}
