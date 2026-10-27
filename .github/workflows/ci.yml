@@ -1,0 +1,47 @@
+# Typecheck, test, and build the package and the harness app.
+#
+# There is no static deployment any more: the UI is served by the harness server
+# (`yarn serve`), which owns sessions and executes the harness. This workflow
+# verifies that the library, the server tests, the UI tests, and the client
+# bundle all compile.
+
+name: CI
+
+on:
+    push:
+        branches: [main]
+    pull_request:
+    workflow_dispatch:
+
+jobs:
+    build:
+        runs-on: ubuntu-latest
+        steps:
+            - name: Checkout
+              uses: actions/checkout@v5
+
+            - name: Setup Node
+              uses: actions/setup-node@v5
+              with:
+                  node-version: 24
+
+            # No lockfile is committed, so `npm install` rather than `npm ci`.
+            - name: Install dependencies
+              run: npm install
+
+            - name: Typecheck
+              run: npm run typecheck
+
+            - name: Test
+              run: npm test
+
+            # The UI suite is a separate vitest config (jsdom, playground/), so the
+            # package's default `test` script cannot cover it.
+            - name: Test UI
+              run: npm run test:playground
+
+            - name: Build library
+              run: npm run build
+
+            - name: Build UI
+              run: npm run build:playground

@@ -1,4 +1,4 @@
-/* Playground styles. Not part of the published package. */
+/* Harness UI styles. Not part of the published package. */
 
 :root {
     color-scheme: dark;
@@ -81,7 +81,13 @@ body {
     letter-spacing: 0.14em;
 }
 
+/* The pill is the app's request-lifecycle indicator. Colour is never the only
+   signal: the text states the phase, and a pulsing dot (motion, then also text)
+   marks work in flight. */
 .status {
+    display: inline-flex;
+    align-items: center;
+    gap: 7px;
     flex: 0 1 auto;
     max-width: 60%;
     padding: 4px 11px;
@@ -95,9 +101,44 @@ body {
     text-overflow: ellipsis;
 }
 
-.status[data-state='running'] {
+.status-dot {
+    flex: 0 0 auto;
+    width: 7px;
+    height: 7px;
+    border-radius: 50%;
+    background: currentColor;
+    opacity: 0.8;
+}
+
+.status-text {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.status[data-state='running'],
+.status[data-state='connecting'] {
     color: var(--warn);
     border-color: rgba(251, 191, 36, 0.4);
+}
+
+/* Only genuine in-flight states animate; a finished or failed run is static so
+   the pill cannot look busy when it is not. */
+.status[data-state='running'] .status-dot,
+.status[data-state='connecting'] .status-dot {
+    animation: status-pulse 1.1s ease-in-out infinite;
+}
+
+@keyframes status-pulse {
+    0%,
+    100% {
+        opacity: 0.25;
+        transform: scale(0.8);
+    }
+
+    50% {
+        opacity: 1;
+        transform: scale(1);
+    }
 }
 
 .status[data-state='done'] {
@@ -184,6 +225,120 @@ body {
     font-size: 11px;
 }
 
+[hidden] {
+    display: none !important;
+}
+
+/* Mode switch ---------------------------------------------------------- */
+
+.modes {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+}
+
+.mode {
+    padding: 6px 8px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--muted);
+    font: inherit;
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.mode[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
+}
+
+/* Tool catalogue ------------------------------------------------------- */
+
+.tool-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.tool-group {
+    margin: 10px 0 2px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+}
+
+.tool-button {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 7px 10px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: var(--bg-elevated);
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.tool-button:hover {
+    border-color: var(--border-strong);
+}
+
+.tool-button[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+.tool-name {
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.tool-kind {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+}
+
+/* Direct tool runner --------------------------------------------------- */
+
+.tool-card {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+}
+
+.tool-note {
+    margin: 0;
+    color: var(--muted);
+    font-size: 12.5px;
+}
+
+.tool-note.is-warning {
+    color: var(--warn);
+}
+
+.tool-args {
+    min-height: 120px;
+    resize: vertical;
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.tool-output .card-body {
+    max-height: 320px;
+}
+
 /* Endpoint ------------------------------------------------------------- */
 
 .endpoint {
@@ -223,6 +378,21 @@ body {
 .field-input:focus {
     border-color: var(--accent);
     outline: 2px solid var(--accent-soft);
+}
+
+/* The model dropdown. Same box as .field-input, with a pointer only while it
+   can actually be changed (it is disabled during a catalogue lookup). */
+.field-select {
+    cursor: pointer;
+}
+
+.field-select:disabled {
+    color: var(--muted);
+    cursor: default;
+}
+
+.field-hint.is-warning {
+    color: var(--warn);
 }
 
 .field-hint {
@@ -300,10 +470,7 @@ body {
 }
 
 .log {
-    display: flex;
-    flex-direction: column;
-    gap: 11px;
-    max-width: 900px;
+    max-width: 1180px;
     margin: 0 auto;
 }
 
@@ -329,83 +496,670 @@ body {
     font-size: 12px;
 }
 
-.divider {
+/* Turn tiles ----------------------------------------------------------- */
+/* A responsive grid of square-ish tiles that fills left to right. Every user
+   turn is one tile; the newest is expanded full-width for reading and the older
+   ones stay compact. `auto-fill` (not `auto-fit`) keeps the columns stable so a
+   short conversation still looks like a grid, not three stretched banners. */
+
+.turns {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(184px, 1fr));
+    gap: 10px;
+    align-items: start;
+}
+
+.turns > .empty,
+.turns > .notice {
+    grid-column: 1 / -1;
+}
+
+.tile {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+    overflow: hidden;
+    transition: border-color 120ms ease, background 120ms ease;
+}
+
+.tile:hover {
+    border-color: var(--border-strong);
+}
+
+/* Compact tile: square-ish, preview only. `aspect-ratio` keeps the grid visually
+   even; content is clamped so a long prompt cannot stretch a row. */
+.tile:not(.is-expanded) {
+    aspect-ratio: 1 / 1;
+}
+
+.tile:not(.is-expanded) .tile-select {
+    flex: 1;
+}
+
+.tile:not(.is-expanded) .tile-body {
+    display: none;
+}
+
+/* The newest (or user-selected) turn: full width, content in full. */
+.tile.is-expanded {
+    grid-column: 1 / -1;
+    border-color: var(--border-strong);
+    background: var(--bg-elevated);
+}
+
+.tile.is-expanded .tile-prompt {
+    /* The body already renders the prompt as Markdown; the header keeps only the
+       status line so the two do not duplicate each other. */
+    display: none;
+}
+
+.tile.is-expanded .tile-select {
+    cursor: default;
+}
+
+.tile-select {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    width: 100%;
+    padding: 10px 12px;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.tile-select:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+
+.tile-top {
     display: flex;
     align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    min-width: 0;
+}
+
+.tile-index {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+}
+
+.tile-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 5px;
+    min-width: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    white-space: nowrap;
+}
+
+.tile-dot {
+    flex: 0 0 auto;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: currentColor;
+}
+
+/* Live states animate; text still spells out the state. `queued`/`waiting` mean
+   the browser has the prompt but no event has arrived yet. */
+.tile[data-state='queued'] .tile-status,
+.tile[data-state='waiting'] .tile-status,
+.tile[data-state='streaming'] .tile-status {
+    color: var(--warn);
+}
+
+.tile[data-state='queued'] .tile-dot,
+.tile[data-state='waiting'] .tile-dot,
+.tile[data-state='streaming'] .tile-dot {
+    animation: status-pulse 1.1s ease-in-out infinite;
+}
+
+.tile[data-state='done'] .tile-status {
+    color: var(--ok);
+}
+
+.tile[data-state='error'] .tile-status {
+    color: var(--danger);
+}
+
+.tile[data-state='cancelled'] .tile-status {
+    color: var(--muted);
+}
+
+.tile-prompt {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 4;
+    overflow: hidden;
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
+
+.tile-meta {
+    margin-top: auto;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    line-height: 1.4;
+    overflow-wrap: anywhere;
+}
+
+.tile-body {
+    display: flex;
+    flex-direction: column;
     gap: 10px;
+    padding: 12px 14px 14px;
+    border-top: 1px solid var(--border);
+}
+
+.turn-prompt {
+    padding: 9px 11px;
+    border-left: 2px solid var(--accent);
+    border-radius: 0 8px 8px 0;
+    background: var(--accent-soft);
+    font-size: 13px;
+}
+
+.tile-flow {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+}
+
+/* Agent sections -------------------------------------------------------- */
+
+.agent {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding-top: 10px;
+    border-top: 1px dashed var(--border);
+}
+
+.tile-flow > .agent:first-child {
+    padding-top: 0;
+    border-top: 0;
+}
+
+.agent-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.agent-name {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.11em;
+    text-transform: uppercase;
+}
+
+.agent-role {
+    padding: 0 6px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 16px;
+}
+
+/* The primary agent is the unmarked default; only a delegated agent needs a
+   label, and it is labelled in text as well as colour. */
+.agent[data-role='primary'] .agent-role {
+    display: none;
+}
+
+.agent[data-role='subagent'] .agent-role {
+    border-color: rgba(251, 191, 36, 0.4);
+    color: var(--warn);
+}
+
+.agent-flow {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.agent-meta {
     color: var(--muted);
     font-family: var(--mono);
     font-size: 11px;
 }
 
-.divider::before,
-.divider::after {
-    content: '';
-    flex: 1;
-    height: 1px;
-    background: var(--border);
+.agent-meta:empty {
+    display: none;
 }
 
-.divider-label {
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}
-
-.bubble {
-    padding: 11px 14px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--bg-elevated);
-}
-
-.bubble-head {
+.agent-error {
     display: flex;
     gap: 8px;
-    margin-bottom: 7px;
-}
-
-.bubble.is-done {
-    border-color: var(--border-strong);
-}
-
-.bubble-agent {
-    color: var(--accent);
+    padding: 8px 10px;
+    border: 1px solid rgba(248, 113, 113, 0.4);
+    border-radius: 8px;
+    color: var(--danger);
     font-family: var(--mono);
-    font-size: 10.5px;
+    font-size: 11.5px;
+}
+
+.agent-error-label {
     text-transform: uppercase;
-    letter-spacing: 0.11em;
+    letter-spacing: 0.09em;
+}
+
+/* Reasoning: available, never shouting. Collapsed by default; the summary counts
+   characters so it is obvious the model said something. */
+.thinking {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #0c0f15;
+}
+
+.thinking-summary {
+    padding: 6px 10px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    cursor: pointer;
 }
 
 .reasoning {
-    margin-bottom: 8px;
-    padding-left: 10px;
+    max-height: 260px;
+    margin: 0;
+    padding: 0 10px 9px 10px;
+    overflow: auto;
     border-left: 2px solid var(--border-strong);
     color: var(--muted);
     font-size: 12.5px;
     font-style: italic;
     white-space: pre-wrap;
+    overflow-wrap: anywhere;
 }
 
-.reasoning:empty {
+/* Tool calls ----------------------------------------------------------- */
+/* `details/summary` gives collapse, keyboard operation and screen-reader
+   semantics. Collapsed, every card answers "what ran, and did it work?". */
+
+.tool {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-input);
+}
+
+.tool[data-state='error'] {
+    border-color: rgba(248, 113, 113, 0.4);
+}
+
+.tool-summary {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 7px 10px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    cursor: pointer;
+    list-style: none;
+}
+
+.tool-summary::-webkit-details-marker {
     display: none;
 }
 
-.text {
-    white-space: pre-wrap;
-    word-break: break-word;
+.tool-summary::before {
+    content: '▸';
+    color: var(--muted);
+    transition: transform 120ms ease;
 }
 
-.meta {
-    margin-top: 8px;
+.tool[open] > .tool-summary::before {
+    transform: rotate(90deg);
+}
+
+.tool-summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+
+.tool-glyph {
+    color: var(--warn);
+}
+
+.tool[data-state='ok'] .tool-glyph {
+    color: var(--ok);
+}
+
+.tool[data-state='error'] .tool-glyph {
+    color: var(--danger);
+}
+
+.tool-name {
+    color: var(--text);
+}
+
+.tool-state {
+    color: var(--muted);
+}
+
+.tool[data-state='ok'] .tool-state {
+    color: var(--ok);
+}
+
+.tool[data-state='error'] .tool-state {
+    color: var(--danger);
+}
+
+.tool-peek {
+    margin-left: auto;
+    min-width: 0;
+    overflow: hidden;
+    color: var(--muted);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tool-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 0 10px 10px;
+}
+
+.tool-section {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.tool-label {
     color: var(--muted);
     font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+}
+
+.tool-pending {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11.5px;
+}
+
+.tool-note-inline {
+    margin: 0;
+    color: var(--warn);
     font-size: 11px;
 }
 
-.meta:empty {
-    display: none;
+.tool-result .code-block {
+    max-height: 300px;
 }
+
+/* Notices (cancelled, endpoint changed, failed) span the grid. */
+.notice {
+    padding: 8px 12px;
+    border: 1px dashed var(--border-strong);
+    border-radius: 8px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11.5px;
+}
+
+.notice[data-tone='error'] {
+    border-color: rgba(248, 113, 113, 0.4);
+    color: var(--danger);
+}
+
+/* Markdown ------------------------------------------------------------- */
+/* Typography for rendered model output. `.markdown` is the only place innerHTML
+   is used, and only with sanitized HTML (see playground/src/ui/markdown.ts). */
+
+.markdown {
+    color: var(--text);
+    font-size: 13.5px;
+    line-height: 1.6;
+    overflow-wrap: anywhere;
+}
+
+.markdown > :first-child {
+    margin-top: 0;
+}
+
+.markdown > :last-child {
+    margin-bottom: 0;
+}
+
+.markdown p,
+.markdown ul,
+.markdown ol,
+.markdown blockquote,
+.markdown pre,
+.markdown table {
+    margin: 0 0 10px;
+}
+
+.markdown ul,
+.markdown ol {
+    padding-left: 22px;
+}
+
+.markdown li + li {
+    margin-top: 3px;
+}
+
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+    margin: 16px 0 8px;
+    line-height: 1.3;
+}
+
+.markdown > :first-child:is(h1, h2, h3, h4, h5, h6) {
+    margin-top: 0;
+}
+
+.markdown h1 {
+    font-size: 19px;
+}
+
+.markdown h2 {
+    font-size: 17px;
+}
+
+.markdown h3 {
+    font-size: 15px;
+}
+
+.markdown h4,
+.markdown h5,
+.markdown h6 {
+    font-size: 13.5px;
+    color: var(--muted);
+}
+
+.markdown a {
+    color: var(--accent);
+    text-decoration: underline;
+    text-underline-offset: 2px;
+}
+
+.markdown strong {
+    font-weight: 600;
+}
+
+.markdown blockquote {
+    padding-left: 10px;
+    border-left: 2px solid var(--border-strong);
+    color: var(--muted);
+}
+
+.markdown hr {
+    height: 1px;
+    margin: 14px 0;
+    border: 0;
+    background: var(--border);
+}
+
+.markdown img {
+    max-width: 100%;
+    border-radius: 6px;
+}
+
+.markdown code {
+    padding: 1px 5px;
+    border: 1px solid var(--border);
+    border-radius: 5px;
+    background: #0a0d13;
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.markdown table {
+    display: block;
+    max-width: 100%;
+    overflow: auto;
+    border-collapse: collapse;
+}
+
+.markdown th,
+.markdown td {
+    padding: 5px 9px;
+    border: 1px solid var(--border);
+    text-align: left;
+}
+
+.markdown th {
+    background: var(--bg-bar);
+    font-weight: 600;
+}
+
+/* Fenced code ---------------------------------------------------------- */
+
+.code-block {
+    max-height: 420px;
+    margin: 0;
+    padding: 10px 12px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: #0a0d13;
+    color: #c7cedb;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.55;
+}
+
+/* A fence inside rendered Markdown keeps the block spacing of prose. */
+.markdown .code-block {
+    margin-bottom: 10px;
+}
+
+.markdown .code-block:last-child {
+    margin-bottom: 0;
+}
+
+.code-block code {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font-size: inherit;
+    white-space: pre;
+    tab-size: 4;
+}
+
+/* highlight.js token palette, tuned to the app's dark surfaces. Layout colours
+   only: no token carries meaning on its own. */
+.hljs-comment,
+.hljs-quote {
+    color: #6b7688;
+    font-style: italic;
+}
+
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-doctag,
+.hljs-name {
+    color: #c792ea;
+}
+
+.hljs-string,
+.hljs-regexp,
+.hljs-addition,
+.hljs-attribute {
+    color: #a5d6a7;
+}
+
+.hljs-number,
+.hljs-symbol,
+.hljs-bullet,
+.hljs-variable,
+.hljs-template-variable,
+.hljs-link {
+    color: #f2b880;
+}
+
+.hljs-title,
+.hljs-section,
+.hljs-title.function_ {
+    color: #82aaff;
+}
+
+.hljs-attr,
+.hljs-selector-attr,
+.hljs-selector-pseudo,
+.hljs-property,
+.hljs-params {
+    color: #d8deea;
+}
+
+.hljs-built_in,
+.hljs-title.class_,
+.hljs-type {
+    color: #fbbf24;
+}
+
+.hljs-meta {
+    color: #8b94a7;
+}
+
+.hljs-punctuation {
+    color: #7d8799;
+}
+
+.hljs-deletion {
+    color: var(--danger);
+}
+
+.hljs-emphasis {
+    font-style: italic;
+}
+
+.hljs-strong {
+    font-weight: 600;
+}
+
+/* Card (direct tool runner) -------------------------------------------- */
 
 .card {
     padding: 9px 12px;
@@ -440,6 +1194,7 @@ body {
 .card.is-error .card-head {
     color: var(--danger);
 }
+
 
 /* Transcript ----------------------------------------------------------- */
 
@@ -552,4 +1307,46 @@ body {
     .composer-actions {
         justify-content: flex-end;
     }
+
+    /* Tiles stay square and readable on a phone: smaller columns, less padding,
+       and the argument preview drops before the tool name would truncate. */
+    .log-wrap {
+        padding: 14px;
+    }
+
+    .turns {
+        grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
+        gap: 8px;
+    }
+
+    .tile-body {
+        padding: 10px 11px 12px;
+    }
+
+    .tool-peek {
+        display: none;
+    }
+
+    .code-block {
+        font-size: 11.5px;
+    }
+
+    .status {
+        max-width: 50%;
+    }
 }
+
+/* Motion preferences: the pulsing dots are decoration on top of the text, so
+   turning them off loses no information. */
+@media (prefers-reduced-motion: reduce) {
+    .status-dot,
+    .tile-dot {
+        animation: none !important;
+    }
+
+    .tile,
+    .tool-summary::before {
+        transition: none;
+    }
+}
+

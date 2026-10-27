@@ -229,6 +229,88 @@ export type Agent = {
 // Tool
 // ---------------------------------------------------------------------------
 
+// Whether the model can see a tool before it searches for one.
+//
+// A large catalogue cannot be declared on every request — thousands of tools
+// would flood the context window before the first prompt. So a request declares:
+//   - every 'core' tool (keep that list tiny), and
+//   - every 'searchable' tool that getTools has already enabled.
+export type ToolVisibility = 'core' | 'searchable';
+
+// One entry in a getTools result: enough for the model to decide whether to call
+// it, without shipping the whole schema again.
+export type ToolMatch = {
+    name: string;
+    description: string;
+    tags: string[];
+};
+
+// The result of a getTools call, and the return value of the pure
+// `searchTools()` helper. Shaped as data because it travels back to the model as
+// a tool result.
+export type ToolSearchResult = {
+    // Tools the model can call from the next turn onward, best match first. This
+    // list is capped (10 by default, 50 maximum) so a query that matches a whole
+    // family cannot flood the context either.
+    enabled: string[];
+    // Metadata for the enabled tools, in the same order.
+    tools: ToolMatch[];
+    // Query tags that matched no tag, name, or description.
+    unmatchedTags?: string[];
+    // Every tag in the searchable catalogue. Present only when nothing matched,
+    // so the model can retry with real vocabulary instead of guessing.
+    availableTags?: string[];
+    // True when more tools matched than the cap and the tail was dropped.
+    truncated?: boolean;
+};
+
+// A request to create a tool at runtime, either from the model-facing createTool
+// tool or from the host through `harness.createTool()`.
+//
+// `source` is the BODY of an async function, compiled once at registration and
+// executed only when the model (or host) calls the tool — registering a tool
+// never runs its source. The body is handed `args` (the parameter value, following
+// the same single-property rule as every other tool) and `context` (the
+// ToolContext, including agent/agents/run inside a harness).
+//
+// SECURITY: compilation uses the host realm's Function constructor. A created tool
+// has exactly the permissions of the process — the same trust model as `runCommand`
+// in src/tools. There is NO sandbox and NO isolation; the only guarantees are
+// bounded input validation, a bounded number of tools, and a compile error if the
+// source does not parse.
+export type ToolCreation = {
+    // Wire name the model calls. Must match the registry-safe pattern in
+    // src/core/creation.ts and must not collide with a registered name.
+    name: string;
+    // Shown to the model and used by getTools matching.
+    description: string;
+    // Capability tags. Required: an untagged creation could never be discovered.
+    tags: readonly string[];
+    // Optional JSON Schema for the arguments.
+    parameters?: Record<string, unknown>;
+    // Async function body, e.g. `return args.toUpperCase();`.
+    source: string;
+};
+
+// What a successful createTool call hands back to the model. Metadata only: the
+// source is never echoed, so a creation round costs one short result.
+export type ToolCreationResult = {
+    name: string;
+    description: string;
+    tags: string[];
+    parameters?: Record<string, unknown>;
+    // A created tool is registered `searchable` and enabled at once, so the very
+    // next turn can call it without a second getTools round.
+    enabled: true;
+};
+
+// What a delegation hands back to the primary agent: the subagent's answer, not
+// its transcript (history stays with the subagent).
+export type HarnessDelegationResult = {
+    agent: string;
+    content: string;
+};
+
 // What a tool implementation is handed when the model calls it.
 //
 // The harness fields are optional because a tool can also be executed on its
@@ -255,6 +337,13 @@ export type ToolConfiguration<TParameters = any, TResult = any> = {
     name?: string;
     // Shown to the model. Required — an undescribed tool is an unusable tool.
     description: string;
+    // Capability tags, used by tool discovery to find close matches. Required:
+    // an untagged tool is invisible to getTools, so it could never be found.
+    // Stored trimmed, lowercased, and deduplicated.
+    tags: readonly string[];
+    // 'core' tools are declared on every request; 'searchable' ones (the
+    // default) stay hidden until getTools enables them.
+    visibility?: ToolVisibility;
     // JSON Schema for the arguments. A TypeBox schema works as-is: TypeBox
     // output is plain JSON Schema.
     parameters?: Record<string, unknown>;
@@ -277,6 +366,10 @@ export type Tool<TParameters = any, TResult = any> = {
     // registry key when the tool is registered.
     name: string;
     description: string;
+    // Normalized capability tags (trimmed, lowercased, deduplicated).
+    tags: readonly string[];
+    // Resolved visibility. A harness declares core tools plus enabled ones.
+    visibility: ToolVisibility;
     parameters?: Record<string, unknown>;
     execute: (context: ToolContext<TParameters>) => Promise<TResult>;
 };
@@ -305,11 +398,28 @@ export type HarnessRunOptions = {
 
 export type HarnessConfiguration = {
     // Every brain the harness can run, keyed by name. The FIRST entry is the
-    // entry point: `writer(...)` runs that agent, and the rest are reachable
-    // from tools through `ctx.run(name, input)`.
+    // entry point unless `primary` names another one: `writer(...)` runs that
+    // agent, and the rest are reachable from tools through `ctx.run(name, input)`
+    // or the `delegate` tool the primary agent gets.
     agents: Record<string, Agent>;
-    // Tools available to every agent. Keyed by the name the model calls.
+    // Which agent the callable runs. Defaults to the first entry of `agents`, so
+    // a single-agent config needs nothing. Must name a registered agent.
+    primary?: string;
+    // Agents the primary agent may delegate to. Defaults to every agent except
+    // the primary. When the list is empty there is no delegation at all and the
+    // `delegate` tool is not registered. Subagents never receive `delegate`, so
+    // delegation is one level deep by construction.
+    subagents?: readonly string[];
+
+    // Every tool the harness can run. Keyed by the name the model calls. Only
+    // `visibility: 'core'` tools are declared up front; the rest are found
+    // through the built-in getTools tool and enabled for the next turn.
     tools?: Record<string, Tool>;
+    // Preload the bundled preset catalogue (src/tools/) into the registry. True by
+    // default: discovery exists so a large catalogue costs nothing until it is
+    // asked for. Set false to start from `tools` alone. A configured tool wins on
+    // a name collision.
+    presets?: boolean;
     // Reporting hooks. `progress` is awaited for every step, so a slow UI can
     // pace the run, and a `console.log` can just print.
     report?: {
@@ -323,17 +433,29 @@ export type HarnessConfiguration = {
 // completion, executing tools until the model answers with text.
 export type Harness = {
     (input: string, options?: HarnessRunOptions): Promise<HarnessAssistantMessage>;
-    // The entry agent's name (the first key of `agents`).
+    // The entry agent's name (`primary`, or the first key of `agents`).
     readonly name: string;
     // The entry agent.
     readonly agent: Agent;
     // Every agent, keyed by the names given in configuration.
     readonly agents: Readonly<Record<string, Agent>>;
-    // The registered tools, keyed by the names the model calls.
+    // Agents the primary may delegate to, keyed by name. Empty when delegation is
+    // not configured.
+    readonly subagents: Readonly<Record<string, Agent>>;
+    // The registered tools, keyed by the names the model calls. Includes the
+    // built-in getTools and createTool entries, plus delegate when there is at
+    // least one subagent.
     readonly tools: Readonly<Record<string, Tool>>;
+    // Register a tool from source at runtime. This is the host-side path the
+    // model-facing createTool tool uses: same validation, same registry, same
+    // "searchable and enabled at once" behaviour. Throws HarnessError on invalid
+    // or colliding input, so a host sees creation failures as exceptions.
+    createTool: (configuration: ToolCreation) => Tool;
     // Names of the applied plugins, in order.
     readonly plugins: readonly string[];
-    // Reset the entry agent's conversation.
+    // Reset the entry agent's conversation and forget which tools getTools had
+    // enabled, so the next run starts from the core set again. Created tools stay
+    // registered (they are part of the catalogue), just not enabled.
     reset: () => void;
 };
 

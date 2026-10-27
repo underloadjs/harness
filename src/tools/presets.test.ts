@@ -34,30 +34,26 @@ afterAll(async () => {
     await rm(workdir, { recursive: true, force: true });
 });
 
-// A transport that always answers with the given text.
-const answer = (text: string): HarnessStream =>
-    async function* (): AsyncIterable<HarnessStreamEvent> {
-        yield { type: 'text', delta: text };
-        yield { type: 'done', stopReason: 'stop', toolCalls: [] };
-    };
-
-// A transport that asks for one tool call, then answers.
-const callsTool = (name: string, args: string, then: string): HarnessStream => {
-    let turn = 0;
+// A transport that replays scripted turns, one per request.
+const scripted = (turns: HarnessStreamEvent[][]): HarnessStream => {
+    let index = 0;
     return async function* (): AsyncIterable<HarnessStreamEvent> {
-        turn++;
-        if (turn === 1) {
-            yield {
-                type: 'done',
-                stopReason: 'tool_calls',
-                toolCalls: [{ id: 'c1', name, arguments: args }]
-            };
-            return;
+        const frames = turns[index] ?? turns[turns.length - 1];
+        index++;
+        for (const frame of frames) {
+            yield frame;
         }
-        yield { type: 'text', delta: then };
-        yield { type: 'done', stopReason: 'stop', toolCalls: [] };
     };
 };
+
+const callTool = (id: string, name: string, args: string): HarnessStreamEvent[] => [
+    { type: 'done', stopReason: 'tool_calls', toolCalls: [{ id, name, arguments: args }] }
+];
+
+const answer = (text: string): HarnessStreamEvent[] => [
+    { type: 'text', delta: text },
+    { type: 'done', stopReason: 'stop', toolCalls: [] }
+];
 
 describe('javascriptSyntax', () => {
     it('is callable on its own', async () => {
@@ -152,10 +148,23 @@ describe('runCommand', () => {
 });
 
 describe('presets inside a harness', () => {
+    it('ships tags and stays discoverable rather than core', () => {
+        // Every preset is searchable: a harness that registers the whole family
+        // still declares only getTools until the model asks for a capability.
+        expect(readFile.tags).toEqual(['files', 'read', 'filesystem']);
+        expect(pythonSyntax.tags).toEqual(['code', 'syntax', 'python', 'validation']);
+        expect(readFile.visibility).toBe('searchable');
+        expect(runCommand.visibility).toBe('searchable');
+    });
+
     it('registers under its export name and runs from a model tool call', async () => {
         const entry = agent({
             model: 'm',
-            stream: callsTool('readFile', '{"path":"harness.txt"}', 'read it')
+            stream: scripted([
+                callTool('c0', 'getTools', '{"tags":["files","read"]}'),
+                callTool('c1', 'readFile', '{"path":"harness.txt"}'),
+                answer('read it')
+            ])
         });
 
         const writer = harness({ agents: { writer: entry }, tools: { readFile, writeFile } });
@@ -168,7 +177,8 @@ describe('presets inside a harness', () => {
         const message = await writer('read the file');
 
         expect(message.content).toBe('read it');
-        expect((entry.messages[2] as { content: string }).content).toBe('seeded content');
+        // user -> getTools call -> result -> readFile call -> result -> answer
+        expect((entry.messages[4] as { content: string }).content).toBe('seeded content');
     });
 
     it('unwraps a single-property schema before execute sees it', async () => {
@@ -176,12 +186,16 @@ describe('presets inside a harness', () => {
         // implementation the string, exactly like a direct call would.
         const entry = agent({
             model: 'm',
-            stream: callsTool('pythonSyntax', '{"code":"def f():\\n    pass"}', 'valid')
+            stream: scripted([
+                callTool('c0', 'getTools', '{"tags":["python"]}'),
+                callTool('c1', 'pythonSyntax', '{"code":"def f():\\n    pass"}'),
+                answer('valid')
+            ])
         });
 
         const writer = harness({ agents: { writer: entry }, tools: { pythonSyntax } });
         await writer('check it');
 
-        expect((entry.messages[2] as { content: string }).content).toBe('true');
+        expect((entry.messages[4] as { content: string }).content).toBe('true');
     });
 });

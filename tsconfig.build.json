@@ -19,6 +19,9 @@
         "**/*.test.tsx",
         "vite.config.ts",
         "vitest.config.ts",
-        "playground"
+        "playground",
+        "server",
+        "cli",
+        "harnesses"
     ]
 }

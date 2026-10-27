@@ -1,21 +1,25 @@
 // tool() — defining an action the model can request, or a human can call.
 //
-// Two contracts are pinned here, because everything else builds on them:
+// Three contracts are pinned here, because everything else builds on them:
 //   - a tool is an executable object: calling it runs the same implementation the
 //     harness runs, with no agent and no registry;
 //   - the single-property rule: a schema with exactly one property delivers that
-//     property's value to `execute`, so a direct call and a model call agree.
+//     property's value to `execute`, so a direct call and a model call agree;
+//   - tags and visibility: every tool is tagged (that is how getTools finds it)
+//     and searchable by default (that is what keeps a big catalogue out of the
+//     context window).
 
 import { describe, expect, it } from 'vitest';
 import { tool, HarnessError } from '@underload/harness';
 
 describe('tool', () => {
-    it('carries name, description, and parameters', () => {
+    it('carries name, description, parameters, and tags', () => {
         const parameters = { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] };
 
         const websearch = tool({
             name: 'websearch',
             description: 'Search the web.',
+            tags: ['search', 'web'],
             parameters,
             execute: ({ parameters: args }) => `results for ${args.q}`
         });
@@ -23,10 +27,34 @@ describe('tool', () => {
         expect(websearch.name).toBe('websearch');
         expect(websearch.description).toBe('Search the web.');
         expect(websearch.parameters).toBe(parameters);
+        expect(websearch.tags).toEqual(['search', 'web']);
+    });
+
+    it('normalizes tags so discovery can compare them directly', () => {
+        const search = tool({
+            description: 'Search.',
+            tags: ['  Files ', 'files', 'READ', '', 'read'],
+            execute: () => 'ok'
+        });
+
+        expect(search.tags).toEqual(['files', 'read']);
+    });
+
+    it('is searchable by default and core on request', () => {
+        const hidden = tool({ description: 'Hidden.', tags: ['x'], execute: () => 'ok' });
+        const visible = tool({
+            description: 'Visible.',
+            tags: ['x'],
+            visibility: 'core',
+            execute: () => 'ok'
+        });
+
+        expect(hidden.visibility).toBe('searchable');
+        expect(visible.visibility).toBe('core');
     });
 
     it('defaults the name when none is given (a harness sets it from the key)', () => {
-        const websearch = tool({ description: 'Search.', execute: () => 'ok' });
+        const websearch = tool({ description: 'Search.', tags: ['search'], execute: () => 'ok' });
         expect(websearch.name).toBe('tool');
     });
 
@@ -36,6 +64,7 @@ describe('tool', () => {
         const pythonSyntax = tool<string, boolean>({
             name: 'pythonSyntax',
             description: 'Check Python syntax.',
+            tags: ['code', 'python'],
             parameters: {
                 type: 'object',
                 properties: { code: { type: 'string' } },
@@ -59,6 +88,7 @@ describe('tool', () => {
     it('passes multi-property parameters through as the object', async () => {
         const writeFile = tool<{ path: string; content: string }, string>({
             description: 'Write a file.',
+            tags: ['files', 'write'],
             parameters: {
                 type: 'object',
                 properties: { path: { type: 'string' }, content: { type: 'string' } },
@@ -71,7 +101,7 @@ describe('tool', () => {
     });
 
     it('always resolves execute as a promise, even for sync implementations', async () => {
-        const now = tool({ description: 'Current time.', execute: () => 'noon' });
+        const now = tool({ description: 'Current time.', tags: ['time'], execute: () => 'noon' });
 
         const result = now.execute({ parameters: {} });
 
@@ -82,6 +112,7 @@ describe('tool', () => {
     it('exposes the same implementation as `.execute` for the harness to call', async () => {
         const echo = tool<string, string>({
             description: 'Echo.',
+            tags: ['echo'],
             execute: ({ parameters }) => parameters
         });
 
@@ -94,7 +125,7 @@ describe('tool', () => {
     });
 
     it('can be renamed, so a harness can key it by registry name', () => {
-        const search = tool({ description: 'Search.', execute: () => 'ok' });
+        const search = tool({ description: 'Search.', tags: ['search'], execute: () => 'ok' });
 
         search.name = 'websearch';
 
@@ -102,12 +133,32 @@ describe('tool', () => {
     });
 
     it('requires a description', () => {
-        expect(() => tool({ description: '', execute: () => 'ok' })).toThrow(HarnessError);
-        expect(() => tool({ description: '', execute: () => 'ok' })).toThrow('A tool requires a description.');
+        expect(() => tool({ description: '', tags: ['x'], execute: () => 'ok' })).toThrow(HarnessError);
+        expect(() => tool({ description: '', tags: ['x'], execute: () => 'ok' })).toThrow(
+            'A tool requires a description.'
+        );
+    });
+
+    it('requires at least one tag', () => {
+        expect(() => tool({ description: 'x', tags: [], execute: () => 'ok' })).toThrow(
+            'A tool requires at least one tag.'
+        );
+        expect(() => tool({ description: 'x', tags: ['  ', ''], execute: () => 'ok' })).toThrow(
+            'A tool requires at least one tag.'
+        );
+        expect(() => tool({ description: 'x', tags: undefined as any, execute: () => 'ok' })).toThrow(
+            'A tool requires at least one tag.'
+        );
+    });
+
+    it('rejects an unknown visibility', () => {
+        expect(() =>
+            tool({ description: 'x', tags: ['x'], visibility: 'sometimes' as any, execute: () => 'ok' })
+        ).toThrow('A tool visibility must be one of: core, searchable. Received "sometimes".');
     });
 
     it('requires an execute function', () => {
-        expect(() => tool({ description: 'x', execute: undefined as any })).toThrow(
+        expect(() => tool({ description: 'x', tags: ['x'], execute: undefined as any })).toThrow(
             'A tool requires an execute function.'
         );
     });

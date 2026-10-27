@@ -1,9 +1,9 @@
 // tool() — define an action the model can request, or a human can call.
 //
 // A tool is data plus one function. It holds no state and no policy: the harness
-// decides when to execute it, how to serialize the result, and what to feed back
-// to the model. Keeping tools inert is what makes them safe to share, reuse, and
-// test in isolation.
+// decides when to execute it, how to serialize the result, and what to feed back.
+// Keeping tools inert is what makes them safe to share, reuse, and test in
+// isolation.
 //
 // Executable object
 // -----------------
@@ -12,17 +12,30 @@
 //
 //     const pythonSyntax = tool<string, boolean>({ ... });
 //
-//     await pythonSyntax('print(1)');         // direct: no agent, no harness
+//     await pythonSyntax('print(1)');         // direct: no harness, no harness loop
 //     harness({ tools: { pythonSyntax } });   // the model calls it
 //
 // Naming: `name` is optional. Inside a harness the registry key names the tool,
 // so `tools: { pythonSyntax }` is enough and the model calls `pythonSyntax`. The
 // harness overwrites `name` with the key on registration.
 //
+// Tags and visibility
+// -------------------
+// Every tool carries tags, and every tool is either:
+//
+//   - 'core'       — declared on every request. Keep the set tiny: it is the
+//                    context budget the model always pays.
+//   - 'searchable' — hidden until the harness's getTools tool matches its tags,
+//                    then declared for the rest of the conversation. The default.
+//
+// That is what keeps a catalogue of thousands of tools out of the context window.
+// Tags are normalized here (trimmed, lowercased, deduplicated) so matching in
+// ../core/discovery.ts can compare them directly.
+//
 // Parameters: `parameters` is a JSON Schema, which is what the OpenAI
 // function-calling format actually wants. A TypeBox schema can be passed
 // directly: TypeBox emits JSON Schema, so this package needs no schema
-// dependency to interop with it.
+// dependency.
 //
 // Single-property rule
 // --------------------
@@ -36,12 +49,13 @@
 // implementation as the string. The harness unwraps using `toolParameterKey()`.
 //
 // Cross-references:
-//   - ../types        — Tool, ToolConfiguration, ToolContext
-//   - ../harness      — registration and the execution loop
+//   - ../types        — Tool, ToolConfiguration, ToolContext, ToolVisibility
+//   - ../harness      — registration, the core set, and the execution loop
+//   - ./discovery     — tag matching behind getTools
 //   - ../tools        — the preset tools built with this factory
 
 import { HarnessError } from '../util';
-import type { Tool, ToolConfiguration, ToolContext } from '../types';
+import type { Tool, ToolConfiguration, ToolContext, ToolVisibility } from '../types';
 
 // The property a single-property schema declares, if that is what it is.
 //
@@ -57,6 +71,29 @@ export const toolParameterKey = (parameters: Record<string, unknown> | undefined
     return keys.length === 1 ? keys[0] : undefined;
 };
 
+const VISIBILITIES: readonly ToolVisibility[] = ['core', 'searchable'];
+
+// Trim, lowercase, deduplicate, and drop blanks. Called for a tool's own tags and
+// for each getTools query, so both sides of a comparison look the same.
+export const normalizeTags = (tags: readonly string[] | undefined): string[] => {
+    if (!Array.isArray(tags)) return [];
+
+    const seen = new Set<string>();
+    const normalized: string[] = [];
+
+    for (const tag of tags) {
+        if (typeof tag !== 'string') continue;
+
+        const value = tag.trim().toLowerCase();
+        if (value.length === 0 || seen.has(value)) continue;
+
+        seen.add(value);
+        normalized.push(value);
+    }
+
+    return normalized;
+};
+
 export const tool = <TParameters = any, TResult = any>(
     configuration: ToolConfiguration<TParameters, TResult>
 ): Tool<TParameters, TResult> => {
@@ -68,6 +105,23 @@ export const tool = <TParameters = any, TResult = any>(
 
     if (typeof execute !== 'function') {
         throw new HarnessError('A tool requires an execute function.');
+    }
+
+    // Tags are the only way getTools can find a searchable tool, so an untagged
+    // one would be dead weight in the registry. Reject it at construction rather
+    // than at the first failed discovery.
+    const tags = normalizeTags(configuration.tags);
+
+    if (tags.length === 0) {
+        throw new HarnessError('A tool requires at least one tag.');
+    }
+
+    const visibility = configuration.visibility ?? 'searchable';
+
+    if (!VISIBILITIES.includes(visibility)) {
+        throw new HarnessError(
+            `A tool visibility must be one of: ${VISIBILITIES.join(', ')}. Received "${String(visibility)}".`
+        );
     }
 
     // Normalize the return type so callers always get a promise, whether the
@@ -89,6 +143,8 @@ export const tool = <TParameters = any, TResult = any>(
     });
 
     callable.description = description;
+    callable.tags = tags;
+    callable.visibility = visibility;
     callable.parameters = parameters;
     callable.execute = run;
 

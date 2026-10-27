@@ -19,7 +19,14 @@ export default defineConfig({
         rollupOptions: {
             external: [/^node:/],
             output: {
-                globals: {}
+                globals: {},
+                // Presets load their implementation through `import()` (see
+                // src/tools/catalogue.ts). Those must stay deferred chunks: inlining
+                // them would hoist every `node:fs`/`child_process`/`vm` import into
+                // the entry and make importing the package pay for all ten tools.
+                // The default is already false; stating it makes the requirement
+                // explicit for anyone changing the build.
+                inlineDynamicImports: false
             }
         },
         sourcemap: true,
