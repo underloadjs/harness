@@ -165,6 +165,30 @@ button {
     border-color: rgba(248, 113, 113, 0.45);
 }
 
+/* Rail toggles (R1) ------------------------------------------------------ */
+
+/* Phone-only disclosures for the two rails. Every layout at or above 861px shows
+   both rails permanently, so the controls do nothing there; hiding them keeps the
+   topbar unchanged on desktop/tablet. The mobile block below reveals them. */
+.rail-toggles {
+    display: none;
+    align-items: center;
+    gap: 6px;
+    flex: 0 0 auto;
+    margin-left: auto;
+}
+
+.rail-toggle {
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+/* Dismiss layer for an expanded phone rail. Never rendered above the phone
+   breakpoint and never occupies grid space (position: fixed). */
+.rail-backdrop {
+    display: none;
+}
+
 /* Three-column shell --------------------------------------------------- */
 
 .shell {
@@ -1074,22 +1098,83 @@ button {
     font-size: 12px;
 }
 
-/* Turn tiles ----------------------------------------------------------- */
-/* A responsive grid of square-ish tiles that fills left to right. Every user
-   turn is one tile; the newest is expanded full-width for reading and the older
-   ones stay compact. `auto-fill` (not `auto-fit`) keeps the columns stable so a
-   short conversation still looks like a grid, not three stretched banners. */
+/* Turn timeline -------------------------------------------------------- */
+/* R4 replaced the responsive tile grid with ONE linear vertical timeline. Every
+   user task is a row on a shared vertical rule, in server FIFO order, so a task
+   submitted while another runs visibly sits behind it. Colour carries state:
+   grey = completed, green = the single active task, neutral = queued. */
 
 .turns {
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(184px, 1fr));
+    position: relative;
+    display: flex;
+    flex-direction: column;
     gap: 10px;
-    align-items: start;
+    padding-left: 22px;
+}
+
+/* The timeline rule. It runs behind every marker, from the first row to the
+   last, and is only decoration (the state is on each marker). */
+.turns::before {
+    content: '';
+    position: absolute;
+    top: 8px;
+    bottom: 8px;
+    left: 5px;
+    width: 2px;
+    border-radius: 999px;
+    background: var(--border);
+    pointer-events: none;
 }
 
 .turns > .empty,
 .turns > .notice {
     grid-column: 1 / -1;
+}
+
+/* One timeline row: marker column + card. The row carries the state so the
+   marker and the card can never disagree (ui/turns.ts mirrors data-state). */
+.turn-row {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.turn-marker {
+    position: absolute;
+    top: 16px;
+    left: -22px;
+    width: 10px;
+    height: 10px;
+    border: 2px solid var(--bg);
+    border-radius: 50%;
+    background: var(--border-strong);
+    box-sizing: content-box;
+    pointer-events: none;
+}
+
+/* Completed tasks are grey: the work is history, not an achievement. */
+.turn-row[data-state='done'] .turn-marker {
+    background: var(--muted);
+}
+
+/* The ONE active task is green. `waiting` (request on the wire) is amber; queued
+   stays neutral and never pulses — it is not working yet. */
+.turn-row[data-state='streaming'] .turn-marker {
+    background: var(--ok);
+    box-shadow: 0 0 0 3px rgba(74, 222, 128, 0.16);
+}
+
+.turn-row[data-state='waiting'] .turn-marker {
+    background: var(--warn);
+}
+
+.turn-row[data-state='queued'] .turn-marker {
+    background: var(--border-strong);
+}
+
+.turn-row[data-state='error'] .turn-marker {
+    background: var(--danger);
 }
 
 .tile {
@@ -1161,9 +1246,9 @@ button {
     display: none;
 }
 
-/* The newest (or user-selected) turn: full width, content in full. */
+/* The active (or user-selected) turn: full width, content in full. */
 .tile.is-expanded {
-    grid-column: 1 / -1;
+    width: 100%;
     border-color: var(--border-strong);
     background: var(--bg-elevated);
 }
@@ -1271,32 +1356,42 @@ button {
     background: currentColor;
 }
 
-/* Live states animate; text (expanded tiles) still spells out the state.
-   `queued`/`waiting` mean the browser has the prompt but no event has arrived. */
-.tile[data-state='queued'] .tile-status,
-.tile[data-state='waiting'] .tile-status,
-.tile[data-state='streaming'] .tile-status {
+/* State colours on the timeline (R4): queued is NEUTRAL (not working yet, so no
+   pulse and no green), waiting is amber, and streaming is the single green
+   "active task" state. Text still spells the state out on an expanded tile. */
+.tile[data-state='queued'] .tile-status {
+    color: var(--muted);
+}
+
+.tile[data-state='waiting'] .tile-status {
     color: var(--warn);
 }
 
-.tile[data-state='queued'] .tile-dot,
+.tile[data-state='streaming'] .tile-status {
+    color: var(--ok);
+}
+
 .tile[data-state='waiting'] .tile-dot,
 .tile[data-state='streaming'] .tile-dot {
     animation: status-pulse 1.1s ease-in-out infinite;
 }
 
-/* Settled states are colour-coded on the compact grid: green = completed
-   successfully, red = failed, muted = cancelled. This is what replaces the
-   visible "done" word, so a finished tile reads at a glance in a wall of tiles.
-   Only the compact variant paints the border; an expanded tile is the reading
-   surface and keeps the neutral frame. */
+/* Settled states on the timeline: grey = completed successfully, red = failed,
+   muted = cancelled. Green is reserved for the ACTIVE task (R4), so a finished
+   row never glows. Only the compact variant paints the border; an expanded tile
+   is the reading surface and keeps the neutral frame. */
 .tile:not(.is-expanded)[data-state='done'] {
-    border-color: rgba(74, 222, 128, 0.45);
-    background: rgba(74, 222, 128, 0.05);
+    border-color: var(--border);
+    background: transparent;
 }
 
 .tile:not(.is-expanded)[data-state='done']:hover {
-    border-color: var(--ok);
+    border-color: var(--border-strong);
+}
+
+.tile:not(.is-expanded)[data-state='streaming'] {
+    border-color: rgba(74, 222, 128, 0.5);
+    background: rgba(74, 222, 128, 0.05);
 }
 
 .tile:not(.is-expanded)[data-state='error'] {
@@ -1312,7 +1407,7 @@ button {
    border) and only the dot is muted — no green and no red would both be lies. */
 
 .tile[data-state='done'] .tile-status {
-    color: var(--ok);
+    color: var(--muted);
 }
 
 .tile[data-state='error'] .tile-status {
@@ -1330,8 +1425,9 @@ button {
    `--agent-ring-angle` property. One animation definition keeps a "working
    tile" and a "working agent" in step. Drawn inside the tile's own 1px border
    because `.tile` clips (`overflow: hidden`) for its rounded corners; the ring
-   is decoration, so reduced motion freezes it at the static arc. */
-.tile:not(.is-expanded)[data-state='queued']::before,
+   is decoration, so reduced motion freezes it at the static arc.
+   R4: `queued` is deliberately absent — a retained task is not running, so it
+   must not spin (the marker stays neutral until the server advances it). */
 .tile:not(.is-expanded)[data-state='waiting']::before,
 .tile:not(.is-expanded)[data-state='streaming']::before {
     content: '';
@@ -1721,12 +1817,29 @@ button {
 
 /* Markdown ------------------------------------------------------------- */
 /* Typography for rendered model output. `.markdown` is the only place innerHTML
-   is used, and only with sanitized HTML (see playground/src/ui/markdown.ts). */
+   is used, and only with sanitized HTML (see playground/src/ui/markdown.ts).
+
+   The transcript is what a reader actually reads, so its contrast is higher than
+   the chrome around it: navigation may be muted, the answer may not be. The
+   response palette lives on `.markdown` (not `:root`) so these values stay
+   scoped to rendered text and cannot drift into rails, tiles or the composer.
+   Every foreground below clears 4.5:1 against `--bg` / `--bg-deep`. */
 
 .markdown {
-    color: var(--text);
-    font-size: 13.5px;
-    line-height: 1.6;
+    --md-body: #e6ecf7;
+    --md-heading: #f3f7ff;
+    --md-muted: #9fabbf;
+    --md-accent: #8fb2ff;
+    --md-link: #a7c2ff;
+    --md-code: #f0c98d;
+    --md-inline-bg: #161d29;
+    --md-inline-border: #2d3749;
+    --md-rule: #26303f;
+    --md-quote-bg: rgba(122, 162, 255, 0.07);
+
+    color: var(--md-body);
+    font-size: 14px;
+    line-height: 1.68;
     overflow-wrap: anywhere;
 }
 
@@ -1744,8 +1857,10 @@ button {
 .markdown blockquote,
 .markdown pre,
 .markdown table {
-    margin: 0 0 10px;
+    margin: 0 0 12px;
 }
+
+/* Lists ---------------------------------------------------------------- */
 
 .markdown ul,
 .markdown ol {
@@ -1753,8 +1868,55 @@ button {
 }
 
 .markdown li + li {
-    margin-top: 3px;
+    margin-top: 4px;
 }
+
+/* The marker carries the accent so a list stays scannable without bolding every
+   row of text. */
+.markdown li::marker {
+    color: var(--md-accent);
+}
+
+/* Nested levels keep their own glyph but drop the accent, so depth reads at a
+   glance instead of every level shouting equally. */
+.markdown ul ul,
+.markdown ol ol {
+    margin: 4px 0 0;
+}
+
+.markdown ul ul li::marker,
+.markdown ol ol li::marker {
+    color: var(--md-muted);
+}
+
+/* A tight list puts no <p> around item text; a loose one adds one per item and
+   its default block margin would double-space the list. */
+.markdown li > p {
+    margin: 0 0 4px;
+}
+
+.markdown li > p:last-child {
+    margin-bottom: 0;
+}
+
+/* GFM task lists: the checkbox replaces the bullet, so the marker is removed and
+   the control sits where the bullet was. `:has` is available in every supported
+   browser (Chrome 105+/Safari 15.4+/Firefox 121+). */
+.markdown li:has(> input[type='checkbox']) {
+    list-style: none;
+}
+
+.markdown li > input[type='checkbox'] {
+    width: 12px;
+    height: 12px;
+    margin: 0 6px 0 -2px;
+    /* `accent-color` themes the native disabled checkbox; it stays inert (the
+       sanitizer forces `disabled`). */
+    accent-color: var(--md-accent);
+    vertical-align: -1px;
+}
+
+/* Headings ------------------------------------------------------------- */
 
 .markdown h1,
 .markdown h2,
@@ -1762,7 +1924,9 @@ button {
 .markdown h4,
 .markdown h5,
 .markdown h6 {
-    margin: 16px 0 8px;
+    margin: 20px 0 8px;
+    color: var(--md-heading);
+    font-weight: 650;
     line-height: 1.3;
 }
 
@@ -1770,46 +1934,101 @@ button {
     margin-top: 0;
 }
 
+/* h1/h2 get a rule underneath: section boundaries become visible while
+   scrolling instead of relying on a 2px size step alone. */
 .markdown h1 {
-    font-size: 19px;
+    font-size: 20px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--md-rule);
 }
 
 .markdown h2 {
     font-size: 17px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--md-rule);
 }
 
 .markdown h3 {
-    font-size: 15px;
+    font-size: 15.5px;
 }
 
 .markdown h4,
 .markdown h5,
 .markdown h6 {
     font-size: 13.5px;
-    color: var(--muted);
+    color: var(--md-muted);
+    letter-spacing: 0.02em;
 }
 
+/* Inline semantics ----------------------------------------------------- */
+
 .markdown a {
-    color: var(--accent);
-    text-decoration: underline;
-    text-underline-offset: 2px;
+    color: var(--md-link);
+    text-decoration-color: rgba(167, 194, 255, 0.45);
+    text-decoration-thickness: 1px;
+    text-underline-offset: 3px;
+}
+
+.markdown a:hover {
+    color: #c8d9ff;
+    text-decoration-color: currentColor;
+}
+
+/* Keyboard users have no hover cue in a transcript, so focus is explicit. */
+.markdown a:focus-visible {
+    border-radius: 2px;
+    outline: 2px solid var(--md-accent);
+    outline-offset: 2px;
 }
 
 .markdown strong {
-    font-weight: 600;
+    color: var(--md-heading);
+    font-weight: 650;
+}
+
+.markdown em {
+    color: #eef3fb;
+}
+
+.markdown del,
+.markdown s {
+    color: var(--md-muted);
+}
+
+/* `==highlight==` is not GFM, but raw <mark> survives sanitizing; colour it so
+   it does not look like a browser default. */
+.markdown mark {
+    padding: 0 3px;
+    border-radius: 3px;
+    background: rgba(251, 191, 36, 0.18);
+    color: #ffe6b0;
 }
 
 .markdown blockquote {
-    padding-left: 10px;
-    border-left: 2px solid var(--border-strong);
-    color: var(--muted);
+    margin-left: 0;
+    padding: 6px 12px;
+    border-left: 3px solid rgba(122, 162, 255, 0.45);
+    border-radius: 0 6px 6px 0;
+    background: var(--md-quote-bg);
+    color: var(--md-muted);
+}
+
+.markdown blockquote > :last-child {
+    margin-bottom: 0;
+}
+
+/* Quotes inside quotes fade their rail and background so nesting stays
+   readable rather than stacking the same tint. */
+.markdown blockquote blockquote {
+    border-left-color: var(--md-rule);
+    background: transparent;
 }
 
 .markdown hr {
     height: 1px;
-    margin: 14px 0;
+    margin: 16px 0;
     border: 0;
-    background: var(--border);
+    background: var(--md-rule);
 }
 
 .markdown img {
@@ -1817,14 +2036,28 @@ button {
     border-radius: 6px;
 }
 
-.markdown code {
+/* Inline code is the most common semantic span in a coding answer, so it gets a
+   warm accent instead of body colour. `:not(pre) > code` keeps these rules away
+   from fenced blocks, whose <pre> owns the container styling. */
+.markdown :not(pre) > code {
     padding: 1px 5px;
-    border: 1px solid var(--border);
-    border-radius: 5px;
-    background: var(--bg-deep);
+    border: 1px solid var(--md-inline-border);
+    border-radius: 4px;
+    background: var(--md-inline-bg);
+    color: var(--md-code);
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: 0.92em;
 }
+
+/* Code inside a link keeps the link colour: the underline already marks it and
+   two competing accents on one word read as noise. */
+.markdown a > code {
+    border-color: rgba(122, 162, 255, 0.3);
+    background: rgba(122, 162, 255, 0.1);
+    color: inherit;
+}
+
+/* Tables --------------------------------------------------------------- */
 
 .markdown table {
     display: block;
@@ -1835,14 +2068,22 @@ button {
 
 .markdown th,
 .markdown td {
-    padding: 5px 9px;
-    border: 1px solid var(--border);
+    padding: 6px 10px;
+    border: 1px solid var(--md-rule);
     text-align: left;
+    vertical-align: top;
 }
 
 .markdown th {
-    background: var(--bg-bar);
+    background: #171e2a;
+    color: var(--md-heading);
     font-weight: 600;
+    white-space: nowrap;
+}
+
+/* Zebra rows: with several columns of prose the eye needs a horizontal guide. */
+.markdown tbody tr:nth-child(even) {
+    background: rgba(255, 255, 255, 0.025);
 }
 
 /* Fenced code ---------------------------------------------------------- */
@@ -1855,18 +2096,49 @@ button {
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--bg-deep);
-    color: #c7cedb;
+    /* Untokenised code sits at #c7cedb before this change, the dimmest text on
+       the page; the tokens below are the accents, not the baseline. */
+    color: #d6dde9;
     font-family: var(--mono);
-    font-size: 12px;
-    line-height: 1.55;
+    font-size: 12.5px;
+    line-height: 1.6;
 }
 
 .markdown .code-block {
-    margin-bottom: 10px;
+    margin-bottom: 12px;
+    border-color: var(--md-rule);
+    /* A shade darker than the transcript so the block reads as a surface, not as
+       another paragraph. */
+    background: #0c1017;
 }
 
 .markdown .code-block:last-child {
     margin-bottom: 0;
+}
+
+/* Language caption. `data-language` is written by the fence renderer
+   (playground/src/ui/markdown.ts) from a validated, length-capped label; the
+   pseudo-element only prints it, so no markup contract changes for consumers
+   (tool cards build their own <pre> without the attribute). Sticky keeps the
+   label in view when the block scrolls sideways, and the ellipsis stops a long
+   label from widening the scroll area. */
+.markdown .code-block[data-language]::before {
+    content: attr(data-language);
+    position: sticky;
+    left: 0;
+    display: block;
+    width: fit-content;
+    max-width: 100%;
+    margin: 0 0 6px;
+    overflow: hidden;
+    color: var(--md-muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.08em;
+    line-height: 1.6;
+    text-overflow: ellipsis;
+    text-transform: uppercase;
+    white-space: nowrap;
 }
 
 .code-block code {
@@ -1880,10 +2152,12 @@ button {
 }
 
 /* highlight.js token palette, tuned to the app's dark surfaces. Layout colours
-   only: no token carries meaning on its own. */
+   only: no token carries meaning on its own. Comments were the dimmest layer
+   (#6b7688 ≈ 3.4:1 on `--bg-deep`); every colour below clears 4.5:1 so the
+   syntax colours are decoration, not the only cue. */
 .hljs-comment,
 .hljs-quote {
-    color: #6b7688;
+    color: #8b98ad;
     font-style: italic;
 }
 
@@ -1922,7 +2196,7 @@ button {
 .hljs-selector-pseudo,
 .hljs-property,
 .hljs-params {
-    color: #d8deea;
+    color: #dbe2ee;
 }
 
 .hljs-built_in,
@@ -1932,11 +2206,11 @@ button {
 }
 
 .hljs-meta {
-    color: #8b94a7;
+    color: #9aa7bb;
 }
 
 .hljs-punctuation {
-    color: #7d8799;
+    color: #9aa5b6;
 }
 
 .hljs-deletion {
@@ -2353,11 +2627,75 @@ button {
     }
 }
 
-/* Phone: one column; the rails become short scrolling strips. */
+/* Phone: one column; both rails start COLLAPSED (R1) and the topbar toggles open
+   exactly one at a time over a dismissable backdrop. The rails stay in the DOM, so
+   their content and state are never rebuilt or lost when a rail is closed. */
 @media (max-width: 860px) {
     .shell {
         grid-template-columns: minmax(0, 1fr);
-        grid-template-rows: auto minmax(0, 1fr) auto;
+        /* Both rails collapsed is the default, so the chat alone fills the shell. */
+        grid-template-rows: minmax(0, 1fr);
+    }
+
+    .rail-toggles {
+        display: flex;
+    }
+
+    /* Collapsed by default: no `data-rail-open` means neither rail is shown (they
+       stay in the DOM; display is the only thing that changes). */
+    .rail-left,
+    .rail-right {
+        display: none;
+    }
+
+    /* Placement is explicit. `display:none` rails are not auto-placed, so without
+       this the chat would land in an `auto` row and the 1fr row would be empty when
+       both rails are closed. The chat always owns row 1 by default. */
+    .center {
+        grid-row: 1;
+    }
+
+    /* Each open state adds ONE row for its rail and keeps the chat in the remaining
+       1fr row: left above the chat, right below it — the strip order the phone
+       layout already used. `.rail-right` is a grid (its two sections) at <=1180px,
+       so it is restored explicitly rather than with `revert`. */
+    .shell[data-rail-open='left'] {
+        grid-template-rows: auto minmax(0, 1fr);
+    }
+
+    .shell[data-rail-open='left'] .rail-left {
+        display: flex;
+        grid-row: 1;
+    }
+
+    .shell[data-rail-open='left'] .center {
+        grid-row: 2;
+    }
+
+    .shell[data-rail-open='right'] {
+        grid-template-rows: minmax(0, 1fr) auto;
+    }
+
+    .shell[data-rail-open='right'] .rail-right {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr);
+        grid-row: 2;
+    }
+
+    /* The open rail sits above the backdrop; the backdrop dims the chat behind it
+       and is the pointer dismiss (Escape is the keyboard one, main.ts). */
+    .shell[data-rail-open] .rail-backdrop {
+        display: block;
+        position: fixed;
+        inset: 0;
+        z-index: 1;
+        background: rgba(0, 0, 0, 0.45);
+    }
+
+    .shell[data-rail-open='left'] .rail-left,
+    .shell[data-rail-open='right'] .rail-right {
+        position: relative;
+        z-index: 2;
     }
 
     .rail-left {
@@ -2368,7 +2706,6 @@ button {
 
     .rail-right {
         max-height: 38vh;
-        grid-template-columns: minmax(0, 1fr);
     }
 
     .composer {
@@ -2380,15 +2717,15 @@ button {
         justify-content: flex-end;
     }
 
-    /* Tiles stay square and readable on a phone: smaller columns, less padding,
-       and the argument preview drops before the tool name would truncate. */
+    /* The timeline stays one column on a phone: only the spacing and the reading
+       surface shrink. */
     .log-wrap {
         padding: 14px;
     }
 
     .turns {
-        grid-template-columns: repeat(auto-fill, minmax(148px, 1fr));
         gap: 8px;
+        padding-left: 20px;
     }
 
     .tile-body {
@@ -2422,7 +2759,6 @@ button {
 @media (prefers-reduced-motion: reduce) {
     .status-dot,
     .tile-dot,
-    .tile[data-state='queued']::before,
     .tile[data-state='waiting']::before,
     .tile[data-state='streaming']::before,
     .agent-tile[data-activity='active']::before {
@@ -2450,15 +2786,14 @@ button {
     }
 
     /* The tile's conic-gradient ring disappears under forced colours too; the
-       outline carries the "working" state instead. */
-    .tile:not(.is-expanded)[data-state='queued'],
+       outline carries the "working" state instead. `queued` is not working, so it
+       is not outlined as busy. */
     .tile:not(.is-expanded)[data-state='waiting'],
     .tile:not(.is-expanded)[data-state='streaming'] {
         outline: 2px solid CanvasText;
         outline-offset: 1px;
     }
 
-    .tile:not(.is-expanded)[data-state='queued']::before,
     .tile:not(.is-expanded)[data-state='waiting']::before,
     .tile:not(.is-expanded)[data-state='streaming']::before {
         display: none;

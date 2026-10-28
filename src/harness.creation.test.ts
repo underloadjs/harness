@@ -80,7 +80,14 @@ describe('toolCreate', () => {
 
         expect(writer.tools.toolCreate.visibility).toBe('core');
         expect(writer.tools.toolCreate.description).toContain('Create a tool for yourself from JavaScript source.');
-        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
+        expect(declaredNames(seen[0])).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
     });
 
     it('registers a tool from a model call and declares it on the next turn', async () => {
@@ -100,8 +107,23 @@ describe('toolCreate', () => {
         const message = await writer('go');
 
         // Round 1: core only. Round 2: the created tool is already enabled.
-        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
-        expect(declaredNames(seen[1])).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'repeat']);
+        expect(declaredNames(seen[0])).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
+        expect(declaredNames(seen[1])).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
+            'repeat'
+        ]);
 
         // The tool is a real registry entry, searchable like any other.
         expect(writer.tools.repeat.name).toBe('repeat');
@@ -207,7 +229,15 @@ describe('toolCreate', () => {
         );
 
         // Nothing was registered by the rejected attempts.
-        expect(Object.keys(writer.tools)).toEqual(['existing', 'toolRequest', 'toolCreate', 'todoManage']);
+        expect(Object.keys(writer.tools)).toEqual([
+            'existing',
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
     });
 
     it('validates the creation shape', () => {
@@ -271,7 +301,8 @@ describe('toolCreate', () => {
             });
         }
 
-        expect(Object.keys(writer.tools)).toHaveLength(35);
+        // Six harness-owned core tools plus the 32 creations.
+        expect(Object.keys(writer.tools)).toHaveLength(38);
         expect(() =>
             writer.createTool({
                 name: 'generated32',

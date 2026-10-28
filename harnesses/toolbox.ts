@@ -28,8 +28,9 @@
 //   - core tools       - the four everyday file tools (fileRead, fileWrite,
 //                        fileEdit, fileGlob), webSearch when the host configured a
 //                        key, and the harness-owned set (toolRequest, toolCreate,
-//                        todoManage, plus agentDelegate for a preset that declares
-//                        subagents). fileList and the other package/app tools stay
+//                        todoManage, profileManage, chapterManage, locationManage,
+//                        plus agentDelegate for a preset that declares subagents).
+//                        fileList and the other package/app tools stay
 //                        searchable, so they wait for toolRequest.
 //
 // "core" is a declaration classification, not a session binding: only the
@@ -107,7 +108,14 @@ export const SHARED_TOOL_NAMES: readonly string[] = Object.freeze(Object.keys(SH
 // Instruct has no delegation tool while Research does. That difference is the
 // agent configuration, not a difference in the shareable toolbox. These are the
 // ONLY core tools the server marks sessionBound.
-export const CORE_TOOL_NAMES = ['toolRequest', 'toolCreate', 'todoManage'] as const;
+export const CORE_TOOL_NAMES = [
+    'toolRequest',
+    'toolCreate',
+    'todoManage',
+    'profileManage',
+    'chapterManage',
+    'locationManage'
+] as const;
 
 // Package presets that are declared on every request (R18). Their metadata lives
 // in src/tools/catalogue.ts with `visibility: 'core'`; this list is the descriptor

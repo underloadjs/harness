@@ -233,7 +233,7 @@ afterEach(() => {
 });
 
 it('boots the three-column shell, streams a turn and resolves server timings', async () => {
-    let messageRequests = 0;
+    let taskRequests = 0;
 
     const start = { type: 'start' as const, agent: 'instruct', model: 'm1' };
     const call = {
@@ -277,8 +277,22 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
         if (url === '/api/sessions' && method === 'POST')
             return json({ session: snapshot({ harnessDefinition: descriptor() }) });
 
-        if (url === '/api/sessions/s1/messages' && method === 'POST') {
-            messageRequests += 1;
+        if (url === '/api/sessions/s1/tasks' && method === 'POST') {
+            taskRequests += 1;
+            return json(
+                {
+                    session: snapshot({
+                        harnessDefinition: descriptor(),
+                        status: 'running',
+                        turns: [opening]
+                    }),
+                    turn: opening
+                },
+                202
+            );
+        }
+
+        if (url === '/api/sessions/s1/events') {
             const at = (offset: number): number => T + offset;
 
             const items: SessionStreamItem[] = [
@@ -360,7 +374,7 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     await flush();
     await flush();
 
-    expect(messageRequests).toBe(1);
+    expect(taskRequests).toBe(1);
 
     const tile = byClass('.tile', 'article');
     expect(tile.dataset.state).toBe('done');
@@ -385,10 +399,16 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
 
     expect(statusText()).toBe('done · m1 · idle');
     expect(runButton.disabled).toBe(false);
-    // A session exists now, so the team is frozen: editing needs a New session.
+    // A session exists now, so the TEAM is frozen: editing needs a New session.
     expect(byClass('.agent-main', 'button').disabled).toBe(true);
     expect(document.querySelector('.agent-lock-text')?.textContent).toBe(
         'This saved session keeps the agent team it started with.'
+    );
+    // ...but the MODELS are live (R2): the tile dropdown still edits this session.
+    const modelSelect = byClass('.agent-model-select', 'select');
+    expect(modelSelect.disabled).toBe(false);
+    expect(modelSelect.title).toBe(
+        'Model for Instruct. Applies to the next request in this session.'
     );
 });
 
@@ -433,7 +453,21 @@ it('prints the running tally per frame and keeps it through the terminal snapsho
         if (url === '/api/sessions' && method === 'POST')
             return json({ session: snapshot({ harnessDefinition: descriptor() }) });
 
-        if (url === '/api/sessions/s1/messages' && method === 'POST') {
+        if (url === '/api/sessions/s1/tasks' && method === 'POST') {
+            return json(
+                {
+                    session: snapshot({
+                        harnessDefinition: descriptor(),
+                        status: 'running',
+                        turns: [opening]
+                    }),
+                    turn: opening
+                },
+                202
+            );
+        }
+
+        if (url === '/api/sessions/s1/events') {
             const stream = splitSse(
                 [
                     { type: 'turn', turn: opening },
@@ -510,16 +544,35 @@ it('keeps the last tally when later frames carry none', async () => {
         if (url === '/api/sessions' && method === 'POST')
             return json({ session: snapshot({ harnessDefinition: descriptor() }) });
 
-        if (url === '/api/sessions/s1/messages' && method === 'POST') {
-            // An older server: no `turns` on the terminal frame, so main.ts settles
-            // the LIVE tile instead of rebuilding it. Whatever the frames left on
-            // the label is what the user keeps.
+        if (url === '/api/sessions/s1/tasks' && method === 'POST') {
+            return json(
+                {
+                    session: snapshot({
+                        harnessDefinition: descriptor(),
+                        status: 'running',
+                        turns: [opening]
+                    }),
+                    turn: opening
+                },
+                202
+            );
+        }
+
+        if (url === '/api/sessions/s1/events') {
+            // The record carries the tally the frames established; the untallied
+            // frames between must not clear it (the tile only prints server data).
             const items: SessionStreamItem[] = [
                 { type: 'turn', turn: opening },
                 { type: 'event', turnId: 't1', event: start, at: T, usage: tally },
                 { type: 'event', turnId: 't1', event: text, at: T + 100 },
                 { type: 'event', turnId: 't1', event: done, at: T + 200 },
-                { type: 'snapshot', session: snapshot({ harnessDefinition: descriptor() }) }
+                {
+                    type: 'snapshot',
+                    session: snapshot({
+                        harnessDefinition: descriptor(),
+                        turns: [{ ...opening, status: 'done', events: [start, text, done] }]
+                    })
+                }
             ];
 
             return sse(items);
@@ -661,6 +714,14 @@ it('restores a remembered session with its frozen team and server timings', asyn
     expect(document.querySelector('.agent-lock-text')?.textContent).toBe(
         'This saved session keeps the agent team it started with.'
     );
+    // R2: models are not part of the frozen team, so their controls stay usable on a
+    // saved session and promise the next request in THIS chat.
+    const modelSelects = [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
+    expect(modelSelects.map((select) => select.disabled)).toEqual([false, false]);
+    expect(modelSelects.map((select) => select.title)).toEqual([
+        'Model for Instruct. Applies to the next request in this session.',
+        'Model for Summarizer. Applies to the next request in this session.'
+    ]);
 
     // The lock's affordance starts a new conversation, which unlocks editing.
     byClass('.agent-lock .link-button', 'button').click();
@@ -989,7 +1050,17 @@ it('replaces the projected stream with the authoritative terminal snapshot', asy
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions' && method === 'POST') return json({ session: snapshot() });
 
-        if (url === '/api/sessions/s1/messages') {
+        if (url === '/api/sessions/s1/tasks' && method === 'POST') {
+            return json(
+                {
+                    session: snapshot({ turns: [opening], status: 'running' }),
+                    turn: opening
+                },
+                202
+            );
+        }
+
+        if (url === '/api/sessions/s1/events') {
             return sse([
                 { type: 'turn', turn: opening },
                 { type: 'event', turnId: 't1', event: start },
@@ -1018,14 +1089,31 @@ it('replaces the projected stream with the authoritative terminal snapshot', asy
     expect(document.querySelector('.agent-text')?.textContent).not.toContain('draft');
 });
 
-it('stops the originating session and locks selection while a run is in flight', async () => {
+it('stops every task in the originating session while a run is in flight', async () => {
     let cancelRequests = 0;
-    let messageStarted: (() => void) | undefined;
+    let cancelBody: unknown;
+    let observerStarted: (() => void) | undefined;
     const started = new Promise<void>((resolve) => {
-        messageStarted = resolve;
+        observerStarted = resolve;
     });
 
     const other = descriptor({ name: 'workspace', title: 'Workspace', agents: ['workspace'], primary: 'workspace' });
+    const runningTurn: SessionTurn = {
+        id: 't1',
+        index: 0,
+        prompt: 'long one',
+        status: 'running',
+        startedAt: T,
+        updatedAt: T,
+        events: [{ type: 'start', agent: 'instruct', model: 'm1' }]
+    };
+    const cancelledTurn: SessionTurn = { ...runningTurn, status: 'cancelled', updatedAt: T + 100 };
+    const transcript = snapshot({
+        harnessDefinition: descriptor(),
+        status: 'running',
+        turns: [runningTurn]
+    });
+    const cancelled = snapshot({ harnessDefinition: descriptor(), turns: [cancelledTurn] });
 
     vi.stubGlobal(
         'fetch',
@@ -1034,11 +1122,14 @@ it('stops the originating session and locks selection while a run is in flight',
 
             if (url === '/api') return json(bootstrap({ presets: [descriptor(), other] }));
             if (url === '/api/models') return json({ models: ['m1'] });
-            if (url === '/api/sessions' && init?.method === 'POST') return json({ session: snapshot() });
+            if (url === '/api/sessions' && init?.method === 'POST') return json({ session: transcript });
+            if (url === '/api/sessions/s1/tasks' && init?.method === 'POST') {
+                return json({ session: transcript, turn: runningTurn }, 202);
+            }
 
-            if (url === '/api/sessions/s1/messages') {
-                messageStarted?.();
-                // A stream that stays open until the request is aborted.
+            if (url === '/api/sessions/s1/events') {
+                observerStarted?.();
+                // A long-lived observer that stays open until it is unsubscribed.
                 return new Promise<Response>((_resolve, reject) => {
                     init?.signal?.addEventListener('abort', () =>
                         reject(new DOMException('The operation was aborted.', 'AbortError'))
@@ -1048,10 +1139,15 @@ it('stops the originating session and locks selection while a run is in flight',
 
             if (url === '/api/sessions/s1/cancel' && init?.method === 'POST') {
                 cancelRequests += 1;
+                cancelBody = init.body === undefined ? undefined : JSON.parse(String(init.body));
                 return json({ cancelled: true });
             }
 
-            if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [] });
+            if (url === '/api/sessions/s1' && init?.method === undefined) {
+                return json({ session: cancelled });
+            }
+
+            if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [transcript] });
 
             throw new Error(`unexpected request: ${url}`);
         })
@@ -1066,17 +1162,28 @@ it('stops the originating session and locks selection while a run is in flight',
     await started;
     await flush();
 
-    // While the stream owns the instance, selection and edits are locked.
-    expect(byClass('.harness-item[data-harness="workspace"]', 'button').disabled).toBe(true);
+    // The queue is server-owned, so switching harness stays possible while it runs;
+    // the team row is locked (frozen session) and New session refuses pending work.
+    expect(byClass('.harness-item[data-harness="workspace"]', 'button').disabled).toBe(false);
     expect(byClass('.new-session', 'button').disabled).toBe(true);
     expect(byClass('.agent-add', 'button').disabled).toBe(true);
+    // R2: the TEAM is locked mid-run, the MODEL is not — it edits the session's live
+    // map for the next request and never cancels this stream.
+    const streamingSelect = byClass('.agent-model-select', 'select');
+    expect(streamingSelect.disabled).toBe(false);
+    expect(streamingSelect.title).toBe(
+        'Model for Instruct. Applies to the next request in this session.'
+    );
 
     byClass('.stop', 'button').click();
     await flush();
     await flush();
+    await flush();
 
-    // Stop cancels the session the run started on, not a later selection.
+    // Stop is total: the body says `{ all: true }` so retained queue records are
+    // cancelled too, and the tile/status show the server's cancellation.
     expect(cancelRequests).toBe(1);
+    expect(cancelBody).toEqual({ all: true });
     expect(tileStates()).toEqual(['cancelled']);
     expect(statusText()).toBe('cancelled');
     expect(byClass('.harness-item[data-harness="workspace"]', 'button').disabled).toBe(false);
@@ -1165,6 +1272,258 @@ it('clears polling and elapsed timers on pagehide', async () => {
     expect(tileElapsed()[0]).toBe(before);
 });
 
+// ---------------------------------------------------------------------------
+// R4 queue: submit behind the active task, advance in FIFO order
+// ---------------------------------------------------------------------------
+it('queues a second task behind the active one and advances it automatically', async () => {
+    const streamBody = (): {
+        response: Response;
+        push: (items: readonly unknown[]) => void;
+        close: () => void;
+    } => {
+        let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+        const body = new ReadableStream<Uint8Array>({
+            start(next) {
+                controller = next;
+            }
+        });
+
+        return {
+            response: new Response(body, {
+                status: 200,
+                headers: { 'Content-Type': 'text/event-stream' }
+            }),
+            push: (items) => {
+                const text = items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join('');
+                controller?.enqueue(new TextEncoder().encode(text));
+            },
+            close: () => controller?.close()
+        };
+    };
+
+    const stream = streamBody();
+    const start = { type: 'start' as const, agent: 'instruct', model: 'm1' };
+
+    const runningA = {
+        id: 'ta',
+        index: 0,
+        prompt: 'first task',
+        status: 'running',
+        startedAt: T,
+        updatedAt: T + 10,
+        events: [start, { type: 'text' as const, agent: 'instruct', delta: 'first answer' }]
+    } as SessionTurn;
+    const doneA = {
+        ...runningA,
+        status: 'done' as const,
+        updatedAt: T + 100,
+        events: [...runningA.events, { type: 'done' as const, agent: 'instruct', message: assistant() }]
+    } as SessionTurn;
+    const queuedB = {
+        id: 'tb',
+        index: 1,
+        prompt: 'second task',
+        status: 'queued',
+        updatedAt: T + 20,
+        events: []
+    } as unknown as SessionTurn;
+    const runningB = {
+        ...queuedB,
+        status: 'running' as const,
+        startedAt: T + 200,
+        updatedAt: T + 210,
+        events: [start]
+    } as SessionTurn;
+    const doneB = {
+        ...runningB,
+        status: 'done' as const,
+        updatedAt: T + 400,
+        events: [
+            ...runningB.events,
+            { type: 'text' as const, agent: 'instruct', delta: 'second answer' },
+            { type: 'done' as const, agent: 'instruct', message: assistant() }
+        ]
+    } as SessionTurn;
+
+    const first = snapshot({ harnessDefinition: descriptor(), status: 'running', turns: [runningA] });
+    const both = snapshot({
+        harnessDefinition: descriptor(),
+        status: 'running',
+        turns: [runningA, queuedB]
+    } as SessionSnapshot);
+
+    let tasks = 0;
+
+    stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap());
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions' && method === 'POST')
+            return json({ session: snapshot({ harnessDefinition: descriptor() }) });
+
+        if (url === '/api/sessions/s1/tasks' && method === 'POST') {
+            tasks += 1;
+            return tasks === 1
+                ? json({ session: first, turn: runningA }, 202)
+                : json({ session: both, turn: queuedB }, 202);
+        }
+
+        if (url === '/api/sessions/s1/events') return stream.response;
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+
+    const form = byClass('.composer', 'form');
+    const input = byClass('.composer-input', 'textarea');
+
+    // Task A starts processing.
+    input.value = 'first task';
+    form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+    await flush();
+    await flush();
+    stream.push([{ type: 'turn', turn: runningA }]);
+    await flush();
+
+    expect(tasks).toBe(1);
+    expect(tileStates()).toEqual(['streaming']);
+    // The composer stays usable while A runs (R4).
+    expect(byClass('.run', 'button').disabled).toBe(false);
+
+    // Task B is submitted BEHIND A and is visibly queued, neutral.
+    input.value = 'second task';
+    form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+    await flush();
+    await flush();
+
+    expect(tasks).toBe(2);
+    expect(tileStates()).toEqual(['streaming', 'queued']);
+    expect(document.querySelectorAll('.turn-row')[1]?.getAttribute('data-state')).toBe('queued');
+    // Queued B has no clock, and Stop is available for the whole queue.
+    expect(tileElapsed()[1]).toBe('');
+    expect(byClass('.stop', 'button').disabled).toBe(false);
+    expect(byClass('.reset', 'button').disabled).toBe(true);
+    // R2: models stay editable while a queue runs.
+    expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
+
+    // A completes; the server advances B without another submit.
+    stream.push([{ type: 'turn', turn: doneA }]);
+    stream.push([{ type: 'snapshot', session: snapshot({ harnessDefinition: descriptor(), status: 'running', turns: [doneA, runningB] }) }]);
+    await flush();
+    await flush();
+
+    expect(tileStates()).toEqual(['done', 'streaming']);
+
+    // B streams its text, then the drain snapshot settles both.
+    stream.push([{ type: 'event', turnId: 'tb', event: { type: 'text', agent: 'instruct', delta: 'second answer' } }]);
+    stream.push([{ type: 'snapshot', session: snapshot({ harnessDefinition: descriptor(), turns: [doneA, doneB] }) }]);
+    stream.close();
+    await flush();
+    await flush();
+
+    expect(tileStates()).toEqual(['done', 'done']);
+    expect(document.querySelectorAll('.tile')[1].querySelector('.agent-text')?.textContent).toBe(
+        'second answer\n'
+    );
+    // No duplicated events: A's single text block appears exactly once.
+    expect(document.querySelectorAll('.tile')[0].querySelectorAll('.agent-text')).toHaveLength(1);
+    expect(document.querySelector('.tile-elapsed')?.textContent).toBe('100ms');
+    expect(byClass('.run', 'button').disabled).toBe(false);
+    expect(byClass('.stop', 'button').disabled).toBe(true);
+});
+
+it('hydrates a queued session on reload and stops the whole queue explicitly', async () => {
+    let cancelBody: unknown;
+    const runningA = {
+        id: 'ta',
+        index: 0,
+        prompt: 'first task',
+        status: 'running',
+        startedAt: T,
+        updatedAt: T + 10,
+        events: [{ type: 'start', agent: 'instruct', model: 'm1' }]
+    } as SessionTurn;
+    const queuedB = {
+        id: 'tb',
+        index: 1,
+        prompt: 'second task',
+        status: 'queued',
+        updatedAt: T + 20,
+        events: []
+    } as unknown as SessionTurn;
+    const queued = snapshot({
+        id: 's1',
+        status: 'running',
+        harnessDefinition: descriptor(),
+        turns: [runningA, queuedB]
+    } as SessionSnapshot);
+    const stopped = snapshot({
+        id: 's1',
+        harnessDefinition: descriptor(),
+        turns: [
+            { ...runningA, status: 'cancelled', updatedAt: T + 100 },
+            { ...queuedB, status: 'cancelled', updatedAt: T + 100 }
+        ] as SessionTurn[]
+    });
+
+    localStorage.setItem(SESSION_KEY, 's1');
+
+    let observer: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const body = new ReadableStream<Uint8Array>({
+        start(next) {
+            observer = next;
+            next.enqueue(dataOf([{ type: 'snapshot', session: queued }]));
+        }
+    });
+
+    let snapshotGets = 0;
+
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+
+            if (url === '/api') return json(bootstrap({ sessions: [queued] }));
+            if (url === '/api/models') return json({ models: ['m1'] });
+            if (url === '/api/sessions/s1' && init?.method === undefined) {
+                snapshotGets += 1;
+                // Boot/open reads the live queue; the post-cancel resync reads the
+                // server's terminal records.
+                return json({ session: snapshotGets === 1 ? queued : stopped });
+            }
+            if (url === '/api/sessions/s1/events') return new Response(body, { status: 200 });
+            if (url === '/api/sessions/s1/cancel' && init?.method === 'POST') {
+                cancelBody = init.body === undefined ? undefined : JSON.parse(String(init.body));
+                return json({ cancelled: true });
+            }
+            if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [queued] });
+
+            throw new Error(`unexpected request: ${url}`);
+        })
+    );
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // Reload shows the server-owned queue: active A, neutral B behind it.
+    expect(tileStates()).toEqual(['streaming', 'queued']);
+    expect(byClass('.stop', 'button').disabled).toBe(false);
+    expect(byClass('.reset', 'button').disabled).toBe(true);
+
+    byClass('.stop', 'button').click();
+    await flush();
+    await flush();
+
+    // Stop is explicit and total: active + retained queue.
+    expect(cancelBody).toEqual({ all: true });
+    expect(tileStates()).toEqual(['cancelled', 'cancelled']);
+    expect(byClass('.stop', 'button').disabled).toBe(true);
+
+    observer?.close();
+});
+
 it('polls a session that is still running after reload until it is terminal', async () => {
     vi.useFakeTimers();
 
@@ -1217,16 +1576,18 @@ it('polls a session that is still running after reload until it is terminal', as
     await import('./main');
     await vi.advanceTimersByTimeAsync(50);
 
-    // The reload rendered the running turn and says it is following the server.
+    // The reload rendered the running turn; the observer route is absent in this
+    // stub, so the UI reports the documented polling fallback.
     expect(gets).toBe(1);
     expect(tileStates()).toEqual(['streaming']);
     expect(document.querySelector('.agent-text')?.textContent).toBe('half\n');
-    expect(statusText()).toBe('session running · polling server');
+    expect(statusText()).toBe('live stream lost · polling server');
 
     // First poll: still running, snapshot re-rendered, same single turn.
     await vi.advanceTimersByTimeAsync(1_000);
     expect(gets).toBe(2);
     expect(tileStates()).toEqual(['streaming']);
+    expect(statusText()).toBe('session running · polling server');
 
     // Second poll: terminal. The server turn list replaces the projection.
     await vi.advanceTimersByTimeAsync(1_000);
@@ -1236,7 +1597,8 @@ it('polls a session that is still running after reload until it is terminal', as
     expect(tileStates()).toEqual(['done']);
     expect(document.querySelector('.agent-text')?.innerHTML).toBe('<p>half and done</p>\n');
     expect(tileElapsed()).toEqual(['2.5s']);
-    expect(statusText()).toBe('idle');
+    // The transition out of pending reports completion (R4), not a bare idle.
+    expect(statusText()).toBe('done · m1 · idle');
     expect(byClass('.session', 'button').dataset.status).toBe('idle');
 
     // Polling is GET-only: it never starts a model run.

@@ -53,7 +53,8 @@ configured it is declared on the first request. The bundled catalogue splits the
 same way (R18): `fileRead`, `fileWrite`, `fileEdit`, and `fileGlob` are core, while
 `fileList`, `commandRun`, `gitDiff`, and `syntaxCheck` are discovered through the
 core `toolRequest` tool — see [Tool discovery](#tool-discovery). The harness-owned
-`toolRequest`, `toolCreate`, `todoManage`, and `agentDelegate` are also declared up
+`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, and
+`locationManage` (plus `agentDelegate` when subagents exist) are also declared up
 front and are the only session-bound core tools.
 
 ## Concepts
@@ -68,7 +69,8 @@ they work without a harness.
 src/
   harness.ts        the only root source file: harness() + the public barrel
   harness.test.ts   its test, next to it
-  core/             agent, tool, discovery, creation   (usable without a harness)
+  core/             agent, tool, discovery, creation, todo, profile, chapter,
+                    location   (usable without a harness)
   agents/           trusted AgentProfile definitions (instruction + guidelines)
   transport/        openai, models      (the wire protocol + model catalogue)
   tools/            the preset catalogue     (lazy, executable on their own)
@@ -212,8 +214,9 @@ Every harness also preloads the bundled preset catalogue by default (`presets:
 true`), so its tools are available with no imports at all. The four core file tools
 (`fileRead`, `fileWrite`, `fileEdit`, `fileGlob`) plus a configured `webSearch` are
 declared from the first request, together with the harness-owned `toolRequest`,
-`toolCreate`, `todoManage` (and `agentDelegate` when subagents exist). `fileList`,
-`commandRun`, `gitDiff`, `syntaxCheck`, and the app tools stay searchable.
+`toolCreate`, `todoManage`, `profileManage`, `chapterManage`, and `locationManage`
+(and `agentDelegate` when subagents exist). `fileList`, `commandRun`, `gitDiff`,
+`syntaxCheck`, and the app tools stay searchable.
 
 ```ts
 tools: {
@@ -244,14 +247,14 @@ query is refined by adding a tag — `["files"]` leaves a sixth match out,
 | Rule | Behaviour |
 |---|---|
 | Tags | Required. Trimmed, lowercased, deduplicated. |
-| Default visibility | `'searchable'`. The core set is `fileRead`/`fileWrite`/`fileEdit`/`fileGlob`, a configured `webSearch`, the harness-owned `toolRequest`/`toolCreate`/`todoManage`, plus `agentDelegate` on a primary with subagents. `fileList` is searchable. |
+| Default visibility | `'searchable'`. The core set is `fileRead`/`fileWrite`/`fileEdit`/`fileGlob`, a configured `webSearch`, the harness-owned `toolRequest`/`toolCreate`/`todoManage`/`profileManage`/`chapterManage`/`locationManage`, plus `agentDelegate` on a primary with subagents. `fileList` is searchable. |
 | Core vs session-bound | `core` means always declared. Only the harness-owned set is `sessionBound` (needs a `sessionId` for a manual server call); core file tools and webSearch run directly. |
 | Ranking | OR-style: a tool needs only one query tag to be a candidate, and its rank is its **best single-tag score** — exact tag (4) > tag prefix (3) > tag substring (2) > name/description hit (1). More matching tags only breaks ties, so a broad tool cannot outrank an exact hit. |
 | Cap | 5 matches — the default AND the maximum. `limit` may only ask for fewer (1–5). `remaining` counts the matches the cap excluded; `truncated: true` mirrors it for older clients. |
 | No match | the result carries `unmatchedTags` and the full `availableTags`, so the model retries with real vocabulary. |
 | Undiscovered tool | calling one returns a tool result naming tags that would enable it — it does not run. |
 | Lifetime | discovery is per harness and kept across calls; `reset()` forgets it with the conversation. `harness.discoveredTools` exposes the enabled names. |
-| Reserved names | `toolRequest`, `toolCreate`, and `todoManage` belong to the harness, and `agentDelegate` too when it is registered; using one throws. |
+| Reserved names | `toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, and `locationManage` belong to the harness, and `agentDelegate` too when it is registered; using one throws. |
 | Manual call | an operator may run any registered tool through `harness.executeTool()` / `POST /tools/:name`; discovery gates the model, not the user. Core file tools need no session; the harness-owned set does. |
 
 `searchTools(tools, tags)` is the same ranking without a harness — useful for a
@@ -296,6 +299,42 @@ call, has no ids, and its list is derived by the UI from the last call. Sources:
 `todoManage` deliberately uses incremental actions and stable ids instead; it does
 not copy that API or claim compatibility.
 
+### Session records (`profileManage`, `chapterManage`, `locationManage`)
+
+Three more core tools follow `todoManage`'s lifecycle exactly: one store per
+harness (therefore per server session), shared by the primary and its subagents,
+stable decimal-string ids from `"1"`, and cleared by `reset()` (ids restart at
+`"1"`). They share one action set and one validation policy:
+
+| Action | Input | Result |
+|---|---|---|
+| `add` | the tool's required fields plus optionals | the stored record, with the next stable id |
+| `list` | — | every record (summaries for chapters) plus `counts` |
+| `get` | `id` | one record; for chapters this is the only action that returns `content` |
+| `update` | `id` plus at least one mutable field | the patched record; fields you omit are unchanged |
+| `remove` | `id` | `removed` plus the remaining records |
+
+Every result is a defensive snapshot (arrays and records are copies). A rejected
+call changes nothing: unknown action, missing/blank `id`, unknown id, wrong field
+type, an update that names no field, and every tool-specific rule below are
+readable errors naming the tool and field.
+
+| Tool | Required on `add` | Optional | `counts` |
+|---|---|---|---|
+| `profileManage` | `name`, `description` | `traits` (string[]; trimmed, deduplicated), `notes` | `{ total }` |
+| `chapterManage` | `title`, `summary` | `content` (default `""`), `status` (`planned`/`draft`/`complete`, default `planned`), `order` (integer) | `{ total, planned, draft, complete }` |
+| `locationManage` | `name`, `description` | `notes` | `{ total }` |
+
+Chapter-specific rules: `list` and every mutation result carry **summaries**
+without the body — only `get` returns `content`; `update` rejects a blank
+`title`/`summary` but may clear `content` to `""`; `order` sorts the returned
+list (ordered chapters ascending first, unordered ones after in insertion order)
+and the live store is never re-sorted. There is no move action: update `order`.
+Profiles and locations return whole records, so an empty `notes` is a normal
+stored value, and `traits: []` clears a profile's traits. Like `todoManage`,
+nothing is persisted and no HTTP/UI surface reads these stores: the tool result
+is the record.
+
 ### Tool names
 
 Every tool — core and preset — is named `<namespace><action>`. The namespace
@@ -322,6 +361,11 @@ groups related tools for discovery; the action is what the model calls.
 | `searchNotes` | `noteSearch` | app tool |
 | `summarize` | `textSummarize` | app tool |
 | `flaky` (tool) | `testFlaky` | the `flaky` **harness/preset id** is unchanged |
+
+`profileManage`, `chapterManage`, and `locationManage` were added under their final
+names, so they have no removed-name row. All three are core session tools with the
+same incremental action set — see
+[Session records](#session-records-profilemanage-chaptermanage-locationmanage).
 
 There are **no aliases**: the old names are gone from the wire surface, the
 exports, the catalogue, and the reserved-name list. This is a deliberate breaking
@@ -590,11 +634,11 @@ repeat the name inside the definition.
 | `writer.agent` | The entry agent. `writer.agent.messages` is the live transcript. |
 | `writer.agents` | Every agent, including the entry one. |
 | `writer.subagents` | The agents the primary may delegate to, keyed by name. Empty when delegation is not configured. |
-| `writer.tools` | The registered tools, including the harness-owned core `toolRequest`, `toolCreate`, `todoManage`, and `agentDelegate` when it exists. |
+| `writer.tools` | The registered tools, including the harness-owned core `toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, and `agentDelegate` when it exists. |
 | `writer.discoveredTools` | Names `toolRequest` has enabled, in discovery order. Read-only copy; `reset()` empties it. |
 | `writer.toolCreate(config)` | Host-side runtime creation. Same validation/registry/budget as the model's `toolCreate`; throws `HarnessError`. |
 | `writer.executeTool(name, parameters)` | Run one registered tool directly, with this harness's context (`agent`, `agents`, `run`). The server's manual-execution path: discovery gates the model, not the operator, so an un-discovered searchable tool still runs. Reserved policy is kept (`toolCreate` registration, primary-only `agentDelegate`); an unregistered name throws. |
-| `writer.reset()` | Reset the entry agent's conversation, forget discovered tools, and clear `todoManage`. Created tools stay registered but are no longer enabled. |
+| `writer.reset()` | Reset the entry agent's conversation, forget discovered tools, and clear `todoManage`, `profileManage`, `chapterManage`, and `locationManage`. Created tools stay registered but are no longer enabled. |
 
 ### Runtime tool creation
 
@@ -890,8 +934,16 @@ the opt-in `webSearch` tool in the live presets (`instruct`, `research`,
 ## Server and UI
 
 The UI is a client. It does not import the harness package, construct a harness,
-or execute a tool. Every action is a request to the server; every result is an SSE
-stream of the same `report.progress` events a CLI prints.
+or execute a tool. Every action is a request to the server: a task submit is the
+`202` JSON accept from `POST /tasks`, and its live progress arrives on the
+session's `GET /events` SSE stream as the same `report.progress` events a CLI
+prints. The server, not the browser, keeps the queue and the transcript.
+
+On a phone (`max-width: 860px`) both side rails start **collapsed** and the topbar
+grows one toggle per rail; opening one closes the other, and a backdrop click or
+`Escape` dismisses it. The rails stay in the DOM (CSS only hides them), so their
+content and state survive opening and closing, and every wider layout ignores the
+toggle state and shows both rails permanently.
 
 ```bash
 yarn start                # API + UI, everything end-to-end
@@ -907,8 +959,9 @@ preset is built by the same factory (`harnesses/toolbox.ts`), so the registered
 toolbox is identical: all eight package tools (`syntaxCheck`, the five file tools,
 `commandRun`, `gitDiff`), the app tools (`timeNow`, `textCount`, `diceRoll`,
 `noteSearch`, `textSummarize`), opt-in `webSearch`, and the harness-owned core tools
-(`toolRequest`, `toolCreate`, `todoManage`, plus `agentDelegate` only when the preset
-declares a subagent). R18 splits declarations: the four core file tools and a
+(`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`,
+`locationManage`, plus `agentDelegate` only when the preset declares a subagent).
+R18 splits declarations: the four core file tools and a
 configured `webSearch` are always declared, while `fileList`, `commandRun`,
 `gitDiff`, `syntaxCheck`, and the app tools are discovered. Choosing a harness
 changes the agents, not the tools.
@@ -935,30 +988,51 @@ identifiers still resolve: `writer` and `assistant` → `instruct`, `researcher`
 reports the canonical name.
 
 The server keeps one harness per session, so submitting a second task continues
-the same conversation. A harness's configuration is **frozen at session creation**:
-the preset object and a descriptor snapshot are captured, so a later create/patch
-never changes what a running session reports or runs. The UI's Endpoint panel is
-sent when a session is created; changing it starts a fresh session on the next run.
-This frozen-chat rule is separate from editability: a harness card is always
-editable (R20.1), and editing it applies to the next session you start — future
-in-place session editing is not implemented. Sessions are in memory and are lost
-when the server restarts. Created tools live in the session's harness: they survive
-`reset()` (which clears the conversation, discovery, and `todoManage`) and
-disappear with the session.
+the same conversation. `POST /api/sessions/:id/tasks` accepts a task with
+`202 { session, turn }` and the server runs it FIFO behind anything already
+pending, so tasks execute in submission order even when they arrive while a run
+streams. **Team membership and the descriptor snapshot are frozen at
+session creation**: the preset object and a `harnessDefinition` are captured, so a
+later create/patch never changes which agents a running session has, its primary,
+or the history it reports. The UI's Endpoint panel is sent when a session is
+created; changing it starts a fresh session on the next run.
 
-The response of a run is also the server's record: every task becomes a
-`SessionTurn` (id, index, prompt, status, timestamps, every event the run produced,
-a parallel `eventTimes` array of epoch-ms stamps, and a `usage` tally summed from the
-per-request `usage` events — `input` with the cached part in `cached`). `GET
-/api/sessions` and `GET /api/sessions/:id` always include the full `turns` array, so
-a browser reload — or a second client — renders the same transcript, the same
-per-step/per-tool elapsed time, and the same token count without having seen the
-stream. A turn that is still running is
-included too, which is what the UI polls to reattach to a running session. Each
-snapshot also carries `harnessDefinition` (the frozen descriptor), `agentModels`
-(the effective model of every agent in that session — overrides resolved, so a
-per-agent dropdown survives a reload), and `discoveredTools` (what `toolRequest`
-had enabled), so a reload loses neither the configuration nor the discovery state.
+One field is deliberately not frozen: an agent's **model**. `PATCH
+/api/sessions/:id` with `{ agentModels: { <agent>: <model> } }` retargets an
+existing session in place (see the session table below). The map MERGES into the
+live map, every key must name a member of that session's harness, values are
+validated like a harness override, and the whole patch is all-or-nothing. It is
+allowed while a run streams: the in-flight request keeps the model it started
+with (the assistant message it commits names that model), and the **next request**
+of that agent uses the new one — including a queued task, whose request starts
+after the patch. Nothing is aborted, rebuilt, or replayed, and the
+frozen `harnessDefinition.agentModels` remains the creation-time record. Team
+editing (primary/subagents) still applies to the next session you start. Sessions
+are in memory and are lost when the server restarts. Created tools live in the
+session's harness: they survive `reset()` (which clears the conversation,
+discovery, `todoManage`, and the three record stores) and disappear with the
+session.
+
+Every submit — queued (`/tasks`) or legacy (`/messages`) — is also the server's
+record: every task becomes a `SessionTurn` (id, index, prompt, status, timestamps,
+every event the run produced, a parallel `eventTimes` array of epoch-ms stamps,
+and a `usage` tally summed from the per-request `usage` events — `input` with the
+cached part in `cached`). A queued task is a turn immediately: `status: 'queued'`,
+a stable `id` and `index`, and **no `startedAt`** until the server pump begins it,
+so a client can render the backlog before execution. `GET /api/sessions` and `GET
+/api/sessions/:id` always include the full `turns` array, so a browser reload — or
+a second client — renders the same transcript, the same per-step/per-tool elapsed
+time, and the same token count without having seen the stream. A turn that is
+still running (or still queued) is included too, which is what the UI reattaches
+to through `GET /api/sessions/:id/events`, with snapshot polling as its fallback.
+A snapshot's `queueDepth` counts waiting turns only — the active turn is not in it
+— and is omitted when the queue is empty, so pre-queue snapshot shapes are
+unchanged. Each snapshot also carries `harnessDefinition` (the frozen descriptor:
+members, primary, and the models the session was created with), `agentModels`
+(the session's LIVE effective model of every agent — overrides resolved,
+rewritten by a session PATCH, so a per-agent dropdown survives a reload and shows
+what the next request will use), and `discoveredTools` (what `toolRequest` had
+enabled), so a reload loses neither the configuration nor the discovery state.
 
 `/api` is the standalone mount. The `@underload/service` host serves the same
 resource paths below `/v1/harness` and adds a bootstrap document at its root; see
@@ -971,17 +1045,20 @@ resource paths below `/v1/harness` and adds a bootstrap document at its root; se
 | `POST /api/harnesses` | Create a harness from trusted agent ids — body `{ name, title?, description?, primary, subagents?, agentModels? }` → `201 { harness }` |
 | `PATCH /api/harnesses/:name` | Change any harness — body `{ title?, description?, primary?, subagents?, agentModels? }` → `{ harness }` |
 | `GET /api/agents` | The trusted agent registry (`name`, `title`, `description`, `instruction`, `guidelines`) |
-| `GET /api/tools` | The whole tool catalogue, session-bound core tools first (`toolRequest`, `toolCreate`, `todoManage`, `agentDelegate`) then every direct-call tool (including the core file tools); `webSearch` always appears with `availability` |
+| `GET /api/tools` | The whole tool catalogue, session-bound core tools first (`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentDelegate`) then every direct-call tool (including the core file tools); `webSearch` always appears with `availability` |
 | `GET /api/tools/bootstrap` | Alias of `GET /api/tools` (the list the root bootstrap document carries) |
-| `POST /api/tools/:name` | Call one tool on the server. A session-bound tool (`toolRequest`, `toolCreate`, `todoManage`, `agentDelegate`) needs `sessionId`; every other tool — including the core file tools — keeps its session-less runner. An unconfigured tool returns `ok: false`. See [the call body](#the-tool-call-body) |
+| `POST /api/tools/:name` | Call one tool on the server. A session-bound tool (`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentDelegate`) needs `sessionId`; every other tool — including the core file tools — keeps its session-less runner. An unconfigured tool returns `ok: false`. See [the call body](#the-tool-call-body) |
 | `POST /api/tools/:name/call` | Alias of the row above (verb-named spelling), same dispatcher |
 | `POST /api/models` | Server-side `GET {baseURL}/models`; returns `{ models: string[] }` for the UI dropdown |
 | `POST /api/sessions` | Create a session for a preset |
 | `GET /api/sessions`, `GET /api/sessions/:id` | List or read sessions |
-| `POST /api/sessions/:id/messages` | Submit a task; response is `text/event-stream` |
-| `POST /api/sessions/:id/reset` | Reset every agent and clear discovery and todos |
-| `POST /api/sessions/:id/cancel` | Abort the running task |
-| `DELETE /api/sessions/:id` | Forget a session |
+| `PATCH /api/sessions/:id` | Retarget models in a live session: body `{ agentModels: { agent: model } }` → `{ session }`. Merges into the live map, validates every key/value, applies all-or-nothing, and is allowed while the session is running (the next request uses the new model; the current one keeps its own). See [Server and UI](#server-and-ui) |
+| `POST /api/sessions/:id/messages` | Legacy submit; response is `text/event-stream`. This response OWNS the run: a disconnect cancels it, and a busy session or a pending queue is a `409`. New clients should prefer `/tasks` + `/events` |
+| `POST /api/sessions/:id/tasks` | Queue a task (`{ input }`) → `202 { session, turn }`. The turn is `queued` with a stable id/index and no `startedAt`; the server pump runs the backlog FIFO (cap 100 pending) and continues after a task fails. In memory only |
+| `GET /api/sessions/:id/events` | Watch the session: `text/event-stream` opening with one `snapshot`, then `turn` upserts (queued → running → terminal) and `event` frames, then one final `snapshot` when the queue drains. A disconnect only unsubscribes; server-owned tasks keep running |
+| `POST /api/sessions/:id/reset` | Reset every agent and clear discovery, todos, and the three record stores; `409` while a run or queued work is pending |
+| `POST /api/sessions/:id/cancel` | Optional `{ all?: true }` → `{ cancelled }`. Default cancels the active run only; `all: true` (the UI Stop button) also cancels every queued turn, which stays in `turns` as a `cancelled` row |
+| `DELETE /api/sessions/:id` | Forget a session: abort active work, drop queued work, and close its watchers |
 
 #### The tool call body
 
@@ -1037,8 +1114,9 @@ resulting `[primary, ...subagents]` set or the request is a `400` naming the mem
 Only ids are overridable — never a provider, base URL, or key. On `PATCH` the map
 REPLACES the previous one, so `{}` clears every override; changing membership
 without restating the map drops the overrides of agents that are no longer selected.
-The factory closure captures the map, so an existing session keeps the models it was
-created with.
+The factory closure captures the map, so a harness edit never rewrites an existing
+session: those models change only through `PATCH /api/sessions/:id` (which merges
+and never touches the frozen definition).
 
 `POST /api/models` takes `{ settings?: { baseURL?, apiKey?, model? } }`. It exists
 because the browser must not hold the server key and providers rarely send CORS
@@ -1053,12 +1131,52 @@ server does not answer. A `curl` client must add it explicitly.
 Each SSE `data:` frame is one of:
 
 ```ts
-| { type: 'turn'; turn: SessionTurn }               // opens every run
+| { type: 'turn'; turn: SessionTurn }               // legacy: opens the run;
+                                                    // watch: an UPSERT by turn id
 | { type: 'event'; turnId; event; at?; usage? }     // `at` = epoch-ms stamp,
                                                     // `usage` = running tally
-| { type: 'snapshot'; session: SessionSnapshot }    // run finished
-| { type: 'failed'; error; session }                // run failed
+| { type: 'snapshot'; session: SessionSnapshot }    // complete state
+| { type: 'failed'; error; session }                // legacy run failed
 ```
+
+The legacy `POST .../messages` stream owns its run: closing the response aborts it.
+The `GET .../events` watcher stream reuses the same shapes but never owns
+execution — `turn` is an upsert for the queued, running, and terminal state of one
+id, it opens with one `snapshot`, and it ends with one `snapshot` when the queue
+drains. Closing the watcher only unsubscribes; the server pump keeps running for
+nobody, which is why a reload or a hidden tab costs nothing.
+
+### Task queue, timeline, and message rendering (R4/R5)
+
+- **The queue is server-owned and FIFO.** `POST /tasks` returns `202` immediately;
+  the pump runs one task at a time, in order, and continues after a per-task error.
+  The backlog is in memory only: a restart loses the sessions, their turns, and any
+  queued work. A single-flight gate is shared by a queue turn, a legacy run, a
+  manual tool call, and a reset; the pump waits for it, while the legacy/manual
+  paths answer `409`.
+- **The UI can keep submitting.** Run stays enabled while a task runs (only the
+  short `POST /tasks` round trip locks it), Stop is enabled whenever work is
+  pending, and Stop sends `{ all: true }` so both the active task and the retained
+  queue are cancelled. Reset, New session, and tab switches stay locked while work
+  is pending; switching harness or session is allowed and only unsubscribes the
+  observer, because the work belongs to the server.
+- **Reload and switching recover from the record.** Selecting a session that still
+  has work opens one `GET /events` observer (a submit also opens or reopens it); a
+  lost stream falls back to `GET /sessions/:id` polling at 1 s (up to about two
+  minutes), and a reload re-reads the snapshot, reconciles turns by id, and reopens
+  the observer when work is still pending. A settled turn never re-animates, and a
+  queued task lights nothing.
+- **The timeline shows state by colour.** One linear vertical timeline: completed
+  rows are grey, the single active row is green (amber while a request is on the
+  wire), queued rows are neutral, failed rows are red, and cancelled rows are
+  muted. The active row is the only one that pulses.
+- **Assistant text is safe, highlighted Markdown.** GFM is rendered with `marked`,
+  always passed through `DOMPurify` (scripts, handlers, `javascript:` URLs, frames,
+  and media are removed), and fenced code is highlighted by `highlight.js` core
+  plus a registered language subset. A fence keeps its author language as a CSS
+  caption, and response typography plus inline code carry the accent styling.
+  This is a source-level description; this documentation pass did not verify
+  rendering in a browser.
 
 The sidebar's **Tools** tab lists the whole catalogue — the session-bound core tools
 first, then every direct-call tool — and calls `POST /api/tools/:name` for all of
@@ -1068,11 +1186,14 @@ session registers, including `commandRun`, the file tools, and a configured
 `webSearch` (they may be `visibility: 'core'` but are not session-bound). The
 **Core tools** group is different by design: those entries are `sessionBound`, their
 call must carry the selected `sessionId`, and they execute inside that session's
-harness, so a manual `toolRequest`, `toolCreate`, `todoManage`, or `agentDelegate`
+harness, so a manual `toolRequest`, `toolCreate`, `todoManage`, `profileManage`,
+`chapterManage`, `locationManage`, or `agentDelegate`
 call changes the conversation the user is looking at (and is refused with `409` while any session
-operation is in flight: a chat turn, a reset, or another manual call). A manual
+operation is in flight: a chat turn, queued work, a reset, or another manual call). A manual
 call is not a turn - it never changes `status` or appends a turn, only a private
-single-flight flag while it runs.
+single-flight flag while it runs. A session model PATCH is the exception: it is a
+model choice, not a harness mutation, so it is accepted while a run streams and
+aborts nothing.
 `agentDelegate` is listed for every host but only exists in a session whose harness
 allows subagents; otherwise the call answers a clear `404`. The **Web search** group
 shows whether this server has `EXA_API_KEY`/`TAVILY_API_KEY`; an unconfigured entry
@@ -1125,7 +1246,7 @@ API + UI on `:5181`; the service gateway is `http://localhost:5000`.
 ```json
 {
     "rootPath": "/v1/harness",
-    "presets": [{ "name": "demo", "title": "…", "requiresEndpoint": false, "primary": "demo", "subagents": [], "agents": ["demo"], "tools": ["timeNow"], "coreTools": ["toolRequest", "toolCreate", "todoManage"], "builtin": true, "editable": true }],
+    "presets": [{ "name": "demo", "title": "…", "requiresEndpoint": false, "primary": "demo", "subagents": [], "agents": ["demo"], "tools": ["timeNow"], "coreTools": ["toolRequest", "toolCreate", "todoManage", "profileManage", "chapterManage", "locationManage"], "builtin": true, "editable": true }],
     "agents": [{ "name": "instruct", "title": "Instruct", "description": "…", "instruction": "…", "guidelines": ["…"] }],
     "tools": [{ "name": "toolRequest", "group": "Core tools", "tags": ["discovery"], "visibility": "core", "sessionBound": true, "parameters": {}, "availability": { "state": "available", "hint": "Runs inside a session harness: send a sessionId with the call." } }, { "name": "fileRead", "group": "Package presets", "tags": ["files"], "visibility": "core", "parameters": {} }],
     "defaults": { "baseURL": "…", "model": "…", "hasApiKey": true },
@@ -1158,10 +1279,13 @@ POST   /v1/harness/models                 server-side GET {baseURL}/models
 GET    /v1/harness/sessions               session snapshots (with turns)
 POST   /v1/harness/sessions               create a session
 GET    /v1/harness/sessions/:id           one snapshot (with turns)
+PATCH  /v1/harness/sessions/:id           retarget agent models (next request)
 DELETE /v1/harness/sessions/:id           forget a session
-POST   /v1/harness/sessions/:id/messages  submit a task → text/event-stream
-POST   /v1/harness/sessions/:id/reset     reset every agent, discovery, todos
-POST   /v1/harness/sessions/:id/cancel    abort the running task
+POST   /v1/harness/sessions/:id/messages  legacy task → text/event-stream (owns the run)
+POST   /v1/harness/sessions/:id/tasks     queue a task → 202 { session, turn }
+GET    /v1/harness/sessions/:id/events    watch the queue → text/event-stream
+POST   /v1/harness/sessions/:id/reset     reset agents, discovery, todos, records
+POST   /v1/harness/sessions/:id/cancel    cancel active work ({ all } also drops the queue)
 ```
 
 **Standalone `/api` compatibility is unchanged.** The `/api` root stays a 404 (it
@@ -1227,11 +1351,14 @@ not in this package.
 
 **Sessions and reloads.** The server, not the browser, owns the transcript. Each
 task is a turn with stable `id`/`index`, and every streamed event names its turn
-(`{ type: 'turn' }` opens a run, `{ type: 'event', turnId }` follows). Reloading
-the UI re-reads `sessions` from the bootstrap document (or `/sessions`), which
-already contains every turn and its events, and the UI polls a session that is
-still `running`. Nothing is persisted: sessions, turns, created tools, discovery,
-and todos vanish on restart, and a service restart is a fresh in-memory store.
+(`{ type: 'turn' }` opens a legacy run; `GET /events` sends the same id as an
+upsert). Reloading the UI re-reads `sessions` from the bootstrap document (or
+`/sessions`), which already contains every turn and its events, then reopens the
+`GET /events` watcher; if that stream is lost the UI polls the session instead.
+Queued and running work belongs to the server, so a reload, a hidden tab, or a
+closed watcher never cancels it. Nothing is persisted: sessions, turns, created
+tools, discovery, todos, and any queued backlog vanish on restart, and a service
+restart is a fresh in-memory store.
 
 **Secrets and restart.** The service loads the package-root `.env` on the first
 request (not at module import, so discovery stays free), after which the

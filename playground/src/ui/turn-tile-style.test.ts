@@ -53,7 +53,7 @@ it('keeps a collapsed tile content-high instead of square', () => {
     expect(prompt).toContain('-webkit-line-clamp: 2');
 });
 
-it('clips the compact status word and colour-codes the settled states', () => {
+it('clips the compact status word and colour-codes the timeline states', () => {
     const statusText = blockOf('.tile:not(.is-expanded) .tile-status-text {');
     expect(statusText).toContain('position: absolute');
     expect(statusText).toContain('clip-path: inset(50%)');
@@ -61,17 +61,21 @@ it('clips the compact status word and colour-codes the settled states', () => {
     // reader while the tile itself shows colour instead.
     expect(statusText).not.toContain('display: none');
 
-    expect(blockOf(".tile:not(.is-expanded)[data-state='done'] {")).toContain(
-        'border-color: rgba(74, 222, 128, 0.45)'
+    // R4: completed is GREY; green is reserved for the one active task.
+    expect(blockOf(".tile:not(.is-expanded)[data-state='done'] {")).toContain('border-color: var(--border)');
+    expect(blockOf(".tile:not(.is-expanded)[data-state='streaming'] {")).toContain(
+        'border-color: rgba(74, 222, 128, 0.5)'
     );
     expect(blockOf(".tile:not(.is-expanded)[data-state='error'] {")).toContain(
         'border-color: rgba(248, 113, 113, 0.5)'
     );
+    // Completed status text is muted too: no green glow on finished work.
+    expect(blockOf(".tile[data-state='done'] .tile-status {")).toContain('color: var(--muted)');
     // Cancelled stays neutral: no green, no red.
     expect(css).not.toContain(".tile:not(.is-expanded)[data-state='cancelled'] {");
 });
 
-it('sweeps the agent activity ring around a live tile', () => {
+it('sweeps the agent activity ring around the active tile only', () => {
     const ring = blockOf(".tile:not(.is-expanded)[data-state='streaming']::before {");
 
     expect(ring).toContain('from var(--agent-ring-angle, 0deg)');
@@ -87,17 +91,35 @@ it('sweeps the agent activity ring around a live tile', () => {
     expect(css).toContain('@keyframes agent-ring-spin');
     expect(css).toContain('@property --agent-ring-angle');
 
-    // A settled tile must never animate: the ring selectors list only live states.
+    // R4: a queued task is NOT spinning; only waiting/streaming animate, and a
+    // settled tile never does.
     const ringSelectors = css.slice(
         css.indexOf("/* Compact tile activity ring"),
         css.indexOf("content: ''", css.indexOf('/* Compact tile activity ring'))
     );
-    expect(ringSelectors).toContain("[data-state='queued']");
+    expect(ringSelectors).not.toContain("[data-state='queued']");
     expect(ringSelectors).toContain("[data-state='waiting']");
     expect(ringSelectors).toContain("[data-state='streaming']");
     expect(ringSelectors).not.toContain("[data-state='done']");
     expect(ringSelectors).not.toContain("[data-state='error']");
     expect(ringSelectors).not.toContain("[data-state='cancelled']");
+});
+
+it('lays the turns out as one linear timeline with grey completed markers', () => {
+    // R4: a single vertical timeline, not the old responsive grid.
+    const turns = blockOf('.turns {');
+    expect(turns).toContain('display: flex');
+    expect(turns).toContain('flex-direction: column');
+    expect(turns).not.toContain('grid-template-columns');
+
+    // Completed rows are grey; the active one is the only green marker.
+    expect(blockOf(".turn-row[data-state='done'] .turn-marker {")).toContain("background: var(--muted)");
+    expect(blockOf(".turn-row[data-state='streaming'] .turn-marker {")).toContain('background: var(--ok)');
+    expect(blockOf(".turn-row[data-state='queued'] .turn-marker {")).toContain(
+        'background: var(--border-strong)'
+    );
+    // Queued status text is neutral, never green.
+    expect(blockOf(".tile[data-state='queued'] .tile-status {")).toContain('color: var(--muted)');
 });
 
 it('freezes the tile ring for reduced motion and outlines it under forced colors', () => {

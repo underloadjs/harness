@@ -99,6 +99,78 @@ describe('agent', () => {
         ]);
     });
 
+    // Model attribution (R2): the model is a mutable accessor, so a change may
+    // arrive WHILE a request streams. The request must be attributed to the model
+    // it actually started with — both in the transport payload and in the
+    // committed message — and the change applies to the next request only.
+    it('attributes a request to the model it started with when the model changes mid-request', async () => {
+        // `brain` is assigned before any generator body runs: the transport is
+        // only invoked once the turn starts.
+        let brain: ReturnType<typeof agent>;
+        const models: string[] = [];
+
+        const switching = async function* (
+            request: Parameters<HarnessStream>[0]
+        ): AsyncGenerator<HarnessStreamEvent> {
+            // What the transport was actually called with.
+            models.push(request.model);
+            // Retarget mid-request: must apply to the NEXT request only.
+            brain.model('model-b');
+            yield { type: 'text', delta: 'answer' };
+            yield done();
+        };
+
+        brain = agent({ name: 'writer', model: 'model-a', stream: switching });
+
+        const events = await collect(brain.stream('go'));
+
+        expect(models).toEqual(['model-a']);
+        // The accessor did change...
+        expect(brain.model()).toBe('model-b');
+        // ...but the turn it interrupted stays attributed to model-a.
+        expect(events).toEqual([
+            { type: 'text', delta: 'answer' },
+            {
+                type: 'done',
+                message: {
+                    role: 'assistant',
+                    content: 'answer',
+                    reasoning: '',
+                    toolCalls: [],
+                    model: 'model-a',
+                    stopReason: 'stop',
+                    usage: undefined
+                }
+            }
+        ]);
+        // The committed history carries the same attribution (reasoning and empty
+        // tool calls are omitted, exactly as the transport produced them).
+        expect(brain.messages).toEqual([
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'answer' }
+        ]);
+
+        // The next request uses the new model.
+        const second = await collect(brain.turn());
+
+        expect(models).toEqual(['model-a', 'model-b']);
+        expect(second).toEqual([
+            { type: 'text', delta: 'answer' },
+            {
+                type: 'done',
+                message: {
+                    role: 'assistant',
+                    content: 'answer',
+                    reasoning: '',
+                    toolCalls: [],
+                    model: 'model-b',
+                    stopReason: 'stop',
+                    usage: undefined
+                }
+            }
+        ]);
+    });
+
     it('streams deltas, accumulates the turn, and appends it to history', async () => {
         const brain = agent({
             model: 'merge/ds4-flash',

@@ -65,6 +65,9 @@
 //   - toolRequest  — discovery, described above.     (every agent, core)
 //   - toolCreate   — compile-and-register a tool.    (every agent, core)
 //   - todoManage   — the session todo list.          (every agent, core)
+//   - profileManage — session character profiles.    (every agent, core)
+//   - chapterManage — session chapter tracking.      (every agent, core)
+//   - locationManage — session places/settings.      (every agent, core)
 //   - agentDelegate — hand a task to a subagent.     (primary agent only, core)
 //
 // toolCreate is the R2b capability: the model can author a JavaScript tool body
@@ -88,7 +91,9 @@
 // todoManage is session state, not catalogue state: a fresh list is created for
 // each harness() call, shared by every agent in that harness, and cleared by
 // reset() with the conversation. That is why it is built by a factory closure
-// (core/todo.ts) rather than registered as a module singleton.
+// (core/todo.ts) rather than registered as a module singleton. profileManage,
+// chapterManage, and locationManage follow the same pattern with their own
+// closures (core/profile.ts, chapter.ts, location.ts).
 //
 // agentDelegate is bounded delegation (R4): `primary` selects the entry agent, and
 // `subagents` is the allowlist the primary may delegate to. The tool is not
@@ -123,12 +128,18 @@ import {
     toolUiOf,
     createDynamicTool,
     createTodoTool,
+    createProfileTool,
+    createChapterTool,
+    createLocationTool,
     TOOL_CREATE_METADATA,
     TOOL_CREATE_NAME,
     AGENT_DELEGATE_NAME,
     TOOL_REQUEST_METADATA,
     TOOL_REQUEST_NAME,
     TODO_MANAGE_NAME,
+    PROFILE_MANAGE_NAME,
+    CHAPTER_MANAGE_NAME,
+    LOCATION_MANAGE_NAME,
     agentDelegateMetadata
 } from './core';
 import { presetTools, createWebSearchTool, WEB_SEARCH_TOOL_NAME } from './tools';
@@ -179,18 +190,31 @@ const resolveMaxIterations = (value: number | undefined): number => {
 // scheme depends on there being exactly one tool that can enable the rest.
 const TOOL_REQUEST = TOOL_REQUEST_NAME;
 
-// Runtime tool creation (R2b), the session todo list, and bounded delegation
-// (R4). All are model-facing core tools, so their wire names are part of the
-// harness contract. The names come from core/metadata.ts, which the server's tool
-// catalogue also describes — one copy, so a descriptor cannot advertise a name the
-// runtime does not register.
+// Runtime tool creation (R2b), the session todo list, the session record tools,
+// and bounded delegation (R4). All are model-facing core tools, so their wire
+// names are part of the harness contract. The names come from core/metadata.ts,
+// which the server's tool catalogue also describes — one copy, so a descriptor
+// cannot advertise a name the runtime does not register.
 const TOOL_CREATE = TOOL_CREATE_NAME;
 const TODO_MANAGE = TODO_MANAGE_NAME;
+const PROFILE_MANAGE = PROFILE_MANAGE_NAME;
+const CHAPTER_MANAGE = CHAPTER_MANAGE_NAME;
+const LOCATION_MANAGE = LOCATION_MANAGE_NAME;
 const AGENT_DELEGATE = AGENT_DELEGATE_NAME;
 
 // Names no configured, preset, plugin, or model-created tool may take. Keeping
 // the whole list in one place is what makes the reservation check exhaustive.
-const RESERVED_TOOL_NAMES = [TOOL_REQUEST, TOOL_CREATE, TODO_MANAGE, AGENT_DELEGATE] as const;
+// Order matches the registration order below (and therefore the declaration
+// order on every request), with agentDelegate last because it is primary-only.
+const RESERVED_TOOL_NAMES = [
+    TOOL_REQUEST,
+    TOOL_CREATE,
+    TODO_MANAGE,
+    PROFILE_MANAGE,
+    CHAPTER_MANAGE,
+    LOCATION_MANAGE,
+    AGENT_DELEGATE
+] as const;
 
 // Budget for toolCreate: registration is cheap but not free, and an unbounded
 // registry defeats the point of discovery. Session-local (no filesystem writes),
@@ -458,6 +482,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // it together with the conversation; nothing is persisted.
     const todo = createTodoTool();
     tools[TODO_MANAGE] = todo.tool;
+
+    // Session records (profiles, chapters, locations). Same lifecycle as the todo
+    // list: one factory instance per harness, shared by every agent here, and
+    // cleared by reset(). Separate closets and separate id sequences, so a
+    // profile id and a chapter id may both be "1" without ambiguity.
+    const profile = createProfileTool();
+    tools[PROFILE_MANAGE] = profile.tool;
+
+    const chapter = createChapterTool();
+    tools[CHAPTER_MANAGE] = chapter.tool;
+
+    const location = createLocationTool();
+    tools[LOCATION_MANAGE] = location.tool;
 
     // Bounded delegation (R4). Registered only when there is somewhere to
     // delegate: a tool that can only fail would cost context on every request.
@@ -862,14 +899,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         executeTool,
         // reset() is "start over": the conversation goes back to the seeded
         // instructions, tool discovery is forgotten with it, and the session
-        // todo list is cleared (ids restart at "1"), so the next run begins from
-        // the core set and an empty plan. Tools created at runtime stay in the
+        // todo list and record stores (profiles, chapters, locations) are
+        // cleared (ids restart at "1"), so the next run begins from the core set
+        // and empty session state. Tools created at runtime stay in the
         // catalogue (they are registry state, not conversation state); they are
         // simply no longer enabled until discovered again.
         reset: () => {
             primary.reset();
             activeTools.clear();
             todo.reset();
+            profile.reset();
+            chapter.reset();
+            location.reset();
         }
     }) as unknown as Harness;
 
@@ -916,6 +957,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 // alongside each tool so a consumer can type a direct call without reaching into
 // an internal path.
 export { agent, tool, searchTools, compileToolSource, createDynamicTool, toolUi, toolUiOf } from './core';
+// The session record factories are public too, so a host can build the same
+// stores the harness registers (e.g. for a server-side tool or a test). They
+// mirror the core/index.ts exports; todoManage's factory stays internal to keep
+// this change scoped.
+export { createProfileTool, createChapterTool, createLocationTool } from './core';
 // Tool-panel bounds and the normalizer are public too: a client or a host-side
 // tool author can quote the same caps the server enforces (see core/tool-ui.ts).
 export { TOOL_UI_LIMITS, normalizeToolUiPanels } from './core';

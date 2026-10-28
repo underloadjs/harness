@@ -427,7 +427,14 @@ it('renders live tool_result.ui panels and keeps them across the terminal snapsh
         if (url === '/api') return json(bootstrap());
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions' && method === 'POST') return json({ session: snapshot() });
-        if (url === '/api/sessions/s1/messages') return new Response(body, { status: 200 });
+        if (url === '/api/sessions/s1/tasks' && method === 'POST') {
+            const opening = { ...recorded, status: 'running' as const, events: [] };
+            return json(
+                { session: snapshot({ status: 'running', turns: [opening] }), turn: opening },
+                202
+            );
+        }
+        if (url === '/api/sessions/s1/events') return new Response(body, { status: 200 });
         return undefined;
     });
 

@@ -70,7 +70,14 @@ describe('todoManage', () => {
         await writer('start a plan');
 
         // toolRequest is never called, yet todoManage was declared and executed.
-        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
+        expect(declaredNames(seen[0])).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
         expect((entry.messages[2] as { content: string }).content).toBe(
             '{"todos":[{"id":"1","text":"Draft plan","completed":false}],"counts":{"total":1,"completed":0,"remaining":1},"todo":{"id":"1","text":"Draft plan","completed":false}}'
         );
@@ -150,8 +157,25 @@ describe('todoManage', () => {
 
         // Both agents see todoManage as core; the primary additionally sees delegate.
         // `peek` was configured, so it precedes the harness-owned names.
-        expect(declaredNames(writerSeen[0])).toEqual(['peek', 'toolRequest', 'toolCreate', 'todoManage', 'agentDelegate']);
-        expect(declaredNames(researcherSeen[0])).toEqual(['peek', 'toolRequest', 'toolCreate', 'todoManage']);
+        expect(declaredNames(writerSeen[0])).toEqual([
+            'peek',
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
+            'agentDelegate'
+        ]);
+        expect(declaredNames(researcherSeen[0])).toEqual([
+            'peek',
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
     });
 
     it('isolates harnesses and clears on reset', async () => {
@@ -219,7 +243,14 @@ describe('todoManage', () => {
             'Tool name "TodoManage" is reserved by the harness.'
         );
 
-        expect(Object.keys(writer.tools)).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
+        expect(Object.keys(writer.tools)).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
     });
 
     it('turns invalid todo input into a recoverable tool result', async () => {

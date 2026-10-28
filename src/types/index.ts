@@ -427,6 +427,184 @@ export type TodoToolset = {
     reset: () => void;
 };
 
+// ---------------------------------------------------------------------------
+// profileManage / chapterManage / locationManage (per-harness session records)
+// ---------------------------------------------------------------------------
+//
+// Three session record tools follow todoManage's lifecycle exactly:
+//   - one factory closure per harness (src/core/profile.ts, chapter.ts,
+//     location.ts), never a module singleton;
+//   - state is shared by every agent in that harness and cleared by reset();
+//   - ids are stable decimal strings, monotonic per instance, restarting at "1"
+//     after reset();
+//   - every mutating action validates completely before touching the store, so a
+//     rejected call leaves the records exactly as they were;
+//   - every result is a defensive copy: `item`, `item.traits`, and the collection
+//     snapshot never alias live state.
+//
+// The action set is identical for all three tools. `update` is partial: only the
+// fields present in the arguments change. `get` returns one record, and for
+// chapters it is the ONLY action that returns the body (lists and mutation
+// results carry summaries, so a long chapter cannot flood the context).
+//
+// Cross-references:
+//   - ../core/profile.ts, ../core/chapter.ts, ../core/location.ts — implementations
+//   - ../core/metadata.ts — names, descriptions, and JSON Schemas
+//   - ../harness.ts — registration, reservation, and reset wiring
+
+// The shared CRUD action set. `add` creates, `list` snapshots, `get` reads one,
+// `update` patches one (partial), `remove` deletes one.
+export type RecordAction = 'add' | 'list' | 'get' | 'update' | 'remove';
+
+// ---------------------------------------------------------------------------
+// profileManage — characters / people
+// ---------------------------------------------------------------------------
+
+// A stored profile. `traits` and `notes` are always present (empty when the
+// caller did not supply them) so a model sees one stable shape. `traits` are
+// trimmed and deduplicated on write; `notes` is free-form text.
+export type ProfileItem = {
+    id: string;
+    name: string;
+    description: string;
+    traits: string[];
+    notes: string;
+};
+
+// Model-facing arguments. `action` is the only required property; each action
+// reads the fields it needs (add → name + description, get/update/remove → id,
+// update → at least one mutable field).
+export type ProfileParameters = {
+    action: RecordAction;
+    id?: string;
+    name?: string;
+    description?: string;
+    traits?: string[];
+    notes?: string;
+};
+
+// Counts are derived on every call, like TodoCounts.
+export type ProfileCounts = {
+    total: number;
+};
+
+// Every profileManage result is a snapshot: `profiles` is a copied list, plus the
+// affected profile for add/get/update and `removed` for remove.
+export type ProfileResult = {
+    profiles: ProfileItem[];
+    profile?: ProfileItem;
+    removed?: ProfileItem;
+    counts: ProfileCounts;
+};
+
+// What createProfileTool() returns: the core tool plus reset().
+export type ProfileToolset = {
+    tool: Tool<ProfileParameters, ProfileResult>;
+    reset: () => void;
+};
+
+// ---------------------------------------------------------------------------
+// chapterManage — ordered chapter tracking
+// ---------------------------------------------------------------------------
+
+// The three lifecycle states a chapter can be in. No other values are accepted.
+export type ChapterStatus = 'planned' | 'draft' | 'complete';
+
+// A chapter as it appears in a LIST or in a mutation result: metadata only. The
+// body is deliberately absent so a long chapter does not flood the context;
+// `get` supplies it separately. `order` is optional and omitted when unset.
+export type ChapterSummary = {
+    id: string;
+    title: string;
+    summary: string;
+    status: ChapterStatus;
+    order?: number;
+};
+
+// The full stored chapter, including the body. Only createChapterTool()'s
+// internal store and the `get` action ever touch `content`.
+export type ChapterItem = ChapterSummary & {
+    content: string;
+};
+
+// Model-facing arguments. `add` requires title + summary; content, status, and
+// order are optional (status defaults to 'planned').
+export type ChapterParameters = {
+    action: RecordAction;
+    id?: string;
+    title?: string;
+    summary?: string;
+    content?: string;
+    status?: ChapterStatus;
+    order?: number;
+};
+
+// Per-status totals derived on every call.
+export type ChapterCounts = {
+    total: number;
+    planned: number;
+    draft: number;
+    complete: number;
+};
+
+// Every chapterManage result is a snapshot of summaries. `content` is present
+// only for `get`; `chapter` for add/get/update; `removed` for remove.
+export type ChapterResult = {
+    chapters: ChapterSummary[];
+    chapter?: ChapterSummary;
+    content?: string;
+    removed?: ChapterSummary;
+    counts: ChapterCounts;
+};
+
+// What createChapterTool() returns: the core tool plus reset().
+export type ChapterToolset = {
+    tool: Tool<ChapterParameters, ChapterResult>;
+    reset: () => void;
+};
+
+// ---------------------------------------------------------------------------
+// locationManage — places / settings
+// ---------------------------------------------------------------------------
+
+// A stored location. `notes` is always present (empty when not supplied) for a
+// stable shape.
+export type LocationItem = {
+    id: string;
+    name: string;
+    description: string;
+    notes: string;
+};
+
+// Model-facing arguments. `add` requires name + description; notes is optional.
+export type LocationParameters = {
+    action: RecordAction;
+    id?: string;
+    name?: string;
+    description?: string;
+    notes?: string;
+};
+
+// Counts are derived on every call, like TodoCounts.
+export type LocationCounts = {
+    total: number;
+};
+
+// Every locationManage result is a snapshot: `locations` is a copied list, plus
+// the affected location for add/get/update and `removed` for remove.
+export type LocationResult = {
+    locations: LocationItem[];
+    location?: LocationItem;
+    removed?: LocationItem;
+    counts: LocationCounts;
+};
+
+// What createLocationTool() returns: the core tool plus reset().
+export type LocationToolset = {
+    tool: Tool<LocationParameters, LocationResult>;
+    reset: () => void;
+};
+
 // What a tool implementation is handed when the model calls it.
 //
 // The harness fields are optional because a tool can also be executed on its
@@ -667,8 +845,9 @@ export type Harness = {
     // not configured.
     readonly subagents: Readonly<Record<string, Agent>>;
     // The registered tools, keyed by the names the model calls. Includes the
-    // built-in toolRequest, toolCreate, and todoManage entries, plus agentDelegate when
-    // there is at least one subagent.
+    // built-in toolRequest, toolCreate, todoManage, profileManage,
+    // chapterManage, and locationManage entries, plus agentDelegate when there
+    // is at least one subagent.
     readonly tools: Readonly<Record<string, Tool>>;
     // Register a tool from source at runtime. This is the host-side path the
     // model-facing toolCreate tool uses: same validation, same registry, same

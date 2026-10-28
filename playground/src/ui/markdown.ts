@@ -9,14 +9,18 @@
 //     everything below is inserted with `innerHTML`, so it is *always* sanitized
 //     first. Raw HTML emitted by a model therefore survives only if it is inert
 //     markup from DOMPurify's allow-list; scripts, event handlers, `javascript:`
-//     URLs, embedded frames and media are removed.
+//     URLs, embedded frames and media are removed. The single form control that
+//     survives is a GFM task-list checkbox, rebuilt as an inert disabled input
+//     (see `SANITIZE_OPTIONS`).
 //
 // `highlight.js` (core + the languages registered below) styles fenced code.
 // Registering individual languages keeps the bundle to the handful a harness
 // conversation actually produces instead of the ~190 language bundle.
 //
 // Cross-references:
-//   - stylised tokens: playground/src/styles.css (`.hljs-*`)
+//   - stylised tokens and response typography: playground/src/styles.css
+//     (`.hljs-*`, `.markdown`, `.code-block[data-language]`)
+//   - CSS contract test: playground/src/ui/markdown-style.test.ts
 //   - consumers: playground/src/ui/turns.ts (assistant text, tool arguments)
 //   - precedent for marked + DOMPurify in this repo:
 //     distribution/ScriptingSpaceScribble/src/features/markdownViewer/MarkdownViewerFeature.tsx
@@ -26,28 +30,59 @@ import DOMPurify from 'dompurify';
 import type { Config as SanitizeConfig } from 'dompurify';
 import hljs from 'highlight.js/lib/core';
 import bash from 'highlight.js/lib/languages/bash';
+import cpp from 'highlight.js/lib/languages/cpp';
+import csharp from 'highlight.js/lib/languages/csharp';
 import css from 'highlight.js/lib/languages/css';
 import diff from 'highlight.js/lib/languages/diff';
+import dockerfile from 'highlight.js/lib/languages/dockerfile';
+import go from 'highlight.js/lib/languages/go';
+import ini from 'highlight.js/lib/languages/ini';
+import java from 'highlight.js/lib/languages/java';
 import javascript from 'highlight.js/lib/languages/javascript';
 import json from 'highlight.js/lib/languages/json';
+import kotlin from 'highlight.js/lib/languages/kotlin';
+import lua from 'highlight.js/lib/languages/lua';
 import markdownLanguage from 'highlight.js/lib/languages/markdown';
+import php from 'highlight.js/lib/languages/php';
+import powershell from 'highlight.js/lib/languages/powershell';
 import python from 'highlight.js/lib/languages/python';
+import ruby from 'highlight.js/lib/languages/ruby';
+import rust from 'highlight.js/lib/languages/rust';
 import sql from 'highlight.js/lib/languages/sql';
+import swift from 'highlight.js/lib/languages/swift';
 import typescript from 'highlight.js/lib/languages/typescript';
 import xml from 'highlight.js/lib/languages/xml';
 import yaml from 'highlight.js/lib/languages/yaml';
 
 // Registering by canonical name means a fence can say `ts`, `typescript` or
-// `application/typescript` — `normalizeLanguage` resolves all of those to the
-// same registered id.
+// `application/typescript` — `ALIAS_LOOKUP` resolves all of those to the same
+// registered id. The set stays deliberately small (per-language imports keep the
+// bundle honest) but covers what a coding harness conversation actually emits;
+// each additional grammar is ~0.5-4 KB, not the ~190-language full build.
+//
+// `ini` doubles as the fallback for TOML: highlight.js 11.12 in this workspace
+// has no separate TOML grammar and their key/value shape is close enough.
 hljs.registerLanguage('bash', bash);
+hljs.registerLanguage('cpp', cpp);
+hljs.registerLanguage('csharp', csharp);
 hljs.registerLanguage('css', css);
 hljs.registerLanguage('diff', diff);
+hljs.registerLanguage('dockerfile', dockerfile);
+hljs.registerLanguage('go', go);
+hljs.registerLanguage('ini', ini);
+hljs.registerLanguage('java', java);
 hljs.registerLanguage('javascript', javascript);
 hljs.registerLanguage('json', json);
+hljs.registerLanguage('kotlin', kotlin);
+hljs.registerLanguage('lua', lua);
 hljs.registerLanguage('markdown', markdownLanguage);
+hljs.registerLanguage('php', php);
+hljs.registerLanguage('powershell', powershell);
 hljs.registerLanguage('python', python);
+hljs.registerLanguage('ruby', ruby);
+hljs.registerLanguage('rust', rust);
 hljs.registerLanguage('sql', sql);
+hljs.registerLanguage('swift', swift);
 hljs.registerLanguage('typescript', typescript);
 hljs.registerLanguage('xml', xml);
 hljs.registerLanguage('yaml', yaml);
@@ -65,13 +100,28 @@ const LANGUAGE_ALIASES: Readonly<Record<string, string | undefined>> = {
     console: 'bash',
     terminal: 'bash',
     cmd: 'bash',
-    powershell: 'bash',
-    ps1: 'bash',
+    powershell: 'powershell',
+    ps1: 'powershell',
+    pwsh: 'powershell',
+    'c#': 'csharp',
+    'c++': 'cpp',
+    c: 'cpp',
+    cc: 'cpp',
+    cfg: 'ini',
+    conf: 'ini',
+    cpp: 'cpp',
+    cs: 'csharp',
+    csharp: 'csharp',
     css: 'css',
-    scss: 'css',
-    less: 'css',
     diff: 'diff',
-    patch: 'diff',
+    docker: 'dockerfile',
+    dockerfile: 'dockerfile',
+    go: 'go',
+    golang: 'go',
+    h: 'cpp',
+    hpp: 'cpp',
+    ini: 'ini',
+    java: 'java',
     js: 'javascript',
     javascript: 'javascript',
     mjs: 'javascript',
@@ -81,21 +131,35 @@ const LANGUAGE_ALIASES: Readonly<Record<string, string | undefined>> = {
     json: 'json',
     jsonc: 'json',
     json5: 'json',
+    kt: 'kotlin',
+    kts: 'kotlin',
+    kotlin: 'kotlin',
+    less: 'css',
+    lua: 'lua',
+    md: 'markdown',
+    markdown: 'markdown',
+    mdx: 'markdown',
+    patch: 'diff',
+    php: 'php',
+    py: 'python',
+    python: 'python',
+    python3: 'python',
+    rb: 'ruby',
+    rs: 'rust',
+    ruby: 'ruby',
+    rust: 'rust',
+    scss: 'css',
+    sql: 'sql',
+    postgres: 'sql',
+    postgresql: 'sql',
+    sqlite: 'sql',
+    swift: 'swift',
+    toml: 'ini',
     ts: 'typescript',
     typescript: 'typescript',
     tsx: 'typescript',
     mts: 'typescript',
     cts: 'typescript',
-    md: 'markdown',
-    markdown: 'markdown',
-    mdx: 'markdown',
-    py: 'python',
-    python: 'python',
-    python3: 'python',
-    sql: 'sql',
-    postgres: 'sql',
-    postgresql: 'sql',
-    sqlite: 'sql',
     html: 'xml',
     xml: 'xml',
     svg: 'xml',
@@ -132,6 +196,32 @@ const escapeHtml = (value: string): string =>
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
+
+// The fence info string is author-controlled text that ends up inside a class
+// name (`class="hljs language-…"`) and inside an attribute value
+// (`data-language="…"`). Both are concatenated into HTML, so both are reduced to
+// a shape that cannot contain a quote, angle bracket or whitespace, no matter
+// how hostile the info string is:
+//
+//   - ids must match a registered-name shape (`[a-z0-9_-]`) — this is what the
+//     `language-*` class and stylesheet key off, and it keeps the class token
+//     valid CSS;
+//   - the human label allows a few more characters (`+`, `#`, `.`, `/`) because
+//     authors write `c++`, `c#`, `Dockerfile.dev`, but it is still capped so a
+//     pathological fence cannot paint an entire line of chrome.
+const SAFE_LANGUAGE_ID = /^[a-z0-9_-]{1,32}$/;
+const SAFE_LANGUAGE_LABEL = /[^A-Za-z0-9_+#./-]/g;
+
+const safeLanguageId = (value: string): string | undefined => {
+    const normalized = value.trim().toLowerCase();
+    return SAFE_LANGUAGE_ID.test(normalized) ? normalized : undefined;
+};
+
+const safeLanguageLabel = (value: string): string =>
+    value
+        .trim()
+        .replace(SAFE_LANGUAGE_LABEL, '')
+        .slice(0, 32);
 
 // Languages considered for `highlightAuto` when a fence has no info string.
 // Unknown-language fences stay plain: guessing wrong is worse than plain text,
@@ -226,14 +316,20 @@ markdownRenderer.use({
             const requested = lang === undefined || lang === null ? undefined : lang.split(/\s+/)[0];
             const resolved = requested === undefined ? undefined : ALIAS_LOOKUP(requested);
             const highlighted = highlightCode(text, requested);
-            const label = requested === undefined || requested.trim().length === 0 ? '' : requested.trim();
+
+            // Both values below are rebuilt from a validated shape (see
+            // `safeLanguageId` / `safeLanguageLabel`) before they are concatenated
+            // into HTML, so `escapeHtml` is the second line of defence rather than
+            // the only one.
+            const languageId = resolved === undefined ? undefined : safeLanguageId(resolved);
+            const label = safeLanguageLabel(requested ?? '');
             const languageClass =
-                resolved === undefined || resolved === null || resolved.length === 0
-                    ? ''
-                    : ` class="hljs language-${escapeHtml(resolved)}"`;
+                languageId === undefined ? '' : ` class="hljs language-${escapeHtml(languageId)}"`;
 
             // `data-language` is the *author's* label so the UI can print it even
-            // when the alias resolved to a different registered language.
+            // when the alias resolved to a different registered language (e.g.
+            // ```ts → language-typescript). The stylesheet renders it as a small
+            // caption above the block (styles.css `.code-block[data-language]`).
             return `<pre class="code-block"${
                 label.length === 0 ? '' : ` data-language="${escapeHtml(label)}"`
             }><code${languageClass}>${highlighted}</code></pre>`;
@@ -248,6 +344,13 @@ markdownRenderer.use({
 // route). The forbidden lists remove what a chat log never needs: forms,
 // embedded documents, media, and inline styling that could hide content.
 //
+// `input` is *not* forbidden because GFM task lists (`- [ ]` / `- [x]`) parse to
+// a disabled checkbox, which is the one form control a transcript legitimately
+// renders. The `afterSanitizeAttributes` hook below is what makes that exception
+// safe: every other input is deleted after sanitizing, and a checkbox is rebuilt
+// with only `type`/`disabled`/`checked` so it cannot submit, focus, or carry a
+// model-chosen `name`/`value`/event handler.
+//
 // `ALLOWED_URI_REGEXP` is the link allow-list: http(s), mailto and in-page or
 // relative targets only. Anything else (`javascript:`, `data:`, `vbscript:`) is
 // dropped by DOMPurify before it reaches the DOM.
@@ -256,7 +359,6 @@ const SANITIZE_OPTIONS: SanitizeConfig = {
     FORBID_TAGS: [
         'style',
         'form',
-        'input',
         'button',
         'select',
         'textarea',
@@ -273,8 +375,44 @@ const SANITIZE_OPTIONS: SanitizeConfig = {
     ],
     FORBID_ATTR: ['style', 'srcset', 'formaction', 'ping', 'onerror', 'onload'],
     ALLOWED_URI_REGEXP: /^(?:(?:https?|mailto):|[#/]|\.{0,2}\/)/i,
-    ADD_ATTR: ['target', 'rel', 'loading', 'referrerpolicy']
+    // `ADD_TAGS` is required because the `html` profile excludes form controls;
+    // the hook below is what restricts the reopened tag to a disabled checkbox.
+    // The three attributes must be re-allowed as well: the profile drops the
+    // form-control attributes along with the tag.
+    ADD_TAGS: ['input'],
+    ADD_ATTR: ['target', 'rel', 'loading', 'referrerpolicy', 'type', 'checked', 'disabled'],
+    // `type` is not URI-safe by DOMPurify's default bookkeeping, and the custom
+    // `ALLOWED_URI_REGEXP` above rejects the literal value "checkbox" (it is not
+    // a URL), which would delete the attribute before the hook can inspect it.
+    // The hook overwrites `type` anyway, so declaring it inert is accurate.
+    ADD_URI_SAFE_ATTR: ['type']
 };
+
+// Runs after attribute sanitizing on every element. Task-list checkboxes are
+// kept but rebuilt from scratch; any other `input` (text, file, password, …) is
+// removed outright, so the sanitizer never widens beyond "read-only checkbox".
+// Only a checkbox that sits directly in a list item is kept — that is the shape
+// GFM task lists produce, and it stops raw HTML from stamping stray controls
+// into prose. `checked` is preserved because it carries the item's `[x]`/`[ ]`
+// state; the `aria-*`/`name`/`value`/handler attributes a model may have
+// supplied are all dropped before this hook runs or by the rebuild.
+const CHECKBOX = 'checkbox';
+DOMPurify.addHook('afterSanitizeAttributes', (node) => {
+    if (node.nodeName !== 'INPUT') return;
+
+    const inListItem = node.parentElement?.nodeName === 'LI';
+    if (!inListItem || (node.getAttribute('type') ?? '').toLowerCase() !== CHECKBOX) {
+        node.remove();
+        return;
+    }
+
+    const checked = node.hasAttribute('checked');
+    for (const name of node.getAttributeNames()) node.removeAttribute(name);
+    node.setAttribute('type', CHECKBOX);
+    // Disabled keeps it inert: not focusable, not submittable, styled by CSS only.
+    node.setAttribute('disabled', '');
+    if (checked) node.setAttribute('checked', '');
+});
 
 // Turn sanitized HTML into a fragment that can be inserted directly. Links are
 // hardened after sanitizing: a model-supplied href must not be able to run code

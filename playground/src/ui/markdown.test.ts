@@ -6,6 +6,11 @@
 // expected values were captured from a real render and then reviewed — a failure
 // means the sanitizer or the renderer changed behaviour.
 //
+// Visual properties of the response (palette, inline-code colour, language
+// caption, list markers) are CSS and are pinned separately in
+// markdown-style.test.ts, which reads styles.css the same way the other
+// *-style tests do.
+//
 // Run: npx vitest run --config playground/vitest.config.ts
 import {
     highlightCode,
@@ -40,15 +45,87 @@ describe('markdownHtml', () => {
         ).toBe('<img loading="lazy" referrerpolicy="no-referrer"><p><a>bad</a></p>\n');
     });
 
+    it('keeps http(s) links but strips data: targets', () => {
+        expect(markdownHtml('[y](https://e.com) [z](data:text/html,hi)')).toBe(
+            '<p><a href="https://e.com" target="_blank" rel="noopener noreferrer nofollow">y</a> <a>z</a></p>\n'
+        );
+    });
+
+    // GFM task lists render a real checkbox. It is the only form control the
+    // sanitizer lets through, and it is rebuilt as an inert disabled checkbox:
+    // the `[x]` state survives, nothing else does.
+    it('renders GFM task lists with inert checkboxes', () => {
+        expect(markdownHtml('- [ ] open\n- [x] done')).toBe(
+            '<ul>\n<li><input type="checkbox" disabled=""> open</li>\n<li><input type="checkbox" disabled="" checked=""> done</li>\n</ul>\n'
+        );
+    });
+
+    it('drops form controls outside a task-list item', () => {
+        // Inline text input: the control disappears, the prose around it stays.
+        expect(markdownHtml('type this <input type="text" value="secret"> ok')).toBe(
+            '<p>type this  ok</p>\n'
+        );
+        // Raw checkbox outside an <li> is not a task list.
+        expect(markdownHtml('<input type="checkbox" checked onclick="alert(1)">')).toBe('');
+        // A form's payload survives as text, the form and its button do not.
+        expect(markdownHtml('<form><input type="checkbox" checked><button>go</button></form>')).toBe(
+            'go'
+        );
+    });
+
     it('highlights a fenced code block and records the author language', () => {
         expect(markdownHtml('```ts\nconst answer = 42;\n```')).toBe(
             '<pre class="code-block" data-language="ts"><code class="hljs language-typescript"><span class="hljs-keyword">const</span> answer = <span class="hljs-number">42</span>;</code></pre>'
         );
     });
 
+    // Rust/Go/PowerShell are registered now; before this they fell back to plain
+    // escaped text even though a coding answer emits them constantly.
+    it('highlights the extended grammars', () => {
+        expect(markdownHtml('```rust\nfn main() { println!("hi"); }\n```')).toBe(
+            '<pre class="code-block" data-language="rust"><code class="hljs language-rust"><span class="hljs-keyword">fn</span> <span class="hljs-title function_">main</span>() { <span class="hljs-built_in">println!</span>(<span class="hljs-string">"hi"</span>); }</code></pre>'
+        );
+        expect(markdownHtml('```go\nfunc main() { fmt.Println("hi") }\n```')).toBe(
+            '<pre class="code-block" data-language="go"><code class="hljs language-go"><span class="hljs-function"><span class="hljs-keyword">func</span> <span class="hljs-title">main</span><span class="hljs-params">()</span></span> { fmt.Println(<span class="hljs-string">"hi"</span>) }</code></pre>'
+        );
+    });
+
+    it('resolves aliases to the registered language', () => {
+        // `ps1` used to be treated as bash; it is PowerShell.
+        expect(markdownHtml('```ps1\nGet-ChildItem\n```')).toBe(
+            '<pre class="code-block" data-language="ps1"><code class="hljs language-powershell"><span class="hljs-built_in">Get-ChildItem</span></code></pre>'
+        );
+        // TOML has no grammar in this highlight.js build, so it borrows ini's.
+        expect(markdownHtml('```toml\nkey = "value"\n```')).toBe(
+            '<pre class="code-block" data-language="toml"><code class="hljs language-ini"><span class="hljs-attr">key</span> = <span class="hljs-string">"value"</span></code></pre>'
+        );
+    });
+
     it('escapes an unlabelled fence instead of guessing', () => {
         expect(markdownHtml('```\nplain <tag>\n```')).toBe(
             '<pre class="code-block"><code>plain &lt;tag&gt;</code></pre>'
+        );
+    });
+
+    it('keeps an unregistered language as escaped text with the author label', () => {
+        expect(markdownHtml('```cobol\nIDENTIFICATION DIVISION.\n```')).toBe(
+            '<pre class="code-block" data-language="cobol"><code class="hljs language-cobol">IDENTIFICATION DIVISION.</code></pre>'
+        );
+    });
+
+    // The fence info string is concatenated into two attributes, so a hostile
+    // label must not be able to close the attribute or inject markup. Only the
+    // safe character subset survives, and both `class` and `data-language` stay
+    // inside their quotes.
+    it('sanitises the fence info string before it reaches an attribute', () => {
+        expect(markdownHtml('```foo"><script>alert(1)</script>\nx\n```')).toBe(
+            '<pre class="code-block" data-language="fooscriptalert1/script"><code>x</code></pre>'
+        );
+    });
+
+    it('caps the author label length', () => {
+        expect(markdownHtml(`\`\`\`${'a'.repeat(60)}\nx\n\`\`\``)).toBe(
+            `<pre class="code-block" data-language="${'a'.repeat(32)}"><code>x</code></pre>`
         );
     });
 
@@ -66,8 +143,14 @@ describe('highlightCode', () => {
         );
     });
 
+    it('highlights Rust through its canonical name', () => {
+        expect(highlightCode('fn main() { let x: u8 = 1; }', 'rust')).toBe(
+            '<span class="hljs-keyword">fn</span> <span class="hljs-title function_">main</span>() { <span class="hljs-keyword">let</span> <span class="hljs-variable">x</span>: <span class="hljs-type">u8</span> = <span class="hljs-number">1</span>; }'
+        );
+    });
+
     it('escapes markup for unknown languages', () => {
-        expect(highlightCode('<div>', 'rust')).toBe('&lt;div&gt;');
+        expect(highlightCode('<div>', 'cobol')).toBe('&lt;div&gt;');
     });
 
     it('escapes markup when no language is given and detection has no answer', () => {

@@ -40,6 +40,7 @@ import type {
     RunnerSettings,
     SessionSnapshot,
     SessionStreamItem,
+    SessionTurn,
     ToolCallResult,
     ToolDescriptor,
     ToolIndex,
@@ -343,6 +344,30 @@ export const getSession = async (id: string): Promise<SessionSnapshot> => {
     return body.session;
 };
 
+// Body of PATCH /sessions/:id (R2). The ONLY session field this client may change
+// is the live per-agent model map: the team and its promotion order stay frozen for
+// an existing conversation (that is the conversation guarantee), while a model is
+// a per-request choice, so the server re-reads it before the NEXT model request and
+// leaves an in-flight run alone.
+//
+// The server answers with the same `{ session }` envelope as GET /sessions/:id, so
+// the caller applies it exactly like a re-read snapshot.
+export type UpdateSessionRequest = {
+    agentModels: Record<string, string>;
+};
+
+export const updateSession = async (
+    id: string,
+    input: UpdateSessionRequest
+): Promise<SessionSnapshot> => {
+    const body = await request<{ session: SessionSnapshot }>(`/sessions/${encodeURIComponent(id)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(input)
+    });
+
+    return body.session;
+};
+
 export const resetSession = async (id: string): Promise<SessionSnapshot> => {
     const body = await request<{ session: SessionSnapshot }>(`/sessions/${encodeURIComponent(id)}/reset`, {
         method: 'POST'
@@ -355,12 +380,37 @@ export const deleteSession = async (id: string): Promise<void> => {
     await request<{ deleted: boolean }>(`/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
 };
 
-export const cancelSession = async (id: string): Promise<boolean> => {
+export const cancelSession = async (id: string, all = false): Promise<boolean> => {
+    // `all: true` is the Stop-all signal: the server aborts the active run AND
+    // cancels every retained queued task, so one press drains the queue instead
+    // of leaving the next task to start on its own. The field is omitted unless
+    // requested so the legacy no-body cancel (active run only) is still sent by
+    // any caller that wants it.
     const body = await request<{ cancelled: boolean }>(`/sessions/${encodeURIComponent(id)}/cancel`, {
-        method: 'POST'
+        method: 'POST',
+        ...(all ? { body: JSON.stringify({ all: true }) } : {})
     });
 
     return body.cancelled;
+};
+
+// POST /sessions/:id/tasks (R4 queue).
+//
+// The server records the task, puts it behind whatever is already running, and
+// answers 202 IMMEDIATELY with the session snapshot plus the turn record. That
+// fast answer is what keeps the composer usable: the request that submits a task
+// is not the request that runs it. Execution and streaming are observed on the
+// long-lived GET /sessions/:id/events stream below.
+export type EnqueueTaskResult = {
+    session: SessionSnapshot;
+    turn: SessionTurn;
+};
+
+export const enqueueTask = async (id: string, input: string): Promise<EnqueueTaskResult> => {
+    return request<EnqueueTaskResult>(`/sessions/${encodeURIComponent(id)}/tasks`, {
+        method: 'POST',
+        body: JSON.stringify({ input })
+    });
 };
 
 // POST /tools/:name — call one tool on the server.
@@ -386,6 +436,60 @@ export const callTool = (
 // Read a `text/event-stream` body and hand every `data:` payload to the caller.
 // The server sends one JSON `SessionStreamItem` per frame, so a frame never
 // contains a literal newline.
+//
+// Shared by both stream routes on purpose: POST /messages (legacy, one task and a
+// terminal frame) and GET /events (the queue observer). Parsing must be identical
+// or the two paths would disagree about the same server.
+const readEventStream = async (
+    body: ReadableStream<Uint8Array>,
+    onItem: (item: SessionStreamItem) => void
+): Promise<void> => {
+    const reader = body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+
+    const handle = (block: string): void => {
+        const data = block
+            .split('\n')
+            .filter((line) => line.startsWith('data:'))
+            .map((line) => line.slice(5).trimStart())
+            .join('\n');
+
+        if (data.length === 0) return;
+
+        let item: SessionStreamItem;
+        try {
+            item = JSON.parse(data) as SessionStreamItem;
+        } catch {
+            return;
+        }
+
+        onItem(item);
+    };
+
+    while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        let index: number;
+        while ((index = buffer.indexOf('\n\n')) >= 0) {
+            const block = buffer.slice(0, index);
+            buffer = buffer.slice(index + 2);
+            if (block.trim().length > 0) handle(block);
+        }
+    }
+
+    if (buffer.trim().length > 0) handle(buffer);
+};
+
+// POST /sessions/:id/messages — the LEGACY single-task stream.
+//
+// Retained for compatibility (an older UI, a script) but the playground no
+// longer uses it: a task is enqueued with POST /tasks and observed with
+// GET /events, so the composer is not tied to the run's duration. The parsing and
+// terminal-snapshot contract are unchanged.
 export const submitMessage = async (
     id: string,
     input: string,
@@ -414,50 +518,56 @@ export const submitMessage = async (
         throw new Error('The harness server returned an empty stream.');
     }
 
-    const reader = response.body.getReader();
-    const decoder = new TextDecoder();
-    let buffer = '';
     let snapshot: SessionSnapshot | undefined;
-
-    const handle = (block: string): void => {
-        const data = block
-            .split('\n')
-            .filter((line) => line.startsWith('data:'))
-            .map((line) => line.slice(5).trimStart())
-            .join('\n');
-
-        if (data.length === 0) return;
-
-        let item: SessionStreamItem;
-        try {
-            item = JSON.parse(data) as SessionStreamItem;
-        } catch {
-            return;
-        }
-
+    await readEventStream(response.body, (item) => {
         if (item.type === 'snapshot' || item.type === 'failed') snapshot = item.session;
         onItem(item);
-    };
-
-    while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-
-        buffer += decoder.decode(value, { stream: true });
-
-        let index: number;
-        while ((index = buffer.indexOf('\n\n')) >= 0) {
-            const block = buffer.slice(0, index);
-            buffer = buffer.slice(index + 2);
-            if (block.trim().length > 0) handle(block);
-        }
-    }
-
-    if (buffer.trim().length > 0) handle(buffer);
+    });
 
     if (snapshot === undefined) {
         throw new Error('The harness stream ended without a terminal frame.');
     }
 
     return snapshot;
+};
+
+// GET /sessions/:id/events — the QUEUE OBSERVER (R4).
+//
+// One long-lived subscription per selected session. The server opens with a
+// `snapshot` of the whole session (so a late/reloaded observer hydrates the queue),
+// then streams `turn` upserts and `event` frames for every task in FIFO order, and
+// emits a fresh `snapshot` when the queue drains.
+//
+// Aborting `signal` only UNSUBSCRIBES: it never cancels work. Execution belongs to
+// the server and continues after the page is gone, which is why the composer can
+// return immediately and why switching a view must not stop the queue. The promise
+// resolves when the server closes the stream and rejects on a transport/HTTP
+// failure; the caller treats either as an observation problem, never as a task
+// failure, and falls back to GET /sessions/:id.
+export const observeSession = async (
+    id: string,
+    onItem: (item: SessionStreamItem) => void,
+    signal: AbortSignal
+): Promise<void> => {
+    let response: Response;
+
+    try {
+        response = await fetch(url(`/sessions/${encodeURIComponent(id)}/events`), {
+            headers: { Accept: 'text/event-stream', 'X-Harness-Client': 'ui' },
+            signal
+        });
+    } catch (error) {
+        if (signal.aborted) throw error;
+        throw new Error(`The harness server is unreachable: ${messageOf(error)}`);
+    }
+
+    if (!response.ok) {
+        throw new Error(await readError(response));
+    }
+
+    if (response.body === null) {
+        throw new Error('The harness server returned an empty event stream.');
+    }
+
+    await readEventStream(response.body, onItem);
 };

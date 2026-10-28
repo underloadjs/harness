@@ -4,12 +4,13 @@
 //   - the harness is callable: `await writer('...')` runs the entry agent;
 //   - the first `agents` key is the entry point (unless `primary` names another),
 //     and its name is the harness name;
-//   - the ONLY core tools are the harness-owned toolRequest, toolCreate, and
-//     todoManage (delegate only when subagents exist); the entire preset catalogue
-//     — file tools included — is searchable and toolRequest enables the matches
-//     for the next turn, until then they are invisible and uncallable;
-//   - toolCreate and todoManage are always core, and delegate is core only when
-//     subagents exist;
+//   - the harness-owned core tools are toolRequest, toolCreate, todoManage,
+//     profileManage, chapterManage, and locationManage (delegate only when
+//     subagents exist); the rest of the preset catalogue — fileList and beyond —
+//     is searchable and toolRequest enables the matches for the next turn, until
+//     then it is invisible and uncallable;
+//   - toolCreate, todoManage, and the record tools are always core, and delegate
+//     is core only when subagents exist;
 //   - tools run, their results are fed back, and the loop repeats until the model
 //     answers with text;
 //   - every failure mode (unknown tool, undiscovered tool, bad JSON, throwing
@@ -132,7 +133,10 @@ describe('harness', () => {
             'core',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
         ]);
     });
 
@@ -162,7 +166,10 @@ describe('harness', () => {
             'fileGlob',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
         ]);
     });
 
@@ -273,7 +280,14 @@ describe('harness', () => {
         });
 
         expect(writer.tools.fileRead).toBeUndefined();
-        expect(Object.keys(writer.tools)).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
+        expect(Object.keys(writer.tools)).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
     });
 
     it('lets the model discover and run a preloaded preset', async () => {
@@ -307,6 +321,9 @@ describe('harness', () => {
             'toolRequest',
             'toolCreate',
             'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
             'syntaxCheck'
         ]);
         expect((entry.messages[4] as { content: string }).content).toBe('true');
@@ -342,8 +359,23 @@ describe('harness', () => {
 
         // Round one: core only. Round two: the discovered tool joined the
         // declarations, and the unrelated tool stayed out.
-        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
-        expect(declaredNames(seen[1])).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'fileRead']);
+        expect(declaredNames(seen[0])).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
+        expect(declaredNames(seen[1])).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
+            'fileRead'
+        ]);
 
         // The discovery result is what the model sees: names plus metadata.
         const discovery = JSON.parse((entry.messages[2] as { content: string }).content);
@@ -568,7 +600,7 @@ describe('harness', () => {
             // so the recovery hint lists exactly those and points at toolRequest
             // for the searchable remainder.
             content:
-                'Tool "nope" is not registered. Available tools: fileRead, fileWrite, fileEdit, fileGlob, toolRequest, toolCreate, todoManage. Call toolRequest with capability tags to search the catalogue.'
+                'Tool "nope" is not registered. Available tools: fileRead, fileWrite, fileEdit, fileGlob, toolRequest, toolCreate, todoManage, profileManage, chapterManage, locationManage. Call toolRequest with capability tags to search the catalogue.'
         });
     });
 
@@ -878,7 +910,15 @@ describe('harness', () => {
         const writer = harness({ agents: { writer: entry }, tools: { hidden }, presets: false });
 
         await writer('go');
-        expect(declaredNames(seen[1])).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'hidden']);
+        expect(declaredNames(seen[1])).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
+            'hidden'
+        ]);
         expect(writer.discoveredTools).toEqual(['hidden']);
 
         writer.reset();
@@ -887,7 +927,14 @@ describe('harness', () => {
         await writer('go again');
 
         // Back to the core set: discovery is part of "start over".
-        expect(declaredNames(seen[2])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
+        expect(declaredNames(seen[2])).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
     });
 
     it('keeps discovery across separate calls on the same harness', async () => {
@@ -917,14 +964,30 @@ describe('harness', () => {
         });
 
         await writer('first');
-        expect(declaredNames(seen[1])).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'reader']);
+        expect(declaredNames(seen[1])).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
+            'reader'
+        ]);
         expect(writer.discoveredTools).toEqual(['reader']);
 
         // A second call starts a NEW turn but not a new catalogue: toolRequest
         // enabled `reader` for the harness, so the next request still declares it
         // without another discovery round.
         await writer('second');
-        expect(declaredNames(seen[3])).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'reader']);
+        expect(declaredNames(seen[3])).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
+            'reader'
+        ]);
         expect(writer.discoveredTools).toEqual(['reader']);
     });
 
@@ -1249,7 +1312,14 @@ describe('executeTool', () => {
         // Nothing was enabled and the model still sees only the core declarations.
         expect(writer.discoveredTools).toEqual([]);
         await writer('go');
-        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
+        expect(declaredNames(seen[0])).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
     });
 
     it('runs a core tool against this harness and rejects an unregistered name', async () => {

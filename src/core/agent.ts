@@ -90,7 +90,9 @@ export const agent = (configuration: AgentConfiguration): Agent => {
     const instructions = normalizeInstructions(configuration.instruction);
 
     // The model is mutable: a caller can switch models mid-conversation without
-    // rebuilding the agent (and losing its history).
+    // rebuilding the agent (and losing its history). A change applies to the NEXT
+    // request: a request already streaming keeps the model it started with, and
+    // the assistant message it commits names that model (requestModel below).
     let model = configuration.model;
 
     // History starts as instructions + seed messages. Every mutation below goes
@@ -127,12 +129,20 @@ export const agent = (configuration: AgentConfiguration): Agent => {
         let toolCalls: HarnessToolCall[] = [];
         let usage: HarnessAssistantMessage['usage'];
 
+        // Capture the model for THIS request. The accessor is mutable (a session
+        // can retarget an agent mid-conversation, see server/sessions.ts
+        // setAgentModels), so reading it again at the end would let a change that
+        // arrives while the transport is streaming relabel a message the OLD model
+        // actually produced. One snapshot keeps the request, the transport payload,
+        // and the committed attribution identical.
+        const requestModel = model;
+
         // Copy the transcript: a transport must never see a live array it could
         // mutate, and later appends must not appear mid-request.
         const transcript = messages.map((message) => ({ ...message }));
 
         for await (const event of transport({
-            model,
+            model: requestModel,
             messages: transcript,
             tools: options?.tools,
             signal: options?.signal
@@ -165,7 +175,9 @@ export const agent = (configuration: AgentConfiguration): Agent => {
             content,
             reasoning,
             toolCalls,
-            model,
+            // The captured request model, not the live accessor: attribution must
+            // describe the request that ran (see requestModel above).
+            model: requestModel,
             stopReason,
             usage
         };

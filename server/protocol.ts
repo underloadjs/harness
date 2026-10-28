@@ -33,7 +33,14 @@ export type SessionStatus = 'idle' | 'running' | 'error';
 // `startedAt`/`updatedAt` are epoch milliseconds from the server clock.
 // `startedAt` never changes once the turn opens; `updatedAt` moves on every
 // recorded event and again when the turn reaches a terminal status.
-export type SessionTurnStatus = 'running' | 'done' | 'error' | 'cancelled';
+//
+// QUEUED (R4): a task submitted through POST /sessions/:id/tasks exists as a turn
+// immediately, but its status is 'queued' until the server pump starts executing
+// it. A queued turn therefore has an id and an index (stable from the submit) and
+// no `startedAt` yet; the server stamps `startedAt` when execution begins. The
+// same turn id is reused for the queued, running, and terminal frames, so a client
+// upserts by id instead of guessing which row a frame belongs to.
+export type SessionTurnStatus = 'queued' | 'running' | 'done' | 'error' | 'cancelled';
 
 export type SessionTurn = {
     id: string;
@@ -41,7 +48,9 @@ export type SessionTurn = {
     // The trimmed task text the harness received, not the raw request body.
     prompt: string;
     status: SessionTurnStatus;
-    startedAt: number;
+    // Absent while 'queued' (execution has not begun); always set once the turn
+    // is 'running' or terminal. Optional so a queued record is a valid turn.
+    startedAt?: number;
     updatedAt: number;
     events: HarnessEvent[];
     // Epoch milliseconds parallel to `events`: entry i is when events[i] was
@@ -173,12 +182,22 @@ export type SessionSnapshot = {
     id: string;
     harness: string;
     status: SessionStatus;
+    // Number of tasks waiting in the server queue (turns with status 'queued');
+    // the active turn is NOT counted. Omitted when the queue is empty so every
+    // pre-queue snapshot keeps its exact shape. A client can render "N waiting"
+    // from this without walking `turns`.
+    queueDepth?: number;
+    // The entry agent's model, read live (it changes when PATCH /sessions/:id
+    // retargets that agent), so a client never has to look it up in `agentModels`.
     model: string;
     // The model each agent in this session actually runs (R9), keyed by agent id.
-    // Frozen at creation with the harness: an agent absent from the preset's
-    // `agentModels` map appears here with the session's settings.model, so a reload
-    // can render every agent's model without knowing the creation settings. A later
-    // PATCH does not change this snapshot.
+    // Derived LIVE from the session's agents: an agent absent from the preset's
+    // `agentModels` map appears here with the session's settings.model, and
+    // PATCH /sessions/:id rewrites an entry in place (see UpdateSessionRequest),
+    // so a reload can render every agent's model without knowing the creation
+    // settings. `harnessDefinition.agentModels` below stays frozen at creation:
+    // this map is what the session runs NOW, the definition is what it was built
+    // with.
     agentModels?: Record<string, string>;
     createdAt: number;
     updatedAt: number;
@@ -242,6 +261,12 @@ export type ModelIndex = {
 //     (or inferred nothing) still attributes deltas correctly;
 //   - `snapshot` is the normal terminal frame; `failed` is the error terminal.
 //     Both carry the complete turn list, so the final frame is self-sufficient.
+//
+// GET /api/sessions/:id/events reuses the SAME item shapes, but there `turn` is an
+// UPSERT: the server sends it when a turn is queued, when it starts, and when it
+// reaches a terminal status, always with the same id/index, so a client replaces
+// by id. That stream opens with one `snapshot`, then turn/event frames, and closes
+// with one `snapshot` once the queue drains (see server/sessions.ts watch()).
 export type SessionStreamItem =
     | { type: 'turn'; turn: SessionTurn }
     // `at` is the epoch-ms time the server recorded this event, the same value
@@ -261,8 +286,43 @@ export type CreateSessionRequest = {
     settings?: Partial<RunnerSettings>;
 };
 
+// Body of PATCH /sessions/:id. The session's harness, settings, history, and
+// frozen `harnessDefinition` are immutable; the ONE thing a client may change is
+// which model an already-selected agent runs, so the next request of that agent
+// targets the new model without rebuilding anything.
+//
+// `agentModels` maps agent id → model id and MERGES into the live map: an agent
+// absent from the body keeps the model it currently runs (changing one dropdown
+// must not reset its siblings). `{}` is rejected as a no-op. Every key must name a
+// member of THIS session's harness and every value must be a non-empty model id
+// (400 otherwise, with nothing applied). The change is accepted while the session
+// is running: an in-flight request keeps the model it started with, and the
+// assistant message it commits names that model. Only future requests use the new
+// one. The response is the same `{ session }` envelope as GET /sessions/:id, with
+// `model`/`agentModels` reflecting the change and `harnessDefinition` unchanged.
+export type UpdateSessionRequest = {
+    agentModels: Record<string, string>;
+};
+
 export type SubmitMessageRequest = {
     input: string;
+};
+
+// Body of POST /api/sessions/:id/tasks — the server-queued submit (R4).
+//
+// Same `{ input }` shape as the legacy /messages body; the difference is the
+// response and who owns execution. /messages opens an SSE response and the run
+// belongs to that response (a disconnect aborts it). /tasks answers 202
+// `{ session, turn }` immediately and the server pump runs the task even if the
+// browser is gone. Task text is trimmed and bounded exactly like /messages.
+export type SubmitTaskRequest = SubmitMessageRequest;
+
+// Body of POST /api/sessions/:id/cancel. Absent/`{}` keeps the legacy behaviour:
+// cancel the ACTIVE run only, leaving queued tasks untouched. `all: true` is the
+// UI Stop button: also drop every queued task (they stay in `turns` as cancelled
+// records). The response stays `{ cancelled }` for both shapes.
+export type CancelSessionRequest = {
+    all?: boolean;
 };
 
 export type ToolCallRequest = {

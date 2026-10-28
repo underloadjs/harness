@@ -488,3 +488,162 @@ describe('harness mutations', () => {
         ]);
     });
 });
+
+describe('task queue (R4)', () => {
+    const turn = {
+        id: 't1',
+        index: 0,
+        prompt: 'queued task',
+        status: 'queued',
+        updatedAt: 4,
+        events: []
+    };
+
+    it('enqueues with POST /tasks and unwraps { session, turn } quickly', async () => {
+        const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+                calls.push({
+                    url: String(input),
+                    method: init?.method,
+                    body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
+                });
+
+                return json({ session: { ...session, turns: [turn] }, turn }, 202);
+            })
+        );
+
+        const module = await import('./api');
+        const answer = await module.enqueueTask('a/b', 'queued task');
+
+        expect(answer).toEqual({ session: { ...session, turns: [turn] }, turn });
+        expect(calls).toEqual([
+            { url: '/api/sessions/a%2Fb/tasks', method: 'POST', body: { input: 'queued task' } }
+        ]);
+    });
+
+    it('observes GET /events and parses every SessionStreamItem frame exactly once', async () => {
+        const frames = [
+            { type: 'snapshot', session: { ...session, turns: [turn] } },
+            { type: 'turn', turn: { ...turn, status: 'running' } },
+            { type: 'event', turnId: 't1', event: { type: 'start', agent: 'writer', model: 'm1' }, at: 5 },
+            { type: 'snapshot', session: { ...session, turns: [{ ...turn, status: 'done' }] } }
+        ];
+
+        const body = new ReadableStream<Uint8Array>({
+            start(controller) {
+                controller.enqueue(
+                    new TextEncoder().encode(frames.map((frame) => `data: ${JSON.stringify(frame)}\n\n`).join(''))
+                );
+                controller.close();
+            }
+        });
+
+        const calls: string[] = [];
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL) => {
+                calls.push(String(input));
+                // An SSE body, exactly what the server returns for the observer.
+                return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+            })
+        );
+
+        const module = await import('./api');
+        const seen: unknown[] = [];
+        const controller = new AbortController();
+
+        await module.observeSession('s1', (item) => seen.push(item), controller.signal);
+
+        expect(calls).toEqual(['/api/sessions/s1/events']);
+        expect(seen).toEqual(frames);
+    });
+
+    it('cancels the active task and the retained queue with an explicit all body', async () => {
+        const calls: Array<{ url: string; body: unknown }> = [];
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+                calls.push({
+                    url: String(input),
+                    body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
+                });
+                return json({ cancelled: true });
+            })
+        );
+
+        const module = await import('./api');
+
+        expect(await module.cancelSession('s1', true)).toBe(true);
+        // The legacy no-body call still means "active only".
+        expect(await module.cancelSession('s1')).toBe(true);
+
+        expect(calls).toEqual([
+            { url: '/api/sessions/s1/cancel', body: { all: true } },
+            { url: '/api/sessions/s1/cancel', body: undefined }
+        ]);
+    });
+});
+
+describe('session model updates', () => {
+
+    it('PATCHes the live model map and unwraps the GET-session envelope', async () => {
+        // R2: the session's `agentModels` map is live; the route answers with the
+        // same `{ session }` envelope as GET /sessions/:id, which `updateSession`
+        // unwraps so main.ts can apply it like a re-read snapshot.
+        const moved = { ...session, agentModels: { writer: 'm2' } };
+        const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+                const url = String(input);
+                calls.push({
+                    url,
+                    method: init?.method,
+                    body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
+                });
+
+                if (url === '/api/sessions/a%2Fb' && init?.method === 'PATCH') {
+                    return json({ session: moved });
+                }
+
+                throw new Error(`unexpected request: ${url}`);
+            })
+        );
+
+        const module = await import('./api');
+
+        expect(await module.updateSession('a/b', { agentModels: { writer: 'm2' } })).toEqual(moved);
+        expect(calls).toEqual([
+            {
+                url: '/api/sessions/a%2Fb',
+                method: 'PATCH',
+                body: { agentModels: { writer: 'm2' } }
+            }
+        ]);
+    });
+
+    it('reports the server message when a session patch is rejected', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+                const url = String(input);
+                if (url === '/api/sessions/s1' && init?.method === 'PATCH') {
+                    return json({ error: { message: 'That model is not available.' } }, 400);
+                }
+
+                throw new Error(`unexpected request: ${url}`);
+            })
+        );
+
+        const module = await import('./api');
+
+        await expect(module.updateSession('s1', { agentModels: {} })).rejects.toThrow(
+            'That model is not available.'
+        );
+    });
+});

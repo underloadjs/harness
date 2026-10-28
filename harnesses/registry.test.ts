@@ -145,6 +145,9 @@ describe('creating a harness', () => {
             'toolRequest',
             'toolCreate',
             'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
             'agentDelegate'
         ]);
 
@@ -404,7 +407,10 @@ describe('updating a harness', () => {
             'timeNow',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
         ]);
         expect(Object.keys(flakyAfter.create(SETTINGS, progress).tools)).toContain('testFlaky');
 
@@ -441,7 +447,15 @@ describe('updating a harness', () => {
 
         // The captured scripted harness is unchanged (frozen-session guarantee).
         expect(Object.keys(scripted.agents)).toEqual(['demo']);
-        expect(Object.keys(scripted.tools)).toEqual(['timeNow', 'toolRequest', 'toolCreate', 'todoManage']);
+        expect(Object.keys(scripted.tools)).toEqual([
+            'timeNow',
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
     });
 
     it('rebuilds flaky live and retains testFlaky on an executable patch', () => {

@@ -37,10 +37,21 @@ const DEFAULTS = {
     hasApiKey: true
 };
 
+// The session record tools (src/core/metadata.ts coreToolMetadata): registered
+// right after todoManage, in this order, by every harness. Spread into the exact
+// core lists below so one edit keeps every projection in step.
+const RECORD_TOOL_NAMES = ['profileManage', 'chapterManage', 'locationManage'];
+
 // The harness-owned core tools lead the catalogue (R8): GET /tools, its
 // /tools/bootstrap alias, and the bootstrap document all list them so a client can
 // review and manually execute them against a session.
-const CORE_TOOL_NAMES = ['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate'];
+const CORE_TOOL_NAMES = [
+    'toolRequest',
+    'toolCreate',
+    'todoManage',
+    ...RECORD_TOOL_NAMES,
+    'agentDelegate'
+];
 
 // The exact catalogue order after the core set: eight package presets, six harness
 // tools, webSearch.
@@ -218,7 +229,7 @@ describe('canonical bootstrap document', () => {
                 'noteSearch',
                 'textSummarize'
             ],
-            coreTools: ['fileRead', 'fileWrite', 'fileEdit', 'fileGlob', 'toolRequest', 'toolCreate', 'todoManage'],
+            coreTools: ['fileRead', 'fileWrite', 'fileEdit', 'fileGlob', 'toolRequest', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES],
             builtin: true,
             editable: true
         });
@@ -238,7 +249,7 @@ describe('canonical bootstrap document', () => {
             subagents: [],
             agents: ['demo'],
             tools: ['timeNow'],
-            coreTools: ['toolRequest', 'toolCreate', 'todoManage'],
+            coreTools: ['toolRequest', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES],
             builtin: true,
             editable: true
         });
@@ -323,7 +334,8 @@ describe('preset descriptor tool metadata', () => {
             'fileGlob',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            ...RECORD_TOOL_NAMES
         ],
         research: [
             'fileRead',
@@ -333,6 +345,7 @@ describe('preset descriptor tool metadata', () => {
             'toolRequest',
             'toolCreate',
             'todoManage',
+            ...RECORD_TOOL_NAMES,
             'agentDelegate'
         ],
         workspace: [
@@ -342,9 +355,10 @@ describe('preset descriptor tool metadata', () => {
             'fileGlob',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            ...RECORD_TOOL_NAMES
         ],
-        demo: ['toolRequest', 'toolCreate', 'todoManage'],
+        demo: ['toolRequest', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES],
         flaky: [
             'fileRead',
             'fileWrite',
@@ -352,7 +366,8 @@ describe('preset descriptor tool metadata', () => {
             'fileGlob',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            ...RECORD_TOOL_NAMES
         ]
     };
 
@@ -365,7 +380,8 @@ describe('preset descriptor tool metadata', () => {
             'webSearch',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            ...RECORD_TOOL_NAMES
         ],
         research: [
             'fileRead',
@@ -376,6 +392,7 @@ describe('preset descriptor tool metadata', () => {
             'toolRequest',
             'toolCreate',
             'todoManage',
+            ...RECORD_TOOL_NAMES,
             'agentDelegate'
         ],
         workspace: [
@@ -386,9 +403,10 @@ describe('preset descriptor tool metadata', () => {
             'webSearch',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            ...RECORD_TOOL_NAMES
         ],
-        demo: ['toolRequest', 'toolCreate', 'todoManage'],
+        demo: ['toolRequest', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES],
         flaky: [
             'fileRead',
             'fileWrite',
@@ -397,7 +415,8 @@ describe('preset descriptor tool metadata', () => {
             'webSearch',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            ...RECORD_TOOL_NAMES
         ]
     };
 
@@ -548,6 +567,134 @@ describe('canonical sessions', () => {
             status: 404,
             body: { error: { message: `Unknown session "${session.id}".` } }
         });
+    });
+
+    // PATCH /sessions/:id — change which model an already-selected agent runs,
+    // while the session keeps its harness, history, and frozen definition. The
+    // response envelope matches GET /sessions/:id exactly (`{ session }`).
+    it('retargets an agent model over HTTP and keeps the frozen definition', async () => {
+        const runtime = createRuntime();
+        const session = await createDemo(runtime);
+
+        // Baseline: one agent, running the session model, no preset override in the
+        // frozen definition.
+        expect(session.model).toBe('demo-model');
+        expect(session.agentModels).toEqual({ demo: 'demo-model' });
+        expect(session.harnessDefinition?.agentModels).toBeUndefined();
+
+        const patched = await jsonBody<{ session: SessionSnapshot }>(
+            await callHandler(runtime, 'PATCH', `/v1/harness/sessions/${session.id}`, {
+                body: { agentModels: { demo: '  next/model  ' } }
+            })
+        );
+
+        expect(patched.status).toBe(200);
+        // Envelope parity with GET: one `session` key, same shape.
+        expect(Object.keys(patched.body)).toEqual(['session']);
+        expect(Object.keys(patched.body.session)).toEqual(Object.keys(session));
+        // Live map (and the entry model derived from it) moved; attribution of what
+        // the session was BUILT with did not.
+        expect(patched.body.session.model).toBe('next/model');
+        expect(patched.body.session.agentModels).toEqual({ demo: 'next/model' });
+        expect(patched.body.session.harnessDefinition).toEqual(session.harnessDefinition);
+        // Nothing else about the session changed: same id, same harness, no turn.
+        expect(patched.body.session.id).toBe(session.id);
+        expect(patched.body.session.harness).toBe('demo');
+        expect(patched.body.session.status).toBe('idle');
+        expect(patched.body.session.turns).toEqual([]);
+
+        // A reload (and the list) report the change; no second session was made.
+        const read = await jsonBody<{ session: SessionSnapshot }>(
+            await callHandler(runtime, 'GET', `/v1/harness/sessions/${session.id}`)
+        );
+        expect(read.body.session.model).toBe('next/model');
+        expect(read.body.session.agentModels).toEqual({ demo: 'next/model' });
+        const list = await jsonBody<{ sessions: SessionSnapshot[] }>(
+            await callHandler(runtime, 'GET', '/v1/harness/sessions')
+        );
+        expect(list.body.sessions.map((entry) => entry.id)).toEqual([session.id]);
+    });
+
+    it('rejects invalid session patches without changing anything', async () => {
+        const runtime = createRuntime();
+        const session = await createDemo(runtime);
+        const path = `/v1/harness/sessions/${session.id}`;
+
+        const patch = (body: unknown) =>
+            callHandler(runtime, 'PATCH', path, { body }).then((result) =>
+                jsonBody<{ error: { message: string } }>(result)
+            );
+
+        // Unknown agent (the key space is THIS session's harness), empty/garbage
+        // model ids, and a non-object map are all 400s from the shared validator.
+        expect(await patch({ agentModels: { ghost: 'x' } })).toEqual({
+            status: 400,
+            body: {
+                error: {
+                    message:
+                        '`agentModels` names "ghost", which is not a member of this harness. Members: demo.'
+                }
+            }
+        });
+        expect(await patch({ agentModels: { demo: '   ' } })).toEqual({
+            status: 400,
+            body: { error: { message: '`agentModels.demo` cannot be empty.' } }
+        });
+        expect(await patch({ agentModels: { demo: 7 } })).toEqual({
+            status: 400,
+            body: { error: { message: '`agentModels.demo` must be a model id string.' } }
+        });
+        expect(await patch({ agentModels: ['demo'] })).toEqual({
+            status: 400,
+            body: { error: { message: '`agentModels` must be an object mapping agent ids to model ids.' } }
+        });
+        // An empty map changes nothing, so it is not a silent success.
+        expect(await patch({ agentModels: {} })).toEqual({
+            status: 400,
+            body: { error: { message: 'A patch must change at least one agent model.' } }
+        });
+        // Only `agentModels` is client-writable on a live session.
+        expect(await patch({ model: 'sneaky/model' })).toEqual({
+            status: 400,
+            body: { error: { message: 'Unknown field "model". Allowed fields: agentModels.' } }
+        });
+        expect(await patch({ agentModels: { demo: 'ok/model' }, harness: 'instruct' })).toEqual({
+            status: 400,
+            body: { error: { message: 'Unknown field "harness". Allowed fields: agentModels.' } }
+        });
+        expect(await patch({})).toEqual({
+            status: 400,
+            body: { error: { message: 'A patch must change at least one of: agentModels.' } }
+        });
+        // A non-object body never reaches the route's field checks.
+        expect(await patch([])).toEqual({
+            status: 400,
+            body: { error: { message: 'The request body must be a JSON object.' } }
+        });
+
+        // The method surface is documented, and an unknown id is a 404 before any
+        // validation (a patch cannot leak which ids exist).
+        const wrongMethod = await jsonBody<{ error: { message: string } }>(
+            await callHandler(runtime, 'PUT', path, { body: { agentModels: {} } })
+        );
+        expect(wrongMethod).toEqual({
+            status: 405,
+            body: { error: { message: 'Use GET, PATCH or DELETE for /v1/harness/sessions/:id.' } }
+        });
+        expect(
+            await jsonBody<{ error: { message: string } }>(
+                await callHandler(runtime, 'PATCH', '/v1/harness/sessions/missing', {
+                    body: { agentModels: { demo: 'ok/model' } }
+                })
+            )
+        ).toEqual({ status: 404, body: { error: { message: 'Unknown session "missing".' } } });
+
+        // Every rejection above left the live session untouched.
+        const after = await jsonBody<{ session: SessionSnapshot }>(
+            await callHandler(runtime, 'GET', path)
+        );
+        expect(after.body.session.model).toBe('demo-model');
+        expect(after.body.session.agentModels).toEqual({ demo: 'demo-model' });
     });
 
     it('streams a run and forwards every frame unchanged', async () => {
@@ -926,7 +1073,7 @@ describe('all-tools manual execution', () => {
         );
 
         expect(status).toBe(200);
-        const core = body.tools.slice(0, 4);
+        const core = body.tools.slice(0, CORE_TOOL_NAMES.length);
         expect(core.map((tool) => tool.name)).toEqual(CORE_TOOL_NAMES);
 
         // toolRequest is exact: its schema is the R7 advertisement (five max,
@@ -963,7 +1110,7 @@ describe('all-tools manual execution', () => {
 
         // The rest are core-marked, session-bound, and carry a real schema.
         expect(core.slice(1)).toEqual(
-            ['toolCreate', 'todoManage', 'agentDelegate'].map((name) => ({
+            ['toolCreate', 'todoManage', ...RECORD_TOOL_NAMES, 'agentDelegate'].map((name) => ({
                 name,
                 group: 'Core tools',
                 description: expect.any(String),
@@ -976,8 +1123,10 @@ describe('all-tools manual execution', () => {
         );
 
         // Everything else keeps the directly callable shape: no session binding.
-        expect(body.tools.slice(4).map((tool) => tool.name)).toEqual(CATALOGUE_TOOL_NAMES);
-        expect(body.tools.slice(4).every((tool) => tool.sessionBound === undefined)).toBe(true);
+        expect(body.tools.slice(CORE_TOOL_NAMES.length).map((tool) => tool.name)).toEqual(CATALOGUE_TOOL_NAMES);
+        expect(body.tools.slice(CORE_TOOL_NAMES.length).every((tool) => tool.sessionBound === undefined)).toBe(
+            true
+        );
     });
 
     it('returns plain content plus bounded declarative panels for timeNow', async () => {
@@ -1759,6 +1908,7 @@ describe('harness registry over HTTP', () => {
                 'toolRequest',
                 'toolCreate',
                 'todoManage',
+                ...RECORD_TOOL_NAMES,
                 'agentDelegate'
             ],
             builtin: false,
@@ -2040,6 +2190,7 @@ describe('harness registry over HTTP', () => {
                 'toolRequest',
                 'toolCreate',
                 'todoManage',
+                ...RECORD_TOOL_NAMES,
                 'agentDelegate'
             ],
             builtin: true,
@@ -2184,7 +2335,8 @@ describe('harness registry over HTTP', () => {
             'fileGlob',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            ...RECORD_TOOL_NAMES
         ]);
 
         // A NEW session runs the live agent configuration with the shared toolbox.

@@ -1086,7 +1086,14 @@ describe('SessionStore turns', () => {
                 subagents: [],
                 agents: ['single'],
                 tools: [],
-                coreTools: ['toolRequest', 'toolCreate', 'todoManage'],
+                coreTools: [
+                    'toolRequest',
+                    'toolCreate',
+                    'todoManage',
+                    'profileManage',
+                    'chapterManage',
+                    'locationManage'
+                ],
                 builtin: true,
                 editable: true
             },
@@ -1202,6 +1209,230 @@ describe('SessionStore and the harness registry', () => {
         store.reset(created.id);
         expect(store.get(created.id).discoveredTools).toEqual([]);
         expect(store.get(created.id).turns).toEqual([]);
+    });
+});
+
+// Per-agent model retargeting on a LIVE session (PATCH /sessions/:id, R2).
+//
+// A model change must not rebuild the harness or lose history: the agent keeps
+// its transcript and only the next request targets the new id. These tests pin
+// the three things that can go wrong silently:
+//   1. the patch updates the live map (`model`/`agentModels`) but not the frozen
+//      `harnessDefinition`;
+//   2. a change arriving while a request streams does not relabel that request
+//      (attribution stays the model that actually ran);
+//   3. validation is all-or-nothing, so a rejected patch leaves every agent alone.
+describe('SessionStore agent model retargeting', () => {
+    // Two agents whose transport records the model each REQUEST names. `overrides`
+    // is the preset's per-agent map (so the frozen definition carries it), and
+    // `wait` lets a test hold a request open while it patches mid-flight.
+    const modelProbePreset = (
+        overrides: Readonly<Record<string, string>> = {},
+        wait?: () => Promise<void>
+    ): { preset: HarnessPreset; requests: string[] } => {
+        const requests: string[] = [];
+
+        const preset = presetOf(
+            'probe',
+            (settings, progress) => {
+                // Mirror the registry's factory: an override wins, otherwise the
+                // session settings' model (see ../harnesses/toolbox.ts).
+                const probe = (name: string) =>
+                    agent({
+                        model: overrides[name] ?? settings.model,
+                        instruction: `You are ${name}.`,
+                        stream: async function* (request): AsyncGenerator<HarnessStreamEvent> {
+                            // Recorded BEFORE any await: this is the model the
+                            // transport actually sent, i.e. the attribution truth.
+                            requests.push(request.model);
+
+                            if (wait !== undefined) await wait();
+
+                            yield { type: 'text', delta: `${name} answered` };
+                            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                        }
+                    });
+
+                return harness({
+                    agents: { lead: probe('lead'), helper: probe('helper') },
+                    primary: 'lead',
+                    subagents: ['helper'],
+                    presets: false,
+                    report: { progress }
+                });
+            },
+            ['lead', 'helper']
+        );
+
+        return { preset: { ...preset, agentModels: { ...overrides } }, requests };
+    };
+
+    it('changes one agent in place, reporting the live map over the frozen definition', () => {
+        const setClock = pinClock(1_000);
+        const { preset, requests } = modelProbePreset({ helper: 'small/fast' });
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
+        const created = store.create('probe');
+
+        // Baseline: the override applies to `helper` only; the entry agent keeps
+        // the session model. The definition carries exactly the preset's map.
+        expect(created.model).toBe('scripted/test');
+        expect(created.agentModels).toEqual({ lead: 'scripted/test', helper: 'small/fast' });
+        expect(created.harnessDefinition?.agentModels).toEqual({ helper: 'small/fast' });
+
+        setClock(2_000);
+
+        // Merge semantics: only the named agent changes (values are trimmed).
+        const patched = store.setAgentModels(created.id, { helper: '  big/model  ' });
+
+        expect(patched.model).toBe('scripted/test');
+        expect(patched.agentModels).toEqual({ lead: 'scripted/test', helper: 'big/model' });
+        expect(patched.updatedAt).toBe(2_000);
+        // The frozen snapshot still records what the session was BUILT with.
+        expect(patched.harnessDefinition?.agentModels).toEqual({ helper: 'small/fast' });
+
+        // The store (not just the returned copy) holds the change: a reload and a
+        // later list() report the same live map.
+        expect(store.get(created.id).agentModels).toEqual({
+            lead: 'scripted/test',
+            helper: 'big/model'
+        });
+        expect(store.list().map((session) => session.agentModels)).toEqual([
+            { lead: 'scripted/test', helper: 'big/model' }
+        ]);
+
+        // Retargeting the ENTRY agent moves the snapshot's top-level model too,
+        // because that field is derived from the live entry brain.
+        expect(store.setAgentModels(created.id, { lead: 'entry/model' }).model).toBe('entry/model');
+
+        // Nothing was sent to a provider by a patch.
+        expect(requests).toEqual([]);
+    });
+
+    it('keeps the running request attributed to its model and uses the new one next', async () => {
+        const setClock = pinClock(1_000);
+        const gate = deferred();
+        const entered = deferred();
+
+        const { preset, requests } = modelProbePreset({}, async () => {
+            entered.resolve();
+            await gate.promise;
+        });
+
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
+        const created = store.create('probe');
+
+        setClock(2_000);
+
+        const items: SessionStreamItem[] = [];
+        const running = store.run(created.id, 'first', async (item) => {
+            items.push(item);
+        });
+
+        // The first request is now inside the transport, so its model is captured
+        // and the transport has already named it. A patch from here is mid-flight.
+        await entered.promise;
+        expect(requests).toEqual(['scripted/test']);
+
+        // A busy session accepts the patch: no 409, no cancellation, and the run
+        // keeps streaming (the turn list still has its in-flight turn).
+        const patched = store.setAgentModels(created.id, { lead: 'next/model' });
+        expect(patched.status).toBe('running');
+        expect(patched.turns.map((turn) => turn.status)).toEqual(['running']);
+        expect(patched.model).toBe('next/model');
+        expect(patched.agentModels).toEqual({ lead: 'next/model', helper: 'scripted/test' });
+
+        gate.resolve();
+        await running;
+
+        // The turn records the model the request STARTED with, in both places the
+        // event stream names a model: the `start` event and the `done` message.
+        const turn = store.get(created.id).turns[0];
+        expect(turn.status).toBe('done');
+        expect(turn.events).toEqual([
+            { type: 'start', agent: 'lead', model: 'scripted/test' },
+            { type: 'text', agent: 'lead', delta: 'lead answered' },
+            {
+                type: 'done',
+                agent: 'lead',
+                message: {
+                    role: 'assistant',
+                    content: 'lead answered',
+                    reasoning: '',
+                    toolCalls: [],
+                    model: 'scripted/test',
+                    stopReason: 'stop'
+                }
+            }
+        ]);
+
+        // The terminal snapshot frame carries the live map, not the attribution.
+        const terminal = items[items.length - 1];
+        expect(terminal.type).toBe('snapshot');
+        if (terminal.type !== 'snapshot') throw new Error('expected a snapshot frame');
+        expect(terminal.session.model).toBe('next/model');
+        expect(terminal.session.agentModels).toEqual({ lead: 'next/model', helper: 'scripted/test' });
+
+        // The NEXT request of the same agent targets the new model, with the
+        // history still intact (one user message from the first run).
+        setClock(3_000);
+        await store.run(created.id, 'second', async () => {});
+        expect(requests).toEqual(['scripted/test', 'next/model']);
+
+        const second = store.get(created.id).turns[1];
+        expect(second.events[0]).toEqual({ type: 'start', agent: 'lead', model: 'next/model' });
+        expect(store.get(created.id).messages.filter((message) => message.role === 'user')).toEqual([
+            { role: 'user', content: 'first' },
+            { role: 'user', content: 'second' }
+        ]);
+    });
+
+    it('rejects every invalid patch atomically, leaving the live map untouched', () => {
+        pinClock(1_000);
+        const { preset } = modelProbePreset({ helper: 'small/fast' });
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([preset]));
+        const created = store.create('probe');
+        const before = { lead: 'scripted/test', helper: 'small/fast' };
+
+        // The valid entry in this map must NOT be applied: validation runs over the
+        // whole map before any brain is touched.
+        expect(() => store.setAgentModels(created.id, { lead: 'new/model', ghost: 'x' })).toThrow(
+            new SessionError(
+                400,
+                '`agentModels` names "ghost", which is not a member of this harness. Members: lead, helper.'
+            )
+        );
+
+        expect(() => store.setAgentModels(created.id, { helper: '' })).toThrow(
+            new SessionError(400, '`agentModels.helper` cannot be empty.')
+        );
+        expect(() => store.setAgentModels(created.id, { helper: '   ' })).toThrow(
+            new SessionError(400, '`agentModels.helper` cannot be empty.')
+        );
+        expect(() => store.setAgentModels(created.id, { helper: 7 })).toThrow(
+            new SessionError(400, '`agentModels.helper` must be a model id string.')
+        );
+        expect(() => store.setAgentModels(created.id, { helper: 'x'.repeat(201) })).toThrow(
+            new SessionError(400, '`agentModels.helper` cannot exceed 200 characters.')
+        );
+        expect(() => store.setAgentModels(created.id, ['lead'])).toThrow(
+            new SessionError(400, '`agentModels` must be an object mapping agent ids to model ids.')
+        );
+        expect(() => store.setAgentModels(created.id, null)).toThrow(
+            new SessionError(400, '`agentModels` must be an object mapping agent ids to model ids.')
+        );
+        // An empty map would change nothing, so it is not a silent success.
+        expect(() => store.setAgentModels(created.id, {})).toThrow(
+            new SessionError(400, 'A patch must change at least one agent model.')
+        );
+        expect(() => store.setAgentModels('nope', { lead: 'x' })).toThrow(
+            new SessionError(404, 'Unknown session "nope".')
+        );
+
+        // Every rejection above left the session exactly as it was.
+        const after = store.get(created.id);
+        expect(after.agentModels).toEqual(before);
+        expect(after.model).toBe('scripted/test');
+        expect(after.harnessDefinition?.agentModels).toEqual({ helper: 'small/fast' });
     });
 });
 

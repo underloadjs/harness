@@ -189,7 +189,10 @@ describe('one toolbox, different agents', () => {
             'webSearch',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
         ]);
         expect(registeredTools('research')).toEqual([
             ...TOOLBOX,
@@ -197,6 +200,9 @@ describe('one toolbox, different agents', () => {
             'toolRequest',
             'toolCreate',
             'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
             'agentDelegate'
         ]);
         expect(registeredTools('workspace')).toEqual([
@@ -204,7 +210,10 @@ describe('one toolbox, different agents', () => {
             'webSearch',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
         ]);
 
         // The example gets the same shared set plus its own failure tool.
@@ -214,26 +223,56 @@ describe('one toolbox, different agents', () => {
             'webSearch',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
         ]);
 
         // The scripted offline fixture is a documented exception.
-        expect(registeredTools('demo')).toEqual(['timeNow', 'toolRequest', 'toolCreate', 'todoManage']);
+        expect(registeredTools('demo')).toEqual([
+            'timeNow',
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
     });
 
     it('registers the identical toolbox on every live preset when the host is keyless', () => {
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
 
-        expect(registeredTools('instruct')).toEqual([...TOOLBOX, 'toolRequest', 'toolCreate', 'todoManage']);
+        expect(registeredTools('instruct')).toEqual([
+            ...TOOLBOX,
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
         expect(registeredTools('research')).toEqual([
             ...TOOLBOX,
             'toolRequest',
             'toolCreate',
             'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
             'agentDelegate'
         ]);
-        expect(registeredTools('workspace')).toEqual([...TOOLBOX, 'toolRequest', 'toolCreate', 'todoManage']);
+        expect(registeredTools('workspace')).toEqual([
+            ...TOOLBOX,
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
 
         // No key means the factory registers no webSearch at all; the global
         // catalogue is where a keyless host learns it exists but is unconfigured.
@@ -357,7 +396,10 @@ describe('one toolbox, different agents', () => {
             'webSearch',
             'toolRequest',
             'toolCreate',
-            'todoManage'
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
         ]);
     });
 

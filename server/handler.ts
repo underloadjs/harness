@@ -147,6 +147,11 @@ const runStream = async (
 
     // One abort source for both directions: a disconnected socket cancels the
     // run, and a completed run leaves a harmless abort after the response ends.
+    //
+    // R4: this signal means different things per route and the dispatcher decides.
+    // POST /messages treats it as "abort the run" (legacy); GET /sessions/:id/events
+    // treats it as "unsubscribe only" — a queued task keeps running server-side, so
+    // the watch handler must simply return (see api.ts watchSessionRoute).
     const controller = new AbortController();
     const abort = (): void => controller.abort();
 

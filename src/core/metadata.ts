@@ -4,15 +4,18 @@
 // four everyday file tools (metadata in ../tools/catalogue.ts) and configured
 // webSearch (../tools/websearch/index.ts). Their metadata lives with their real
 // implementations; this file stays the single source for the session-bound
-// harness-owned set (toolRequest/toolCreate/todoManage/agentDelegate), which is
-// also what harnesses/core.ts exports to the server with sessionBound: true.
+// harness-owned set (toolRequest/toolCreate/todoManage/profileManage/
+// chapterManage/locationManage/agentDelegate), which is also what
+// harnesses/core.ts exports to the server with sessionBound: true.
 //
 // WHY THIS FILE EXISTS (single source of truth)
 // ---------------------------------------------
 // The core tools are built in two very different places:
 //   - src/harness.ts registers toolRequest, toolCreate, and (when the harness has
 //     subagents) agentDelegate on the live harness;
-//   - src/core/todo.ts builds todoManage from its factory closure.
+//   - src/core/todo.ts builds todoManage from its factory closure, and
+//     src/core/profile.ts, chapter.ts, and location.ts do the same for the
+//     session record tools.
 // A SERVER also has to *describe* those same tools without building a harness:
 // the Tools tab lists them for review and manual execution (R8), and a descriptor
 // must never advertise a name, description, tag list, or schema that the runtime
@@ -20,7 +23,8 @@
 // registration and the server catalogue read it — makes that drift impossible.
 //
 // NAMING (T14): every tool is `<namespace><action>` — toolRequest, toolCreate,
-// todoManage, agentDelegate — and the preset tools follow the same rule
+// todoManage, profileManage, chapterManage, locationManage, agentDelegate — and
+// the preset tools follow the same rule
 // (fileRead, fileWrite, fileEdit, fileList, fileGlob, commandRun, webSearch,
 // timeNow, textCount, diceRoll, noteSearch, textSummarize, testFlaky). The
 // namespace is what groups related tools in discovery; the action is what the
@@ -38,6 +42,7 @@
 //   - ./discovery.ts     — MAX_DISCOVERY_MATCHES, the enforced cap
 //   - ../harness.ts      — registers these definitions as core tools
 //   - ./todo.ts          — builds todoManage from TODO_MANAGE_METADATA
+//   - ./profile.ts / ./chapter.ts / ./location.ts — build the session record tools
 //   - ../../harnesses/core.ts — server catalogue entries for the same names
 
 import type { ToolVisibility } from '../types';
@@ -49,6 +54,9 @@ import { MAX_DISCOVERY_MATCHES } from './discovery';
 export const TOOL_REQUEST_NAME = 'toolRequest';
 export const TOOL_CREATE_NAME = 'toolCreate';
 export const TODO_MANAGE_NAME = 'todoManage';
+export const PROFILE_MANAGE_NAME = 'profileManage';
+export const CHAPTER_MANAGE_NAME = 'chapterManage';
+export const LOCATION_MANAGE_NAME = 'locationManage';
 export const AGENT_DELEGATE_NAME = 'agentDelegate';
 
 // One core tool's declarative half: everything a request declaration or a server
@@ -169,6 +177,148 @@ export const TODO_MANAGE_METADATA: CoreToolMetadata = {
     }
 };
 
+// Session character/people profiles. Same factory-closure lifecycle as todos
+// (./profile.ts), and the same action set as the other two record tools. The
+// description documents the partial-update contract because the model reads the
+// description, not this file.
+export const PROFILE_MANAGE_METADATA: CoreToolMetadata = {
+    name: PROFILE_MANAGE_NAME,
+    description:
+        'Manage character and people profiles for this harness session. Actions: "add" (requires name and description; optional traits and notes), "list", "get" (requires id), "update" (requires id and at least one of name, description, traits, notes; fields you omit are unchanged), and "remove" (requires id). Traits are trimmed and deduplicated. Ids are stable strings returned by "add". Profiles are shared by every agent in this harness, kept across turns, and cleared by reset. Every result returns the profile list, counts { total }, and the affected profile (or removed profile).',
+    tags: ['profile', 'profiles', 'character', 'characters', 'person', 'people'],
+    visibility: 'core',
+    parameters: {
+        type: 'object',
+        properties: {
+            action: {
+                type: 'string',
+                enum: ['add', 'list', 'get', 'update', 'remove'],
+                description: 'One of: add, list, get, update, remove.'
+            },
+            id: {
+                type: 'string',
+                description: 'Profile id returned by "add". Required for get/update/remove.'
+            },
+            name: {
+                type: 'string',
+                description:
+                    'Profile name for "add", or a replacement name for "update". Required for "add"; trimmed.'
+            },
+            description: {
+                type: 'string',
+                description:
+                    'Profile description for "add", or a replacement for "update". Required for "add"; trimmed.'
+            },
+            traits: {
+                type: 'array',
+                items: { type: 'string' },
+                description:
+                    'Optional traits for "add" or "update", e.g. ["brave", "loyal"]. Entries are trimmed and deduplicated; omitting the field leaves traits unchanged on update.'
+            },
+            notes: {
+                type: 'string',
+                description:
+                    'Optional free-form notes for "add" or "update". Omitting the field leaves notes unchanged on update; an empty string clears them.'
+            }
+        },
+        required: ['action'],
+        additionalProperties: false
+    }
+};
+
+// Session chapters. The description states the two chapter-specific rules the
+// model must know: summaries in lists/results, and the body only from "get".
+export const CHAPTER_MANAGE_METADATA: CoreToolMetadata = {
+    name: CHAPTER_MANAGE_NAME,
+    description:
+        'Manage chapters for this harness session. Actions: "add" (requires title and summary; optional content, status and order), "list", "get" (requires id), "update" (requires id and at least one of title, summary, content, status, order; fields you omit are unchanged), and "remove" (requires id). Status is planned, draft or complete and defaults to planned. The optional integer order sorts list: ordered chapters first ascending, unordered ones after in insertion order. Ids are stable strings returned by "add". Lists and mutation results return summaries without the body; only "get" returns content. Chapters are shared by every agent in this harness, kept across turns, and cleared by reset. Every result returns chapter summaries, counts { total, planned, draft, complete }, and the affected summary (or removed summary).',
+    tags: ['chapter', 'chapters', 'story', 'writing', 'outline', 'book'],
+    visibility: 'core',
+    parameters: {
+        type: 'object',
+        properties: {
+            action: {
+                type: 'string',
+                enum: ['add', 'list', 'get', 'update', 'remove'],
+                description: 'One of: add, list, get, update, remove.'
+            },
+            id: {
+                type: 'string',
+                description: 'Chapter id returned by "add". Required for get/update/remove.'
+            },
+            title: {
+                type: 'string',
+                description:
+                    'Chapter title for "add", or a replacement for "update". Required for "add"; trimmed.'
+            },
+            summary: {
+                type: 'string',
+                description:
+                    'Short summary for "add", or a replacement for "update". Required for "add"; trimmed. Returned by list.'
+            },
+            content: {
+                type: 'string',
+                description:
+                    'Chapter body for "add" or "update". Optional; trimmed. Never returned by list or mutation results - use "get" to read it.'
+            },
+            status: {
+                type: 'string',
+                enum: ['planned', 'draft', 'complete'],
+                description:
+                    'Chapter status. Defaults to "planned" on add; omitting it on update leaves it unchanged.'
+            },
+            order: {
+                type: 'integer',
+                description:
+                    'Optional sort position. Lower values list first; chapters without one follow in insertion order. Omitting it on update leaves it unchanged.'
+            }
+        },
+        required: ['action'],
+        additionalProperties: false
+    }
+};
+
+// Session locations/places. Deliberately small: every result carries the whole
+// record, so there is no summary/body split.
+export const LOCATION_MANAGE_METADATA: CoreToolMetadata = {
+    name: LOCATION_MANAGE_NAME,
+    description:
+        'Manage locations for this harness session. Actions: "add" (requires name and description; optional notes), "list", "get" (requires id), "update" (requires id and at least one of name, description, notes; fields you omit are unchanged), and "remove" (requires id). Ids are stable strings returned by "add". Locations are shared by every agent in this harness, kept across turns, and cleared by reset. Every result returns the location list, counts { total }, and the affected location (or removed location).',
+    tags: ['location', 'locations', 'place', 'places', 'setting', 'world'],
+    visibility: 'core',
+    parameters: {
+        type: 'object',
+        properties: {
+            action: {
+                type: 'string',
+                enum: ['add', 'list', 'get', 'update', 'remove'],
+                description: 'One of: add, list, get, update, remove.'
+            },
+            id: {
+                type: 'string',
+                description: 'Location id returned by "add". Required for get/update/remove.'
+            },
+            name: {
+                type: 'string',
+                description:
+                    'Location name for "add", or a replacement name for "update". Required for "add"; trimmed.'
+            },
+            description: {
+                type: 'string',
+                description:
+                    'Location description for "add", or a replacement for "update". Required for "add"; trimmed.'
+            },
+            notes: {
+                type: 'string',
+                description:
+                    'Optional free-form notes for "add" or "update". Omitting the field leaves notes unchanged on update; an empty string clears them.'
+            }
+        },
+        required: ['action'],
+        additionalProperties: false
+    }
+};
+
 // Delegation (R4). Capability-by-configuration: the harness registers agentDelegate
 // only when the allowlist is non-empty, so this metadata has two honest forms:
 //   - with subagents — the runtime declaration, whose `agent` enum is the exact
@@ -208,9 +358,14 @@ export const agentDelegateMetadata = (subagents: readonly string[] = []): CoreTo
     };
 };
 
-// The core set a harness without subagents registers: discovery, creation, todos.
+// The core set a harness without subagents registers: discovery, creation, todos,
+// and the three session record tools. Order is the registration order the
+// harness uses, so this list is also what a catalogue projection reads.
 export const coreToolMetadata = (): CoreToolMetadata[] => [
     TOOL_REQUEST_METADATA,
     TOOL_CREATE_METADATA,
-    TODO_MANAGE_METADATA
+    TODO_MANAGE_METADATA,
+    PROFILE_MANAGE_METADATA,
+    CHAPTER_MANAGE_METADATA,
+    LOCATION_MANAGE_METADATA
 ];

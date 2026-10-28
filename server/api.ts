@@ -71,6 +71,7 @@ import { toolUiOf } from '../src/harness';
 import { listModels, ModelListError } from '../src/transport/models';
 import type {
     AgentDescriptor,
+    CancelSessionRequest,
     CreateHarnessRequest,
     CreateSessionRequest,
     HarnessDescriptor,
@@ -80,15 +81,18 @@ import type {
     SessionSnapshot,
     SessionStreamItem,
     SubmitMessageRequest,
+    SubmitTaskRequest,
     ToolCallRequest,
     ToolCallResult,
     ToolDescriptor,
     ToolIndex,
-    UpdateHarnessRequest
+    UpdateHarnessRequest,
+    UpdateSessionRequest
 } from './protocol';
 import { mergeSettings, SettingsError } from './config';
 import { HarnessRegistryError } from '../harnesses/registry';
 import { SessionError, SessionStore } from './sessions';
+import type { SessionWatch } from './sessions';
 
 const MAX_BODY_BYTES = 1_000_000;
 
@@ -136,7 +140,9 @@ export type HarnessApiRequest = {
 export type HarnessApiEmit = (item: SessionStreamItem) => void | Promise<void>;
 
 // A stream that has already passed validation (status line may be sent).
-// `signal` aborts when the client disconnects; the dispatcher cancels the run.
+// `signal` aborts when the client disconnects. What that means is per route:
+// POST /messages cancels the run (legacy ownership), while GET /sessions/:id/events
+// only unsubscribes — the queue pump owns execution and keeps running for nobody.
 export type HarnessApiStream = (emit: HarnessApiEmit, signal: AbortSignal) => Promise<void>;
 
 export type HarnessApiResult =
@@ -203,6 +209,15 @@ const UPDATE_HARNESS_FIELDS = [
     'subagents',
     'agentModels'
 ] as const;
+
+// The one live-session mutation a client may send (PATCH /sessions/:id). The
+// harness, settings, and frozen definition are never client-writable, so the
+// allowlist is deliberately a single field.
+const SESSION_PATCH_FIELDS = ['agentModels'] as const;
+
+// The only field POST /sessions/:id/cancel accepts. An absent body (or `{}`) is
+// the legacy active-run cancel; `all` also drops the queued backlog.
+const SESSION_CANCEL_FIELDS = ['all'] as const;
 
 // Reject unknown properties instead of ignoring them. A request that tries to set
 // `instructions` is then a visible contract violation rather than a silent no-op
@@ -533,7 +548,15 @@ export const createHarnessApi = ({
 
     // POST /sessions/:id/messages — validate first, then hand back a stream. The
     // adapter decides how to write frames; the dispatcher owns cancellation:
-    // aborting `signal` cancels the run exactly like the Node response-close path.
+    // aborting `signal` cancels THIS legacy run exactly like the Node
+    // response-close path.
+    //
+    // RACE NOTE (T12): cancellation is passed INTO store.run as `signal`, never by
+    // calling store.cancel(id) from a listener here. A listener on this route would
+    // outlive the run's gate: after the run finishes and the pump starts a QUEUED
+    // task, a still-registered abort would cancel that different task. The store
+    // forwards the signal to its own controller and removes the forwarder before
+    // releasing the gate (executeTurn), so identity is exact.
     const runSessionRoute = (id: string, input: string): HarnessApiResult => {
         // Validate before a status line is sent, so a busy session can still
         // answer with a normal JSON error (409) rather than an SSE failure frame.
@@ -542,20 +565,12 @@ export const createHarnessApi = ({
         return {
             kind: 'stream',
             start: async (emit, signal) => {
-                // A disconnect between dispatch and stream opening still cancels.
-                if (signal.aborted) {
-                    store.cancel(id);
-                    return;
-                }
-
-                const cancel = (): void => {
-                    store.cancel(id);
-                };
-
-                signal.addEventListener('abort', cancel, { once: true });
+                // A disconnect between dispatch and stream opening leaves nothing
+                // to run: an already-aborted signal means the client is gone.
+                if (signal.aborted) return;
 
                 try {
-                    await store.run(id, input, emit);
+                    await store.run(id, input, emit, { signal });
                 } catch (error) {
                     // The pre-flight check passed, so this is a race or an
                     // internal failure. The stream is already open; report it as
@@ -568,10 +583,149 @@ export const createHarnessApi = ({
                             session: store.get(id)
                         });
                     } catch {
-                        // Stream closed; cancellation already handled above.
+                        // Stream closed; the store has already settled the turn.
                     }
+                }
+            }
+        };
+    };
+
+    // GET /sessions/:id/events — the queue watch stream (R4).
+    //
+    // Unlike POST /messages, this stream does NOT own execution: the pump runs
+    // regardless of who is listening, and a submit is a 202 rather than a stream.
+    // A disconnect therefore only unsubscribes — it never aborts the run, which is
+    // why `signal` here is used for cleanup only (see the `start` body).
+    //
+    // Frame contract:
+    //   1. one `snapshot` immediately (complete state, including queueDepth);
+    //   2. `turn` upserts when a turn is queued, starts, and reaches a terminal
+    //      status (same id/index every time, so a client replaces by id);
+    //   3. `event` frames while a turn runs, each naming its turnId;
+    //   4. one final `snapshot` when the queue drains (or after reset).
+    //
+    // ORDERING: every frame goes through ONE promise chain (`tail`), snapshot first.
+    // publish() never awaits its watchers, so without this chain two async writes
+    // could overlap and a later frame could complete before an earlier one. The
+    // chain also bounds a slow observer: once more than MAX_WATCH_BACKLOG writes are
+    // pending, the observer is dropped (stream ended) instead of growing memory —
+    // and because publish() never waits, dropping can never stall the task pump.
+    const MAX_WATCH_BACKLOG = 1024;
+
+    const watchSessionRoute = (id: string): HarnessApiResult => {
+        // 404 before a status line, exactly like GET /sessions/:id.
+        store.get(id);
+
+        return {
+            kind: 'stream',
+            start: async (emit, signal) => {
+                // Resolved by the client disconnect, by the session being removed,
+                // or by this stream dropping a slow observer. Either way it ends
+                // WITHOUT touching the pump.
+                let finish!: () => void;
+                const finished = new Promise<void>((resolve) => {
+                    finish = resolve;
+                });
+
+                // Frames published between registration and the first chain entry
+                // (the snapshot) are buffered and appended right after it, so the
+                // snapshot is always the first frame and no frame is lost.
+                let ready = false;
+                let ended = false;
+                let abandoned = false;
+                let pendingWrites = 0;
+                const buffered: SessionStreamItem[] = [];
+
+                // Serialized writer: each item is written only after the previous
+                // write settled, so backpressure cannot reorder frames.
+                let tail: Promise<void> = Promise.resolve();
+
+                const append = (item: SessionStreamItem): void => {
+                    if (ended) return;
+
+                    pendingWrites += 1;
+
+                    if (pendingWrites > MAX_WATCH_BACKLOG) {
+                        // Slow/dead consumer: drop it rather than buffer forever.
+                        // Do not await the stalled tail below; the adapter ends the
+                        // response when start() returns.
+                        abandoned = true;
+                        ended = true;
+                        finish();
+                        return;
+                    }
+
+                    const written = tail.then(() => emit(item));
+
+                    tail = written.then(
+                        () => {
+                            pendingWrites -= 1;
+                        },
+                        () => {
+                            // The write failed (client vanished). End this stream;
+                            // the task is untouched.
+                            pendingWrites -= 1;
+                            ended = true;
+                            finish();
+                        }
+                    );
+                };
+
+                let watched: SessionWatch | undefined;
+                try {
+                    // watch() captures the snapshot atomically with registration.
+                    // The watcher callback is SYNCHRONOUS on purpose: frames are
+                    // queued in publish() order, not in resolution order.
+                    watched = store.watch(
+                        id,
+                        (item) => {
+                            if (!ready) {
+                                buffered.push(item);
+                                return;
+                            }
+
+                            append(item);
+                        },
+                        () => {
+                            // remove()/dispose(): the session is gone.
+                            ended = true;
+                            finish();
+                        }
+                    );
+                } catch {
+                    // Removed between dispatch and stream open: nothing to watch.
+                    return;
+                }
+
+                if (watched === undefined) return;
+
+                const onAbort = (): void => {
+                    // Unsubscribe only. Never store.cancel(): the task outlives
+                    // this browser by design.
+                    ended = true;
+                    finish();
+                };
+
+                signal.addEventListener('abort', onAbort, { once: true });
+                if (signal.aborted) finish();
+
+                // Snapshot first, then every buffered frame, then live frames — all
+                // through the same chain, in this exact order.
+                append({ type: 'snapshot', session: watched.snapshot });
+                ready = true;
+
+                for (const item of buffered.splice(0)) {
+                    append(item);
+                }
+
+                try {
+                    await finished;
+                    if (!abandoned) await tail;
                 } finally {
-                    signal.removeEventListener('abort', cancel);
+                    ready = false;
+                    ended = true;
+                    signal.removeEventListener('abort', onAbort);
+                    watched.unsubscribe();
                 }
             }
         };
@@ -783,15 +937,83 @@ export const createHarnessApi = ({
                         return { kind: 'json', status: 200, body: { session: store.get(first) } };
                     }
 
+                    // PATCH /sessions/:id — the ONE live mutation of an existing
+                    // session: retarget an agent's model without rebuilding the
+                    // harness or touching the frozen definition. Unlike the manual
+                    // tool routes this is allowed while a run streams (see
+                    // SessionStore.setAgentModels); nothing is aborted.
+                    //
+                    // Envelope matches GET /sessions/:id exactly: `{ session }`.
+                    if (method === 'PATCH') {
+                        const body = requireObjectBody<UpdateSessionRequest>(
+                            await readBody<UpdateSessionRequest>()
+                        );
+
+                        // Same policy as the harness writes: only whitelisted
+                        // fields, and a patch that names none is a 400 rather than
+                        // a silent no-op. Shape/agent/model-id validation of the map
+                        // itself belongs to the store, which knows the members.
+                        requireKnownFields(body, SESSION_PATCH_FIELDS);
+
+                        if (body.agentModels === undefined) {
+                            throw new HttpError(
+                                400,
+                                `A patch must change at least one of: ${SESSION_PATCH_FIELDS.join(', ')}.`
+                            );
+                        }
+
+                        return {
+                            kind: 'json',
+                            status: 200,
+                            body: { session: store.setAgentModels(first, body.agentModels) }
+                        };
+                    }
+
                     if (method === 'DELETE') {
                         if (!store.remove(first)) throw new HttpError(404, `Unknown session "${first}".`);
                         return { kind: 'json', status: 200, body: { deleted: true } };
                     }
 
-                    throw new HttpError(405, `Use GET or DELETE for ${mount}/sessions/:id.`);
+                    throw new HttpError(405, `Use GET, PATCH or DELETE for ${mount}/sessions/:id.`);
                 }
 
                 if (segments.length === 3) {
+                    // POST /sessions/:id/tasks — the server-queued submit (R4).
+                    //
+                    // 202 `{ session, turn }`: the turn exists immediately with
+                    // status 'queued' and a stable id/index, and the server pump
+                    // runs it even if this client (or any browser) disconnects.
+                    // Validation/trimming/cap live in the store (400/413/429) so
+                    // this route and the legacy /messages route cannot disagree.
+                    if (second === 'tasks') {
+                        if (method !== 'POST') throw new HttpError(405, 'Use POST to submit a task.');
+
+                        const body = requireObjectBody<SubmitTaskRequest>(
+                            await readBody<SubmitTaskRequest>()
+                        );
+                        if (typeof body.input !== 'string') {
+                            throw new HttpError(400, 'A task must be a string.');
+                        }
+
+                        const submitted = store.enqueue(first, body.input);
+
+                        return {
+                            kind: 'json',
+                            status: 202,
+                            body: { session: submitted.session, turn: submitted.turn }
+                        };
+                    }
+
+                    // GET /sessions/:id/events — watch the queue. This is a
+                    // WATCHER stream: disconnecting unsubscribes, never cancels.
+                    if (second === 'events') {
+                        if (method !== 'GET') {
+                            throw new HttpError(405, `Use GET for ${mount}/sessions/:id/events.`);
+                        }
+
+                        return watchSessionRoute(first);
+                    }
+
                     if (second === 'messages') {
                         if (method !== 'POST') throw new HttpError(405, 'Use POST to submit a task.');
 
@@ -818,10 +1040,28 @@ export const createHarnessApi = ({
                     if (second === 'cancel') {
                         if (method !== 'POST') throw new HttpError(405, 'Use POST to cancel a run.');
 
+                        // Optional body: `{ all: true }` also drops the queued
+                        // backlog (the UI Stop button). Absent/`{}` keeps the
+                        // legacy "cancel the active run only" behaviour and the
+                        // exact `{ cancelled }` response.
+                        const body = requireObjectBody<CancelSessionRequest>(
+                            await readBody<CancelSessionRequest>()
+                        );
+                        requireKnownFields(body, SESSION_CANCEL_FIELDS);
+
+                        if (body.all !== undefined && typeof body.all !== 'boolean') {
+                            throw new HttpError(400, '`all` must be a boolean when present.');
+                        }
+
                         // Look the session up first so an unknown id is a 404 even
                         // when there is nothing to cancel.
                         store.get(first);
-                        return { kind: 'json', status: 200, body: { cancelled: store.cancel(first) } };
+
+                        return {
+                            kind: 'json',
+                            status: 200,
+                            body: { cancelled: store.cancel(first, { all: body.all === true }) }
+                        };
                     }
                 }
             }

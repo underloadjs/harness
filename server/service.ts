@@ -198,7 +198,9 @@ const createSseResponse = (start: HarnessApiStream, requestSignal: AbortSignal |
             release();
         },
         cancel() {
-            // Browser closed the tab / fetch aborted: cancel the harness run.
+            // Browser closed the tab / fetch aborted. R4: the dispatcher decides
+            // what this means per route — POST /messages cancels the run (legacy),
+            // GET /sessions/:id/events only unsubscribes; the pump keeps working.
             stop();
             requestSignal?.removeEventListener('abort', onRequestAbort);
         }

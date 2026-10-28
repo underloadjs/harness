@@ -139,8 +139,23 @@ describe('agentDelegate', () => {
 
         // The primary sees toolRequest, toolCreate, delegate. The subagent never sees
         // the delegation control.
-        expect(declaredNames(seenWriter[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate']);
-        expect(declaredNames(seenResearcher[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
+        expect(declaredNames(seenWriter[0])).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
+            'agentDelegate'
+        ]);
+        expect(declaredNames(seenResearcher[0])).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage'
+        ]);
     });
 
     it('runs the subagent under its own instructions and returns only its answer', async () => {

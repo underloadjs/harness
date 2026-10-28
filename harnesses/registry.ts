@@ -291,7 +291,13 @@ const requireModelId = (value: unknown, agent: string): string => {
 // it configured something. Unknown keys are therefore rejected explicitly; the
 // caller (update) drops keys that became non-members because the SAME patch
 // changed the membership, which is a legitimate consequence rather than a typo.
-const normalizeAgentModels = (
+//
+// Exported because the session store validates the same map for
+// PATCH /sessions/:id (a live per-agent model change). One validator keeps the
+// two mutation surfaces from disagreeing about what a model id is, and the
+// message a client sees is identical. It throws HarnessRegistryError (400); a
+// non-registry caller re-wraps it into its own error type.
+export const normalizeAgentModels = (
     value: unknown,
     members: readonly string[]
 ): Record<string, string> => {

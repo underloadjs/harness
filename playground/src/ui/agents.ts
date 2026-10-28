@@ -20,8 +20,9 @@
 //     promotion button. It is a bare select with no visible "model" label; its
 //     accessible name still carries the agent. It never says "inherit": the
 //     no-override choice is labelled with the ACTUAL model it resolves to, and the
-//     provider catalogue follows alphabetically. A locked (saved) session shows the
-//     effective frozen model with the control disabled.
+//     provider catalogue follows alphabetically. R2: a saved session's models are
+//     LIVE (main.ts PATCHes /sessions/:id), so the control stays enabled there even
+//     though the team is frozen; only a caller with no model data disables it.
 //   - an active agent's tile carries `data-activity='active'` / `aria-busy` for the
 //     rotating ring (ui/activity.ts, styles.css).
 //
@@ -84,6 +85,10 @@ export type AgentModelSelect = {
     // False when the team is locked: the select shows the effective frozen model
     // and cannot change it. The caller explains the lock and offers New session.
     editable: boolean;
+    // R2: true when this dropdown edits a SAVED session's live model map. It only
+    // changes the tooltip's promise ("next request in this session" instead of
+    // "future sessions"); the control's enabled state still comes from `editable`.
+    session?: boolean;
     onChange?: (name: string, model: string) => void;
 };
 
@@ -208,7 +213,9 @@ const modelSelectFor = (name: string, title: string, models: AgentModelSelect): 
     select.title = models.editable
         ? models.onChange === undefined
             ? 'Model editing is unavailable.'
-            : `Model for ${name}. Applies to future sessions.`
+            : models.session === true
+              ? `Model for ${title}. Applies to the next request in this session.`
+              : `Model for ${title}. Applies to future sessions.`
         : 'This chat keeps the models it started with; start a new session to change them.';
 
     select.addEventListener('change', () => {

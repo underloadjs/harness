@@ -9,13 +9,17 @@
 //   createTodoTool() — the harness's per-session todoManage state, as a factory.
 //                  State stays in the closure so a harness (and nothing global)
 //                  owns it. See ../core/todo.ts.
+//   createProfileTool()/createChapterTool()/createLocationTool() — the same
+//                  factory pattern for the session record tools (profiles,
+//                  chapters, locations). See ../core/profile.ts, chapter.ts,
+//                  location.ts.
 //   coreToolMetadata()/agentDelegateMetadata() — the CORE tools' declarative half
 //                  (name, description, tags, schema). The runtime registration in
 //                  ../harness.ts and the server catalogue both read this copy.
 //   MAX_DISCOVERY_MATCHES — the discovery cap (R7) the toolRequest schema
 //                  advertises and searchTools enforces.
 //
-// Both factories are usable on their own. An agent on its own means writing the
+// These factories are usable on their own. An agent on its own means writing the
 // loop by hand: send a message, read `message.toolCalls`, run the tools, append
 // the results, send again. That is exactly what `harness()` automates.
 //
@@ -28,6 +32,9 @@ export { tool, toolParameterKey, normalizeTags } from './tool';
 export { MAX_DISCOVERY_MATCHES, searchTools } from './discovery';
 export { compileToolSource, createDynamicTool } from './creation';
 export { createTodoTool } from './todo';
+export { createProfileTool } from './profile';
+export { createChapterTool } from './chapter';
+export { createLocationTool } from './location';
 export {
     TOOL_UI_LIMITS,
     normalizeToolUiPanels,
@@ -43,6 +50,12 @@ export {
     TOOL_REQUEST_NAME,
     TODO_MANAGE_METADATA,
     TODO_MANAGE_NAME,
+    PROFILE_MANAGE_METADATA,
+    PROFILE_MANAGE_NAME,
+    CHAPTER_MANAGE_METADATA,
+    CHAPTER_MANAGE_NAME,
+    LOCATION_MANAGE_METADATA,
+    LOCATION_MANAGE_NAME,
     agentDelegateMetadata,
     coreToolMetadata
 } from './metadata';

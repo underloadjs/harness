@@ -361,7 +361,198 @@ const tileIndexes = (board: ReturnType<typeof createTurnBoard>): (string | null)
     [...board.element.querySelectorAll<HTMLElement>('.tile-index')].map((node) => node.textContent);
 
 // ---------------------------------------------------------------------------
-// Elapsed timing (R4)
+// Server queue (R4)
+// ---------------------------------------------------------------------------
+//
+// The server owns the queue: turns are FIFO, a task submitted while another runs
+// is `queued`, and the browser reconciles records by the stable server id. These
+// cases pin (a) queued rendering is neutral with no clock, (b) a queued turn sits
+// after the active one, (c) merging a record NEVER replays events the tile already
+// holds (no duplicated streamed text), and (d) reconcile keeps the reader's
+// expanded tile while adopting a task the browser had never seen.
+
+describe('server queue', () => {
+    const T = 1_700_000_000_000;
+
+    const start = (agent: string): { type: 'start'; agent: string; model: string } => ({
+        type: 'start',
+        agent,
+        model: 'm1'
+    });
+
+    const turnRecord = (overrides: Partial<SessionTurn> = {}): SessionTurn =>
+        ({
+            id: 't1',
+            index: 0,
+            prompt: 'task',
+            status: 'done',
+            startedAt: T,
+            updatedAt: T + 1000,
+            events: [],
+            ...overrides
+        }) as SessionTurn;
+
+    it('renders a queued turn neutral, with no ring and no elapsed clock', () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T));
+
+        const { board } = mount();
+        const queued = board.adopt(
+            turnRecord({
+                id: 't2',
+                index: 1,
+                prompt: 'second task',
+                status: 'queued',
+                startedAt: undefined,
+                updatedAt: T,
+                events: []
+            })
+        );
+
+        expect(queued.state()).toBe('queued');
+        expect(queued.element.dataset.state).toBe('queued');
+        expect(queued.element.parentElement?.dataset.state).toBe('queued');
+        expect(queued.element.querySelector('.tile-status-text')?.textContent).toBe('queued');
+        // No clock: a queued task is not running and must not accrue time.
+        expect(queued.elapsed()).toBe('');
+        expect(queued.element.querySelector<HTMLElement>('.tile-elapsed')?.hidden).toBe(true);
+
+        vi.advanceTimersByTime(5000);
+        expect(queued.elapsed()).toBe('');
+
+        vi.useRealTimers();
+    });
+
+    it('keeps queued tasks after the active one and advances them in FIFO order', () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T + 60_000));
+
+        const { board } = mount();
+
+        const active = turnRecord({
+            id: 'a',
+            index: 0,
+            status: 'running',
+            events: [start('writer')]
+        });
+        const queued = turnRecord({
+            id: 'b',
+            index: 1,
+            prompt: 'behind',
+            status: 'queued',
+            startedAt: undefined,
+            updatedAt: T,
+            events: []
+        });
+
+        const handles = board.reconcile([active, queued], { model: 'm1' });
+
+        expect(handles.map((handle) => handle.id())).toEqual(['a', 'b']);
+        expect(handles.map((handle) => handle.state())).toEqual(['streaming', 'queued']);
+        expect(
+            [...board.element.querySelectorAll<HTMLElement>('.turn-row')].map((row) => row.dataset.state)
+        ).toEqual(['streaming', 'queued']);
+
+        // The server advances the queue: B's upsert becomes running with a start
+        // stamp, and the tile now ticks from THAT stamp (never from the submit).
+        const advanced = turnRecord({
+            id: 'b',
+            index: 1,
+            prompt: 'behind',
+            status: 'running',
+            startedAt: T + 60_000,
+            updatedAt: T + 60_500,
+            events: [start('writer')]
+        });
+        handles[1].merge(advanced, 'm1');
+
+        expect(handles[1].state()).toBe('streaming');
+        expect(handles[1].elapsed()).toBe('0ms');
+        expect(handles[0].state()).toBe('streaming');
+
+        vi.useRealTimers();
+    });
+
+    it('merges a server record without replaying events the tile already streamed', () => {
+        const { board } = mount();
+        const turn = board.begin('streamed');
+        turn.bind({ id: 't1', index: 0 });
+
+        // Live frames: the tile already holds these two text deltas.
+        turn.apply({ type: 'text', agent: 'writer', delta: 'Hello ' });
+        turn.apply({ type: 'text', agent: 'writer', delta: 'world' });
+        turn.flush();
+
+        expect(turn.applied()).toBe(2);
+
+        // A reconnect reports the same record (the server now also has a third
+        // event). Only the third may be applied.
+        turn.merge(
+            turnRecord({
+                events: [
+                    { type: 'text', agent: 'writer', delta: 'Hello ' },
+                    { type: 'text', agent: 'writer', delta: 'world' },
+                    { type: 'text', agent: 'writer', delta: '!' }
+                ],
+                updatedAt: T + 100
+            }),
+            'm1'
+        );
+        turn.flush();
+
+        expect(turn.applied()).toBe(3);
+        expect(turn.element.querySelector('.agent-text')?.textContent).toBe('Hello world!\n');
+        expect(turn.element.querySelectorAll('.agent-text')).toHaveLength(1);
+    });
+
+    it('reconciles by id: keeps the expanded tile and adopts a turn it never saw', () => {
+        const { board } = mount();
+
+        const first = turnRecord({
+            id: 'a',
+            index: 0,
+            prompt: 'first',
+            events: [start('writer')]
+        });
+        const [handleA] = board.reconcile([first]);
+        board.expand(handleA);
+
+        // A second task was submitted elsewhere; the snapshot carries both.
+        const second = turnRecord({
+            id: 'b',
+            index: 1,
+            prompt: 'second',
+            status: 'running',
+            startedAt: T + 10,
+            updatedAt: T + 20,
+            events: [start('writer')]
+        });
+        const handles = board.reconcile([first, second], { keep: 'a' });
+
+        expect(handles.map((handle) => handle.id())).toEqual(['a', 'b']);
+        expect(handles[0]).toBe(handleA);
+        expect(board.expanded()).toBe(handleA);
+        // The reader's tile was merged in place, not rebuilt: same DOM node.
+        expect(handles[0].element).toBe(handleA.element);
+        expect(handles[1].state()).toBe('streaming');
+    });
+
+    it('drops turns the server no longer lists but keeps an unbound optimistic tile', () => {
+        const { board } = mount();
+
+        board.reconcile([turnRecord({ id: 'a', index: 0 })]);
+        const optimistic = board.begin('not answered yet');
+
+        const handles = board.reconcile([turnRecord({ id: 'b', index: 1, prompt: 'other' })]);
+
+        // Server authority removed `a`; the browser's own in-flight prompt stays.
+        expect(handles.map((handle) => handle.id())).toEqual(['b', undefined]);
+        expect(handles[1]).toBe(optimistic);
+        expect(board.turns()).toHaveLength(2);
+    });
+});
+
+
 // ---------------------------------------------------------------------------
 //
 // Live labels tick from the local clock; hydration uses the server's
@@ -394,6 +585,13 @@ describe('elapsed timing', () => {
         const turn = board.begin('live');
         const label = turn.element.querySelector<HTMLElement>('.tile-elapsed');
 
+        // R4: a queued tile has no clock. It may wait behind another task for
+        // minutes and must not be charged for that wait.
+        expect(turn.elapsed()).toBe('');
+        expect(label?.hidden).toBe(true);
+
+        // The clock starts only when the server advances the task to running.
+        turn.setState('streaming');
         expect(turn.elapsed()).toBe('0ms');
         expect(label?.hidden).toBe(false);
 

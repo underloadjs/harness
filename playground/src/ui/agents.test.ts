@@ -285,7 +285,10 @@ describe('per-agent model dropdown', () => {
         expect(catalogue).toEqual(['zeta-2', 'Alpha', 'beta-10', 'beta-2', 'alpha']);
     });
 
-    it('shows effective frozen models and disables the selects when the chat is locked', () => {
+    it('shows the effective models and honours a caller-disabled control', () => {
+        // The component does not decide whether a saved session may edit models
+        // (main.ts does, via `editable`); this pins that it truthfully renders the
+        // effective map and obeys an explicit lock.
         const onChange = vi.fn();
         const { element } = mount({
             members: ['instruct', 'summarizer'],
@@ -309,11 +312,27 @@ describe('per-agent model dropdown', () => {
             'm1'
         ]);
         expect(selects.map((select) => select.disabled)).toEqual([true, true]);
+        expect(selects[0].title).toBe(
+            'This chat keeps the models it started with; start a new session to change them.'
+        );
 
         // A disabled select cannot be driven by a stale handler.
         selects[0].value = 'm1';
         selects[0].dispatchEvent(new Event('change', { bubbles: true }));
         expect(onChange).not.toHaveBeenCalled();
+    });
+
+    it('promises a session-scoped edit when the caller marks the map live', () => {
+        // R2: the same control edits a saved session's live map; the tooltip must
+        // say so, because the team row above it is still locked.
+        const { element } = mount({
+            members: ['instruct'],
+            models: models({ session: true })
+        });
+
+        expect(element.querySelector<HTMLSelectElement>('.agent-model-select')?.title).toBe(
+            'Model for Instruct. Applies to the next request in this session.'
+        );
     });
 
     it('keeps the model row when no model data is supplied (caller has no catalogue)', () => {

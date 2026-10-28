@@ -158,10 +158,16 @@ it('lights on start, keeps a delegated sibling lit, and clears on done/terminal'
             if (url === '/api/models') return json({ models: ['m1'] });
             if (url === '/api/sessions' && init?.method === 'POST') return json({ session: snapshot() }, 201);
 
-            if (url === '/api/sessions/s1/messages') {
+            if (url === '/api/sessions/s1/tasks' && init?.method === 'POST') {
                 messageRequests += 1;
-                return stream.response;
+                const opening = turn({ events: [] });
+                return json(
+                    { session: snapshot({ status: 'running', turns: [opening] }), turn: opening },
+                    202
+                );
             }
+
+            if (url === '/api/sessions/s1/events') return stream.response;
 
             throw new Error(`unexpected request: ${url}`);
         })
@@ -246,9 +252,19 @@ it('clears every ring as soon as Stop is pressed', async () => {
             if (url === '/api') return json(bootstrap());
             if (url === '/api/models') return json({ models: ['m1'] });
             if (url === '/api/sessions' && init?.method === 'POST') return json({ session: snapshot() }, 201);
-            if (url === '/api/sessions/s1/messages') return stream.response;
+            if (url === '/api/sessions/s1/tasks' && init?.method === 'POST') {
+                const opening = turn({ events: [] });
+                return json(
+                    { session: snapshot({ status: 'running', turns: [opening] }), turn: opening },
+                    202
+                );
+            }
+            if (url === '/api/sessions/s1/events') return stream.response;
             if (url === '/api/sessions/s1/cancel' && init?.method === 'POST') {
                 return json({ cancelled: true });
+            }
+            if (url === '/api/sessions/s1') {
+                return json({ session: snapshot({ turns: [turn({ status: 'cancelled' })] }) });
             }
             if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [] });
 

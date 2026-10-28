@@ -4,10 +4,10 @@
 // ----------------------------------------------
 // `createToolCatalogue()` (./index.ts) lists tools a host can call DIRECTLY: no
 // harness, no model, no session. The harness-owned core tools are the opposite —
-// toolRequest, toolCreate, todoManage, and agentDelegate only mean something
-// inside one session's harness, because they mutate that harness's enabled set,
-// registry, todo list, or agent team. Adding them there would make the CLI promise
-// a callable tool it cannot run.
+// toolRequest, toolCreate, todoManage, profileManage, chapterManage, locationManage,
+// and agentDelegate only mean something inside one session's harness, because they
+// mutate that harness's enabled set, registry, todo list, record stores, or agent
+// team. Adding them there would make the CLI promise a callable tool it cannot run.
 //
 // R18: the four core FILE tools (fileRead/fileWrite/fileEdit/fileGlob) and a
 // configured webSearch are also `visibility: 'core'`, but they are NOT listed
@@ -52,10 +52,11 @@ export const CORE_TOOL_GROUP = 'Core tools' as const;
 export const CORE_TOOL_SESSION_HINT =
     'Runs inside a session harness: send a sessionId with the call.';
 
-// Build the four core entries. `agentDelegate` is always listed, with generic
-// metadata: the catalogue is host-wide, while whether agentDelegate is registered
-// is a property of the selected session's harness. A session without subagents
-// answers a clear 404 rather than inventing a subagent.
+// Build the core entries: the six always-registered harness tools from
+// coreToolMetadata(), then agentDelegate. `agentDelegate` is always listed, with
+// generic metadata: the catalogue is host-wide, while whether agentDelegate is
+// registered is a property of the selected session's harness. A session without
+// subagents answers a clear 404 rather than inventing a subagent.
 export const createCoreToolEntries = (): CatalogueEntry[] =>
     [...coreToolMetadata(), agentDelegateMetadata()].map((metadata) => ({
         name: metadata.name,

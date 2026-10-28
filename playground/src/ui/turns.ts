@@ -1,32 +1,35 @@
-// Turn tiles: one tile per logical user → assistant exchange.
+// Turn tiles: one tile per logical user → assistant exchange, laid out as a
+// single vertical timeline.
 //
 // Turn boundaries are server data, not browser inference. The server records one
 // `SessionTurn` per submitted task (`id`, `index`, `prompt`, `status`, `events`)
 // and returns that list from `GET /sessions`, `GET /sessions/:id` and in the
-// terminal frame of every stream. This module renders those records:
+// snapshot frames of the queue observer. This module renders those records:
 //
 //   - `begin(prompt)` creates an optimistic tile for a prompt the browser is
-//     about to submit, before the server has a turn for it;
-//   - `bind(turn)` attaches the server id/index when the stream's opening `turn`
-//     frame arrives, so later `event` frames route by explicit id;
-//   - `adopt(turn)` / `hydrate(turns)` rebuild tiles from a server snapshot by
-//     replaying the recorded events in order. This is how a reload, a session
-//     selection or an in-progress poll renders history: the server record wins
-//     over anything the browser had projected locally.
+//     about to enqueue, before the server has a turn for it. It starts `queued`
+//     and NEUTRAL: no spinner, no elapsed clock;
+//   - `bind(turn)` attaches the server id/index when the POST /tasks answer (or a
+//     stream `turn` frame) arrives, so later `event` frames route by explicit id;
+//   - `merge(turn)` reconciles an existing tile with an authoritative server record
+//     (queued → running → terminal) by replaying ONLY events it has not applied
+//     yet, so a reconnect/upsert never duplicates streamed text;
+//   - `adopt(turn)` / `reconcile(turns)` rebuild or update tiles from a server
+//     snapshot. This is how a reload, a session selection or an in-progress poll
+//     renders history: the server record wins over anything the browser projected.
 //
-// Delegation — one agent calling another — shows up as extra agents inside the
-// same turn (each event names its agent) and is labelled as a subagent.
-//
-// Layout model:
-//   - every turn is a compact, content-height tile in a responsive grid that
-//     fills left to right; a compact tile shows a two-line prompt preview, the
-//     counts and the model, and encodes its state by colour (green completed,
-//     red failed, neutral cancelled) plus a shared activity ring while it works;
-//   - exactly one tile is expanded at a time, and the newest turn is expanded as
-//     soon as it starts;
+// Timeline model (R4):
+//   - one linear, vertical list — completed tasks grey, the active task green,
+//     queued tasks neutral. Order is the server's FIFO submission order, so a
+//     task submitted while another runs visibly sits BEHIND it;
+//   - every tile is a compact content-height row on a shared vertical rule; only
+//     the active (or user-selected) tile expands;
 //   - expanding an older tile never destroys the newest turn's content: tiles
 //     keep their DOM, only visibility changes, so a user reading turn 3 is not
 //     pulled away by deltas arriving for turn 7.
+//
+// Delegation — one agent calling another — shows up as extra agents inside the
+// same turn (each event names its agent) and is labelled as a subagent.
 //
 // Rendering model: assistant text is Markdown, re-rendered per animation frame
 // while it streams (see playground/src/ui/markdown.ts for the sanitizer) and
@@ -38,7 +41,7 @@
 //   - tool cards: playground/src/ui/tools.ts
 //   - lifecycle status (topbar pill): playground/src/main.ts (`setLifecycle`)
 //   - elapsed formatting: playground/src/ui/time.ts
-//   - styles: playground/src/styles.css (`.turns`, `.tile`, `.agent`)
+//   - styles: playground/src/styles.css (`.turns`, `.turn-row`, `.tile`, `.agent`)
 
 import type { HarnessEvent, HarnessUsage, SessionTurn, SessionTurnStatus } from '../../../server/protocol';
 import { callIdOf, eventTimesOf, finiteOf, usageOf } from '../contract';
@@ -49,17 +52,21 @@ import { createToolCallCard } from './tools';
 import type { ToolCallCard, ToolState } from './tools';
 
 // Lifecycle of one user turn. `queued` and `waiting` are distinct on purpose:
-// `queued` means the browser has the prompt but has not got a session yet,
-// `waiting` means the request is on the wire and the first event has not arrived.
-// Anything later is driven by real events, never by a timer.
+// `queued` means the task is retained by the server behind other work (or the
+// browser is enqueueing it); `waiting` means the request is on the wire and the
+// first event has not arrived. Anything later is driven by real events, never by a
+// timer.
 //
 // Server statuses map onto this set one-to-one (`running` → `streaming`); the two
 // pre-request states only ever exist for an optimistic browser-created tile.
 export type TurnState = 'queued' | 'waiting' | 'streaming' | 'done' | 'error' | 'cancelled';
 
 // Server status → tile state. A running server turn is "streaming" even when the
-// browser is polling a snapshot instead of holding a live stream.
-const stateOf = (status: SessionTurnStatus): TurnState => (status === 'running' ? 'streaming' : status);
+// browser is polling a snapshot instead of holding a live stream. `queued` is a
+// server status too (R4): it passes straight through so a retained task renders
+// neutral instead of pretending to run.
+const stateOf = (status: SessionTurnStatus | 'queued'): TurnState =>
+    status === 'running' ? 'streaming' : status;
 
 export type TurnHandle = {
     element: HTMLElement;
@@ -73,6 +80,16 @@ export type TurnHandle = {
     // should fall back to the local clock (`live`) or to no timing at all
     // (`recorded`, the legacy-replay path).
     apply: (event: HarnessEvent, at?: number, origin?: ApplyOrigin) => void;
+    // Reconcile this tile with an authoritative server record (R4 queue): bind its
+    // id/index, update status/timing/usage, and apply ONLY the events after the
+    // ones this tile already holds. A streamed prefix is therefore never replayed
+    // twice, which is what keeps a reconnect (live frames, then a snapshot) from
+    // duplicating assistant text. Safe to call for queued, running and terminal
+    // records; `model` is the detail line for a settled tile.
+    merge: (turn: SessionTurn, model?: string) => void;
+    // Number of `events` this tile has applied (live + recorded). Exposed for the
+    // reconciliation tests and for callers that want to prove no double-apply.
+    applied: () => number;
     // Render every pending incremental update immediately. Called when a turn
     // settles so the final text is never one frame behind the status.
     flush: () => void;
@@ -136,6 +153,10 @@ export type TurnBoard = {
     // Replace the whole board with the server's turns. Returns the new handles;
     // any previous handle is detached and must not be used again.
     hydrate: (turns: readonly SessionTurn[], options?: HydrateOptions) => TurnHandle[];
+    // Reconcile in place with the server's turns (R4): match by id, merge events
+    // without duplicating them, adopt new turns, drop removed ones, and keep the
+    // reader's expanded tile. This is the snapshot path for a live queue.
+    reconcile: (turns: readonly SessionTurn[], options?: HydrateOptions) => TurnHandle[];
     // Stop every live timer the board owns. Safe to call repeatedly; the page's
     // `pagehide` handler and a view teardown both use it.
     destroy: () => void;
@@ -150,11 +171,13 @@ const STATE_TEXT: Readonly<Record<TurnState, string>> = {
     cancelled: 'cancelled'
 };
 
-// States that mean "work is in flight". Drives the compact tile's activity ring
-// (styles.css, shared with the agent row); the status text stays in the DOM as
-// the accessible signal even though a compact tile clips it visually.
-const isLive = (state: TurnState): boolean =>
-    state === 'queued' || state === 'waiting' || state === 'streaming';
+// States that mean "work is actually executing". Drives the compact tile's
+// activity ring (styles.css, shared with the agent row) AND the elapsed clock.
+// `queued` is deliberately NOT live (R4): a retained task is neutral — no
+// spinning ring and no tick — until the server advances it to running. The status
+// text stays in the DOM as the accessible signal even though a compact tile clips
+// it visually.
+const isLive = (state: TurnState): boolean => state === 'waiting' || state === 'streaming';
 
 // Unique ids for `aria-controls`. A module counter is enough: one document.
 let nextId = 0;
@@ -283,6 +306,16 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         const card = el('article', 'tile');
         card.dataset.state = 'queued';
 
+        // Timeline row: the marker is a SIBLING of the card so the card can keep
+        // `overflow: hidden` (the active ring is drawn inside its border) while the
+        // marker still sits on the shared vertical rule at negative x. The row
+        // mirrors the tile state so CSS can colour the marker (styles.css).
+        const row = el('div', 'turn-row');
+        row.dataset.state = 'queued';
+        const marker = el('span', 'turn-marker');
+        marker.setAttribute('aria-hidden', 'true');
+        row.append(marker, card);
+
         const select = el('button', 'tile-select');
         select.type = 'button';
         select.setAttribute('aria-expanded', 'false');
@@ -332,13 +365,23 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         let toolCount = 0;
         // Server identity for this tile. Absent until `bind()` or a snapshot.
         let serverId: string | undefined;
+        // How many of the server turn's `events` this tile has applied. Live
+        // frames and replayed records both count, so `merge()` can skip the
+        // prefix it already rendered instead of appending it twice.
+        let appliedCount = 0;
+        // The events themselves, in order. `merge()` compares the server's prefix
+        // against these: identical means "append the remainder"; different means
+        // the server record won and the projection must be rebuilt.
+        const appliedEvents: HarnessEvent[] = [];
 
         // --- timing --------------------------------------------------------
-        // An optimistic tile starts on the local clock; `bind()`/`setTiming()`
-        // replace that with the server's `startedAt`. `endedAt` is set when the
-        // turn settles: the local clock for a live run, `updatedAt` on hydration
-        // (which is why a poll/rebuild never resets the shown duration).
-        let startedAt: number | undefined = Date.now();
+        // A queued tile has NO clock (R4): the task may wait behind another run for
+        // minutes, and counting that wait would be a lie. `startedAt` is set when
+        // the tile actually starts working (`waiting`/`streaming`), or replaced by
+        // the server's `startedAt` through `bind()`/`setTiming()`. `endedAt` is set
+        // when the turn settles: the local clock for a live run, `updatedAt` on
+        // hydration (which is why a poll/rebuild never resets the shown duration).
+        let startedAt: number | undefined;
         let endedAt: number | undefined;
         let elapsedTick: number | undefined;
         // True once `setTiming` supplied recorded server stamps. A replay calls
@@ -428,9 +471,11 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
             // Terminal states freeze the elapsed label. Hydration may already have
             // supplied the server's `updatedAt`; in that case keep it instead of
-            // overwriting it with the replay's local clock.
+            // overwriting it with the replay's local clock. A task that never
+            // started (cancelled while queued) had no span, so leave the label
+            // hidden rather than printing a fabricated 0ms.
             if (next === 'done' || next === 'error' || next === 'cancelled') {
-                if (endedAt === undefined && !recordedTiming) endedAt = Date.now();
+                if (startedAt !== undefined && endedAt === undefined && !recordedTiming) endedAt = Date.now();
                 stopElapsed();
                 // A tool call left pending when the run ended must not keep a live
                 // ticker running on a settled tile.
@@ -441,11 +486,20 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 }
             } else if (!recordedTiming) {
                 endedAt = undefined;
-                startElapsed();
+
+                // The clock starts only when the task actually runs (R4). `queued`
+                // deliberately does not start it; `waiting`/`streaming` do.
+                if (next === 'waiting' || next === 'streaming') {
+                    if (startedAt === undefined) startedAt = Date.now();
+                    startElapsed();
+                }
             }
 
             paintElapsed();
             card.dataset.state = next;
+            // The row mirrors the state so the timeline marker and the tile never
+            // disagree (green only for the active task, grey when completed).
+            row.dataset.state = next;
             badge.dataset.state = next;
             statusText.textContent = STATE_TEXT[next];
             updateMeta();
@@ -646,12 +700,37 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             section.meta.textContent = text;
         };
 
+        // Discard everything the browser rendered from a now-superseded event
+        // stream. Used only when a server record's event prefix DISAGREES with what
+        // the tile applied (the record wins), never on a normal reconnect where the
+        // prefix matches and only the remainder is appended.
+        const resetProjection = (): void => {
+            for (const section of sections.values()) {
+                if (section.text !== undefined) cancel(section.text);
+                for (const tool of section.tools) tool.destroy();
+            }
+
+            sections.clear();
+            pendingTools.length = 0;
+            flow.replaceChildren();
+            primaryAgent = undefined;
+            toolCount = 0;
+            appliedCount = 0;
+            appliedEvents.length = 0;
+        };
+
         // --- events -------------------------------------------------------
         // `at` is the server clock for this event. A live frame arrives with one
         // on the new server; local date is only the fallback. `origin` keeps the
         // replay path honest for records that predate timing support.
         const apply = (event: HarnessEvent, at?: number, origin: ApplyOrigin = 'live'): void => {
-            if (isLive(state) && state !== 'streaming') setState('streaming');
+            // A queued tile receiving its first event is now running: transition
+            // locally (the server may batch the status upsert). `waiting` is the
+            // pre-first-event state; both become `streaming`.
+            if (state === 'queued' || state === 'waiting') setState('streaming');
+
+            appliedCount += 1;
+            appliedEvents.push(event);
 
             switch (event.type) {
                 case 'start': {
@@ -751,16 +830,64 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             card.dataset.turnId = server.id;
             index.textContent = `#${server.index + 1}`;
 
+            // A queued turn has no `startedAt` yet (optional until execution), so a
+            // queued tile keeps its clock hidden. Once the server supplies a start,
+            // it replaces the local baseline and the tick resumes if still live.
             const serverStart = finiteOf(server.startedAt);
             if (serverStart !== undefined) {
                 startedAt = serverStart;
                 paintElapsed();
+                if (isLive(state) && endedAt === undefined) startElapsed();
             }
         };
 
+        // Reconcile this tile with an authoritative server record (R4). This is the
+        // queue-aware replacement for "rebuild from zero": identity/index/timing/
+        // status come from the record, and ONLY events past `appliedCount` are
+        // applied. A reconnect that already streamed a prefix therefore appends
+        // the remainder instead of duplicating assistant text.
+        //
+        // Queued records carry no `startedAt`; a running one has no `endedAt`; a
+        // terminal one freezes at `updatedAt` (never at "now", so a poll and the
+        // live view agree). The model detail follows the existing tile convention.
+        const merge = (source: SessionTurn, model?: string): void => {
+            bind(source);
+
+            const terminal =
+                source.status !== 'running' && (source.status as string) !== 'queued';
+            setTiming({
+                startedAt: finiteOf(source.startedAt),
+                endedAt: terminal ? finiteOf(source.updatedAt) : undefined
+            });
+
+            const times = eventTimesOf(source);
+            const events = Array.isArray(source.events) ? source.events : [];
+
+            // Server authority with no duplicated text: keep the applied prefix
+            // only if it MATCHES the record. A shorter/different record means the
+            // browser's projection was superseded, so rebuild it from the record.
+            const samePrefix =
+                appliedCount <= events.length &&
+                appliedEvents.every(
+                    (event, position) => JSON.stringify(event) === JSON.stringify(events[position])
+                );
+            if (!samePrefix) resetProjection();
+
+            for (let position = appliedCount; position < events.length; position += 1) {
+                apply(events[position], times?.[position], 'recorded');
+            }
+            appliedCount = events.length;
+
+            // The server owns the tally (see setUsage).
+            setUsage(usageOf(source.usage));
+
+            setState(stateOf(source.status), model !== undefined && model.length > 0 ? model : undefined);
+            flush();
+        };
+
         // Clicking the header expands a compact tile; clicking the expanded tile
-        // collapses it back to the grid (so the whole conversation is visible at
-        // once). Only one tile is ever expanded.
+        // collapses it back to the timeline (so the whole conversation is visible
+        // at once). Only one tile is ever expanded.
         select.addEventListener('click', () => {
             if (expandedTurn === turn) collapse();
             else expand(turn);
@@ -783,6 +910,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             state: () => state,
             setState,
             apply,
+            merge,
+            applied: () => appliedCount,
             flush,
             id: () => serverId,
             bind,
@@ -795,11 +924,13 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         };
 
         turns.push(turn);
-        element.append(card);
-        // Paint the optimistic "0ms" and start counting; `bind`/`setTiming`
-        // re-baseline without ever showing a negative or a NaN.
+        // The card lives inside its timeline row; the row is what the board
+        // appends, removes and reorders, and it carries the marker state.
+        element.append(row);
+        // A queued tile paints no clock (nothing is running yet). `bind()` and
+        // `setState('streaming')` start it from the server's start stamp, so a
+        // task that waited in the queue is never charged for the wait.
         paintElapsed();
-        startElapsed();
         // Newest turn opens full-width. This is the *only* moment the board
         // changes the selection on its own: stream deltas never steal the view.
         expand(turn);
@@ -819,7 +950,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
     const clear = (): void => {
         for (const turn of turns) {
             turn.destroy();
-            turn.element.remove();
+            // The tile is wrapped in its timeline row; removing the card alone
+            // would leave an empty marker on the rule.
+            turn.element.parentElement?.remove();
         }
         turns.length = 0;
 
@@ -841,39 +974,80 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         sequence += 1;
 
         const handle = create(source.prompt, source.index + 1);
-        handle.bind(source);
-
-        // Server timing wins over the replay clock. A running turn keeps ticking
-        // from `startedAt`; a settled turn freezes at `updatedAt`. Legacy records
-        // have neither, so `setTiming` gets undefined and the label stays hidden.
-        handle.setTiming({
-            startedAt: finiteOf(source.startedAt),
-            endedAt: source.status === 'running' ? undefined : finiteOf(source.updatedAt)
-        });
-
-        // `eventTimes` is aligned 1:1 with `events`. When the server sent none,
-        // pass no timestamp at all in recorded mode: tool cards then show no
-        // duration instead of a fabricated one.
-        const times = eventTimesOf(source);
-        for (let index = 0; index < source.events.length; index += 1) {
-            handle.apply(source.events[index], times?.[index], 'recorded');
-        }
-
-        // The server's tally is the one to show: replaying the per-request events
-        // would recompute it, and a run whose provider reported nothing has no
-        // tally at all (undefined hides the label rather than printing 0).
-        handle.setUsage(usageOf(source.usage));
-
-        const next = stateOf(source.status);
-        // The meta line carries only the model; the state is painted by the
-        // `.tile-status` dot and the tile's state border (styles.css), so
-        // repeating "done"/"error" here would be a second, redundant label. A
-        // running turn also has no detail: its agent/tool count and the live
-        // status badge already say more.
-        handle.setState(next, model !== undefined && model.length > 0 ? model : undefined);
-        handle.flush();
+        // One code path with `merge` keeps a freshly adopted tile and a reconciled
+        // live tile identical: timing, events, tally and status all come from the
+        // record, and `appliedCount` starts at zero for a new tile.
+        handle.merge(source, model);
 
         return handle;
+    };
+
+    // Reconcile the board with an authoritative snapshot (R4 queue).
+    //
+    // Unlike `hydrate` this does NOT rebuild the transcript: tiles are matched by
+    // the server's stable FIFO id and merged in place, so the reader's expanded
+    // tile, its DOM, and any text already rendered survive a reconnect/poll. New
+    // turns are adopted, turns the server dropped are removed, and the DOM is
+    // re-ordered to the server's index order (a reconnect can otherwise append a
+    // turn that belongs in the middle).
+    //
+    // An UNBOUND tile (id undefined: enqueue still in flight, or a failed submit)
+    // is kept after the server turns: the browser must not silently discard the
+    // user's prompt, and the POST answer will bind it shortly.
+    const reconcile = (
+        sources: readonly SessionTurn[],
+        options: HydrateOptions = {}
+    ): TurnHandle[] => {
+        const keepId = options.keep ?? expandedTurn?.id();
+        const seen = new Set<string>();
+        const ordered: TurnHandle[] = [];
+
+        for (const source of sources) {
+            seen.add(source.id);
+
+            const existing = find(source.id);
+            if (existing !== undefined) {
+                existing.merge(source, options.model);
+                ordered.push(existing);
+            } else {
+                ordered.push(adopt(source, options.model));
+            }
+        }
+
+        // Server authority: a turn the snapshot no longer lists is gone (reset, or
+        // a queued task cancelled from the queue). Drop it from the timeline.
+        const unbound: TurnHandle[] = [];
+        for (const turn of [...turns]) {
+            const id = turn.id();
+            if (id === undefined) {
+                unbound.push(turn);
+                continue;
+            }
+
+            if (seen.has(id)) continue;
+
+            turn.destroy();
+            turn.element.parentElement?.remove();
+        }
+
+        const next = [...ordered, ...unbound];
+        turns.length = 0;
+        turns.push(...next);
+
+        // Appending an existing node MOVES it, which is how the order is fixed
+        // without rebuilding any tile. Notices are re-anchored after the rows.
+        for (const turn of next) {
+            const row = turn.element.parentElement;
+            if (row !== null) element.append(row);
+        }
+        for (const node of [...element.querySelectorAll<HTMLElement>('.notice')]) element.append(node);
+
+        // Keep the reader where they were; collapse only if that turn disappeared.
+        const kept = keepId === undefined ? undefined : next.find((handle) => handle.id() === keepId);
+        if (kept !== undefined) expand(kept);
+        else if (expandedTurn !== undefined && !next.includes(expandedTurn)) collapse();
+
+        return next;
     };
 
     // Replace the board with the server's authoritative turn list. Expansion is
@@ -910,6 +1084,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         find,
         adopt,
         hydrate,
+        reconcile,
         destroy
     };
 };
