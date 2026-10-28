@@ -240,7 +240,9 @@ describe('server turns', () => {
         expect(turn.element.querySelector('.tile-status-text')?.textContent).toBe('done');
         expect(turn.element.querySelector('.agent-text')?.innerHTML).toBe('<p>recorded <strong>prose</strong></p>\n');
         expect(turn.element.querySelector<HTMLElement>('details.tool')?.dataset.state).toBe('ok');
-        expect(turn.element.querySelector('.tile-meta')?.textContent).toBe('1 agent · 1 tool call · m1 · done');
+        // The meta line stops at the model: the settled state is carried by the
+        // tile's colour (`data-state`), never repeated as a second "done" word.
+        expect(turn.element.querySelector('.tile-meta')?.textContent).toBe('1 agent · 1 tool call · m1');
         expect(empty.isConnected).toBe(false);
     });
 
@@ -280,7 +282,8 @@ describe('server turns', () => {
         expect(handles[0].element.classList.contains('is-expanded')).toBe(false);
         expect(handles[0].element.querySelector('.agent-text')?.textContent).toBe('one\n');
         expect(handles[1].element.querySelector('.agent-error-text')?.textContent).toBe('boom');
-        expect(handles[1].element.querySelector('.tile-meta')?.textContent).toBe('1 agent · m1 · error');
+        // Failure is colour-coded (`data-state="error"`), not spelled out again.
+        expect(handles[1].element.querySelector('.tile-meta')?.textContent).toBe('1 agent · m1');
     });
 
     it('keeps the reader’s expanded turn across a snapshot rebuild', () => {
@@ -482,6 +485,216 @@ describe('elapsed timing', () => {
         );
 
         expect(turn.element.querySelector('.tool-duration')?.textContent).toBe('750ms');
+    });
+
+    // Consecutive calls must read as one compact row. jsdom cannot compute the
+    // flex layout, so the DOM contract is the group boundary: calls between two
+    // prose/reasoning blocks share one `.tool-group`, and every card stays a
+    // direct child of that group (never a direct child of `.agent-flow`).
+    it('puts consecutive tool calls in one wrapping group', () => {
+        const { board } = mount();
+        const turn = board.begin('two calls');
+
+        turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'fileRead', arguments: '{"path":"a"}' } });
+        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'c2', name: 'websearch', arguments: '{"query":"x"}' } });
+
+        const groups = [...turn.element.querySelectorAll('.agent-flow > .tool-group')];
+        expect(groups).toHaveLength(1);
+        expect([...groups[0].children].map((child) => child.className)).toEqual(['tool', 'tool']);
+        expect([...groups[0].querySelectorAll('.tool-name')].map((node) => node.textContent)).toEqual([
+            'fileRead',
+            'websearch'
+        ]);
+        // No card escaped the group into the flow column.
+        expect(turn.element.querySelectorAll('.agent-flow > details.tool')).toHaveLength(0);
+    });
+
+    it('starts a new group after prose and resolves calls in place', () => {
+        const { board } = mount();
+        const turn = board.begin('mixed flow');
+
+        turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'fileRead', arguments: '{}' } });
+        turn.apply({ type: 'text', agent: 'writer', delta: 'checking more' });
+        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'c2', name: 'commandRun', arguments: '{}' } });
+        turn.apply({ type: 'tool_result', agent: 'writer', name: 'fileRead', content: '{"ok":true}', isError: false });
+
+        const flowChildren = [...(turn.element.querySelector('.agent-flow')?.children ?? [])].map(
+            (child) => child.className
+        );
+        // tool row → prose → tool row; the resolved card stays in the first row.
+        expect(flowChildren).toEqual(['tool-group', 'markdown agent-text', 'tool-group']);
+
+        const first = turn.element.querySelector<HTMLDetailsElement>('.tool-group > details.tool');
+        expect(first?.getAttribute('data-state')).toBe('ok');
+        expect(first?.querySelector('.tool-result code')?.textContent).toBe('{\n  "ok": true\n}');
+        expect(turn.element.querySelectorAll('.agent-flow > details.tool')).toHaveLength(0);
+    });
+
+    it('replays the same grouping from a recorded turn', () => {
+        const { board } = mount();
+        const [turn] = board.hydrate([
+            serverTurn({
+                events: [
+                    { type: 'start', agent: 'writer', model: 'm1' },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'websearch', arguments: '{}' } },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c2', name: 'websearch', arguments: '{}' } },
+                    { type: 'reasoning', agent: 'writer', delta: 'thinking' },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c3', name: 'fileRead', arguments: '{}' } }
+                ]
+            })
+        ]);
+
+        const groups = [...turn.element.querySelectorAll('.agent-flow > .tool-group')];
+        expect(groups.map((group) => group.querySelectorAll('details.tool').length)).toEqual([2, 1]);
+        expect(groups[1].querySelector('.tool-name')?.textContent).toBe('fileRead');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Token tally (W4)
+// ---------------------------------------------------------------------------
+//
+// The header prints the SERVER's running tally next to the elapsed label:
+// `#1  2m 29s | 122,111 (100,301)   [done]`. The separator is CSS decoration, so
+// the span's text is exactly the formatted figure. The tile only ever prints a
+// figure it was handed (a live frame's `usage` via setUsage, or a record's
+// `SessionTurn.usage` on hydration) — it never sums `usage` events itself.
+
+describe('token tally', () => {
+    const serverTurn = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
+        id: 't1',
+        index: 0,
+        prompt: 'server prompt',
+        status: 'done',
+        startedAt: 1,
+        updatedAt: 2,
+        events: [],
+        ...overrides
+    });
+
+    // The four header spans, in DOM order. `tile-tokens` sits between the elapsed
+    // label and the status badge.
+    const topClasses = (turn: { element: HTMLElement }): (string | null)[] =>
+        [...(turn.element.querySelector('.tile-top')?.children ?? [])].map((child) => child.className);
+
+    it('starts hidden and empty on a fresh optimistic tile', () => {
+        const { board } = mount();
+        const turn = board.begin('no usage yet');
+        const label = turn.element.querySelector<HTMLElement>('.tile-tokens');
+
+        // Nothing has reported usage, so the label claims nothing rather than "0".
+        expect(turn.tokens()).toBe('');
+        expect(label?.textContent).toBe('');
+        expect(label?.hidden).toBe(true);
+    });
+
+    it('shows the server tally between the elapsed label and the status', () => {
+        const { board } = mount();
+        const turn = board.begin('tallied');
+
+        turn.setUsage({ input: 122111, output: 4, total: 5, cached: 100301 });
+
+        const label = turn.element.querySelector<HTMLElement>('.tile-tokens');
+        // No pipe in the text: the `|` is styles.css decoration between the spans.
+        expect(turn.tokens()).toBe('122,111 (100,301)');
+        expect(label?.textContent).toBe('122,111 (100,301)');
+        expect(label?.hidden).toBe(false);
+        expect(topClasses(turn)).toEqual(['tile-index', 'tile-elapsed', 'tile-tokens', 'tile-status']);
+    });
+
+    it('hides the label again when the tally is cleared', () => {
+        const { board } = mount();
+        const turn = board.begin('cleared');
+
+        turn.setUsage({ input: 122111, output: 4, total: 5, cached: 100301 });
+        expect(turn.tokens()).toBe('122,111 (100,301)');
+
+        turn.setUsage(undefined);
+
+        const label = turn.element.querySelector<HTMLElement>('.tile-tokens');
+        expect(turn.tokens()).toBe('');
+        expect(label?.textContent).toBe('');
+        expect(label?.hidden).toBe(true);
+    });
+
+    it('hydrates the recorded tally onto a replayed turn', () => {
+        const { board } = mount();
+
+        const [turn] = board.hydrate([
+            serverTurn({ usage: { input: 292, output: 104, total: 396, cached: 168 } })
+        ]);
+
+        // formatTokens prints the INPUT count then the CACHED count, not totals.
+        expect(turn.tokens()).toBe('292 (168)');
+        expect(turn.element.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(false);
+    });
+
+    it('leaves a hydrated turn without a usage record empty', () => {
+        const { board } = mount();
+
+        const [turn] = board.hydrate([serverTurn({ events: [{ type: 'start', agent: 'writer', model: 'm1' }] })]);
+
+        // Absent usage is unknown, not a zero-spend turn.
+        expect(turn.tokens()).toBe('');
+        expect(turn.element.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(true);
+    });
+
+    it('does not tally usage events itself when replaying a record', () => {
+        const { board } = mount();
+
+        const [turn] = board.hydrate([
+            serverTurn({
+                events: [
+                    { type: 'start', agent: 'writer', model: 'm1' },
+                    {
+                        type: 'usage',
+                        agent: 'writer',
+                        usage: { input: 122111, output: 4, total: 5, cached: 100301 }
+                    },
+                    { type: 'text', agent: 'writer', delta: 'answer' }
+                ]
+            })
+        ]);
+
+        // The record carries no `usage` tally, so the header stays clean: two
+        // accumulators (events here, server there) would disagree on a re-render.
+        expect(turn.tokens()).toBe('');
+        expect(turn.element.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(true);
+    });
+
+    it('does not tally a live usage event applied through apply()', () => {
+        const { board } = mount();
+        const turn = board.begin('live usage');
+
+        turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+        turn.apply({
+            type: 'usage',
+            agent: 'writer',
+            usage: { input: 122111, output: 4, total: 5, cached: 100301 }
+        });
+
+        // The server's own tally on the frame (setUsage) is authoritative; the
+        // event alone changes nothing.
+        expect(turn.tokens()).toBe('');
+        expect(turn.element.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(true);
+    });
+
+    it('keeps the tally across a snapshot rebuild', () => {
+        const { board } = mount();
+        const record = serverTurn({
+            usage: { input: 122111, output: 4, total: 5, cached: 100301 },
+            events: [{ type: 'start', agent: 'writer', model: 'm1' }]
+        });
+
+        const [first] = board.hydrate([record], { model: 'm1' });
+        expect(first.tokens()).toBe('122,111 (100,301)');
+
+        const [second] = board.hydrate([record], { model: 'm1', keep: 't1' });
+        expect(second.tokens()).toBe('122,111 (100,301)');
+        expect(second.tokens()).toBe(first.tokens());
+        expect(second.element.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(false);
     });
 });
 

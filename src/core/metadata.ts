@@ -1,5 +1,12 @@
 // Canonical metadata for the harness-owned CORE tools.
 //
+// R18 note: the harness also declares core tools that are NOT harness-owned — the
+// four everyday file tools (metadata in ../tools/catalogue.ts) and configured
+// webSearch (../tools/websearch/index.ts). Their metadata lives with their real
+// implementations; this file stays the single source for the session-bound
+// harness-owned set (toolRequest/toolCreate/todoManage/agentDelegate), which is
+// also what harnesses/core.ts exports to the server with sessionBound: true.
+//
 // WHY THIS FILE EXISTS (single source of truth)
 // ---------------------------------------------
 // The core tools are built in two very different places:
@@ -62,7 +69,7 @@ export type CoreToolMetadata = {
 export const TOOL_REQUEST_METADATA: CoreToolMetadata = {
     name: TOOL_REQUEST_NAME,
     description:
-        `Find tools by capability tag and enable them. The whole catalogue is searchable (including the file and command tools). Pass the tags you need (for example ["files", "read"] or ["shell"] or ["git", "diff"]) and up to ${MAX_DISCOVERY_MATCHES} of the closest matches become available on your next turn. The result's "remaining" field counts any further tools that matched but were not listed, so add a more specific tag to drill into the rest. Call this before concluding that something cannot be done.`,
+        `Find tools by capability tag and enable them. The searchable catalogue holds the list, shell, git, syntax, time, text, notes, and other tools; the everyday file tools (fileRead, fileWrite, fileEdit, fileGlob) are already available, as is webSearch when the host configured it. Pass the tags you need (for example ["files", "list"] or ["shell"] or ["git", "diff"]) and up to ${MAX_DISCOVERY_MATCHES} of the closest matches become available on your next turn. The result's "remaining" field counts any further tools that matched but were not listed, so add a more specific tag to drill into the rest. Call this before concluding that something cannot be done.`,
     tags: ['discovery', 'tools', 'catalogue'],
     visibility: 'core',
     parameters: {

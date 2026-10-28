@@ -68,7 +68,7 @@ describe('webSearch catalogue', () => {
                 group: 'Web search',
                 description: WEB_SEARCH_METADATA.description,
                 tags: ['web', 'search', 'internet', 'news', 'research'],
-                visibility: 'searchable',
+                visibility: 'core',
                 parameters: WEB_SEARCH_METADATA.parameters,
                 availability: {
                     state: 'unconfigured',

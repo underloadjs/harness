@@ -43,6 +43,10 @@ export const applyActivity = (active: Set<string>, event: HarnessEvent): void =>
         case 'reasoning':
         case 'tool_call':
         case 'tool_result':
+        // A usage report is emitted while the agent is still mid-run (right after
+        // its request settles, before any tool it asked for runs), so it keeps the
+        // ring lit exactly like the other in-flight events.
+        case 'usage':
             active.add(event.agent);
             return;
 

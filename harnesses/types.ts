@@ -41,8 +41,9 @@ export type HarnessPreset = {
     // appends only the ones with an executable definition. A keyless host adds
     // nothing, which keeps "listed" == "callable" — the preset factory itself
     // already skips registration when the key is absent (see src/harness.ts).
-    // Every live preset declares `webSearch`; the scripted demo and the
-    // recoverable-failure example do not.
+    // Every live preset and the recoverable-failure example declare `webSearch`
+    // (all are built by createToolboxHarness, which opts in); the scripted demo
+    // does not.
     environmentTools?: readonly string[];
     // Per-agent model overrides (R9): agent id → model id. A member that is absent
     // falls back to `RunnerSettings.model`, so a harness can swap the model of one
@@ -51,14 +52,30 @@ export type HarnessPreset = {
     // or credential. Empty/absent means "the session model for every member".
     agentModels?: Readonly<Record<string, string>>;
     // Shipped with the application (`true`) or registered by a client through
-    // POST /harnesses (`false`). A built-in is not deletable/renamable; the flag
-    // only tells the UI where the card came from.
+    // POST /harnesses (`false`). Informational provenance only: both are editable
+    // application entries, and the registry never uses this to gate a mutation.
     builtin: boolean;
-    // Whether PATCH /harnesses/:name may change this harness. The live built-ins
-    // (instruct, research, workspace) are editable through the in-memory registry;
-    // the fixtures (demo, flaky) are not, because their behaviour is scripted by a
-    // test/example and an override would make the fixture lie.
+    // COMPATIBILITY ONLY (R20.1). Always true: the registry starts from
+    // independent copies of the shipped templates and records every create/PATCH
+    // as a new entry, so there is no read-only harness category any more. The
+    // field stays on the wire so existing clients keep their shape.
     editable: boolean;
+    // INTERNAL execution template — never projected onto the wire. The registry
+    // uses it when a patch changes the executable team or models:
+    //   - 'live'     (default) — rebuild with createProfiledHarness;
+    //   - 'scripted' — the demo's offline script. A metadata-only patch keeps the
+    //                  script; an executable patch upgrades it to a LIVE profiled
+    //                  harness so the card stops advertising scripted behaviour;
+    //   - 'flaky'    — the failure example. A metadata-only patch keeps its
+    //                  factory; an executable patch rebuilds the live toolbox with
+    //                  the TestFlaky extra retained.
+    template?: 'live' | 'scripted' | 'flaky';
+    // Metadata a NON-LIVE template adopts when an executable patch upgrades it and
+    // the current title/description are still the shipped ones. Without this, the
+    // scripted demo would keep prose claiming no endpoint after it became a live
+    // harness. A user-edited title/description is never overwritten. Not on the
+    // wire.
+    live?: { title: string; description: string };
     // Build a fresh harness. Progress is routed by the caller (a CLI renderer or
     // one HTTP session), which is why it is a parameter rather than a field.
     create: (settings: RunnerSettings, progress: HarnessProgress) => Harness;
@@ -68,7 +85,9 @@ export type HarnessPreset = {
 // from the presets because webSearch is credential-dependent and opt-in: a host
 // must see at a glance whether this deployment can run it. 'Core tools' holds the
 // harness-owned set (toolRequest, toolCreate, todoManage, agentDelegate), which are
-// listed for review and manual execution but only ever run inside a session.
+// listed for review and manual execution but only ever run inside a session. R18:
+// the core FILE tools stay in 'Package presets' and are directly callable, because
+// 'core' visibility does not imply a session binding.
 export type ToolGroup = 'Package presets' | 'Harness tools' | 'Web search' | 'Core tools';
 
 // Whether a catalogue entry can actually run on this host.
@@ -91,11 +110,13 @@ export type ToolAvailability = {
 // entry is executable: a credential-dependent tool with no key has no callable
 // definition, which is what keeps "listed" from meaning "pretends to work".
 //
-// `sessionBound` marks the harness-owned CORE tools (R8). They have no `tool` and
-// can never be called with a dummy implementation: they run inside a session's
-// harness, so the server requires a `sessionId` and forwards the call to
-// `harness.executeTool`. Listing them is what lets the UI's Tools tab show the
-// core set and run it against the selected session.
+// `sessionBound` marks the harness-owned CORE tools (R8): toolRequest, toolCreate,
+// todoManage, agentDelegate. They have no `tool` and can never be called with a
+// dummy implementation: they run inside a session's harness, so the server requires
+// a `sessionId` and forwards the call to `harness.executeTool`. R18 keeps the flag
+// off the core file tools and webSearch: they have real implementations and run
+// statelessly. Listing the harness-owned set is what lets the UI's Tools tab show
+// it and run it against the selected session.
 export type CatalogueEntry = {
     name: string;
     group: ToolGroup;

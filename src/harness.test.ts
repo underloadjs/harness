@@ -18,8 +18,14 @@
 //   - transport failure or a runaway loop truncates history and throws.
 
 import { describe, expect, it } from 'vitest';
-import { agent, harness, fileRead, commandRun, syntaxCheck, tool } from '@underload/harness';
-import type { HarnessEvent, HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '@underload/harness';
+import { agent, harness, fileRead, commandRun, syntaxCheck, tool, toolUi } from '@underload/harness';
+import type {
+    HarnessEvent,
+    HarnessStream,
+    HarnessStreamEvent,
+    HarnessStreamRequest,
+    HarnessUsage
+} from '@underload/harness';
 
 // A transport that replays a scripted list of turns, one per request. Each entry
 // is the set of frames for a single turn, so a test can script
@@ -37,13 +43,21 @@ const scripted = (turns: HarnessStreamEvent[][], seen?: HarnessStreamRequest[]):
     };
 };
 
-const answer = (text: string): HarnessStreamEvent[] => [
+// The optional `usage` makes the scripted transport report token accounting for
+// THAT request, which is how the per-request `usage` progress events are pinned.
+// Omitting it scripts a provider that sent no usage block (never zero-filled).
+const answer = (text: string, usage?: HarnessUsage): HarnessStreamEvent[] => [
     { type: 'text', delta: text },
-    { type: 'done', stopReason: 'stop', toolCalls: [] }
+    { type: 'done', stopReason: 'stop', toolCalls: [], ...(usage === undefined ? {} : { usage }) }
 ];
 
-const callTool = (id: string, name: string, args: string): HarnessStreamEvent[] => [
-    { type: 'done', stopReason: 'tool_calls', toolCalls: [{ id, name, arguments: args }] }
+const callTool = (id: string, name: string, args: string, usage?: HarnessUsage): HarnessStreamEvent[] => [
+    {
+        type: 'done',
+        stopReason: 'tool_calls',
+        toolCalls: [{ id, name, arguments: args }],
+        ...(usage === undefined ? {} : { usage })
+    }
 ];
 
 const declaredNames = (request: HarnessStreamRequest | undefined): string[] =>
@@ -103,13 +117,16 @@ describe('harness', () => {
 
         const writer = harness({
             agents: { writer: brain(scripted([answer('hi')], seen)) },
-            tools: { searchable, core }
+            tools: { searchable, core },
+            // Isolate the configured set: with the default preload the four core
+            // file tools are declared too.
+            presets: false
         });
 
         await writer('go');
 
-        // The searchable tool is registered but absent from the request. No preset
-        // tool is core either, so only the configured core tool is declared.
+        // The searchable tool is registered but absent from the request; only the
+        // configured core tool (plus the harness-owned set) is declared.
         expect(writer.tools.searchable).toBe(searchable);
         expect(declaredNames(seen[0])).toEqual([
             'core',
@@ -119,23 +136,37 @@ describe('harness', () => {
         ]);
     });
 
-    it('preloads the preset catalogue with every entry searchable', async () => {
+    it('preloads the catalogue: four core file tools declared, the rest searchable', async () => {
         const seen: HarnessStreamRequest[] = [];
         const writer = harness({ agents: { writer: brain(scripted([answer('hi')], seen)) } });
 
         await writer('go');
 
-        // Registered, so they can be discovered without any import...
+        // Registered, so they can be used without any import...
         expect(writer.tools.fileRead).toBe(fileRead);
         expect(writer.tools.commandRun).toBe(commandRun);
         expect(writer.tools.syntaxCheck).toBe(syntaxCheck);
-        expect(writer.tools.fileRead.visibility).toBe('searchable');
+        // R18: everyday file access is core; the rest still waits for discovery.
+        expect(writer.tools.fileRead.visibility).toBe('core');
+        expect(writer.tools.fileWrite.visibility).toBe('core');
+        expect(writer.tools.fileEdit.visibility).toBe('core');
+        expect(writer.tools.fileGlob.visibility).toBe('core');
+        expect(writer.tools.fileList.visibility).toBe('searchable');
         expect(writer.tools.commandRun.visibility).toBe('searchable');
-        // ...and nothing is declared but the harness-owned core set.
-        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
+        // ...so the first request declares exactly the core file tools plus the
+        // harness-owned set.
+        expect(declaredNames(seen[0])).toEqual([
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
+        ]);
     });
 
-    it('discovers the file tools along with syntaxCheck', async () => {
+    it('never returns the core file tools from toolRequest', async () => {
         const entry = brain(
             scripted([
                 callTool('c1', 'toolRequest', '{"tags":["files"]}'),
@@ -147,64 +178,54 @@ describe('harness', () => {
 
         await writer('look around');
 
-        // Every file tool is searchable now and each carries the exact tag
-        // "files", so all five tie on the best single-tag score (4). A name or
-        // description hit is the 1-point rung of that ladder, not a bonus on top
-        // of a tag hit, so it cannot reorder them; hits and then name decide.
-        // T14 folded glob+content search into one fileGlob tool, so the whole
-        // family now fits inside the five-match cap.
+        // fileRead/fileWrite/fileEdit/fileGlob are core, so a "files" query only
+        // finds the searchable remainder. There is no fileSearch: fileGlob is the
+        // one search surface and it is already declared.
         const fileSearch = JSON.parse((entry.messages[2] as { content: string }).content);
-        expect(fileSearch.enabled).toEqual([
-            'fileEdit',
-            'fileGlob',
-            'fileList',
-            'fileRead',
-            'fileWrite'
-        ]);
-        expect(fileSearch.tools.map((tool: { name: string }) => tool.name)).toEqual([
-            'fileEdit',
-            'fileGlob',
-            'fileList',
-            'fileRead',
-            'fileWrite'
+        expect(fileSearch.enabled).toEqual(['fileList']);
+        expect(fileSearch.tools).toEqual([
+            {
+                name: 'fileList',
+                description: expect.stringContaining('List the immediate entries'),
+                tags: ['files', 'list', 'filesystem']
+            }
         ]);
         expect(fileSearch.remaining).toBe(0);
         expect(fileSearch.truncated).toBeUndefined();
 
-        // ...while the searchable syntaxCheck is found and enabled. The same
-        // "javascript" query also reaches fileGlob weakly (its description mentions
-        // a "JavaScript regular expression"), which is the documented 1-point rung,
-        // so the exact tag hit ranks first and both are declared.
+        // "javascript" finds the searchable syntaxCheck; core fileGlob is excluded
+        // even though its description mentions JavaScript.
         const syntaxSearch = JSON.parse((entry.messages[4] as { content: string }).content);
-        expect(syntaxSearch.enabled).toEqual(['syntaxCheck', 'fileGlob']);
+        expect(syntaxSearch.enabled).toEqual(['syntaxCheck']);
         expect(syntaxSearch.tools).toEqual([
             {
                 name: 'syntaxCheck',
                 description: expect.stringContaining('Check whether a code snippet parses'),
                 tags: ['code', 'syntax', 'javascript', 'python', 'validation']
-            },
-            {
-                name: 'fileGlob',
-                description: expect.stringContaining('Find files by glob pattern'),
-                tags: [
-                    'files',
-                    'glob',
-                    'search',
-                    'grep',
-                    'find',
-                    'content',
-                    'filesystem'
-                ]
             }
         ]);
         expect(syntaxSearch.remaining).toBe(0);
         expect(syntaxSearch.truncated).toBeUndefined();
 
-        expect(writer.tools.fileRead.visibility).toBe('searchable');
+        expect(writer.tools.fileRead.visibility).toBe('core');
         expect(writer.tools.syntaxCheck.visibility).toBe('searchable');
     });
 
-    it('refines a broad query to reach the match the cap left out', async () => {
+    it('refines a broad query over independent searchable tools to reach the cap leftover', async () => {
+        // The cap test must not depend on the preset catalogue: R18 made its file
+        // family core, so these fixtures are plain searchable tools. Every one has
+        // the exact tag "files"; only file-f carries "write" too.
+        const fixtures = ['file-a', 'file-b', 'file-c', 'file-d', 'file-e', 'file-f'].map((name) =>
+            tool({
+                // The harness renames on registration; a unique name here keeps the
+                // object keys distinct before that happens.
+                name,
+                description: `${name} fixture.`,
+                tags: name === 'file-f' ? ['files', 'write'] : ['files'],
+                execute: () => name
+            })
+        );
+
         const entry = brain(
             scripted([
                 callTool('c1', 'toolRequest', '{"tags":["files"]}'),
@@ -212,37 +233,36 @@ describe('harness', () => {
                 answer('done')
             ])
         );
-        const writer = harness({ agents: { writer: entry } });
+        const writer = harness({
+            agents: { writer: entry },
+            tools: Object.fromEntries(fixtures.map((definition) => [definition.name, definition])),
+            presets: false
+        });
 
         await writer('change a file');
 
-        // "files" alone already lists every file tool (the whole family fits in
-        // the cap now that glob+content search is one tool). Adding the second tag
-        // gives fileEdit and fileWrite a second matching query tag, which is the
-        // documented tie break, so they move to the front — that is the R7
-        // refinement workflow: same shortlist, better order.
-        expect(JSON.parse((entry.messages[2] as { content: string }).content).enabled).toEqual([
-            'fileEdit',
-            'fileGlob',
-            'fileList',
-            'fileRead',
-            'fileWrite'
-        ]);
-        expect(JSON.parse((entry.messages[4] as { content: string }).content).enabled).toEqual([
-            'fileEdit',
-            'fileWrite',
-            'fileGlob',
-            'fileList',
-            'fileRead'
-        ]);
-        // Discovery order is first-enabled-first: the broad query enabled all five,
-        // so the refined query adds nothing new and the order is unchanged.
+        // Cap 5 of 6: name order decides the ties, and the sixth match is only
+        // counted (never named).
+        const broad = JSON.parse((entry.messages[2] as { content: string }).content);
+        expect(broad.enabled).toEqual(['file-a', 'file-b', 'file-c', 'file-d', 'file-e']);
+        expect(broad.remaining).toBe(1);
+        expect(broad.truncated).toBe(true);
+
+        // Adding "write" gives the omitted fixture a second hit, which is the
+        // documented tie break: it reaches the shortlist, one other drops, and the
+        // cap stays enforced.
+        const refined = JSON.parse((entry.messages[4] as { content: string }).content);
+        expect(refined.enabled).toEqual(['file-f', 'file-a', 'file-b', 'file-c', 'file-d']);
+        expect(refined.remaining).toBe(1);
+
+        // First-enabled-first order survives the refinement.
         expect(writer.discoveredTools).toEqual([
-            'fileEdit',
-            'fileGlob',
-            'fileList',
-            'fileRead',
-            'fileWrite'
+            'file-a',
+            'file-b',
+            'file-c',
+            'file-d',
+            'file-e',
+            'file-f'
         ]);
     });
 
@@ -277,16 +297,17 @@ describe('harness', () => {
         const writer = harness({ agents: { writer: entry } });
         const message = await writer('check this snippet');
 
-        // A "javascript" query hits syntaxCheck on its exact tag (4) and fileGlob
-        // weakly through its description ("a JavaScript regular expression", 1).
-        // Both are enabled; the ranking puts the exact tag hit first, so the
-        // declaration order is syntaxCheck then fileGlob.
+        // "javascript" enables syntaxCheck; the core file tools are already
+        // declared, and fileGlob is one of them, so discovery adds only syntaxCheck.
         expect(declaredNames(seen[1])).toEqual([
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
             'toolRequest',
             'toolCreate',
             'todoManage',
-            'syntaxCheck',
-            'fileGlob'
+            'syntaxCheck'
         ]);
         expect((entry.messages[4] as { content: string }).content).toBe('true');
         expect(message.content).toBe('valid');
@@ -453,6 +474,86 @@ describe('harness', () => {
         expect(resolved).toBe(true);
     });
 
+    // R20.2: a tool may return `toolUi(content, panels)`. The model must see the
+    // plain content (never the envelope or panels), while the recorded event
+    // carries the normalized panels on its optional `ui` field.
+    it('unwraps toolUi panels into the event and feeds the model content only', async () => {
+        const panels = [
+            {
+                id: 'answer',
+                slot: 'right',
+                title: 'Answer details',
+                blocks: [
+                    { type: 'keyValue' as const, items: [{ label: 'Value', value: '42' }] },
+                    { type: 'text' as const, text: 'Generated by the UI tool.' }
+                ]
+            }
+        ];
+
+        const uiTool = tool({
+            description: 'Returns a declarative panel.',
+            tags: ['ui'],
+            visibility: 'core',
+            execute: () => toolUi({ answer: 42 }, panels)
+        });
+        const plainTool = tool({
+            description: 'Returns a plain value.',
+            tags: ['plain'],
+            visibility: 'core',
+            execute: () => ({ answer: 7 })
+        });
+
+        const events: HarnessEvent[] = [];
+        const seen: HarnessStreamRequest[] = [];
+
+        const writer = harness({
+            agents: {
+                writer: brain(
+                    scripted(
+                        [callTool('c1', 'uiTool', '{}'), callTool('c2', 'plainTool', '{}'), answer('done')],
+                        seen
+                    )
+                )
+            },
+            tools: { uiTool, plainTool },
+            report: { progress: async (event) => { events.push(event); } }
+        });
+
+        await writer('go');
+
+        const results = events.filter((event) => event.type === 'tool_result');
+        expect(results).toEqual([
+            {
+                type: 'tool_result',
+                agent: 'writer',
+                name: 'uiTool',
+                callId: 'c1',
+                content: '{"answer":42}',
+                isError: false,
+                ui: panels
+            },
+            {
+                type: 'tool_result',
+                agent: 'writer',
+                name: 'plainTool',
+                callId: 'c2',
+                content: '{"answer":7}',
+                isError: false
+            }
+        ]);
+
+        // The model's transcript holds the underlying content only.
+        expect(writer.agent.messages.filter((message) => message.role === 'tool')).toEqual([
+            { role: 'tool', content: '{"answer":42}', toolCallId: 'c1', name: 'uiTool' },
+            { role: 'tool', content: '{"answer":7}', toolCallId: 'c2', name: 'plainTool' }
+        ]);
+
+        // Nothing about the envelope leaves the process: every request the model
+        // transport saw is plain content.
+        expect(JSON.stringify(seen)).not.toContain('__toolUi');
+        expect(JSON.stringify(seen)).not.toContain('Answer details');
+    });
+
     it('turns an unknown tool into a recoverable tool result', async () => {
         const entry = brain(scripted([callTool('c1', 'nope', '{}'), answer('recovered')]));
         const writer = harness({ agents: { writer: entry } });
@@ -463,10 +564,11 @@ describe('harness', () => {
         expect(entry.messages[2]).toMatchObject({
             role: 'tool',
             name: 'nope',
-            // Only the harness-owned core tools are declared, so the recovery hint
-            // lists exactly those and points at toolRequest for the catalogue.
+            // The preloaded core file tools and the harness-owned set are declared,
+            // so the recovery hint lists exactly those and points at toolRequest
+            // for the searchable remainder.
             content:
-                'Tool "nope" is not registered. Available tools: toolRequest, toolCreate, todoManage. Call toolRequest with capability tags to search the catalogue.'
+                'Tool "nope" is not registered. Available tools: fileRead, fileWrite, fileEdit, fileGlob, toolRequest, toolCreate, todoManage. Call toolRequest with capability tags to search the catalogue.'
         });
     });
 
@@ -910,6 +1012,218 @@ describe('harness', () => {
     });
 });
 
+// Per-request token accounting (`usage` events).
+//
+// `done` only ever reports the FINAL request of a run, so a client that wants the
+// whole cost reads the `usage` events: exactly one per model request whose
+// message carries usage — including the intermediate tool-call rounds — emitted
+// after that request's text and before its tool_calls/done. A request whose
+// transport reported no usage emits nothing at all: "not reported" must never be
+// turned into a zero-filled event. The source of truth is the `usage` block on
+// the `done` stream frame (see core/agent.ts, `request()`), fanned out by
+// harness.ts inside runAgentCore.
+describe('usage reporting', () => {
+    it('reports one usage event for a single answered request, before done', async () => {
+        const events: HarnessEvent[] = [];
+        const usage = { input: 3, output: 2, total: 5 };
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done', usage)])) },
+            report: { progress: (event) => { events.push(event); } }
+        });
+
+        await writer('go');
+
+        // Exactly one usage event, positioned after the answer text and before done.
+        expect(events.map((event) => event.type)).toEqual(['start', 'text', 'usage', 'done']);
+        expect(events[2]).toEqual({ type: 'usage', agent: 'writer', usage });
+
+        // The final `done` still carries the same usage on its message, so the
+        // last request appears on BOTH events; a tallying consumer counts only
+        // the usage events.
+        const done = events.at(-1) as Extract<HarnessEvent, { type: 'done' }>;
+        expect(done.message.usage).toEqual({ input: 3, output: 2, total: 5 });
+        expect(events.filter((event) => event.type === 'usage')).toEqual([
+            { type: 'usage', agent: 'writer', usage }
+        ]);
+    });
+
+    it('reports usage for every tool-call round as well as the final answer', async () => {
+        const events: HarnessEvent[] = [];
+        const first = { input: 11, output: 6, total: 17 };
+        const second = { input: 21, output: 4, total: 25 };
+
+        const probe = tool({
+            description: 'Probe.',
+            tags: ['probe'],
+            visibility: 'core',
+            execute: () => 'pong'
+        });
+        const writer = harness({
+            agents: {
+                writer: brain(
+                    scripted([callTool('c1', 'probe', '{}', first), answer('finished', second)])
+                )
+            },
+            tools: { probe },
+            presets: false,
+            report: { progress: (event) => { events.push(event); } }
+        });
+
+        await writer('go');
+
+        // Round 1: usage BEFORE that round's tool_call/tool_result. Round 2:
+        // usage after the text, before done. No usage is reported twice.
+        expect(events.map((event) => event.type)).toEqual([
+            'start',
+            'usage',
+            'tool_call',
+            'tool_result',
+            'text',
+            'usage',
+            'done'
+        ]);
+        expect(events.filter((event) => event.type === 'usage')).toEqual([
+            { type: 'usage', agent: 'writer', usage: first },
+            { type: 'usage', agent: 'writer', usage: second }
+        ]);
+
+        // `done` describes only the FINAL request, with that request's usage.
+        const done = events.at(-1) as Extract<HarnessEvent, { type: 'done' }>;
+        expect(done.message.usage).toEqual({ input: 21, output: 4, total: 25 });
+    });
+
+    it('emits no usage event when a request reports none', async () => {
+        const events: HarnessEvent[] = [];
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done')])) },
+            report: { progress: (event) => { events.push(event); } }
+        });
+
+        await writer('go');
+
+        expect(events.map((event) => event.type)).toEqual(['start', 'text', 'done']);
+        expect(events.filter((event) => event.type === 'usage')).toEqual([]);
+
+        // The message also stays honest: an unreported request is not zero-filled.
+        const done = events.at(-1) as Extract<HarnessEvent, { type: 'done' }>;
+        expect(done.message.usage).toBeUndefined();
+    });
+
+    it('reports only the requests that carry usage, leaving the rest absent', async () => {
+        const events: HarnessEvent[] = [];
+        const first = { input: 7, output: 1, total: 8 };
+
+        const probe = tool({
+            description: 'Probe.',
+            tags: ['probe'],
+            visibility: 'core',
+            execute: () => 'pong'
+        });
+        const writer = harness({
+            agents: { writer: brain(scripted([callTool('c1', 'probe', '{}', first), answer('finished')])) },
+            tools: { probe },
+            presets: false,
+            report: { progress: (event) => { events.push(event); } }
+        });
+
+        await writer('go');
+
+        // The tool round reported usage; the final answer did not. No zero-filled
+        // event is invented for the silent request.
+        expect(events.map((event) => event.type)).toEqual([
+            'start',
+            'usage',
+            'tool_call',
+            'tool_result',
+            'text',
+            'done'
+        ]);
+        expect(events.filter((event) => event.type === 'usage')).toEqual([
+            { type: 'usage', agent: 'writer', usage: first }
+        ]);
+
+        const done = events.at(-1) as Extract<HarnessEvent, { type: 'done' }>;
+        expect(done.message.usage).toBeUndefined();
+    });
+
+    it('passes the cached figure through untouched', async () => {
+        const events: HarnessEvent[] = [];
+        const usage = { input: 10, output: 4, total: 14, cached: 8 };
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('done', usage)])) },
+            report: { progress: (event) => { events.push(event); } }
+        });
+
+        await writer('go');
+
+        // Exact object: the optional `cached` figure is neither stripped nor
+        // supplemented, and no keys are added.
+        expect(events.map((event) => event.type)).toEqual(['start', 'text', 'usage', 'done']);
+        expect(events[2]).toEqual({
+            type: 'usage',
+            agent: 'writer',
+            usage: { input: 10, output: 4, total: 14, cached: 8 }
+        });
+        expect(Object.keys((events[2] as Extract<HarnessEvent, { type: 'usage' }>).usage)).toEqual([
+            'input',
+            'output',
+            'total',
+            'cached'
+        ]);
+    });
+
+    it('reports a delegated subagent usage with its own agent name, interleaved', async () => {
+        const events: HarnessEvent[] = [];
+        const leadFirst = { input: 5, output: 2, total: 7 };
+        const helperUsage = { input: 9, output: 3, total: 12 };
+        const leadAnswer = { input: 13, output: 5, total: 18 };
+
+        const writer = harness({
+            agents: {
+                // The primary delegates, then answers; each of its requests carries usage.
+                lead: brain(
+                    scripted([
+                        callTool('c1', 'agentDelegate', '{"agent":"helper","input":"find it"}', leadFirst),
+                        answer('lead done', leadAnswer)
+                    ])
+                ),
+                // The subagent's single request carries its own usage.
+                helper: brain(scripted([answer('helper answer', helperUsage)]))
+            },
+            primary: 'lead',
+            subagents: ['helper'],
+            presets: false,
+            report: { progress: (event) => { events.push(event); } }
+        });
+
+        await writer('go');
+
+        // The subagent's whole run (start/text/usage/done) happens INSIDE the
+        // primary's tool_call, so its usage lands in the same stream, tagged
+        // with the subagent name, before the primary's tool_result.
+        expect(events.map((event) => `${event.agent}:${event.type}`)).toEqual([
+            'lead:start',
+            'lead:usage',
+            'lead:tool_call',
+            'helper:start',
+            'helper:text',
+            'helper:usage',
+            'helper:done',
+            'lead:tool_result',
+            'lead:text',
+            'lead:usage',
+            'lead:done'
+        ]);
+        expect(events.filter((event) => event.type === 'usage')).toEqual([
+            { type: 'usage', agent: 'lead', usage: leadFirst },
+            { type: 'usage', agent: 'helper', usage: helperUsage },
+            { type: 'usage', agent: 'lead', usage: leadAnswer }
+        ]);
+    });
+});
+
 // Manual execution (R8): the host/server path behind the Tools tab.
 //
 // The same registered implementation runs, with this harness's context. Discovery
@@ -920,7 +1234,13 @@ describe('executeTool', () => {
     it('runs a registered searchable tool without enabling it for the model', async () => {
         const seen: HarnessStreamRequest[] = [];
         const hidden = tool({ description: 'Read text.', tags: ['files', 'read'], execute: () => 'contents' });
-        const writer = harness({ agents: { writer: brain(scripted([answer('hi')], seen)) }, tools: { hidden } });
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('hi')], seen)) },
+            tools: { hidden },
+            // Keep this test about the searchable-tool bypass: the preload's core
+            // file declarations are asserted separately above.
+            presets: false
+        });
 
         expect(writer.discoveredTools).toEqual([]);
         // The parameter IS the value `execute` receives (single-property rule).

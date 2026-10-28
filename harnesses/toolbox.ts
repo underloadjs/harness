@@ -25,11 +25,17 @@
 //                        harness factory registers it only when a key resolves,
 //                        so a keyless host is offline-safe. The global catalogue
 //                        still lists it as `unconfigured`, never fake-callable.
-//   - core tools       — harness-owned only: toolRequest, toolCreate, todoManage,
-//                        and agentDelegate for a preset that declares subagents.
-//                        Every package and app tool (including the file tools) is
-//                        searchable, so a live harness declares nothing else up
-//                        front.
+//   - core tools       - the four everyday file tools (fileRead, fileWrite,
+//                        fileEdit, fileGlob), webSearch when the host configured a
+//                        key, and the harness-owned set (toolRequest, toolCreate,
+//                        todoManage, plus agentDelegate for a preset that declares
+//                        subagents). fileList and the other package/app tools stay
+//                        searchable, so they wait for toolRequest.
+//
+// "core" is a declaration classification, not a session binding: only the
+// harness-owned set is sessionBound in the server catalogue because only it
+// mutates a session's harness. Core file tools and webSearch keep the ordinary
+// session-less direct-call path.
 //
 // DELIBERATE EXCEPTIONS
 // ---------------------
@@ -53,7 +59,7 @@
 //   - ../src/harness.ts — `presets: false` + explicit `tools` registry semantics
 //   - ../server/api.ts  — descriptors resolved from the same preset metadata
 
-import { agent, harness, presetTools } from '../src/harness';
+import { agent, harness, presetTools, WEB_SEARCH_TOOL_NAME } from '../src/harness';
 import type { Agent, Harness, HarnessProgress, Tool } from '../src/harness';
 import { agentInstruction, agentProfile } from '../src/agents';
 import { harnessTools } from './tools';
@@ -99,18 +105,41 @@ export const SHARED_TOOL_NAMES: readonly string[] = Object.freeze(Object.keys(SH
 // Harness-owned core names. agentDelegate is capability-by-configuration: the
 // harness registers it only when the harness declares subagents, so a single-agent
 // Instruct has no delegation tool while Research does. That difference is the
-// agent configuration, not a difference in the shareable toolbox.
-//
-// No preset entry is core any more: every registered package/app tool is
-// searchable, so a descriptor advertises exactly these names (plus agentDelegate).
-// `presetCore` is kept out of the signature deliberately — there is no second
-// source of core tools that could disagree with this list.
+// agent configuration, not a difference in the shareable toolbox. These are the
+// ONLY core tools the server marks sessionBound.
 export const CORE_TOOL_NAMES = ['toolRequest', 'toolCreate', 'todoManage'] as const;
 
-export const coreToolNames = (subagents: readonly string[] = []): string[] => [
-    ...CORE_TOOL_NAMES,
-    ...(subagents.length > 0 ? ['agentDelegate'] : [])
-];
+// Package presets that are declared on every request (R18). Their metadata lives
+// in src/tools/catalogue.ts with `visibility: 'core'`; this list is the descriptor
+// counterpart, so a card can advertise what its runs really declare. fileList is
+// deliberately absent: it stays discoverable. There is no fileSearch entry — the
+// approved consolidation is the one fileGlob tool, now core.
+export const CORE_PRESET_TOOL_NAMES = ['fileRead', 'fileWrite', 'fileEdit', 'fileGlob'] as const;
+
+// The configured environment-backed core tool. It appears only when the runtime
+// catalogue has an executable definition (a provider key resolved), which is why
+// it is not in the static list above.
+export const CORE_ENVIRONMENT_TOOL_NAMES = [WEB_SEARCH_TOOL_NAME] as const;
+
+// Project the core set for one preset descriptor.
+//
+// `registered` is the exact tool-name set the card was built with (preset.tools
+// plus environment tools THIS host can actually run — see descriptor.ts). A core
+// name is advertised only when it is in that set, so the demo fixture (timeNow
+// only) does not claim file tools, and a keyless host does not claim webSearch.
+export const coreToolNames = (
+    subagents: readonly string[] = [],
+    registered: readonly string[] = []
+): string[] => {
+    const available = new Set(registered);
+
+    return [
+        ...CORE_PRESET_TOOL_NAMES.filter((name) => available.has(name)),
+        ...CORE_ENVIRONMENT_TOOL_NAMES.filter((name) => available.has(name)),
+        ...CORE_TOOL_NAMES,
+        ...(subagents.length > 0 ? ['agentDelegate'] : [])
+    ];
+};
 
 // Provider settings are never used by construction; they only feed `agent(...)`.
 // An empty key is omitted rather than sent as `Bearer `.
@@ -212,7 +241,7 @@ export const createToolboxHarness = (
         // Environment-backed search; no key means the factory returns undefined
         // and the harness is unchanged. Keys are resolved at construction, after
         // `.env` is loaded by the CLI/server. The CONFIGURATION field keeps its
-        // name (`websearch`); the tool it registers is webSearch.
+        // name (`websearch`); the core tool it registers is webSearch (R18).
         websearch: true,
         report: { progress }
     });

@@ -4,7 +4,7 @@
 // a runtime dependency that a browser cannot load. The server and CLI import the
 // values they need from their own modules.
 
-import type { HarnessErrorInfo, HarnessEvent, HarnessMessage } from '../src/harness';
+import type { HarnessErrorInfo, HarnessEvent, HarnessMessage, HarnessUsage, ToolUiPanel } from '../src/harness';
 import type { RunnerSettings } from '../harnesses/types';
 
 export type {
@@ -14,7 +14,9 @@ export type {
     HarnessMessage,
     HarnessStopReason,
     HarnessToolCall,
-    HarnessUsage
+    HarnessUsage,
+    ToolUiBlock,
+    ToolUiPanel
 } from '../src/harness';
 export type { RunnerSettings } from '../harnesses/types';
 
@@ -47,6 +49,12 @@ export type SessionTurn = {
     // per-tool elapsed time without replaying the stream. Optional so an older
     // recorded turn (or a hand-built one) stays valid.
     eventTimes?: number[];
+    // The turn's token tally, summed BY THE SERVER from every per-request `usage`
+    // event the run reported (each agent's requests included, so a delegated
+    // subagent is part of the same bill). Optional because providers, not this
+    // server, decide whether usage exists at all: absent means "no request
+    // reported any", which is not the same as a zero-spend turn.
+    usage?: HarnessUsage;
 };
 
 // One trusted agent, as the UI needs it to choose a primary/subagent. The text
@@ -73,19 +81,26 @@ export type HarnessDescriptor = {
     subagents: string[];
     agents: string[];
     tools: string[];
-    // The core tools this card's runs will declare: toolRequest, toolCreate,
-    // todoManage for every harness, plus agentDelegate when a subagent allowlist exists.
-    // No preset tool is core any more (the whole catalogue is searchable).
+    // The core tools this card's runs will declare (R18): the four core file tools
+    // (fileRead/fileWrite/fileEdit/fileGlob) when registered, the harness-owned
+    // toolRequest/toolCreate/todoManage, agentDelegate when a subagent allowlist
+    // exists, and webSearch when this host has a provider key. The UI core dropdown
+    // renders this exact set, so it reflects runtime visibility rather than a
+    // hard-coded harness list. fileList and the other presets stay searchable.
     coreTools?: string[];
     // Per-agent model overrides (R9): agent id → model id. PRESENT ONLY WHEN a
     // harness actually overrides something, so existing cards keep their exact
-    // shape. A member absent from the map uses the session's model — that is the
-    // "default" a per-agent dropdown should show, not the resolved id.
+    // shape. A member absent from the map uses the session's model; the UI labels
+    // that no-override choice with the resolved id (R18), never "inherit".
     agentModels?: Record<string, string>;
-    // Shipped with the application vs created through POST /harnesses.
+    // Shipped with the application vs created through POST /harnesses. Informational
+    // only: every harness in the in-memory registry is an editable application copy
+    // of a template or a client-created harness.
     builtin: boolean;
-    // Whether PATCH /harnesses/:name may change it (live built-ins and user-created
-    // harnesses are editable; the demo/flaky fixtures are not).
+    // COMPATIBILITY ONLY (R20.1): always true. Every registry entry is editable —
+    // the shipped templates are starting copies, and PATCH produces a new immutable
+    // entry. Retained because existing clients read the field; a client must not
+    // treat it as a category or hide an edit affordance when it is true.
     editable: boolean;
 };
 
@@ -232,7 +247,12 @@ export type SessionStreamItem =
     // `at` is the epoch-ms time the server recorded this event, the same value
     // appended to the turn's `eventTimes` entry. Optional for compatibility with
     // an older server frame.
-    | { type: 'event'; turnId: string; event: HarnessEvent; at?: number }
+    //
+    // `usage` is the turn's running token tally AFTER this event, as the server
+    // summed it (see SessionTurn.usage). Present only once the turn has reported
+    // one, and repeated on later frames so a client never has to accumulate
+    // anything itself: the label it shows is the server's figure.
+    | { type: 'event'; turnId: string; event: HarnessEvent; at?: number; usage?: HarnessUsage }
     | { type: 'snapshot'; session: SessionSnapshot }
     | { type: 'failed'; error: HarnessErrorInfo; session: SessionSnapshot };
 
@@ -261,7 +281,18 @@ export type ToolCallRequest = {
 };
 
 export type ToolCallResult =
-    | { ok: true; result: unknown; durationMs: number }
+    | {
+          ok: true;
+          // The tool's ordinary result value, already unwrapped from a
+          // `toolUi(content, panels)` envelope. Standard tools are unchanged.
+          result: unknown;
+          // Optional declarative panels the tool supplied with `toolUi()`
+          // (R20.2). Presentation data only — no HTML, script, or actions — and
+          // bounded by the server before it reaches a client. Omitted for every
+          // ordinary tool so existing responses keep their exact shape.
+          panels?: ToolUiPanel[];
+          durationMs: number;
+      }
     | { ok: false; error: HarnessErrorInfo; durationMs: number };
 
 export type ApiErrorBody = {

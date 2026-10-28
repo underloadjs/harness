@@ -35,8 +35,10 @@
 // TOOL EXECUTION (R8): every tool runs on the server. GET /tools (and
 // /tools/bootstrap, and the bootstrap document) lists the whole catalogue PLUS the
 // harness-owned core tools — toolRequest, toolCreate, todoManage, agentDelegate — marked
-// `visibility: 'core'` and `sessionBound: true`. A sessionBound entry has no
-// standalone implementation: POST /tools/:name requires `sessionId`, rejects 400
+// `visibility: 'core'` and `sessionBound: true`. R18: only the harness-owned set
+// is sessionBound; core file tools/webSearch keep a real `tool` and run directly.
+// A sessionBound entry has no standalone implementation: POST /tools/:name
+// requires `sessionId`, rejects 400
 // without one, 404 for an unknown session or a core tool that session's harness
 // does not register (agentDelegate without subagents), and 409 while the session is
 // busy (a streaming run, a reset, or another manual call) so a manual mutation
@@ -65,6 +67,7 @@ import { createToolCatalogue, describeAgent, describeHarness } from '../harnesse
 import { createCoreToolEntries } from '../harnesses';
 import { createHarnessRegistry } from '../harnesses';
 import type { CatalogueEntry, HarnessRegistry, ToolCatalogue } from '../harnesses';
+import { toolUiOf } from '../src/harness';
 import { listModels, ModelListError } from '../src/transport/models';
 import type {
     AgentDescriptor,
@@ -249,6 +252,29 @@ const toolIndex = (entries: readonly CatalogueEntry[]): ToolIndex => ({
     tools: entries.map(describeTool)
 });
 
+// Build the success envelope for a manual tool call. R20.2: a tool may return the
+// branded `toolUi(content, panels)` envelope. The HTTP result must stay the
+// ordinary content (`result`) and may carry the optional declarative `panels`;
+// `toolUiOf` also re-validates and bounds them here, at the server boundary, so a
+// hand-built or malformed envelope cannot reach the client unbounded. An ordinary
+// value is returned untouched, which keeps standard tools byte-for-byte stable.
+const successfulToolResult = (value: unknown, started: number): ToolCallResult => {
+    const ui = toolUiOf(value);
+
+    if (ui === undefined) {
+        return { ok: true, result: value, durationMs: Date.now() - started };
+    }
+
+    return {
+        ok: true,
+        result: ui.content,
+        // Omit an empty list: an envelope with nothing renderable is
+        // indistinguishable from a standard tool response.
+        ...(ui.panels.length === 0 ? {} : { panels: ui.panels }),
+        durationMs: Date.now() - started
+    };
+};
+
 // Split the path below the mount. Both mounts are plain prefixes; a path that
 // does not start with the mount is an unknown route (the adapters already
 // filtered, but a defensive empty result keeps the dispatcher safe).
@@ -397,15 +423,17 @@ export const createHarnessApi = ({
     //
     // Two execution paths, because there are two kinds of entry:
     //
-    //   core (sessionBound) — toolRequest, toolCreate, todoManage, agentDelegate. These
-    //     have no standalone implementation by design; they run inside a session's
-    //     harness so a manual call changes THAT conversation (enabled tools,
-    //     registered tools, todos, a delegated subagent turn). A call must carry
-    //     `sessionId`, and the store rejects a session that is already busy
-    //     (running, resetting, or serving another manual call).
-    //   catalogue            — the direct runner that predates R8: no harness, no
-    //     model, no loop. A `sessionId` may still be present (one request shape)
-    //     and is ignored.
+    //   sessionBound — the harness-owned core tools toolRequest, toolCreate,
+    //     todoManage, agentDelegate. They have no standalone implementation by
+    //     design; they run inside a session's harness so a manual call changes THAT
+    //     conversation (enabled tools, registered tools, todos, a delegated
+    //     subagent turn). A call must carry `sessionId`, and the store rejects a
+    //     session that is already busy (running, resetting, or another manual call).
+    //   catalogue — the direct runner that predates R8: no harness, no model, no
+    //     loop. A `sessionId` may still be present (one request shape) and is
+    //     ignored. R18: this now includes the core FILE tools and a configured
+    //     webSearch. They are `visibility: 'core'` (always declared to the model)
+    //     but have real implementations, so they must NOT require a session.
     //
     // The entry is looked up BEFORE reading the body so an unknown name answers a
     // 404 without consuming a request the adapter may not need to drain.
@@ -452,8 +480,7 @@ export const createHarnessApi = ({
 
             try {
                 const result = await store.callTool(sessionId, name, body.parameters as never);
-                const payload: ToolCallResult = { ok: true, result, durationMs: Date.now() - started };
-                return { kind: 'json', status: 200, body: payload };
+                return { kind: 'json', status: 200, body: successfulToolResult(result, started) };
             } catch (error) {
                 // Unknown session (404), a busy session (409, run or another
                 // manual call), and a core tool the session's harness does not
@@ -493,8 +520,7 @@ export const createHarnessApi = ({
             // The value is the parameter as `execute` receives it, including the
             // single-property rule the UI already mirrors.
             const result = await entry.tool(body.parameters as never);
-            const payload: ToolCallResult = { ok: true, result, durationMs: Date.now() - started };
-            return { kind: 'json', status: 200, body: payload };
+            return { kind: 'json', status: 200, body: successfulToolResult(result, started) };
         } catch (error) {
             const payload: ToolCallResult = {
                 ok: false,
@@ -641,9 +667,9 @@ export const createHarnessApi = ({
                 return { kind: 'json', status: 200, body: index };
             }
 
-            // PATCH /harnesses/:name — override a built-in live harness's metadata
-            // or agent routing. Registry changes affect FUTURE sessions only; an
-            // existing session keeps its captured preset and descriptor.
+            // PATCH /harnesses/:name — change any harness's metadata or agent
+            // routing. Registry changes affect FUTURE sessions only; an existing
+            // session keeps its captured preset and descriptor.
             if (head === 'harnesses' && segments.length === 2) {
                 if (method !== 'PATCH') {
                     throw new HttpError(405, `Use PATCH for ${mount}/harnesses/:name.`);
@@ -806,7 +832,8 @@ export const createHarnessApi = ({
             // replicate the status mapping. An unexpected error is still a 500
             // with the same `{ error: { message } }` envelope as before.
             // SettingsError carries a 400 for the shared settings caps/type checks;
-            // HarnessRegistryError carries 400/403/404/409 for create/patch.
+            // HarnessRegistryError carries 400/404/409 for create/patch (no 403:
+            // no harness is read-only, R20.1).
             const status =
                 error instanceof HttpError ||
                 error instanceof SessionError ||

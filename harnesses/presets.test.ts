@@ -22,7 +22,16 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { HarnessProgress } from '../src/harness';
-import { findPreset, presets, PRESET_ALIASES, PRESET_MAX_ITERATIONS, SHARED_TOOL_NAMES } from './index';
+import {
+    createToolCatalogue,
+    createWebSearchCatalogueEntry,
+    describeHarness,
+    findPreset,
+    presets,
+    PRESET_ALIASES,
+    PRESET_MAX_ITERATIONS,
+    SHARED_TOOL_NAMES
+} from './index';
 import { AGENT_PROFILES } from '../src/agents';
 
 // Provider settings are never used by construction; they only feed `agent(...)`.
@@ -144,7 +153,9 @@ describe('preset catalogue', () => {
                 subagents: [],
                 agents: ['flaky'],
                 tools: [...TOOLBOX, 'testFlaky'],
-                environmentTools: undefined
+                // The factory opts into search via createToolboxHarness, so the
+                // metadata says so too (descriptor/runtime agreement).
+                environmentTools: ['webSearch']
             }
         ]);
 
@@ -240,15 +251,15 @@ describe('one toolbox, different agents', () => {
         expect(registeredTools('flaky')).toContain('testFlaky');
     });
 
-    it('keeps every shared tool searchable, file tools included', () => {
+    it('marks the four everyday file tools core and leaves fileList discoverable', () => {
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
 
         const harness = presetOf('instruct').create(SETTINGS, progress);
 
-        // The latest scope: discovery is the only way to reach a catalogue tool,
-        // so no preset entry is declared up front. Only the harness-owned core
-        // tools bypass toolRequest.
+        // R18: read/write/edit/glob are declared up front. fileList and the app /
+        // command tools still go through toolRequest. The harness-owned tools are
+        // core as well, but they are the session-bound set.
         expect(
             Object.fromEntries(
                 [
@@ -268,11 +279,11 @@ describe('one toolbox, different agents', () => {
                 ].map((name) => [name, harness.tools[name].visibility])
             )
         ).toEqual({
-            fileRead: 'searchable',
-            fileWrite: 'searchable',
-            fileEdit: 'searchable',
+            fileRead: 'core',
+            fileWrite: 'core',
+            fileEdit: 'core',
             fileList: 'searchable',
-            fileGlob: 'searchable',
+            fileGlob: 'core',
             syntaxCheck: 'searchable',
             commandRun: 'searchable',
             gitDiff: 'searchable',
@@ -291,6 +302,63 @@ describe('one toolbox, different agents', () => {
         expect(harness.tools.todoManage.visibility).toBe('core');
         expect(harness.tools.agentDelegate).toBeUndefined();
         expect(presetOf('research').create(SETTINGS, progress).tools.agentDelegate.visibility).toBe('core');
+    });
+
+    it('marks a configured webSearch core, like the file core set', () => {
+        vi.stubEnv('EXA_API_KEY', 'configured-exa-key');
+        vi.stubEnv('TAVILY_API_KEY', '');
+
+        const harness = presetOf('instruct').create(SETTINGS, progress);
+
+        expect(harness.tools.webSearch.visibility).toBe('core');
+        // Still only registered when a key resolved.
+        vi.stubEnv('EXA_API_KEY', '');
+        expect(presetOf('instruct').create(SETTINGS, progress).tools.webSearch).toBeUndefined();
+    });
+
+    it('descriptor coreTools agrees with the runtime core declarations', () => {
+        const coreNamesAtRuntime = (name: string): string[] =>
+            Object.values(presetOf(name).create(SETTINGS, progress).tools)
+                .filter((tool) => tool.visibility === 'core')
+                .map((tool) => tool.name);
+
+        const names = ['instruct', 'research', 'workspace', 'demo', 'flaky'];
+
+        // Keyless: no webSearch anywhere, and the demo fixture claims no file
+        // tools because it registers timeNow only.
+        vi.stubEnv('EXA_API_KEY', '');
+        vi.stubEnv('TAVILY_API_KEY', '');
+        const keyless = createToolCatalogue({
+            websearch: createWebSearchCatalogueEntry({ configuration: { env: {} } })
+        });
+        for (const name of names) {
+            expect(describeHarness(presetOf(name), keyless).coreTools).toEqual(coreNamesAtRuntime(name));
+        }
+
+        // Configured: webSearch is core exactly on the presets that registered it
+        // (the live trio and flaky; not the scripted demo).
+        vi.stubEnv('EXA_API_KEY', 'configured-exa-key');
+        vi.stubEnv('TAVILY_API_KEY', '');
+        const configured = createToolCatalogue({
+            websearch: createWebSearchCatalogueEntry({
+                configuration: { env: { EXA_API_KEY: 'configured-exa-key' } }
+            })
+        });
+        for (const name of names) {
+            expect(describeHarness(presetOf(name), configured).coreTools).toEqual(coreNamesAtRuntime(name));
+        }
+
+        // Pin the configured live order too, so a descriptor cannot drift silently.
+        expect(describeHarness(presetOf('instruct'), configured).coreTools).toEqual([
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'webSearch',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
+        ]);
     });
 
     it('gives each live preset distinct instructions and the right subagents', () => {
@@ -352,21 +420,23 @@ describe('one toolbox, different agents', () => {
         );
     });
 
-    it('marks the catalogue builtin/editable for future registry mutations', () => {
+    it('marks every template editable (compatibility field only)', () => {
         expect(
             presets.map((preset) => ({
                 name: preset.name,
                 builtin: preset.builtin,
-                editable: preset.editable
+                editable: preset.editable,
+                template: preset.template
             }))
         ).toEqual([
-            { name: 'instruct', builtin: true, editable: true },
-            { name: 'research', builtin: true, editable: true },
-            { name: 'workspace', builtin: true, editable: true },
-            // Fixtures are not overridable: an override would make the scripted
-            // demo / failure example claim behaviour it does not run.
-            { name: 'demo', builtin: true, editable: false },
-            { name: 'flaky', builtin: true, editable: false }
+            { name: 'instruct', builtin: true, editable: true, template: 'live' },
+            { name: 'research', builtin: true, editable: true, template: 'live' },
+            { name: 'workspace', builtin: true, editable: true, template: 'live' },
+            // R20.1: there is no read-only template. `editable: true` is a wire
+            // compatibility field; `template` is the registry's internal signal
+            // for what a metadata-only vs executable patch must do.
+            { name: 'demo', builtin: true, editable: true, template: 'scripted' },
+            { name: 'flaky', builtin: true, editable: true, template: 'flaky' }
         ]);
     });
 });

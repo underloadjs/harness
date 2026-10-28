@@ -14,8 +14,23 @@
 //           primary, and subagents.
 //   fixture — demo is a scripted offline run with timeNow only. It is retained so
 //           the UI (and the service tests) can exercise the whole loop without a
-//           provider; it is deliberately not a live harness, is `editable: false`,
-//           and is listed after the live presets.
+//           provider; it is deliberately not a live harness and is listed after
+//           the live presets.
+//
+// EDITABLE TEMPLATES (R20.1)
+// --------------------------
+// Every entry here is a TEMPLATE. The registry copies it into an independent
+// application entry, so a PATCH never mutates this module (and a later session
+// keeps the factory it captured). `editable: true` is a compatibility wire field
+// only; there is no read-only category, no categorization UI, and the registry
+// does not gate a PATCH on it. `template` (not on the wire) tells the registry
+// what a metadata-only patch must preserve:
+//   - 'scripted' — demo keeps its offline script and timeNow registry;
+//   - 'flaky'    — the example keeps testFlaky and its shared toolbox;
+//   - 'live'     — rebuilt from the selected agents/models.
+// An executable change (primary/subagents/agentModels) on demo upgrades it to a
+// live profiled harness; on flaky it rebuilds the live toolbox and retains
+// testFlaky. See ./registry.ts update().
 //
 // Instructions live in src/agents, not here
 // -----------------------------------------
@@ -65,12 +80,13 @@ export { PRESET_MAX_ITERATIONS };
 
 // The general-purpose choice and the first card in the UI. Its profile's
 // guidelines are about *behaviour* and discovery, not about which capabilities
-// exist: every capability is searchable in the shared toolbox.
+// exist: the four core file tools and a configured webSearch are always declared;
+// fileList, commands, git, syntax and the app tools are searchable.
 const instruct: HarnessPreset = {
     name: 'instruct',
     title: 'Instruct',
     description:
-        'A general instruction-following agent with the full shared toolbox. Every capability is searchable: call toolRequest with capability tags to enable the file, command, git, time, text, notes, or web-search tools the task needs. The live presets differ only in their agents, not their tools.',
+        'A general instruction-following agent with the full shared toolbox. File read/write/edit/glob and a configured webSearch are always available; call toolRequest with capability tags for fileList, commands, diffs, syntax checks, time, text, or notes. The live presets differ only in their agents, not their tools.',
     requiresEndpoint: true,
     primary: 'instruct',
     subagents: [],
@@ -82,6 +98,7 @@ const instruct: HarnessPreset = {
     environmentTools: ['webSearch'],
     builtin: true,
     editable: true,
+    template: 'live',
     create: createProfiledHarness('instruct', [])
 };
 
@@ -92,7 +109,7 @@ const research: HarnessPreset = {
     name: 'research',
     title: 'Research',
     description:
-        'A research agent with the same full toolbox as every live harness, plus a summarizer subagent. `primary` and `subagents` are explicit: the research agent is the entry point and the only agent that may delegate, and delegation is one level deep. Web search joins the toolbox when the host configured a search key.',
+        'A research agent with the same full toolbox as every live harness, plus a summarizer subagent. fileRead and fileGlob are always available; `primary` and `subagents` are explicit: the research agent is the entry point and the only agent that may delegate, and delegation is one level deep. Web search is core and joins the toolbox when the host configured a search key.',
     requiresEndpoint: true,
     primary: 'research',
     subagents: ['summarizer'],
@@ -101,6 +118,7 @@ const research: HarnessPreset = {
     environmentTools: ['webSearch'],
     builtin: true,
     editable: true,
+    template: 'live',
     create: createProfiledHarness('research', ['summarizer'])
 };
 
@@ -111,7 +129,7 @@ const workspace: HarnessPreset = {
     name: 'workspace',
     title: 'Workspace (coding)',
     description:
-        'A coding agent with the full shared toolbox: discover and use file read/write/edit/list/glob, check syntax, diff the working tree, run commands, and web search when a key is configured. It has the same registered tools as every live harness and differs only in its agent profile and routing. Everything runs on the server host; discovery gates each tool.',
+        'A coding agent with the full shared toolbox: file read/write/edit/glob are always available, and fileList, syntax checks, diffs, and commands are discovered by tag. Web search is available when a key is configured. It has the same registered tools as every live harness and differs only in its agent profile and routing. Everything runs on the server host.',
     requiresEndpoint: true,
     primary: 'workspace',
     subagents: [],
@@ -120,6 +138,7 @@ const workspace: HarnessPreset = {
     environmentTools: ['webSearch'],
     builtin: true,
     editable: true,
+    template: 'live',
     create: createProfiledHarness('workspace', [])
 };
 
@@ -130,8 +149,11 @@ const workspace: HarnessPreset = {
 // The offline demo is a scripted transport, not a live harness: it demonstrates
 // the loop (reasoning, toolRequest discovery, one tool call, answer) with no
 // endpoint. Its timeNow-only registry is intentional and pinned by its script, so
-// it is exempt from the shared-toolbox rule. `editable: false`: overriding its
-// metadata would let the fixture claim a configuration its script does not run.
+// it is exempt from the shared-toolbox rule. It is still an EDITABLE template
+// (R20.1): a metadata-only PATCH (title/description) keeps the script; an
+// executable PATCH (primary/subagents/agentModels) upgrades it to an honest live
+// profiled harness (shared toolbox, requiresEndpoint, no script). `template` is
+// the registry's signal for that distinction — see ./registry.ts.
 const demo: HarnessPreset = {
     name: 'demo',
     title: 'Scripted demo',
@@ -143,7 +165,16 @@ const demo: HarnessPreset = {
     agents: ['demo'],
     tools: ['timeNow'],
     builtin: true,
-    editable: false,
+    editable: true,
+    template: 'scripted',
+    // Adopted by the registry only when an executable PATCH upgrades this template
+    // and the operator has not edited the shipped title/description (R20.1): the
+    // card must stop claiming "scripted, no endpoint" once it runs live turns.
+    live: {
+        title: 'Live demo',
+        description:
+            'A live harness built from the selected agents with the shared toolbox, running against the session provider. This entry started as the scripted demo and no longer uses the offline script.'
+    },
     create: (settings, progress) =>
         harness({
             agents: {
@@ -169,9 +200,11 @@ const demo: HarnessPreset = {
 // Recoverable failures is a live example, so it gets the shared toolbox too and
 // adds `testFlaky` as an extra. `testFlaky` stays out of the shared table on
 // purpose: it throws two calls out of three and keeps module-level attempt state,
-// which must never be part of what Instruct/Research/Workspace can call. Not
-// editable: the example's point is its fixed failure behaviour. The harness id
-// stays `flaky` (only the TOOL is testFlaky).
+// which must never be part of what Instruct/Research/Workspace can call. The
+// example's failure behaviour is its point, so its template is `flaky`: a
+// metadata-only PATCH keeps this factory and its extra tool, while an executable
+// PATCH rebuilds the live toolbox with testFlaky retained. The harness id stays
+// `flaky` (only the TOOL is testFlaky).
 const failure: HarnessPreset = {
     name: 'flaky',
     title: 'Recoverable failures (example)',
@@ -182,8 +215,13 @@ const failure: HarnessPreset = {
     subagents: [],
     agents: ['flaky'],
     tools: [...SHARED_TOOL_NAMES, 'testFlaky'],
+    // R18: the factory below uses createToolboxHarness, which opts into webSearch
+    // exactly like the live presets. Declaring it here keeps descriptor.tools and
+    // descriptor.coreTools equal to what the session actually registers.
+    environmentTools: ['webSearch'],
     builtin: true,
-    editable: false,
+    editable: true,
+    template: 'flaky',
     create: (settings: RunnerSettings, progress) =>
         createToolboxHarness(
             {

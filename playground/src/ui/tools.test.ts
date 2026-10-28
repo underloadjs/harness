@@ -19,6 +19,7 @@ describe('createToolCallCard', () => {
         expect(card.element.getAttribute('data-state')).toBe('running');
         expect(card.element.querySelector('.tool-state')?.textContent).toBe('running');
         expect(card.element.querySelector('.tool-name')?.textContent).toBe('fileRead');
+        expect(card.element.querySelector('.tool-summary')?.getAttribute('aria-label')).toBe('fileRead: running');
         expect(card.element.querySelector('.tool-peek')?.textContent).toBe('{"paths":["package.json"]}');
         expect(card.element.querySelector('.tool-label')?.textContent).toBe('arguments');
         expect(card.element.querySelectorAll('.tool-label')[1]?.textContent).toBe('result · pending');
@@ -26,6 +27,32 @@ describe('createToolCallCard', () => {
             'Waiting for the harness to run this call…'
         );
         expect(card.state()).toBe('running');
+    });
+
+    it('keeps arguments and result available when a chip is expanded', () => {
+        const card = createToolCallCard('fileRead', '{"paths":["package.json"]}');
+        card.resolve('{"ok":true}', false);
+
+        const summary = card.element.querySelector('.tool-summary');
+        expect(summary?.getAttribute('aria-label')).toBe('fileRead: ok');
+
+        const argumentsText = '{\n  "paths": [\n    "package.json"\n  ]\n}';
+        const resultText = '{\n  "ok": true\n}';
+
+        // Collapsed chip markup still contains the full detail; styles.css is what
+        // hides the verbose summary pieces, not the DOM.
+        expect(card.element.querySelectorAll('.tool-section code')[0]?.textContent).toBe(argumentsText);
+        expect(card.element.querySelector('.tool-result code')?.textContent).toBe(resultText);
+
+        card.element.open = true;
+        expect(card.element.open).toBe(true);
+        expect(card.element.querySelector('.tool-peek')?.textContent).toBe(
+            '{"paths":["package.json"]} · 11 chars'
+        );
+
+        card.element.open = false;
+        expect(card.element.querySelectorAll('.tool-section code')[0]?.textContent).toBe(argumentsText);
+        expect(card.element.querySelector('.tool-result code')?.textContent).toBe(resultText);
     });
 
     it('resolves a successful result, highlighting JSON and summarising the size', () => {
@@ -50,6 +77,9 @@ describe('createToolCallCard', () => {
 
         expect(card.state()).toBe('error');
         expect(card.element.querySelector('.tool-state')?.textContent).toBe('error');
+        expect(card.element.querySelector('.tool-summary')?.getAttribute('aria-label')).toBe(
+            'commandRun: error'
+        );
         expect(card.element.querySelector('.tool-peek')?.textContent).toBe(
             '{"command":"false"} · failed'
         );

@@ -48,15 +48,20 @@ const removeButtons = (element: HTMLElement): HTMLButtonElement[] => [
 ];
 
 describe('createAgentRow', () => {
-    it('labels every member as primary or secondary and disables removing the last one', () => {
+    it('shows one human-readable name per member with role as data only', () => {
         const { element } = mount({ members: ['instruct', 'summarizer'], primary: 'instruct' });
 
         const tiles = [...element.querySelectorAll<HTMLElement>('.agent-tile')];
         expect(tiles.map((tile) => tile.dataset.agent)).toEqual(['instruct', 'summarizer']);
         expect(tiles.map((tile) => tile.dataset.role)).toEqual(['primary', 'secondary']);
+        // The preset title is the only displayed name: no duplicated slug and no
+        // separate title line.
         expect(
-            [...element.querySelectorAll<HTMLElement>('.agent-role')].map((node) => node.textContent)
-        ).toEqual(['primary', 'secondary']);
+            [...element.querySelectorAll<HTMLElement>('.agent-tile-name')].map((node) => node.textContent)
+        ).toEqual(['Instruct', 'Summarizer']);
+        expect(element.querySelector('.agent-tile-title')).toBeNull();
+        // Role is colour + aria-pressed, not a badge.
+        expect(element.querySelector('.agent-role')).toBeNull();
         expect(mainButtons(element).map((button) => button.getAttribute('aria-pressed'))).toEqual([
             'true',
             'false'
@@ -147,7 +152,7 @@ describe('createAgentRow', () => {
         const { element } = mount({ members: ['instruct', 'legacy-helper'] });
 
         const tile = element.querySelector<HTMLElement>('.agent-tile[data-agent="legacy-helper"]');
-        expect(tile?.querySelector('.agent-tile-title')?.textContent).toBe('legacy-helper');
+        expect(tile?.querySelector('.agent-tile-name')?.textContent).toBe('legacy-helper');
         expect(element.querySelectorAll('.agent-option')).toHaveLength(agents.length);
     });
 });
@@ -158,7 +163,8 @@ describe('per-agent model dropdown', () => {
     ): NonNullable<AgentRowOptions['models']> => ({
         models: {},
         catalogue: ['m1', 'm2'],
-        inheritModel: 'm1',
+        // R18: the no-override choice is labelled with this resolved model.
+        fallbackModel: 'm1',
         editable: true,
         onChange: vi.fn(),
         ...options
@@ -169,12 +175,17 @@ describe('per-agent model dropdown', () => {
 
         const selects = [...element.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
         expect(selects.map((select) => select.getAttribute('aria-label'))).toEqual([
-            'Model for instruct',
-            'Model for summarizer'
+            'Model for Instruct',
+            'Model for Summarizer'
         ]);
+        // The control is a bare select: no visible MODEL label, but the accessible
+        // name above still identifies it.
+        expect(element.querySelector('.agent-model-label')).toBeNull();
         expect(
-            [...element.querySelectorAll<HTMLElement>('.agent-model-label')].map((node) => node.textContent)
-        ).toEqual(['model', 'model']);
+            [...element.querySelectorAll<HTMLElement>('.agent-model')].map((row) =>
+                [...row.children].map((child) => child.tagName)
+            )
+        ).toEqual([['SELECT'], ['SELECT']]);
         // The promotion buttons contain no select: choosing a model can never
         // also promote the agent.
         expect(
@@ -185,40 +196,93 @@ describe('per-agent model dropdown', () => {
         expect(selects.map((select) => select.disabled)).toEqual([false, false]);
     });
 
-    it('offers inherit, the catalogue and a current override that is absent from it', () => {
+    it('labels the default with its model, dedupes it from the catalogue, and sorts an absent override', () => {
         const { element, options } = mount({
             members: ['instruct', 'summarizer'],
             models: models({ models: { instruct: 'legacy-model' } })
         });
 
         const select = element.querySelector<HTMLSelectElement>('.agent-model-select');
+        // Option 0 is the no-override default, labelled m1 (the fallback it really
+        // resolves to), so the catalogue's m1 is not repeated. No "inherit" text.
+        // `legacy-model` sorts into its alphabetic place, not at the tail.
         expect([...select!.options].map((option) => option.textContent)).toEqual([
-            'inherit · m1',
             'm1',
-            'm2',
-            'legacy-model (current)'
+            'legacy-model',
+            'm2'
         ]);
         expect([...select!.options].map((option) => option.value)).toEqual([
             '',
-            'm1',
-            'm2',
-            'legacy-model'
+            'legacy-model',
+            'm2'
         ]);
         expect(select!.value).toBe('legacy-model');
 
-        // A member without an override shows the inherit choice and names the
-        // model it would use.
-        const inherit = element.querySelectorAll<HTMLSelectElement>('.agent-model-select')[1];
-        expect(inherit.value).toBe('');
-        expect(inherit.options[0].textContent).toBe('inherit · m1');
+        // A member without an override selects the default option and shows the
+        // actual model it uses.
+        const fallback = element.querySelectorAll<HTMLSelectElement>('.agent-model-select')[1];
+        expect(fallback.value).toBe('');
+        expect(fallback.options[0].textContent).toBe('m1');
 
         select!.value = 'm2';
         select!.dispatchEvent(new Event('change', { bubbles: true }));
         expect(options.models?.onChange).toHaveBeenCalledWith('instruct', 'm2');
 
-        inherit.value = '';
-        inherit.dispatchEvent(new Event('change', { bubbles: true }));
+        // Reverting sends '' so main.ts deletes the override.
+        fallback.value = '';
+        fallback.dispatchEvent(new Event('change', { bubbles: true }));
         expect(options.models?.onChange).toHaveBeenLastCalledWith('summarizer', '');
+    });
+
+    it('shows an honest label when the effective model is unknown, never "inherit"', () => {
+        const { element } = mount({
+            models: models({ fallbackModel: '', models: {}, catalogue: [] })
+        });
+
+        const select = element.querySelector<HTMLSelectElement>('.agent-model-select');
+        expect([...select!.options].map((option) => option.textContent)).toEqual([
+            'model not specified'
+        ]);
+        expect(select!.value).toBe('');
+        expect(JSON.stringify([...select!.options].map((option) => option.textContent))).not.toContain(
+            'inherit'
+        );
+    });
+
+    it('sorts an unsorted catalogue case-insensitively and places an unknown current override in order', () => {
+        // Deliberately unsorted, mixed case and mixed numeric widths. The helper
+        // (ui/model-order.ts) lower-cases for comparison, then applies a numeric
+        // collator, then a raw tie-break: `Alpha` and `alpha` fold equal and sort
+        // by codepoint (uppercase first), while `beta-2` precedes `beta-10`.
+        const catalogue = ['zeta-2', 'Alpha', 'beta-10', 'beta-2', 'alpha'];
+        const { element } = mount({
+            members: ['instruct'],
+            models: models({ catalogue, models: { instruct: 'Legacy-Model' } })
+        });
+
+        const select = element.querySelector<HTMLSelectElement>('.agent-model-select');
+        expect([...select!.options].map((option) => option.textContent)).toEqual([
+            'm1',
+            'Alpha',
+            'alpha',
+            'beta-2',
+            'beta-10',
+            'Legacy-Model',
+            'zeta-2'
+        ]);
+        expect([...select!.options].map((option) => option.value)).toEqual([
+            '',
+            'Alpha',
+            'alpha',
+            'beta-2',
+            'beta-10',
+            'Legacy-Model',
+            'zeta-2'
+        ]);
+        // The unknown override stays selected after being sorted into place.
+        expect(select!.value).toBe('Legacy-Model');
+        // Sorting copies: the caller's catalogue must not be reordered in place.
+        expect(catalogue).toEqual(['zeta-2', 'Alpha', 'beta-10', 'beta-2', 'alpha']);
     });
 
     it('shows effective frozen models and disables the selects when the chat is locked', () => {
@@ -229,14 +293,21 @@ describe('per-agent model dropdown', () => {
             lockReason: 'This saved session keeps the agent team it started with.',
             models: models({
                 editable: false,
-                inheritModel: 'm1',
+                fallbackModel: 'm1',
                 models: { instruct: 'm2', summarizer: 'm1' },
                 onChange
             })
         });
 
         const selects = [...element.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
-        expect(selects.map((select) => select.value)).toEqual(['m2', 'm1']);
+        // The visible effective model is what matters: m2 is an override (its own
+        // option), m1 equals the fallback so the default option is selected and
+        // labelled m1. No option says "inherit".
+        expect(selects.map((select) => select.value)).toEqual(['m2', '']);
+        expect(selects.map((select) => select.options[select.selectedIndex].textContent)).toEqual([
+            'm2',
+            'm1'
+        ]);
         expect(selects.map((select) => select.disabled)).toEqual([true, true]);
 
         // A disabled select cannot be driven by a stale handler.
@@ -250,8 +321,9 @@ describe('per-agent model dropdown', () => {
 
         const select = element.querySelector<HTMLSelectElement>('.agent-model-select');
         expect(select?.disabled).toBe(true);
+        // No caller data: the honest unknown label, never an inherit claim.
         expect([...select!.options].map((option) => option.textContent)).toEqual([
-            'inherit session model'
+            'model not specified'
         ]);
     });
 });

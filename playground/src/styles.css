@@ -516,8 +516,8 @@ button {
 
 /* Tools tab ------------------------------------------------------------- */
 /* Full-width, keyed list of every server tool (core entries included) above the
-   manual runner. The right rail keeps its compact catalogue; both open the same
-   runner and a call always executes on the server. */
+   manual runner. After R21.2 this is the ONLY catalogue: the right rail no longer
+   duplicates it, and a call always executes on the server. */
 
 .tools-pane {
     gap: 12px;
@@ -688,49 +688,55 @@ button {
 .agent-row {
     display: flex;
     align-items: stretch;
-    gap: 8px;
+    gap: 6px;
     padding-bottom: 2px;
     overflow-x: auto;
 }
 
+/* Compact pills: a single name row plus the bare model select. The previous
+   card carried a role badge, slug and title on separate lines, which made each
+   agent taller than its content warranted. */
 .agent-tile {
     position: relative;
     display: flex;
     flex-direction: column;
     flex: 0 0 auto;
-    min-width: 148px;
-    max-width: 220px;
+    min-width: 128px;
+    max-width: 200px;
     /* The tile's own border is the dim track the activity ring sweeps around
        (see .agent-tile[data-activity='active']::before). */
     border: 1px solid var(--border);
-    border-radius: 12px;
+    border-radius: 10px;
     background: var(--bg-elevated);
     transition: border-color 120ms ease, background 120ms ease;
 }
 
+/* Primary reads green end to end; secondary stays neutral. The name colour
+   below is the primary/secondary signal, so no role badge is needed. */
 .agent-tile[data-role='primary'] {
-    border-color: var(--accent);
-    background: var(--accent-soft);
+    border-color: rgba(74, 222, 128, 0.5);
+    background: rgba(74, 222, 128, 0.1);
 }
 
 /* Top row: promotion button + remove button. The model dropdown is a sibling
    below, never inside the promotion button, so choosing a model cannot promote. */
 .agent-tile-top {
     display: flex;
-    align-items: stretch;
+    align-items: center;
     flex: 1;
     min-width: 0;
 }
 
 .agent-main {
     display: flex;
-    flex-direction: column;
-    gap: 2px;
+    flex-direction: row;
+    align-items: center;
+    gap: 6px;
     flex: 1;
     min-width: 0;
-    padding: 8px 10px;
+    padding: 5px 4px 4px 8px;
     border: 0;
-    border-radius: 12px 0 0 0;
+    border-radius: 10px 0 0 0;
     background: transparent;
     color: inherit;
     text-align: left;
@@ -745,53 +751,28 @@ button {
     background: rgba(255, 255, 255, 0.03);
 }
 
-/* Role is text first: the colour is decoration. */
-.agent-role {
-    width: fit-content;
-    padding: 0 6px;
-    border: 1px solid var(--border-strong);
-    border-radius: 999px;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 9.5px;
-    line-height: 16px;
-    text-transform: uppercase;
-    letter-spacing: 0.08em;
-}
-
-.agent-tile[data-role='primary'] .agent-role {
-    border-color: rgba(122, 162, 255, 0.5);
-    color: var(--accent);
-}
-
-.agent-tile[data-role='secondary'] .agent-role {
-    border-color: rgba(251, 191, 36, 0.4);
-    color: var(--warn);
-}
-
 .agent-tile-name {
     overflow: hidden;
+    color: var(--text);
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: 11.5px;
+    font-weight: 500;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-.agent-tile-title {
-    overflow: hidden;
-    color: var(--muted);
-    font-size: 11px;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+.agent-tile[data-role='primary'] .agent-tile-name {
+    color: var(--ok);
 }
 
 .agent-remove {
-    padding: 0 8px;
+    padding: 0 6px;
     border: 0;
-    border-radius: 0 12px 0 0;
+    border-radius: 0 10px 0 0;
     background: transparent;
     color: var(--muted);
-    font-size: 14px;
+    font-size: 12px;
+    line-height: 1;
     cursor: pointer;
 }
 
@@ -856,29 +837,23 @@ button {
     display: flex;
     align-items: center;
     gap: 6px;
-    padding: 5px 8px 7px;
+    padding: 2px 6px 5px;
     border-top: 1px solid var(--border);
-    border-radius: 0 0 12px 12px;
+    border-radius: 0 0 10px 10px;
 }
 
-.agent-model-label {
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 9.5px;
-    letter-spacing: 0.06em;
-    text-transform: uppercase;
-}
-
+/* No visible "model" label: the select's accessible name carries both the
+   field and the agent (aria-label in ui/agents.ts). */
 .agent-model-select {
     flex: 1;
     min-width: 0;
-    padding: 2px 4px;
+    padding: 1px 3px;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: 5px;
     background: var(--bg-input);
     color: var(--text);
     font-family: var(--mono);
-    font-size: 10.5px;
+    font-size: 10px;
 }
 
 .agent-model-select:disabled {
@@ -888,12 +863,12 @@ button {
 
 .agent-add {
     flex: 0 0 auto;
-    width: 46px;
+    width: 36px;
     border: 1px dashed var(--border-strong);
-    border-radius: 12px;
+    border-radius: 10px;
     background: transparent;
     color: var(--muted);
-    font-size: 19px;
+    font-size: 16px;
     cursor: pointer;
 }
 
@@ -1118,6 +1093,7 @@ button {
 }
 
 .tile {
+    position: relative;
     display: flex;
     flex-direction: column;
     min-width: 0;
@@ -1132,14 +1108,53 @@ button {
     border-color: var(--border-strong);
 }
 
-/* Compact tile: square-ish, preview only. `aspect-ratio` keeps the grid visually
-   even; content is clamped so a long prompt cannot stretch a row. */
+/* Compact tile: a slim content-height card, not a square. The earlier
+   `aspect-ratio: 1 / 1` reserved a ~210px square and left a large empty middle
+   under a four-line prompt; the tile now ends after its meta line. The prompt is
+   clamped to two lines so one long paste cannot stretch a whole grid row. */
 .tile:not(.is-expanded) {
-    aspect-ratio: 1 / 1;
+    align-self: start;
 }
 
 .tile:not(.is-expanded) .tile-select {
     flex: 1;
+    gap: 4px;
+    padding: 8px 10px 9px;
+}
+
+.tile:not(.is-expanded) .tile-prompt {
+    -webkit-line-clamp: 2;
+    font-size: 12.5px;
+    line-height: 1.4;
+}
+
+/* A narrow tile with both an elapsed and a token label used to push the status
+   dot past the clipped right edge — the one state cue a compact tile relies on.
+   The numeric labels give way (ellipsis) and the badge never shrinks. */
+.tile:not(.is-expanded) .tile-top {
+    gap: 6px;
+}
+
+/* Compact headers use the smallest type in the app so the index, clock, tally
+   and badge all fit the 184px grid minimum; the ellipsis rules below are only a
+   guard for extreme values, not the normal rendering. */
+.tile:not(.is-expanded) .tile-index,
+.tile:not(.is-expanded) .tile-elapsed,
+.tile:not(.is-expanded) .tile-tokens,
+.tile:not(.is-expanded) .tile-status {
+    font-size: 10px;
+}
+
+.tile:not(.is-expanded) .tile-elapsed,
+.tile:not(.is-expanded) .tile-tokens {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tile:not(.is-expanded) .tile-status {
+    flex: 0 0 auto;
 }
 
 .tile:not(.is-expanded) .tile-body {
@@ -1203,7 +1218,24 @@ button {
     font-variant-numeric: tabular-nums;
 }
 
+/* Server-summed token tally (`122,111 (100,301)`), sat next to the elapsed label.
+   The `|` between them is decoration applied here rather than a character in
+   either value, so each span stays a clean, copy-pastable number; it disappears
+   when the timer is hidden (a legacy record with no start stamp). */
+.tile-tokens {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
+    white-space: nowrap;
+}
+
+.tile-elapsed:not([hidden]) + .tile-tokens:not([hidden])::before {
+    content: ' | ';
+}
+
 .tile-status {
+    position: relative;
     display: inline-flex;
     align-items: center;
     gap: 5px;
@@ -1215,6 +1247,22 @@ button {
     white-space: nowrap;
 }
 
+/* Compact tiles convey the state by colour and the activity ring below, so the
+   status word would be a second visible label ("done" next to the meta line).
+   It stays in the DOM for assistive tech — clipped, not removed. Expanded tiles
+   keep the word: there, the header is the only place the state is spelled out. */
+.tile:not(.is-expanded) .tile-status-text {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+}
+
 .tile-dot {
     flex: 0 0 auto;
     width: 6px;
@@ -1223,8 +1271,8 @@ button {
     background: currentColor;
 }
 
-/* Live states animate; text still spells out the state. `queued`/`waiting` mean
-   the browser has the prompt but no event has arrived yet. */
+/* Live states animate; text (expanded tiles) still spells out the state.
+   `queued`/`waiting` mean the browser has the prompt but no event has arrived. */
 .tile[data-state='queued'] .tile-status,
 .tile[data-state='waiting'] .tile-status,
 .tile[data-state='streaming'] .tile-status {
@@ -1237,6 +1285,32 @@ button {
     animation: status-pulse 1.1s ease-in-out infinite;
 }
 
+/* Settled states are colour-coded on the compact grid: green = completed
+   successfully, red = failed, muted = cancelled. This is what replaces the
+   visible "done" word, so a finished tile reads at a glance in a wall of tiles.
+   Only the compact variant paints the border; an expanded tile is the reading
+   surface and keeps the neutral frame. */
+.tile:not(.is-expanded)[data-state='done'] {
+    border-color: rgba(74, 222, 128, 0.45);
+    background: rgba(74, 222, 128, 0.05);
+}
+
+.tile:not(.is-expanded)[data-state='done']:hover {
+    border-color: var(--ok);
+}
+
+.tile:not(.is-expanded)[data-state='error'] {
+    border-color: rgba(248, 113, 113, 0.5);
+    background: rgba(248, 113, 113, 0.05);
+}
+
+.tile:not(.is-expanded)[data-state='error']:hover {
+    border-color: var(--danger);
+}
+
+/* Cancelled is a deliberate stop, not a failure: it stays neutral (default
+   border) and only the dot is muted — no green and no red would both be lies. */
+
 .tile[data-state='done'] .tile-status {
     color: var(--ok);
 }
@@ -1247,6 +1321,41 @@ button {
 
 .tile[data-state='cancelled'] .tile-status {
     color: var(--muted);
+}
+
+/* Compact tile activity ring ------------------------------------------- */
+/* Same visual language as the agent row's working border
+   (`.agent-tile[data-activity='active']::before` above): a conic-gradient arc
+   swept by the shared `agent-ring-spin` keyframes and the shared
+   `--agent-ring-angle` property. One animation definition keeps a "working
+   tile" and a "working agent" in step. Drawn inside the tile's own 1px border
+   because `.tile` clips (`overflow: hidden`) for its rounded corners; the ring
+   is decoration, so reduced motion freezes it at the static arc. */
+.tile:not(.is-expanded)[data-state='queued']::before,
+.tile:not(.is-expanded)[data-state='waiting']::before,
+.tile:not(.is-expanded)[data-state='streaming']::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    padding: 1px;
+    border-radius: inherit;
+    background: conic-gradient(
+        from var(--agent-ring-angle, 0deg),
+        transparent 0deg,
+        transparent 250deg,
+        var(--accent) 330deg,
+        #b9cdff 360deg
+    );
+    -webkit-mask:
+        linear-gradient(#fff 0 0) content-box,
+        linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask:
+        linear-gradient(#fff 0 0) content-box,
+        linear-gradient(#fff 0 0);
+    mask-composite: exclude;
+    animation: agent-ring-spin 900ms linear infinite;
+    pointer-events: none;
 }
 
 .tile-prompt {
@@ -1318,6 +1427,22 @@ button {
     font-size: 10.5px;
     letter-spacing: 0.11em;
     text-transform: uppercase;
+}
+
+/* Transcript-only role badge (ui/turns.ts). The compact team row no longer
+   renders `.agent-role`, but the turn cards still use it; keep the base shape
+   here so the subagent variant below only overrides colour. */
+.agent-role {
+    width: fit-content;
+    padding: 0 6px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 9.5px;
+    line-height: 16px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
 }
 
 .agent[data-role='primary'] .agent-role {
@@ -1392,12 +1517,32 @@ button {
 
 /* Tool calls ----------------------------------------------------------- */
 /* `details/summary` gives collapse, keyboard operation and screen-reader
-   semantics. Collapsed, every card answers "what ran, and did it work?". */
+   semantics. Collapsed, every card answers "what ran, and did it work?".
+   
+   Consecutive calls share one `.tool-group` row (turns.ts): collapsed they are
+   compact inline chips (`[websearch][fileRead]`) that wrap when the tile is
+   narrow; an opened chip takes the full line so its arguments/result can use the
+   card's former width. */
+
+.tool-group {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: 4px;
+}
 
 .tool {
+    flex: 0 1 auto;
+    max-width: 100%;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: 6px;
     background: var(--bg-input);
+}
+
+/* The expanded card leaves the chip row: `flex-basis: 100%` forces it onto its
+   own line, and the remaining chips wrap after it. */
+.tool[open] {
+    flex-basis: 100%;
 }
 
 .tool[data-state='error'] {
@@ -1407,13 +1552,19 @@ button {
 .tool-summary {
     display: flex;
     align-items: center;
-    gap: 8px;
-    padding: 7px 10px;
+    gap: 5px;
+    padding: 3px 8px;
     color: var(--muted);
     font-family: var(--mono);
     font-size: 11.5px;
     cursor: pointer;
     list-style: none;
+}
+
+/* An opened card has room for the verbose summary line again. */
+.tool[open] > .tool-summary {
+    gap: 8px;
+    padding: 7px 10px;
 }
 
 .tool-summary::-webkit-details-marker {
@@ -1435,6 +1586,15 @@ button {
     outline-offset: -2px;
 }
 
+/* Collapsed chip = disclosure arrow + tool name only. Duration, the state word
+   and the argument preview are verbose metadata; they stay in the DOM (and in
+   the accessible `aria-label` on the summary) but are hidden until expanded. */
+.tool:not([open]) .tool-state,
+.tool:not([open]) .tool-duration,
+.tool:not([open]) .tool-peek {
+    display: none;
+}
+
 .tool-glyph {
     color: var(--warn);
 }
@@ -1447,8 +1607,30 @@ button {
     color: var(--danger);
 }
 
+/* Tool-call chip name. Success turns the name green and failure red, so the
+   collapsed row is scannable without expanding anything. Running stays the
+   existing neutral text colour with the amber arrow. */
 .tool-name {
     color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+    max-width: 32ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.tool[data-state='ok'] .tool-name {
+    color: var(--ok);
+}
+
+.tool[data-state='error'] .tool-name {
+    color: var(--danger);
+}
+
+/* The expanded card has a whole row, so a long tool name is no longer clipped. */
+.tool[open] .tool-name {
+    max-width: none;
 }
 
 .tool-state {
@@ -1858,150 +2040,144 @@ button {
     font-weight: 600;
 }
 
-/* Core tools (right rail) ---------------------------------------------- */
-/* R3: the harness core set lives here, collapsed, and nowhere else. */
+/* Core tools dropdown (right rail) — REMOVED in R21.2 ------------------ */
+/* The right rail no longer lists tools at all: the Tools tab is the single
+   catalogue (core entries included). Only the tab's session-status line and the
+   panel hosts remain styled below. */
 
-.core-tools {
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--bg-elevated);
+/* Tool scratch board + panel hosts (R21.3) ----------------------------- */
+
+/* A host is a plain stack of cards. It hides itself (hidden attribute) while it
+   has no panels, so an unused location adds no chrome. */
+.panel-host {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
 }
 
-.core-summary {
-    padding: 8px 10px;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 11px;
-    letter-spacing: 0.08em;
-    text-transform: uppercase;
-    cursor: pointer;
-    list-style: none;
+/* The left host sits between the harness list and the endpoint disclosure; the
+   centre host sits above the turn stage. Both stay quiet: no border of their
+   own, the cards carry the appearance. */
+.rail-left > .panel-host {
+    margin-top: 2px;
 }
 
-.core-summary::-webkit-details-marker {
-    display: none;
+.center > .panel-host {
+    padding: 10px 20px 0;
 }
 
-.core-summary::before {
-    content: '▸';
-    display: inline-block;
-    margin-right: 6px;
-    transition: transform 120ms ease;
+/* The scratch board is the primary host: it lives in the right rail, above
+   sessions, and may scroll with the rail. */
+.scratch-section {
+    flex: 0 1 auto;
+    min-height: 0;
 }
 
-.core-tools[open] > .core-summary::before {
-    transform: rotate(90deg);
+.scratch-note {
+    margin: 0;
 }
 
-.core-body {
+.panel {
     display: flex;
     flex-direction: column;
     gap: 7px;
-    padding: 0 10px 10px;
-}
-
-.core-list {
-    display: flex;
-    flex-direction: column;
-    gap: 5px;
-}
-
-.core-tool {
-    display: flex;
-    flex-direction: column;
-    gap: 1px;
-    padding: 6px 8px;
+    padding: 9px 10px;
     border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--bg-input);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+    min-width: 0;
 }
 
-.core-tool-name {
+.panel-title {
+    margin: 0;
     color: var(--accent);
     font-family: var(--mono);
-    font-size: 11.5px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    overflow-wrap: anywhere;
 }
 
-.core-tool-description {
-    color: var(--muted);
+.panel-blocks {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    min-width: 0;
+}
+
+/* Tool text is DATA: it is rendered with textContent, so it can never execute.
+   It is still plain text, not Markdown, because the panel contract says so. */
+.panel-text {
+    margin: 0;
+    font-size: 12px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.panel-table-wrap {
+    max-width: 100%;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+}
+
+.panel-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
     font-size: 11px;
 }
 
-/* Tool catalogue ------------------------------------------------------- */
-
-.catalogue-count {
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 10.5px;
-}
-
-.tool-list {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-}
-
-.tool-group {
-    margin: 8px 0 2px;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 10.5px;
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
-}
-
-.tool-group:first-child {
-    margin-top: 0;
-}
-
-.tool-button {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 8px;
-    padding: 7px 10px;
-    border: 1px solid transparent;
-    border-radius: 8px;
-    background: var(--bg-elevated);
-    color: inherit;
-    font: inherit;
+.panel-table th,
+.panel-table td {
+    padding: 4px 7px;
+    border-bottom: 1px solid var(--border);
     text-align: left;
-    cursor: pointer;
+    white-space: nowrap;
 }
 
-.tool-button:hover:not(:disabled) {
-    border-color: var(--border-strong);
+.panel-table th {
+    position: sticky;
+    top: 0;
+    background: var(--bg-bar);
+    color: var(--muted);
+    font-weight: 500;
 }
 
-.tool-button[aria-pressed='true'] {
-    border-color: var(--accent);
-    background: var(--accent-soft);
+.panel-table tr:last-child td {
+    border-bottom: 0;
 }
 
-.tool-button:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
+.panel-kv {
+    display: grid;
+    grid-template-columns: minmax(0, auto) minmax(0, 1fr);
+    gap: 2px 10px;
+    margin: 0;
+    font-size: 11.5px;
 }
 
-.tool-name {
-    font-family: var(--mono);
-    font-size: 12px;
-}
-
-.tool-kind {
+.panel-kv-label {
     color: var(--muted);
     font-family: var(--mono);
     font-size: 10.5px;
+    overflow-wrap: anywhere;
 }
 
-/* A listed-but-unconfigured tool (websearch without a provider key) stays
-   clickable so its hint and schema are readable, but the state must not look
-   like a working tool. Colour is decoration; the text says "unconfigured". */
-.tool-button[data-availability='unconfigured'] .tool-kind {
-    color: var(--warn);
+.panel-kv-value {
+    margin: 0;
+    overflow-wrap: anywhere;
 }
 
-/* Direct tool runner --------------------------------------------------- */
+/* Tools tab session status (R21.2) ------------------------------------- */
+/* Informational session binding + tools toolRequest enabled for it. This replaced
+   the removed right-rail core-tools dropdown; the tab itself is styled above. */
+.tools-session-note {
+    margin: 0;
+    color: var(--accent);
+}
 
 .tool-card {
     display: flex;
@@ -2162,8 +2338,9 @@ button {
 
     .rail-right {
         grid-column: 1 / -1;
+        /* Two sections now: the scratch board and sessions (R21.2). */
         display: grid;
-        grid-template-columns: repeat(3, minmax(0, 1fr));
+        grid-template-columns: repeat(2, minmax(0, 1fr));
         gap: 14px;
         max-height: 40vh;
         border-left: 0;
@@ -2245,6 +2422,9 @@ button {
 @media (prefers-reduced-motion: reduce) {
     .status-dot,
     .tile-dot,
+    .tile[data-state='queued']::before,
+    .tile[data-state='waiting']::before,
+    .tile[data-state='streaming']::before,
     .agent-tile[data-activity='active']::before {
         animation: none !important;
     }
@@ -2252,7 +2432,6 @@ button {
     .tile,
     .tool-summary::before,
     .endpoint-summary::before,
-    .core-summary::before,
     .harness-item {
         transition: none;
     }
@@ -2267,6 +2446,21 @@ button {
     }
 
     .agent-tile[data-activity='active']::before {
+        display: none;
+    }
+
+    /* The tile's conic-gradient ring disappears under forced colours too; the
+       outline carries the "working" state instead. */
+    .tile:not(.is-expanded)[data-state='queued'],
+    .tile:not(.is-expanded)[data-state='waiting'],
+    .tile:not(.is-expanded)[data-state='streaming'] {
+        outline: 2px solid CanvasText;
+        outline-offset: 1px;
+    }
+
+    .tile:not(.is-expanded)[data-state='queued']::before,
+    .tile:not(.is-expanded)[data-state='waiting']::before,
+    .tile:not(.is-expanded)[data-state='streaming']::before {
         display: none;
     }
 }

@@ -11,7 +11,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '../src/harness';
-import type { HarnessStream, HarnessStreamEvent } from '../src/harness';
+import type { HarnessEvent, HarnessStream, HarnessStreamEvent, HarnessUsage } from '../src/harness';
 import type { HarnessPreset, RunnerSettings } from '../harnesses/types';
 import { createHarnessRegistry } from '../harnesses';
 import { SessionError, SessionStore } from './sessions';
@@ -94,6 +94,81 @@ const singlePreset = (): HarnessPreset =>
                 })
             },
             primary: 'single',
+            presets: false,
+            report: { progress }
+        })
+    );
+
+// Replay one scripted frame list per request, exactly like src/harness.test.ts.
+// The last list is reused when a run asks for more requests than were scripted,
+// so a preset can be reused across turns. The usage tests below need per-request
+// figures, which the shared `answerStream` cannot vary.
+const requestStream = (requests: HarnessStreamEvent[][]): HarnessStream => {
+    let index = 0;
+
+    return async function* (): AsyncGenerator<HarnessStreamEvent> {
+        const frames = requests[index] ?? requests[requests.length - 1];
+        index++;
+        for (const frame of frames) yield frame;
+    };
+};
+
+// One agent, one tool-free answer whose single request reports exactly `usage`.
+// Used by the cached-propagation tests: "reported 0 cached" and "not reported"
+// must stay distinguishable all the way into the turn tally.
+const usagePreset = (usage: HarnessUsage): HarnessPreset =>
+    presetOf('priced', (settings, progress) =>
+        harness({
+            agents: {
+                priced: agent({
+                    model: settings.model,
+                    instruction: 'You are a scripted test agent.',
+                    stream: requestStream([
+                        [
+                            { type: 'text', delta: 'priced answer' },
+                            { type: 'done', stopReason: 'stop', toolCalls: [], usage }
+                        ]
+                    ])
+                })
+            },
+            primary: 'priced',
+            presets: false,
+            report: { progress }
+        })
+    );
+
+// One agent that ALWAYS takes exactly one `todoManage` tool round before
+// answering, so a single run makes two model requests. Entry 0 is the tool
+// round's usage, entry 1 the answer's; the harness reports each on a `usage`
+// event and then repeats the LAST one on `done` (the double-count trap).
+// `todoManage` is a CORE tool, declared on the first request without a
+// toolRequest round (src/harness.todo.test.ts pins that).
+const toolRoundPreset = (usage: readonly [HarnessUsage, HarnessUsage]): HarnessPreset =>
+    presetOf('rounds', (settings, progress) =>
+        harness({
+            agents: {
+                rounds: agent({
+                    model: settings.model,
+                    instruction: 'Take one tool round, then answer.',
+                    stream: requestStream([
+                        [
+                            {
+                                type: 'done',
+                                stopReason: 'tool_calls',
+                                toolCalls: [
+                                    { id: 'c1', name: 'todoManage', arguments: '{"action":"list"}' }
+                                ],
+                                usage: usage[0]
+                            }
+                        ],
+                        [
+                            { type: 'text', delta: 'all done' },
+                            { type: 'done', stopReason: 'stop', toolCalls: [], usage: usage[1] }
+                        ]
+                    ])
+                })
+            },
+            primary: 'rounds',
             presets: false,
             report: { progress }
         })
@@ -195,6 +270,10 @@ describe('SessionStore turns', () => {
         expect(events).toEqual([
             { type: 'start', agent: 'single', model: 'scripted/test' },
             { type: 'text', agent: 'single', delta: 'hello' },
+            // Per-request accounting (`src/harness.ts:704`): the harness reports
+            // the request's usage AFTER the streamed text and BEFORE the terminal
+            // message, so the event list has exactly one entry between them.
+            { type: 'usage', agent: 'single', usage: { input: 3, output: 2, total: 5 } },
             {
                 type: 'done',
                 agent: 'single',
@@ -228,7 +307,11 @@ describe('SessionStore turns', () => {
                 updatedAt: 2_000,
                 events,
                 // The clock is pinned, so every record shares this timestamp.
-                eventTimes: [2_000, 2_000, 2_000]
+                eventTimes: [2_000, 2_000, 2_000, 2_000],
+                // The server's running tally for the one reported request
+                // (`SessionStore` addUsage). No `cached` key: this fixture never
+                // reports a cache figure, and absent must stay absent.
+                usage: { input: 3, output: 2, total: 5 }
             }
         ]);
 
@@ -238,6 +321,271 @@ describe('SessionStore turns', () => {
 
         // 5. Provider settings (including the key) never enter a snapshot.
         expect(JSON.stringify(terminal.session)).not.toContain('super-secret-key');
+    });
+
+    it('carries the running tally on every frame from the first usage event on', async () => {
+        const setClock = pinClock(1_000);
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
+        const created = store.create('single');
+
+        setClock(2_000);
+
+        const items: SessionStreamItem[] = [];
+        await store.run(created.id, 'cost please', async (item) => {
+            items.push(item);
+        });
+
+        const opening = items[0];
+        if (opening.type !== 'turn') throw new Error(`expected a turn frame first, got ${opening.type}`);
+
+        const turnId = opening.turn.id;
+
+        // The one request's reported usage is the server's whole tally here.
+        const tally = { input: 3, output: 2, total: 5 };
+
+        // The recorded event list, in emission order: start/text precede the
+        // per-request usage, and the terminal `done` repeats the same usage only
+        // inside its message.
+        const events: HarnessEvent[] = [
+            { type: 'start', agent: 'single', model: 'scripted/test' },
+            { type: 'text', agent: 'single', delta: 'hello' },
+            { type: 'usage', agent: 'single', usage: { input: 3, output: 2, total: 5 } },
+            {
+                type: 'done',
+                agent: 'single',
+                message: {
+                    role: 'assistant',
+                    content: 'hello',
+                    reasoning: '',
+                    toolCalls: [],
+                    model: 'scripted/test',
+                    stopReason: 'stop',
+                    usage: { input: 3, output: 2, total: 5 }
+                }
+            }
+        ];
+
+        // Every frame is asserted whole. `usage` is ABSENT (not `undefined`) on the
+        // opening turn frame and on the frames before the first usage event, so a
+        // client cannot print a tally it was never handed.
+        expect(items.slice(0, -1)).toEqual([
+            {
+                type: 'turn',
+                turn: {
+                    id: turnId,
+                    index: 0,
+                    prompt: 'cost please',
+                    status: 'running',
+                    startedAt: 2_000,
+                    updatedAt: 2_000,
+                    events: [],
+                    eventTimes: []
+                }
+            },
+            {
+                type: 'event',
+                turnId,
+                at: 2_000,
+                event: { type: 'start', agent: 'single', model: 'scripted/test' }
+            },
+            {
+                type: 'event',
+                turnId,
+                at: 2_000,
+                event: { type: 'text', agent: 'single', delta: 'hello' }
+            },
+            {
+                // The usage frame already carries the tally its own event produced.
+                type: 'event',
+                turnId,
+                at: 2_000,
+                event: { type: 'usage', agent: 'single', usage: { input: 3, output: 2, total: 5 } },
+                usage: tally
+            },
+            {
+                // `done` reports the same request's usage again inside its message;
+                // the sink does not fold it, so the frame tally is unchanged.
+                type: 'event',
+                turnId,
+                at: 2_000,
+                event: {
+                    type: 'done',
+                    agent: 'single',
+                    message: {
+                        role: 'assistant',
+                        content: 'hello',
+                        reasoning: '',
+                        toolCalls: [],
+                        model: 'scripted/test',
+                        stopReason: 'stop',
+                        usage: { input: 3, output: 2, total: 5 }
+                    }
+                },
+                usage: tally
+            }
+        ]);
+
+        const terminal = items.at(-1);
+        if (terminal?.type !== 'snapshot') {
+            throw new Error(`expected a snapshot last, got ${terminal?.type}`);
+        }
+
+        // The reloaded record agrees with the live frames: same events, same tally.
+        expect(terminal.session.turns).toEqual([
+            {
+                id: turnId,
+                index: 0,
+                prompt: 'cost please',
+                status: 'done',
+                startedAt: 2_000,
+                updatedAt: 2_000,
+                events,
+                eventTimes: [2_000, 2_000, 2_000, 2_000],
+                usage: { input: 3, output: 2, total: 5 }
+            }
+        ]);
+    });
+
+    it('sums every reported request and never counts the repeated done usage', async () => {
+        const setClock = pinClock(1_000);
+
+        // Both requests of the tool round report the same figures, so a sink that
+        // also folded `done` would report {9,6,15} instead of {6,4,10}.
+        const step = { input: 3, output: 2, total: 5 };
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([toolRoundPreset([step, step])]));
+        const created = store.create('rounds');
+        setClock(2_000);
+
+        const items: SessionStreamItem[] = [];
+        await store.run(created.id, 'two requests', async (item) => {
+            items.push(item);
+        });
+
+        const opening = items[0];
+        if (opening.type !== 'turn') throw new Error(`expected a turn frame first, got ${opening.type}`);
+
+        const events = items.slice(1, -1).map((item) => {
+            if (item.type !== 'event') {
+                throw new Error(`expected only event frames before the terminal one, got ${item.type}`);
+            }
+
+            expect(item.turnId).toBe(opening.turn.id);
+            return item.event;
+        });
+
+        // One start, one usage per request, the tool round in between, then the
+        // answer. Each request's usage precedes its own terminal message.
+        expect(events).toEqual([
+            { type: 'start', agent: 'rounds', model: 'scripted/test' },
+            { type: 'usage', agent: 'rounds', usage: { input: 3, output: 2, total: 5 } },
+            {
+                type: 'tool_call',
+                agent: 'rounds',
+                call: { id: 'c1', name: 'todoManage', arguments: '{"action":"list"}' }
+            },
+            {
+                type: 'tool_result',
+                agent: 'rounds',
+                name: 'todoManage',
+                callId: 'c1',
+                content: '{"todos":[],"counts":{"total":0,"completed":0,"remaining":0}}',
+                isError: false
+            },
+            { type: 'text', agent: 'rounds', delta: 'all done' },
+            { type: 'usage', agent: 'rounds', usage: { input: 3, output: 2, total: 5 } },
+            {
+                type: 'done',
+                agent: 'rounds',
+                message: {
+                    role: 'assistant',
+                    content: 'all done',
+                    reasoning: '',
+                    toolCalls: [],
+                    model: 'scripted/test',
+                    stopReason: 'stop',
+                    usage: { input: 3, output: 2, total: 5 }
+                }
+            }
+        ]);
+
+        const terminal = items.at(-1);
+        if (terminal?.type !== 'snapshot') {
+            throw new Error(`expected a snapshot last, got ${terminal?.type}`);
+        }
+
+        // Two requests × {3,2,5}; the repeated `done` usage is deliberately not
+        // added (double-count guard).
+        expect(terminal.session.turns[0].usage).toEqual({ input: 6, output: 4, total: 10 });
+
+        // The final event frame carries the same running tally after the second sum.
+        expect(items.at(-2)).toEqual({
+            type: 'event',
+            turnId: opening.turn.id,
+            at: 2_000,
+            event: events[6],
+            usage: { input: 6, output: 4, total: 10 }
+        });
+    });
+
+    it('sums cached only over the requests that report it', async () => {
+        const setClock = pinClock(1_000);
+
+        // Request 0 reports no cache figure at all; request 1 reports 2 cached. The
+        // tally carries the reported sum only and never invents a 0 for request 0.
+        const store = new SessionStore(
+            DEFAULTS,
+            createHarnessRegistry([
+                toolRoundPreset([
+                    { input: 3, output: 2, total: 5 },
+                    { input: 4, output: 3, total: 7, cached: 2 }
+                ])
+            ])
+        );
+        const created = store.create('rounds');
+        setClock(2_000);
+
+        await store.run(created.id, 'cache me', async () => {});
+
+        expect(store.get(created.id).turns[0].usage).toEqual({
+            input: 7,
+            output: 5,
+            total: 12,
+            cached: 2
+        });
+    });
+
+    it('omits cached entirely when no request reports it', async () => {
+        pinClock(2_000);
+        const store = new SessionStore(
+            DEFAULTS,
+            createHarnessRegistry([usagePreset({ input: 5, output: 1, total: 6 })])
+        );
+        const created = store.create('priced');
+
+        await store.run(created.id, 'no cache', async () => {});
+
+        // toEqual without `cached` fails if the tally carries the key at all, so
+        // this pins "absent stays absent" (never a zero-filled figure).
+        expect(store.get(created.id).turns[0].usage).toEqual({ input: 5, output: 1, total: 6 });
+    });
+
+    it('keeps a reported cached figure of zero distinct from absent', async () => {
+        pinClock(2_000);
+        const store = new SessionStore(
+            DEFAULTS,
+            createHarnessRegistry([usagePreset({ input: 5, output: 1, total: 6, cached: 0 })])
+        );
+        const created = store.create('priced');
+
+        await store.run(created.id, 'zero cache', async () => {});
+
+        // The provider DID report a cache figure, so the tally must carry the 0.
+        expect(store.get(created.id).turns[0].usage).toEqual({
+            input: 5,
+            output: 1,
+            total: 6,
+            cached: 0
+        });
     });
 
     it('records subagent events in the primary turn', async () => {
@@ -278,6 +626,9 @@ describe('SessionStore turns', () => {
             },
             { type: 'start', agent: 'helper', model: 'scripted/test' },
             { type: 'text', agent: 'helper', delta: 'helper answer' },
+            // Only the helper's stream reports usage here: the lead's two requests
+            // have no `usage` on their `done` frames, so they emit no usage event.
+            { type: 'usage', agent: 'helper', usage: { input: 3, output: 2, total: 5 } },
             {
                 type: 'done',
                 agent: 'helper',
@@ -323,6 +674,9 @@ describe('SessionStore turns', () => {
         expect(terminal.session.turns).toHaveLength(1);
         expect(terminal.session.turns[0].status).toBe('done');
         expect(terminal.session.turns[0].events).toEqual(events);
+        // The delegated request's spend belongs to the same turn: only the helper
+        // reported usage, so the tally is that one request's figures.
+        expect(terminal.session.turns[0].usage).toEqual({ input: 3, output: 2, total: 5 });
         expect(store.get(created.id).turns).toEqual(terminal.session.turns);
     });
 
@@ -651,12 +1005,27 @@ describe('SessionStore turns', () => {
 
         const stored = store.get(created.id);
         expect(stored.turns[0].prompt).toBe('original');
-        expect(stored.turns[0].events.map((event) => event.type)).toEqual(['start', 'text', 'done']);
+        expect(stored.turns[0].events.map((event) => event.type)).toEqual([
+            'start',
+            'text',
+            'usage',
+            'done'
+        ]);
 
         // Mutating a snapshot must not change a later read.
         const external = store.get(created.id);
         external.turns[0].prompt = 'mutated';
         external.turns[0].events.length = 0;
+
+        // The running tally is copied exactly like `eventTimes`, so tampering with
+        // the object a client received cannot rewrite the server's figure.
+        const usage = external.turns[0].usage;
+        if (usage === undefined) throw new Error('expected a usage tally on the copied turn');
+        usage.input = 999;
+        usage.output = 999;
+        usage.total = 999;
+        usage.cached = 999;
+
         external.turns.pop();
         external.messages.length = 0;
 
@@ -686,6 +1055,7 @@ describe('SessionStore turns', () => {
                     events: [
                         { type: 'start', agent: 'single', model: 'scripted/test' },
                         { type: 'text', agent: 'single', delta: 'hello' },
+                        { type: 'usage', agent: 'single', usage: { input: 3, output: 2, total: 5 } },
                         {
                             type: 'done',
                             agent: 'single',
@@ -700,7 +1070,9 @@ describe('SessionStore turns', () => {
                             }
                         }
                     ],
-                    eventTimes: [2_000, 2_000, 2_000]
+                    eventTimes: [2_000, 2_000, 2_000, 2_000],
+                    // Untouched by the tampering above: the live tally survives.
+                    usage: { input: 3, output: 2, total: 5 }
                 }
             ],
             // The frozen configuration captured at creation, and the (empty)

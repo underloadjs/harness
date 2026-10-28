@@ -2,8 +2,11 @@
 // the trusted preset picker.
 //
 // Product rules this component encodes (R2):
-//   - the row replaces the old description wall; every member is labelled either
-//     `primary` or `secondary` in text (not colour alone);
+//   - the row replaces the old description wall; each tile shows exactly ONE
+//     human-readable name (the preset title, e.g. "Summarizer") instead of a
+//     duplicated slug + title pair, and no role badge. Role is conveyed by the
+//     name colour (primary green, secondary neutral, styles.css) plus the
+//     `aria-pressed` state below, so the control stays compact;
 //   - selecting any member's tile makes it primary — the row never shows two
 //     primaries, and the caller sends the complete `subagents` list with the new
 //     `primary` so a demotion cannot leave a stale duplicate behind;
@@ -13,10 +16,12 @@
 //   - a member already in the team is visibly disabled in the picker, so a
 //     duplicate cannot be added;
 //   - removing a member is offered on every tile except the last one;
-//   - every tile carries its own model dropdown (R9), labelled for that agent and
-//     placed outside the promotion button. It offers "inherit" plus the provider
-//     catalogue; a locked (saved) session shows the effective frozen model with the
-//     control disabled.
+//   - every tile carries its own model dropdown (R9/R18) placed outside the
+//     promotion button. It is a bare select with no visible "model" label; its
+//     accessible name still carries the agent. It never says "inherit": the
+//     no-override choice is labelled with the ACTUAL model it resolves to, and the
+//     provider catalogue follows alphabetically. A locked (saved) session shows the
+//     effective frozen model with the control disabled.
 //   - an active agent's tile carries `data-activity='active'` / `aria-busy` for the
 //     rotating ring (ui/activity.ts, styles.css).
 //
@@ -30,6 +35,9 @@
 //   - playground/src/styles.css — `.agent-row`, `.agent-tile`, `.agent-picker`
 
 import type { AgentDescriptor } from '../../../server/protocol';
+// Per-agent dropdowns show the catalogue alphabetically; the global dropdown in
+// main.ts keeps provider order, so the helper is intentionally only used here.
+import { sortModelIds } from './model-order';
 
 export type AgentRowOptions = {
     // Member names in display order; the primary is also present in this list.
@@ -58,21 +66,31 @@ export type AgentRowOptions = {
 
 // Data for the model dropdown on each tile.
 export type AgentModelSelect = {
-    // Effective model id per member. For an editable harness this is the override
-    // map only (a missing member inherits); for a frozen session it is the
+    // Known model id per member. For an editable harness this is the override map
+    // only (a missing member uses fallbackModel); for a frozen session it is the
     // server's effective map, so the id shown is the one the chat is running.
     models: Readonly<Record<string, string>>;
-    // Provider catalogue ids, in the server's order. The current id is appended
-    // when it is absent, so a provider that stopped advertising it still renders.
+    // Provider catalogue ids, in the server's order. The per-agent dropdown sorts
+    // a copy alphabetically (ui/model-order.ts); an override absent from the
+    // catalogue is sorted in too, so a provider that stopped advertising it still
+    // renders without changing the caller's array.
     catalogue: readonly string[];
-    // The model named by the "inherit" option: the session model for a frozen
-    // chat, the global settings model for a new session.
-    inheritModel?: string;
+    // The model a member uses when it has no override: the session/global model
+    // for an editable harness, the frozen session model for a saved chat. R18: this
+    // is only ever rendered as the resolved model id (never as "inherit"). Empty
+    // means the caller does not know the effective model; the option then says so
+    // honestly instead of inventing an id.
+    fallbackModel?: string;
     // False when the team is locked: the select shows the effective frozen model
     // and cannot change it. The caller explains the lock and offers New session.
     editable: boolean;
     onChange?: (name: string, model: string) => void;
 };
+
+// Shown when no effective model is known (a blank setting before the server
+// default arrives). Deliberately not "inherit": R18 requires the dropdown to name
+// a model, and when it cannot it must say so rather than imply one.
+export const UNKNOWN_MODEL_LABEL = 'model not specified';
 
 const el = <K extends keyof HTMLElementTagNameMap>(
     tag: K,
@@ -126,55 +144,66 @@ const presetDetail = (agent: AgentDescriptor): HTMLElement => {
     return detail;
 };
 
-// One tile's model dropdown. Kept as a helper because the option list has three
-// sources that must not disagree:
+// One tile's model dropdown. R18: every option label is a real model id — the
+// first option (value '') is the no-override/default choice, and it is labelled
+// with the fallback model that choice actually resolves to:
 //
-//   1. `inherit` (value '') — the member uses the session/global model, which is
-//      what a member missing from the override map really does;
-//   2. every id the provider advertises, in provider order;
-//   3. the current id when the catalogue does not list it (an override chosen
-//      before the provider changed, or a frozen session's effective model). It is
-//      labelled "(current)" so a stale id is visibly not a fresh choice.
+//   1. the fallback id (`fallbackModel`) when known, otherwise an honest
+//      "model not specified" — never "inherit"/"inherited";
+//   2. every id the provider advertises, alphabetically (ui/model-order.ts), so
+//      the same model sits in the same place on every tile;
+//   3. the member's current id when it is not in the catalogue and is not the
+//      fallback (a stale override or a frozen session's effective model), sorted
+//      into place like any other id.
 //
-// The visible text is "model"; the accessible name carries the agent, so a screen
-// reader announces "Model for summarizer".
-const modelSelectFor = (name: string, models: AgentModelSelect): HTMLElement => {
-    const row = el('label', 'agent-model');
-    row.append(el('span', 'agent-model-label', 'model'));
+// Dedup rule: the fallback id is represented by option 0, so a catalogue entry
+// with that exact id is skipped. That avoids two options with the same visible
+// label; selecting option 0 is the revert-to-default action (the change payload
+// stays '' and main.ts deletes the override). A current override that EQUALS the
+// fallback is also represented by option 0, because the effective model is
+// identical and an explicit same-as-default override is not a distinct choice.
+//
+// The visible control is just the select; its accessible name carries the agent,
+// so a screen reader announces "Model for Summarizer" without adding a visible
+// MODEL label above it.
+const modelSelectFor = (name: string, title: string, models: AgentModelSelect): HTMLElement => {
+    // A plain container, not a <label>: there is no visible label text to click.
+    const row = el('div', 'agent-model');
 
     const select = el('select', 'agent-model-select field-select');
-    select.setAttribute('aria-label', `Model for ${name}`);
+    select.setAttribute('aria-label', `Model for ${title}`);
 
-    const inherit = el(
+    // The no-override option. Its value is '' (main.ts maps that to "delete the
+    // override"); its LABEL is the resolved model, which is why "inherit" can never
+    // appear in the UI.
+    const fallback = models.fallbackModel?.trim() ?? '';
+    const fallbackOption = el(
         'option',
         undefined,
-        models.inheritModel !== undefined && models.inheritModel.length > 0
-            ? `inherit · ${models.inheritModel}`
-            : 'inherit session model'
+        fallback.length > 0 ? fallback : UNKNOWN_MODEL_LABEL
     );
-    inherit.value = '';
-    select.append(inherit);
+    fallbackOption.value = '';
+    select.append(fallbackOption);
 
-    const current = models.models[name] ?? '';
-    const catalogue = [...models.catalogue];
-    // Append the current id only when the catalogue does not already offer it.
-    // For an editable harness `current` is an override; for a frozen session it is
-    // the effective model, and seeing it is the point of the locked dropdown.
-    const ids = current.length > 0 && !catalogue.includes(current) ? [...catalogue, current] : catalogue;
+    const current = (models.models[name] ?? '').trim();
+    // catalogue entries that are not the fallback; exact equality keeps ids that
+    // differ only by case (providers can list both) as distinct choices.
+    const catalogue = models.catalogue.filter((id) => id.length > 0 && id !== fallback);
+    // Add the current override only when the catalogue omits it AND option 0 does
+    // not already label it; sorting afterwards places it naturally, not at the tail.
+    const needsCurrent = current.length > 0 && current !== fallback && !catalogue.includes(current);
+    const ids = sortModelIds(needsCurrent ? [...catalogue, current] : catalogue);
 
     for (const id of ids) {
-        const option = el(
-            'option',
-            undefined,
-            id === current && !catalogue.includes(id) ? `${id} (current)` : id
-        );
+        const option = el('option', undefined, id);
         option.value = id;
         select.append(option);
     }
 
-    // A non-empty current value selects its option; an inherited member lands on
-    // the inherit entry because no override option exists for it.
-    select.value = current;
+    // Choose the option that represents the EFFECTIVE model: the override when it
+    // differs from the fallback, otherwise option 0 (the default). This keeps the
+    // selected control truthful even when an explicit override equals the default.
+    select.value = current.length > 0 && current !== fallback ? current : '';
     select.disabled = !models.editable || models.onChange === undefined;
     select.title = models.editable
         ? models.onChange === undefined
@@ -289,15 +318,17 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
         main.type = 'button';
         main.disabled = !options.editable;
         main.setAttribute('aria-pressed', isPrimary ? 'true' : 'false');
+        // Exactly one human-readable name (the preset title). The slug is kept in
+        // `data-agent` for the callbacks and tests but is never displayed, so a
+        // tile reads "Summarizer", not "summarizer" + "Summarizer". The fallback
+        // descriptor in detailsOf sets title = name when details are missing.
+        const label = agent.title.trim().length > 0 ? agent.title : agent.name;
+
         main.title = isPrimary
             ? 'This agent is the primary (entry) agent.'
-            : `Make ${name} the primary agent; ${options.primary} becomes a subagent.`;
+            : `Make ${label} the primary agent; ${options.primary} becomes a subagent.`;
 
-        main.append(
-            el('span', 'agent-role', isPrimary ? 'primary' : 'secondary'),
-            el('span', 'agent-tile-name', agent.name),
-            el('span', 'agent-tile-title', agent.title)
-        );
+        main.append(el('span', 'agent-tile-name', label));
         main.addEventListener('click', () => {
             if (!options.editable || isPrimary) return;
             options.onSelectPrimary(name);
@@ -306,12 +337,12 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
         const remove = el('button', 'agent-remove');
         remove.type = 'button';
         remove.textContent = '×';
-        remove.setAttribute('aria-label', `Remove ${name}`);
+        remove.setAttribute('aria-label', `Remove ${label}`);
         // The last agent is the entry point: removing it would leave nothing to
         // run, so it is disabled rather than silently rejected.
         remove.disabled = !options.editable || options.members.length <= 1;
         remove.title =
-            options.members.length <= 1 ? 'A harness needs at least one agent.' : `Remove ${name}`;
+            options.members.length <= 1 ? 'A harness needs at least one agent.' : `Remove ${label}`;
         remove.addEventListener('click', () => {
             if (!options.editable || options.members.length <= 1) return;
             options.onRemove(name);
@@ -324,6 +355,7 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
         // it: changing a model must not also promote the agent.
         const model = modelSelectFor(
             name,
+            label,
             options.models ?? {
                 models: {},
                 catalogue: [],

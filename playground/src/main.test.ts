@@ -6,8 +6,8 @@
 //   - R2: a horizontal agent row labels primary/secondary, the trailing + opens a
 //     trusted preset picker, selecting a member promotes it, and a saved session
 //     freezes its team (editing is locked with a New session affordance);
-//   - R3: the core tools live only in a collapsed dropdown, the complete catalogue
-//     is on the right, and sessions are filtered/locked to the selected harness;
+//   - R3 (as amended by R21.2): sessions are filtered/locked to the selected
+//     harness and the right rail is the scratch board then sessions — no tool list;
 //   - R4: turn and tool-call durations come from the server on reload;
 //   - R5: existing streaming, snapshot hydration, endpoint drafts and polling are
 //     preserved.
@@ -41,7 +41,15 @@ const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor 
         requiresEndpoint: true,
         agents: ['instruct'],
         tools: ['fileRead'],
-        coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'fileRead'],
+        coreTools: [
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
+        ],
         primary: 'instruct',
         subagents: [],
         builtin: true,
@@ -107,16 +115,49 @@ const bootstrap = (overrides: Record<string, unknown> = {}): Record<string, unkn
 });
 
 // One SSE frame per `SessionStreamItem`, exactly the shape api.ts parses.
+const dataOf = (items: readonly unknown[]): Uint8Array =>
+    new TextEncoder().encode(items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join(''));
+
 const sse = (items: readonly unknown[]): Response => {
-    const body = items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join('');
+    const body = dataOf(items);
     const stream = new ReadableStream<Uint8Array>({
         start(controller) {
-            controller.enqueue(new TextEncoder().encode(body));
+            controller.enqueue(body);
             controller.close();
         }
     });
 
     return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+};
+
+// The same body, delivered in two halves: `start` sends the first, the test calls
+// `release()` for the rest. One `sse` chunk applies every frame before the test
+// regains control, which cannot pin what the tile shows BETWEEN frames (main.ts
+// updates the tally per frame) — this can.
+const splitSse = (
+    first: readonly unknown[],
+    rest: readonly unknown[]
+): { response: Response; release: () => void } => {
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+
+    const stream = new ReadableStream<Uint8Array>({
+        start(next) {
+            controller = next;
+            next.enqueue(dataOf(first));
+        }
+    });
+
+    return {
+        response: new Response(stream, {
+            status: 200,
+            headers: { 'Content-Type': 'text/event-stream' }
+        }),
+        release: (): void => {
+            if (controller === undefined) throw new Error('the stream never started');
+            controller.enqueue(dataOf(rest));
+            controller.close();
+        }
+    };
 };
 
 const json = (value: unknown, status = 200): Response =>
@@ -164,6 +205,8 @@ const agentNames = (): (string | null)[] =>
     [...document.querySelectorAll<HTMLElement>('.agent-tile-name')].map((node) => node.textContent);
 const harnessNames = (): (string | null)[] =>
     [...document.querySelectorAll<HTMLElement>('.harness-item .harness-name')].map((node) => node.textContent);
+// The core list is gone from the UI (R21.2); this helper stays only so a test can
+// prove it renders nothing anywhere.
 const coreToolNames = (): (string | null)[] =>
     [...document.querySelectorAll<HTMLElement>('.core-tool-name')].map((node) => node.textContent);
 const sessionIds = (): (string | undefined)[] =>
@@ -266,16 +309,32 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     expect(document.querySelector('.main-title')?.textContent).toBe('Instruct');
 
     // The agent row replaced the description wall.
-    expect(agentNames()).toEqual(['instruct']);
+    expect(agentNames()).toEqual(['Instruct']);
     expect(agentRoles()).toEqual(['primary']);
     expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
     expect(document.querySelector('.agent-add')).not.toBeNull();
 
-    // Core tools are a collapsed dropdown, only the harness core set.
-    const core = byClass('.core-tools', 'details');
-    expect(core.open).toBe(false);
-    expect(document.querySelector('.core-summary')?.textContent).toBe('Core tools · 3');
-    expect(coreToolNames()).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
+    // R21.1: the rail says template/custom and an agent count — never a
+    // read-only/editable distinction.
+    expect(document.querySelector('.harness-meta')?.textContent).toBe('template · 1 agent');
+
+    // R21.2: the right rail has NO tool list and NO core-tools dropdown. The
+    // scratch board is the first section and sessions come second.
+    expect(document.querySelector('.rail-right .core-tools')).toBeNull();
+    expect(document.querySelector('.rail-right .tool-list')).toBeNull();
+    expect(document.querySelector('.rail-right .tool-button')).toBeNull();
+    expect(document.querySelector('.rail-right .catalogue-count')).toBeNull();
+    const rightSections = [...document.querySelectorAll<HTMLElement>('.rail-right > .rail-section')];
+    expect(rightSections.map((section) => section.className)).toEqual([
+        'rail-section scratch-section',
+        'rail-section sessions'
+    ]);
+    // The board explains its empty state and stays hidden until a tool publishes.
+    expect(document.querySelector('.scratch-section .rail-title')?.textContent).toBe('Scratch board');
+    expect(document.querySelector('.scratch-note')?.textContent).toBe(
+        'No tool panels yet. A tool that publishes ui/panels lands here.'
+    );
+    expect(byClass('.scratch-section .panel-host', 'div').hidden).toBe(true);
     // No badge wall in the header any more.
     expect(document.querySelector('.badges')).toBeNull();
 
@@ -333,11 +392,176 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     );
 });
 
+// Token tally: the server OWNS the running sum. Each event frame carries it
+// (`SessionStreamItem.usage`), main.ts forwards it to the tile (`setUsage`) and
+// the tile prints INPUT with the cached part in brackets — see
+// playground/src/ui/tokens.ts, which is why `48/0` renders '48 (0)' and
+// `144/48` renders '144 (48)'; `output` is never printed.
+it('prints the running tally per frame and keeps it through the terminal snapshot', async () => {
+    const firstTally = { input: 48, output: 18, total: 66, cached: 0 };
+    const lastTally = { input: 144, output: 40, total: 184, cached: 48 };
+
+    const start = { type: 'start' as const, agent: 'instruct', model: 'm1' };
+    const text = { type: 'text' as const, agent: 'instruct', delta: 'hi' };
+    const done = { type: 'done' as const, agent: 'instruct', message: assistant({ content: 'hi' }) };
+
+    // The recorded turn is what the terminal snapshot re-hydrates from, tally
+    // included: a reload must show the same figure the live stream ended on.
+    const recorded: SessionTurn = {
+        id: 't1',
+        index: 0,
+        prompt: 'say hi',
+        status: 'done',
+        startedAt: T,
+        updatedAt: T + 3600,
+        events: [start, text, done],
+        eventTimes: [T, T + 100, T + 200],
+        usage: lastTally
+    } as SessionTurn;
+    const opening: SessionTurn = { ...recorded, status: 'running', events: [], usage: firstTally };
+    const finished = snapshot({ harnessDefinition: descriptor(), turns: [recorded] });
+
+    // Assigned when the messages stream opens; a missing request must fail the
+    // test loudly instead of silently asserting a stale tile.
+    let releaseStream: () => void = () => {
+        throw new Error('the messages stream never opened');
+    };
+
+    stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap());
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions' && method === 'POST')
+            return json({ session: snapshot({ harnessDefinition: descriptor() }) });
+
+        if (url === '/api/sessions/s1/messages' && method === 'POST') {
+            const stream = splitSse(
+                [
+                    { type: 'turn', turn: opening },
+                    { type: 'event', turnId: 't1', event: start, at: T, usage: firstTally }
+                ],
+                [
+                    // A frame with NO tally between two tallied ones: it must leave
+                    // the figure alone rather than clear it.
+                    { type: 'event', turnId: 't1', event: text, at: T + 100 },
+                    { type: 'event', turnId: 't1', event: done, at: T + 200, usage: lastTally },
+                    { type: 'snapshot', session: finished }
+                ]
+            );
+            releaseStream = stream.release;
+            return stream.response;
+        }
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+
+    const input = byClass('.composer-input', 'textarea');
+    input.value = 'say hi';
+    byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+
+    // The pre-stream requests (session, models) and the first half settle here;
+    // the stream cannot advance until `releaseStream()` below.
+    await flush();
+    await flush();
+
+    const liveTally = byClass('.tile', 'article').querySelector<HTMLElement>('.tile-tokens');
+    expect(liveTally?.textContent).toBe('48 (0)');
+    expect(liveTally?.hidden).toBe(false);
+
+    releaseStream();
+    await flush();
+    await flush();
+
+    // The terminal snapshot rebuilt the tile from the recorded turn, so the label
+    // comes from `SessionTurn.usage` — the same exact figure, not a double sum.
+    expect(document.querySelectorAll('.tile')).toHaveLength(1);
+    const tile = byClass('.tile', 'article');
+    expect(tile.dataset.state).toBe('done');
+    expect(tile.querySelector<HTMLElement>('.tile-tokens')?.textContent).toBe('144 (48)');
+    expect(tile.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(false);
+    // The recorded stamps (not the local clock) prove this tile is the rehydrated
+    // one: the live tile ran from T to "now".
+    expect(tile.querySelector('.tile-elapsed')?.textContent).toBe('3.6s');
+});
+
+it('keeps the last tally when later frames carry none', async () => {
+    const tally = { input: 48, output: 18, total: 66, cached: 0 };
+
+    const start = { type: 'start' as const, agent: 'instruct', model: 'm1' };
+    const text = { type: 'text' as const, agent: 'instruct', delta: 'hi' };
+    const done = { type: 'done' as const, agent: 'instruct', message: assistant({ content: 'hi' }) };
+
+    const opening: SessionTurn = {
+        id: 't1',
+        index: 0,
+        prompt: 'say hi',
+        status: 'running',
+        startedAt: T,
+        updatedAt: T + 200,
+        events: [],
+        usage: tally
+    } as SessionTurn;
+
+    stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap());
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions' && method === 'POST')
+            return json({ session: snapshot({ harnessDefinition: descriptor() }) });
+
+        if (url === '/api/sessions/s1/messages' && method === 'POST') {
+            // An older server: no `turns` on the terminal frame, so main.ts settles
+            // the LIVE tile instead of rebuilding it. Whatever the frames left on
+            // the label is what the user keeps.
+            const items: SessionStreamItem[] = [
+                { type: 'turn', turn: opening },
+                { type: 'event', turnId: 't1', event: start, at: T, usage: tally },
+                { type: 'event', turnId: 't1', event: text, at: T + 100 },
+                { type: 'event', turnId: 't1', event: done, at: T + 200 },
+                { type: 'snapshot', session: snapshot({ harnessDefinition: descriptor() }) }
+            ];
+
+            return sse(items);
+        }
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+
+    const input = byClass('.composer-input', 'textarea');
+    input.value = 'say hi';
+    byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+
+    await flush();
+    await flush();
+
+    const tile = byClass('.tile', 'article');
+    expect(tile.dataset.state).toBe('done');
+    // The frames after the tallied one carried no `usage`, so the figure is
+    // untouched — never cleared, never re-summed.
+    expect(tile.querySelector<HTMLElement>('.tile-tokens')?.textContent).toBe('48 (0)');
+    expect(tile.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(false);
+});
+
 it('restores a remembered session with its frozen team and server timings', async () => {
     const frozen = descriptor({
         agents: ['instruct', 'summarizer'],
         primary: 'instruct',
-        subagents: ['summarizer']
+        subagents: ['summarizer'],
+        // A subagent allowlist is what makes the server add agentDelegate.
+        coreTools: [
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'agentDelegate'
+        ]
     });
 
     const first: SessionTurn = {
@@ -421,12 +645,15 @@ it('restores a remembered session with its frozen team and server timings', asyn
     expect(document.body.textContent ?? '').not.toContain('NaN');
 
     // The frozen definition is what is displayed, not the live descriptor.
-    expect(agentNames()).toEqual(['instruct', 'summarizer']);
+    expect(agentNames()).toEqual(['Instruct', 'Summarizer']);
     expect(agentRoles()).toEqual(['primary', 'secondary']);
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         'Viewing a saved session · agent team frozen'
     );
-    expect(coreToolNames()).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate']);
+    // R21.2: the enabled-for-session status now lives on the Tools tab (its tab
+    // pane is detached while Chat owns the stage — tools-tab.test.ts pins the
+    // text). What matters here is that no right-rail core dropdown came back.
+    expect(document.querySelector('.core-tools')).toBeNull();
     for (const button of document.querySelectorAll<HTMLButtonElement>('.agent-main')) {
         expect(button.disabled).toBe(true);
     }
@@ -441,7 +668,7 @@ it('restores a remembered session with its frozen team and server timings', asyn
 
     expect(document.querySelectorAll('.tile')).toHaveLength(0);
     expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
-    expect(agentNames()).toEqual(['instruct']);
+    expect(agentNames()).toEqual(['Instruct']);
     expect(byClass('.agent-main', 'button').disabled).toBe(false);
     expect(localStorage.getItem(SESSION_KEY)).toBeNull();
     expect(writes).toBe(0);
@@ -464,7 +691,17 @@ it('creates a harness from preset agents with an initial primary', async () => {
                         subagents: request.subagents,
                         builtin: false,
                         editable: true,
-                        tools: []
+                        tools: [],
+                        coreTools: [
+                            'fileRead',
+                            'fileWrite',
+                            'fileEdit',
+                            'fileGlob',
+                            'toolRequest',
+                            'toolCreate',
+                            'todoManage',
+                            ...(request.subagents.length > 0 ? ['agentDelegate'] : [])
+                        ]
                     })
                 },
                 201
@@ -518,9 +755,12 @@ it('creates a harness from preset agents with an initial primary', async () => {
     const selected = byClass('.harness-item[data-harness="release-captain"]', 'button');
     expect(selected.getAttribute('aria-pressed')).toBe('true');
     expect(document.querySelector('.main-title')?.textContent).toBe('Release captain');
-    expect(agentNames()).toEqual(['workspace', 'summarizer']);
+    expect(agentNames()).toEqual(['Workspace', 'Summarizer']);
     expect(agentRoles()).toEqual(['primary', 'secondary']);
-    expect(coreToolNames()).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate']);
+    // R21.2: no right-rail core list follows the new harness; the Tools tab
+    // (detached while Chat is showing) carries that status instead.
+    expect(document.querySelector('.core-tools')).toBeNull();
+    expect(document.querySelector('.rail-right .tool-list')).toBeNull();
 });
 
 it('adds a picker agent, promotes it to primary and never duplicates a member', async () => {
@@ -535,7 +775,18 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
             current = descriptor({
                 agents: [request.primary, ...request.subagents],
                 primary: request.primary,
-                subagents: request.subagents
+                subagents: request.subagents,
+                // A server with a subagent allowlist adds agentDelegate.
+                coreTools: [
+                    'fileRead',
+                    'fileWrite',
+                    'fileEdit',
+                    'fileGlob',
+                    'toolRequest',
+                    'toolCreate',
+                    'todoManage',
+                    ...(request.subagents.length > 0 ? ['agentDelegate'] : [])
+                ]
             });
             return json({ harness: current });
         }
@@ -571,9 +822,11 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
         subagents: ['summarizer']
     });
     expect(picker.hidden).toBe(true);
-    expect(agentNames()).toEqual(['instruct', 'summarizer']);
+    expect(agentNames()).toEqual(['Instruct', 'Summarizer']);
     expect(agentRoles()).toEqual(['primary', 'secondary']);
-    expect(coreToolNames()).toContain('agentDelegate');
+    // R21.2: the core set is no longer rendered anywhere; the Tools tab lists every
+    // tool (core entries included) from the server catalogue instead.
+    expect(document.querySelector('.core-tool-name')).toBeNull();
 
     // Selecting a secondary demotes the old primary; the request lists it once.
     document.querySelectorAll<HTMLButtonElement>('.agent-main')[1].click();
@@ -583,7 +836,7 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
         primary: 'summarizer',
         subagents: ['instruct']
     });
-    expect(agentNames()).toEqual(['summarizer', 'instruct']);
+    expect(agentNames()).toEqual(['Summarizer', 'Instruct']);
     expect(agentRoles()).toEqual(['primary', 'secondary']);
 
     // Removing a secondary keeps exactly one primary and the complete list.
@@ -594,7 +847,7 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
         primary: 'summarizer',
         subagents: []
     });
-    expect(agentNames()).toEqual(['summarizer']);
+    expect(agentNames()).toEqual(['Summarizer']);
     expect(byClass('.agent-remove', 'button').disabled).toBe(true);
 });
 
@@ -639,7 +892,7 @@ it('filters the sessions rail to the selected harness and opens within it', asyn
 
     expect(sessionIds()).toEqual(['s2']);
     expect(document.querySelector('.sessions-scope')?.textContent).toBe('Locked to workspace.');
-    expect(agentNames()).toEqual(['workspace']);
+    expect(agentNames()).toEqual(['Workspace']);
 
     byClass('.session[data-session-id="s2"]', 'button').click();
     await flush();

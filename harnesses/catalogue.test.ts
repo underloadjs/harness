@@ -56,7 +56,7 @@ describe('tool catalogue', () => {
             group: 'Web search',
             description: WEB_SEARCH_METADATA.description,
             tags: TAGS,
-            visibility: 'searchable',
+            visibility: 'core',
             parameters: UNCONFIGURED_PARAMETERS,
             availability: {
                 state: 'unconfigured',
@@ -83,7 +83,7 @@ describe('tool catalogue', () => {
         expect(entry?.group).toBe('Web search');
         expect(entry?.description).toBe(entry?.tool?.description);
         expect(entry?.tags).toEqual(TAGS);
-        expect(entry?.visibility).toBe('searchable');
+        expect(entry?.visibility).toBe('core');
         expect(entry?.parameters).toBe(entry?.tool?.parameters);
         expect(entry?.availability).toEqual({
             state: 'available',

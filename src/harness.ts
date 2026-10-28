@@ -20,6 +20,7 @@
 //     append user input
 //     repeat:
 //         turn()                      -> assistant message (+ tool calls)
+//         usage?                      -> report what that request spent
 //         no tool calls?              -> report done, return the message
 //         for each call:              -> execute, append a tool message
 //         (loop again)
@@ -39,10 +40,13 @@
 //   - every `visibility: 'core'` tool, and
 //   - every searchable tool that toolRequest has enabled so far.
 //
-// The only core tools are the harness-owned ones below; the ENTIRE catalogue,
-// including the bundled file tools, is searchable. That is deliberate: one
-// discovery surface means a file tool costs the same round trip as commandRun,
-// and the set of core tools can never silently grow with a preset import.
+// Core vs searchable (R18): the everyday file tools (fileRead, fileWrite,
+// fileEdit, fileGlob) carry `visibility: 'core'` in the preset catalogue, and a
+// configured webSearch is core too, so they are declared up front. The rest of the
+// preset catalogue — fileList, syntaxCheck, commandRun, gitDiff, the app tools —
+// stays searchable. "core" is only a declaration classification: it does NOT make
+// the tool session-bound. The harness-owned tools below are the session-bound set,
+// and the server gates only those on a sessionId.
 //
 // toolRequest is itself core and is always registered here. It ranks the catalogue
 // against the tags the model passes (core/discovery), enables the best matches,
@@ -73,8 +77,10 @@
 // REGISTERED tool directly, with this harness's context. It is the host/server path
 // behind the UI's Tools tab (server/sessions.ts → executeTool), so a manual
 // toolRequest/toolCreate/todoManage/agentDelegate call changes this session rather
-// than a detached copy. Discovery gates the model only: an explicit user call may
-// run a searchable tool that was never enabled. Everything else still applies —
+// than a detached copy. Core file tools (R18) also run here, exactly like a direct
+// call; only the harness-owned set needs session state. Discovery gates the model
+// only: an explicit user call may run a searchable tool that was never enabled.
+// Everything else still applies —
 // toolCreate keeps its guarded registration, agentDelegate keeps its primary-only
 // check, and a tool this harness did not register (agentDelegate without subagents)
 // is an honest error, never a fabricated implementation.
@@ -91,9 +97,10 @@
 // also closes ctx.run cycles.
 //
 // The bundled preset catalogue (./tools) is preloaded into the registry by
-// default, so a new harness can discover fileRead/commandRun/… without the caller
-// importing anything; every preset is searchable, so preloading costs no context.
-// `presets: false` opts out.
+// default, so a new harness gets fileRead/fileWrite/fileEdit/fileGlob as declared
+// core tools and can discover commandRun/… without the caller importing anything.
+// The searchable presets cost no context until discovered. `presets: false` opts
+// out.
 //
 // Cross-references:
 //   - core/agent     — the brain being driven (turn())
@@ -113,6 +120,7 @@ import {
     tool as defineTool,
     searchTools,
     toolParameterKey,
+    toolUiOf,
     createDynamicTool,
     createTodoTool,
     TOOL_CREATE_METADATA,
@@ -285,11 +293,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     for (const name of subagentNames) subagents[name] = agents[name];
 
     // Build the tool registry, same rule: the key is the wire name. The bundled
-    // preset catalogue is preloaded by default, so a new harness can discover
-    // fileRead/commandRun/... without the caller importing them. It is all
-    // searchable, so preloading costs no context until something is discovered.
-    // `presets: false` starts from the configured tools only, and a configured
-    // tool of the same name replaces the preset.
+    // preset catalogue is preloaded by default: the four core file tools are
+    // declared immediately and the searchable remainder is discoverable without
+    // the caller importing anything. `presets: false` starts from the configured
+    // tools only, and a configured tool of the same name replaces the preset.
     const tools: Record<string, Tool> = configuration.presets === false ? {} : { ...presetTools };
 
     for (const [name, definition] of Object.entries(configuration.tools ?? {})) {
@@ -302,7 +309,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     }
 
     // Opt-in web search (W3). `websearch: true` (or a configuration object) builds
-    // one searchable tool from the keys available to THIS harness; `presets: false`
+    // one CORE tool from the keys available to THIS harness (R18); `presets: false`
     // does not disable it, because it is not part of the preset catalogue. Rules:
     //   - a configured tool named `webSearch` wins: the caller brought its own;
     //   - no usable key means no tool at all (the factory returns undefined), so a
@@ -508,9 +515,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         });
     }
 
-    // The tools a request may declare: the core set first, then everything
-    // discovered so far. Everything else stays out of the context window on
-    // purpose.
+    // The tools a request may declare: every core tool first (file tools, a
+    // configured webSearch, and the harness-owned set), then everything discovered
+    // so far. Everything else stays out of the context window on purpose.
     //
     // agentDelegate is core for the primary only: it is skipped for every other
     // agent, so a subagent cannot even see the delegation control.
@@ -621,7 +628,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         try {
             const result = await definition.execute(context);
-            const content = serialize(result);
+
+            // R20.2: a tool may return a `toolUi(content, panels)` envelope.
+            // Unwrap it exactly here, so the model gets the ordinary content and
+            // the client gets optional declarative panels. Ordinary values pass
+            // through unchanged, and a malformed/fake envelope is not recognized.
+            const ui = toolUiOf(result);
+            const content = serialize(ui === undefined ? result : ui.content);
             appendToolResult(brain, call, content);
             await progress({
                 type: 'tool_result',
@@ -629,7 +642,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 name: call.name,
                 callId: call.id,
                 content,
-                isError: false
+                isError: false,
+                // Absent for every ordinary tool, so recorded events keep their
+                // existing shape. The model never sees this field.
+                ...(ui === undefined ? {} : { ui: ui.panels })
             });
         } catch (error) {
             await fail(`Tool "${call.name}" failed: ${toErrorInfo(error).message}`);
@@ -677,6 +693,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                 if (!message) {
                     throw new HarnessError(`Agent "${brain.name}" ended without producing a message.`);
+                }
+
+                // Per-request token accounting, reported for EVERY turn — including
+                // the tool rounds that continue this run — so a client can tally the
+                // whole run's cost while it iterates. The `done` event below reports
+                // only the FINAL request, which is why this event exists separately.
+                // A transport that reports no usage for a request emits nothing here;
+                // an unreported request must not look like a free one.
+                if (message.usage !== undefined) {
+                    await progress({ type: 'usage', agent: brain.name, usage: message.usage });
                 }
 
                 // The model answered with text: the run is done.
@@ -768,8 +794,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // The host/server-facing execution path (R8): run one REGISTERED tool by name
     // with the session it belongs to, exactly like the model would, but without
     // spending a discovery round trip. The server's `POST /tools/:name` calls this
-    // through its session, which is what makes a manual toolRequest/toolCreate/
-    // todoManage/agentDelegate call mutate THIS harness instead of a detached copy.
+    // through its session for the session-bound harness-owned tools, which is what
+    // makes a manual toolRequest/toolCreate/todoManage/agentDelegate call mutate
+    // THIS harness instead of a detached copy. Core file tools use the ordinary
+    // direct-call path and do not require a session.
     //
     // Gating difference, on purpose: discovery gates the MODEL. An explicit user
     // action may run any registered tool even when toolRequest never enabled it;
@@ -887,7 +915,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 // costs no `node:fs`/`child_process`/`vm` load. The result types are exported
 // alongside each tool so a consumer can type a direct call without reaching into
 // an internal path.
-export { agent, tool, searchTools, compileToolSource, createDynamicTool } from './core';
+export { agent, tool, searchTools, compileToolSource, createDynamicTool, toolUi, toolUiOf } from './core';
+// Tool-panel bounds and the normalizer are public too: a client or a host-side
+// tool author can quote the same caps the server enforces (see core/tool-ui.ts).
+export { TOOL_UI_LIMITS, normalizeToolUiPanels } from './core';
+export type { ToolUiExtraction } from './core';
 export { openAICompatible, listModels, ModelListError } from './transport';
 export type { ModelListConfiguration, ModelListErrorKind } from './transport';
 export {

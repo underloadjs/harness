@@ -11,6 +11,15 @@
 // tool calls must stay scannable, and each summary already answers "what ran and
 // did it work?".
 //
+// Collapsed presentation (R1/R2): styles.css turns the summary into a compact
+// chip that shows only the disclosure arrow and the tool name — green once the
+// call succeeds, red when it fails, neutral (the existing warn arrow) while it
+// runs. The state word, duration and argument preview stay in the DOM but are
+// hidden until the card is opened, so the expanded card still carries every
+// detail. The `aria-label` mirrors `name: state` because the visible state word
+// is hidden in the chip. Consecutive calls are grouped by turns.ts (`.tool-group`),
+// which is what makes the chips flow horizontally and wrap.
+//
 // Cross-references:
 //   - created by: playground/src/ui/turns.ts (per-agent flow)
 //   - highlighting/sanitizing: playground/src/ui/markdown.ts
@@ -83,6 +92,12 @@ const STATE_TEXT: Readonly<Record<ToolState, string>> = {
     error: 'error'
 };
 
+// The collapsed chip hides the visible state word (styles.css `.tool:not([open])`),
+// so the summary carries an accessible equivalent. An `aria-label` replaces the
+// summary's visible text for assistive technology, hence the tool name is repeated
+// here verbatim — casing is preserved because it is the model-reported name.
+const summaryLabel = (name: string, state: ToolState): string => `${name}: ${STATE_TEXT[state]}`;
+
 // The glyph is `aria-hidden`: the adjacent text carries the meaning.
 const STATE_GLYPH: Readonly<Record<ToolState, string>> = {
     running: '→',
@@ -140,6 +155,7 @@ export const createToolCallCard = (
     peek.textContent = previewArguments(rawArguments);
 
     summary.append(glyph, label, state, duration, peek);
+    summary.setAttribute('aria-label', summaryLabel(name, 'running'));
 
     const body = document.createElement('div');
     body.className = 'tool-body';
@@ -217,6 +233,7 @@ export const createToolCallCard = (
         element.dataset.state = current;
         glyph.textContent = STATE_GLYPH[current];
         state.textContent = STATE_TEXT[current];
+        summary.setAttribute('aria-label', summaryLabel(name, current));
         resultLabel.textContent = isError ? 'result · error' : 'result';
 
         const text = content.length > 0 ? content : '(empty result)';

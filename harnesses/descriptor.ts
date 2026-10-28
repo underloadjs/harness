@@ -17,7 +17,7 @@
 //
 // Cross-references:
 //   - ./types.ts          — HarnessPreset (the source of the fields)
-//   - ./toolbox.ts        — coreToolNames / SHARED_TOOL_NAMES
+//   - ./toolbox.ts        — coreToolNames / CORE_PRESET_TOOL_NAMES / SHARED_TOOL_NAMES
 //   - ../src/agents       — AgentProfile (the trusted agent definitions)
 //   - ../server/protocol  — HarnessDescriptor / AgentDescriptor (wire tuples)
 
@@ -55,37 +55,46 @@ export const describeAgents = (profiles: readonly AgentProfile[]): AgentDescript
 // keyless host therefore advertises exactly what it can call and never claims a
 // search tool that would answer `ok: false`.
 //
-// `coreTools` comes from the harness-owned list only: toolRequest,
-// toolCreate, todoManage, plus agentDelegate when there is a subagent allowlist. No
-// preset entry is core any more (the whole catalogue is searchable), so the
-// descriptor cannot advertise a declared file tool that is not actually declared.
+// `coreTools` is the exact set this card's runs declare up front (R18): the four
+// core package file tools, a configured webSearch, the harness-owned
+// toolRequest/toolCreate/todoManage, and agentDelegate when there is a subagent
+// allowlist. It is computed from the REGISTERED names, not a static "all core"
+// list, so the demo fixture (timeNow only) does not claim file tools and a keyless
+// host does not claim webSearch. A UI core dropdown can therefore trust it instead
+// of hard-coding the harness-owned names.
 //
 // `agentModels` (R9) is emitted only when at least one agent has an override, so
 // every existing card keeps its exact descriptor shape. It is the OVERRIDE map,
-// not the effective one: an agent it omits uses the session's model, which is what
-// lets a UI show "default" rather than guessing.
+// not the effective one: an agent it omits uses the session's model.
 export const describeHarness = (
     preset: HarnessPreset,
     catalogue?: DescriptorCatalogue
-): HarnessDescriptor => ({
-    name: preset.name,
-    title: preset.title,
-    description: preset.description,
-    requiresEndpoint: preset.requiresEndpoint,
-    primary: preset.primary,
-    subagents: [...preset.subagents],
-    agents: [...preset.agents],
-    tools: [
+): HarnessDescriptor => {
+    // The exact names this card registers: the declarative preset list plus every
+    // environment-backed name THIS host can actually run. webSearch is the only
+    // entry there today, and it is added only when the runtime catalogue has an
+    // executable definition (a provider key resolved).
+    const registered = [
         ...preset.tools,
         ...(preset.environmentTools ?? []).filter(
-            (name) =>
-                catalogue?.tools[name] !== undefined && !preset.tools.includes(name)
+            (name) => catalogue?.tools[name] !== undefined && !preset.tools.includes(name)
         )
-    ],
-    coreTools: coreToolNames(preset.subagents),
-    ...(Object.keys(preset.agentModels ?? {}).length > 0
-        ? { agentModels: { ...preset.agentModels } }
-        : {}),
-    builtin: preset.builtin,
-    editable: preset.editable
-});
+    ];
+
+    return {
+        name: preset.name,
+        title: preset.title,
+        description: preset.description,
+        requiresEndpoint: preset.requiresEndpoint,
+        primary: preset.primary,
+        subagents: [...preset.subagents],
+        agents: [...preset.agents],
+        tools: registered,
+        coreTools: coreToolNames(preset.subagents, registered),
+        ...(Object.keys(preset.agentModels ?? {}).length > 0
+            ? { agentModels: { ...preset.agentModels } }
+            : {}),
+        builtin: preset.builtin,
+        editable: preset.editable
+    };
+};

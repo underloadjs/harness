@@ -3,11 +3,18 @@
 // WHY THIS IS SEPARATE FROM createToolCatalogue()
 // ----------------------------------------------
 // `createToolCatalogue()` (./index.ts) lists tools a host can call DIRECTLY: no
-// harness, no model, no session. The core tools are the opposite — toolRequest,
-// toolCreate, todoManage, and agentDelegate only mean something inside one
-// session's harness, because they mutate that harness's enabled set, registry, todo
-// list, or agent team. Adding them there would make the CLI promise a callable tool
-// it cannot run.
+// harness, no model, no session. The harness-owned core tools are the opposite —
+// toolRequest, toolCreate, todoManage, and agentDelegate only mean something
+// inside one session's harness, because they mutate that harness's enabled set,
+// registry, todo list, or agent team. Adding them there would make the CLI promise
+// a callable tool it cannot run.
+//
+// R18: the four core FILE tools (fileRead/fileWrite/fileEdit/fileGlob) and a
+// configured webSearch are also `visibility: 'core'`, but they are NOT listed
+// here and NOT sessionBound: they have real standalone implementations, so they
+// stay in createToolCatalogue()'s direct-call path and run without a sessionId.
+// "Core" means always declared; only this harness-owned set means "needs a
+// session".
 //
 // The server, however, must LIST them: the UI's Tools tab shows every tool
 // (core included) for review and manual execution, and all execution happens
@@ -16,8 +23,9 @@
 // require a `sessionId` and forward the call to `harness.executeTool`.
 //
 // NO DUMMY IMPLEMENTATIONS: every entry here has `tool: undefined` on purpose.
-// There is exactly one implementation of each core tool — the one the harness
-// registers for the session — and the server reaches it through the session.
+// There is exactly one implementation of each harness-owned core tool — the one
+// the harness registers for the session — and the server reaches it through the
+// session.
 //
 // Metadata comes from ../../src/core/metadata.ts, the same copy the harness
 // registration reads, so a descriptor cannot advertise a name, description, tags,

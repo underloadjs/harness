@@ -1,14 +1,13 @@
 // Tool-catalogue rendering for the credential-dependent webSearch entry.
 //
-// C1 is a visibility fix: the right-rail catalogue must show webSearch even when
-// the server has no key, the button must say so before a click, and the runner
-// must offer the example arguments while refusing to call it. With a key, the
-// same entry is a normal callable tool. `main.ts` is imported with a stubbed
-// fetch, exactly like main.test.ts, so no server runs and no key exists anywhere.
+// C1 is a visibility fix: the catalogue must show webSearch even when the server
+// has no key, the button must say so before a click, and the runner must offer the
+// example arguments while refusing to call it. With a key, the same entry is a
+// normal callable tool. `main.ts` is imported with a stubbed fetch, exactly like
+// main.test.ts, so no server runs and no key exists anywhere.
 //
-// The right-rail catalogue stays visible on every view, and clicking a tool opens
-// the direct runner in the centre (switching to the Tools tab) while the rails stay
-// usable. The Tools tab lists the same entries plus the core tools.
+// R21.2 moved this catalogue: the right rail no longer lists tools at all, so the
+// Tools tab is the only place a tool is selected, and the runner opens there.
 //
 // Run: npx vitest run --config playground/vitest.config.ts
 
@@ -54,7 +53,8 @@ const stubFetch = (availability: unknown): void => {
                             group: 'Web search',
                             description: 'Search the web with Exa or Tavily.',
                             tags: ['web', 'search', 'internet', 'news', 'research'],
-                            visibility: 'searchable',
+                            // R18: a configured (or listed) webSearch is core.
+                            visibility: 'core',
                             parameters: WEBSEARCH_PARAMETERS,
                             availability
                         }
@@ -82,11 +82,19 @@ const boot = async (): Promise<void> => {
     await flush();
 };
 
-const selectWebsearch = (): void => {
-    const button = document.querySelector<HTMLButtonElement>('.tool-button');
-    if (button === null) throw new Error('the tool list did not render');
-    button.click();
+// R21.2: the Tools tab is the only catalogue. Selecting a tool means clicking its
+// keyed button there, so the tab is opened first.
+const openToolsTab = (): void => {
+    const found = [...document.querySelectorAll<HTMLButtonElement>('.tab')].find(
+        (candidate) => candidate.textContent === 'Tools'
+    );
+    if (found === undefined) throw new Error('the Tools tab did not render');
+    found.click();
 };
+
+const toolButtons = (): HTMLButtonElement[] => [
+    ...document.querySelectorAll<HTMLButtonElement>('.tool-tab-button')
+];
 
 const warningNotes = (): HTMLElement[] =>
     Array.from(document.querySelectorAll<HTMLElement>('.tool-card .tool-note.is-warning'));
@@ -108,22 +116,30 @@ it('lists an unconfigured webSearch, explains it, and disables the call', async 
     stubFetch({ state: 'unconfigured', environment: ['EXA_API_KEY', 'TAVILY_API_KEY'], hint });
     await boot();
 
-    // The catalogue is always visible: no mode switch needed.
+    // R21.2: no tool list on the right rail any more, and no mode switch either.
     expect(document.querySelectorAll('.modes')).toHaveLength(0);
-    expect(document.querySelector('.catalogue-count')?.textContent).toBe('1');
-    expect(document.querySelector('.tool-group')?.textContent).toBe('Web search');
+    expect(document.querySelector('.rail-right .tool-list')).toBeNull();
+    expect(document.querySelector('.rail-right .core-tools')).toBeNull();
 
-    const button = document.querySelector<HTMLButtonElement>('.tool-button');
-    expect(button?.dataset.availability).toBe('unconfigured');
-    expect(button?.querySelector('.tool-kind')?.textContent).toBe('searchable · unconfigured');
+    openToolsTab();
 
-    selectWebsearch();
+    expect([...document.querySelectorAll<HTMLElement>('.tool-tab-group')].map((node) => node.textContent)).toEqual([
+        'Web search'
+    ]);
+
+    const button = toolButtons()[0];
+    expect(button.dataset.availability).toBe('unconfigured');
+    expect(button.querySelector('.tool-tab-kind')?.textContent).toBe('core · unconfigured');
+
+    // The Tools tab opens the first entry automatically, so the runner is already
+    // showing webSearch; clicking the entry again is the explicit path.
+    button.click();
 
     // The tool opens in the centre; the header describes it without badge clutter.
     expect(document.querySelector('.main-title')?.textContent).toBe('webSearch');
     expect(document.querySelector('.harness-id')?.textContent).toBe('Web search');
     expect(document.querySelector('.harness-note')?.textContent).toBe(
-        'searchable · tags: web, search, internet, news, research · unconfigured'
+        'core · tags: web, search, internet, news, research · unconfigured'
     );
     // The rails stay accessible around the runner.
     expect(document.querySelector('.rail-left')).not.toBeNull();
@@ -153,15 +169,17 @@ it('enables the same entry when the server reports it configured', async () => {
     stubFetch({ state: 'available', environment: ['EXA_API_KEY', 'TAVILY_API_KEY'] });
     await boot();
 
-    const button = document.querySelector<HTMLButtonElement>('.tool-button');
-    expect(button?.dataset.availability).toBeUndefined();
-    expect(button?.querySelector('.tool-kind')?.textContent).toBe('searchable');
+    openToolsTab();
 
-    selectWebsearch();
+    const button = toolButtons()[0];
+    expect(button.dataset.availability).toBeUndefined();
+    expect(button.querySelector('.tool-tab-kind')?.textContent).toBe('core');
+
+    button.click();
 
     expect(document.querySelector('.main-title')?.textContent).toBe('webSearch');
     expect(document.querySelector('.harness-note')?.textContent).toBe(
-        'searchable · tags: web, search, internet, news, research'
+        'core · tags: web, search, internet, news, research'
     );
 
     const args = document.querySelector<HTMLTextAreaElement>('.tool-args');

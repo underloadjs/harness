@@ -10,11 +10,22 @@
 // summarize, flaky) are gone with no aliases; a second name for one tool would make
 // discovery ambiguous.
 
-import { tool } from '../src/harness';
-import type { Tool } from '../src/harness';
+import { tool, toolUi } from '../src/harness';
+import type { Tool, ToolUiEnvelope } from '../src/harness';
 
 // timeNow — the current time. The timezone argument is only a label for the answer.
-const timeNow = tool<string | undefined, { timezone: string; iso: string; unix: number }>({
+//
+// R20.2 DEMONSTRATION: this is the shipped example of a declarative panel. It
+// returns `toolUi(content, panels)` so:
+//   - the MODEL still receives exactly the JSON of `{ timezone, iso, unix }`
+//     (the harness serializes `content` only — see src/harness.ts);
+//   - a chat client gets one `right`-slot key/value panel on the tool_result;
+//   - the manual/direct server call unwraps to the same `{ timezone, iso, unix }`
+//     result object (server/api.ts) with an optional `panels` field.
+// A caller that invokes the tool callable directly now receives the branded
+// envelope, which is why `toolUiOf()` is exported for host code too. Keep the
+// content shape unchanged: the scripted demo and the API contract depend on it.
+const timeNow = tool<string | undefined, ToolUiEnvelope<{ timezone: string; iso: string; unix: number }>>({
     description:
         'Read the current time. Returns an ISO 8601 timestamp and the Unix time in seconds. The timezone argument is only a label for the answer.',
     tags: ['time', 'clock', 'date'],
@@ -28,12 +39,31 @@ const timeNow = tool<string | undefined, { timezone: string; iso: string; unix: 
     },
     execute: ({ parameters: timezone }) => {
         const now = new Date();
-
-        return {
+        const content = {
             timezone: timezone ?? 'UTC',
             iso: now.toISOString(),
             unix: Math.floor(now.getTime() / 1000)
         };
+
+        return toolUi(content, [
+            {
+                id: 'timeNow',
+                // 'right' is the default mount point; slot names are open strings.
+                slot: 'right',
+                title: 'Current time',
+                blocks: [
+                    {
+                        type: 'keyValue',
+                        items: [
+                            { label: 'Timezone', value: content.timezone },
+                            { label: 'ISO 8601', value: content.iso },
+                            { label: 'Unix', value: String(content.unix) }
+                        ]
+                    },
+                    { type: 'text', text: 'Read from the server clock at execution time.' }
+                ]
+            }
+        ]);
     }
 });
 

@@ -35,7 +35,7 @@ src/
   harness.delegation.test.ts  primary/subagents + delegate, next to the loop
   harness.todo.test.ts        todoManage declaration/state in a harness
   harness.metadata.test.ts    core tool metadata (R7 cap, schemas) as registered
-  harness.websearch.test.ts   opt-in webSearch registration/discovery/secrets
+  harness.websearch.test.ts   opt-in webSearch registration/core declaration/secrets
   core/
     index.ts            barrel: agent, tool, searchTools, compileToolSource, createDynamicTool, createTodoTool
     agent.ts            the brain
@@ -354,11 +354,19 @@ declares:
 - every searchable tool that toolRequest has enabled.
 
 **Every harness preloads the preset catalogue** (`src/tools/`) unless it is
-created with `presets: false`. **Every preset is searchable**, file tools included:
-the preload adds catalogue entries only, so a model that needs a file asks for
-`files`/`read` and fileRead appears on the next turn. A configured tool replaces a
-preloaded preset of the same name. The only core tools are the harness-owned
-toolRequest/toolCreate/todoManage (plus delegate for a primary with subagents).
+created with `presets: false`. **Four file tools are core (R18)** —
+`fileRead`, `fileWrite`, `fileEdit`, `fileGlob` — so they are declared on every
+request and need no discovery. `fileList`, `syntaxCheck`, `commandRun`, and
+`gitDiff` stay searchable: a model that needs a directory listing asks for
+`files`/`list`. A configured tool replaces a preloaded preset of the same name.
+The harness-owned toolRequest/toolCreate/todoManage (plus delegate for a primary
+with subagents) are core too, and a configured `webSearch` is core as well.
+
+**Core is not session-bound.** The four core file tools and `webSearch` have real
+implementations, so the server's direct-call path runs them without a `sessionId`.
+Only the harness-owned set mutates a session's harness and therefore carries
+`sessionBound: true`. There is no `fileSearch` tool: `fileGlob` is the one search
+surface (filename mode, or content mode with `content`), and it is now core.
 
 **toolRequest is built by the harness**, not shipped in `src/tools/`. It has to be:
 it closes over the live registry and the harness's active set. It is registered
@@ -389,7 +397,9 @@ same way.
   a count, never names — and `truncated: true` mirrors it for older clients.
   Results sort by best score, then hit count, then name, so which five survive is
   deterministic. A broad tag is refined (`["files"]` then `["files", "write"]`),
-  which is how the rest of the five file tools are reached without pagination.
+  which is how the remaining searchable tools are reached without pagination.
+  Core tools never appear in results: the four file tools and a configured
+  `webSearch` are already declared, so a `["files"]` query only finds `fileList`.
 - `availableTags` (the sorted vocabulary of searchable tools) is returned when
   nothing matched or when the query was empty, so a failed query teaches the model
   the real tags.
@@ -454,8 +464,9 @@ not replace it with the full-list shape.
 
 `src/tools/` ships eight presets: `syntaxCheck`, the five file tools (`fileRead`,
 `fileWrite`, `fileEdit`, `fileList`, `fileGlob`), `commandRun`, and `gitDiff`. Each
-is a standard `tool()` and each is executable standalone. All eight are
-**searchable**: no preset is declared up front.
+is a standard `tool()` and each is executable standalone. R18: `fileRead`,
+`fileWrite`, `fileEdit`, and `fileGlob` are **core**; `fileList`, `syntaxCheck`,
+`commandRun`, and `gitDiff` remain **searchable**.
 
 The folder is one file per tool, one folder per capability — `tools/syntax/`,
 `tools/files/`, `tools/command/` — and the barrel exports both the named tools and
@@ -477,9 +488,9 @@ implementation through `loadPresetTool`'s `import()` on first call. Consequences
   harness registration and the server's direct-call path are unchanged;
 - a failed import clears the cache so the next call retries.
 
-Every preset is tagged and **searchable** (the default), so a harness that registers
-all eight declares only the harness-owned core set until the model asks for `files`,
-`read`, `shell`, `git`, `python`, or `javascript`.
+Every preset is tagged. The four core file tools are declared up front; the
+searchable remainder (`fileList`, `syntaxCheck`, `commandRun`, `gitDiff`) waits for
+`files`/`list`, `shell`, `git`, `python`, or `javascript`.
 
 | Export | Call | Result |
 |---|---|---|
@@ -589,9 +600,13 @@ error: it means no provider has a usable key, and that is also what makes
 
 harness.ts registers the result after configured tools and before the reserved-name
 check (so a preset or plugin cannot claim the name first), and only when
-`configuration.websearch` is truthy (the field keeps its name) and no custom `webSearch` exists. Keys live in
-the tool closure: two harnesses never share one, and nothing enters the schema,
-arguments, result, events, `RunnerSettings`, the UI, or a client payload.
+`configuration.websearch` is truthy (the field keeps its name) and no custom `webSearch` exists. **A configured
+`webSearch` is core (R18)**: it is declared on every request, so the model calls it
+directly instead of spending a toolRequest round. Registration is still conditional
+on a usable key, so a keyless host neither declares nor lists a runnable search
+tool. Keys live in the tool closure: two harnesses never share one, and nothing
+enters the schema, arguments, result, events, `RunnerSettings`, the UI, or a client
+payload.
 
 **Catalogue visibility (C1).** `harnesses/websearch.ts` always produces an entry
 for the direct-call catalogue. `createWebSearchCatalogueEntry()` calls the factory
@@ -652,7 +667,9 @@ and is not cached, so a later call can retry.
 
 **Application wiring:** the live presets (`instruct`, `research`, `workspace`)
 pass `websearch: true`, so the CLI and server read search keys from their own
-process environment; `demo` stays offline and the `flaky` example does not opt in.
+process environment; the shared-factory `flaky` example opts in too, while
+`demo` stays offline. `flaky`'s preset metadata declares `environmentTools:
+['webSearch']` so its descriptor matches what the factory registers.
 This is why no search key was added to `RunnerSettings` or the Endpoint panel. The
 app entry points preload the package-root `.env` into `process.env` (see “CLI,
 server, and UI”); the library still has no autoload and importing it never reads a
@@ -660,12 +677,13 @@ file.
 
 **Preset descriptors follow the catalogue.** Those live presets also declare
 `environmentTools: ['webSearch']` in `harnesses/presets.ts` — metadata only, no
-harness is built to answer a listing. `server/api.ts` appends such a name to the
+harness is built to answer a listing. `describeHarness` appends such a name to the
 preset's `tools` only when the runtime catalogue holds an executable definition for
-it, so the descriptors in the bootstrap document and `GET /harnesses` / `/presets`
-match what the session can discover. All live presets advertise the same shared
-toolbox, so a keyless host reports that list minus webSearch; the global catalogue
-still shows webSearch as unconfigured.
+it, and includes it in `coreTools` under the same condition (R18). A keyless host
+therefore advertises neither a callable webSearch nor a core webSearch; the global
+catalogue still shows the tool as unconfigured with its hint. Core file tools in
+`coreTools` are likewise filtered by the preset's registered names, so the demo
+fixture (timeNow only) does not claim them.
 
 ---
 
@@ -764,18 +782,21 @@ await writer('tell me about new year');
   `tool.name` are overwritten to match.
 - **Tool declarations are filtered, not the registry.** `writer.tools` holds the
   preset preload, the configured tools, `toolRequest`, `toolCreate`, `todoManage`,
-  and `agentDelegate` when there is a subagent; a request declares the harness-owned
-  core tools, then whatever toolRequest enabled. No preset (file tools included) is
-  core. `agentDelegate` is core for the primary only.
+  and `agentDelegate` when there is a subagent; a request declares every core tool
+  (`fileRead`/`fileWrite`/`fileEdit`/`fileGlob`, a configured `webSearch`, and the
+  harness-owned set), then whatever toolRequest enabled. The searchable remainder
+  (`fileList`, `commandRun`, ...) waits for discovery. `agentDelegate` is core for
+  the primary only.
 - **`discoveredTools`** is a read-only copy of the enabled set, in discovery order.
   It persists for the harness's lifetime (every call/turn) and is emptied by
   `reset()`; a server snapshot records it so a reload can show it.
 - **`executeTool(name, parameters)`** (R8) runs one REGISTERED tool directly with
   this harness's context (`agent: primary`, `agents`, `run`). It is the server's
-  manual-execution path (`POST /tools/:name` with a `sessionId`), so a manual
-  toolRequest/toolCreate/todoManage/delegate call mutates this session. Discovery
-  gates the MODEL only: an explicit operator call may run a searchable tool that
-  was never enabled. Nothing else is bypassed — `toolCreate` keeps its guarded
+  manual-execution path for the session-bound tools (`POST /tools/:name` with a
+  `sessionId`), so a manual toolRequest/toolCreate/todoManage/delegate call mutates
+  this session. Core file tools and webSearch are ordinary direct-call catalogue
+  entries and do not need a session. Discovery gates the MODEL only: an explicit
+  operator call may run a searchable tool that was never enabled. Nothing else is bypassed — `toolCreate` keeps its guarded
   registration, `agentDelegate` keeps its primary-only check, and a name this harness
   did not register (delegate without subagents) throws instead of inventing an
   implementation. No progress events are emitted: a manual call is not a turn.
@@ -899,7 +920,8 @@ const ids = await listModels({ baseURL, apiKey, headers?, signal? });
 | { type: 'text';        agent: string; delta: string }
 | { type: 'reasoning';   agent: string; delta: string }
 | { type: 'tool_call';   agent: string; call: HarnessToolCall }
-| { type: 'tool_result'; agent: string; name: string; callId?: string; content: string; isError: boolean }
+| { type: 'tool_result'; agent: string; name: string; callId?: string; content: string; isError: boolean; ui?: ToolUiPanel[] }
+| { type: 'usage';      agent: string; usage: HarnessUsage }
 | { type: 'done';        agent: string; message: HarnessAssistantMessage }
 | { type: 'error';       agent: string; error: { message: string } }
 ```
@@ -908,7 +930,16 @@ Delivered through `report.progress`, which is **awaited** for every step, so a
 slow reporter paces the run. Every event names its agent. `tool_result.callId` is
 optional for compatibility and is always populated by the harness: it is the id of
 the `tool_call` the result answers, which lets a client pair two same-name calls
-exactly instead of positionally.
+exactly instead of positionally. `ui` is the optional declarative panel list from
+`toolUi()` (see “Declarative tool panels” below); the model never sees it.
+
+`usage` is emitted once per **model request**, including the tool rounds that keep
+a run going — `done` only ever reports the final request, so this is the only
+per-request feed a client can tally. It is absent when the provider reported no
+usage block for that request. The server folds every one of them into
+`SessionTurn.usage` (subagent requests included) and repeats the running sum on
+each SSE frame; the UI prints it next to the turn's elapsed label as
+`input (cached)`, e.g. `122,111 (100,301)`.
 
 ## HarnessMessage
 
@@ -932,9 +963,19 @@ string — malformed JSON is the harness's problem to report, not a parse crash.
     toolCalls: HarnessToolCall[];   // [] when the model answered directly
     model: string;                  // captured at request time
     stopReason: 'stop' | 'length' | 'tool_calls';
-    usage?: { input: number; output: number; total: number };
+    usage?: {
+        input: number;   // prompt tokens, INCLUDING a replayed cache prefix
+        output: number;
+        total: number;
+        cached?: number; // replayed prefix the provider served from cache, when reported
+    };
 }
 ```
+
+`usage.cached` is optional and never defaulted: “not reported” and “reported, 0”
+are different facts. The transport reads it from `prompt_tokens_details.cached_tokens`
+(OpenAI-compatible, and what the workspace's Lightning adapter emits) or
+`prompt_cache_hit_tokens` (DeepSeek-compatible), and clamps it to `input`.
 
 ## ToolVisibility / ToolSearchResult
 
@@ -953,6 +994,46 @@ type ToolSearchResult = {
 
 `searchTools()` returns the same shape as a `toolRequest` call, so a UI can rank a
 catalogue without a harness.
+
+## Declarative tool panels (R20.2)
+
+A tool result is text for the model. To let a client render a small, safe summary,
+a tool wraps its ordinary value:
+
+```ts
+toolUi(content, panels)               // branded ToolUiEnvelope<TContent>
+toolUiOf(value)                       // extraction + re-normalization, or undefined
+
+type ToolUiBlock =
+    | { type: 'text'; text: string }
+    | { type: 'table'; columns: string[]; rows: string[][] }
+    | { type: 'keyValue'; items: { label: string; value: string }[] };
+
+type ToolUiPanel = { id: string; slot: string; title: string; blocks: ToolUiBlock[] };
+```
+
+`src/types/index.ts` is the canonical type home; `src/core/tool-ui.ts` owns the
+normalizer and the exported `TOOL_UI_LIMITS`.
+
+- **Model content is unchanged.** `executeToolCall` calls `toolUiOf(result)` and
+  serializes only `ui.content`; the envelope/panels never enter the transcript or
+  a transport request.
+- **The event carries it.** `tool_result.ui` is present only for a recognized
+  envelope. `server/sessions.ts` copies events as before, so SSE and the recorded
+  turn keep the panels and `eventTimes` stays a parallel array with the same
+  length/order.
+- **Manual calls unwrap.** `server/api.ts` projects `ToolCallResult.result` to the
+  content and adds optional `panels` (session-bound and direct paths alike).
+- **Safety bounds.** `slot` is an open string (`right` is the default mount, with
+  `center`/`left` available to the UI); panels are data only (no HTML/JS/actions).
+  Normalization caps 32 panels, 64 blocks/panel, 100 table rows, 20 columns, 100
+  key/value items, bounded text/cell/label lengths, and a 256 KiB total; malformed
+  panels/blocks are dropped, non-string cells blanked/padded, and oversized
+  panels dropped whole.
+- **Demonstration.** `harnesses/tools.ts` `timeNow` returns a right-slot key/value
+  panel while keeping its `{ timezone, iso, unix }` content. The server API result
+  is unchanged; the chat transcript shows the panel. A direct callable consumer
+  receives the branded envelope and should use `toolUiOf()`.
 
 ---
 
@@ -1012,11 +1093,11 @@ catalogue without a harness.
   as a tool result naming the tags that would enable it, which is recoverable and
   still teaches the model the vocabulary.
 - **Preload the catalogue, declare only the core.** Shipping the presets into
-  every harness by default stays cheap because no preset is core: the registry
-  grows, the first request declares only toolRequest/toolCreate/todoManage
-  (+delegate). `presets: false` exists for callers who want an empty catalogue,
-  which is also what the harness tests use when they assert exact discovery
-  results.
+  every harness by default stays cheap: only the four core file tools are declared
+  up front, alongside toolRequest/toolCreate/todoManage (and delegate when
+  applicable), while the searchable remainder costs no context until discovered.
+  `presets: false` exists for callers who want an empty catalogue, which is also
+  what the harness tests use when they assert exact discovery results.
 
 ## CLI, server, and UI
 
@@ -1070,8 +1151,11 @@ published library; the three entry points are consumers of it.
   live preset uses, so `instruct`, `research`, and `workspace` register the same
   tools and differ only in agents/instructions/routing. `demo` uses the scripted
   transport, needs no endpoint, and keeps a timeNow-only registry as a documented
-  fixture exception; `flaky` is the shared toolbox plus the intentional failure
-  tool (excluded from the shared set because it fails on purpose). Every preset
+  template exception; `flaky` is the shared toolbox plus the intentional failure
+  tool (excluded from the shared set because it fails on purpose). Every template is
+  editable (R20.1): the registry copies it, metadata-only patches preserve the
+  captured factory, and an executable patch upgrades demo to a live profiled
+  harness / rebuilds flaky with `testFlaky` retained. Every preset
   names its `primary` explicitly (single-agent presets have no subagents, so no
   `agentDelegate` tool); `research` declares `subagents: ['summarizer']`, and every
   agent keeps its own instruction. `harnesses/index.ts` exports
@@ -1103,11 +1187,11 @@ paths below `/v1/harness` **plus** the bare root:
 | Route | Purpose |
 |---|---|
 | `GET /api/health` | Liveness and session count |
-| `GET /api/harnesses` | Harness descriptors (`primary`/`subagents`/`coreTools`/`agentModels?`/`builtin`/`editable`), provider defaults, and `agents` |
+| `GET /api/harnesses` | Harness descriptors (`primary`/`subagents`/`coreTools`/`agentModels?`/`builtin`/`editable`), provider defaults, and `agents`; every entry is editable and `editable` is always `true` |
 | `POST /api/harnesses` | `{ name, title?, description?, primary, subagents?, agentModels? }` → `201 { harness }` |
-| `PATCH /api/harnesses/:name` | `{ title?, description?, primary?, subagents?, agentModels? }` → `{ harness }` |
+| `PATCH /api/harnesses/:name` | `{ title?, description?, primary?, subagents?, agentModels? }` → `{ harness }`; every template is patchable |
 | `GET /api/agents` | Trusted agent registry (`AgentDescriptor[]`) |
-| `GET /api/tools` | Full catalogue: core entries first (`group: 'Core tools'`, `sessionBound: true`), then every direct-call tool; `webSearch` always present with `availability` |
+| `GET /api/tools` | Full catalogue: session-bound core entries first (`group: 'Core tools'`, `sessionBound: true`), then every direct-call tool (including the core file tools); `webSearch` always present with `availability` |
 | `GET /api/tools/bootstrap` | Alias of `GET /api/tools` — the list the root bootstrap document carries |
 | `POST /api/tools/:name` | `{ parameters, sessionId? }` → `{ ok, result | error, durationMs }`. A `sessionBound` core tool requires `sessionId` (`400` without, `404` unknown session or unavailable tool, `409` while the session is busy - a run, reset, or another manual call) and executes inside that session's harness; a direct-call tool is unchanged and ignores `sessionId` |
 | `POST /api/tools/:name/call` | Alias of the row above (verb-named spelling), same dispatcher |
@@ -1151,6 +1235,17 @@ accept and ignore `sessionId` so one request shape serves the whole Tools tab. T
 metadata comes from `src/core/metadata.ts`, the copy the harness registers, so a
 descriptor cannot advertise a schema the runtime does not use.
 
+**R18: core file/search tools are NOT session-bound.** `fileRead`, `fileWrite`,
+`fileEdit`, `fileGlob`, and a configured `webSearch` are `visibility: 'core'` but
+keep their real `tool` implementation and appear in the direct-call catalogue
+(groups `Package presets` / `Web search`), so `POST /api/tools/fileRead` works
+without a `sessionId`. `sessionBound: true` remains exclusive to the four
+harness-owned entries above. The UI's core dropdown reads `coreTools` from the
+descriptor, which is computed from the registered names and therefore includes the
+file tools, adds `webSearch` only when this host resolved a key, omits `fileList`
+(and the other searchable tools), and matches the harness's actual core
+declarations.
+
 Every standalone request requires `X-Harness-Client: ui`. A browser on another
 origin cannot set that header without a CORS preflight, and the server answers
 none, so a malicious page cannot read transcripts or POST a command to localhost.
@@ -1158,13 +1253,16 @@ The UI sends it; `curl` must add it. The service mount does **not** use that
 header (its loader allows any header); it uses the Origin gate described above.
 
 Every SSE `data:` frame is `{ type: 'turn', turn }` (opening), `{ type: 'event',
-turnId, event, at }`, `{ type: 'snapshot', session }` on success, or `{ type:
+turnId, event, at, usage? }`, `{ type: 'snapshot', session }` on success, or `{ type:
 'failed', error, session }` on failure. `at` is the server's epoch-ms stamp for that
 record and is identical to the matching entry in `turn.eventTimes`, so a live view
-and a reload agree on elapsed time. `tool_result` events also carry the `callId` of
-the `tool_call` they answer, which pairs same-name calls exactly. The response's
-`close` event cancels the run, so a disconnected client does not keep spending
-provider time.
+and a reload agree on elapsed time. `usage` is the turn's running token tally as the
+SERVER summed it (`{ input, output, total, cached? }`): it is repeated on every frame
+once it exists, so a client prints the server's figure instead of accumulating one
+of its own, and a poll/reload (`SessionTurn.usage`) shows exactly the same number.
+`tool_result` events also carry the `callId` of the `tool_call` they answer, which
+pairs same-name calls exactly. The response's `close` event cancels the run, so a
+disconnected client does not keep spending provider time.
 
 ### Agents and the harness registry
 
@@ -1177,7 +1275,8 @@ Nothing in a profile is secret, and a client cannot supply one.
 `harnesses/registry.ts` is the in-memory harness registry shared by the store and
 the dispatcher:
 
-- `list()` → shipped built-ins (preset order) then user-created harnesses;
+- `list()` → shipped templates (preset order) then user-created harnesses; each entry
+  is an independent COPY of its template (R20.1), never the module object;
 - `find()` resolves legacy aliases (`writer`/`assistant` → `instruct`,
   `researcher` → `research`) for session creation; `update()` deliberately does not
   accept an alias;
@@ -1185,10 +1284,16 @@ the dispatcher:
   unique, not an alias), a known `primary`, and a distinct, bounded, known
   `subagents` allowlist, then builds a live harness with the shared toolbox and
   `builtin: false, editable: true`;
-- `update()` changes `title`/`description`/`primary`/`subagents` for an editable
-  entry. It **replaces** the preset object (new factory closure) instead of mutating
-  it. Changing `primary` without restating `subagents` removes the new primary from
-  the old allowlist;
+- `update()` changes `title`/`description`/`primary`/`subagents`/`agentModels` for
+  **every** entry (there is no 403/read-only branch; `editable` is a compatibility
+  wire field, always true). It **replaces** the preset object instead of mutating
+  it. A metadata-only patch keeps the captured factory (demo's script, flaky's
+  `testFlaky`); an executable patch (primary/subagents/agentModels) rebuilds from
+  the `template`: `scripted` upgrades to a live profiled harness and corrects
+  `requiresEndpoint`/`tools`/`environmentTools`, `flaky` rebuilds the live toolbox
+  with the extra retained, and `live` uses `createProfiledHarness`. Changing
+  `primary` without restating `subagents` removes the new primary from the old
+  allowlist;
 - `agentModels` (R9) is a map of selected agent id → model id on create/patch. Keys
   are validated against the FINAL `[primary, ...subagents]` set (unknown key = 400
   naming the members), values are trimmed, non-empty, ≤200 characters, and free of
@@ -1199,8 +1304,8 @@ the dispatcher:
   session keeps its models. Only ids are overridable: provider, base URL, and key
   always come from `RunnerSettings`. `describeHarness()` emits the override map
   only when it is non-empty, so an omitted agent reads as "session default";
-- `demo`/`flaky` are `editable: false` (403); unknown names are 404; duplicate names
-  are 409; everything else is 400.
+- unknown names are 404; duplicate names are 409; everything else is 400. No
+  registry failure is a 403.
 
 Semantic validation lives in the registry; the dispatcher rejects unknown body
 fields, so `instruction`, `tools`, or `provider` cannot be smuggled into a
@@ -1212,7 +1317,9 @@ Sessions capture the resolved preset AND a `describeHarness()` snapshot at
 creation. A registry change therefore affects future sessions only; the existing
 session keeps running (and reporting) what it was built with, including its frozen
 `harnessDefinition`. The same descriptor projection feeds `/harnesses`, so a card
-and a session snapshot cannot disagree.
+and a session snapshot cannot disagree. This frozen-chat rule is not a read-only
+harness rule: every harness card is editable (R20.1), and an edit applies to the
+next session started; in-place editing of an existing chat is not implemented.
 
 ### Decisions worth keeping
 
@@ -1281,7 +1388,7 @@ In the order they are expected:
 2. **session persistence** — the server keeps sessions in memory; restarting loses them.
 3. **compaction** — history pruning before context limits.
 4. **per-agent tool scoping** — searchable tools are catalogued once; every agent
-   can discover every non-core tool (only `agentDelegate` is primary-only).
+   can discover every searchable tool (only `agentDelegate` is primary-only).
 5. **parallel tool execution** — calls run sequentially today.
 6. **sandboxed presets and created tools** — the file and command tools, and any
    `toolCreate` body, run with host permissions; a `root`-scoped/fenced variant

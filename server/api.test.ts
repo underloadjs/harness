@@ -190,14 +190,15 @@ describe('canonical bootstrap document', () => {
         expect(body.defaults).toEqual(DEFAULTS);
         expect(body.sessions).toEqual([]);
 
-        // Descriptors, not factories: the first card is the Instruct harness, and
-        // the only core tools are the harness-owned ones (no subagents, so no
-        // delegate). Every preset tool is searchable.
+        // Descriptors, not factories: the first card is the Instruct harness. Its
+        // core set is the four file tools plus the harness-owned set (no subagents,
+        // so no delegate); a keyless host has no core webSearch. fileList and the
+        // command/app tools stay searchable.
         expect((body.presets as unknown[])[0]).toEqual({
             name: 'instruct',
             title: 'Instruct',
             description:
-                'A general instruction-following agent with the full shared toolbox. Every capability is searchable: call toolRequest with capability tags to enable the file, command, git, time, text, notes, or web-search tools the task needs. The live presets differ only in their agents, not their tools.',
+                'A general instruction-following agent with the full shared toolbox. File read/write/edit/glob and a configured webSearch are always available; call toolRequest with capability tags for fileList, commands, diffs, syntax checks, time, text, or notes. The live presets differ only in their agents, not their tools.',
             requiresEndpoint: true,
             primary: 'instruct',
             subagents: [],
@@ -217,13 +218,14 @@ describe('canonical bootstrap document', () => {
                 'noteSearch',
                 'textSummarize'
             ],
-            coreTools: ['toolRequest', 'toolCreate', 'todoManage'],
+            coreTools: ['fileRead', 'fileWrite', 'fileEdit', 'fileGlob', 'toolRequest', 'toolCreate', 'todoManage'],
             builtin: true,
             editable: true
         });
 
-        // The offline fixture is still described, just no longer the first card;
-        // it is a fixture, so it is not editable.
+        // The offline fixture is still described, just no longer the first card.
+        // R20.1: it is editable like every template (`editable` is compatibility
+        // data now, not a read-only flag); a metadata-only patch keeps its script.
         expect((body.presets as { name: string; tools: string[]; coreTools: string[] }[]).find(
             (preset) => preset.name === 'demo'
         )).toEqual({
@@ -238,7 +240,7 @@ describe('canonical bootstrap document', () => {
             tools: ['timeNow'],
             coreTools: ['toolRequest', 'toolCreate', 'todoManage'],
             builtin: true,
-            editable: false
+            editable: true
         });
     });
 
@@ -304,20 +306,99 @@ describe('preset descriptor tool metadata', () => {
         research: [...TOOLBOX, 'webSearch'],
         workspace: [...TOOLBOX, 'webSearch'],
         demo: ['timeNow'],
-        // The example adds its own failure tool; webSearch is not part of it.
-        flaky: [...TOOLBOX, 'testFlaky']
+        // The example adds its own failure tool and shares the same opt-in search
+        // wiring as the live presets (createToolboxHarness).
+        flaky: [...TOOLBOX, 'testFlaky', 'webSearch']
     };
 
-    // Only the harness-owned names are core now. The whole shared toolbox —
-    // file tools included — is searchable, so no preset entry appears here.
-    // Agent configuration: only Research declares a subagent, so only Research
-    // gets the delegate tool.
+    // R18 core sets. Every live preset/flaky registers the four file tools; the
+    // demo fixture registers timeNow only, so it must NOT advertise them. Only
+    // Research declares a subagent, so only Research gets delegate. A configured
+    // host adds webSearch after the file tools (the order coreToolNames emits).
     const CORE_TOOLS = {
-        instruct: ['toolRequest', 'toolCreate', 'todoManage'],
-        research: ['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate'],
-        workspace: ['toolRequest', 'toolCreate', 'todoManage'],
+        instruct: [
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
+        ],
+        research: [
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'agentDelegate'
+        ],
+        workspace: [
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
+        ],
         demo: ['toolRequest', 'toolCreate', 'todoManage'],
-        flaky: ['toolRequest', 'toolCreate', 'todoManage']
+        flaky: [
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
+        ]
+    };
+
+    const CONFIGURED_CORE_TOOLS = {
+        instruct: [
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'webSearch',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
+        ],
+        research: [
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'webSearch',
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'agentDelegate'
+        ],
+        workspace: [
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'webSearch',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
+        ],
+        demo: ['toolRequest', 'toolCreate', 'todoManage'],
+        flaky: [
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'webSearch',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
+        ]
     };
 
     const configuredRuntime = (): HarnessRuntime => {
@@ -349,7 +430,7 @@ describe('preset descriptor tool metadata', () => {
         );
 
         expect(toolLists(bootstrap.body.presets)).toEqual(CONFIGURED_PRESET_TOOLS);
-        expect(coreLists(bootstrap.body.presets)).toEqual(CORE_TOOLS);
+        expect(coreLists(bootstrap.body.presets)).toEqual(CONFIGURED_CORE_TOOLS);
 
         // Every live card advertises the identical list: the toolbox is not part
         // of what a harness choice changes.
@@ -385,6 +466,10 @@ describe('preset descriptor tool metadata', () => {
             demo: ['timeNow'],
             flaky: [...TOOLBOX, 'testFlaky']
         });
+
+        // Keyless honesty: no card advertises a core webSearch it cannot run, and
+        // the demo's timeNow-only registry does not inherit the package core set.
+        expect(coreLists(bootstrap.body.presets)).toEqual(CORE_TOOLS);
 
         // Keyless stays honest: the global catalogue still lists webSearch, but as
         // unconfigured, and no preset card advertises a tool it cannot call.
@@ -492,20 +577,46 @@ describe('canonical sessions', () => {
         expect(first.turn.prompt).toBe('What time is it?');
         expect(first.turn.status).toBe('running');
 
-        // Non-delta events follow the scripted loop exactly: discovery call,
-        // clock call, then the answer. Delta events are checked by membership in
-        // the terminal equality assertion below.
+        // Non-delta events follow the scripted loop exactly: discovery call, clock
+        // call, then the answer — each request's `usage` reported BEFORE the tool
+        // call (or the final `done`) it belongs to. Delta events are checked by
+        // membership in the terminal equality assertion below.
         const events = items.flatMap((item) => (item.type === 'event' ? [item.event] : []));
         expect(
             events
                 .filter((event) => event.type !== 'text' && event.type !== 'reasoning')
                 .map((event) => event.type)
-        ).toEqual(['start', 'tool_call', 'tool_result', 'tool_call', 'tool_result', 'done']);
+        ).toEqual(['start', 'usage', 'tool_call', 'tool_result', 'usage', 'tool_call', 'tool_result', 'usage', 'done']);
 
         // Every event frame names the turn it belongs to.
         for (const item of items) {
             if (item.type === 'event') expect(item.turnId).toBe(first.turn.id);
         }
+
+        // Frame-level token tally. Only frames exist for events that were actually
+        // reported: `start` precedes every request, so it carries no `usage` key,
+        // while every frame from the first `usage` event onward repeats the
+        // server's running sum.
+        const eventFrames = items.flatMap((item) => (item.type === 'event' ? [item] : []));
+        expect(eventFrames[0].event.type).toBe('start');
+        expect(eventFrames[0]).not.toHaveProperty('usage');
+
+        const usageFrames = eventFrames.filter((frame) => frame.event.type === 'usage');
+        // Each `usage` EVENT is one request's own figures (the demo transport's
+        // scripted numbers: 48/18/66, then 96/22/118, then 148/64/212)...
+        expect(usageFrames.map((frame) => frame.event)).toEqual([
+            { type: 'usage', agent: 'demo', usage: { input: 48, output: 18, total: 66, cached: 0 } },
+            { type: 'usage', agent: 'demo', usage: { input: 96, output: 22, total: 118, cached: 48 } },
+            { type: 'usage', agent: 'demo', usage: { input: 148, output: 64, total: 212, cached: 120 } }
+        ]);
+        // ...while the FRAME's `usage` is the server's running tally after that
+        // event: the first request has no cached prefix, and each later request
+        // re-sends (and caches) the earlier transcript.
+        expect(usageFrames.map((frame) => frame.usage)).toEqual([
+            { input: 48, output: 18, total: 66, cached: 0 },
+            { input: 144, output: 40, total: 184, cached: 48 },
+            { input: 292, output: 104, total: 396, cached: 168 }
+        ]);
 
         // Terminal frame: complete session, turn done, events byte-identical to
         // the frames the client just received (the dispatcher must not reshape).
@@ -518,6 +629,25 @@ describe('canonical sessions', () => {
         expect(terminal.session.turns).toHaveLength(1);
         expect(terminal.session.turns[0].status).toBe('done');
         expect(terminal.session.turns[0].events).toEqual(events);
+        // The terminal snapshot's turn carries the same figure the last frame did:
+        // the sum of all three reported requests, cached part included.
+        expect(terminal.session.turns[0].usage).toEqual({
+            input: 292,
+            output: 104,
+            total: 396,
+            cached: 168
+        });
+
+        // A snapshot read after the run reports the turn usage over plain JSON too.
+        const readAfterRun = await jsonBody<{ session: SessionSnapshot }>(
+            await callHandler(runtime, 'GET', `/v1/harness/sessions/${session.id}`)
+        );
+        expect(readAfterRun.body.session.turns[0].usage).toEqual({
+            input: 292,
+            output: 104,
+            total: 396,
+            cached: 168
+        });
     });
 
     it('resets a canonical session', async () => {
@@ -805,7 +935,7 @@ describe('all-tools manual execution', () => {
             name: 'toolRequest',
             group: 'Core tools',
             description:
-                'Find tools by capability tag and enable them. The whole catalogue is searchable (including the file and command tools). Pass the tags you need (for example ["files", "read"] or ["shell"] or ["git", "diff"]) and up to 5 of the closest matches become available on your next turn. The result\'s "remaining" field counts any further tools that matched but were not listed, so add a more specific tag to drill into the rest. Call this before concluding that something cannot be done.',
+                'Find tools by capability tag and enable them. The searchable catalogue holds the list, shell, git, syntax, time, text, notes, and other tools; the everyday file tools (fileRead, fileWrite, fileEdit, fileGlob) are already available, as is webSearch when the host configured it. Pass the tags you need (for example ["files", "list"] or ["shell"] or ["git", "diff"]) and up to 5 of the closest matches become available on your next turn. The result\'s "remaining" field counts any further tools that matched but were not listed, so add a more specific tag to drill into the rest. Call this before concluding that something cannot be done.',
             tags: ['discovery', 'tools', 'catalogue'],
             visibility: 'core',
             parameters: {
@@ -848,6 +978,119 @@ describe('all-tools manual execution', () => {
         // Everything else keeps the directly callable shape: no session binding.
         expect(body.tools.slice(4).map((tool) => tool.name)).toEqual(CATALOGUE_TOOL_NAMES);
         expect(body.tools.slice(4).every((tool) => tool.sessionBound === undefined)).toBe(true);
+    });
+
+    it('returns plain content plus bounded declarative panels for timeNow', async () => {
+        const runtime = createRuntime();
+
+        // Exact panel projection shared by the direct and session paths. The
+        // values come from the call's own result because the clock is real.
+        const panelsFor = (value: { timezone: string; iso: string; unix: number }) => [
+            {
+                id: 'timeNow',
+                slot: 'right',
+                title: 'Current time',
+                blocks: [
+                    {
+                        type: 'keyValue',
+                        items: [
+                            { label: 'Timezone', value: value.timezone },
+                            { label: 'ISO 8601', value: value.iso },
+                            { label: 'Unix', value: String(value.unix) }
+                        ]
+                    },
+                    { type: 'text', text: 'Read from the server clock at execution time.' }
+                ]
+            }
+        ];
+
+        // Direct catalogue path: `result` is the underlying content, not the
+        // `toolUi()` envelope, and the optional `panels` carries the UI data.
+        const direct = await jsonBody<ToolCallResult>(
+            await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', {
+                body: { parameters: 'UTC' }
+            })
+        );
+        expect(direct.status).toBe(200);
+        if (!direct.body.ok) throw new Error('expected a successful tool call');
+
+        const directValue = direct.body.result as { timezone: string; iso: string; unix: number };
+        expect(directValue.timezone).toBe('UTC');
+        expect(directValue.iso).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+        expect(Number.isInteger(directValue.unix)).toBe(true);
+        expect(direct.body.panels).toEqual(panelsFor(directValue));
+
+        // Session-bound path through the demo harness: same unwrapping, same panel
+        // shape. The demo registers timeNow even though its toolbox is the script.
+        const session = await createDemo(runtime);
+        const viaSession = await jsonBody<ToolCallResult>(
+            await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', {
+                body: { parameters: 'UTC', sessionId: session.id }
+            })
+        );
+        expect(viaSession.status).toBe(200);
+        if (!viaSession.body.ok) throw new Error('expected a successful session tool call');
+
+        const sessionValue = viaSession.body.result as { timezone: string; iso: string; unix: number };
+        expect(sessionValue.timezone).toBe('UTC');
+        expect(viaSession.body.panels).toEqual(panelsFor(sessionValue));
+    });
+
+    it('lists core file tools as direct-call entries and runs one without a session', async () => {
+        const runtime = createRuntime();
+        const { body } = await jsonBody<ToolIndex>(
+            await callHandler(runtime, 'GET', '/v1/harness/tools')
+        );
+
+        // R18: core visibility, but NOT session-bound — they have real
+        // implementations in the direct-call catalogue.
+        const fileRead = body.tools.find((tool) => tool.name === 'fileRead');
+        expect(fileRead).toMatchObject({
+            name: 'fileRead',
+            group: 'Package presets',
+            visibility: 'core'
+        });
+        expect(fileRead?.sessionBound).toBeUndefined();
+
+        // A keyless webSearch is visible and core-marked, but has no executable
+        // tool and is not falsely session-bound or runnable.
+        const webSearch = body.tools.find((tool) => tool.name === 'webSearch');
+        expect(webSearch).toMatchObject({
+            name: 'webSearch',
+            group: 'Web search',
+            visibility: 'core',
+            availability: {
+                state: 'unconfigured',
+                environment: ['EXA_API_KEY', 'TAVILY_API_KEY'],
+                hint: WEBSEARCH_UNCONFIGURED_HINT
+            }
+        });
+        expect(webSearch?.sessionBound).toBeUndefined();
+
+        // The manual call needs no `sessionId`: it is an ordinary direct call.
+        const fixture = await mkdtemp(join(TEMP_LIST_ROOT, 'api-core-file-'));
+        const path = join(fixture, 'note.txt');
+
+        try {
+            await writeTextFile(path, 'core file', 'utf8');
+
+            const result = await jsonBody<ToolCallResult>(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/fileRead', {
+                    // fileRead declares ONE property, so `parameters` IS the array
+                    // (the direct-call contract, not a { paths } wrapper).
+                    body: { parameters: [path] }
+                })
+            );
+
+            expect(result.status).toBe(200);
+            expect(result.body).toEqual({
+                ok: true,
+                result: [{ path, content: 'core file' }],
+                durationMs: expect.any(Number)
+            });
+        } finally {
+            await rm(fixture, { recursive: true, force: true });
+        }
     });
 
     it('serves the same catalogue at /tools/bootstrap', async () => {
@@ -1414,8 +1657,9 @@ describe('standalone /api compatibility', () => {
 // sessions only, which the frozen-definition assertions below pin directly.
 describe('harness registry over HTTP', () => {
     const INSTRUCT_GUIDELINES = [
-        'The whole catalogue is searchable. Call toolRequest with capability tags before concluding that a capability is missing; discovery enables the matches for your next turn.',
-        'Tags are broad: "files"/"read" to read one or more files, "files"/"write" and "files"/"edit" to change them, "files"/"list" and "files"/"glob" to inspect a tree or grep contents, "shell" to run a command, "git"/"diff" to review the working tree, "javascript" or "python" to check syntax with syntaxCheck, and "time", "text", "random", "notes", and "web"/"search" for the internet when the host configured a search key.',
+        'fileRead, fileWrite, fileEdit and fileGlob are always available: use them directly. fileGlob is the single search surface (filename mode, or content mode when you pass `content`); there is no separate file-search tool.',
+        'Search the rest of the catalogue with toolRequest before concluding that a capability is missing: "files"/"list" for fileList, "shell" for commandRun, "git"/"diff" for gitDiff, "javascript" or "python" for syntaxCheck, and "time", "text", "random" or "notes" for the app tools. Discovery enables the matches for your next turn.',
+        'webSearch is always available when the host configured a search key; call it directly. If it is not declared, the host has no key, so say so instead of inventing sources.',
         'Prefer a tool over memory when it can answer more accurately, and say which tool you used.',
         'File and command tools execute on the server host with the server process permissions and are not sandboxed, so inspect before you change anything.',
         'If a small capability is missing, toolCreate can add one for this session.',
@@ -1444,7 +1688,7 @@ describe('harness registry over HTTP', () => {
             name: 'instruct',
             title: 'Instruct',
             description:
-                'General instruction-following agent with the shared toolbox. Answers directly, and discovers the capabilities it needs before using them.',
+                'General instruction-following agent with the shared toolbox. Answers directly; file read/write/edit/glob and configured web search are always available, and other capabilities are discovered by tag.',
             instruction:
                 'You are the Instruct agent. Answer the request directly and keep the answer focused.',
             guidelines: INSTRUCT_GUIDELINES
@@ -1507,7 +1751,16 @@ describe('harness registry over HTTP', () => {
                 'noteSearch',
                 'textSummarize'
             ],
-            coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate'],
+            coreTools: [
+                'fileRead',
+                'fileWrite',
+                'fileEdit',
+                'fileGlob',
+                'toolRequest',
+                'toolCreate',
+                'todoManage',
+                'agentDelegate'
+            ],
             builtin: false,
             editable: true
         });
@@ -1779,7 +2032,16 @@ describe('harness registry over HTTP', () => {
             primary: 'workspace',
             subagents: ['research'],
             agents: ['workspace', 'research'],
-            coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate'],
+            coreTools: [
+                'fileRead',
+                'fileWrite',
+                'fileEdit',
+                'fileGlob',
+                'toolRequest',
+                'toolCreate',
+                'todoManage',
+                'agentDelegate'
+            ],
             builtin: true,
             editable: true
         });
@@ -1798,22 +2060,24 @@ describe('harness registry over HTTP', () => {
         expect(after.messages[0]).toEqual({ role: 'system', content: 'You are a workspace coding agent.' });
     });
 
-    it('refuses read-only fixtures and invalid patches', async () => {
+    it('patches every template (no read-only category) and keeps invalid patches rejected', async () => {
         const runtime = createRuntime();
 
         const patch = async (name: string, body: unknown) =>
-            jsonBody<{ error: { message: string } }>(
+            jsonBody<{ harness?: HarnessDescriptor; error?: { message: string } }>(
                 await callHandler(runtime, 'PATCH', `/v1/harness/harnesses/${name}`, { body })
             );
 
-        expect(await patch('demo', { title: 'Nope' })).toEqual({
-            status: 403,
-            body: { error: { message: 'Harness "demo" is read-only.' } }
-        });
-        expect(await patch('flaky', { title: 'Nope' })).toEqual({
-            status: 403,
-            body: { error: { message: 'Harness "flaky" is read-only.' } }
-        });
+        // R20.1: a metadata-only PATCH is a 200 for EVERY shipped template (the
+        // formerly frozen demo/flaky included), and the wire field stays true.
+        for (const name of PRESET_NAMES) {
+            const result = await patch(name, { title: `${name} patched` });
+            expect(result.status).toBe(200);
+            expect(result.body.harness?.title).toBe(`${name} patched`);
+            expect(result.body.harness?.editable).toBe(true);
+        }
+
+        // An unknown harness is still a 404, not a permission question.
         expect(await patch('missing', { title: 'Nope' })).toEqual({
             status: 404,
             body: { error: { message: 'Unknown harness "missing".' } }
@@ -1847,6 +2111,133 @@ describe('harness registry over HTTP', () => {
         );
         expect(aliasWrite).toEqual({ status: 405, body: { error: { message: 'Use GET for /v1/harness/presets.' } } });
     });
+
+    it('keeps demo scripted through metadata edits and makes an executable edit live', async () => {
+        const runtime = createRuntime();
+
+        // A session created from the shipped template is scripted and requires no
+        // endpoint; its frozen definition says so.
+        const scripted = await createDemo(runtime);
+        expect(scripted.harnessDefinition).toMatchObject({
+            requiresEndpoint: false,
+            tools: ['timeNow'],
+            editable: true
+        });
+
+        // Metadata-only PATCH: 200, and the descriptor still describes the script.
+        const renamed = await jsonBody<{ harness: HarnessDescriptor }>(
+            await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/demo', {
+                body: { title: 'Scripted demo (renamed)', description: 'Still the offline fixture.' }
+            })
+        );
+        expect(renamed.status).toBe(200);
+        expect(renamed.body.harness).toMatchObject({
+            name: 'demo',
+            title: 'Scripted demo (renamed)',
+            description: 'Still the offline fixture.',
+            requiresEndpoint: false,
+            tools: ['timeNow'],
+            builtin: true,
+            editable: true
+        });
+
+        // The already-created session keeps the shipped frozen definition.
+        expect(runtime.store.get(scripted.id).harnessDefinition?.title).toBe('Scripted demo');
+
+        // Executable PATCH: demo becomes an honest live profiled harness. The
+        // descriptor must stop advertising the offline script.
+        const live = await jsonBody<{ harness: HarnessDescriptor }>(
+            await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/demo', {
+                body: { primary: 'workspace' }
+            })
+        );
+        expect(live.status).toBe(200);
+        expect(live.body.harness).toMatchObject({
+            name: 'demo',
+            title: 'Scripted demo (renamed)',
+            requiresEndpoint: true,
+            primary: 'workspace',
+            subagents: [],
+            agents: ['workspace'],
+            builtin: true,
+            editable: true
+        });
+        expect(live.body.harness.tools).toEqual([
+            'syntaxCheck',
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileList',
+            'fileGlob',
+            'commandRun',
+            'gitDiff',
+            'timeNow',
+            'textCount',
+            'diceRoll',
+            'noteSearch',
+            'textSummarize'
+        ]);
+        expect(live.body.harness.coreTools).toEqual([
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
+        ]);
+
+        // A NEW session runs the live agent configuration with the shared toolbox.
+        const after = await createSessionFor(runtime, 'demo');
+        expect(after.harnessDefinition).toEqual(live.body.harness);
+        expect(after.messages[0]).toEqual({ role: 'system', content: 'You are a workspace coding agent.' });
+
+        // The old scripted session is untouched: its definition and prompt stay.
+        expect(runtime.store.get(scripted.id).harnessDefinition).toEqual(scripted.harnessDefinition);
+    });
+
+    it('keeps flaky extras through metadata edits and on an executable edit', async () => {
+        const runtime = createRuntime();
+
+        const renamed = await jsonBody<{ harness: HarnessDescriptor }>(
+            await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/flaky', {
+                body: { description: 'Still the failure example.' }
+            })
+        );
+        expect(renamed.status).toBe(200);
+        expect(renamed.body.harness.tools).toEqual([
+            'syntaxCheck',
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileList',
+            'fileGlob',
+            'commandRun',
+            'gitDiff',
+            'timeNow',
+            'textCount',
+            'diceRoll',
+            'noteSearch',
+            'textSummarize',
+            'testFlaky'
+        ]);
+
+        const live = await jsonBody<{ harness: HarnessDescriptor }>(
+            await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/flaky', {
+                body: { primary: 'workspace' }
+            })
+        );
+        expect(live.status).toBe(200);
+        expect(live.body.harness).toMatchObject({
+            name: 'flaky',
+            requiresEndpoint: true,
+            primary: 'workspace',
+            agents: ['workspace'],
+            editable: true
+        });
+        // The executable rebuild retains the example-only extra.
+        expect(live.body.harness.tools).toContain('testFlaky');
+    });
 });
 
 // Timing and discovery through the server record.
@@ -1879,10 +2270,50 @@ describe('recorded run timing', () => {
         expect(times.every((value, index) => index === 0 || value >= times[index - 1])).toBe(true);
 
         // Discovery is part of the recorded snapshot: the scripted demo enabled
-        // `clock` through toolRequest, so a reload can show it.
+        // `timeNow` through toolRequest, so a reload can show it.
         expect(terminal.session.discoveredTools).toEqual(['timeNow']);
 
-        // And the record survives the reload path unchanged.
+        // R20.2: the demo's timeNow call carries declarative panels in the SAME
+        // recorded event, both on the stream frame and after a reload. The model
+        // content stays the ordinary serialized value.
+        const timeResult = terminal.session.turns[0].events.find(
+            (event) => event.type === 'tool_result' && event.name === 'timeNow'
+        );
+        if (timeResult?.type !== 'tool_result') throw new Error('expected a recorded timeNow result');
+
+        const timeValue = JSON.parse(timeResult.content) as {
+            timezone: string;
+            iso: string;
+            unix: number;
+        };
+        const expectedPanels = [
+            {
+                id: 'timeNow',
+                slot: 'right',
+                title: 'Current time',
+                blocks: [
+                    {
+                        type: 'keyValue',
+                        items: [
+                            { label: 'Timezone', value: timeValue.timezone },
+                            { label: 'ISO 8601', value: timeValue.iso },
+                            { label: 'Unix', value: String(timeValue.unix) }
+                        ]
+                    },
+                    { type: 'text', text: 'Read from the server clock at execution time.' }
+                ]
+            }
+        ];
+        expect(timeResult.ui).toEqual(expectedPanels);
+
+        const streamed = frames.find(
+            (frame) => frame.event.type === 'tool_result' && frame.event.name === 'timeNow'
+        );
+        if (streamed?.event.type !== 'tool_result') throw new Error('expected a streamed timeNow result');
+        expect(streamed.event.ui).toEqual(expectedPanels);
+        expect(streamed.event.content).toBe(timeResult.content);
+
+        // And the record survives the reload path unchanged, UI panels included.
         expect(runtime.store.get(session.id).turns).toEqual(terminal.session.turns);
         expect(runtime.store.get(session.id).discoveredTools).toEqual(['timeNow']);
     });

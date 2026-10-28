@@ -17,6 +17,7 @@ import {
     harness,
     commandRun,
     fileEdit,
+    fileGlob,
     fileList,
     fileRead,
     fileWrite,
@@ -257,7 +258,7 @@ describe('commandRun', () => {
 });
 
 describe('presets inside a harness', () => {
-    it('ships every preset searchable, file tools included', () => {
+    it('ships the four everyday file tools core and the rest searchable', () => {
         expect(fileRead.tags).toEqual(['files', 'read', 'filesystem']);
         expect(syntaxCheck.tags).toEqual([
             'code',
@@ -266,16 +267,18 @@ describe('presets inside a harness', () => {
             'python',
             'validation'
         ]);
-        expect(fileRead.visibility).toBe('searchable');
+        expect(fileRead.visibility).toBe('core');
+        expect(fileEdit.visibility).toBe('core');
+        expect(fileGlob.visibility).toBe('core');
+        expect(fileList.visibility).toBe('searchable');
         expect(commandRun.visibility).toBe('searchable');
         expect(syntaxCheck.visibility).toBe('searchable');
     });
 
-    it('registers a file tool under its export name and runs it after discovery', async () => {
+    it('registers a core file tool under its export name and runs it without discovery', async () => {
         const entry = agent({
             model: 'm',
             stream: scripted([
-                callTool('c0', 'toolRequest', '{"tags":["read"]}'),
                 callTool('c1', 'fileRead', '{"paths":["harness.txt"]}'),
                 answer('read it')
             ])
@@ -287,24 +290,22 @@ describe('presets inside a harness', () => {
 
         // The registry key renames the tool, so the model calls `fileRead`.
         expect(writer.tools.fileRead.name).toBe('fileRead');
+        // R18: core, so the very first declaration already contains it.
+        expect(writer.tools.fileRead.visibility).toBe('core');
 
         const message = await writer('read the file');
 
         expect(message.content).toBe('read it');
-        // user -> toolRequest -> fileRead call -> result -> answer. Discovery is
-        // OR-ranked, so a description mention of "read" ("Read one or more…",
-        // "Read-only", "read and match-checked") also enables those tools as weak
-        // matches, which is why the array is longer than the exact tag hit.
-        expect(JSON.parse((entry.messages[2] as { content: string }).content).enabled).toEqual([
-            'fileRead',
-            'fileEdit',
-            'fileGlob',
-            'fileWrite',
-            'gitDiff'
+        // user -> fileRead call -> result -> answer: no toolRequest round.
+        expect(entry.messages.map((item) => item.role)).toEqual([
+            'user',
+            'assistant',
+            'tool',
+            'assistant'
         ]);
         // The single-property rule unwrapped the model's {"paths":[...]} to the
         // array, and the result serialized as the ordered array.
-        expect(JSON.parse((entry.messages[4] as { content: string }).content)).toEqual([
+        expect(JSON.parse((entry.messages[2] as { content: string }).content)).toEqual([
             { path: join(workdir, 'harness.txt'), content: 'seeded content' }
         ]);
     });

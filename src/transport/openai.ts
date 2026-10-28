@@ -166,15 +166,55 @@ const stopReasonOf = (finishReason: unknown): HarnessStopReason => {
 
 // Normalize the OpenAI usage block. `total_tokens` is not always present on
 // gateways that do report the halves, so fall back to their sum.
+//
+// Cached input: providers publish the replayed prefix under different keys, and
+// all of them describe the SAME request shape (A+B sent, C new → cached = A+B).
+//   - `prompt_tokens_details.cached_tokens` — OpenAI-compatible standard, and the
+//     exact shape this workspace's Lightning adapter emits
+//     (packages/agentic/provider/src/lightning/lightning-client.ts:276).
+//   - `prompt_cache_hit_tokens` — DeepSeek-compatible gateways.
+// A provider that publishes neither yields `cached: undefined`, never 0: unknown
+// is not the same fact as "nothing was cached".
+const cachedOf = (raw: Record<string, unknown>): number | undefined => {
+    const details = raw.prompt_tokens_details;
+
+    if (details !== null && typeof details === 'object') {
+        const cached = (details as { cached_tokens?: unknown }).cached_tokens;
+        if (typeof cached === 'number' && Number.isFinite(cached) && cached >= 0) return cached;
+    }
+
+    const hit = raw.prompt_cache_hit_tokens;
+    if (typeof hit === 'number' && Number.isFinite(hit) && hit >= 0) return hit;
+
+    return undefined;
+};
+
 const usageOf = (usage: unknown): HarnessUsage | undefined => {
     if (!usage || typeof usage !== 'object') return undefined;
 
-    const raw = usage as { prompt_tokens?: unknown; completion_tokens?: unknown; total_tokens?: unknown };
+    const raw = usage as {
+        prompt_tokens?: unknown;
+        completion_tokens?: unknown;
+        total_tokens?: unknown;
+        prompt_tokens_details?: unknown;
+        prompt_cache_hit_tokens?: unknown;
+    };
     const input = typeof raw.prompt_tokens === 'number' ? raw.prompt_tokens : 0;
     const output = typeof raw.completion_tokens === 'number' ? raw.completion_tokens : 0;
     const total = typeof raw.total_tokens === 'number' ? raw.total_tokens : input + output;
 
-    return { input, output, total };
+    // The cached part is a subset of the input, so a gateway reporting more
+    // cached than prompt tokens is contradicting its own block. Clamping keeps a
+    // display honest ("never more cached than sent") instead of rendering
+    // `(200)` beside an input of 100.
+    const cached = cachedOf(raw as Record<string, unknown>);
+
+    return {
+        input,
+        output,
+        total,
+        ...(cached === undefined ? {} : { cached: Math.min(cached, input) })
+    };
 };
 
 // One partially received tool call, keyed by its stream index.

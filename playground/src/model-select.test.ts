@@ -1,12 +1,13 @@
 // Per-member model selection on the agent tiles (R9).
 //
-// Covered here:
-//   - every tile has its own labelled dropdown with an inherit choice, the
-//     provider catalogue, and the current override even when the catalogue no
-//     longer lists it;
+// Covered here (R18):
+//   - every tile has its own labelled dropdown whose no-override option shows the
+//     ACTUAL effective model (never "inherit"), followed by the provider catalogue
+//     and any current override the catalogue no longer lists;
+//   - the default option and a catalogue entry with the same id are deduped;
 //   - a model change PATCHes the complete override map;
 //   - promotion/add preserve the map, removal drops the removed member's key, and
-//     choosing "inherit" deletes that member's entry;
+//     choosing the default deletes that member's entry;
 //   - a saved (frozen) session displays its EFFECTIVE frozen models with the
 //     dropdowns locked and the existing New session affordance, so an old chat is
 //     never silently rewritten.
@@ -150,15 +151,18 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
     await flush();
 
     // One dropdown per member, each labelled for its agent and showing the
-    // override; options are inherit + catalogue.
+    // effective model. Option 0 is the default labelled m1, so m1 is not repeated.
     expect(modelSelects().map((select) => select.getAttribute('aria-label'))).toEqual([
-        'Model for instruct',
-        'Model for summarizer'
+        'Model for Instruct',
+        'Model for Summarizer'
     ]);
     const [instruct, summarizer] = modelSelects();
-    expect(optionTexts(instruct)).toEqual(['inherit · m1', 'm1', 'm2', 'm3']);
+    expect(optionTexts(instruct)).toEqual(['m1', 'm2', 'm3']);
     expect(instruct.value).toBe('m2');
-    expect(summarizer.value).toBe('m1');
+    // The summarizer's explicit override equals the fallback, so the default
+    // option represents it and already displays m1.
+    expect(summarizer.value).toBe('');
+    expect(summarizer.selectedOptions[0].textContent).toBe('m1');
 
     // --- change one model: the complete map goes with it ------------------
     instruct.value = 'm3';
@@ -170,7 +174,8 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
         subagents: ['summarizer'],
         agentModels: { instruct: 'm3', summarizer: 'm1' }
     });
-    expect(modelSelects().map((select) => select.value)).toEqual(['m3', 'm1']);
+    expect(modelSelects().map((select) => select.value)).toEqual(['m3', '']);
+    expect(modelSelects()[1].selectedOptions[0].textContent).toBe('m1');
 
     // --- adding a member preserves existing entries -----------------------
     byClass('.agent-add', 'button').click();
@@ -221,7 +226,7 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
     });
     expect(modelSelects().map((select) => select.value)).toEqual(['m2', 'm3']);
 
-    // --- inherit deletes the key (not an empty-string entry) --------------
+    // --- choosing the default deletes the key (not an empty entry) ---------
     modelSelects()[1].value = '';
     modelSelects()[1].dispatchEvent(new Event('change', { bubbles: true }));
     await flush();
@@ -232,7 +237,40 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
         agentModels: { critic: 'm2' }
     });
     expect(modelSelects()[1].value).toBe('');
-    expect(optionTexts(modelSelects()[1])[0]).toBe('inherit · m1');
+    expect(optionTexts(modelSelects()[1])[0]).toBe('m1');
+});
+
+it('names the server fallback when the stored settings model is blank', async () => {
+    // A blank stored model is sent as blank; mergeSettings then falls back to the
+    // server default. The dropdown must label that real model, not "inherit" and
+    // not an empty/unknown value (R18).
+    localStorage.setItem(
+        'underload-harness-app:settings',
+        JSON.stringify({ baseURL: 'http://provider/v1', apiKey: '', model: '' })
+    );
+
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+            const url = String(input);
+
+            if (url === '/api') return json(bootstrap({ presets: [descriptor()] }));
+            if (url === '/api/models') return json({ models: ['m1', 'm2'] });
+
+            throw new Error(`unexpected request: ${url}`);
+        })
+    );
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    const [select] = modelSelects();
+    expect(optionTexts(select)).toEqual(['m1', 'm2']);
+    expect(select.value).toBe('');
+    expect(select.selectedOptions[0].textContent).toBe('m1');
+    // The default option and the catalogue's m1 are the same entry, not two.
+    expect(optionTexts(select).filter((label) => label === 'm1')).toHaveLength(1);
 });
 
 it('shows a model-change error and keeps the last server-confirmed selection', async () => {
@@ -323,14 +361,17 @@ it('shows a reloaded session’s frozen effective models and locks the dropdowns
 
     const selects = modelSelects();
     // Effective frozen values, not the live descriptor's map (which only has
-    // instruct) and not the current global model.
-    expect(selects.map((select) => select.value)).toEqual(['m2', 'm1']);
+    // instruct) and not the current global model. m1 is the session fallback, so
+    // the summarizer's default option (labelled m1) is the selected one.
+    expect(selects.map((select) => select.value)).toEqual(['m2', '']);
+    expect(selects.map((select) => select.selectedOptions[0].textContent)).toEqual(['m2', 'm1']);
     expect(selects.map((select) => select.disabled)).toEqual([true, true]);
 
-    // The frozen id is offered even though the catalogue no longer lists it.
-    expect(optionTexts(selects[0])).toEqual(['inherit · m1', 'm1', 'm3', 'm2 (current)']);
-    // A model that IS in the catalogue is not duplicated as "(current)".
-    expect(optionTexts(selects[1])).toEqual(['inherit · m1', 'm1', 'm3']);
+    // The frozen id is offered even though the catalogue no longer lists it, and
+    // it is sorted into place rather than appended. The default m1 is not repeated.
+    expect(optionTexts(selects[0])).toEqual(['m1', 'm2', 'm3']);
+    // A model that IS the default is represented by the default option alone.
+    expect(optionTexts(selects[1])).toEqual(['m1', 'm3']);
 
     // The lock is explained with the existing New session affordance; changing a
     // select cannot PATCH the frozen conversation.

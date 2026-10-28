@@ -34,8 +34,9 @@ const answer = (text: string): HarnessStreamEvent[] => [
 // One scripted answer is enough, and it keeps these tests offline.
 const idle = () => agent({ model: 'm', stream: scripted([answer('idle')]) });
 
-const discoveryAndSearch = (): HarnessStreamEvent[][] => [
-    callTool('c0', 'toolRequest', '{"tags":["web","search"]}'),
+// R18: a configured webSearch is core, so there is no discovery round: the model
+// calls it directly on the first turn.
+const searchOnly = (): HarnessStreamEvent[][] => [
     callTool('c1', 'webSearch', '{"query":"harness","maxResults":2}'),
     answer('found it')
 ];
@@ -97,7 +98,7 @@ describe('registration', () => {
         expect(writer.tools.webSearch).toBeUndefined();
     });
 
-    it('registers a searchable tool from process.env when opted in with true', () => {
+    it('registers a core tool from process.env when opted in with true', () => {
         vi.stubEnv('EXA_API_KEY', 'exa-secret-key');
         vi.stubEnv('TAVILY_API_KEY', '');
 
@@ -106,10 +107,10 @@ describe('registration', () => {
             websearch: true
         });
 
-        // Searchable, not core: the model still has to discover it, so an opt-in
-        // harness does not grow the always-declared context.
+        // R18: configured search is core, so it is declared without a discovery
+        // round. Registration itself is still key-gated (tested above).
         expect(writer.tools.webSearch).toBeDefined();
-        expect(writer.tools.webSearch.visibility).toBe('searchable');
+        expect(writer.tools.webSearch.visibility).toBe('core');
         expect(writer.tools.webSearch.tags).toEqual(['web', 'search', 'internet', 'news', 'research']);
     });
 
@@ -156,14 +157,14 @@ describe('registration', () => {
     });
 });
 
-describe('discovery and execution', () => {
-    it('is enabled by toolRequest and returns the normalized result', async () => {
+describe('execution', () => {
+    it('is declared directly and returns the normalized result', async () => {
         const fetchMock = stubFetch();
         const events: string[] = [];
 
         const entry = agent({
             model: 'm',
-            stream: scripted(discoveryAndSearch())
+            stream: scripted(searchOnly())
         });
 
         const writer = harness({
@@ -194,8 +195,8 @@ describe('discovery and execution', () => {
             contents: { highlights: true }
         });
 
-        // user -> toolRequest call -> result -> webSearch call -> result -> answer
-        const resultMessage = entry.messages[4] as { role: string; content: string };
+        // user -> webSearch call -> result -> answer
+        const resultMessage = entry.messages[2] as { role: string; content: string };
         expect(resultMessage.role).toBe('tool');
 
         const expected: WebSearchResult = {
@@ -215,7 +216,7 @@ describe('discovery and execution', () => {
         expect(JSON.parse(resultMessage.content)).toEqual(expected);
 
         // Nothing secret in the transcript or the progress stream. The tool is
-        // declared (toolRequest enabled it), so the declaration text is in history.
+        // declared (core), so the declaration text is in history.
         const transcript = JSON.stringify(entry.messages);
         expect(transcript).not.toContain('exa-secret-key');
         expect(transcript).not.toContain('EXA_API_KEY');
@@ -227,13 +228,13 @@ describe('discovery and execution', () => {
         const fetchMock = stubFetch();
 
         const first = harness({
-            agents: { writer: agent({ model: 'm', stream: scripted(discoveryAndSearch()) }) },
+            agents: { writer: agent({ model: 'm', stream: scripted(searchOnly()) }) },
             presets: false,
             websearch: { env: { EXA_API_KEY: 'first-exa-key' } }
         });
 
         const second = harness({
-            agents: { writer: agent({ model: 'm', stream: scripted(discoveryAndSearch()) }) },
+            agents: { writer: agent({ model: 'm', stream: scripted(searchOnly()) }) },
             presets: false,
             websearch: { env: { TAVILY_API_KEY: 'second-tavily-key' } }
         });

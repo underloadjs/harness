@@ -1,7 +1,9 @@
 // The recoverable-failures example agent. A live harness (it needs an endpoint)
 // whose task is to exercise the failure path: a tool that throws two calls out of
-// three, retried until it succeeds. It is a documented example, so its descriptor
-// is `editable: false`.
+// three, retried until it succeeds. It is a documented example template and, like
+// every registry entry, editable (R20.1): a metadata-only PATCH keeps its factory
+// and the testFlaky extra; an executable PATCH rebuilds the live toolbox with the
+// extra retained.
 //
 // T14: the harness id stays `flaky`; the TOOL is `testFlaky` and discovery goes
 // through toolRequest.

@@ -14,24 +14,36 @@
 // local: which tile is expanded, which session id was last viewed, the request
 // spinner.
 //
-// Shell (three columns, R1–R3):
+// Shell (three columns, R21):
 //   - left rail  — harnesses (built-ins and user-created) plus the create form,
-//                  and a collapsed endpoint/model panel at the bottom;
+//                  the `left` tool-panel host, and a collapsed endpoint/model
+//                  panel at the bottom;
 //   - centre     — a Chat/Tools tablist. Chat shows the selected harness title,
-//                  its agent row (with a per-agent model dropdown), the transcript
-//                  and the composer. Tools is the full-width list of EVERY server
-//                  tool — core entries included — plus the manual runner; a direct
-//                  tool call opens there too;
-//   - right rail — the core-tools disclosure, the complete tool catalogue, and
-//                  the sessions for the selected harness only.
+//                  its agent row (with a per-agent model dropdown), the `center`
+//                  tool-panel host, the transcript and the composer. Tools is the
+//                  full-width list of EVERY server tool — core entries included —
+//                  plus the manual runner; the tool list lives ONLY there;
+//   - right rail — the tool-contributed SCRATCH BOARD (primary panel host) and,
+//                  below it, the sessions for the selected harness only.
+//
+// R21.2 removed the right rail's core-tools dropdown and tool catalogue. They
+// duplicated the Tools tab, which is now the single place to review and call
+// tools; enabled-for-session status moved next to that list (`.tools-session-note`)
+// instead of floating on the board.
+//
+// R21.1: every harness is editable. The legacy `editable:false` flag (old demo/
+// flaky fixtures) is ignored — see contract.ts `editableOf` — so the rail shows
+// only template/custom, never a read-only badge or gate. What remains locked is a
+// SAVED SESSION's frozen team, which is a conversation guarantee, not a harness
+// permission.
 //
 // Agent editing is deliberately scoped to *new* sessions. A saved session carries
 // a frozen `harnessDefinition` and frozen effective `agentModels`; the row renders
 // those and explains why it is locked, with a New session action. Editing (team or
 // model) therefore never rewrites a conversation that is already on screen.
 //
-// Execution is server-only. A catalogue tool is a direct call; a core tool
-// (`sessionBound`) is sent with the selected session's id so toolRequest,
+// Execution is server-only. A catalogue tool is a direct call; a session-bound
+// core tool (`sessionBound`) is sent with the selected session's id so toolRequest,
 // toolCreate, todoManage and agentDelegate change THAT conversation — and the snapshot is
 // re-read afterwards so discoveries/todos show up. The browser never evaluates a
 // tool.
@@ -76,14 +88,12 @@ import {
 } from './api';
 import type { HarnessBootstrap } from './api';
 import {
-    HARNESS_CORE_TOOL_DESCRIPTIONS,
     agentModelsOf,
     agentsFromDescriptors,
     builtinOf,
     canonicalHarnessName,
-    coreToolsOf,
-    editableOf,
     frameAtOf,
+    frameUsageOf,
     frozenDefinitionOf,
     membersOf,
     modelsForMembers,
@@ -94,6 +104,8 @@ import { createCreateHarnessPanel } from './ui/create-harness';
 import { createAgentRow } from './ui/agents';
 import { applyActivity, activityOfTurns, paintActivity } from './ui/activity';
 import { highlightCode, looksLikeJson, prettyJson } from './ui/markdown';
+import { applyPanels, createPanelHost, mediaOfTurns } from './ui/panels';
+import type { PanelMedia } from './ui/panels';
 import { createTurnBoard } from './ui/turns';
 import type { TurnHandle } from './ui/turns';
 
@@ -147,6 +159,21 @@ const loadSettings = (): RunnerSettings => {
 };
 
 const settings = loadSettings();
+
+// The provider's advertised default model, learned from the bootstrap document.
+// R18: when the settings model is blank, a session request sends no model and the
+// SERVER falls back to this value, so it is the effective fallback a per-agent
+// dropdown must name. Kept separately from `settings` because `applyDefaults`
+// skips stored settings — the label still needs the real server fallback.
+let serverDefaultModel = '';
+
+// The model a member with no override uses for a NEW session: the typed settings
+// model, else the server's documented fallback. Empty means unknown (the dropdown
+// says so rather than fabricating an id).
+const defaultSessionModel = (): string => {
+    const typed = settings.model.trim();
+    return typed.length > 0 ? typed : serverDefaultModel;
+};
 
 const saveSettings = (): void => {
     try {
@@ -440,10 +467,20 @@ const templateFor = (parameters: Record<string, unknown> | undefined): string =>
 // the server snapshot after a call so toolRequest discoveries and todo state are
 // on screen immediately. None of these live in this module: the runner must not
 // own the selection, and it must not guess a session id.
+//
+// `onPanels` delivers the tool's declarative panels (R21.3) TOGETHER WITH the
+// owner captured before the call: the caller decides which instance may draw
+// them. That is what keeps a slow manual call from painting into whatever harness
+// or session happens to be selected when the answer lands.
 export type ToolRunnerOptions = {
     context: () => { harness?: string; sessionId?: string };
     ensureSession: () => Promise<string | undefined>;
     refreshSession: (sessionId: string) => Promise<void>;
+    onPanels?: (
+        toolName: string,
+        panels: unknown,
+        owner: { harness?: string; sessionId?: string }
+    ) => void;
 };
 
 type ToolRunner = {
@@ -645,6 +682,12 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
                 sync();
             }
 
+            // Capture the owner BEFORE the call. `ensureSession` above may have just
+            // created the session, so read `context()` now: this is the exact view
+            // the request is about to report into. A selection change during the
+            // await can no longer redirect the answer.
+            const owner = options.context();
+
             const response = await callTool(entry.name, parameters, sessionId);
 
             if (!response.ok) {
@@ -677,6 +720,12 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
                     // primary outcome, and main.ts reports refresh trouble.
                 }
             }
+
+            // Declarative panels come LAST: the refresh above recomputes instance
+            // panels from the server's turns and would drop a manual panel that has
+            // no backend storage yet. `panels` is optional on the success result, so
+            // an older/ordinary tool answer passes `undefined` (a no-op).
+            options.onPanels?.(entry.name, response.panels, owner);
         } catch (error) {
             // Request-level failures (no session 400, unknown session 404, active
             // run 409, offline) arrive here with the server's own message.
@@ -971,7 +1020,7 @@ const refreshModels = async (): Promise<void> => {
         // Per-agent model dropdowns are built from this catalogue. Re-render the
         // chrome so an already-open harness (or a boot that opened a remembered
         // session before the provider answered) offers the real ids instead of
-        // only inherit/current.
+        // only the effective default/current labels.
         if (current !== undefined) renderHarnessChrome();
         setModelStatus(
             ids.length === 0
@@ -1113,45 +1162,35 @@ resetButton.type = 'button';
 actions.append(runButton, stopButton, resetButton);
 composer.append(input, actions);
 
-center.append(tabs, mainHead, agentSlot, stage, composer);
+// Tool-panel hosts (R21.3). Three named locations, one renderer:
+//   - `center` sits above the turn grid, inside the chat column;
+//   - `scratch` is the right rail's primary board (mounted below, above sessions);
+//   - `left` sits under the harness list and above the endpoint disclosure.
+// Each host hides itself while it has no panels (ui/panels.ts), so the shell stays
+// exactly as quiet as before for tools that contribute nothing.
+const centerPanels = createPanelHost('center');
+// The left host is appended with the create-harness panel below (harness list →
+// panels → endpoint), which is the requested "below harnesses, above endpoint".
+const leftPanels = createPanelHost('left');
+center.append(tabs, mainHead, agentSlot, centerPanels.element, stage, composer);
 
-// --- right rail: core tools, catalogue, sessions ----------------------------
+// --- right rail: scratch board (primary panel host), then sessions ----------
 const rightRail = el('aside', 'rail rail-right');
-rightRail.setAttribute('aria-label', 'Core tools, tool catalogue and sessions');
+rightRail.setAttribute('aria-label', 'Tool scratch board and sessions');
 
-const coreSection = el('section', 'rail-section core-section');
-const coreDetails = el('details', 'core-tools');
-const coreSummary = el('summary', 'core-summary', 'Core tools');
-const coreBody = el('div', 'core-body');
-const coreHint = el(
-    'p',
-    'field-hint',
-    'Always available in chat. toolRequest enables more tools for this session; discovered tools stay enabled for it.'
-);
-const coreList = el('div', 'core-list');
-// Tools toolRequest enabled for the selected session, from the server snapshot
-// (`discoveredTools`). Kept separate from the core list: these are session state,
-// not the harness-owned set, and a core-tool call refreshes the snapshot so this
-// line updates without a reload.
-const coreDiscovered = el('p', 'core-discovered', '');
-coreDiscovered.hidden = true;
-coreBody.append(coreHint, coreList, coreDiscovered);
-coreDetails.append(coreSummary, coreBody);
-coreSection.append(coreDetails);
+// The scratch board is where a tool's declarative output lands. It is the primary
+// host on purpose: the right rail is visible while chatting, so a tool can show
+// state next to the conversation without owning a centre view.
+const scratchSection = el('section', 'rail-section scratch-section');
+const scratchHead = el('div', 'rail-head');
+const scratchHeading = el('h2', 'rail-title', 'Scratch board');
+const scratchNote = el('p', 'field-hint scratch-note', 'Tool-contributed panels for the current session.');
+const scratchHost = createPanelHost('scratch');
+scratchSection.append(scratchHead, scratchNote, scratchHost.element);
+scratchHead.append(scratchHeading);
 
-const catalogueSection = el('section', 'rail-section catalogue-section');
-const catalogueHead = el('div', 'rail-head');
-const catalogueHeading = el('h2', 'rail-title', 'Tool catalogue');
-const catalogueCount = el('span', 'catalogue-count', '0');
-catalogueHead.append(catalogueHeading, catalogueCount);
-const catalogueHint = el(
-    'p',
-    'field-hint',
-    'Every tool the server can call, core tools included. Nothing is assigned here: chat discovers tools with toolRequest by tag.'
-);
-const toolList = el('div', 'tool-list');
-catalogueSection.append(catalogueHead, catalogueHint, toolList);
-
+// Sessions are the second section, deliberately below the board: the conversation
+// directory stays where it was, and the board never displaces it.
 const sessionsSection = el('section', 'rail-section sessions');
 const sessionsHead = el('div', 'rail-head');
 const sessionsHeading = el('h2', 'rail-title', 'Sessions');
@@ -1171,7 +1210,7 @@ sessionsActions.append(newSessionButton, refreshSessionsButton);
 const sessionList = el('div', 'session-list');
 sessionsSection.append(sessionsHead, sessionsScope, sessionsActions, sessionList);
 
-rightRail.append(coreSection, catalogueSection, sessionsSection);
+rightRail.append(scratchSection, sessionsSection);
 shell.append(leftRail, center, rightRail);
 app.append(topbar, shell);
 
@@ -1191,15 +1230,22 @@ type Instance = {
     // (SessionSnapshot.agentModels). Used only while a saved session is on screen;
     // an editable harness reads its override map from the descriptor.
     sessionModels?: Record<string, string>;
-    // The session's settings model: the value the per-agent "inherit" choice names
-    // for a frozen chat, and the fallback when a member is absent from the map.
+    // The session's frozen settings model: the effective fallback for a frozen
+    // chat and the label its no-override choice shows (R18 never renders "inherit").
     sessionModel?: string;
     // Tools toolRequest enabled for this session (SessionSnapshot.discoveredTools),
-    // shown under the core dropdown. Refreshed by the snapshot a core call triggers.
+    // shown on the Tools tab's session note (R21.2 — there is no core dropdown any
+    // more). Refreshed by the snapshot a core call triggers.
     discovered?: readonly string[];
     // Per-instance live activity set for the tile rings. Never a module global:
     // two harness views must not share who is busy.
     activity: Set<string>;
+    // Tool-contributed panels for THIS instance/session (R21.3), keyed by
+    // tool+panel id. Recomputed from the server's turns on every applySnapshot
+    // (reload, poll, session open, reset) and upserted live from
+    // `tool_result.ui` and from manual tool results. Never shared across
+    // instances: switching harness can neither show nor leak another chat's board.
+    panels: Map<string, PanelMedia>;
 };
 
 const instances = new Map<string, Instance>();
@@ -1209,8 +1255,8 @@ let presetDescriptors: readonly HarnessDescriptor[] = [];
 let agentLibrary: readonly AgentDescriptor[] = [];
 let sessions: SessionSnapshot[] = [];
 let currentTool: ToolDescriptor | undefined;
-// The complete server catalogue (core entries included) for the Tools tab. Boot
-// replaces it from the bootstrap document; the right rail renders the same list.
+// The complete server catalogue (core entries included) for the Tools tab — the
+// ONLY tool listing after R21.2. Boot replaces it from the bootstrap document.
 let toolEntries: readonly ToolDescriptor[] = [];
 // Which centre view is showing. The Tools tab is not the catalogue: it is a
 // full-width, keyed list of every tool plus the manual runner.
@@ -1262,6 +1308,28 @@ const runner = createToolRunner({
         applySnapshot(owner, session);
         rememberSession(session.id);
         runner.sync();
+    },
+    onPanels: (toolName, panels, owner) => {
+        // R21.3 manual-call routing. The owner was captured immediately before the
+        // request; the instance is resolved by harness name, then REQUIRED to still
+        // point at that same session. If the reader moved on (another harness, New
+        // session, another conversation) the panels are dropped rather than painted
+        // into a conversation they were never produced for.
+        //
+        // MANUAL PANELS ARE EPHEMERAL: there is no backend storage for a direct
+        // call's panels, so the next recompute (reload, poll, session reopen) derives
+        // the board from turns and this panel disappears. That is the documented
+        // trade-off; a tool that wants durable output must return it inside a run
+        // (recorded `tool_result.ui`).
+        if (owner.harness === undefined) return;
+
+        const instance = instances.get(owner.harness);
+        if (instance === undefined || instance.sessionId !== owner.sessionId) return;
+
+        // `applyPanels` is a no-op for a server that sends no `panels` field, so an
+        // older backend simply contributes nothing (no error, no empty card).
+        const changes = applyPanels(instance.panels, toolName, panels);
+        if (changes > 0 && current === instance) paintPanels();
     }
 });
 
@@ -1280,7 +1348,12 @@ const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
         return existing;
     }
 
-    const instance: Instance = { descriptor, view: createView(descriptor), activity: new Set<string>() };
+    const instance: Instance = {
+        descriptor,
+        view: createView(descriptor),
+        activity: new Set<string>(),
+        panels: new Map<string, PanelMedia>()
+    };
     instances.set(descriptor.name, instance);
     return instance;
 };
@@ -1322,12 +1395,34 @@ const clearActivity = (): void => {
     paintActivity(agentSlot, new Set<string>());
 };
 
+// Paint every named panel host from the SELECTED instance's panel state.
+//
+// The hosts are dumb; the instance is the source of truth. That is what makes a
+// session switch safe: the board can only ever show the panels of the conversation
+// on screen, and `current.panels` is rebuilt from that session's turns and results.
+const paintPanels = (): void => {
+    const media: readonly PanelMedia[] = current === undefined ? [] : [...current.panels.values()];
+    scratchHost.apply(media);
+    centerPanels.apply(media);
+    leftPanels.apply(media);
+
+    // The scratch note explains an empty board instead of leaving a blank section.
+    const count = scratchHost.ids().length;
+    scratchNote.textContent =
+        current === undefined
+            ? 'Select a harness to see tool panels.'
+            : count > 0
+              ? `${count} tool panel${count === 1 ? '' : 's'} for ${current.descriptor.name}.`
+              : 'No tool panels yet. A tool that publishes ui/panels lands here.';
+};
+
 const harnessMeta = (descriptor: HarnessDescriptor): string => {
     const members = membersOf(descriptor).length;
-    const kind = builtinOf(descriptor) ? 'builtin' : 'custom';
-    const access = editableOf(descriptor) ? 'editable' : 'read-only';
+    // R21.1: `template` marks a shipped harness, `custom` a user-created one. There
+    // is deliberately no editable/read-only word here: every harness is editable.
+    const kind = builtinOf(descriptor) ? 'template' : 'custom';
 
-    return `${kind} · ${members} agent${members === 1 ? '' : 's'} · ${access}`;
+    return `${kind} · ${members} agent${members === 1 ? '' : 's'}`;
 };
 
 const selectHarness = (name: string): void => {
@@ -1351,7 +1446,6 @@ const selectHarness = (name: string): void => {
     for (const [key, button] of harnessButtons) {
         button.setAttribute('aria-pressed', key === name ? 'true' : 'false');
     }
-    for (const button of toolButtons.values()) button.setAttribute('aria-pressed', 'false');
     for (const button of toolTabButtons.values()) button.setAttribute('aria-pressed', 'false');
 
     agentSlot.hidden = false;
@@ -1359,6 +1453,9 @@ const selectHarness = (name: string): void => {
     stage.replaceChildren(current.view.pane);
     renderHarnessChrome();
     renderSessions();
+    // The board follows the SELECTED instance only; switching harness never shows
+    // the previous conversation's panels.
+    paintPanels();
     runner.sync();
     setStatus('idle');
 };
@@ -1406,10 +1503,11 @@ const renderHarnessChrome = (): void => {
 
     const display = instance.frozen ?? instance.descriptor;
 
-    // The right-rail core section always describes the SELECTED harness — it is
-    // visible while the Tools tab owns the centre, and a snapshot refreshed by a
-    // manual core call must update its "enabled for this session" line there.
-    renderCoreTools(display, membersOf(display).length, instance.discovered);
+    // The Tools tab's session line always describes the SELECTED harness (R21.2):
+    // the tab is where tools are reviewed and called, and a snapshot refreshed by a
+    // manual core call must update "enabled for this session" there. The right rail
+    // no longer renders any tool list.
+    renderToolsSession(display, instance.sessionId, instance.discovered);
 
     // While a tool runner owns the centre, the head/agent row belong to the tool;
     // do not overwrite them.
@@ -1419,13 +1517,13 @@ const renderHarnessChrome = (): void => {
 
     headTitle.textContent = display.title;
     headName.textContent = display.name;
+    // R21.1: no read-only branch. Editing a harness applies to its NEXT session;
+    // a saved chat keeps what it started with (the conversation guarantee).
     headNote.textContent = locked
         ? instance.frozen !== undefined
             ? 'Viewing a saved session · agent team frozen'
             : 'Viewing a saved session'
-        : editableOf(display)
-          ? 'Edits apply to new sessions'
-          : 'Read-only harness';
+        : 'Edits apply to new sessions';
 
     // A locked session renders the definition it started with; the live harness
     // may already have moved on.
@@ -1436,17 +1534,17 @@ const renderAgents = (instance: Instance): HTMLElement => {
     const display = instance.frozen ?? instance.descriptor;
     const members = membersOf(display);
     const locked = instance.sessionId !== undefined;
-    const editable = editableOf(display) && !locked && !running;
+    // R21.1: the harness itself is always editable; only a saved session (frozen
+    // team) or an in-flight run locks the row.
+    const editable = !locked && !running;
 
-    const lockReason = !editableOf(display)
-        ? 'The server marks this harness read-only.'
-        : locked
-          ? instance.frozen !== undefined
-              ? 'This saved session keeps the agent team it started with.'
-              : 'This saved session cannot change its agent team here.'
-          : running
-            ? 'Stop the run before changing the agent team.'
-            : undefined;
+    const lockReason = locked
+        ? instance.frozen !== undefined
+            ? 'This saved session keeps the agent team it started with.'
+            : 'This saved session cannot change its agent team here.'
+        : running
+          ? 'Stop the run before changing the agent team.'
+          : undefined;
 
     // Effective model per member.
     //
@@ -1455,9 +1553,9 @@ const renderAgents = (instance: Instance): HTMLElement => {
     // afterwards. Before that field existed, fall back to the frozen descriptor's
     // overrides and finally to the session model.
     //
-    // Editable harness: only overrides are relevant; a member without one shows
-    // the "inherit" option naming the current global model, and a session started
-    // later resolves it from its settings.
+    // Editable harness: only overrides are relevant; a member without one uses the
+    // settings model (or the server's fallback when the field is blank), which is
+    // passed as `fallbackModel` and rendered as that model id — never "inherit".
     const overrides = agentModelsOf(display);
     const models: Record<string, string> = {};
     for (const name of members) {
@@ -1466,6 +1564,34 @@ const renderAgents = (instance: Instance): HTMLElement => {
             : overrides[name];
         if (model !== undefined && model.length > 0) models[name] = model;
     }
+
+    // The actual model the no-override choice resolves to. For a new session it
+    // is the typed model, else the server default (what mergeSettings applies to a
+    // blank request).
+    //
+    // For a saved chat, `snapshot.model` is the PRIMARY's effective model, which is
+    // not necessarily the session settings model when the primary has an override.
+    // Use a member that has no frozen override instead: its effective model is the
+    // session model. If every member is overridden (or an older snapshot has no
+    // effective map), the fallback is unknown and the option says so rather than
+    // labelling another agent's override as the default.
+    const frozenOverrides = agentModelsOf(display);
+    const hasFrozenOverrides = Object.keys(frozenOverrides).length > 0;
+    const fallback = locked
+        ? (members
+              .filter((name) => frozenOverrides[name] === undefined)
+              // The frozen effective map is authoritative. A legacy snapshot
+              // without it can only name the session model when nothing was
+              // overridden (otherwise `snapshot.model` may be the primary's
+              // override, not the settings model).
+              .map(
+                  (name) =>
+                      instance.sessionModels?.[name] ??
+                      (hasFrozenOverrides ? undefined : instance.sessionModel)
+              )
+              .find((model): model is string => typeof model === 'string' && model.trim().length > 0) ??
+          '')
+        : defaultSessionModel();
 
     return createAgentRow({
         members,
@@ -1476,12 +1602,8 @@ const renderAgents = (instance: Instance): HTMLElement => {
         models: {
             models,
             catalogue: modelIds,
-            ...(locked
-                ? instance.sessionModel === undefined
-                    ? {}
-                    : { inheritModel: instance.sessionModel }
-                : { inheritModel: settings.model }),
-            editable: editableOf(display) && !locked && !running,
+            ...(fallback.length > 0 ? { fallbackModel: fallback } : {}),
+            editable: !locked && !running,
             onChange: (name, model) => void setAgentModel(name, model)
         },
         activity: [...instance.activity],
@@ -1515,7 +1637,9 @@ const patchAgents = async (
     if (instance === undefined || savingAgents) return;
 
     const display = instance.frozen ?? instance.descriptor;
-    if (!editableOf(display) || instance.sessionId !== undefined || running) return;
+    // R21.1: no harness-level permission gate. A saved session and an in-flight run
+    // are the only reasons to refuse an edit.
+    if (instance.sessionId !== undefined || running) return;
 
     const unique = uniqueNames(members);
     const nextPrimary = unique.includes(primary) ? primary : unique[0];
@@ -1549,18 +1673,20 @@ const patchAgents = async (
     }
 };
 
-// Change one member's model. An empty value is the "inherit" choice: delete the
-// key so the member resolves to the session's settings model, and send the
-// resulting map explicitly (even `{}`) so clearing the last override really clears
-// it on the server.
+// Change one member's model. An empty value is the revert-to-default choice:
+// delete the key so the member resolves to the session's settings model (or the
+// server fallback), and send the resulting map explicitly (even `{}`) so clearing
+// the last override really clears it on the server. The dropdown labels that
+// default with its real model id; "inherit" never appears in the UI.
 const setAgentModel = async (name: string, model: string): Promise<void> => {
     const instance = current;
     if (instance === undefined) return;
 
     const display = instance.frozen ?? instance.descriptor;
     // A saved chat keeps the models it started with; the tile dropdown is disabled
-    // in that state, and this guard covers a stale handler.
-    if (!editableOf(display) || instance.sessionId !== undefined || running) return;
+    // in that state, and this guard covers a stale handler. R21.1: the harness's
+    // legacy `editable` flag is not a gate.
+    if (instance.sessionId !== undefined || running) return;
 
     const members = membersOf(display);
     if (!members.includes(name)) return;
@@ -1609,65 +1735,52 @@ const removeAgent = async (name: string): Promise<void> => {
     await patchAgents(nextPrimary, remaining);
 };
 
-// Core tools live ONLY in this collapsible dropdown (R3): the harness-owned set,
-// where agentDelegate appears exactly when there is somewhere to delegate. The Tools tab
-// and the right-rail catalogue list every tool including these; this dropdown stays
-// as the informational view of what a session always has.
-const renderCoreTools = (
+// R21.2: the tool catalogue is the Tools tab and nothing else. This line is the
+// tab's informational session status (the one piece the removed right-rail core
+// dropdown actually carried that is still worth showing): which harness/session a
+// session-bound call will mutate, and which tools toolRequest enabled there.
+//
+// It is updated from the SELECTED instance on every chrome rebuild, so a manual
+// core call's snapshot refresh keeps it truthful without a reload.
+const renderToolsSession = (
     descriptor: HarnessDescriptor,
-    memberCount: number,
+    sessionId: string | undefined,
     discovered?: readonly string[]
 ): void => {
-    const names = coreToolsOf(descriptor, memberCount);
-    coreSummary.textContent = `Core tools · ${names.length}`;
-    coreList.replaceChildren();
-
-    for (const name of names) {
-        const row = el('div', 'core-tool');
-        row.dataset.tool = name;
-        row.append(
-            el('span', 'core-tool-name', name),
-            el(
-                'span',
-                'core-tool-description',
-                HARNESS_CORE_TOOL_DESCRIPTIONS[name] ?? 'Harness core tool.'
-            )
-        );
-        coreList.append(row);
-    }
-
-    // Discovered tools are session state: a manual toolRequest (Tools tab) or a
-    // chat discovery refreshes the snapshot, and this line follows it.
+    const target =
+        sessionId === undefined
+            ? `${descriptor.name} (no session yet — a call creates one)`
+            : `${descriptor.name} · session ${sessionId}`;
     const enabled = discovered ?? [];
-    coreDiscovered.hidden = enabled.length === 0;
-    coreDiscovered.textContent = enabled.length === 0 ? '' : `enabled for this session: ${enabled.join(', ')}`;
+
+    toolsSessionNote.textContent =
+        enabled.length === 0
+            ? `Session-bound tools run inside ${target}.`
+            : `Session-bound tools run inside ${target} · enabled for this session: ${enabled.join(', ')}`;
 };
 
 // ---------------------------------------------------------------------------
-// Tool catalogue (right rail + Tools tab) and the manual runner (centre)
+// Tools tab: the complete catalogue and the manual runner (centre)
 // ---------------------------------------------------------------------------
 //
-// Two listings of the SAME server data, on purpose:
-//   - the right rail is the compact catalogue that stays visible while chatting;
-//   - the Tools tab is the full-width, keyed list the user asked for, and it
-//     includes the core tools (toolRequest/toolCreate/todoManage/agentDelegate) even
-//     though the harness also shows them informationally in its core dropdown.
-// Selecting either listing opens the same runner, and a core entry runs inside the
-// selected harness's session (api.ts `callTool(name, parameters, sessionId)`).
+// R21.2: this is the ONLY tool listing. The right rail used to duplicate it (a
+// catalogue plus a core-tools disclosure); both were removed so there is one place
+// to review and call every server tool, core entries included.
+// A `sessionBound` entry runs inside the selected harness's session
+// (api.ts `callTool(name, parameters, sessionId)`); every other entry is a direct
+// function call on the server.
 
-const toolButtons = new Map<string, HTMLButtonElement>();
 const toolTabButtons = new Map<string, HTMLButtonElement>();
 
 const toolsPane = el('div', 'pane tools-pane');
 const toolsTabHead = el('div', 'tools-tab-head');
-toolsTabHead.append(
-    el('h2', 'tools-tab-title', 'Tools'),
-    el(
-        'p',
-        'tools-tab-hint',
-        'Every tool the server lists, core tools included. Calls execute on the harness server — nothing runs in this browser. Core tools run inside the selected harness’s session; ordinary tools run directly.'
-    )
+const toolsTabHint = el(
+    'p',
+    'tools-tab-hint',
+    'Every tool the server lists, core tools included. Calls execute on the harness server — nothing runs in this browser. Session-bound tools (toolRequest, toolCreate, todoManage, agentDelegate) run inside the selected harness’s session; every other tool, including the core file and search tools, runs directly.'
 );
+const toolsSessionNote = el('p', 'tools-session-note field-hint', '');
+toolsTabHead.append(el('h2', 'tools-tab-title', 'Tools'), toolsTabHint, toolsSessionNote);
 const toolsTabList = el('div', 'tool-tab-list');
 const runnerSlot = el('div', 'tool-runner-slot');
 toolsPane.append(toolsTabHead, toolsTabList, runnerSlot);
@@ -1678,14 +1791,11 @@ const selectTool = (entry: ToolDescriptor): void => {
     stopPolling();
 
     currentTool = entry;
-    // Selecting a tool is what the Tools tab is for: switch to it so the full list
-    // and the runner are both visible, whichever listing was clicked.
+    // Selecting a tool switches to the Tools tab: that is the only tool listing
+    // now (R21.2), so the full catalogue and the runner are always in view together.
     activeTab = 'tools';
     paintTabs();
 
-    for (const [name, button] of toolButtons) {
-        button.setAttribute('aria-pressed', name === entry.name ? 'true' : 'false');
-    }
     for (const [name, button] of toolTabButtons) {
         button.setAttribute('aria-pressed', name === entry.name ? 'true' : 'false');
     }
@@ -1725,7 +1835,6 @@ const setTab = (tab: 'chat' | 'tools'): void => {
         paintTabs();
 
         currentTool = undefined;
-        for (const button of toolButtons.values()) button.setAttribute('aria-pressed', 'false');
         for (const button of toolTabButtons.values()) button.setAttribute('aria-pressed', 'false');
 
         agentSlot.hidden = false;
@@ -1770,8 +1879,9 @@ const setTab = (tab: 'chat' | 'tools'): void => {
 chatTab.addEventListener('click', () => setTab('chat'));
 toolsTab.addEventListener('click', () => setTab('tools'));
 
-// Full-width Tools tab listing. Same grouping as the rail, but every entry is a
+// Full-width Tools tab listing: the single catalogue (R21.2). Every entry is a
 // keyed button with enough room to show what it is and whether a session is needed.
+// Group headings come from the server order, core entries included.
 const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
     toolsTabList.replaceChildren();
     toolTabButtons.clear();
@@ -1815,50 +1925,12 @@ const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
     }
 };
 
+// Boot entry for the catalogue. R21.2: the Tools tab is the sole listing, so this
+// only caches the entries (for `setTab`) and rebuilds that list — no right-rail
+// duplicate to keep in sync any more.
 const buildTools = (entries: readonly ToolDescriptor[]): void => {
     toolEntries = entries;
-    toolList.replaceChildren();
-    toolButtons.clear();
-    catalogueCount.textContent = String(entries.length);
     buildToolsTab(entries);
-
-    let lastGroup = '';
-
-    for (const entry of entries) {
-        if (entry.group !== lastGroup) {
-            toolList.append(el('div', 'tool-group', entry.group));
-            lastGroup = entry.group;
-        }
-
-        const button = el('button', 'tool-button');
-        button.type = 'button';
-        button.dataset.tool = entry.name;
-        button.setAttribute('aria-pressed', 'false');
-        button.disabled = running;
-
-        // The rail has to answer "is webSearch available here?" before a click.
-        // The kind text is the existing visibility, with an explicit unconfigured
-        // suffix and a data attribute for styling; a configured tool is unchanged.
-        const unavailable = entry.availability?.state === 'unconfigured';
-        if (unavailable) button.dataset.availability = 'unconfigured';
-
-        button.append(
-            el('span', 'tool-name', entry.name),
-            el(
-                'span',
-                'tool-kind',
-                unavailable ? `${entry.visibility} · unconfigured` : entry.visibility
-            )
-        );
-        button.addEventListener('click', () => selectTool(entry));
-
-        toolButtons.set(entry.name, button);
-        toolList.append(button);
-    }
-
-    if (entries.length === 0) {
-        toolList.append(el('p', 'field-hint', 'The server reported no direct-call tools.'));
-    }
 };
 
 // ---------------------------------------------------------------------------
@@ -1991,6 +2063,14 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
         for (const name of activityOfTurns(session.turns)) instance.activity.add(name);
     }
 
+    // R21.3: the tool panels are DERIVED from the server's recorded turns on every
+    // snapshot — reload, poll, session open, reset, terminal frame. A completed
+    // turn's panels are valid scratch state (they describe work that happened), but
+    // they never light an agent ring: activity above only reads a RUNNING turn.
+    // Recomputation also means no cross-session leakage: the board is replaced with
+    // exactly what this conversation recorded.
+    instance.panels = mediaOfTurns(session.turns);
+
     instance.view.hydrate(session.turns, session.model);
     instance.view.setTranscript(JSON.stringify(session.messages, null, 2));
     upsertSession(session);
@@ -1999,6 +2079,7 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     if (current === instance) {
         paintActivity(agentSlot, instance.activity);
         renderHarnessChrome();
+        paintPanels();
         runner.sync();
     }
 };
@@ -2157,12 +2238,17 @@ const newSession = (): void => {
     instance.sessionModels = undefined;
     instance.sessionModel = undefined;
     instance.discovered = undefined;
+    // A new conversation has no tool output yet: clearing the instance state and
+    // repainting is what drops the previous session's board and any manual panels
+    // that lived only in the browser (R21.3).
+    instance.panels.clear();
     clearActivity();
     instance.view.clear();
     instance.view.setTranscript('[]');
     if (instance === current) forgetRememberedSession();
     renderHarnessChrome();
     renderSessions();
+    paintPanels();
     setStatus('idle');
     input.focus();
 };
@@ -2184,7 +2270,6 @@ const setBusy = (value: boolean): void => {
     if (value && createPanel.isOpen()) createPanel.close();
 
     for (const button of harnessButtons.values()) button.disabled = value || !booted;
-    for (const button of toolButtons.values()) button.disabled = value;
     for (const button of toolTabButtons.values()) button.disabled = value;
     chatTab.disabled = value;
     toolsTab.disabled = value;
@@ -2223,6 +2308,10 @@ const ensureSession = async (instance: Instance): Promise<string> => {
     instance.discovered = Array.isArray(session.discoveredTools)
         ? [...session.discoveredTools]
         : undefined;
+    // A freshly created session starts with an empty turn list, so recomputing from
+    // it both empties the board and guarantees nothing from a previously viewed
+    // session survives a New session.
+    instance.panels = mediaOfTurns(session.turns);
     rememberSession(session.id);
     upsertSession(session);
     renderSessions();
@@ -2231,6 +2320,7 @@ const ensureSession = async (instance: Instance): Promise<string> => {
     // session id now instead of "no session yet".
     if (current === instance) {
         renderHarnessChrome();
+        paintPanels();
         runner.sync();
     }
 
@@ -2328,11 +2418,28 @@ const run = async (): Promise<void> => {
                     const target = instance.view.turn(item.turnId) ?? turn;
                     target.apply(item.event, frameAtOf(item));
 
+                    // Token tally, straight from the server: the frame carries the
+                    // turn's running sum (input `(cached)`) whenever one exists, and
+                    // the tile prints it verbatim next to the elapsed label. Frames
+                    // without a tally leave the last figure alone — only a real
+                    // server number may change or clear it.
+                    const tally = frameUsageOf(item);
+                    if (tally !== undefined) target.setUsage(tally);
+
                     // Per-agent ring. `start` activates the agent, text/reasoning/
                     // tool events keep it active, and a `done`/`error` for one agent
                     // removes only that agent (a delegated sibling keeps spinning).
                     applyActivity(instance.activity, item.event);
                     if (current === instance) paintActivity(agentSlot, instance.activity);
+
+                    // R21.3 LIVE panels: a tool result may carry `ui`. Upsert it
+                    // into THIS instance's board immediately (the reader sees the
+                    // panel as soon as the tool answers, not only at the terminal
+                    // snapshot). The event's tool name scopes the panel ids.
+                    if (item.event.type === 'tool_result') {
+                        const changed = applyPanels(instance.panels, item.event.name, item.event.ui);
+                        if (changed > 0 && current === instance) paintPanels();
+                    }
                     return;
                 }
 
@@ -2370,10 +2477,19 @@ const run = async (): Promise<void> => {
         if (stillShown && terminal !== undefined && terminal.turns.length > 0) {
             instance.frozen = frozenDefinitionOf(terminal) ?? instance.frozen;
             instance.view.hydrate(terminal.turns, terminal.model, turn.id());
+            // The terminal snapshot is authoritative for panels too. Recomputing
+            // from its turns keeps live, polled and reloaded renders identical; a
+            // server that does not record `ui` yields an empty board (documented)
+            // rather than stale cards.
+            instance.panels = mediaOfTurns(terminal.turns);
+            if (current === instance) paintPanels();
         } else if (stillShown && failure !== undefined) {
             turn.setState('error', failure);
         } else if (stillShown) {
-            turn.setState('done', `${snapshot.model} · ${snapshot.status}`);
+            // Only the model goes into the tile meta: the tile's state dot and
+            // border already say "done" (styles.css `.tile-status`, `[data-state]`),
+            // so repeating the status word here was a second visible label.
+            turn.setState('done', snapshot.model);
         }
 
         if (failure !== undefined) {
@@ -2402,9 +2518,12 @@ const run = async (): Promise<void> => {
             if (message.includes('Unknown session')) {
                 // The server restarted (sessions are in memory). Forget the stale
                 // pointer so the next run creates a fresh conversation; the
-                // session list is re-read to show what actually exists now.
+                // session list is re-read to show what actually exists now. The
+                // board belonged to a conversation the server no longer holds.
                 instance.sessionId = undefined;
                 instance.frozen = undefined;
+                instance.panels.clear();
+                if (instance === current) paintPanels();
                 if (instance === current) forgetRememberedSession();
                 void refreshSessions();
             }
@@ -2479,6 +2598,10 @@ resetButton.addEventListener('click', () => {
     const sessionId = instance.sessionId;
     instance.view.clear();
     instance.view.setTranscript('[]');
+    // Local reset clears the board immediately, before the server answers: the
+    // conversation is being emptied, so its tool panels are emptied with it.
+    instance.panels.clear();
+    paintPanels();
     clearActivity();
     setStatus('idle');
 
@@ -2525,7 +2648,7 @@ const createPanel = createCreateHarnessPanel({
 });
 createPanel.element.id = 'create-harness-panel';
 createHarnessButton.setAttribute('aria-controls', createPanel.element.id);
-leftRail.append(harnessHead, harnessList, createPanel.element, endpoint);
+leftRail.append(harnessHead, harnessList, createPanel.element, leftPanels.element, endpoint);
 
 createHarnessButton.addEventListener('click', () => {
     if (running || !booted) return;
@@ -2560,6 +2683,11 @@ window.addEventListener('pagehide', () => {
 // ---------------------------------------------------------------------------
 
 const applyDefaults = (defaults: HarnessBootstrap['defaults']): void => {
+    // Record the server fallback even when stored settings win: a blank settings
+    // model still resolves to it server-side, and the per-agent dropdown labels
+    // that real model (R18) instead of claiming "inherit" or an empty value.
+    serverDefaultModel = defaults.model.trim();
+
     if (hasStoredSettings) return;
 
     if (defaults.baseURL.trim().length > 0) settings.baseURL = defaults.baseURL;

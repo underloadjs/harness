@@ -47,7 +47,7 @@ describe('core tool metadata', () => {
         // The model reads the description, not this file: the cap and `remaining`
         // have to be stated there too.
         expect(writer.tools.toolRequest.description).toBe(
-            'Find tools by capability tag and enable them. The whole catalogue is searchable (including the file and command tools). Pass the tags you need (for example ["files", "read"] or ["shell"] or ["git", "diff"]) and up to 5 of the closest matches become available on your next turn. The result\'s "remaining" field counts any further tools that matched but were not listed, so add a more specific tag to drill into the rest. Call this before concluding that something cannot be done.'
+            'Find tools by capability tag and enable them. The searchable catalogue holds the list, shell, git, syntax, time, text, notes, and other tools; the everyday file tools (fileRead, fileWrite, fileEdit, fileGlob) are already available, as is webSearch when the host configured it. Pass the tags you need (for example ["files", "list"] or ["shell"] or ["git", "diff"]) and up to 5 of the closest matches become available on your next turn. The result\'s "remaining" field counts any further tools that matched but were not listed, so add a more specific tag to drill into the rest. Call this before concluding that something cannot be done.'
         );
         expect(writer.tools.toolRequest.tags).toEqual(['discovery', 'tools', 'catalogue']);
         expect(writer.tools.toolRequest.visibility).toBe('core');

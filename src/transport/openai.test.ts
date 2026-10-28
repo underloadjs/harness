@@ -29,6 +29,14 @@ const collect = async (events: AsyncIterable<HarnessStreamEvent>): Promise<Harne
     return collected;
 };
 
+// Narrow the terminal frame to its parsed usage. `toStrictEqual` against the
+// returned value also rejects an accidental `cached: undefined` key, which a
+// plain `toEqual` would treat as absent.
+const usageOfDone = (event: HarnessStreamEvent | undefined) => {
+    if (event?.type !== 'done') throw new Error(`expected a done event, got ${JSON.stringify(event)}`);
+    return event.usage;
+};
+
 // A fresh Response per call: a Response body can only be read once.
 const stubFetch = (frames: string[], init?: ResponseInit) => {
     const fetchMock = vi.fn(async () => new Response(sseBody(frames), init ?? { status: 200 }));
@@ -303,6 +311,208 @@ describe('openAICompatible', () => {
             toolCalls: [],
             usage: { input: 10, output: 4, total: 14 }
         });
+    });
+
+    // Cached input — the replayed prefix. Two wire keys mean the same fact:
+    // OpenAI-compatible `prompt_tokens_details.cached_tokens` and
+    // DeepSeek-compatible `prompt_cache_hit_tokens`. See cachedOf in openai.ts.
+    it('reads cached input from prompt_tokens_details.cached_tokens', async () => {
+        stubFetch([
+            sse({ choices: [{ delta: { content: 'hi' }, finish_reason: 'stop' }] }),
+            sse({
+                choices: [],
+                usage: {
+                    prompt_tokens: 10,
+                    completion_tokens: 4,
+                    total_tokens: 14,
+                    prompt_tokens_details: { cached_tokens: 8 }
+                }
+            }),
+            'data: [DONE]\n\n'
+        ]);
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(events.at(-1)).toEqual({
+            type: 'done',
+            stopReason: 'stop',
+            toolCalls: [],
+            usage: { input: 10, output: 4, total: 14, cached: 8 }
+        });
+    });
+
+    it('reads cached input from DeepSeek-compatible prompt_cache_hit_tokens', async () => {
+        stubFetch([
+            sse({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+            sse({
+                choices: [],
+                usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14, prompt_cache_hit_tokens: 7 }
+            }),
+            'data: [DONE]\n\n'
+        ]);
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(events.at(-1)).toEqual({
+            type: 'done',
+            stopReason: 'stop',
+            toolCalls: [],
+            usage: { input: 10, output: 4, total: 14, cached: 7 }
+        });
+    });
+
+    // Both keys present with different values: the OpenAI-compatible standard
+    // wins, so 6 (not 99) is reported.
+    it('prefers prompt_tokens_details.cached_tokens over prompt_cache_hit_tokens', async () => {
+        stubFetch([
+            sse({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+            sse({
+                choices: [],
+                usage: {
+                    prompt_tokens: 10,
+                    completion_tokens: 4,
+                    total_tokens: 14,
+                    prompt_tokens_details: { cached_tokens: 6 },
+                    prompt_cache_hit_tokens: 99
+                }
+            }),
+            'data: [DONE]\n\n'
+        ]);
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(events.at(-1)).toEqual({
+            type: 'done',
+            stopReason: 'stop',
+            toolCalls: [],
+            usage: { input: 10, output: 4, total: 14, cached: 6 }
+        });
+    });
+
+    // A gateway reporting more cached tokens than prompt tokens contradicts its
+    // own block; the value is clamped to the input so `cached > input` can never
+    // be rendered. See the clamp in usageOf (openai.ts).
+    it('clamps cached tokens to the prompt tokens', async () => {
+        stubFetch([
+            sse({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+            sse({
+                choices: [],
+                usage: {
+                    prompt_tokens: 10,
+                    completion_tokens: 4,
+                    total_tokens: 14,
+                    prompt_tokens_details: { cached_tokens: 99 }
+                }
+            }),
+            'data: [DONE]\n\n'
+        ]);
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(events.at(-1)).toEqual({
+            type: 'done',
+            stopReason: 'stop',
+            toolCalls: [],
+            usage: { input: 10, output: 4, total: 14, cached: 10 }
+        });
+    });
+
+    // No cache fields at all means "unknown", not "nothing cached": the usage
+    // object must not carry a `cached` key at all. `toStrictEqual` is used here
+    // because `toEqual` would also accept a present-but-undefined key.
+    it('omits cached entirely when the provider reports no cache fields', async () => {
+        stubFetch([
+            sse({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+            sse({ choices: [], usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14 } }),
+            'data: [DONE]\n\n'
+        ]);
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(events.at(-1)).toEqual({
+            type: 'done',
+            stopReason: 'stop',
+            toolCalls: [],
+            usage: { input: 10, output: 4, total: 14 }
+        });
+        expect(usageOfDone(events.at(-1))).toStrictEqual({ input: 10, output: 4, total: 14 });
+    });
+
+    // `prompt_tokens_details: null` is what some gateways send when they do not
+    // track a cache; the parser must not throw and must not invent a value.
+    it('ignores a null prompt_tokens_details', async () => {
+        stubFetch([
+            sse({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+            sse({
+                choices: [],
+                usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14, prompt_tokens_details: null }
+            }),
+            'data: [DONE]\n\n'
+        ]);
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(events.at(-1)).toEqual({
+            type: 'done',
+            stopReason: 'stop',
+            toolCalls: [],
+            usage: { input: 10, output: 4, total: 14 }
+        });
+        expect(usageOfDone(events.at(-1))).toStrictEqual({ input: 10, output: 4, total: 14 });
+    });
+
+    // A non-object `prompt_tokens_details` (string here, number in the next
+    // case) is also tolerated and yields no `cached`.
+    it('ignores a non-object prompt_tokens_details', async () => {
+        stubFetch([
+            sse({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+            sse({
+                choices: [],
+                usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14, prompt_tokens_details: 'cached' }
+            }),
+            'data: [DONE]\n\n'
+        ]);
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(usageOfDone(events.at(-1))).toStrictEqual({ input: 10, output: 4, total: 14 });
+    });
+
+    it('ignores a numeric prompt_tokens_details', async () => {
+        stubFetch([
+            sse({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+            sse({
+                choices: [],
+                usage: { prompt_tokens: 10, completion_tokens: 4, total_tokens: 14, prompt_tokens_details: 8 }
+            }),
+            'data: [DONE]\n\n'
+        ]);
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(usageOfDone(events.at(-1))).toStrictEqual({ input: 10, output: 4, total: 14 });
+    });
+
+    // A negative or non-numeric cache value is not usable and is ignored rather
+    // than surfaced as a negative "cached" count.
+    it('ignores a negative cached token count', async () => {
+        stubFetch([
+            sse({ choices: [{ delta: {}, finish_reason: 'stop' }] }),
+            sse({
+                choices: [],
+                usage: {
+                    prompt_tokens: 10,
+                    completion_tokens: 4,
+                    total_tokens: 14,
+                    prompt_tokens_details: { cached_tokens: -3 }
+                }
+            }),
+            'data: [DONE]\n\n'
+        ]);
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(usageOfDone(events.at(-1))).toStrictEqual({ input: 10, output: 4, total: 14 });
     });
 
     it('ignores non-data SSE lines and stops at [DONE]', async () => {

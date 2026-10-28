@@ -101,6 +101,14 @@ export const createRenderer = ({ json, color }: RenderOptions): Renderer => {
                 break;
             }
 
+            // Per-request token accounting. Silent on purpose: the `done` line below
+            // already prints that same request's figure plus the model and stop
+            // reason, so a second line per request would only add noise. `--json`
+            // emits the event itself for anything that wants to tally.
+            case 'usage': {
+                break;
+            }
+
             case 'done': {
                 endLine();
                 process.stdout.write(`${dim(`  ${describeDone(event.message)}`)}\n`);

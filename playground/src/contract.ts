@@ -18,25 +18,32 @@ import type {
     AgentDescriptor,
     HarnessDescriptor,
     HarnessEvent,
+    HarnessUsage,
     SessionSnapshot,
     SessionStreamItem,
     SessionTurn
 } from '../../server/protocol';
 
-// The harness core tools, in display order. R3 is explicit that this dropdown is
-// *only* the harness core set: `toolRequest`/`toolCreate`/`todoManage` always,
-// `agentDelegate` when the harness has a second agent to delegate to. Other tools
-// are catalogue entries, not core tools.
+// Legacy fallback: the harness-owned core tools an OLD server (no `coreTools`)
+// declared. R21.2 removed the right-rail core dropdown and the tool catalogue that
+// used this list, so the UI no longer derives a core set at all: the Tools tab
+// renders the server's complete catalogue, core entries included. The constants are
+// kept (exported for callers that only need the historical names) but nothing in
+// the shell renders them.
 export const HARNESS_CORE_TOOL_NAMES = ['toolRequest', 'toolCreate', 'todoManage'] as const;
 
-// One-line explanations for the core dropdown. They describe behaviour the
-// harness owns (src/harness.ts) rather than which capability exists, because the
-// catalogue below already lists every tool.
+// One-line explanations for the historical core set. Retained as documentation
+// data; no UI location lists core tools any more (R21.2).
 export const HARNESS_CORE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
     toolRequest: 'Find tools by capability tag and enable them for this chat.',
     toolCreate: 'Add a small session-local tool when the catalogue cannot help.',
     todoManage: 'Keep a task list for the current work.',
-    agentDelegate: 'Hand a self-contained task to one of this harness’s agents.'
+    agentDelegate: 'Hand a self-contained task to one of this harness’s agents.',
+    fileRead: 'Read one or more text files on the server host.',
+    fileWrite: 'Write one or more text files on the server host.',
+    fileEdit: 'Replace exact text in one or more files on the server host.',
+    fileGlob: 'Find files by glob, or search their contents, in one call.',
+    webSearch: 'Search the web when the host configured a provider key.'
 };
 
 const descriptorsOf = (descriptor: HarnessDescriptor): readonly string[] =>
@@ -85,22 +92,37 @@ export const uniqueNames = (names: readonly string[]): string[] => {
     return result;
 };
 
-// `editable` is explicit on the new server. The check is written against `true`
-// so a payload missing the field (older server) stays editable: the user must
-// still be able to configure the built-in harnesses.
-export const editableOf = (descriptor: HarnessDescriptor): boolean => descriptor.editable !== false;
+// R21.1: EVERY harness is editable. The wire's `editable` flag is legacy metadata
+// (the old server marked the demo/flaky fixtures `false`), and the UI deliberately
+// ignores it rather than disabling a card: the backend now accepts PATCH for every
+// built-in preset, including those fixtures, so a stored `false` describes an old
+// server, not a real restriction. A harness that really cannot be patched reports
+// its refusal through PATCH (main.ts shows the server's message); the UI must not
+// pre-emptively claim a read-only state that no longer exists.
+//
+// Kept as a function (rather than deleting the accessor and its call sites) so the
+// distinction between "editing a harness" and "editing the team of a saved
+// session" (main.ts `renderAgents`) stays explicit.
+export const editableOf = (_descriptor: HarnessDescriptor): boolean => true;
 
 export const builtinOf = (descriptor: HarnessDescriptor): boolean => descriptor.builtin === true;
 
-// Core tools for the dropdown, limited to the harness-owned set. `agentDelegate`
-// is shown when the team has a second member or when the server already declares
-// it.
+// Core tools for the dropdown. R18: the SERVER's `coreTools` is authoritative —
+// it already contains the four file tools, a configured webSearch, and
+// agentDelegate when applicable — so the UI reflects catalogue/runtime visibility
+// instead of hard-coding the harness-owned names. Only an older payload without
+// the field falls back to the legacy harness-owned list (adding delegate when the
+// local team has a second member).
 export const coreToolsOf = (descriptor: HarnessDescriptor, memberCount: number): string[] => {
-    const declared = Array.isArray(descriptor.coreTools) ? descriptor.coreTools : undefined;
+    if (Array.isArray(descriptor.coreTools)) {
+        return descriptor.coreTools.filter(
+            (name): name is string => typeof name === 'string' && name.length > 0
+        );
+    }
 
     return [
         ...HARNESS_CORE_TOOL_NAMES,
-        ...(memberCount > 1 || declared?.includes('agentDelegate') === true ? ['agentDelegate'] : [])
+        ...(memberCount > 1 ? ['agentDelegate'] : [])
     ];
 };
 
@@ -108,9 +130,9 @@ export const coreToolsOf = (descriptor: HarnessDescriptor, memberCount: number):
 //
 // The map is optional and only present when a harness actually overrides a member
 // (protocol.ts HarnessDescriptor.agentModels). A member absent from the map uses
-// the session's settings model — that is the "inherit" choice a per-agent
-// dropdown shows, not a resolved id. Values are model ids only: no provider or
-// credential ever travels here.
+// the session's settings model; the dropdown labels that no-override choice with
+// the resolved id (R18), never the word "inherit". Values are model ids only: no
+// provider or credential ever travels here.
 //
 // The same accessor reads a SessionSnapshot's effective map: the server freezes it
 // at creation with every member present, so a reload can render each agent's model
@@ -123,7 +145,7 @@ export const agentModelsOf = (source: {
 
     const result: Record<string, string> = {};
     for (const [name, model] of Object.entries(map)) {
-        // Empty ids are "inherit" and must not become a dropdown option.
+        // Empty ids mean "no override" and must not become a model option.
         if (typeof model === 'string' && model.length > 0) result[name] = model;
     }
 
@@ -171,6 +193,32 @@ export const frameAtOf = (item: SessionStreamItem): number | undefined => {
     if (item.type !== 'event') return undefined;
     return finiteOf(item.at);
 };
+
+// Validate one token tally from the wire — a turn record's `usage` or a stream
+// frame's `usage`. All three required counts must be finite; a partially malformed
+// block resolves to undefined so the header hides instead of printing "NaN" or a
+// half-sum. `cached` is kept only when it is a real number (absent means "the
+// provider never reported a cache figure", which the label renders without
+// brackets).
+export const usageOf = (value: unknown): HarnessUsage | undefined => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+
+    const candidate = value as { input?: unknown; output?: unknown; total?: unknown; cached?: unknown };
+    const input = finiteOf(candidate.input);
+    const output = finiteOf(candidate.output);
+    const total = finiteOf(candidate.total);
+
+    if (input === undefined || output === undefined || total === undefined) return undefined;
+
+    const cached = finiteOf(candidate.cached);
+    return { input, output, total, ...(cached === undefined ? {} : { cached }) };
+};
+
+// The running tally attached to an event frame (see protocol.ts SessionStreamItem).
+// Undefined for every other frame type and for a server that does not send one, so
+// the tile falls back to the recorded turn's `usage` rather than inventing a value.
+export const frameUsageOf = (item: SessionStreamItem): HarnessUsage | undefined =>
+    item.type === 'event' ? usageOf(item.usage) : undefined;
 
 // `tool_result` may name the call it answers. When present it is the authoritative
 // match; name+oldest-first stays as the fallback for an older server.

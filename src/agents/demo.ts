@@ -1,7 +1,9 @@
 // The offline demo agent. Its transport is scripted (harnesses/demo.ts), so this
 // profile is metadata + the seeded instruction only: nothing here can reach a
-// provider. The demo harness is a fixture, not a general-purpose choice, which is
-// why its descriptor is `editable: false`.
+// provider. The demo harness is a template, not a general-purpose choice. It is
+// editable like every registry entry (R20.1): a metadata-only PATCH keeps the
+// script, while an executable PATCH upgrades the preset to a live profiled
+// harness.
 //
 // T14: the demo registry is timeNow-only and discovery goes through toolRequest.
 import type { AgentProfile } from './types';

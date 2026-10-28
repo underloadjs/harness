@@ -31,10 +31,11 @@
 // and a deferred `execute`, so harness registration/rename and the server's direct
 // calls behave exactly as they did with eager tools. See ./lazy.
 //
-// Every preset is **searchable**, so the model asks toolRequest for `files`,
-// `read`, `shell`, `git`, … and discovery enables the matches; nothing in this
-// catalogue is declared up front. A harness preloads `presetTools` unless it is
-// created with `presets: false`.
+// R18: fileRead/fileWrite/fileEdit/fileGlob are **core** and declared up front;
+// fileList, syntaxCheck, commandRun, and gitDiff stay **searchable**, so the model
+// asks toolRequest for `files`/`list`, `shell`, `git`, … and discovery enables the
+// matches. A harness preloads `presetTools` unless it is created with
+// `presets: false`.
 //
 // They are deliberately opinionated about *shape* and unopinionated about
 // *policy*: no sandboxing, no confirmation prompts, no allowlists. A harness that

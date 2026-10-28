@@ -60,6 +60,11 @@ const DEMO_PREAMBLE = 'Found it. Calling timeNow now.';
 //   1. user prompt          -> toolRequest(["time"])   (the only declared tool)
 //   2. toolRequest result   -> timeNow                 (now declared, so callable)
 //   3. timeNow result       -> the answer
+//
+// The usage figures follow the shape a real gateway reports: every request re-sends
+// the transcript, so `input` grows round over round and the cached part of it is the
+// previous round's whole prompt plus results (A+B, then A+B+C). No provider is
+// involved, yet the UI's token tally fills in exactly as it does live.
 export const scriptedDemo = (): HarnessStream =>
     async function* (request): AsyncGenerator<HarnessStreamEvent> {
         const last = request.messages[request.messages.length - 1];
@@ -77,7 +82,9 @@ export const scriptedDemo = (): HarnessStream =>
                 type: 'done',
                 stopReason: 'stop',
                 toolCalls: [],
-                usage: { input: 148, output: 64, total: 212 }
+                // Third request: the whole transcript is a cached prefix; only the
+                // new timeNow result above is fresh input.
+                usage: { input: 148, output: 64, total: 212, cached: 120 }
             };
             return;
         }
@@ -88,7 +95,8 @@ export const scriptedDemo = (): HarnessStream =>
                 type: 'done',
                 stopReason: 'tool_calls',
                 toolCalls: [{ id: 'call_time_now_1', name: 'timeNow', arguments: '{"timezone":"UTC"}' }],
-                usage: { input: 96, output: 22, total: 118 }
+                // Second request: the first prompt is now a cached prefix.
+                usage: { input: 96, output: 22, total: 118, cached: 48 }
             };
             return;
         }
@@ -99,6 +107,7 @@ export const scriptedDemo = (): HarnessStream =>
             type: 'done',
             stopReason: 'tool_calls',
             toolCalls: [{ id: 'call_tool_request_1', name: 'toolRequest', arguments: '{"tags":["time"]}' }],
-            usage: { input: 48, output: 18, total: 66 }
+            // First request: no prefix to reuse yet, so nothing is cached.
+            usage: { input: 48, output: 18, total: 66, cached: 0 }
         };
     };

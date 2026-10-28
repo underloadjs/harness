@@ -23,8 +23,10 @@
 // the prompt, status, timestamps, and every HarnessEvent the run produced
 // (including events from subagents reached by delegation). `eventTimes` is a
 // parallel epoch-ms array, so per-step and per-tool elapsed time survives a
-// reload. Snapshots clone the turns, so a client that mutates a response cannot
-// corrupt the live record.
+// reload. `usage` is the server's running token tally for the turn, folded from the
+// per-request `usage` events (see addUsage) and repeated on every stream frame, so
+// a live tile and a reloaded one print the same number. Snapshots clone the turns,
+// so a client that mutates a response cannot corrupt the live record.
 //
 // Cross-references:
 //   - ./protocol.ts — SessionSnapshot.turns, SessionTurn, SessionStreamItem
@@ -41,6 +43,7 @@ import type { HarnessRegistry } from '../harnesses/registry';
 import { mergeSettings } from './config';
 import type {
     HarnessDescriptor,
+    HarnessUsage,
     SessionSnapshot,
     SessionStatus,
     SessionStreamItem,
@@ -110,7 +113,8 @@ const copyEvent = (event: HarnessEvent): HarnessEvent =>
 
 // A turn copy is the only shape a client ever receives. The live SessionTurn stays
 // private to the store; list()/get()/terminal frames all go through here.
-// `eventTimes` is copied when present, preserving the parallel array contract.
+// `eventTimes` is copied when present, preserving the parallel array contract, and
+// `usage` is copied so a client cannot mutate the running tally it was handed.
 const copyTurn = (turn: SessionTurn): SessionTurn => ({
     id: turn.id,
     index: turn.index,
@@ -119,8 +123,32 @@ const copyTurn = (turn: SessionTurn): SessionTurn => ({
     startedAt: turn.startedAt,
     updatedAt: turn.updatedAt,
     events: turn.events.map(copyEvent),
-    ...(turn.eventTimes === undefined ? {} : { eventTimes: [...turn.eventTimes] })
+    ...(turn.eventTimes === undefined ? {} : { eventTimes: [...turn.eventTimes] }),
+    ...(turn.usage === undefined ? {} : { usage: { ...turn.usage } })
 });
+
+// Fold one request's usage into a turn's running tally.
+//
+// The SERVER owns this sum (not the browser) so that a reload, a poll, a second
+// client and the live stream all show the same figure: a client only ever prints
+// what it was handed (SessionTurn.usage / the stream frame's `usage`). Input token
+// accounting is cumulative by nature — request n+1 re-sends the whole transcript,
+// so its `input` already contains everything earlier requests sent, and adding the
+// requests up is what makes `A+B` then `A+B+C` read as the run's spend.
+//
+// `cached` follows the reported-vs-absent rule of HarnessUsage: a request that
+// reports no cache figure contributes nothing and must not turn the whole tally
+// into "(0)". Once ANY request in the turn reports one, the tally carries a sum.
+const addUsage = (prior: HarnessUsage | undefined, next: HarnessUsage): HarnessUsage => {
+    const cachedReported = prior?.cached !== undefined || next.cached !== undefined;
+
+    return {
+        input: (prior?.input ?? 0) + next.input,
+        output: (prior?.output ?? 0) + next.output,
+        total: (prior?.total ?? 0) + next.total,
+        ...(cachedReported ? { cached: (prior?.cached ?? 0) + (next.cached ?? 0) } : {})
+    };
+};
 
 // A descriptor is plain JSON, so a round trip is a safe deep copy. The session
 // keeps the original; every snapshot hands out its own copy so a client cannot
@@ -375,6 +403,13 @@ export class SessionStore {
             const at = Date.now();
             turn.events.push(record);
             turn.eventTimes?.push(at);
+
+            // Token tally, accumulated here so every client reads the SERVER's
+            // figure. Only the per-request `usage` event counts: the harness also
+            // repeats the final request's usage on `done`, and adding that too
+            // would double the last step.
+            if (record.type === 'usage') turn.usage = addUsage(turn.usage, record.usage);
+
             turn.updatedAt = at;
 
             // A cancelled run keeps recording but stops sending: the stream is gone
@@ -383,8 +418,16 @@ export class SessionStore {
 
             try {
                 // The emitted frame is another copy so a stream listener cannot
-                // mutate the record the snapshot will hand to the next client.
-                await emit({ type: 'event', turnId: turn.id, event: copyEvent(record), at });
+                // mutate the record the snapshot will hand to the next client. The
+                // running tally rides along (when there is one) so a live tile never
+                // has to accumulate usage itself.
+                await emit({
+                    type: 'event',
+                    turnId: turn.id,
+                    event: copyEvent(record),
+                    at,
+                    ...(turn.usage === undefined ? {} : { usage: { ...turn.usage } })
+                });
             } catch {
                 // The client went away mid-run. Abort the harness instead of
                 // letting it keep spending provider time on a dead stream.

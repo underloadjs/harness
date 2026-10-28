@@ -1,10 +1,17 @@
 // The in-memory harness registry.
 //
 // These tests pin the contract the HTTP layer depends on: exactly one primary,
-// trusted agent ids only, reserved/duplicate names, editable vs read-only
-// built-ins, and — most importantly — that update() REPLACES a preset rather than
+// trusted agent ids only, reserved/duplicate names, every template editable
+// (R20.1), and — most importantly — that update() REPLACES a preset rather than
 // mutating it, which is what keeps an already-created session frozen to the
 // configuration it was built with.
+//
+// R20.1 specifics:
+//   - the registry starts from independent copies of the shipped templates;
+//   - a metadata-only patch keeps the captured factory (demo's script, flaky's
+//     testFlaky extra);
+//   - an executable patch rebuilds demo as an honest live profiled harness and
+//     flaky as the live toolbox with testFlaky retained.
 //
 // No provider and no network: constructing a preset never calls the transport.
 
@@ -38,7 +45,7 @@ const registryError = (run: () => unknown): { status: number; message: string } 
 };
 
 describe('the shipped registry', () => {
-    it('lists the built-ins in preset order with their editability', () => {
+    it('lists every template as an independent, editable copy', () => {
         const registry = createHarnessRegistry();
 
         expect(
@@ -51,9 +58,22 @@ describe('the shipped registry', () => {
             { name: 'instruct', builtin: true, editable: true },
             { name: 'research', builtin: true, editable: true },
             { name: 'workspace', builtin: true, editable: true },
-            { name: 'demo', builtin: true, editable: false },
-            { name: 'flaky', builtin: true, editable: false }
+            { name: 'demo', builtin: true, editable: true },
+            { name: 'flaky', builtin: true, editable: true }
         ]);
+
+        // R20.1: independent copies. No registry entry aliases a shipped template
+        // object or its mutable arrays, so editing one registry cannot leak into
+        // another (or into the module constants).
+        const instruct = registry.find('instruct')!;
+        expect(instruct).not.toBe(presets[0]);
+        expect(instruct.tools).not.toBe(presets[0].tools);
+        expect(instruct.subagents).not.toBe(presets[0].subagents);
+
+        const other = createHarnessRegistry();
+        registry.update('instruct', { title: 'Edited' });
+        expect(other.find('instruct')?.title).toBe('Instruct');
+        expect(presets[0].title).toBe('Instruct');
     });
 
     it('exposes the trusted agent profiles', () => {
@@ -339,21 +359,108 @@ describe('updating a harness', () => {
         });
     });
 
-    it('refuses fixtures and unknown harnesses', () => {
+    it('patches every shipped template and rejects only unknown names', () => {
         const registry = createHarnessRegistry();
 
-        expect(registryError(() => registry.update('demo', { title: 'Demo!' }))).toEqual({
-            status: 403,
-            message: 'Harness "demo" is read-only.'
-        });
-        expect(registryError(() => registry.update('flaky', { title: 'Flaky!' }))).toEqual({
-            status: 403,
-            message: 'Harness "flaky" is read-only.'
-        });
+        // R20.1: no read-only category. A metadata-only patch is a 200 for the
+        // formerly frozen demo/flaky templates too.
+        expect(registry.update('demo', { title: 'Demo!' }).title).toBe('Demo!');
+        expect(registry.update('flaky', { title: 'Flaky!' }).title).toBe('Flaky!');
+
         expect(registryError(() => registry.update('missing', { title: 'x' }))).toEqual({
             status: 404,
             message: 'Unknown harness "missing".'
         });
+    });
+
+    it('keeps the demo script and flaky extras through a metadata-only patch', () => {
+        const registry = createHarnessRegistry();
+        const demoBefore = registry.find('demo')!;
+        const flakyBefore = registry.find('flaky')!;
+
+        const demoAfter = registry.update('demo', {
+            title: 'Scripted demo (renamed)',
+            description: 'Edited description.'
+        });
+        const flakyAfter = registry.update('flaky', {
+            title: 'Recoverable failures (renamed)'
+        });
+
+        // The factory is the SAME closure: metadata is not execution, so the
+        // scripted transport and the timeNow-only registry survive.
+        expect(demoAfter.create).toBe(demoBefore.create);
+        expect(demoAfter.tools).toEqual(['timeNow']);
+        expect(demoAfter.requiresEndpoint).toBe(false);
+        expect(demoAfter.template).toBe('scripted');
+
+        // The flaky example keeps its extra tool and shared toolbox declaration.
+        expect(flakyAfter.create).toBe(flakyBefore.create);
+        expect(flakyAfter.tools).toEqual([...SHARED_TOOL_NAMES, 'testFlaky']);
+        expect(flakyAfter.environmentTools).toEqual(['webSearch']);
+        expect(flakyAfter.template).toBe('flaky');
+
+        // The runtime really keeps them: these are the exact registered names.
+        expect(Object.keys(demoAfter.create(SETTINGS, progress).tools)).toEqual([
+            'timeNow',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
+        ]);
+        expect(Object.keys(flakyAfter.create(SETTINGS, progress).tools)).toContain('testFlaky');
+
+        // The old objects are untouched; a session that captured them keeps the
+        // shipped metadata too.
+        expect(demoBefore.title).toBe('Scripted demo');
+        expect(flakyBefore.title).toBe('Recoverable failures (example)');
+    });
+
+    it('upgrades the demo to an honest live profiled harness on an executable patch', () => {
+        const registry = createHarnessRegistry();
+        const before = registry.find('demo')!;
+        const scripted = before.create(SETTINGS, progress);
+
+        const after = registry.update('demo', { primary: 'workspace' });
+
+        // The descriptor stops claiming the offline fixture: it now needs a
+        // provider, advertises the shared toolbox the live factory registers, and
+        // adopts the template's live prose because the shipped text was untouched.
+        expect(after.template).toBe('live');
+        expect(after.title).toBe('Live demo');
+        expect(after.description).toContain('no longer uses the offline script');
+        expect(after.requiresEndpoint).toBe(true);
+        expect(after.tools).toEqual(SHARED_TOOL_NAMES);
+        expect(after.environmentTools).toEqual(['webSearch']);
+        expect(after.primary).toBe('workspace');
+        expect(after.agents).toEqual(['workspace']);
+
+        const live = after.create(SETTINGS, progress);
+        expect(Object.keys(live.agents)).toEqual(['workspace']);
+        expect(Object.keys(live.tools)).toEqual(
+            expect.arrayContaining([...SHARED_TOOL_NAMES, 'toolRequest', 'toolCreate', 'todoManage'])
+        );
+
+        // The captured scripted harness is unchanged (frozen-session guarantee).
+        expect(Object.keys(scripted.agents)).toEqual(['demo']);
+        expect(Object.keys(scripted.tools)).toEqual(['timeNow', 'toolRequest', 'toolCreate', 'todoManage']);
+    });
+
+    it('rebuilds flaky live and retains testFlaky on an executable patch', () => {
+        const registry = createHarnessRegistry();
+
+        const after = registry.update('flaky', {
+            primary: 'workspace',
+            agentModels: { workspace: 'big/model' }
+        });
+
+        expect(after.template).toBe('flaky');
+        expect(after.tools).toEqual([...SHARED_TOOL_NAMES, 'testFlaky']);
+        expect(after.requiresEndpoint).toBe(true);
+        expect(after.agents).toEqual(['workspace']);
+
+        const live = after.create(SETTINGS, progress);
+        expect(live.tools.testFlaky).toBeDefined();
+        expect(Object.keys(live.agents)).toEqual(['workspace']);
+        expect(live.agents.workspace.model()).toBe('big/model');
     });
 });
 
@@ -575,8 +682,10 @@ describe('an injected registry', () => {
     it('keeps its own entries and still offers the trusted agents', () => {
         const registry = createHarnessRegistry([scripted]);
 
+        // R20.1: the entry is an independent copy, not the injected object.
         expect(registry.list()).toEqual([scripted]);
-        expect(registry.find('scripted')).toBe(scripted);
+        expect(registry.find('scripted')).not.toBe(scripted);
+        expect(registry.find('scripted')).toEqual(scripted);
         expect(registry.find('instruct')).toBeUndefined();
         expect(registry.agents().map((profile) => profile.name)).toEqual([...AGENT_PROFILE_NAMES]);
 

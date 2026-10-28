@@ -2,7 +2,8 @@
 //
 // The ring must mean "this agent is working in the turn on screen". These tests
 // pin the accept/reject rules as exact sets:
-//   - start activates; text/reasoning/tool events reactivate;
+//   - start activates; text/reasoning/tool/usage events reactivate (a `usage`
+//     report arrives mid-run, before the tools the agent asked for have run);
 //   - done/error remove ONLY that agent (delegated siblings keep spinning);
 //   - only a RUNNING recorded turn contributes activity, so replaying history can
 //     never light an old tile;
@@ -41,6 +42,13 @@ const done = (agent: string): HarnessEvent => ({
     }
 });
 const failed = (agent: string): HarnessEvent => ({ type: 'error', agent, error: { message: 'boom' } });
+// Per-request token accounting: emitted mid-run (right after the request settles,
+// before its tools run), so it must keep the agent's ring lit.
+const usage = (agent: string): HarnessEvent => ({
+    type: 'usage',
+    agent,
+    usage: { input: 10, output: 5, total: 15 }
+});
 
 const turn = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
     id: 't1',
@@ -67,6 +75,13 @@ describe('applyActivity', () => {
         expect(reduce([reasoning('instruct')])).toEqual(['instruct']);
         expect(reduce([toolCall('instruct')])).toEqual(['instruct']);
         expect(reduce([toolResult('instruct')])).toEqual(['instruct']);
+        expect(reduce([usage('instruct')])).toEqual(['instruct']);
+    });
+
+    it('adds the agent to an empty set on a usage event', () => {
+        const active = new Set<string>();
+        applyActivity(active, usage('instruct'));
+        expect(active).toEqual(new Set(['instruct']));
     });
 
     it('removes only the agent that finished, not a delegated sibling', () => {
@@ -80,6 +95,20 @@ describe('applyActivity', () => {
 
     it('reactivates an agent after an intermediate done (a second agent run)', () => {
         expect(reduce([start('instruct'), done('instruct'), text('instruct')])).toEqual(['instruct']);
+    });
+
+    it('does not resurrect a finished agent when a usage follows the done', () => {
+        // A usage is emitted mid-run (before the tools it asked for run), so a usage
+        // that lands after done is out of order; the reducer follows event order, so
+        // the trailing done still leaves the set empty.
+        expect(reduce([start('instruct'), usage('instruct'), done('instruct')])).toEqual([]);
+    });
+
+    it('removes only the agent whose done follows its usage', () => {
+        const active = new Set<string>(['instruct', 'helper']);
+        applyActivity(active, usage('instruct'));
+        applyActivity(active, done('instruct'));
+        expect(active).toEqual(new Set(['helper']));
     });
 });
 
@@ -108,6 +137,18 @@ describe('activityOfTurn / activityOfTurns', () => {
 
         expect([...activityOfTurns([older, current])]).toEqual(['helper']);
         expect([...activityOfTurns([older])]).toEqual([]);
+    });
+
+    it('keeps a usage-reporting agent lit while its turn is running', () => {
+        // Mid-run usage (the request settled, its tools have not run yet) must keep
+        // the tile spinning; the same events on a settled turn stay history.
+        const usageEvents = [start('instruct'), usage('instruct')];
+
+        const running = turn({ events: usageEvents });
+        expect(activityOfTurns([running])).toEqual(new Set(['instruct']));
+
+        const settled = turn({ status: 'done', events: usageEvents });
+        expect(activityOfTurns([settled])).toEqual(new Set<string>());
     });
 
     it('leaves an empty set for a finished turn whose last event is a done', () => {

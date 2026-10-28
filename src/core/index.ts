@@ -29,6 +29,13 @@ export { MAX_DISCOVERY_MATCHES, searchTools } from './discovery';
 export { compileToolSource, createDynamicTool } from './creation';
 export { createTodoTool } from './todo';
 export {
+    TOOL_UI_LIMITS,
+    normalizeToolUiPanels,
+    toolUi,
+    toolUiOf
+} from './tool-ui';
+export type { ToolUiExtraction } from './tool-ui';
+export {
     TOOL_CREATE_METADATA,
     TOOL_CREATE_NAME,
     AGENT_DELEGATE_NAME,

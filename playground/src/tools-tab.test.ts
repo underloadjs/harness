@@ -1,6 +1,10 @@
 // Tools tab: every bootstrap tool (core included) is listed and callable, and a
 // core call runs on the server inside the selected session.
 //
+// R21.2 acceptance this file also pins: the Tools tab is the ONLY tool listing —
+// the right rail no longer drops a catalogue or core-tools disclosure — and the
+// enabled-for-session status lives here (`.tools-session-note`).
+//
 // R8 acceptance this file pins:
 //   - the Tools tab exists as an accessible tablist and lists core tools as well
 //     as catalogue tools;
@@ -175,8 +179,10 @@ it('lists core tools on the Tools tab, calls with the captured session and refre
     await flush();
     await flush();
 
-    // A real tablist: the catalogue is no longer the only way in.
+    // A real tablist, and the only tool listing (R21.2).
     const tabs = byClass('.tabs', 'div');
+    expect(document.querySelector('.rail-right .tool-list')).toBeNull();
+    expect(document.querySelector('.rail-right .core-tools')).toBeNull();
     expect(tabs.getAttribute('role')).toBe('tablist');
     expect([...document.querySelectorAll<HTMLElement>('.tab')].map((node) => node.textContent)).toEqual([
         'Chat',
@@ -238,12 +244,12 @@ it('lists core tools on the Tools tab, calls with the captured session and refre
         '1 tool enabled; 2 more tools match. Refine the tags to see them.'
     );
 
-    // The post-call snapshot refresh surfaced the discovery in the right rail,
-    // while the Tools tab still owns the centre.
+    // The post-call snapshot refresh surfaced the discovery on the Tools tab, while
+    // the Tools tab still owns the centre (R21.2: this replaced the removed
+    // right-rail core dropdown).
     expect(calls.filter((call) => call.url === '/api/sessions/s1')).toHaveLength(1);
-    expect(byClass('.core-discovered', 'p').hidden).toBe(false);
-    expect(byClass('.core-discovered', 'p').textContent).toBe(
-        'enabled for this session: fileRead, fileGlob'
+    expect(byClass('.tools-session-note', 'p').textContent).toBe(
+        'Session-bound tools run inside instruct · session s1 · enabled for this session: fileRead, fileGlob'
     );
 
     // An ordinary tool is unchanged: no sessionId key, no extra session traffic.

@@ -299,18 +299,34 @@ describeService('service endpoint discovery and canonical API', () => {
         expect(first.turn.status).toBe('running');
 
         const events = items.flatMap((item) => (item.type === 'event' ? [item.event] : []));
-        // The scripted demo always runs: toolRequest, clock, answer. Asserting the
-        // non-delta sequence pins the frame passthrough without depending on
-        // whitespace chunking.
+        // The scripted demo always runs: toolRequest, clock, answer — with each
+        // request's `usage` reported before the tool call (or the final `done`) it
+        // belongs to. Asserting the non-delta sequence pins the frame passthrough
+        // without depending on whitespace chunking.
         expect(
             events
                 .filter((event) => event.type !== 'text' && event.type !== 'reasoning')
                 .map((event) => event.type)
-        ).toEqual(['start', 'tool_call', 'tool_result', 'tool_call', 'tool_result', 'done']);
+        ).toEqual(['start', 'usage', 'tool_call', 'tool_result', 'usage', 'tool_call', 'tool_result', 'usage', 'done']);
         // The dispatcher must not reshape frames: every event names its turn.
         for (const item of items) {
             if (item.type === 'event') expect(item.turnId).toBe(first.turn.id);
         }
+
+        // The adapter is transport-neutral: the `usage` field is forwarded on the
+        // raw SSE `data:` JSON exactly as the in-process handler emits it. `start`
+        // precedes every request, so it has no key; each `usage` frame carries the
+        // server's running sum (not the request's own figure).
+        const eventFrames = items.flatMap((item) => (item.type === 'event' ? [item] : []));
+        expect(eventFrames[0].event.type).toBe('start');
+        expect(eventFrames[0]).not.toHaveProperty('usage');
+
+        const usageFrames = eventFrames.filter((frame) => frame.event.type === 'usage');
+        expect(usageFrames.map((frame) => frame.usage)).toEqual([
+            { input: 48, output: 18, total: 66, cached: 0 },
+            { input: 144, output: 40, total: 184, cached: 48 },
+            { input: 292, output: 104, total: 396, cached: 168 }
+        ]);
 
         const terminal = items.at(-1);
         expect(terminal?.type).toBe('snapshot');
@@ -318,6 +334,13 @@ describeService('service endpoint discovery and canonical API', () => {
         expect(terminal.session.turns).toHaveLength(1);
         expect(terminal.session.turns[0].status).toBe('done');
         expect(terminal.session.turns[0].events).toEqual(events);
+        // The terminal snapshot carries the run's exact tally of all three requests.
+        expect(terminal.session.turns[0].usage).toEqual({
+            input: 292,
+            output: 104,
+            total: 396,
+            cached: 168
+        });
 
         const reset = await json<{ session: SessionSnapshot }>(
             await fetch(`${base}/v1/harness/sessions/${session.id}/reset`, { method: 'POST' })

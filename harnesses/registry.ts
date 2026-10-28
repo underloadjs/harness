@@ -3,11 +3,16 @@
 // WHY THIS EXISTS
 // ---------------
 // The catalogue used to be a frozen array of presets: the only harnesses a client
-// could run were the ones shipped with the package. The latest design lets a
-// client create a harness (choose a primary agent, optionally some subagents) and
-// let an operator override a built-in's title/description/agent routing. Both are
+// could run were the ones shipped with the package. The registry now starts from
+// INDEPENDENT COPIES of the shipped templates (R20.1): every card is an editable
+// application entry, a client may create a harness (choose a primary, optionally
+// subagents/models), and PATCH produces a new immutable entry. Everything is
 // in-memory only: there is no persistence layer, so a restart returns to the
-// shipped catalogue. That limitation is documented in README.md/knowledge.md.
+// shipped templates. That limitation is documented in README.md/knowledge.md.
+//
+// There is NO read-only harness concept. `editable` survives on the wire as a
+// compatibility field and is always true; the registry never gates on it, and a
+// non-live template (demo's script, flaky's extra tool) is editable too.
 //
 // INVARIANTS
 // ----------
@@ -22,18 +27,32 @@
 //     affect future sessions only" is therefore a structural property, not a
 //     convention.
 //
+// TEMPLATE PRESERVATION
+// ---------------------
+// A PATCH is split into two kinds:
+//   - metadata only (title/description) — keep the captured factory and every
+//     executable field, so demo stays the scripted fixture, flaky keeps testFlaky,
+//     and a live harness keeps the exact closure a session captured;
+//   - executable (primary/subagents/agentModels) — rebuild from the template:
+//       'live'     → createProfiledHarness (unchanged behaviour);
+//       'scripted' → upgrade to a LIVE profiled harness and correct the descriptor
+//                    (requiresEndpoint, shared toolbox, environmentTools) so the
+//                    card stops claiming scripted behaviour it no longer runs;
+//       'flaky'    → rebuild the live toolbox with the testFlaky extra retained.
+// A hand-built/injected preset without a `template` defaults to 'live'.
+//
 // VALIDATION OWNERSHIP
 // --------------------
 // Field/type validation that concerns the wire (unknown properties, non-object
 // bodies) lives in server/api.ts. Semantic validation — known agents, duplicate
-// ids, reserved names, editable checks — lives here, because both the HTTP API
-// and any future caller must agree. Registry failures carry an HTTP status so the
-// dispatcher can map them without re-deriving one.
+// ids, reserved names — lives here, because both the HTTP API and any future
+// caller must agree. Registry failures carry an HTTP status so the dispatcher can
+// map them without re-deriving one.
 //
 // Cross-references:
 //   - ../src/agents/index.ts — the trusted profile registry
-//   - ./presets.ts           — the shipped built-ins
-//   - ./toolbox.ts           — createProfiledHarness (the live harness factory)
+//   - ./presets.ts           — the shipped templates
+//   - ./toolbox.ts           — createProfiledHarness / createToolboxHarness
 //   - ../server/sessions.ts  — resolves a session's harness through find()
 //   - ../server/api.ts       — POST/PATCH /harnesses and GET /agents
 
@@ -41,7 +60,13 @@ import { agentProfiles, isAgentProfileName } from '../src/agents';
 import type { AgentProfile } from '../src/agents';
 import type { HarnessPreset } from './types';
 import { presets } from './presets';
-import { SHARED_TOOL_NAMES, createProfiledHarness } from './toolbox';
+import { harnessTools } from './tools';
+import {
+    SHARED_TOOL_NAMES,
+    agentsFromProfiles,
+    createProfiledHarness,
+    createToolboxHarness
+} from './toolbox';
 
 // Legacy preset identifiers. The catalogue is agent-named now, but a CLI
 // invocation, script, or bookmarked API client written against the old names must
@@ -122,8 +147,8 @@ export type HarnessRegistry = {
 };
 
 // A registry failure with an HTTP status, so the dispatcher maps it like
-// HttpError/SessionError instead of guessing. 400 = invalid input, 403 =
-// read-only built-in, 404 = unknown harness, 409 = name conflict.
+// HttpError/SessionError instead of guessing. 400 = invalid input, 404 = unknown
+// harness, 409 = name conflict. There is no 403: no harness is read-only (R20.1).
 export class HarnessRegistryError extends Error {
     constructor(
         readonly status: number,
@@ -293,11 +318,69 @@ const normalizeAgentModels = (
     return resolved;
 };
 
+// Copy one template into an independent registry entry. Arrays and the model map
+// are copied so nothing a registry (or a caller holding list()[i]) does can reach
+// the shipped module constants. The factory is shared: it is immutable (a closure
+// over its own configuration), and sharing it is exactly what lets a metadata-only
+// PATCH preserve demo's script / flaky's extra tool.
+//
+// `editable` is forced true: R20.1 removes the read-only concept, and the field is
+// kept only so an existing client still sees its familiar wire shape.
+const copyTemplate = (preset: HarnessPreset): HarnessPreset => ({
+    ...preset,
+    subagents: [...preset.subagents],
+    agents: [...preset.agents],
+    tools: [...preset.tools],
+    ...(preset.environmentTools === undefined
+        ? {}
+        : { environmentTools: [...preset.environmentTools] }),
+    ...(preset.agentModels === undefined ? {} : { agentModels: { ...preset.agentModels } }),
+    editable: true
+});
+
+// Build the factory for a template's LIVE form. 'flaky' keeps its example-only
+// extra tool; everything else is the shared profiled harness. The model map is
+// captured by the closure (via createProfiledHarness / agentsFromProfiles), which
+// is what makes a later PATCH invisible to an existing session.
+const liveFactory = (
+    template: 'live' | 'flaky',
+    primary: string,
+    subagents: readonly string[],
+    agentModels: Readonly<Record<string, string>>
+): HarnessPreset['create'] => {
+    if (template === 'live') {
+        return createProfiledHarness(primary, subagents, agentModels);
+    }
+
+    return (settings, progress) =>
+        createToolboxHarness(
+            {
+                agents: agentsFromProfiles([primary, ...subagents], settings, agentModels),
+                primary,
+                subagents: [...subagents],
+                extraTools: { testFlaky: harnessTools.testFlaky }
+            },
+            settings,
+            progress
+        );
+};
+
 export const createHarnessRegistry = (initial: readonly HarnessPreset[] = presets): HarnessRegistry => {
     // Insertion-ordered map: list() is stable, and update() preserves position.
     const entries = new Map<string, HarnessPreset>();
 
-    for (const preset of initial) entries.set(preset.name, preset);
+    // R20.1: start from independent template copies, never the module constants.
+    for (const preset of initial) entries.set(preset.name, copyTemplate(preset));
+
+    // The shipped title/description per template. An executable upgrade of a
+    // non-live template adopts its `live` metadata only while these strings are
+    // still untouched, so an operator's earlier title/description edit survives.
+    const shippedMetadata = new Map(
+        initial.map((preset) => [
+            preset.name,
+            { title: preset.title, description: preset.description }
+        ])
+    );
 
     const find = (name: string): HarnessPreset | undefined => {
         const direct = entries.get(name);
@@ -364,16 +447,20 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
             primary,
             subagents,
             agents,
-            // One toolbox for every live harness, user-created included: the
-            // whole catalogue is searchable and the harness core tools are
-            // harness-owned.
-            tools: SHARED_TOOL_NAMES,
+            // One toolbox for every live harness, user-created included. The four
+            // core file tools are declared up front (R18); the searchable remainder
+            // waits for toolRequest, and webSearch is core when configured.
+            // Copied so no registry entry aliases the shared module array.
+            tools: [...SHARED_TOOL_NAMES],
             environmentTools: ['webSearch'],
             // Absent vs `{}` are the same thing: no overrides. Stored as a plain
             // object so update() has one shape to reason about.
             agentModels,
             builtin: false,
             editable: true,
+            // A created harness is a live profiled harness; later PATCHes treat
+            // it like the live built-ins.
+            template: 'live',
             // The factory closure captures the map, so a later PATCH builds a NEW
             // closure: an existing session keeps the models it was created with.
             create: createProfiledHarness(primary, subagents, agentModels)
@@ -393,13 +480,9 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
             throw new HarnessRegistryError(404, `Unknown harness "${name}".`);
         }
 
-        // Fixtures are read-only: demo and flaky exist to demonstrate scripted and
-        // failing behaviour, and an override would make the fixture claim a
-        // configuration it does not run.
-        if (!current.editable) {
-            throw new HarnessRegistryError(403, `Harness "${current.name}" is read-only.`);
-        }
-
+        // R20.1: no read-only gate. Every entry is an editable application copy;
+        // the previous 403 branch is intentionally gone, and `editable` is a wire
+        // compatibility field only.
         const primary =
             patch.primary === undefined ? current.primary : requireAgent(patch.primary, 'primary');
 
@@ -431,23 +514,70 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
                 ? retainedModels
                 : normalizeAgentModels(patch.agentModels, agents);
 
-        // A new object, with a new factory closure: an existing session keeps the
-        // preset it captured, so it continues to run (and report) the old
-        // configuration — including the old per-agent models. This is the
-        // frozen-session guarantee.
+        // R20.1 template handling. A metadata-only patch keeps the exact factory
+        // the entry already captured (demo's script, flaky's testFlaky, a live
+        // closure). An executable patch rebuilds from the template:
+        //   - 'scripted' upgrades to a live profiled factory AND corrects the
+        //     descriptor fields that would otherwise still advertise the offline
+        //     fixture (requiresEndpoint/tools/environmentTools), then becomes a
+        //     'live' entry for any later patch;
+        //   - 'flaky' rebuilds the live toolbox with testFlaky retained;
+        //   - everything else uses the standard profiled factory.
+        const template = current.template ?? 'live';
+        const executable =
+            patch.primary !== undefined ||
+            patch.subagents !== undefined ||
+            patch.agentModels !== undefined;
+
+        const upgradedScripted = executable && template === 'scripted';
+
+        // Honest prose on upgrade: only when the current values are still the
+        // shipped template's (an operator edit is never overwritten).
+        const shipped = shippedMetadata.get(current.name);
+        const untouched = (field: 'title' | 'description'): boolean =>
+            shipped !== undefined && current[field] === shipped[field];
+        const upgradedTitle =
+            upgradedScripted && current.live !== undefined && untouched('title')
+                ? current.live.title
+                : current.title;
+        const upgradedDescription =
+            upgradedScripted && current.live !== undefined && untouched('description')
+                ? current.live.description
+                : current.description;
+
+        const create = executable
+            ? liveFactory(
+                  template === 'scripted' || template === 'live' ? 'live' : 'flaky',
+                  primary,
+                  subagents,
+                  agentModels
+              )
+            : current.create;
+
+        // A new object: an existing session keeps the preset it captured, so it
+        // continues to run (and report) the old configuration — including the old
+        // per-agent models. This is the frozen-session guarantee.
         const preset: HarnessPreset = {
             ...current,
             title:
-                patch.title === undefined ? current.title : normalizeTitle(patch.title),
+                patch.title === undefined ? upgradedTitle : normalizeTitle(patch.title),
             description:
                 patch.description === undefined
-                    ? current.description
+                    ? upgradedDescription
                     : normalizeDescription(patch.description),
             primary,
             subagents,
             agents,
             agentModels,
-            create: createProfiledHarness(primary, subagents, agentModels)
+            ...(upgradedScripted
+                ? {
+                      requiresEndpoint: true,
+                      tools: [...SHARED_TOOL_NAMES],
+                      environmentTools: ['webSearch'],
+                      template: 'live' as const
+                  }
+                : {}),
+            create
         };
 
         entries.set(current.name, preset);

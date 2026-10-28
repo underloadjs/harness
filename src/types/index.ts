@@ -75,9 +75,18 @@ export type HarnessStopReason = 'stop' | 'length' | 'tool_calls';
 
 // Token accounting, normalized from the provider's `usage` block.
 export type HarnessUsage = {
+    // Prompt/input tokens for the request, INCLUDING any replayed cache prefix.
+    // That is the OpenAI-compatible `prompt_tokens` semantics: a request that
+    // replays A+B and adds C reports A+B+C here.
     input: number;
     output: number;
     total: number;
+    // How much of `input` the provider served from its prefix cache, when it says
+    // so at all. OPTIONAL and never defaulted: "not reported" and "reported, 0
+    // cached" are different facts, and a client that prints `(0)` for a provider
+    // which never reports a cache figure would be inventing one. Readers must
+    // treat undefined as unknown, not as zero.
+    cached?: number;
 };
 
 // ---------------------------------------------------------------------------
@@ -323,6 +332,47 @@ export type HarnessDelegationResult = {
 };
 
 // ---------------------------------------------------------------------------
+// Declarative tool UI panels (R20.2)
+// ---------------------------------------------------------------------------
+//
+// A tool may return a `ToolUiEnvelope` (built with the `toolUi()` helper) to give
+// the client a small, safe, declarative rendering of its result. The envelope is
+// INTERNAL: the harness unwraps it, sends `content` to the model exactly as it
+// would send any other tool value, and reports the panels on the optional
+// `ui` field of the `tool_result` event / `ToolCallResult`. This keeps the model
+// context identical to a plain return value.
+//
+// SECURITY: panels are DATA ONLY. There is no HTML, JavaScript, URL action, or
+// callback in this shape, so a tool cannot inject executable content into the
+// browser. The server normalizes and bounds every supplied panel (see
+// src/core/tool-ui.ts) before it reaches a client.
+//
+// `slot` is an open string, not an enum: today the client mounts `right` next to
+// the transcript and can treat `center`/`left` as additional placements, and a
+// future host may add its own slot names without a schema change.
+export type ToolUiBlock =
+    | { type: 'text'; text: string }
+    | { type: 'table'; columns: string[]; rows: string[][] }
+    | { type: 'keyValue'; items: { label: string; value: string }[] };
+
+export type ToolUiPanel = {
+    // Stable within one tool result; lets a client update a panel in place.
+    id: string;
+    // Placement hint. Extensible: 'right' is the default mount point.
+    slot: string;
+    title: string;
+    blocks: ToolUiBlock[];
+};
+
+// The branded value `toolUi(content, panels)` returns. The brand property is a
+// plain string key so it survives module duplication and can be detected with an
+// own-property check; `content` is the ordinary tool result the model sees.
+export type ToolUiEnvelope<TContent = unknown> = {
+    readonly __toolUi: ToolUiPanel[];
+    readonly content: TContent;
+};
+
+// ---------------------------------------------------------------------------
 // todoManage (per-harness session todos)
 // ---------------------------------------------------------------------------
 //
@@ -529,7 +579,20 @@ export type HarnessEvent =
           callId?: string;
           content: string;
           isError: boolean;
+          // Optional declarative panels a tool supplied with `toolUi()`. The
+          // `content` above is always the underlying value, and the model never
+          // sees this field: it is presentation data for the client only. Absent
+          // for every ordinary tool, so recorded events keep their old shape.
+          ui?: ToolUiPanel[];
       }
+    // Per-request token accounting, emitted once for EVERY model request a run
+    // makes — including the tool rounds that keep the loop going. `done` only
+    // ever reports the FINAL request of an agent run, so without this event a
+    // client can only see the last step's tokens, never the cost of the run.
+    // Absent entirely when the provider reported no usage for that request (a
+    // gateway that sends no `usage` block); a run may therefore report some
+    // requests and not others.
+    | { type: 'usage'; agent: string; usage: HarnessUsage }
     | { type: 'done'; agent: string; message: HarnessAssistantMessage }
     | { type: 'error'; agent: string; error: HarnessErrorInfo };
 

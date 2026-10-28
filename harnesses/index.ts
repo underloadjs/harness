@@ -38,6 +38,8 @@ import type { CatalogueEntry, HarnessPreset, ToolGroup } from './types';
 
 export { presets, harnessTools, PRESET_MAX_ITERATIONS };
 export {
+    CORE_ENVIRONMENT_TOOL_NAMES,
+    CORE_PRESET_TOOL_NAMES,
     CORE_TOOL_NAMES,
     SHARED_APP_TOOL_NAMES,
     SHARED_TOOL_NAMES,

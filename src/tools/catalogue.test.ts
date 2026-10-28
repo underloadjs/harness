@@ -104,19 +104,18 @@ describe('preset catalogue', () => {
         expect(presetTools.syntaxCheck.visibility).toBe('searchable');
     });
 
-    it('keeps every preset searchable, including the five file tools', () => {
-        // The whole catalogue goes through toolRequest, so no preset is declared up
-        // front. A descriptor's core list is harness-owned only.
-        for (const name of [
-            'fileRead',
-            'fileWrite',
-            'fileEdit',
-            'fileList',
-            'fileGlob'
-        ] as const) {
-            expect('visibility' in PRESET_TOOLS[name]).toBe(false);
-            expect(presetTools[name].visibility).toBe('searchable');
+    it('makes the four everyday file tools core and keeps fileList discoverable', () => {
+        // R18: read/write/edit/glob are declared on every request; fileList is the
+        // occasional directory survey and still waits for toolRequest. Exactly the
+        // approved set and no fileSearch alias.
+        for (const name of ['fileRead', 'fileWrite', 'fileEdit', 'fileGlob'] as const) {
+            expect(PRESET_TOOLS[name].visibility).toBe('core');
+            expect(presetTools[name].visibility).toBe('core');
         }
+
+        expect('visibility' in PRESET_TOOLS.fileList).toBe(false);
+        expect(presetTools.fileList.visibility).toBe('searchable');
+        expect(PRESET_TOOLS).not.toHaveProperty('fileSearch');
 
         // syntaxCheck, commandRun and gitDiff share the same visibility default:
         // discovery is the only way to reach them.

@@ -60,7 +60,8 @@ describe('key resolution', () => {
         const exa = configured({ EXA_API_KEY: 'exa-secret-key' });
 
         expect(exa.name).toBe('webSearch');
-        expect(exa.visibility).toBe('searchable');
+        // R18: a configured search tool is core — declared, never discovered.
+        expect(exa.visibility).toBe('core');
         expect(exa.tags).toEqual(['web', 'search', 'internet', 'news', 'research']);
 
         // No provider property at all: one legal value is not a choice.

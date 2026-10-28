@@ -34,13 +34,17 @@
 //   - ./index       — builds the named exports + `presetTools` from this table
 //   - ../core/tool  — normalizes tags and defines the Tool contract
 //
-// Discovery: EVERY entry is `searchable` (the tool() default). Searchable means
-// the harness declares it only after toolRequest matches its tags, so the
-// catalogue can grow without spending context. The only core tools are the
-// harness-owned toolRequest/toolCreate/todoManage (plus agentDelegate for a primary
-// with subagents); no preset — including the file tools — is declared up front.
-// One discovery surface for the whole catalogue, so a file tool costs the same
-// round trip as commandRun.
+// Discovery (R18): the four everyday file tools — fileRead, fileWrite, fileEdit,
+// fileGlob — are CORE, so they are declared on every request; fileList stays
+// searchable (it is the occasional directory-survey tool, and fileGlob already
+// covers filename/content search in one surface). syntaxCheck, commandRun and
+// gitDiff stay searchable too. Every other entry keeps the tool() default.
+//
+// "core" here is a DECLARATION classification, not a session binding: these file
+// tools have real standalone implementations, so the server's direct-call path
+// still runs them without a sessionId (see harnesses/core.ts / server/api.ts).
+// Only harness-owned tools (toolRequest/toolCreate/todoManage/agentDelegate) are
+// sessionBound because only they mutate a session's harness.
 
 import type { Tool, ToolVisibility } from '../types';
 
@@ -51,15 +55,17 @@ export type PresetToolMetadata = {
     name: string;
     description: string;
     tags: readonly string[];
-    // 'searchable' when omitted, matching tool()'s default.
+    // Omitted means 'searchable' (tool()'s default); the four core file rows set
+    // 'core' explicitly.
     visibility?: ToolVisibility;
     parameters: Record<string, unknown>;
 };
 
 // The catalogue. Key order is the order `presetTools` is built in, which is the
 // order the harness preloads — grouped syntax, files, command so the folder
-// structure and the registry read the same way. No entry is core: the whole
-// catalogue is declared only after toolRequest enables it.
+// structure and the registry read the same way. The four core file rows are
+// declared immediately; the searchable remainder (fileList, syntaxCheck,
+// commandRun, gitDiff) waits for toolRequest.
 //
 // `as const` keeps literal tag tuples (so a parity test can compare them exactly)
 // while `satisfies` proves every row is complete enough to become a Tool.
@@ -94,6 +100,8 @@ export const PRESET_TOOLS = {
         description:
             'Read one or more UTF-8 text files and return their contents. Pass an array of paths and get an ordered array of { path, content } entries in the same order. One missing or unreadable path rejects the whole call, so a short answer never looks complete. Paths are absolute or relative to the working directory.',
         tags: ['files', 'read', 'filesystem'],
+        // R18: everyday file access is core — always declared, never discovered.
+        visibility: 'core',
         parameters: {
             type: 'object',
             properties: {
@@ -116,6 +124,8 @@ export const PRESET_TOOLS = {
         description:
             'Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. Every entry is validated before anything is written, and the same target path twice is rejected. A write error part-way through is reported with the paths already completed: there is no rollback.',
         tags: ['files', 'write', 'filesystem'],
+        // R18: writing files is core, like the rest of the everyday file set.
+        visibility: 'core',
         parameters: {
             type: 'object',
             properties: {
@@ -153,6 +163,8 @@ export const PRESET_TOOLS = {
         description:
             'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match byte-for-byte and must appear exactly once unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes }. Creates nothing: use fileWrite for new files.',
         tags: ['files', 'edit', 'write', 'replace', 'filesystem'],
+        // R18: editing files is core, so a model never spends a discovery round on it.
+        visibility: 'core',
         parameters: {
             type: 'object',
             properties: {
@@ -232,6 +244,10 @@ export const PRESET_TOOLS = {
         description:
             'Find files by glob pattern, and optionally search their contents in the same call. `patterns` (default ["**/*"]) supports *, ?, **, and [abc] classes; a pattern with no slash also matches file names at any depth. Patterns are matched against each file\'s path RELATIVE TO THE ROOT that found it, never against an absolute path, and every result is prefixed with that root: { "paths": ["src"], "patterns": ["**/*.ts"] } returns "src/a.ts" and "src/nested/b.ts". `paths` (default ["."]) lists the roots to walk, in order; overlapping roots and patterns are deduplicated by real file identity (a symlink alias or a case-alias root is walked once), so a file is reported once, under the first root that reached it. WITHOUT `content` the result is { files, truncated }. WITH `content` (a JavaScript regular expression) every file matching the patterns is read and each matching line is returned as { matches: [{ path, line, text }], truncated }; a pattern that backtracks past the 2-second matching budget is stopped with an error rather than allowed to hang. Content mode skips .git, node_modules, symlinks, binary files, and files larger than 1 MiB. Results are capped (100 by default) across all roots. Does not read .gitignore files.',
         tags: ['files', 'glob', 'search', 'grep', 'find', 'content', 'filesystem'],
+        // R18: fileGlob is core because it is the ONE search surface (filename and
+        // content). There is deliberately no fileSearch alias/tool: the previous
+        // consolidation stays, and its functionality is now always declared.
+        visibility: 'core',
         parameters: {
             type: 'object',
             properties: {

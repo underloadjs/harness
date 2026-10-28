@@ -18,8 +18,10 @@
 // same turn (each event names its agent) and is labelled as a subagent.
 //
 // Layout model:
-//   - every turn is a square-ish tile in a responsive grid that fills left to
-//     right; compact tiles show a preview, the status and counts;
+//   - every turn is a compact, content-height tile in a responsive grid that
+//     fills left to right; a compact tile shows a two-line prompt preview, the
+//     counts and the model, and encodes its state by colour (green completed,
+//     red failed, neutral cancelled) plus a shared activity ring while it works;
 //   - exactly one tile is expanded at a time, and the newest turn is expanded as
 //     soon as it starts;
 //   - expanding an older tile never destroys the newest turn's content: tiles
@@ -38,10 +40,11 @@
 //   - elapsed formatting: playground/src/ui/time.ts
 //   - styles: playground/src/styles.css (`.turns`, `.tile`, `.agent`)
 
-import type { HarnessEvent, SessionTurn, SessionTurnStatus } from '../../../server/protocol';
-import { callIdOf, eventTimesOf, finiteOf } from '../contract';
+import type { HarnessEvent, HarnessUsage, SessionTurn, SessionTurnStatus } from '../../../server/protocol';
+import { callIdOf, eventTimesOf, finiteOf, usageOf } from '../contract';
 import { markdownFragment, plainPreview } from './markdown';
 import { elapsedBetween, formatDuration } from './time';
+import { formatTokens } from './tokens';
 import { createToolCallCard } from './tools';
 import type { ToolCallCard, ToolState } from './tools';
 
@@ -87,6 +90,14 @@ export type TurnHandle = {
     // Current elapsed label text ('' when the span is unknown). Exposed for the
     // meta line tests and for callers that need the value without reading DOM.
     elapsed: () => string;
+    // Server-supplied token tally for this turn: `122,111 (100,301)` — input tokens
+    // with the cached part in brackets — or '' when nothing has reported usage yet.
+    // Set from a live frame (`SessionStreamItem.usage`) or from a hydrated
+    // `SessionTurn.usage`; the tile never invents a figure.
+    tokens: () => string;
+    // Replace the shown tally with the server's running sum. Called per streamed
+    // frame and once per hydrated turn; `undefined` clears the label.
+    setUsage: (usage?: HarnessUsage) => void;
     // Number of agent sections, tool cards and the primary agent name. Exposed
     // for tests and for the tile's meta line.
     summary: () => { agents: number; tools: number; primary?: string };
@@ -139,8 +150,9 @@ const STATE_TEXT: Readonly<Record<TurnState, string>> = {
     cancelled: 'cancelled'
 };
 
-// States that mean "work is in flight". Drives the animated dot; the text next
-// to it is the accessible signal.
+// States that mean "work is in flight". Drives the compact tile's activity ring
+// (styles.css, shared with the agent row); the status text stays in the DOM as
+// the accessible signal even though a compact tile clips it visually.
 const isLive = (state: TurnState): boolean =>
     state === 'queued' || state === 'waiting' || state === 'streaming';
 
@@ -206,6 +218,10 @@ type AgentSection = {
     text: TextBlock | undefined;
     reasoning: { details: HTMLDetailsElement; summary: HTMLElement; body: HTMLElement; buffer: string } | undefined;
     tools: ToolCallCard[];
+    // Active wrapping row for consecutive tool calls, or undefined when the last
+    // flow child was not a tool. Keeping the group alive across calls is what lets
+    // `[websearch][fileRead]` share a line; prose/reasoning/error resets it.
+    toolGroup: HTMLElement | undefined;
 };
 
 // One unresolved tool call. `callId` is the authoritative match; name+order is the
@@ -278,6 +294,13 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         // when the span is unknown (legacy fixture), never "NaN".
         const elapsedLabel = el('span', 'tile-elapsed');
         elapsedLabel.hidden = true;
+        // Server-summed token tally, right after the elapsed label: input tokens
+        // with the cached part in brackets (`122,111 (100,301)`). Hidden until the
+        // first request reports usage, so a provider that sends none leaves the
+        // header clean instead of claiming "0". The `|` separator is CSS
+        // decoration (styles.css), not part of either value.
+        const tokensLabel = el('span', 'tile-tokens');
+        tokensLabel.hidden = true;
         const badge = el('span', 'tile-status');
         badge.dataset.state = 'queued';
         const dot = el('span', 'tile-dot');
@@ -287,7 +310,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
         const promptPreview = el('span', 'tile-prompt', plainPreview(prompt, 220));
         const meta = el('span', 'tile-meta', 'waiting for the first event');
-        top.append(index, elapsedLabel, badge);
+        top.append(index, elapsedLabel, tokensLabel, badge);
         select.append(top, promptPreview, meta);
 
         const body = el('div', 'tile-body');
@@ -354,6 +377,31 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             stopElapsed();
             paintElapsed();
             startElapsed();
+        };
+
+        // --- token tally ----------------------------------------------------
+        // The SERVER owns the sum (server/sessions.ts addUsage): every stream frame
+        // carries the turn's running total and a hydrated turn carries it as
+        // `SessionTurn.usage`, so this tile only ever prints a figure it was given.
+        // It deliberately does NOT accumulate the per-request `usage` events itself:
+        // two accumulators would be two numbers, and a re-render (poll, reload,
+        // terminal snapshot) would have to know which one to trust.
+        //
+        // The label shows input tokens with the cached part in brackets — the same
+        // shape the gateway logs — because input grows cumulatively across a run's
+        // requests (each request re-sends the transcript), which is what "tokens
+        // spent so far" means while the run iterates. See ui/tokens.ts.
+        let tally: HarnessUsage | undefined;
+
+        const paintTokens = (): void => {
+            const text = formatTokens(tally);
+            tokensLabel.textContent = text;
+            tokensLabel.hidden = text.length === 0;
+        };
+
+        const setUsage = (usage?: HarnessUsage): void => {
+            tally = usage;
+            paintTokens();
         };
 
         const sections = new Map<string, AgentSection>();
@@ -439,7 +487,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 role,
                 text: undefined,
                 reasoning: undefined,
-                tools: []
+                tools: [],
+                toolGroup: undefined
             };
 
             sections.set(agentName, section);
@@ -466,7 +515,30 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             section.text = undefined;
         };
 
+        // End the current run of tool calls. The group node stays in the flow (its
+        // cards belong to it); only the pointer is cleared so the next call is
+        // appended to a fresh row after whatever broke the run.
+        const closeToolGroup = (section: AgentSection): void => {
+            section.toolGroup = undefined;
+        };
+
+        // Return the row consecutive calls should join, creating it lazily so no
+        // empty `.tool-group` ever sits in the flow between two prose blocks.
+        const toolGroupOf = (section: AgentSection): HTMLElement => {
+            if (section.toolGroup === undefined) {
+                const group = el('div', 'tool-group');
+                section.flow.append(group);
+                section.toolGroup = group;
+            }
+
+            return section.toolGroup;
+        };
+
         const appendText = (section: AgentSection, delta: string): void => {
+            // Prose after a call ends the tool row: the next call must start below
+            // this text rather than float back up into the previous group.
+            closeToolGroup(section);
+
             if (section.text === undefined) {
                 const node = el('div', 'markdown agent-text');
                 section.flow.append(node);
@@ -479,6 +551,10 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         };
 
         const appendReasoning = (section: AgentSection, delta: string): void => {
+            // Reasoning is its own flow block, so it breaks the chip row exactly
+            // like assistant prose does.
+            closeToolGroup(section);
+
             if (section.reasoning === undefined) {
                 const details = el('details', 'thinking');
                 const summary = el('summary', 'thinking-summary', 'reasoning');
@@ -517,7 +593,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             });
 
             section.tools.push(card);
-            section.flow.append(card.element);
+            toolGroupOf(section).append(card.element);
             pendingTools.push({ card, name, callId, startedAt });
             toolCount += 1;
             updateMeta();
@@ -559,7 +635,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             const section = sections.get(primaryAgent ?? 'unknown') ?? ensureSection('unknown');
             const card = createToolCallCard(name, '');
             card.resolve(content, isError);
-            section.flow.append(card.element);
+            toolGroupOf(section).append(card.element);
             section.tools.push(card);
             toolCount += 1;
             updateMeta();
@@ -618,9 +694,19 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     );
                     break;
 
+                // Per-request usage. Nothing to accumulate here on purpose: the
+                // server sums it and hands the running total over (setUsage) on the
+                // frame that carries this event, and on the recorded turn. Replayed
+                // usage events therefore cost the tile nothing.
+                case 'usage':
+                    break;
+
                 case 'done': {
                     const section = ensureSection(event.agent);
                     closeText(section);
+                    // The agent turn is over: a later call in a new turn gets its
+                    // own row rather than joining calls from the finished turn.
+                    closeToolGroup(section);
 
                     // `done` closes one *agent* turn, which may be a subagent
                     // nested inside a tool call. The user turn only settles when
@@ -638,6 +724,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 case 'error': {
                     const section = ensureSection(event.agent);
                     closeText(section);
+                    // The error notice is not a chip, so the next call starts a
+                    // fresh row below it.
+                    closeToolGroup(section);
                     const error = el('div', 'agent-error');
                     error.append(el('span', 'agent-error-label', 'error'), el('span', 'agent-error-text', event.error.message));
                     section.flow.append(error);
@@ -699,6 +788,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             bind,
             setTiming,
             elapsed: () => elapsedLabel.textContent ?? '',
+            tokens: () => tokensLabel.textContent ?? '',
+            setUsage,
             summary: () => ({ agents: sections.size, tools: toolCount, primary: primaryAgent }),
             destroy
         };
@@ -768,12 +859,18 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             handle.apply(source.events[index], times?.[index], 'recorded');
         }
 
+        // The server's tally is the one to show: replaying the per-request events
+        // would recompute it, and a run whose provider reported nothing has no
+        // tally at all (undefined hides the label rather than printing 0).
+        handle.setUsage(usageOf(source.usage));
+
         const next = stateOf(source.status);
-        const settled = next === 'done' || next === 'error' || next === 'cancelled';
-        // `model · status` in the meta line keeps a reloaded tile as informative
-        // as the one that streamed live. A running turn has no detail: its meta
-        // is the agent/tool count and the live status badge already says more.
-        handle.setState(next, settled && model !== undefined && model.length > 0 ? `${model} · ${source.status}` : undefined);
+        // The meta line carries only the model; the state is painted by the
+        // `.tile-status` dot and the tile's state border (styles.css), so
+        // repeating "done"/"error" here would be a second, redundant label. A
+        // running turn also has no detail: its agent/tool count and the live
+        // status badge already say more.
+        handle.setState(next, model !== undefined && model.length > 0 ? model : undefined);
         handle.flush();
 
         return handle;

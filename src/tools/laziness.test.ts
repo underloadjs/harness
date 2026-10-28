@@ -55,9 +55,9 @@ describe('lazy preset tools', () => {
             'Read one or more UTF-8 text files and return their contents. Pass an array of paths and get an ordered array of { path, content } entries in the same order. One missing or unreadable path rejects the whole call, so a short answer never looks complete. Paths are absolute or relative to the working directory.'
         );
         expect(presetTools.fileRead.tags).toEqual(['files', 'read', 'filesystem']);
-        // Searchable by catalogue metadata: discovery must enable it, but that
-        // changes no laziness property.
-        expect(presetTools.fileRead.visibility).toBe('searchable');
+        // Core by catalogue metadata (R18): declared up front, but that changes no
+        // laziness property — the body still loads only on first call.
+        expect(presetTools.fileRead.visibility).toBe('core');
         expect(presetTools.fileRead.parameters).toEqual({
             type: 'object',
             properties: {
