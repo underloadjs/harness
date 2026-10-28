@@ -311,6 +311,61 @@ export type HarnessDelegationResult = {
     content: string;
 };
 
+// ---------------------------------------------------------------------------
+// todoTools (per-harness session todos)
+// ---------------------------------------------------------------------------
+//
+// A harness-specific incremental todo API. It is intentionally NOT OpenCode's
+// experimental `todowrite`: actions mutate one item at a time, ids are stable
+// strings, and the list is session state rather than full-list replacement.
+// See src/core/todo.ts and README.md for the source-backed reference.
+
+// Every accepted action. `uncheck` is an explicit alias for `check` with
+// `completed: false`.
+export type TodoAction = 'add' | 'remove' | 'check' | 'uncheck' | 'list';
+
+// One stored todo. `id` is a decimal string, monotonic within one harness
+// instance (and restarted by reset()).
+export type TodoItem = {
+    id: string;
+    text: string;
+    completed: boolean;
+};
+
+// The model-facing arguments. Only `action` is required; each action reads the
+// fields it needs (add → text, remove/check/uncheck → id, check → completed).
+export type TodoParameters = {
+    action: TodoAction;
+    text?: string;
+    id?: string;
+    completed?: boolean;
+};
+
+// Counts are derived on every call so the model does not have to list and count.
+export type TodoCounts = {
+    total: number;
+    completed: number;
+    remaining: number;
+};
+
+// Every todoTools result is a snapshot: `todos` is always a copy of the current
+// list, plus the affected item and/or counts. `todo` is present for add/check/
+// uncheck, `removed` for remove.
+export type TodoResult = {
+    todos: TodoItem[];
+    todo?: TodoItem;
+    removed?: TodoItem;
+    counts: TodoCounts;
+};
+
+// What createTodoTool() returns: the core tool plus the reset hook a harness
+// stores with its own handle. State lives in the factory closure, never in a
+// module singleton, so two harnesses cannot share todos.
+export type TodoToolset = {
+    tool: Tool<TodoParameters, TodoResult>;
+    reset: () => void;
+};
+
 // What a tool implementation is handed when the model calls it.
 //
 // The harness fields are optional because a tool can also be executed on its
@@ -375,6 +430,73 @@ export type Tool<TParameters = any, TResult = any> = {
 };
 
 // ---------------------------------------------------------------------------
+// Web search (opt-in)
+// ---------------------------------------------------------------------------
+//
+// One model-facing tool, `websearch`, backed by a hosted search API. The keys are
+// provider credentials, so they are resolved once at harness construction and
+// never appear in a tool schema, argument, result, or progress event (W3).
+//
+// Cross-references:
+//   - tools/websearch/index.ts  — createWebsearchTool, the per-harness factory
+//   - harness.ts                — `websearch` configuration field wiring
+export type WebsearchProvider = 'exa' | 'tavily';
+
+// A key, or a getter that reads it from a store when the harness is constructed.
+// A getter is called once per harness construction and the captured key serves
+// every search (no per-request rotation), so `process.env` is never read per call
+// and two harnesses can hold different keys.
+export type WebsearchCredential = string | (() => string | undefined);
+
+export type WebsearchProviderConfiguration = {
+    // Explicit override for this provider. When omitted the factory reads the
+    // provider's environment variable (EXA_API_KEY / TAVILY_API_KEY) instead.
+    apiKey?: WebsearchCredential;
+};
+
+export type WebsearchConfiguration = {
+    // Environment snapshot to read the two key variables from. Tests and
+    // deployments can inject one; the default is `process.env` (never a dotenv
+    // autoload — the caller owns that).
+    env?: Readonly<Record<string, string | undefined>>;
+    // Explicit per-provider keys. A provider with no key (here or in `env`) is
+    // simply absent: it is not registered and not offered to the model.
+    exa?: WebsearchProviderConfiguration;
+    tavily?: WebsearchProviderConfiguration;
+};
+
+// The model-facing argument shape. `query` is the only required property; having
+// more than one property keeps the object wrapper intact (see the single-property
+// rule in core/tool.ts), and both optional fields are validated in execute.
+export type WebsearchParameters = {
+    query: string;
+    // Requested result count. Defaults to 5 and is clamped to 1–20.
+    maxResults?: number;
+    // Which configured provider to use. Omitted = the first configured one
+    // (Exa before Tavily), so a single-key setup needs no decision.
+    provider?: WebsearchProvider;
+};
+
+// One normalized result. Every field is present (possibly empty) so the model
+// sees a stable shape regardless of provider. `snippet` is the provider's
+// highlight/content excerpt, truncated and treated as untrusted data.
+export type WebsearchMatch = {
+    title: string;
+    url: string;
+    snippet: string;
+    // Provider-reported publication date, when it sends one.
+    published?: string;
+};
+
+export type WebsearchResult = {
+    provider: WebsearchProvider;
+    query: string;
+    // The count actually requested from the provider, after clamping.
+    maxResults: number;
+    results: WebsearchMatch[];
+};
+
+// ---------------------------------------------------------------------------
 // Harness (the execution loop)
 // ---------------------------------------------------------------------------
 
@@ -411,6 +533,16 @@ export type HarnessConfiguration = {
     // delegation is one level deep by construction.
     subagents?: readonly string[];
 
+    // Maximum number of tool rounds one agent run may take before the harness
+    // treats it as a runaway loop: history is truncated back to the start of the
+    // call and the harness throws. Defaults to 16, the library guard. Must be a
+    // positive safe integer; validated at construction so a typo fails before a
+    // long run. There is no "unlimited" value. The same bound applies to every run
+    // in this harness (entry, ctx.run, and delegated subagents); each run gets its
+    // own budget. The bundled application presets set 1000 for real work — see
+    // harnesses/presets.ts.
+    maxIterations?: number;
+
     // Every tool the harness can run. Keyed by the name the model calls. Only
     // `visibility: 'core'` tools are declared up front; the rest are found
     // through the built-in getTools tool and enabled for the next turn.
@@ -420,6 +552,14 @@ export type HarnessConfiguration = {
     // asked for. Set false to start from `tools` alone. A configured tool wins on
     // a name collision.
     presets?: boolean;
+    // Opt-in web search. `true` reads EXA_API_KEY / TAVILY_API_KEY from this
+    // process's environment and registers one searchable `websearch` tool; an
+    // object does the same with an injected env or explicit key overrides. Off
+    // when absent or false, and absent when neither key is present — so a
+    // default harness never carries a network tool it cannot use. Secrets stay in
+    // the constructed tool closure: no schema value, argument, result, or event
+    // carries them. A configured tool named `websearch` wins over this field.
+    websearch?: boolean | WebsearchConfiguration;
     // Reporting hooks. `progress` is awaited for every step, so a slow UI can
     // pace the run, and a `console.log` can just print.
     report?: {
@@ -443,8 +583,8 @@ export type Harness = {
     // not configured.
     readonly subagents: Readonly<Record<string, Agent>>;
     // The registered tools, keyed by the names the model calls. Includes the
-    // built-in getTools and createTool entries, plus delegate when there is at
-    // least one subagent.
+    // built-in getTools, createTool, and todoTools entries, plus delegate when
+    // there is at least one subagent.
     readonly tools: Readonly<Record<string, Tool>>;
     // Register a tool from source at runtime. This is the host-side path the
     // model-facing createTool tool uses: same validation, same registry, same
@@ -453,9 +593,10 @@ export type Harness = {
     createTool: (configuration: ToolCreation) => Tool;
     // Names of the applied plugins, in order.
     readonly plugins: readonly string[];
-    // Reset the entry agent's conversation and forget which tools getTools had
-    // enabled, so the next run starts from the core set again. Created tools stay
-    // registered (they are part of the catalogue), just not enabled.
+    // Reset the entry agent's conversation, forget which tools getTools had
+    // enabled, and clear the session todo list, so the next run starts from the
+    // core set again. Created tools stay registered (they are part of the
+    // catalogue), just not enabled.
     reset: () => void;
 };
 

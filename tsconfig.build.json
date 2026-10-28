@@ -22,6 +22,9 @@
         "playground",
         "server",
         "cli",
-        "harnesses"
+        "harnesses",
+        // The service-hosted endpoint modules (discovered by @underload/service)
+        // are application wiring, never part of the published library.
+        "endpoint"
     ]
 }

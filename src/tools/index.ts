@@ -6,6 +6,8 @@
 //   syntax/   javascriptSyntax, pythonSyntax
 //   files/    readFile, writeFile, editFile, listFiles, searchFiles, globFiles
 //   command/  runCommand, gitDiff
+//   websearch/ websearch — opt-in, per-harness (NOT in `presetTools`: it needs a
+//             provider key, which belongs to one harness; see createWebsearchTool)
 //
 // Lazy, not eager (R1b)
 // --------------------
@@ -76,6 +78,21 @@ export type {
     SearchFilesResult
 } from './files';
 export type { GitDiffParameters, GitDiffResult, RunCommandResult } from './command';
+
+// Web search is intentionally outside `presetTools`: a preset is shared by every
+// harness, while a search tool closes over that harness's key. harness.ts calls
+// this factory only when `websearch` is configured, and the factory returns
+// undefined when no provider key is available.
+export { createWebsearchTool, WEBSEARCH_METADATA, WEBSEARCH_TOOL_NAME } from './websearch';
+export type { WebsearchMetadata } from './websearch';
+export type {
+    WebsearchConfiguration,
+    WebsearchMatch,
+    WebsearchParameters,
+    WebsearchProvider,
+    WebsearchProviderConfiguration,
+    WebsearchResult
+} from '../types';
 
 // The preload catalogue, keyed by the name the model calls. `harness()` spreads
 // this into its registry by default, and the harness app's server uses it to offer

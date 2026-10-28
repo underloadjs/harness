@@ -112,11 +112,31 @@ const searchNotes = tool<string, { title: string; excerpt: string }[]>({
     }
 });
 
+// Deterministic local condensation: the first two sentences, whitespace
+// collapsed. Used when there is no `summarizer` agent to hand the notes to —
+// which is the normal case for Instruct/Workspace, whose agent configuration has
+// no subagents. One shared toolbox means this tool must work in every live
+// harness, so the fallback is a real summary rather than a silent no-op.
+const condense = (notes: string): string => {
+    const cleaned = notes.trim().replace(/\s+/g, ' ');
+
+    if (cleaned.length === 0) return '';
+
+    return cleaned
+        .split(/(?<=[.!?])\s+/)
+        .filter((sentence) => sentence.length > 0)
+        .slice(0, 2)
+        .join(' ');
+};
+
 // The tool-side half of a multi-agent run: `run(name, input)` is only present
-// inside a harness, so a direct call falls back to returning the notes untouched.
+// inside a harness. Research configures a `summarizer` subagent so this tool
+// delegates to it; every other live harness shares the same tool but has no such
+// agent, so it condenses locally (see `condense` above). A direct server call has
+// neither `run` nor `agents`, and gets the same local fallback.
 const summarize = tool<string, string>({
     description:
-        'Hand the collected notes to the summarizer agent and return its summary. Use this once you have notes worth compressing.',
+        'Summarise collected notes in at most two sentences. When the harness configures a summarizer subagent this hands the notes to it; otherwise it condenses them locally.',
     tags: ['summarize', 'text', 'agents'],
     parameters: {
         type: 'object',
@@ -126,8 +146,12 @@ const summarize = tool<string, string>({
         required: ['notes'],
         additionalProperties: false
     },
-    execute: async ({ parameters: notes, run }) => {
-        if (!run) return notes;
+    execute: async ({ parameters: notes, run, agents }) => {
+        // `agents` is the harness registry; a missing `summarizer` key is the
+        // documented agent-configuration difference, not an error.
+        const summarizer = agents?.summarizer;
+
+        if (!run || summarizer === undefined) return condense(notes);
 
         const message = await run('summarizer', `Summarise these notes in at most two sentences:\n\n${notes}`);
         return message.content;

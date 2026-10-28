@@ -7,14 +7,15 @@
 //   harness "summarise this"          one task, exit
 //   harness                           interactive session (TTY)
 //   echo "a task" | harness           one task from stdin
-//   harness --preset writer --json    newline-delimited events
+//   harness --preset instruct --json    newline-delimited events
 //   harness --serve                   API + built UI on http://127.0.0.1:5181
 
 import { createInterface } from 'node:readline';
 import { parseArgs } from 'node:util';
-import { catalogue, findPreset, presets } from '../harnesses';
+import { createToolCatalogue, findPreset, presets } from '../harnesses';
 import type { HarnessPreset, RunnerSettings } from '../harnesses/types';
 import { loadConfiguration } from '../server/config';
+import { loadEnvironmentFile } from '../server/environment';
 import { startHarnessServer } from '../server/index';
 import type { Harness } from '../src/harness';
 import { createRenderer } from './render';
@@ -48,6 +49,7 @@ Options:
 
 Environment:
   HARNESS_BASE_URL, HARNESS_API_KEY, HARNESS_MODEL
+  EXA_API_KEY, TAVILY_API_KEY   web search for live presets (opt-in, per key)
 `);
 };
 
@@ -59,17 +61,29 @@ const printPresets = (): void => {
     }
 };
 
+// Built per call, after `loadEnvironmentFile()` (bottom of this file), so a search
+// key from `.env` is visible. Never a module-level snapshot: that would capture
+// the environment before the file is read.
 const printTools = (): void => {
+    const catalogue = createToolCatalogue();
     let group = '';
 
-    for (const entry of catalogue) {
+    for (const entry of catalogue.entries) {
         if (entry.group !== group) {
             group = entry.group;
             console.log(`\n${group}`);
         }
 
+        // The columns match the old output exactly. An unconfigured entry appends
+        // the hint instead of pretending the tool is callable, and the hint names
+        // environment variables only (never a value).
+        const availability =
+            entry.availability?.state === 'unconfigured'
+                ? `  [unconfigured — ${entry.availability.hint ?? 'set a provider key and restart'}]`
+                : '';
+
         console.log(
-            `  ${entry.name.padEnd(20)} ${entry.tool.visibility.padEnd(11)} ${entry.tool.tags.join(', ').padEnd(30)} ${entry.tool.description}`
+            `  ${entry.name.padEnd(20)} ${entry.visibility.padEnd(11)} ${entry.tags.join(', ').padEnd(30)} ${entry.description}${availability}`
         );
     }
 };
@@ -388,5 +402,9 @@ const main = async (): Promise<void> => {
 
     await oneShot(preset, settings, renderer, piped, json);
 };
+
+// Load the package-root `.env` before `main()` can read HARNESS_* in
+// `settingsFrom` or construct a preset that captures EXA_/TAVILY_API_KEY.
+loadEnvironmentFile();
 
 await main();

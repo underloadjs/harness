@@ -230,7 +230,6 @@ body {
 }
 
 /* Mode switch ---------------------------------------------------------- */
-
 .modes {
     display: grid;
     grid-template-columns: 1fr 1fr;
@@ -304,6 +303,87 @@ body {
     color: var(--muted);
     font-family: var(--mono);
     font-size: 10.5px;
+}
+
+/* A listed-but-unconfigured tool (websearch without a provider key) stays
+   clickable so its hint and schema are readable, but the state must not look
+   like a working tool. Colour is decoration; the text says "unconfigured". */
+.tool-button[data-availability='unconfigured'] .tool-kind {
+    color: var(--warn);
+}
+
+/* Session directory ----------------------------------------------------- */
+/* Server-owned conversations. The active row is the session this card is
+   pointed at; the status text (not just colour) says whether it is running. */
+
+.sessions {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+
+.sessions-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+}
+
+.button.small {
+    padding: 5px 8px;
+    font-size: 12px;
+}
+
+.session-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.session {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 7px 10px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: var(--bg-elevated);
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.session:hover {
+    border-color: var(--border-strong);
+}
+
+.session[data-active='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+.session-harness {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    color: var(--accent);
+}
+
+.session-meta {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+}
+
+.session[data-status='running'] .session-meta {
+    color: var(--warn);
+}
+
+.session-prompt {
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+    text-overflow: ellipsis;
 }
 
 /* Direct tool runner --------------------------------------------------- */

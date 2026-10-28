@@ -6,6 +6,9 @@
 //                  uses). Pure, so tooling and UIs can reuse the ranking.
 //   createDynamicTool() — validate + compile a tool from an async function body.
 //                  The primitive behind the harness's createTool tool.
+//   createTodoTool() — the harness's per-session todoTools state, as a factory.
+//                  State stays in the closure so a harness (and nothing global)
+//                  owns it. See ../core/todo.ts.
 //
 // Both factories are usable on their own. An agent on its own means writing the
 // loop by hand: send a message, read `message.toolCalls`, run the tools, append
@@ -19,3 +22,4 @@ export { agent } from './agent';
 export { tool, toolParameterKey, normalizeTags } from './tool';
 export { searchTools } from './discovery';
 export { compileToolSource, createDynamicTool } from './creation';
+export { createTodoTool } from './todo';

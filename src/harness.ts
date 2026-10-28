@@ -29,7 +29,8 @@
 //   - an unknown tool, an undiscovered tool, malformed arguments, or a throwing
 //     tool becomes a tool result the model can read and recover from — it does
 //     not end the run;
-//   - exceeding MAX_ITERATIONS, or a transport failure, ends the run: history is
+//   - exceeding the configured tool-loop limit (`maxIterations`, default
+//     DEFAULT_MAX_ITERATIONS), or a transport failure, ends the run: history is
 //     truncated back to where the call started and the harness throws.
 //
 // Tool visibility:
@@ -48,9 +49,10 @@
 // Undiscovered tools are not callable, so the model cannot skip discovery by
 // guessing a name.
 //
-// Three harness-owned names sit outside that scheme:
+// Harness-owned names sit outside that scheme:
 //   - getTools    — discovery, described above.     (every agent, core)
 //   - createTool  — compile-and-register a tool.    (every agent, core)
+//   - todoTools   — the session todo list.           (every agent, core)
 //   - delegate    — hand a task to a subagent.      (primary agent only, core)
 //
 // createTool is the R2b capability: the model can author a JavaScript tool body
@@ -58,6 +60,11 @@
 // source is compiled but never executed at registration. There is NO sandbox: a
 // created tool runs with this process's permissions, the same trust model as the
 // runCommand preset. See core/creation.ts for the validated bounds.
+//
+// todoTools is session state, not catalogue state: a fresh list is created for
+// each harness() call, shared by every agent in that harness, and cleared by
+// reset() with the conversation. That is why it is built by a factory closure
+// (core/todo.ts) rather than registered as a module singleton.
 //
 // delegate is bounded delegation (R4): `primary` selects the entry agent, and
 // `subagents` is the allowlist the primary may delegate to. The tool is not
@@ -74,6 +81,7 @@
 //   - core/tool      — what gets executed, and where tags/visibility live
 //   - core/discovery — the tag ranking behind getTools
 //   - core/creation  — compile-and-register behind createTool
+//   - core/todo      — the per-harness todo list behind todoTools
 //   - types          — Harness, HarnessEvent, HarnessConfiguration
 //
 // This is the only source file at the root of src/. Everything else lives in a
@@ -86,9 +94,10 @@ import {
     tool as defineTool,
     searchTools,
     toolParameterKey,
-    createDynamicTool
+    createDynamicTool,
+    createTodoTool
 } from './core';
-import { presetTools } from './tools';
+import { presetTools, createWebsearchTool, WEBSEARCH_TOOL_NAME } from './tools';
 import { runPlugins } from './plugin';
 import type {
     Agent,
@@ -109,22 +118,43 @@ import type {
 } from './types';
 
 // Hard stop for a model that keeps requesting tools forever. This is a guard,
-// not a policy knob: a runaway loop must not be able to run a CLI process out of
-// money or stack.
-const MAX_ITERATIONS = 16;
+// not a policy knob, so the library default stays deliberately small; a real
+// agent session can raise it with `harness({ maxIterations })` (the application
+// presets do, see harnesses/presets.ts). A runaway loop must not be able to run a
+// CLI process out of money or stack, so `maxIterations` is validated at
+// construction (positive safe integer) and can never be Infinity.
+const DEFAULT_MAX_ITERATIONS = 16;
+
+// Validate and resolve the configured tool-loop bound. Rejecting anything that is
+// not a positive safe integer keeps the guard meaningful: 0 would make every tool
+// request fail, 1.5/NaN/Infinity have no well-defined round count, and values
+// beyond Number.MAX_SAFE_INTEGER cannot be counted exactly.
+const resolveMaxIterations = (value: number | undefined): number => {
+    if (value === undefined) return DEFAULT_MAX_ITERATIONS;
+
+    if (!Number.isSafeInteger(value) || value < 1) {
+        throw new HarnessError(
+            `maxIterations must be a positive safe integer; received ${String(value)}.`
+        );
+    }
+
+    return value;
+};
 
 // The discovery entry point. The harness owns this name: the whole visibility
 // scheme depends on there being exactly one tool that can enable the rest.
 const GET_TOOLS = 'getTools';
 
-// Runtime tool creation (R2b) and bounded delegation (R4). Both are model-facing
-// core tools, so their wire names are part of the harness contract.
+// Runtime tool creation (R2b), the session todo list, and bounded delegation
+// (R4). All are model-facing core tools, so their wire names are part of the
+// harness contract.
 const CREATE_TOOL = 'createTool';
+const TODO_TOOLS = 'todoTools';
 const DELEGATE = 'delegate';
 
 // Names no configured, preset, plugin, or model-created tool may take. Keeping
 // the whole list in one place is what makes the reservation check exhaustive.
-const RESERVED_TOOL_NAMES = [GET_TOOLS, CREATE_TOOL, DELEGATE] as const;
+const RESERVED_TOOL_NAMES = [GET_TOOLS, CREATE_TOOL, TODO_TOOLS, DELEGATE] as const;
 
 // Budget for createTool: registration is cheap but not free, and an unbounded
 // registry defeats the point of discovery. Session-local (no filesystem writes),
@@ -151,6 +181,12 @@ const unwrapParameters = (definition: Tool, parsed: Record<string, unknown>): un
 };
 
 export const harness = (configuration: HarnessConfiguration): Harness => {
+    // Resolve the loop bound once, before anything is built, so a bad value fails
+    // at construction instead of after a long run. The bound applies to every agent
+    // run in this harness (entry, ctx.run, and delegated subagents); each run gets
+    // its own budget because the check lives in runAgentCore's loop.
+    const maxIterations = resolveMaxIterations(configuration.maxIterations);
+
     const agentNames = Object.keys(configuration.agents ?? {});
     if (agentNames.length === 0) {
         throw new HarnessError('A harness requires at least one agent.');
@@ -234,6 +270,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         definition.name = name;
         tools[name] = definition;
+    }
+
+    // Opt-in web search (W3). `websearch: true` (or a configuration object) builds
+    // one searchable tool from the keys available to THIS harness; `presets: false`
+    // does not disable it, because it is not part of the preset catalogue. Rules:
+    //   - a configured tool named `websearch` wins: the caller brought its own;
+    //   - no usable key means no tool at all (the factory returns undefined), so a
+    //     keyless deployment and a default harness stay offline-safe;
+    //   - keys resolve now, at construction, and live only in the tool closure, so
+    //     two harnesses never share a credential and nothing reaches the schema,
+    //     arguments, results, or progress events.
+    // This runs before the reserved-name check on purpose: `websearch` is not a
+    // harness-reserved name, only a name the harness fills when asked to.
+    if (
+        configuration.websearch !== undefined &&
+        configuration.websearch !== false &&
+        tools[WEBSEARCH_TOOL_NAME] === undefined
+    ) {
+        const websearch = createWebsearchTool(
+            configuration.websearch === true ? {} : configuration.websearch
+        );
+
+        if (websearch) tools[WEBSEARCH_TOOL_NAME] = websearch;
     }
 
     // The harness owns its core names. Checked after presets and configured tools
@@ -400,6 +459,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return result;
         }
     });
+
+    // Session todos (R1/R2). One instance per harness: the tool closes over its
+    // own list and id counter, so two harnesses (and therefore two server
+    // sessions) can never share todos. Every agent in this harness calls the same
+    // tool, so the primary and its subagents see one list. reset() below clears
+    // it together with the conversation; nothing is persisted.
+    const todo = createTodoTool();
+    tools[TODO_TOOLS] = todo.tool;
 
     // Bounded delegation (R4). Registered only when there is somewhere to
     // delegate: a tool that can only fail would cost context on every request.
@@ -598,7 +665,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         brain.user(input);
 
         try {
-            for (let iteration = 0; iteration < MAX_ITERATIONS; iteration++) {
+            for (let iteration = 0; iteration < maxIterations; iteration++) {
                 let message: HarnessAssistantMessage | undefined;
 
                 for await (const event of brain.turn({ signal: options?.signal, tools: declarations(brain) })) {
@@ -637,7 +704,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             }
 
             throw new HarnessError(
-                `Agent "${brain.name}" requested tools more than ${MAX_ITERATIONS} times without answering.`
+                `Agent "${brain.name}" requested tools more than ${maxIterations} times without answering.`
             );
         } catch (error) {
             brain.messages.splice(commitIndex);
@@ -726,13 +793,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // the failure into a tool result.
         createTool: createToolFrom,
         // reset() is "start over": the conversation goes back to the seeded
-        // instructions, and tool discovery is forgotten with it, so the next run
-        // begins from the core set again. Tools created at runtime stay in the
+        // instructions, tool discovery is forgotten with it, and the session
+        // todo list is cleared (ids restart at "1"), so the next run begins from
+        // the core set and an empty plan. Tools created at runtime stay in the
         // catalogue (they are registry state, not conversation state); they are
         // simply no longer enabled until discovered again.
         reset: () => {
             primary.reset();
             activeTools.clear();
+            todo.reset();
         }
     }) as Harness;
 
@@ -782,6 +851,9 @@ export {
     globFiles,
     runCommand,
     gitDiff,
+    createWebsearchTool,
+    WEBSEARCH_METADATA,
+    WEBSEARCH_TOOL_NAME,
     presetTools
 } from './tools';
 export type {

@@ -1,11 +1,21 @@
 // Turn tiles: one tile per logical user → assistant exchange.
 //
-// The harness streams a single, flat event list (`start`, `text`, `reasoning`,
-// `tool_call`, `tool_result`, `done`, `error`) and never says "this is a new
-// user turn". The UI knows because *it* submitted the prompt, so a turn is
-// created on submit and every event that follows belongs to it until the stream
-// ends. Delegation — one agent calling another — shows up as extra agents inside
-// the same turn (each event names its agent) and is labelled as a subagent.
+// Turn boundaries are server data, not browser inference. The server records one
+// `SessionTurn` per submitted task (`id`, `index`, `prompt`, `status`, `events`)
+// and returns that list from `GET /sessions`, `GET /sessions/:id` and in the
+// terminal frame of every stream. This module renders those records:
+//
+//   - `begin(prompt)` creates an optimistic tile for a prompt the browser is
+//     about to submit, before the server has a turn for it;
+//   - `bind(turn)` attaches the server id/index when the stream's opening `turn`
+//     frame arrives, so later `event` frames route by explicit id;
+//   - `adopt(turn)` / `hydrate(turns)` rebuild tiles from a server snapshot by
+//     replaying the recorded events in order. This is how a reload, a session
+//     selection or an in-progress poll renders history: the server record wins
+//     over anything the browser had projected locally.
+//
+// Delegation — one agent calling another — shows up as extra agents inside the
+// same turn (each event names its agent) and is labelled as a subagent.
 //
 // Layout model:
 //   - every turn is a square-ish tile in a responsive grid that fills left to
@@ -27,7 +37,7 @@
 //   - lifecycle status (topbar pill): playground/src/main.ts (`setLifecycle`)
 //   - styles: playground/src/styles.css (`.turns`, `.tile`, `.agent`)
 
-import type { HarnessEvent } from '../../../server/protocol';
+import type { HarnessEvent, SessionTurn, SessionTurnStatus } from '../../../server/protocol';
 import { markdownFragment, plainPreview } from './markdown';
 import { createToolCallCard } from './tools';
 import type { ToolCallCard, ToolState } from './tools';
@@ -36,7 +46,14 @@ import type { ToolCallCard, ToolState } from './tools';
 // `queued` means the browser has the prompt but has not got a session yet,
 // `waiting` means the request is on the wire and the first event has not arrived.
 // Anything later is driven by real events, never by a timer.
+//
+// Server statuses map onto this set one-to-one (`running` → `streaming`); the two
+// pre-request states only ever exist for an optimistic browser-created tile.
 export type TurnState = 'queued' | 'waiting' | 'streaming' | 'done' | 'error' | 'cancelled';
+
+// Server status → tile state. A running server turn is "streaming" even when the
+// browser is polling a snapshot instead of holding a live stream.
+const stateOf = (status: SessionTurnStatus): TurnState => (status === 'running' ? 'streaming' : status);
 
 export type TurnHandle = {
     element: HTMLElement;
@@ -49,9 +66,24 @@ export type TurnHandle = {
     // Render every pending incremental update immediately. Called when a turn
     // settles so the final text is never one frame behind the status.
     flush: () => void;
+    // Server turn id, once the opening `turn` frame (or a snapshot) supplied one.
+    // Undefined while the tile is an optimistic prompt with no server record yet.
+    id: () => string | undefined;
+    // Attach the server's identity for this turn and mirror its 1-based display
+    // position. Called on the opening `turn` frame and when adopting a snapshot.
+    bind: (turn: Pick<SessionTurn, 'id' | 'index'>) => void;
     // Number of agent sections, tool cards and the primary agent name. Exposed
     // for tests and for the tile's meta line.
     summary: () => { agents: number; tools: number; primary?: string };
+};
+
+export type HydrateOptions = {
+    // Session model, appended to a settled tile's meta so a reloaded transcript
+    // still answers "which model ran this?".
+    model?: string;
+    // Server turn id to keep expanded across the rebuild. Defaults to whichever
+    // tile was expanded before `hydrate` cleared the board.
+    keep?: string;
 };
 
 export type TurnBoard = {
@@ -63,6 +95,14 @@ export type TurnBoard = {
     collapse: () => void;
     expanded: () => TurnHandle | undefined;
     turns: () => readonly TurnHandle[];
+    // Find a tile by server turn id. This is how a stream `event` frame with an
+    // explicit `turnId` finds its tile without guessing from stream order.
+    find: (id: string) => TurnHandle | undefined;
+    // Build one tile from an authoritative server record (replays its events).
+    adopt: (turn: SessionTurn, model?: string) => TurnHandle;
+    // Replace the whole board with the server's turns. Returns the new handles;
+    // any previous handle is detached and must not be used again.
+    hydrate: (turns: readonly SessionTurn[], options?: HydrateOptions) => TurnHandle[];
 };
 
 const STATE_TEXT: Readonly<Record<TurnState, string>> = {
@@ -180,12 +220,18 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
     const begin = (prompt: string): TurnHandle => {
         sequence += 1;
+        return create(prompt, sequence);
+    };
+
+    // One tile, shared by the optimistic `begin` path and server adoption. The
+    // label is the 1-based display position; a server turn overrides it through
+    // `bind()` so a hydrated transcript is numbered by the server's `index`.
+    const create = (prompt: string, label: number): TurnHandle => {
         empty?.remove();
 
         const id = `turn-${++nextId}`;
         const card = el('article', 'tile');
         card.dataset.state = 'queued';
-        card.dataset.turn = String(sequence);
 
         const select = el('button', 'tile-select');
         select.type = 'button';
@@ -193,7 +239,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         select.setAttribute('aria-controls', `${id}-body`);
 
         const top = el('span', 'tile-top');
-        const index = el('span', 'tile-index', `#${sequence}`);
+        const index = el('span', 'tile-index', `#${label}`);
         const badge = el('span', 'tile-status');
         badge.dataset.state = 'queued';
         const dot = el('span', 'tile-dot');
@@ -223,6 +269,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         let detail: string | undefined;
         let primaryAgent: string | undefined;
         let toolCount = 0;
+        // Server identity for this tile. Absent until `bind()` or a snapshot.
+        let serverId: string | undefined;
 
         const sections = new Map<string, AgentSection>();
         // Calls whose result has not arrived yet. The protocol does not carry a
@@ -448,6 +496,16 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             for (const section of sections.values()) flushText(section);
         };
 
+        // Attach the server identity. `index` is 0-based on the wire; tiles are
+        // numbered from 1 so the first turn reads "#1". A late bind (the opening
+        // `turn` frame) is normal, not an error: the optimistic tile existed
+        // before the request reached the server.
+        const bind = (server: Pick<SessionTurn, 'id' | 'index'>): void => {
+            serverId = server.id;
+            card.dataset.turnId = server.id;
+            index.textContent = `#${server.index + 1}`;
+        };
+
         // Clicking the header expands a compact tile; clicking the expanded tile
         // collapses it back to the grid (so the whole conversation is visible at
         // once). Only one tile is ever expanded.
@@ -463,6 +521,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             setState,
             apply,
             flush,
+            id: () => serverId,
+            bind,
             summary: () => ({ agents: sections.size, tools: toolCount, primary: primaryAgent })
         };
 
@@ -495,6 +555,48 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         if (empty !== undefined) element.append(empty);
     };
 
+    // Route lookup by explicit server id. A stream frame names its `turnId`, so
+    // the board never has to guess which tile a delta belongs to.
+    const find = (id: string): TurnHandle | undefined => turns.find((candidate) => candidate.id() === id);
+
+    // Rebuild one tile from the server's record. Replaying the events (rather
+    // than trusting browser state) is what makes a reload render the same
+    // transcript: `events` includes subagent events the server recorded.
+    const adopt = (source: SessionTurn, model?: string): TurnHandle => {
+        sequence += 1;
+
+        const handle = create(source.prompt, source.index + 1);
+        handle.bind(source);
+
+        for (const event of source.events) handle.apply(event);
+
+        const next = stateOf(source.status);
+        const settled = next === 'done' || next === 'error' || next === 'cancelled';
+        // `model · status` in the meta line keeps a reloaded tile as informative
+        // as the one that streamed live. A running turn has no detail: its meta
+        // is the agent/tool count and the live status badge already says more.
+        handle.setState(next, settled && model !== undefined && model.length > 0 ? `${model} · ${source.status}` : undefined);
+        handle.flush();
+
+        return handle;
+    };
+
+    // Replace the board with the server's authoritative turn list. Expansion is
+    // carried across the rebuild by turn id, so a reader looking at an older
+    // turn is not yanked to the end by a poll or a terminal snapshot.
+    const hydrate = (sources: readonly SessionTurn[], options: HydrateOptions = {}): TurnHandle[] => {
+        const keepId = options.keep ?? expandedTurn?.id();
+
+        clear();
+
+        const handles = sources.map((source) => adopt(source, options.model));
+
+        const kept = keepId === undefined ? undefined : handles.find((handle) => handle.id() === keepId);
+        if (kept !== undefined) expand(kept);
+
+        return handles;
+    };
+
     return {
         element,
         begin,
@@ -503,7 +605,10 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         expand,
         collapse,
         expanded: () => expandedTurn,
-        turns: () => turns
+        turns: () => turns,
+        find,
+        adopt,
+        hydrate
     };
 };
 

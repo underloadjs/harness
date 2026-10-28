@@ -23,6 +23,8 @@ npm-debug.log*
 # Local env / secrets
 .env
 .env.*
+# Keep the placeholder template tracked so `cp .env.example .env` is discoverable.
+!.env.example
 
 # OS junk
 .DS_Store

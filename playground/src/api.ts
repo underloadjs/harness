@@ -1,26 +1,138 @@
 // The browser client for the harness server.
 //
-// The UI has no harness code of its own. It creates a session, submits tasks, and
-// renders the SSE stream the server sends back. Every endpoint lives under
-// `/api`; in development Vite mounts the same handler, and in production the
-// harness server serves both this bundle and the API.
+// The UI has no harness code of its own. It loads the server catalogue and
+// session list, creates a session, submits tasks, and renders the SSE stream the
+// server sends back. The same client works against both supported mounts:
+//
+//   - `/v1/harness` — canonical @underload/service root, which serves the
+//     bootstrap document at GET root;
+//   - `/api`        — standalone node server, whose root is a 404 and whose
+//     per-resource routes (`/harnesses`, `/tools`, `/sessions`) are the source.
+//
+// The root is chosen at runtime, in this order (see `resolveApiRoot`):
+//   1. `?apiRoot=` on the page URL (validated; a bad value falls back silently);
+//   2. server-injected config (`window.__HARNESS_CONFIG__.apiRoot` or a
+//      `<meta name="harness-api-root">` element), for a host that serves this
+//      bundle and knows where its API lives;
+//   3. build-time `VITE_HARNESS_API`;
+//   4. `/api`.
+//
+// The root is only ever a base URL/prefix. No credential, query string or hash
+// is accepted on it, so a secret can never be pushed into a URL by this module.
 
 import type {
+    HarnessDescriptor,
     HarnessIndex,
     ModelIndex,
     RunnerSettings,
     SessionSnapshot,
     SessionStreamItem,
     ToolCallResult,
+    ToolDescriptor,
     ToolIndex
 } from '../../server/protocol';
 
-// Same-origin by default. `VITE_HARNESS_API` overrides the path prefix (for a
-// reverse proxy that mounts the API somewhere other than `/api`); the server
-// sends no CORS headers, so a cross-origin URL will not work.
-const API_BASE = (import.meta.env.VITE_HARNESS_API ?? '/api').replace(/\/+$/, '');
+// Payload of GET `/v1/harness`. `server/api.ts` owns this shape (HarnessBootstrap)
+// but protocol.ts is not ours to extend, so the browser mirrors the fields it
+// consumes. Keep in sync with server/api.ts `HarnessBootstrap`.
+export type HarnessBootstrap = {
+    rootPath: string;
+    presets: HarnessDescriptor[];
+    tools: ToolDescriptor[];
+    defaults: HarnessIndex['defaults'];
+    sessions: SessionSnapshot[];
+};
 
-const url = (path: string): string => `${API_BASE}${path}`;
+const FALLBACK_ROOT = '/api';
+
+// A root is a path prefix (`/v1/harness`) or an absolute http(s) URL origin+path.
+// Anything else (a scheme like `javascript:`, a protocol-relative `//host`, a
+// query, a hash, or embedded userinfo) is rejected: this value ends up in every
+// request URL, so it must not be able to carry credentials or change meaning
+// when concatenated.
+export const normalizeApiRoot = (value: string | null | undefined, fallback: string): string => {
+    const raw = (value ?? '').trim();
+    if (raw.length === 0) return fallback;
+
+    // Absolute URL: require http(s), no search/hash/userinfo.
+    if (/^[a-z][a-z0-9+.-]*:/i.test(raw)) {
+        let parsed: URL;
+        try {
+            parsed = new URL(raw);
+        } catch {
+            throw new Error(`"${raw}" is not a valid API root URL.`);
+        }
+
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            throw new Error('The API root must be an http(s) URL.');
+        }
+
+        if (parsed.search.length > 0 || parsed.hash.length > 0) {
+            throw new Error('The API root cannot carry a query string or a fragment.');
+        }
+
+        if (parsed.username.length > 0 || parsed.password.length > 0) {
+            throw new Error('The API root cannot carry credentials.');
+        }
+
+        return `${parsed.origin}${parsed.pathname}`.replace(/\/+$/, '') || parsed.origin;
+    }
+
+    // Relative roots must be rooted paths. `//host` would be protocol-relative
+    // and silently point at another origin; a bare segment would resolve under
+    // whatever page URL this bundle happened to be served from.
+    if (!raw.startsWith('/') || raw.startsWith('//')) {
+        throw new Error('A relative API root must start with a single "/".');
+    }
+
+    if (raw.includes('?') || raw.includes('#')) {
+        throw new Error('The API root cannot carry a query string or a fragment.');
+    }
+
+    // A trailing slash would produce `//sessions`; strip every one. A root of
+    // just "/" becomes "" so `${root}${path}` stays correct.
+    return raw.replace(/\/+$/, '');
+};
+
+// Server-injected config, for a host that renders this bundle itself. Read
+// defensively: the global is not typed and may be absent, partial, or hostile.
+const injectedRoot = (): string | undefined => {
+    const config = (globalThis as { __HARNESS_CONFIG__?: { apiRoot?: unknown } }).__HARNESS_CONFIG__;
+    if (typeof config?.apiRoot === 'string') return config.apiRoot;
+
+    const meta = globalThis.document?.querySelector<HTMLMetaElement>('meta[name="harness-api-root"]');
+    return meta?.content;
+};
+
+// Resolve once at module load: every later request uses the same root, and the
+// query parameter is not consulted per request (a change means a reload, which
+// also resets the transient view — the server snapshot is re-fetched on boot).
+export const resolveApiRoot = (): string => {
+    const query = new URLSearchParams(globalThis.location?.search ?? '').get('apiRoot') ?? undefined;
+
+    // An invalid *query* value is ignored rather than fatal: a hand-edited URL
+    // must not stop the UI from booting against its documented default. An
+    // invalid injected root is also ignored for the same reason; the build-time
+    // value is trusted and validated last.
+    const attempt = (value: string | undefined): string | undefined => {
+        try {
+            return normalizeApiRoot(value, FALLBACK_ROOT);
+        } catch {
+            return undefined;
+        }
+    };
+
+    return (
+        attempt(query) ??
+        attempt(injectedRoot()) ??
+        attempt(import.meta.env.VITE_HARNESS_API) ??
+        FALLBACK_ROOT
+    );
+};
+
+export const API_ROOT = resolveApiRoot();
+
+const url = (path: string): string => `${API_ROOT}${path}`;
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -64,6 +176,44 @@ const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
 export const listHarnesses = (): Promise<HarnessIndex> => request<HarnessIndex>('/harnesses');
 
 export const listTools = (): Promise<ToolIndex> => request<ToolIndex>('/tools');
+
+// GET root. Only the canonical mount (`/v1/harness`) answers this with the
+// bootstrap document; the standalone `/api` root is a deliberate 404. Callers
+// use `loadBootstrap` rather than this directly.
+export const getBootstrap = (): Promise<HarnessBootstrap> => request<HarnessBootstrap>('');
+
+// Every session the server holds, newest last (the store keeps insertion order).
+export const listSessions = async (): Promise<SessionSnapshot[]> => {
+    const body = await request<{ sessions: SessionSnapshot[] }>('/sessions');
+    return body.sessions;
+};
+
+// One call that works against either mount: try the canonical bootstrap first,
+// then fall back to the standalone resource routes. The fallback is not a
+// compatibility hack — it is the documented standalone contract (its root is a
+// 404) — so it runs for any bootstrap failure, including a reverse proxy that
+// strips or rewrites the root document. If both fail, the fallback's error is the
+// one worth reporting: it names the route the UI actually needs.
+export const loadBootstrap = async (): Promise<HarnessBootstrap> => {
+    try {
+        return await getBootstrap();
+    } catch {
+        // Deliberately discard the root failure: a 404 from `/api` is expected,
+        // and its message would mask the useful error if the server is down.
+    }
+
+    const [index, tools, sessions] = await Promise.all([listHarnesses(), listTools(), listSessions()]);
+
+    return {
+        // Standalone has no advertised filesystem root; the UI treats "" as
+        // "not reported" and never prints it as a path.
+        rootPath: '',
+        presets: index.harnesses,
+        tools: tools.tools,
+        defaults: index.defaults,
+        sessions
+    };
+};
 
 // The provider catalogue, fetched by the harness server.
 //

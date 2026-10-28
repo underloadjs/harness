@@ -6,7 +6,10 @@
 
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
+import { createToolCatalogue } from '../harnesses';
+import type { ToolCatalogue } from '../harnesses';
 import { loadConfiguration } from './config';
+import { loadEnvironmentFile } from './environment';
 import { createHarnessHandler } from './handler';
 import type { HarnessHandler } from './handler';
 import type { RunnerSettings } from '../harnesses/types';
@@ -22,6 +25,10 @@ export type StartServerOptions = {
     settings?: RunnerSettings;
     // Advertised to clients as the starting point for the endpoint fields.
     defaults?: HarnessIndex['defaults'];
+    // Direct-call catalogue. Omitted means "build it now, after `.env` loading".
+    // Tests inject one to pin a configured/unconfigured websearch without
+    // touching the test runner's environment.
+    catalogue?: ToolCatalogue;
 };
 
 export type HarnessServer = {
@@ -62,11 +69,23 @@ const sendFailure = (response: http.ServerResponse, error: unknown): void => {
 };
 
 export const startHarnessServer = async (options: StartServerOptions = {}): Promise<HarnessServer> => {
+    // Load before configuration and before any session constructs a harness: the
+    // provider defaults are read here, and search keys are captured once at
+    // harness construction. Idempotent when the CLI already loaded the same file.
+    loadEnvironmentFile();
+
     const configuration = loadConfiguration();
     const store = new SessionStore(options.settings ?? configuration.settings);
+
+    // Built after loadEnvironmentFile() on purpose: websearch resolves its
+    // provider key here, once, and the handler keeps the snapshot for its whole
+    // lifetime. A keyless host still gets the entry, marked unconfigured.
+    const catalogue = options.catalogue ?? createToolCatalogue();
+
     const api: HarnessHandler = createHarnessHandler({
         store,
-        defaults: options.defaults ?? configuration.defaults
+        defaults: options.defaults ?? configuration.defaults,
+        catalogue
     });
 
     const staticRoot =

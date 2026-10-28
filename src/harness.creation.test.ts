@@ -80,7 +80,7 @@ describe('createTool', () => {
 
         expect(writer.tools.createTool.visibility).toBe('core');
         expect(writer.tools.createTool.description).toContain('Create a tool for yourself from JavaScript source.');
-        expect(declaredNames(seen[0])).toEqual(['getTools', 'createTool']);
+        expect(declaredNames(seen[0])).toEqual(['getTools', 'createTool', 'todoTools']);
     });
 
     it('registers a tool from a model call and declares it on the next turn', async () => {
@@ -100,8 +100,8 @@ describe('createTool', () => {
         const message = await writer('go');
 
         // Round 1: core only. Round 2: the created tool is already enabled.
-        expect(declaredNames(seen[0])).toEqual(['getTools', 'createTool']);
-        expect(declaredNames(seen[1])).toEqual(['getTools', 'createTool', 'repeat']);
+        expect(declaredNames(seen[0])).toEqual(['getTools', 'createTool', 'todoTools']);
+        expect(declaredNames(seen[1])).toEqual(['getTools', 'createTool', 'todoTools', 'repeat']);
 
         // The tool is a real registry entry, searchable like any other.
         expect(writer.tools.repeat.name).toBe('repeat');
@@ -206,7 +206,7 @@ describe('createTool', () => {
         );
 
         // Nothing was registered by the rejected attempts.
-        expect(Object.keys(writer.tools)).toEqual(['existing', 'getTools', 'createTool']);
+        expect(Object.keys(writer.tools)).toEqual(['existing', 'getTools', 'createTool', 'todoTools']);
     });
 
     it('validates the creation shape', () => {
@@ -270,7 +270,7 @@ describe('createTool', () => {
             });
         }
 
-        expect(Object.keys(writer.tools)).toHaveLength(34);
+        expect(Object.keys(writer.tools)).toHaveLength(35);
         expect(() =>
             writer.createTool({
                 name: 'generated32',

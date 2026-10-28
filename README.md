@@ -92,6 +92,8 @@ tools/
   files/                readFile.ts, writeFile.ts, editFile.ts, listFiles.ts,
                         searchFiles.ts, globFiles.ts, glob.ts (shared walker)
   command/              runCommand.ts, gitDiff.ts
+  websearch/            request.ts (bounds/errors), exa.ts, tavily.ts,
+                        index.ts (createWebsearchTool — opt-in, per-harness)
   presets.test.ts       covers every preset, standalone and in a harness
 ```
 
@@ -224,16 +226,55 @@ round 2  model -> readFile({ "path": "README.md" })      // now declared
 | Rule | Behaviour |
 |---|---|
 | Tags | Required. Trimmed, lowercased, deduplicated. |
-| Default visibility | `'searchable'` — only the core set (`getTools`, `createTool`, and `delegate` on the primary) is declared at first. |
+| Default visibility | `'searchable'` — only the core set (`getTools`, `createTool`, `todoTools`, and `delegate` on the primary) is declared at first. |
 | Ranking | OR-style: a tool needs only one query tag to be a candidate, and its rank is its **best single-tag score** — exact tag (4) > tag prefix (3) > tag substring (2) > name/description hit (1). More matching tags only breaks ties, so a broad tool cannot outrank an exact hit. |
 | Cap | 10 matches by default. `limit` raises it up to a hard maximum of 50; `truncated: true` says the tail was dropped. |
 | No match | the result carries `unmatchedTags` and the full `availableTags`, so the model retries with real vocabulary. |
 | Undiscovered tool | calling one returns a tool result naming tags that would enable it — it does not run. |
 | Lifetime | discovery is per harness and kept across calls; `reset()` forgets it with the conversation. |
-| Reserved names | `getTools` and `createTool` belong to the harness, and `delegate` too when it is registered; using one throws. |
+| Reserved names | `getTools`, `createTool`, and `todoTools` belong to the harness, and `delegate` too when it is registered; using one throws. |
 
 `searchTools(tools, tags)` is the same ranking without a harness — useful for a
 catalogue UI or for checking that a tag vocabulary resolves the way you expect.
+
+### Session todos (`todoTools`)
+
+Every harness registers a core `todoTools` tool, so the model can keep a plan
+without a discovery round. It is **incremental** and **session-scoped**:
+
+| Action | Input | Result |
+|---|---|---|
+| `add` | `text` (non-blank; trimmed) | The new todo, with the next stable id (`"1"`, `"2"`, …). |
+| `remove` | `id` | `removed` plus the remaining `todos`. |
+| `check` | `id`, optional `completed` (default `true`; `false` unchecks) | The updated todo. |
+| `uncheck` | `id` | The updated todo with `completed: false` (alias for `check` + `completed: false`). |
+| `list` | — | Every todo plus `counts: { total, completed, remaining }`. |
+
+```text
+todoTools({ "action": "add", "text": "Draft the plan" })
+  -> { todos: [{ id: "1", text: "Draft the plan", completed: false }],
+       todo: { id: "1", text: "Draft the plan", completed: false },
+       counts: { total: 1, completed: 0, remaining: 1 } }
+```
+
+- Every result carries the current `todos` (copies, never live references) and
+  `counts`. `todo` appears for add/check/uncheck; `removed` for remove.
+- Invalid input is a readable, recoverable tool result: unknown action, blank
+  `text`, blank `id`, unknown id, and non-boolean `completed` all name the action
+  and field. A failed call never changes the list.
+- The list is **per harness**, shared by the primary and its subagents, kept
+  across turns, and cleared by `reset()` (ids restart at `"1"`). Nothing is
+  persisted: two harnesses, and therefore two server sessions, never share todos.
+
+**Not OpenCode parity.** OpenCode's current dev branch (`fd8268e`, 2026-10-27)
+ships a different, experimental `todowrite` tool: gated behind `experimental.todo`,
+it takes `{ todos: [{ content, status }] }`, replaces the whole list on every
+call, has no ids, and its list is derived by the UI from the last call. Sources:
+[`plugin/todo.ts`](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/plugin/todo.ts),
+[`todowrite.txt`](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/todowrite.txt),
+[`tool-todo.test.ts`](https://github.com/anomalyco/opencode/blob/dev/packages/core/test/tool-todo.test.ts).
+`todoTools` deliberately uses incremental actions and stable ids instead; it does
+not copy that API or claim compatibility.
 
 ### Preset tools
 
@@ -308,6 +349,111 @@ needs a shell asks for `shell`, and the rest stay out of the context window.
 harness inside a container, a worktree, or an account you are willing to have
 modified, or wrap `execute` to add a fence.
 
+### Web search (`websearch`)
+
+One opt-in search tool over **Exa** or **Tavily**. It is deliberately **not** part
+of `presetTools`: a search tool needs a provider key, and a key belongs to one
+harness. Nothing is registered unless the configuration asks for it *and* a key is
+available.
+
+```ts
+// Library: environment-backed (EXA_API_KEY / TAVILY_API_KEY in process.env)
+const writer = harness({
+    agents: { writer: agent({ ... }) },
+    websearch: true
+});
+
+// Library: injected environment, or explicit per-provider overrides
+const writer = harness({
+    agents: { writer: agent({ ... }) },
+    websearch: {
+        env: { EXA_API_KEY: readSecretFromYourStore() },
+        tavily: { apiKey: () => vault.get('TAVILY_API_KEY') }
+    }
+});
+
+// Standalone factory: undefined when no provider key is available
+const definition = createWebsearchTool({ env: process.env });
+```
+
+Registration rules:
+
+| Rule | Effect |
+|---|---|
+| `websearch` absent or `false` | No tool. |
+| `websearch: true` or `{}` | Resolve `EXA_API_KEY` / `TAVILY_API_KEY` at construction. |
+| `exa.apiKey` / `tavily.apiKey` | Explicit override (string, or a getter called once at construction and reused for every search — no per-request rotation); an explicit blank key disables that provider instead of falling back to env. |
+| Provider without a key | Absent: not in the schema, not callable. |
+| No provider with a key | No tool at all, even when opted in. |
+| `tools: { websearch }` configured | Your tool wins; the built-in factory is not consulted. |
+
+Keys are read from `process.env` only (or from `env` when injected). The published
+library never imports a dotenv parser and never reads a file: when you embed
+`@underload/harness`, the host owns the environment. The bundled Node entry points
+(CLI, server, `yarn start`) load the package-root `.env` once at startup before any
+harness is constructed — see [Environment file](#environment-file). The
+CLI/server presets pass `websearch: true`, so a key in the shell or in `.env` is
+enough for any of those entry points; the offline `demo` stays offline, and no UI
+field or `RunnerSettings` value carries a search key. The live harnesses
+(`instruct`, `research`, `workspace`) share one toolbox, so a key makes web search
+available to all of them or to none; the `flaky` example does not opt in.
+
+**Catalogue visibility (server and UI).** The harness app always lists
+`websearch` in its direct-call catalogue, configured or not. With a key it is a
+normal callable entry (`POST /api/tools/websearch`); without one the entry is
+marked `unconfigured`, carries the provider variable *names* and a non-secret hint,
+and a direct call answers a normal `{ "ok": false }` tool failure explaining what
+to set and that a restart is required. The catalogue is built when the server
+starts — after `.env` loading, never at module import — and each descriptor may
+carry `availability: { state, environment, hint }`. Key values never appear in a
+descriptor, hint, CLI listing, or UI.
+
+The same rule applies to preset descriptors (`GET /harnesses`, the `/presets`
+alias, and the canonical bootstrap document). Every live preset (`instruct`,
+`research`, `workspace`) declares `environmentTools: ['websearch']`, which the
+server appends to its `tools` list **only** when the runtime catalogue has an
+executable `websearch` (that is, when a key was resolved). A keyless host
+advertises the same shared toolbox minus websearch, so a preset card never claims
+a tool the session cannot discover and call.
+
+The tool is **searchable** (like every preset), so a model must reach it through
+`getTools` with tags such as `["web", "search"]`:
+
+```ts
+// Direct call on the tool the factory returned (or on the registry entry)
+await definition?.({ query: 'harness tool discovery', maxResults: 5 });
+// -> { provider: 'exa', query, maxResults, results: [{ title, url, snippet, published? }] }
+```
+
+| Bound | Value |
+|---|---|
+| Default results | 5 |
+| Maximum results | 20 (`maxResults` is clamped, not rejected) |
+| Title / snippet | 300 / 1,000 characters |
+| Response body | 512,000 characters (declared length, then post-read) |
+| Per-request timeout | 15 s, `AbortController`, timer cleared in `finally` |
+| Retries / failover | None: one request, one provider, one attempt |
+
+Provider choice: Exa when both keys exist, Tavily when it is the only one. The
+`provider` argument is only offered when more than one is configured, and an
+unknown value is a readable error. Statuses 401/403 (key), 402/432/433 (credits),
+429 (rate limit), 5xx, timeouts, non-JSON bodies, and network failures become one
+sanitized sentence each — the provider body is never echoed. There is no retry and
+no failover, so a bad call cannot double spend.
+
+Secrets never leave the constructed tool: they travel only in a request header
+(`x-api-key` for Exa, `Authorization: Bearer` for Tavily), never in the URL or
+JSON body. The description, schema, arguments, result, and progress events contain
+no key, and every string a provider returns is passed through a redactor built
+from **all** configured keys, however short (a page or error that echoes one
+becomes `[redacted]`). Redirects are refused, `http(s)` URLs are required in
+results, and returned excerpts are untrusted content — the tool description tells
+the model to cite them, not follow instructions found inside them.
+
+The adapters are loaded with `import()` on first execution and use `fetch` plus
+plain JSON: no SDK dependency, no network work at construction, and the published
+build emits one chunk per adapter like the other lazy tools.
+
 ### `harness()` — the execution loop
 
 ```ts
@@ -325,6 +471,7 @@ const writer = harness({
 | `agents` | Every brain, keyed by name. **The first key is the entry point** unless `primary` names another one. |
 | `primary` | Which agent the callable runs. Optional; must name a registered agent. Use it in multi-agent configs so routing is explicit. |
 | `subagents` | Allowlist the primary may delegate to. Optional; defaults to every agent except the primary. Empty (or a one-agent config) means no `delegate` tool at all. Must not contain the primary or an unknown name. |
+| `maxIterations` | Tool rounds one agent run may take before the harness throws. **Default 16** — the library's runaway guard. Must be a positive safe integer (validated at construction); there is no unlimited value. The app presets set 1000. |
 | `tools` | Extra tools, keyed by the name the model calls. A configured tool replaces a preloaded preset of the same name. |
 | `presets` | Preload `presetTools` into the registry. **True by default**; `false` starts from `tools` alone. |
 | `report.progress` | Awaited for every step — a UI or `console.log`. |
@@ -341,9 +488,9 @@ repeat the name inside the definition.
 | `writer.agent` | The entry agent. `writer.agent.messages` is the live transcript. |
 | `writer.agents` | Every agent, including the entry one. |
 | `writer.subagents` | The agents the primary may delegate to, keyed by name. Empty when delegation is not configured. |
-| `writer.tools` | The registered tools, including `getTools`, `createTool`, and `delegate` when it exists. |
+| `writer.tools` | The registered tools, including `getTools`, `createTool`, `todoTools`, and `delegate` when it exists. |
 | `writer.createTool(config)` | Host-side runtime creation. Same validation/registry/budget as the model's `createTool`; throws `HarnessError`. |
-| `writer.reset()` | Reset the entry agent's conversation and forget discovered tools. Created tools stay registered but are no longer enabled. |
+| `writer.reset()` | Reset the entry agent's conversation, forget discovered tools, and clear `todoTools`. Created tools stay registered but are no longer enabled. |
 
 ### Runtime tool creation
 
@@ -417,9 +564,14 @@ Failures split in two:
 - **Recoverable** — unknown tool, undiscovered tool, malformed JSON arguments, or a
   throwing tool. Each becomes a tool result the model sees, so it can correct
   itself.
-- **Terminal** — a transport failure or more than 16 tool iterations. History is
-  truncated back to where the call started and the harness throws, so a failed
-  call is never replayed on the next attempt.
+- **Terminal** — a transport failure or more than `maxIterations` tool rounds
+  (default 16; the bundled live presets pass 1000). History is truncated back to
+  where the call started and the harness throws, so a failed call is never
+  replayed on the next attempt.
+
+`maxIterations` is per agent run — a delegated subagent gets its own budget — and
+is validated when `harness()` is called: a value that is not a positive safe
+integer throws `HarnessError` immediately instead of failing mid-run.
 
 ### Transport
 
@@ -495,6 +647,47 @@ try {
 
 Every event names its agent, so multi-agent runs stay readable in one stream.
 
+## Environment file
+
+The Node entry points load one `.env` automatically:
+
+```text
+packages/underload/harness/.env
+```
+
+`yarn start` / `yarn dev:playground` (server), `yarn serve` / `yarn server`
+(CLI `--serve`), and `yarn cli` all use the same loader. The path is resolved from
+the package, not the current directory, so launching from the workspace root still
+finds it. In this workspace the file is
+`D:/Projects/typescript/noobscript/packages/underload/harness/.env`. Copy
+`.env.example` to `.env`; the real file is git-ignored.
+
+| Variable | Used by |
+|---|---|
+| `HARNESS_BASE_URL` | Provider base URL default; CLI `-b` overrides |
+| `HARNESS_API_KEY` | Provider key; CLI `-k` overrides. Falls back to `OPENAI_API_KEY` |
+| `HARNESS_MODEL` | Model default; CLI `-m` overrides |
+| `EXA_API_KEY` | Opt-in `websearch` for the live presets (`instruct`, `research`, `workspace`) |
+| `TAVILY_API_KEY` | Second opt-in `websearch` provider |
+
+Rules:
+
+- Existing shell/process values win, **including explicitly empty ones**. The file
+  only fills keys that are absent; CLI flags win over both.
+- A missing `.env` is a no-op: every value has a fallback and search keys are
+  optional.
+- Loading happens before provider configuration and harness construction, because
+  search keys are read once when a harness is created.
+- The server reads the file; the browser never does. The UI receives only
+  `hasApiKey`, never the key. Nothing aliases these names to `VITE_*`; do not
+  prefix a secret with `VITE_`, because Vite exposes such keys to the browser.
+- The `@underload/service` host loads the same file lazily, on the first request
+  to a canonical route (`server/runtime.ts`), not when the endpoint module is
+  imported. Discovery therefore stays free of environment reads.
+- Editing `.env` needs a restart (`Ctrl+C`, then start again). Server env is not
+  hot-reloaded; a fresh terminal or session is enough. `yarn preview:playground`
+  is only the static UI and does not read `.env`.
+
 ## CLI
 
 The CLI runs a preset in-process. No UI, no HTTP server, no browser. It runs from
@@ -503,10 +696,10 @@ the library.
 
 ```bash
 yarn cli "What time is it?"                         # default preset: demo (offline)
-yarn cli --preset writer "Write an opening."        # live; needs an endpoint
-yarn cli --preset assistant --model merge/ds4-flash --base-url http://localhost:5500/providers/private/v1
+yarn cli --preset instruct "Write an opening."      # live; needs an endpoint
+yarn cli --preset research --model merge/ds4-flash --base-url http://localhost:5500/providers/private/v1
 yarn cli                                            # interactive session (TTY)
-echo "Summarise this" | yarn cli --preset writer    # one task from stdin
+echo "Summarise this" | yarn cli --preset instruct  # one task from stdin
 ```
 
 | Flag | Meaning |
@@ -524,7 +717,11 @@ echo "Summarise this" | yarn cli --preset writer    # one task from stdin
 
 In an interactive session, `/reset` clears the conversation, `/tools` and
 `/presets` print the catalogues, and `/exit` quits. `HARNESS_BASE_URL`,
-`HARNESS_API_KEY`, and `HARNESS_MODEL` provide the same defaults as the flags.
+`HARNESS_API_KEY`, and `HARNESS_MODEL` provide the same defaults as the flags;
+they can come from the shell or from the package-root `.env` (see
+[Environment file](#environment-file)). `EXA_API_KEY` or `TAVILY_API_KEY` enables
+the opt-in `websearch` tool in the live presets (`instruct`, `research`,
+`workspace`); with neither key it is simply absent.
 
 ## Server and UI
 
@@ -541,34 +738,59 @@ yarn dev:playground       # same as start
 yarn preview:playground   # built UI on :5180, proxying /api to a running yarn serve
 ```
 
-The catalogue lives in `harnesses/`. Both entry points use it:
+The catalogue lives in `harnesses/`. Both entry points use it. Every **live**
+preset is built by the same factory (`harnesses/toolbox.ts`), so the registered
+toolbox is identical: the package coding tools (`readFile`, `writeFile`,
+`editFile`, `listFiles`, `searchFiles`, `globFiles`, `gitDiff`, `runCommand`,
+syntax checks), the app tools (`clock`, `wordCount`, `roll`, `searchNotes`,
+`summarize`), opt-in `websearch`, and the core tools (`getTools`, `createTool`,
+`todoTools`, plus `delegate` only when the preset declares a subagent). Discovery
+still gates the searchable ones. Choosing a harness changes the agents, not the
+tools.
 
 | Preset | Shape |
 |---|---|
-| `demo` | Scripted transport — no endpoint needed; discovers `clock` with `getTools`, calls it, then answers |
-| `writer` | One agent, no tools |
-| `assistant` | One agent with `clock`, `wordCount`, `roll` in the catalogue |
-| `researcher` | Two agents with explicit `primary: 'researcher'` / `subagents: ['summarizer']`; each keeps its own instruction, and the primary can delegate one level |
-| `flaky` | A tool that throws two calls out of three, to show recoverable failures |
-| `workspace` | The useful default: the package preset catalogue (`readFile`, `writeFile`, `editFile`, `listFiles`, `searchFiles`, `globFiles`, `gitDiff`, `runCommand`, syntax checks) plus core `createTool`, executed by the server |
+| `instruct` | **Default UI card.** One general instruction-following agent with the full shared toolbox. |
+| `research` | Two agents with explicit `primary: 'research'` / `subagents: ['summarizer']`; same toolbox, a research instruction, and one-level delegation. |
+| `workspace` | One coding-focused agent with the same toolbox and a coding instruction. |
+| `demo` | Scripted offline fixture — no endpoint needed; discovers `clock` with `getTools`, calls it, then answers. Deliberately not a live harness, so it uses clock only. |
+| `flaky` | The shared toolbox plus a tool that throws two calls out of three, to show recoverable failures. |
+
+`flaky` is the only preset-specific extra tool: it is excluded from the shared
+toolbox because it fails on purpose and keeps attempt state. Legacy identifiers
+still resolve: `writer` and `assistant` → `instruct`, `researcher` → `research`.
+They are aliases, not extra cards, and a session created through one reports the
+canonical name.
 
 The server keeps one harness per session, so submitting a second task continues
 the same conversation. The UI's Endpoint panel is sent when a session is created;
 changing it starts a fresh session on the next run. Sessions are in memory and are
 lost when the server restarts. Created tools live in the session's harness: they
-survive `reset()` (which only clears discovery) and disappear with the session.
+survive `reset()` (which clears the conversation, discovery, and `todoTools`) and
+disappear with the session.
+
+The response of a run is also the server's record: every task becomes a
+`SessionTurn` (id, index, prompt, status, timestamps, and every event the run
+produced). `GET /api/sessions` and `GET /api/sessions/:id` always include the full
+`turns` array, so a browser reload — or a second client — renders the same
+transcript without having seen the stream. A turn that is still running is
+included too, which is what the UI polls to reattach to a running session.
+
+`/api` is the standalone mount. The `@underload/service` host serves the same
+resource paths below `/v1/harness` and adds a bootstrap document at its root; see
+[Service host](#service-host-v1harness) below.
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /api/health` | Liveness and session count |
 | `GET /api/harnesses` | Preset descriptors and provider defaults |
-| `GET /api/tools` | Direct-call tool catalogue |
-| `POST /api/tools/:name` | Call one tool with no harness, agent, or loop |
+| `GET /api/tools` | Direct-call tool catalogue; `websearch` is always listed with `availability` |
+| `POST /api/tools/:name` | Call one tool with no harness, agent, or loop; an unconfigured tool returns `ok: false` |
 | `POST /api/models` | Server-side `GET {baseURL}/models`; returns `{ models: string[] }` for the UI dropdown |
 | `POST /api/sessions` | Create a session for a preset |
 | `GET /api/sessions`, `GET /api/sessions/:id` | List or read sessions |
 | `POST /api/sessions/:id/messages` | Submit a task; response is `text/event-stream` |
-| `POST /api/sessions/:id/reset` | Reset every agent and clear discovery |
+| `POST /api/sessions/:id/reset` | Reset every agent and clear discovery and todos |
 | `POST /api/sessions/:id/cancel` | Abort the running task |
 | `DELETE /api/sessions/:id` | Forget a session |
 
@@ -592,17 +814,154 @@ Each SSE `data:` frame is one of:
 
 The sidebar's **Tools** tab calls `POST /api/tools/:name`. Package presets really
 run there, so the direct-call path now exercises the same `execute` a session
-registers, including `runCommand` and the file tools.
+registers, including `runCommand` and the file tools. The **Web search** group
+shows whether this server has `EXA_API_KEY`/`TAVILY_API_KEY`; an unconfigured
+entry keeps its schema and example arguments visible but disables **Call tool** and
+prints the server's hint, so it never looks like a working tool.
 
-**No sandbox.** The server binds to `127.0.0.1` by default and has no CORS layer,
-which is what keeps a same-origin UI simple. It is still a process with the
-server's permissions: `workspace`, `runCommand`, `writeFile`, and direct tool calls
-can change the host. Do not expose it to a network you do not trust.
+`--tools` (and `/tools` in an interactive CLI session) uses the same runtime
+catalogue and appends `[unconfigured — …]` to an entry that needs a missing key.
+
+**No sandbox.** The standalone server binds to `127.0.0.1` by default and has no
+CORS layer, which is what keeps a same-origin UI simple. It is still a process with
+the server's permissions: `workspace`, `runCommand`, `writeFile`, and direct tool
+calls can change the host. Do not expose it to a network you do not trust. The
+service host is stricter in transport but not in trust: `0.0.0.0` plus permissive
+CORS, with only the loopback Origin gate described above.
 
 `playground/vite.config.ts` no longer aliases `@underload/harness` or stubs
 `node:`: the browser bundle never reaches the package. `playground/dev.ts` starts
 the standalone server and points Vite's `/api` proxy at it, so development and
 production use the same server implementation.
+
+### Service host (`/v1/harness`)
+
+The same API can be hosted by `@underload/service` (the repository's Hono
+gateway) instead of the standalone Node server. Nothing in this package starts a
+listener for it: the service loader scans the repository root for `endpoint` /
+`endpoints` folders, finds `packages/underload/harness/endpoint/harness/`, and
+imports the two discovered modules:
+
+| Module | Route | Job |
+|---|---|---|
+| `endpoint/harness/service-route.ts` | `/v1/harness/*` | everything below the mount |
+| `endpoint/harness/service-route-root.ts` | `/v1/harness` | the bare bootstrap document |
+
+Neither module declares a `port`, so both run **in place on the gateway's single
+listener**. A port would move the endpoint onto an isolated worker and answer
+clients with a 307 redirect; the harness API is cheap to host in-process and must
+share the service's port. The route modules only describe a URL and a handler —
+`server/runtime.ts` creates the `.env`-loaded store and catalogue lazily on the
+first request, and every route shares that one store, so a session created through
+one route is visible through the other.
+
+Start it from the repository root with `yarn start-service` (which runs
+`yarn workspace @underload/service start`); that entry scans the repository root,
+so the two modules above are discovered. `yarn start` is still the standalone
+API + UI on `:5181`; the service gateway is `http://localhost:5000`.
+
+`GET /v1/harness` is the canonical bootstrap document:
+
+```json
+{
+    "rootPath": "/v1/harness",
+    "presets": [{ "name": "demo", "title": "…", "requiresEndpoint": false, "agents": ["demo"], "tools": ["clock"] }],
+    "tools": [{ "name": "readFile", "group": "Package presets", "tags": ["files"], "visibility": "searchable", "parameters": {} }],
+    "defaults": { "baseURL": "…", "model": "…", "hasApiKey": true },
+    "sessions": []
+}
+```
+
+`rootPath` is the **API URL this document was served from**, not a filesystem
+path. There is deliberately no advertised workspace root: the file and command
+tools resolve relative paths against the server process's working directory
+(`process.cwd()`) and have no sandbox or fence, so a file-root option would
+promise behaviour the tools do not implement. The service's `variables.root` is
+the shared database/storage boundary and is not used here.
+
+The rest of the surface is the same table as `/api`, one level below the mount:
+
+```text
+GET    /v1/harness                        bootstrap document
+GET    /v1/harness/health                 liveness + session count
+GET    /v1/harness/harnesses              presets + provider defaults
+GET    /v1/harness/presets                alias of /harnesses
+GET    /v1/harness/tools                  direct-call catalogue
+POST   /v1/harness/tools/:name            call one tool
+POST   /v1/harness/models                 server-side GET {baseURL}/models
+GET    /v1/harness/sessions               session snapshots (with turns)
+POST   /v1/harness/sessions               create a session
+GET    /v1/harness/sessions/:id           one snapshot (with turns)
+DELETE /v1/harness/sessions/:id           forget a session
+POST   /v1/harness/sessions/:id/messages  submit a task → text/event-stream
+POST   /v1/harness/sessions/:id/reset     reset every agent, discovery, todos
+POST   /v1/harness/sessions/:id/cancel    abort the running task
+```
+
+**Standalone `/api` compatibility is unchanged.** The `/api` root stays a 404 (it
+has no bootstrap document), every `/api` request still needs
+`X-Harness-Client: ui`, and `/api/presets` exists as an alias of `/api/harnesses`.
+The canonical mount does not use that header: the service loader installs
+permissive CORS, so a custom header is not an access boundary there.
+
+**Access control is an Origin gate, not authentication.** The service app is built
+with `cors({ origin: '*', allowHeaders: '*' })`, and it listens on `0.0.0.0` by
+default. The harness endpoint therefore rejects a browser request whose `Origin`
+is neither the request's own host nor a loopback hostname (`localhost`,
+`127.0.0.1`, `[::1]`); requests with no `Origin` (curl, server-to-server) are
+allowed. That stops a public web page from reading transcripts or driving tools
+**through a browser**, but it does not authenticate anyone who can reach the port
+directly. Combined with unsandboxed tools (`runCommand`, `writeFile`,
+`createTool`), that means: bind the service to a trusted network only, and prefer
+loopback (`host: '127.0.0.1'`) when the port is reachable from elsewhere. No
+global service host/CORS settings are changed by this package.
+
+**Connecting the UI to the service.** The browser chooses its API root at runtime
+(`?apiRoot=` → injected config → `VITE_HARNESS_API` → `/api`), so the same built
+bundle works against either mount:
+
+```text
+http://localhost:5180/?apiRoot=http://localhost:5000/v1/harness
+```
+
+`yarn preview:playground` serves the built UI on `:5180`; the service gateway
+listens on `:5000`. The Vite dev origin is a loopback origin, which the Origin
+gate allows. The UI never sees the API key — it posts only the base URL and model,
+and `defaults.hasApiKey` is a boolean.
+
+**Credentials stay with the configured provider.** `POST /models` and
+`POST /sessions` both merge client settings through `server/config.ts`
+(`mergeSettings`). An omitted or blank `apiKey` means "use the server key" **only
+when the effective `baseURL` is the configured provider** — same origin and base
+path after normalizing trailing slashes. Point the client at any other host, port,
+or path and the request/session is created **unauthenticated**, unless the client
+supplies its own key. A client key is always used as given. This is why a session
+created against another endpoint cannot exfiltrate the server credential.
+
+**Body policy and bounds.** Action endpoints that read a body require a JSON
+*object* (`null`, arrays, and primitives are `400`). A direct tool call must carry
+a `parameters` property (`{ "parameters": {} }` is a valid argument-less call), so
+an empty body cannot execute a tool. The Node adapter rejects a streamed body over
+1,000,000 bytes with `413`. The service adapter additionally rejects a declared
+`content-length` and a serialized parsed body over the same cap before dispatch —
+but the service loader parses JSON *before* the endpoint runs, so it cannot
+prevent that upstream allocation, and a malformed body arrives as `{}`. That
+residual is documented in `server/service.ts`; fixing it belongs in the loader,
+not in this package.
+
+**Sessions and reloads.** The server, not the browser, owns the transcript. Each
+task is a turn with stable `id`/`index`, and every streamed event names its turn
+(`{ type: 'turn' }` opens a run, `{ type: 'event', turnId }` follows). Reloading
+the UI re-reads `sessions` from the bootstrap document (or `/sessions`), which
+already contains every turn and its events, and the UI polls a session that is
+still `running`. Nothing is persisted: sessions, turns, created tools, discovery,
+and todos vanish on restart, and a service restart is a fresh in-memory store.
+
+**Secrets and restart.** The service loads the package-root `.env` on the first
+request (not at module import, so discovery stays free), after which the
+credential tool and provider defaults are fixed for the process lifetime. Editing
+`.env` requires a restart; the browser never reads it and no search/provider key is
+aliased to `VITE_*`.
 
 
 ## Development
@@ -616,6 +975,7 @@ yarn start             # API + UI end-to-end
 yarn cli --list        # CLI preset catalogue
 yarn serve             # API + built UI
 yarn dev:playground    # same as start
+yarn start-service     # repo root: @underload/service host, /v1/harness on :5000
 ```
 
 ## npm Publishing

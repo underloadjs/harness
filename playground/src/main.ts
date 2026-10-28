@@ -1,30 +1,45 @@
 // The harness UI.
 //
-// This file is a *client*. It creates server sessions, submits tasks, and renders
-// the progress events that come back over SSE. It deliberately imports nothing
-// from `@underload/harness`: the CLI can run every preset without a browser, and
-// the browser can only reach the loop through the server.
+// This file is a *client*. It loads the server catalogue (bootstrap or the
+// standalone routes), creates and selects server sessions, submits tasks, and
+// renders the transcript the server owns. It deliberately imports nothing from
+// `@underload/harness`: the CLI can run every preset without a browser, and the
+// browser can only reach the loop through the server.
+//
+// Authoritative transcript (H4): the server records one SessionTurn per submit
+// and returns the turn list from GET /sessions, GET /sessions/:id and every
+// terminal stream frame. The browser never invents a turn boundary and never
+// deletes a session because a settings draft changed — it renders the latest
+// snapshot and keeps no conversation state of its own. Only presentation is
+// local: which tile is expanded, which session id was last viewed, the request
+// spinner.
+//
+// API root: `./api.ts` resolves it at runtime (?apiRoot → injected config →
+// build-time VITE_HARNESS_API → /api) and `loadBootstrap` works against the
+// canonical `/v1/harness` root document or the standalone `/api` routes.
 
 import './styles.css';
 import type {
     HarnessDescriptor,
-    HarnessEvent,
-    HarnessIndex,
     RunnerSettings,
+    SessionSnapshot,
     SessionStreamItem,
+    SessionTurn,
     ToolDescriptor
 } from '../../server/protocol';
 import {
+    API_ROOT,
     callTool,
     cancelSession,
     createSession,
-    deleteSession,
-    listHarnesses,
+    getSession,
     listProviderModels,
-    listTools,
+    listSessions,
+    loadBootstrap,
     resetSession,
     submitMessage
 } from './api';
+import type { HarnessBootstrap } from './api';
 import { highlightCode, looksLikeJson, prettyJson } from './ui/markdown';
 import { createTurnBoard } from './ui/turns';
 import type { TurnHandle } from './ui/turns';
@@ -88,7 +103,36 @@ const saveSettings = (): void => {
     }
 };
 
-const signatureOf = (value: RunnerSettings): string => `${value.baseURL}|${value.apiKey}|${value.model}`;
+// UI preference only: which server session this browser looked at last. The
+// conversation itself is never stored here — the id is a pointer the server
+// answers for, and an id from a previous server process simply 404s and is
+// forgotten.
+const SESSION_KEY = 'underload-harness-app:session';
+
+const loadRememberedSession = (): string | undefined => {
+    try {
+        const value = localStorage.getItem(SESSION_KEY);
+        return value !== null && value.length > 0 ? value : undefined;
+    } catch {
+        return undefined;
+    }
+};
+
+const rememberSession = (id: string): void => {
+    try {
+        localStorage.setItem(SESSION_KEY, id);
+    } catch {
+        // Private browsing and blocked storage are not worth a dialog here.
+    }
+};
+
+const forgetRememberedSession = (): void => {
+    try {
+        localStorage.removeItem(SESSION_KEY);
+    } catch {
+        // See above.
+    }
+};
 
 // ---------------------------------------------------------------------------
 // One view per harness
@@ -101,7 +145,6 @@ const signatureOf = (value: RunnerSettings): string => `${value.baseURL}|${value
 
 type View = {
     pane: HTMLElement;
-    apply: (event: HarnessEvent) => void;
     // Start a new user turn and return its handle. Called by `run()` *before* the
     // session exists, so the tile can show "queued → waiting → streaming" as the
     // request actually progresses rather than appearing only once text arrives.
@@ -109,6 +152,12 @@ type View = {
     clear: () => void;
     notice: (text: string, tone?: 'info' | 'error') => void;
     setTranscript: (text: string) => void;
+    // Replace the whole transcript with the server's turns. Used on boot, on
+    // session selection, while polling a running session, and on the terminal
+    // stream frame — the server record always wins over local projection.
+    hydrate: (turns: readonly SessionTurn[], model?: string, keep?: string) => TurnHandle[];
+    // Look up a tile by the server turn id carried on a stream `event` frame.
+    turn: (id: string) => TurnHandle | undefined;
 };
 
 const createView = (descriptor: HarnessDescriptor): View => {
@@ -138,9 +187,6 @@ const createView = (descriptor: HarnessDescriptor): View => {
     logWrap.append(log);
     pane.append(logWrap, details);
 
-    // The turn currently receiving this view's events.
-    let active: TurnHandle | undefined;
-
     // Only follow the stream when the reader has not scrolled away from the
     // bottom. Reading history while a run streams is a legitimate thing to do.
     const pinned = (): boolean => logWrap.scrollTop + logWrap.clientHeight >= logWrap.scrollHeight - 48;
@@ -151,23 +197,15 @@ const createView = (descriptor: HarnessDescriptor): View => {
 
     return {
         pane,
-        apply: (event) => {
-            // Read the geometry *before* mutating, otherwise `pinned()` always
-            // answers for the already-grown content.
-            const follow = pinned();
-            active?.apply(event);
-            stick(follow);
-        },
         begin: (prompt) => {
-            active = board.begin(prompt);
+            const turn = board.begin(prompt);
             // A new turn is the one thing that always scrolls: the user just
             // submitted it.
             stick(true);
-            return active;
+            return turn;
         },
         clear: () => {
             board.clear();
-            active = undefined;
             logWrap.scrollTop = 0;
         },
         notice: (text, tone) => {
@@ -176,7 +214,17 @@ const createView = (descriptor: HarnessDescriptor): View => {
         },
         setTranscript: (text) => {
             transcriptBody.textContent = text;
-        }
+        },
+        hydrate: (turns, model, keep) => {
+            const follow = pinned();
+            const handles = board.hydrate(turns, {
+                ...(model === undefined ? {} : { model }),
+                ...(keep === undefined ? {} : { keep })
+            });
+            stick(follow);
+            return handles;
+        },
+        turn: (id) => board.find(id)
     };
 };
 
@@ -201,7 +249,10 @@ const EXAMPLES: Readonly<Record<string, unknown>> = {
     wordCount: 'The harness finds tools by tag before it uses them.',
     roll: 6,
     searchNotes: 'tool loop',
-    summarize: 'The harness runs tools until the model answers with text.'
+    summarize: 'The harness runs tools until the model answers with text.',
+    // The server owns the provider key; the runner only needs a valid query. The
+    // exact key is never part of this value.
+    websearch: { query: 'harness tool discovery', maxResults: 5 }
 };
 
 // The single-property rule, mirrored for the UI: a one-property schema means the
@@ -271,6 +322,12 @@ const createToolRunner = (): ToolRunner => {
         'This runs on the harness server with the server process permissions. The file and command presets are not sandboxed.'
     );
 
+    // Credential-dependent tools stay listed when the server has no key. This is
+    // the server's own hint (variable names only, never values), so the runner
+    // never invents a configuration message the server does not agree with.
+    const availabilityNote = el('p', 'tool-note is-warning', '');
+    availabilityNote.hidden = true;
+
     const schema = el('details', 'transcript');
     schema.append(el('summary', 'transcript-summary', 'Parameter schema'));
     const schemaBody = el('pre', 'transcript-body', '{}');
@@ -295,7 +352,7 @@ const createToolRunner = (): ToolRunner => {
     const outputBody = el('pre', 'card-body', '');
     output.append(outputHead, outputBody);
 
-    card.append(note, safetyNote, schema, argsField, rule, actions, output);
+    card.append(note, safetyNote, availabilityNote, schema, argsField, rule, actions, output);
     log.append(card);
     wrap.append(log);
     pane.append(wrap);
@@ -314,7 +371,10 @@ const createToolRunner = (): ToolRunner => {
     };
 
     callButton.addEventListener('click', async () => {
-        if (active === undefined) return;
+        // The button is disabled for an unconfigured entry; this guard keeps a
+        // programmatic click (or a stale handler) from asking a server that has
+        // already answered "no credential".
+        if (active === undefined || active.availability?.state === 'unconfigured') return;
 
         let parameters: unknown;
         try {
@@ -345,6 +405,8 @@ const createToolRunner = (): ToolRunner => {
         } catch (error) {
             setOutput(messageOf(error), true);
         } finally {
+            // The early guard returned for an unconfigured entry, so reaching here
+            // means the tool is callable and the button may be offered again.
             callButton.disabled = false;
         }
     });
@@ -357,6 +419,9 @@ const createToolRunner = (): ToolRunner => {
             const single = singleProperty(entry.parameters);
             const properties = entry.parameters.properties;
             const count = properties && typeof properties === 'object' ? Object.keys(properties).length : 0;
+            // 'unconfigured' is the server's answer that the tool exists but has
+            // no credential. Listing it is the point; calling it is not offered.
+            const unavailable = entry.availability?.state === 'unconfigured';
 
             schemaBody.textContent = JSON.stringify(entry.parameters, null, 2);
 
@@ -371,8 +436,18 @@ const createToolRunner = (): ToolRunner => {
                       ? 'This schema declares no properties, so execute receives an empty object.'
                       : `execute receives the whole object, because the schema declares ${count} properties.`;
 
-            setOutput('Nothing yet. Press “Call tool”.', false);
-            outputHead.textContent = 'result';
+            availabilityNote.textContent = entry.availability?.hint ?? '';
+            availabilityNote.hidden = !unavailable;
+            callButton.disabled = unavailable;
+            args.disabled = unavailable;
+
+            setOutput(
+                // The full hint is already rendered above the schema; repeating a
+                // paragraph in the result box would just be noise.
+                unavailable ? 'Not configured on this server.' : 'Nothing yet. Press “Call tool”.',
+                unavailable
+            );
+            outputHead.textContent = unavailable ? 'unconfigured' : 'result';
         }
     };
 };
@@ -426,6 +501,27 @@ modeSwitch.append(harnessMode, toolsMode);
 const presetList = el('div', 'presets');
 const toolList = el('div', 'tool-list');
 toolList.hidden = true;
+
+// --- session directory -----------------------------------------------------
+//
+// The server owns sessions; this list is a view of GET /sessions. Selecting an
+// entry loads that session's snapshot, which is how a reload, a second tab or
+// the CLI's conversation becomes visible in this UI. "New" is an explicit action
+// that forgets the current pointer (it never deletes server state).
+const sessionsSection = el('section', 'sessions');
+const sessionsActions = el('div', 'sessions-actions');
+
+const newSessionButton = el('button', 'button small', 'New session');
+newSessionButton.type = 'button';
+newSessionButton.disabled = true;
+
+const refreshSessionsButton = el('button', 'button small', 'Refresh');
+refreshSessionsButton.type = 'button';
+refreshSessionsButton.disabled = true;
+
+sessionsActions.append(newSessionButton, refreshSessionsButton);
+const sessionList = el('div', 'session-list');
+sessionsSection.append(el('h2', 'sidebar-head', 'Sessions'), sessionsActions, sessionList);
 
 const main = el('main', 'main');
 const head = el('div', 'main-head');
@@ -700,26 +796,34 @@ endpoint.append(
         'p',
         'field-hint',
         'Sent to the harness server when a session starts. Leave the key blank to use the key configured on the server. Values are saved in this browser only. The model list is fetched by the server from {base URL}/models.'
-    )
+    ),
+    // Show the resolved root so a deployment question ("is this page talking to
+    // /v1/harness or /api?") is answerable without devtools. `?apiRoot=` wins at
+    // runtime; this text is the value actually in use.
+    el('p', 'field-hint', `API root: ${API_ROOT.length > 0 ? API_ROOT : '(origin)'} · override with ?apiRoot=/v1/harness`)
 );
 
 // Initial paint: the stored model is a valid selection even before the server
 // answers, so the dropdown must show it rather than an empty control.
 renderModelOptions();
 
-sidebar.append(modeSwitch, presetList, toolList, endpoint);
+sidebar.append(modeSwitch, presetList, toolList, sessionsSection, endpoint);
 layout.append(sidebar, main);
 app.append(topbar, layout);
 
 // ---------------------------------------------------------------------------
 // Instances
 // ---------------------------------------------------------------------------
+//
+// Each view owns one turn board: the tiles are per preset, so switching presets
+// never destroys a conversation you wanted to compare against. The conversation
+// itself lives on the server; this map only remembers which session belongs to
+// which card, and it is never the source of truth for turn content.
 
 type Instance = {
     descriptor: HarnessDescriptor;
     view: View;
     sessionId?: string;
-    signature?: string;
 };
 
 const instances = new Map<string, Instance>();
@@ -734,30 +838,20 @@ const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
     return instance;
 };
 
+// Create a session only when this card has none. Settings drafts are read here
+// and nowhere else: editing the endpoint, model or key afterwards must not
+// recreate, replace or delete the conversation the user already has (H4). A new
+// session is an explicit "New session" click, and the first submit after it
+// creates the server record.
 const ensureSession = async (instance: Instance): Promise<string> => {
-    const wanted = signatureOf(settings);
+    if (instance.sessionId !== undefined) return instance.sessionId;
 
-    if (instance.sessionId !== undefined && instance.signature === wanted) return instance.sessionId;
-
-    const previous = instance.sessionId;
     const session = await createSession(instance.descriptor.name, settings);
 
     instance.sessionId = session.id;
-    instance.signature = wanted;
-
-    if (previous !== undefined) {
-        void deleteSession(previous).catch(() => undefined);
-        instance.view.setTranscript('[]');
-
-        // A run is in flight (the endpoint changed while a session existed). The
-        // turn tile was created before this call, so clearing the board here
-        // would throw away the tile the user is watching; mark the boundary
-        // instead. With no run in flight the old log belongs to a session that no
-        // longer exists, so it is safe to drop.
-        if (!running) instance.view.clear();
-
-        instance.view.notice('endpoint settings changed — new server session');
-    }
+    rememberSession(session.id);
+    upsertSession(session);
+    renderSessions();
 
     return session.id;
 };
@@ -787,7 +881,11 @@ const select = (instance: Instance): void => {
     headDescription.textContent = descriptor.description;
     headBadges.replaceChildren(
         badge(`agents: ${descriptor.agents.join(', ')}`),
-        badge('core: getTools'),
+        // Core tools are server-owned (HarnessDescriptor.coreTools): the server
+        // knows whether delegate exists from the preset's subagent allowlist, so
+        // the UI never hardcodes a core catalogue. The fallback keeps an older
+        // server's descriptor renderable.
+        badge(`core: ${descriptor.coreTools?.join(', ') ?? 'getTools'}`),
         badge(`catalogue: ${descriptor.tools.length > 0 ? descriptor.tools.join(', ') : 'none'}`),
         badge(descriptor.requiresEndpoint ? 'needs endpoint' : 'offline')
     );
@@ -795,6 +893,9 @@ const select = (instance: Instance): void => {
     stage.replaceChildren(instance.view.pane);
     stage.dataset.preset = descriptor.name;
     setStatus('idle');
+
+    // The list highlights whichever row this card is pointed at.
+    renderSessions();
 };
 
 const selectTool = (entry: ToolDescriptor): void => {
@@ -806,7 +907,14 @@ const selectTool = (entry: ToolDescriptor): void => {
 
     headTitle.textContent = entry.name;
     headDescription.textContent = entry.description;
-    headBadges.replaceChildren(badge(entry.group), badge(`tags: ${entry.tags.join(', ')}`), badge(entry.visibility));
+    headBadges.replaceChildren(
+        badge(entry.group),
+        badge(`tags: ${entry.tags.join(', ')}`),
+        badge(entry.visibility),
+        // Only credential-dependent tools carry availability; other entries keep
+        // the original three-badge header.
+        ...(entry.availability === undefined ? [] : [badge(entry.availability.state)])
+    );
 
     runner.show(entry);
     stage.replaceChildren(runner.pane);
@@ -849,7 +957,21 @@ const buildTools = (entries: readonly ToolDescriptor[]): void => {
         const button = el('button', 'tool-button');
         button.type = 'button';
         button.setAttribute('aria-pressed', 'false');
-        button.append(el('span', 'tool-name', entry.name), el('span', 'tool-kind', entry.visibility));
+
+        // The sidebar has to answer "is websearch available here?" before a click.
+        // The kind text is the existing visibility, with an explicit unconfigured
+        // suffix and a data attribute for styling; a configured tool is unchanged.
+        const unavailable = entry.availability?.state === 'unconfigured';
+        if (unavailable) button.dataset.availability = 'unconfigured';
+
+        button.append(
+            el('span', 'tool-name', entry.name),
+            el(
+                'span',
+                'tool-kind',
+                unavailable ? `${entry.visibility} · unconfigured` : entry.visibility
+            )
+        );
         button.addEventListener('click', () => selectTool(entry));
 
         toolButtons.set(entry.name, button);
@@ -863,6 +985,8 @@ const setMode = (next: 'harness' | 'tool'): void => {
 
     presetList.hidden = next !== 'harness';
     toolList.hidden = next !== 'tool';
+    // The session directory belongs to harness runs, not to direct tool calls.
+    sessionsSection.hidden = next !== 'harness';
     endpoint.hidden = next !== 'harness';
     composer.hidden = next !== 'harness';
 
@@ -876,6 +1000,255 @@ const setMode = (next: 'harness' | 'tool'): void => {
 
 harnessMode.addEventListener('click', () => setMode('harness'));
 toolsMode.addEventListener('click', () => setMode('tool'));
+
+// ---------------------------------------------------------------------------
+// Session directory (server-owned)
+// ---------------------------------------------------------------------------
+//
+// `sessions` is a cache of the server's answers, not a record: the UI asks again
+// on refresh, after every run and while polling a running session, and every
+// answer replaces the cache entries it mentions. Local edits never add or remove
+// server sessions.
+
+let sessions: SessionSnapshot[] = [];
+
+const upsertSession = (session: SessionSnapshot): void => {
+    const index = sessions.findIndex((candidate) => candidate.id === session.id);
+    if (index >= 0) sessions[index] = session;
+    else sessions.push(session);
+};
+
+// Eight characters is the same prefix the server's logs are readable by, and a
+// full uuid would not fit the 272px sidebar.
+const shortId = (id: string): string => (id.length <= 8 ? id : id.slice(0, 8));
+
+// Rows are buttons: keyboard reachable and self-explanatory with a status text
+// and turn count. The active row is marked for styling only — selection is state
+// in `current.sessionId`, not in this DOM.
+const renderSessions = (): void => {
+    sessionList.replaceChildren();
+
+    if (sessions.length === 0) {
+        sessionList.append(el('p', 'field-hint', 'No sessions on this server yet. Send a task to create one.'));
+        return;
+    }
+
+    const activeId = current?.sessionId;
+
+    for (const session of sessions) {
+        const row = el('button', 'session');
+        row.type = 'button';
+        row.dataset.sessionId = session.id;
+        row.dataset.status = session.status;
+        if (session.id === activeId) row.dataset.active = 'true';
+
+        // `turns.length` is the server's count; the UI does not compute a turn
+        // count from event frames (it could disagree after a reload).
+        const turns = session.turns.length;
+        row.append(
+            el('span', 'session-harness', session.harness),
+            el('span', 'session-meta', `${session.status} · ${turns} turn${turns === 1 ? '' : 's'} · ${shortId(session.id)}`),
+            el('span', 'session-prompt', session.turns.length > 0 ? session.turns[session.turns.length - 1].prompt : 'no turns yet')
+        );
+        row.title = `${session.harness} · ${session.id}`;
+
+        row.addEventListener('click', () => {
+            void openSession(session.id);
+        });
+
+        sessionList.append(row);
+    }
+};
+
+// Re-read the directory. A failure is reported in the status pill; the list on
+// screen stays usable (it is the last answer the server gave).
+const refreshSessions = async (): Promise<void> => {
+    refreshSessionsButton.disabled = true;
+
+    try {
+        sessions = await listSessions();
+        renderSessions();
+    } catch (error) {
+        setStatus('error', `session list: ${messageOf(error)}`);
+    } finally {
+        refreshSessionsButton.disabled = false;
+    }
+};
+
+// Draw a snapshot into its card. The turns are the authoritative transcript;
+// `messages` is the entry agent's own view of the same run and is informational.
+const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
+    instance.sessionId = session.id;
+    instance.view.hydrate(session.turns, session.model);
+    instance.view.setTranscript(JSON.stringify(session.messages, null, 2));
+    renderSessions();
+};
+
+const descriptorFor = (name: string): HarnessDescriptor | undefined =>
+    presetDescriptors.find((candidate) => candidate.name === name);
+
+// ---------------------------------------------------------------------------
+// Polling a running session (reload / late attach)
+// ---------------------------------------------------------------------------
+//
+// The stream endpoint is POST-only, so a page that reloaded mid-run cannot
+// attach to the live stream. It polls GET /sessions/:id instead: bounded in
+// frequency and in total attempts, cleared on every terminal answer, and it
+// never POSTs /messages, so it can never start a second model run.
+
+const POLL_INTERVAL_MS = 1_000;
+// About two minutes. Long enough for a real run, short enough that a stuck
+// session stops asking rather than polling forever.
+const POLL_MAX_ATTEMPTS = 120;
+
+let pollTimer: number | undefined;
+let pollToken = 0;
+
+const stopPolling = (): void => {
+    // The token invalidates an in-flight `getSession` response: a stale answer
+    // must not repaint the card after the reader moved to another session.
+    pollToken += 1;
+
+    if (pollTimer !== undefined) {
+        window.clearTimeout(pollTimer);
+        pollTimer = undefined;
+    }
+};
+
+const pollSession = (instance: Instance, id: string): void => {
+    stopPolling();
+
+    const token = pollToken;
+    let attempts = 0;
+
+    const tick = async (): Promise<void> => {
+        if (token !== pollToken) return;
+        // The card was pointed elsewhere (new session, another selection).
+        if (instance.sessionId !== id) return;
+
+        attempts += 1;
+
+        let session: SessionSnapshot;
+        try {
+            session = await getSession(id);
+        } catch (error) {
+            if (token !== pollToken) return;
+
+            stopPolling();
+            setStatus('error', `polling session: ${messageOf(error)}`);
+            return;
+        }
+
+        if (token !== pollToken) return;
+
+        upsertSession(session);
+
+        if (session.status !== 'running') {
+            applySnapshot(instance, session);
+            setStatus(session.status === 'error' ? 'error' : 'idle');
+            stopPolling();
+            return;
+        }
+
+        // Still running: render the server snapshot (it wins over whatever the
+        // browser projected) and keep the reader's expansion by turn id.
+        applySnapshot(instance, session);
+        setStatus('running', 'session running · polling server');
+
+        if (attempts >= POLL_MAX_ATTEMPTS) {
+            stopPolling();
+            setStatus('error', 'stopped polling a long-running session · reload to retry');
+            return;
+        }
+
+        pollTimer = window.setTimeout(() => {
+            void tick();
+        }, POLL_INTERVAL_MS);
+    };
+
+    pollTimer = window.setTimeout(() => {
+        void tick();
+    }, POLL_INTERVAL_MS);
+};
+
+// Select and render an existing session. Everything drawn here comes from the
+// server's snapshot; nothing is reconstructed from browser memory.
+const openSession = async (id: string): Promise<void> => {
+    stopPolling();
+
+    let session: SessionSnapshot;
+    try {
+        session = await getSession(id);
+    } catch (error) {
+        // A remembered id from a previous server process is not an error state
+        // the user must fix: forget it and show what the server does have. A
+        // stale id in a *row* (someone else's process) must not clear a valid
+        // pointer, so only the remembered id is forgotten.
+        if (loadRememberedSession() === id) forgetRememberedSession();
+        setStatus('error', messageOf(error));
+        void refreshSessions();
+        return;
+    }
+
+    const descriptor = descriptorFor(session.harness);
+    if (descriptor === undefined) {
+        setStatus('error', `unknown harness "${session.harness}"`);
+        return;
+    }
+
+    const target = ensureInstance(descriptor);
+
+    // One session, one card: release any other card pointed at this id.
+    for (const instance of instances.values()) {
+        if (instance !== target && instance.sessionId === id) instance.sessionId = undefined;
+    }
+
+    target.sessionId = id;
+    select(target);
+    applySnapshot(target, session);
+    upsertSession(session);
+    renderSessions();
+    rememberSession(id);
+
+    if (session.status === 'running') {
+        setStatus('running', 'session running · polling server');
+        pollSession(target, id);
+        return;
+    }
+
+    setStatus(session.status === 'error' ? 'error' : 'idle', session.status === 'error' ? (session.lastError ?? 'session error') : undefined);
+};
+
+// Explicit new conversation: forget the pointer and drop the local projection.
+// The previous session stays on the server and in the list — nothing is deleted.
+newSessionButton.addEventListener('click', () => {
+    const instance = current;
+    if (instance === undefined) return;
+
+    if (running) {
+        instance.view.notice('cancel the running task before starting a new session');
+        return;
+    }
+
+    stopPolling();
+    instance.sessionId = undefined;
+    instance.view.clear();
+    instance.view.setTranscript('[]');
+    forgetRememberedSession();
+    renderSessions();
+    setStatus('idle');
+    input.focus();
+});
+
+refreshSessionsButton.addEventListener('click', () => {
+    void refreshSessions();
+});
+
+// A polling loop must never outlive the page; a reload re-reads the snapshot.
+window.addEventListener('pagehide', () => {
+    stopPolling();
+});
+
 
 // ---------------------------------------------------------------------------
 // Running
@@ -915,6 +1288,10 @@ const run = async (): Promise<void> => {
         return;
     }
 
+    // Submitting makes this card live: a background poll for a previously
+    // running session must stop doing GETs while a stream owns the tile.
+    stopPolling();
+
     // The turn tile exists before the request does: it is what makes the
     // lifecycle visible instead of the view looking idle until the first token.
     const turn = instance.view.begin(prompt);
@@ -932,6 +1309,7 @@ const run = async (): Promise<void> => {
     setStatus('connecting', 'creating session');
 
     let failure: string | undefined;
+    let terminal: SessionSnapshot | undefined;
     let sessionId: string | undefined;
 
     try {
@@ -955,6 +1333,15 @@ const run = async (): Promise<void> => {
             sessionId,
             prompt,
             (item: SessionStreamItem) => {
+                // The server opens every stream with its turn record. Binding it
+                // gives the optimistic tile the server's id/index, which is what
+                // makes the tile a projection of a real record rather than a
+                // browser-invented boundary.
+                if (item.type === 'turn') {
+                    turn.bind(item.turn);
+                    return;
+                }
+
                 if (item.type === 'event') {
                     // First real event is the honest start of streaming; before
                     // that the request is queued on the server.
@@ -964,11 +1351,22 @@ const run = async (): Promise<void> => {
                         setStatus('running', 'streaming');
                     }
 
-                    instance.view.apply(item.event);
+                    // Explicit routing: the frame names its turn. Look the tile
+                    // up by that id; an event for a turn this view does not hold
+                    // (another tab's stream, a stale frame) is dropped. The
+                    // terminal snapshot reconciles anything missed.
+                    const target = instance.view.turn(item.turnId) ?? turn;
+                    target.apply(item.event);
                     return;
                 }
 
-                instance.view.setTranscript(JSON.stringify(item.session.messages, null, 2));
+                // Terminal frames (snapshot | failed) carry the complete session,
+                // turns included. This is the frame that makes the server record
+                // authoritative for the whole transcript.
+                if (item.type === 'snapshot' || item.type === 'failed') {
+                    terminal = item.session;
+                    instance.view.setTranscript(JSON.stringify(item.session.messages, null, 2));
+                }
 
                 if (item.type === 'failed') failure = item.error.message;
             },
@@ -979,14 +1377,35 @@ const run = async (): Promise<void> => {
         // is never one animation frame behind the "done" badge.
         turn.flush();
 
-        if (failure !== undefined) {
+        // If the reader opened another session in this card while the stream was
+        // open, the tiles are detached: writing the terminal snapshot would
+        // overwrite the conversation now on screen. The server still recorded the
+        // run, so the directory entry is updated from it below.
+        const stillShown = instance.sessionId === sessionId;
+
+        // Server snapshot wins. Rebuilding from `turns` replays every recorded
+        // event (subagent events included) and drops any transient projection the
+        // browser held. A frame without turns (older server) falls back to
+        // settling the live tile so nothing is lost.
+        if (stillShown && terminal !== undefined && terminal.turns.length > 0) {
+            instance.view.hydrate(terminal.turns, terminal.model, turn.id());
+        } else if (stillShown && failure !== undefined) {
             turn.setState('error', failure);
+        } else if (stillShown) {
+            turn.setState('done', `${snapshot.model} · ${snapshot.status}`);
+        }
+
+        if (failure !== undefined) {
             setStatus('error', failure);
         } else {
-            const detail = `${snapshot.model} · ${snapshot.status}`;
-            turn.setState('done', detail);
-            setStatus('done', `done · ${detail}`);
+            setStatus('done', `done · ${snapshot.model} · ${snapshot.status}`);
         }
+
+        // Keep the directory row in step with the run that just finished; no
+        // extra request is needed because the terminal frame is a full snapshot.
+        upsertSession(terminal ?? snapshot);
+        if (stillShown) rememberSession(sessionId);
+        renderSessions();
     } catch (error) {
         turn.flush();
 
@@ -994,14 +1413,17 @@ const run = async (): Promise<void> => {
             turn.setState('cancelled', 'stopped by user');
             instance.view.notice('run cancelled');
             setStatus('idle', 'cancelled');
+            void refreshSessions();
         } else {
             const message = messageOf(error);
 
             if (message.includes('Unknown session')) {
-                // The server restarted (or the session was deleted). Forget the
-                // stale id so the next run starts a fresh conversation.
+                // The server restarted (sessions are in memory). Forget the stale
+                // pointer so the next run creates a fresh conversation; the
+                // session list is re-read to show what actually exists now.
                 instance.sessionId = undefined;
-                instance.signature = undefined;
+                if (instance === current) forgetRememberedSession();
+                void refreshSessions();
             }
 
             turn.setState('error', message);
@@ -1038,7 +1460,13 @@ stopButton.addEventListener('click', () => {
 
     const instance = current;
     if (instance?.sessionId !== undefined) {
-        void cancelSession(instance.sessionId).catch(() => undefined);
+        // The server records the cancellation as the turn's terminal status; the
+        // directory row should stop saying "running" once it has.
+        void cancelSession(instance.sessionId)
+            .catch(() => undefined)
+            .finally(() => {
+                void refreshSessions();
+            });
     }
 });
 
@@ -1060,15 +1488,20 @@ resetButton.addEventListener('click', () => {
 
     void resetSession(sessionId).then(
         (session) => {
-            instance.view.setTranscript(JSON.stringify(session.messages, null, 2));
+            // The reset answer is a full snapshot with an empty turn list; draw
+            // it rather than guessing that clearing locally was equivalent.
+            applySnapshot(instance, session);
+            upsertSession(session);
+            renderSessions();
         },
         (error: unknown) => {
             // The server may have restarted since this card was opened. Forget the
             // stale id so the next run creates a fresh session.
             instance.sessionId = undefined;
-            instance.signature = undefined;
+            if (instance === current) forgetRememberedSession();
             instance.view.notice(`reset failed: ${messageOf(error)}`);
             setStatus('error', messageOf(error));
+            void refreshSessions();
         }
     );
 });
@@ -1077,7 +1510,7 @@ resetButton.addEventListener('click', () => {
 // Boot
 // ---------------------------------------------------------------------------
 
-const applyDefaults = (defaults: HarnessIndex['defaults']): void => {
+const applyDefaults = (defaults: HarnessBootstrap['defaults']): void => {
     if (hasStoredSettings) return;
 
     if (defaults.baseURL.trim().length > 0) settings.baseURL = defaults.baseURL;
@@ -1122,9 +1555,13 @@ const boot = async (): Promise<void> => {
     setStatus('connecting');
 
     try {
-        const [index, tools] = await Promise.all([listHarnesses(), listTools()]);
+        // One bootstrap document on the canonical mount; the standalone `/api`
+        // root is a 404, so the client falls back to /harnesses + /tools +
+        // /sessions there. Both bring the full session list, which is what makes
+        // a reload land on an existing conversation.
+        const data = await loadBootstrap();
 
-        applyDefaults(index.defaults);
+        applyDefaults(data.defaults);
 
         // The defaults may have replaced the model, and the stored settings may
         // name a model the provider no longer serves. Rendering first and then
@@ -1133,10 +1570,17 @@ const boot = async (): Promise<void> => {
         renderModelOptions();
         void refreshModels();
 
-        buildPresets(index.harnesses);
-        buildTools(tools.tools);
+        buildPresets(data.presets);
+        buildTools(data.tools);
 
-        if (index.harnesses.length === 0) {
+        sessions = data.sessions;
+        renderSessions();
+
+        // Catalogue-dependent actions become usable only now.
+        refreshSessionsButton.disabled = false;
+        newSessionButton.disabled = false;
+
+        if (data.presets.length === 0) {
             showOffline('The server reported no harnesses.');
             setStatus('error', 'no harnesses');
             return;
@@ -1144,8 +1588,20 @@ const boot = async (): Promise<void> => {
 
         booted = true;
         runButton.disabled = false;
-        setStatus('idle');
         setMode('harness');
+
+        // Resume the last conversation this browser looked at, but only if this
+        // server still holds it (sessions are in memory, so a restart loses
+        // them). An unknown id is forgotten, not treated as an error.
+        const remembered = loadRememberedSession();
+
+        if (remembered !== undefined && sessions.some((session) => session.id === remembered)) {
+            await openSession(remembered);
+        } else {
+            if (remembered !== undefined) forgetRememberedSession();
+            setStatus('idle');
+        }
+
         input.focus();
     } catch (error) {
         showOffline(messageOf(error));

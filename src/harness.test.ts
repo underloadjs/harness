@@ -6,7 +6,8 @@
 //     and its name is the harness name;
 //   - only core tools are declared, and getTools enables the rest for the next
 //     turn — a searchable tool is invisible and uncallable until then;
-//   - createTool is always core, and delegate is core only when subagents exist;
+//   - createTool and todoTools are always core, and delegate is core only when
+//     subagents exist;
 //   - tools run, their results are fed back, and the loop repeats until the model
 //     answers with text;
 //   - every failure mode (unknown tool, undiscovered tool, bad JSON, throwing
@@ -108,7 +109,7 @@ describe('harness', () => {
         // The searchable tool is registered but absent from the request. getTools
         // is core, so it is always there.
         expect(writer.tools.searchable).toBe(searchable);
-        expect(declaredNames(seen[0])).toEqual(['core', 'getTools', 'createTool']);
+        expect(declaredNames(seen[0])).toEqual(['core', 'getTools', 'createTool', 'todoTools']);
     });
 
     it('preloads the preset catalogue into every harness, searchable', async () => {
@@ -122,8 +123,8 @@ describe('harness', () => {
         expect(writer.tools.runCommand).toBe(runCommand);
         expect(writer.tools.javascriptSyntax).toBe(javascriptSyntax);
         // ... and all searchable, so the first request pays only for the core
-        // tools (getTools + createTool).
-        expect(declaredNames(seen[0])).toEqual(['getTools', 'createTool']);
+        // tools (getTools + createTool + todoTools).
+        expect(declaredNames(seen[0])).toEqual(['getTools', 'createTool', 'todoTools']);
     });
 
     it('starts from the configured tools only when presets are disabled', () => {
@@ -133,7 +134,7 @@ describe('harness', () => {
         });
 
         expect(writer.tools.readFile).toBeUndefined();
-        expect(Object.keys(writer.tools)).toEqual(['getTools', 'createTool']);
+        expect(Object.keys(writer.tools)).toEqual(['getTools', 'createTool', 'todoTools']);
     });
 
     it('lets the model discover and run a preloaded preset', async () => {
@@ -153,7 +154,7 @@ describe('harness', () => {
         const writer = harness({ agents: { writer: entry } });
         const message = await writer('check this snippet');
 
-        expect(declaredNames(seen[1])).toEqual(['getTools', 'createTool', 'javascriptSyntax']);
+        expect(declaredNames(seen[1])).toEqual(['getTools', 'createTool', 'todoTools', 'javascriptSyntax']);
         expect((entry.messages[4] as { content: string }).content).toBe('true');
         expect(message.content).toBe('valid');
     });
@@ -187,8 +188,8 @@ describe('harness', () => {
 
         // Round one: core only. Round two: the discovered tool joined the
         // declarations, and the unrelated tool stayed out.
-        expect(declaredNames(seen[0])).toEqual(['getTools', 'createTool']);
-        expect(declaredNames(seen[1])).toEqual(['getTools', 'createTool', 'readFile']);
+        expect(declaredNames(seen[0])).toEqual(['getTools', 'createTool', 'todoTools']);
+        expect(declaredNames(seen[1])).toEqual(['getTools', 'createTool', 'todoTools', 'readFile']);
 
         // The discovery result is what the model sees: names plus metadata.
         const discovery = JSON.parse((entry.messages[2] as { content: string }).content);
@@ -317,7 +318,7 @@ describe('harness', () => {
             role: 'tool',
             name: 'nope',
             content:
-                'Tool "nope" is not registered. Available tools: getTools, createTool. Call getTools with capability tags to search the catalogue.'
+                'Tool "nope" is not registered. Available tools: getTools, createTool, todoTools. Call getTools with capability tags to search the catalogue.'
         });
     });
 
@@ -479,6 +480,120 @@ describe('harness', () => {
         expect(writer.agent.messages).toEqual([]);
     });
 
+    it('honours a configured maxIterations above the library default', async () => {
+        // 20 tool rounds would trip the default 16-round guard; a real session
+        // (the workspace preset) reaches this shape routinely.
+        const seen: HarnessStreamRequest[] = [];
+        const turns = [
+            ...Array.from({ length: 20 }, (_, index) => callTool(`c${index}`, 'again', '{}')),
+            answer('finished')
+        ];
+
+        const again = tool({
+            description: 'again',
+            tags: ['loop'],
+            visibility: 'core',
+            execute: () => 'ok'
+        });
+        const writer = harness({
+            agents: { writer: brain(scripted(turns, seen)) },
+            tools: { again },
+            maxIterations: 1000
+        });
+
+        const message = await writer('go');
+
+        expect(message.content).toBe('finished');
+        // 21 requests: 20 tool rounds plus the answering turn.
+        expect(seen).toHaveLength(21);
+        // user + (assistant tool call + tool result) * 20 + assistant answer.
+        expect(writer.agent.messages).toHaveLength(42);
+        expect(writer.agent.messages.at(-1)).toEqual({ role: 'assistant', content: 'finished' });
+    });
+
+    it('fails at the configured bound and names it in the error', async () => {
+        // Always asks for another tool, never answers.
+        const loop: HarnessStream = async function* () {
+            yield {
+                type: 'done' as const,
+                stopReason: 'tool_calls' as const,
+                toolCalls: [{ id: 'c', name: 'again', arguments: '{}' }]
+            };
+        };
+
+        const again = tool({
+            description: 'again',
+            tags: ['loop'],
+            visibility: 'core',
+            execute: () => 'ok'
+        });
+        const writer = harness({
+            agents: { writer: brain(loop) },
+            tools: { again },
+            maxIterations: 2
+        });
+
+        await expect(writer('go')).rejects.toThrow('requested tools more than 2 times');
+        expect(writer.agent.messages).toEqual([]);
+    });
+
+    it('allows one tool round at maxIterations: 2 and answers on the next turn', async () => {
+        const again = tool({
+            description: 'again',
+            tags: ['loop'],
+            visibility: 'core',
+            execute: () => 'ok'
+        });
+        const writer = harness({
+            agents: { writer: brain(scripted([callTool('c1', 'again', '{}'), answer('done')])) },
+            tools: { again },
+            maxIterations: 2
+        });
+
+        const message = await writer('go');
+
+        expect(message.content).toBe('done');
+        expect(writer.agent.messages).toHaveLength(4);
+    });
+
+    it('accepts maxIterations: 1 for a single answering turn', async () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('immediate')])) },
+            maxIterations: 1
+        });
+
+        const message = await writer('go');
+
+        expect(message.content).toBe('immediate');
+        expect(writer.agent.messages).toEqual([
+            { role: 'user', content: 'go' },
+            { role: 'assistant', content: 'immediate' }
+        ]);
+    });
+
+    it('rejects a maxIterations that is not a positive safe integer', () => {
+        // The exact message is part of the contract: it names the field and the
+        // received value so a host can fix its configuration.
+        const invalid: Array<[unknown, string]> = [
+            [0, 'received 0'],
+            [-1, 'received -1'],
+            [1.5, 'received 1.5'],
+            [Number.NaN, 'received NaN'],
+            [Number.POSITIVE_INFINITY, 'received Infinity'],
+            [Number.NEGATIVE_INFINITY, 'received -Infinity'],
+            [Number.MAX_SAFE_INTEGER + 1, 'received 9007199254740992']
+        ];
+
+        for (const [value, received] of invalid) {
+            expect(() =>
+                harness({
+                    agents: { writer: brain(scripted([answer('hi')])) },
+                    maxIterations: value as number
+                })
+            ).toThrow(`maxIterations must be a positive safe integer; ${received}.`);
+        }
+    });
+
     it('reset() clears the entry agent conversation and keeps the tools', async () => {
         const websearch = tool({ description: 'Search.', tags: ['search'], execute: () => 'ok' });
         const writer = harness({
@@ -513,13 +628,13 @@ describe('harness', () => {
         const writer = harness({ agents: { writer: entry }, tools: { hidden }, presets: false });
 
         await writer('go');
-        expect(declaredNames(seen[1])).toEqual(['getTools', 'createTool', 'hidden']);
+        expect(declaredNames(seen[1])).toEqual(['getTools', 'createTool', 'todoTools', 'hidden']);
 
         writer.reset();
         await writer('go again');
 
         // Back to the core set: discovery is part of "start over".
-        expect(declaredNames(seen[2])).toEqual(['getTools', 'createTool']);
+        expect(declaredNames(seen[2])).toEqual(['getTools', 'createTool', 'todoTools']);
     });
 
     it('requires at least one agent', () => {
