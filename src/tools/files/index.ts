@@ -16,6 +16,12 @@
 // regex that switches the result to matching lines. It uses ./glob's walker, so
 // .git, node_modules, and symlinks are skipped, results are capped, and .gitignore
 // is deliberately not read.
+//
+// Two private helpers sit beside the tool and are shared by the batch:
+//   - ./identity — one canonical key per real file, so duplicate targets (Windows
+//     case aliases, symlink aliases, aliased roots) cannot slip through;
+//   - ./bounded-regex — content matching inside node:vm with a timeout, so a
+//     catastrophic pattern fails instead of hanging the process.
 export { fileRead } from './fileRead';
 export type { FileReadEntry, FileReadParameters, FileReadResult } from './fileRead';
 export { fileWrite } from './fileWrite';

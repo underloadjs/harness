@@ -54,7 +54,11 @@ import { PRESET_TOOLS } from '../catalogue';
 // ../catalogue) declares the array form; a bare string stays accepted because a
 // one-directory call is the common case and the single-property rule hands this
 // value to `execute` untouched, with no schema lookup to normalize it.
-export type FileListParameters = string | string[] | undefined;
+//
+// `null` and an empty object are accepted as "no preference" (see normalizePaths):
+// they are what a client sends when the argument box is empty, and the documented
+// default is the working directory.
+export type FileListParameters = string | string[] | null | undefined;
 
 // Posix separators in every result, on every platform: the model should not have
 // to care which OS the harness runs on. Same convention as fileGlob.
@@ -69,7 +73,11 @@ const compareNames = (left: string, right: string): number =>
 // Normalize the argument into the directories to list, in caller order.
 //
 //   undefined  -> ['.']  (the historic default: the working directory)
+//   null / {}  -> ['.']  ("no preference": an empty argument box on the wire)
 //   'src'      -> ['src'] (direct-call convenience for a single directory)
+//   ['src']    -> ['src']
+//   { paths }  -> the wrapped array (the parameter object the server's direct-call
+//                 route passes through without unwrapping it)
 //   []         -> HarnessError (see below)
 //   ['src',''] -> HarnessError (a blank entry is a caller mistake, not a request)
 //
@@ -77,10 +85,32 @@ const compareNames = (left: string, right: string): number =>
 // sends `{"paths": []}` almost certainly meant "no preference", and an empty
 // result would let it conclude the directory is empty — a wrong answer is worse
 // than an error that names the fix (omit `paths` to list the working directory).
-const normalizePaths = (paths: FileListParameters): string[] => {
-    if (paths === undefined) return ['.'];
+//
+// WHY THE DEFAULTS LIVE HERE AND NOT IN THE SERVER (T16): both entry points reach
+// `execute` with the property VALUE when their own unwrapping applies, but the
+// server's direct-call route hands over the `parameters` object as-is (`{}` for an
+// empty box, or `{ "paths": [...] }` for a model-shaped body). Accepting those here
+// keeps the API free of per-tool defaulting and keeps one documented contract.
+const normalizePaths = (paths: FileListParameters | Record<string, unknown>): string[] => {
+    // `null` and `{}` are the two shapes of "the caller expressed no preference".
+    if (paths === undefined || paths === null) return ['.'];
 
-    const list = Array.isArray(paths) ? paths : [paths];
+    if (!Array.isArray(paths) && typeof paths === 'object') {
+        const keys = Object.keys(paths);
+
+        // Only an EMPTY object is a no-argument call. Any other object is malformed
+        // for this tool and is reported rather than guessed at.
+        if (keys.length === 0) return ['.'];
+
+        const wrapped = (paths as { paths?: unknown }).paths;
+        if (keys.length === 1 && keys[0] === 'paths') {
+            return normalizePaths(wrapped as FileListParameters);
+        }
+
+        throw new HarnessError('fileList paths must be non-empty strings.');
+    }
+
+    const list = Array.isArray(paths) ? paths : [paths as string];
 
     if (list.length === 0) {
         throw new HarnessError(

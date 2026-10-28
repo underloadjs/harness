@@ -298,6 +298,11 @@ const createView = (descriptor: HarnessDescriptor): View => {
 // implementation a session registers, so package presets work here too.
 
 // A few tools deserve a real starting value rather than a schema-derived blank.
+//
+// Every entry here must be an input the tool would actually accept: the box is
+// editable and nothing runs until "Call tool", so a value with empty tags, a
+// missing required string, or an optional field pinned to an invalid 0 only
+// teaches the wrong shape.
 const EXAMPLES: Readonly<Record<string, unknown>> = {
     // Two properties, so the runner sends the whole object (no single-property
     // unwrapping): the language is part of the input, not a separate mode.
@@ -309,11 +314,28 @@ const EXAMPLES: Readonly<Record<string, unknown>> = {
     fileEdit: [{ path: 'notes/hello.txt', oldString: 'hello', newString: 'hi' }],
     // "." works from whatever directory the server runs in.
     fileList: ['.'],
-    // fileGlob declares four properties, so it takes the whole object. `content`
-    // is present here to show the content-search mode; delete it for a filename
-    // listing.
-    fileGlob: { patterns: ['**/*.ts'], paths: ['.'], content: 'harness', maxResults: 20 },
+    // fileGlob declares four properties, so it takes the whole object. Both lists
+    // are the documented defaults, and the optional `content`/`maxResults` are
+    // OMITTED: an absent `content` is filename mode (the useful first call) and an
+    // absent `maxResults` means the documented cap, whereas `""` or `0` would
+    // switch to content mode or be clamped. Add `content` to try a content search.
+    fileGlob: { patterns: ['**/*'], paths: ['.'] },
     commandRun: { command: 'git status --short' },
+    // Core tools: the manual runner can call these inside the selected session, so
+    // their examples have to satisfy the same schema the model sees (non-empty
+    // tags, a real action, a body that would parse).
+    toolRequest: { tags: ['files', 'read'] },
+    toolCreate: {
+        name: 'shoutText',
+        description: 'Uppercase a short string.',
+        tags: ['text', 'upper'],
+        source: 'return args.trim().toUpperCase();'
+    },
+    todoManage: { action: 'add', text: 'Review the harness catalogue' },
+    agentDelegate: {
+        agent: 'summarizer',
+        input: 'Summarise these notes in at most two sentences.'
+    },
     timeNow: 'UTC',
     textCount: 'The harness finds tools by tag before it uses them.',
     diceRoll: 6,
@@ -336,15 +358,32 @@ const singleProperty = (parameters: Record<string, unknown> | undefined): string
     return keys.length === 1 ? keys[0] : undefined;
 };
 
+// A schema-derived starting value for one property, used only when no example and
+// no schema `default` exist.
+//
+// The order is deliberate: an enum member is always valid, "required" strings and
+// numbers get a value the schema would accept, and an array is left empty (that is
+// valid for every array schema here — a `minItems` constraint would need an
+// example instead).
 const placeholderFor = (schema: Record<string, unknown> | undefined): unknown => {
+    // A declared default is the best answer there is: it is what the tool itself
+    // documents as the value to use.
+    if (schema !== undefined && schema.default !== undefined) return schema.default;
+
+    const values = schema?.enum;
+
+    // An enum member is valid by construction. Taking the first keeps the template
+    // deterministic (todoManage.action, syntaxCheck.language).
+    if (Array.isArray(values) && values.length > 0) return values[0];
+
     switch (schema?.type) {
         case 'string':
             return '';
         case 'number':
         case 'integer':
-            return 0;
+            return schema.minimum !== undefined && typeof schema.minimum === 'number' ? schema.minimum : 0;
         case 'boolean':
-            return false;
+            return schema.default === true;
         case 'array':
             return [];
         case 'object':
@@ -354,17 +393,42 @@ const placeholderFor = (schema: Record<string, unknown> | undefined): unknown =>
     }
 };
 
+// The auto-generated argument text for a tool that has no curated example.
+//
+// WHY OPTIONAL PROPERTIES ARE DROPPED (T16)
+// -----------------------------------------
+// Filling every property with a type-shaped blank produced arguments that no tool
+// would accept: `{"tags": [], "limit": 0}` for toolRequest (empty tags, and 0 is
+// below the minimum), `{"patterns": [], "paths": [], "content": "", "maxResults": 0}`
+// for fileGlob. Omitting what the schema does not require is both valid and the
+// honest reading of "optional": the tool then applies its documented default. Only
+// the `required` list is materialized; a schema with no `required` at all gets `{}`,
+// which is a valid no-argument call.
+//
+// The ONE-property case is different: the single-property rule means the textarea
+// holds that property's VALUE, not a wrapper object (see `singleProperty` above), so
+// it is emitted bare whether or not the schema marks it required — with no value at
+// all the box would be `undefined` instead of JSON.
+//
+// The text stays fully editable in the runner; nothing here executes.
 const templateFor = (parameters: Record<string, unknown> | undefined): string => {
     if (!parameters || parameters.type !== 'object') return '{}';
 
     const properties = (parameters.properties ?? {}) as Record<string, Record<string, unknown>>;
+    const required = Array.isArray(parameters.required)
+        ? (parameters.required as unknown[]).filter((key): key is string => typeof key === 'string')
+        : [];
     const keys = Object.keys(properties);
 
-    if (keys.length === 0) return '{}';
+    // Single-property schema: the whole argument IS this property's value.
     if (keys.length === 1) return JSON.stringify(placeholderFor(properties[keys[0]]));
 
+    const included = keys.filter((key) => required.includes(key));
+
+    if (included.length === 0) return '{}';
+
     const value: Record<string, unknown> = {};
-    for (const key of keys) value[key] = placeholderFor(properties[key]);
+    for (const key of included) value[key] = placeholderFor(properties[key]);
 
     return JSON.stringify(value, null, 2);
 };

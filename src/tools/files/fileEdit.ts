@@ -17,12 +17,13 @@
 // PREFLIGHT — ALL-OR-NOTHING (this is what makes batching safe)
 // ------------------------------------------------------------
 // Before the first byte is written, EVERY edit is validated (shape, non-empty
-// oldString, distinct oldString/newString, no NUL, UNIQUE resolved target path) and
-// EVERY file is read and match-checked. A failure anywhere — including on the last
-// entry — therefore leaves every file untouched, which is why the batch can be
-// trusted. Duplicate targets are rejected rather than merged: two edits to one file
-// would both be computed from the same original text, so the second write would
-// silently discard the first.
+// oldString, distinct oldString/newString, no NUL, UNIQUE target file) and EVERY
+// file is read and match-checked. A failure anywhere — including on the last entry
+// — therefore leaves every file untouched, which is why the batch can be trusted.
+// Duplicate targets are rejected rather than merged: two edits to one file would
+// both be computed from the same original text, so the second write would silently
+// discard the first. Uniqueness is by FILE IDENTITY (./identity.ts), so on Windows
+// two case spellings of one file — or a symlink alias — are caught as well.
 //
 // FAILURE SEMANTICS (honest, not transactional)
 // ---------------------------------------------
@@ -45,6 +46,7 @@ import { resolve } from 'node:path';
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
 import { PRESET_TOOLS } from '../catalogue';
+import { fileIdentity } from './identity';
 
 // One replacement to apply.
 export type FileEditEntry = {
@@ -79,6 +81,14 @@ export type FileEditResult = FileEditResultEntry[];
 // in newString is written literally rather than expanded.
 const countOccurrences = (content: string, search: string): number => content.split(search).length - 1;
 
+// A validated edit whose target has been resolved: what the read/match pass needs.
+type NormalizedEdit = {
+    target: string;
+    oldString: string;
+    newString: string;
+    replaceAll: boolean;
+};
+
 // A validated, match-checked edit: everything the write phase needs.
 type PreparedEdit = {
     target: string;
@@ -93,8 +103,10 @@ type PreparedEdit = {
 
 // Validate the shape of every entry, resolve every target, and reject duplicates.
 // Kept separate from the read/match pass so shape errors are reported before any
-// filesystem work at all.
-const normalizeEdits = (edits: FileEditParameters): { target: string; oldString: string; newString: string; replaceAll: boolean }[] => {
+// filesystem work at all. The duplicate check does read (`realpath`), because two
+// spellings of one existing file must collide on every platform — see
+// ./identity.ts for the rule and for why only win32 folds case.
+const normalizeEdits = async (edits: FileEditParameters): Promise<NormalizedEdit[]> => {
     if (!Array.isArray(edits)) {
         throw new HarnessError(
             'fileEdit expects an array of { path, oldString, newString } entries, e.g. [{"path":"a.txt","oldString":"a","newString":"b"}].'
@@ -105,7 +117,7 @@ const normalizeEdits = (edits: FileEditParameters): { target: string; oldString:
         throw new HarnessError('fileEdit received an empty edits array; pass at least one edit.');
     }
 
-    const normalized: { target: string; oldString: string; newString: string; replaceAll: boolean }[] = [];
+    const normalized: NormalizedEdit[] = [];
     const seen = new Set<string>();
 
     for (const entry of edits) {
@@ -151,13 +163,17 @@ const normalizeEdits = (edits: FileEditParameters): { target: string; oldString:
 
         // Two edits to one file would both be computed from the same original text,
         // so the second write would discard the first. Reject rather than guess.
-        if (seen.has(target)) {
+        // The message names the resolved path; the comparison uses the real file
+        // identity, so `a.txt`/`A.TXT` (Windows) and symlink aliases collide too.
+        const identity = await fileIdentity(target);
+
+        if (seen.has(identity)) {
             throw new HarnessError(
                 `fileEdit received the same target path twice (${target}); make one edit per file per call.`
             );
         }
 
-        seen.add(target);
+        seen.add(identity);
         normalized.push({ target, oldString, newString, replaceAll: replaceAll === true });
     }
 
@@ -166,9 +182,7 @@ const normalizeEdits = (edits: FileEditParameters): { target: string; oldString:
 
 // Read and match-check every file. Nothing is written here, so a failure on the
 // last entry still leaves the first file untouched.
-const prepareEdits = async (
-    edits: ReturnType<typeof normalizeEdits>
-): Promise<PreparedEdit[]> => {
+const prepareEdits = async (edits: NormalizedEdit[]): Promise<PreparedEdit[]> => {
     const prepared: PreparedEdit[] = [];
 
     for (const edit of edits) {
@@ -217,7 +231,7 @@ const applyEdit = (edit: PreparedEdit): { updated: string; replacements: number 
 export const fileEdit = tool<FileEditParameters, FileEditResult>({
     ...PRESET_TOOLS.fileEdit,
     execute: async ({ parameters: edits }) => {
-        const normalized = normalizeEdits(edits);
+        const normalized = await normalizeEdits(edits);
         const prepared = await prepareEdits(normalized);
         const results: FileEditResultEntry[] = [];
 

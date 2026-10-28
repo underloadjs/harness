@@ -377,20 +377,23 @@ await fileEdit([{ path: 'a.ts', oldString: 'a', newString: 'b' }]);
 ```
 
 `fileWrite` and `fileEdit` validate **every** entry (shape, non-empty strings, no
-NUL, unique resolved target path) before the first write, and `fileEdit` also
-reads and match-checks every file first, so one bad entry leaves every file
-untouched. A filesystem error part-way through the write phase is reported with the
-paths already completed: there is **no transaction and no rollback**.
+NUL, unique target file) before the first write, and `fileEdit` also reads and
+match-checks every file first, so one bad entry leaves every file untouched.
+Uniqueness is by **real file identity**, not spelling: on Windows `notes.txt` and
+`NOTES.TXT` are one file, and so is a symlink alias on any platform, so a batch that
+names one file twice is rejected before anything is written (Linux keeps `a.ts` and
+`A.ts` as two files). A filesystem error part-way through the write phase is reported
+with the paths already completed: there is **no transaction and no rollback**.
 
 | Tool | Signatures | Result |
 |---|---|---|
 | `syntaxCheck` | `({ code, language: 'javascript' \| 'python' })` | `true` when the snippet parses; JavaScript is a classic script (no `import`/`export` or top-level await) |
 | `fileRead` | `(paths: string[])` — non-empty | ordered `{ path, content }[]`; one missing/unreadable path rejects the whole call |
-| `fileWrite` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`, creating parent directories; duplicate resolved targets rejected |
+| `fileWrite` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`, creating parent directories; duplicate target files rejected |
 | `fileEdit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes }[]`; `oldString` must be unique unless `replaceAll`; all edits preflighted |
 | `fileList` | `(paths?)` — string or string[]; defaults to `["."]` | `string[]` of `dir/entry`, directories end with `/`; non-recursive |
 | `fileGlob` | `({ patterns?, paths?, maxResults? })` | filename mode: `{ files, truncated }`; caps at 100 |
-| `fileGlob` | `({ patterns?, paths?, content, maxResults? })` | content mode: `{ matches: [{ path, line, text }], truncated }`; caps at 100 |
+| `fileGlob` | `({ patterns?, paths?, content, maxResults? })` | content mode: `{ matches: [{ path, line, text }], truncated }`; caps at 100, matching time-bounded |
 | `commandRun` | `({ command, cwd? })` | `{ exitCode, stdout, stderr }` |
 | `gitDiff` | `({ ref?, staged?, paths?, cwd? })` | `{ exitCode, stdout, stderr, truncated, timedOut }`; read-only |
 
@@ -403,11 +406,23 @@ not this table:
   restricted to files matching `patterns`).
 
 `patterns` (default `["**/*"]`) are OR-ed, and a pattern with no `/` also matches
-file names at any depth. `paths` (default `["."]`) are walked in caller order;
-overlapping roots and patterns are deduplicated by resolved file identity while
-keeping the first root's prefix, and the cap is global across every root.
+file names at any depth. A pattern is matched against each file's path **relative to
+the root that found it**, and results carry that root as their prefix, so
+`fileGlob({ paths: ['src'], patterns: ['**/*.ts'] })` returns `src/a.ts` and
+`src/nested/b.ts` (never an absolute path, and never a pattern matched against one).
+`paths` (default `["."]`) are walked in caller order; roots that resolve to the same
+directory (a symlink alias, or `src`/`SRC` on Windows) are walked once, and files are
+deduplicated by resolved identity while keeping the first root's prefix. The cap is
+global across every root.
 `.git`, `node_modules`, symlinks, binary files, and files over 1 MiB are skipped in
 content mode, and `.gitignore` is **not** read.
+
+Content matching is **time-bounded**: a JavaScript regex can backtrack
+exponentially (`(a+)+$` needs seconds on a 31-byte line), so the match loop runs in
+`node:vm` with a cumulative 2-second budget and a pattern that exceeds it fails with
+a clear error instead of hanging the call. It is a timeout, not a sandbox, and an
+ordinary grep over a large tree is unaffected (the context is reused per search and
+the boundary is crossed once per file, not once per line).
 `gitDiff` runs a fixed `git diff` argv with no shell, colour, external diff
 drivers, or textconv, and never stages or commits.
 
@@ -819,7 +834,7 @@ yarn preview:playground   # built UI on :5180, proxying /api to a running yarn s
 
 The catalogue lives in `harnesses/`. Both entry points use it. Every **live**
 preset is built by the same factory (`harnesses/toolbox.ts`), so the registered
-toolbox is identical: all nine package tools (`syntaxCheck`, the six file tools,
+toolbox is identical: all eight package tools (`syntaxCheck`, the five file tools,
 `commandRun`, `gitDiff`), the app tools (`timeNow`, `textCount`, `diceRoll`,
 `noteSearch`, `textSummarize`), opt-in `webSearch`, and the harness-owned core tools
 (`toolRequest`, `toolCreate`, `todoManage`, plus `agentDelegate` only when the preset
@@ -880,7 +895,7 @@ resource paths below `/v1/harness` and adds a bootstrap document at its root; se
 | `GET /api/agents` | The trusted agent registry (`name`, `title`, `description`, `instruction`, `guidelines`) |
 | `GET /api/tools` | The whole tool catalogue, core tools first (`toolRequest`, `toolCreate`, `todoManage`, `agentDelegate`) then every direct-call tool; `webSearch` always appears with `availability` |
 | `GET /api/tools/bootstrap` | Alias of `GET /api/tools` (the list the root bootstrap document carries) |
-| `POST /api/tools/:name` | Call one tool on the server. A core tool needs `sessionId` (it runs inside that session's harness); a direct-call tool keeps its session-less runner. An unconfigured tool returns `ok: false` |
+| `POST /api/tools/:name` | Call one tool on the server. A core tool needs `sessionId` (it runs inside that session's harness); a direct-call tool keeps its session-less runner. An unconfigured tool returns `ok: false`. See [the call body](#the-tool-call-body) |
 | `POST /api/tools/:name/call` | Alias of the row above (verb-named spelling), same dispatcher |
 | `POST /api/models` | Server-side `GET {baseURL}/models`; returns `{ models: string[] }` for the UI dropdown |
 | `POST /api/sessions` | Create a session for a preset |
@@ -889,6 +904,33 @@ resource paths below `/v1/harness` and adds a bootstrap document at its root; se
 | `POST /api/sessions/:id/reset` | Reset every agent and clear discovery and todos |
 | `POST /api/sessions/:id/cancel` | Abort the running task |
 | `DELETE /api/sessions/:id` | Forget a session |
+
+#### The tool call body
+
+`POST /api/tools/:name` always takes **one wrapper object with a `parameters`
+property**; `{ "parameters": {} }` is a valid argument-less call, and a body without
+`parameters` is a `400`. What `parameters` HOLDS depends on the tool's schema, and the
+two forms are not interchangeable:
+
+```jsonc
+// fileList declares ONE property, so the value IS that property (the same unwrapping
+// a model call gets and a direct call passes):
+POST /api/tools/fileList   { "parameters": ["src", "task"] }
+
+// its schema, as listed by GET /api/tools, is still an object:
+{ "type": "object", "properties": { "paths": { "type": "array", … } }, … }
+
+// a multi-property tool takes the whole object, because there is nothing to unwrap:
+POST /api/tools/fileGlob   { "parameters": { "patterns": ["**/*.ts"], "paths": ["src"] } }
+POST /api/tools/toolRequest { "parameters": { "tags": ["files"] }, "sessionId": "…" }
+```
+
+The single-property tools are `fileRead`, `fileWrite`, `fileEdit`, and `fileList`;
+`fileGlob`, `syntaxCheck`, `commandRun`, `gitDiff`, and every core tool carry several
+properties. `fileList` normalizes the tolerated "no preference" shapes itself
+(`undefined`, `null`, `{}`, and a `{ "paths": [...] }` wrapper all mean `["."]`), so an
+empty argument box and a model-shaped body agree, while an explicit `[]` is still an
+error.
 
 **Harness creation and overrides are in memory only.** `POST /api/harnesses` adds
 a live harness built from trusted agents and the shared toolbox; `PATCH` can change

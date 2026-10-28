@@ -187,7 +187,7 @@ reach into `src/`.
 - [Delegation](#delegation) — Explicit primary/subagents, one level deep
 
 ### Preset Tools
-- [Preset tools](#preset-tools) - the nine lazy presets, executable on their own
+- [Preset tools](#preset-tools) - the eight lazy presets, executable on their own
 - [Web search](#web-search) — opt-in per-harness `webSearch` over Exa/Tavily
 
 ### Harness
@@ -389,7 +389,7 @@ same way.
   a count, never names — and `truncated: true` mirrors it for older clients.
   Results sort by best score, then hit count, then name, so which five survive is
   deterministic. A broad tag is refined (`["files"]` then `["files", "write"]`),
-  which is how the sixth file tool is reached without pagination.
+  which is how the rest of the five file tools are reached without pagination.
 - `availableTags` (the sorted vocabulary of searchable tools) is returned when
   nothing matched or when the query was empty, so a failed query teaches the model
   the real tags.
@@ -452,8 +452,10 @@ not replace it with the full-list shape.
 
 ## Preset tools
 
-`src/tools/` ships nine presets. Each is a standard `tool()` and each is executable
-standalone. All nine are **searchable**: no preset is declared up front.
+`src/tools/` ships eight presets: `syntaxCheck`, the five file tools (`fileRead`,
+`fileWrite`, `fileEdit`, `fileList`, `fileGlob`), `commandRun`, and `gitDiff`. Each
+is a standard `tool()` and each is executable standalone. All eight are
+**searchable**: no preset is declared up front.
 
 The folder is one file per tool, one folder per capability — `tools/syntax/`,
 `tools/files/`, `tools/command/` — and the barrel exports both the named tools and
@@ -476,7 +478,7 @@ implementation through `loadPresetTool`'s `import()` on first call. Consequences
 - a failed import clears the cache so the next call retries.
 
 Every preset is tagged and **searchable** (the default), so a harness that registers
-all nine declares only the harness-owned core set until the model asks for `files`,
+all eight declares only the harness-owned core set until the model asks for `files`,
 `read`, `shell`, `git`, `python`, or `javascript`.
 
 | Export | Call | Result |
@@ -507,9 +509,12 @@ Implementation notes worth keeping:
   what makes `fileRead(['a', 'b'])` and a model call carrying
   `{ "paths": ["a", "b"] }` the same code path.
 - **`fileWrite` / `fileEdit` preflight everything.** Every entry is shape-checked,
-  every resolved target must be unique, and (for edits) every file is read and
-  match-checked before the first byte is written, so one bad entry leaves every
-  file untouched. A filesystem error during the write phase names the completed
+  every target must be unique **by real file identity** (`tools/files/identity.ts`:
+  `realpath`, plus the nearest existing ancestor for a file that does not exist yet,
+  case-folded only on Windows — so `notes.txt`/`NOTES.TXT` and symlink aliases are
+  caught, while Linux keeps `a.ts`/`A.ts` as two files), and (for edits) every file
+  is read and match-checked before the first byte is written, so one bad entry leaves
+  every file untouched. A filesystem error during the write phase names the completed
   paths: there is **no transaction and no rollback**.
 - **`fileEdit` is exact and guarded.** `oldString` must appear exactly once or
   `replaceAll: true` must be passed; a missing file is an error (use `fileWrite`
@@ -518,17 +523,32 @@ Implementation notes worth keeping:
   flat list whose entries are prefixed with their directory (`src/a.ts`,
   `src/nested/`, `task/b.ts`); directories keep the trailing `/`. It stays
   **non-recursive** — `fileGlob({ patterns: ['**/*'] })` is the walking tool — and
-  the default `paths: ["."]` returns bare entry names. Directories are visited in
-  the caller's order, each listing sorted by code point, and a missing directory
-  rejects the whole call (no partial result).
+  the default `paths: ["."]` returns bare entry names (the schema declares
+  `default: ["."]`). `undefined`, `null`, `{}`, and a `{ "paths": [...] }` wrapper
+  all normalize to that default in the implementation, because the server's
+  direct-call route hands over the `parameters` object as-is; an explicit `[]` is
+  still an error. Directories are visited in the caller's order, each listing sorted
+  by code point, and a missing directory rejects the whole call (no partial result).
 - **`fileGlob` is ONE tool with two modes**, discriminated by the presence of
   `content`: absent → `{ files, truncated }`, present → `{ matches, truncated }`.
   `patterns` default `['**/*']` and are OR-ed; a pattern with no `/` also matches
-  file names at any depth. `paths` default `['.']` and are walked in caller order;
-  overlapping roots/patterns are deduplicated by resolved file identity (first root
-  wins the prefix) and the cap is global. `.git`, `node_modules`, symlinks,
-  binaries, and files over 1 MiB are skipped in content mode; results default to
-  100 (clamped 1–100) and set `truncated`; `.gitignore` is deliberately not read.
+  file names at any depth, and a pattern is matched against a file path **relative
+  to each root** (results are root-prefixed, never absolute-matched). `paths` default
+  `['.']` and are walked in caller order; overlapping roots are deduplicated by root
+  identity first (a symlink alias, or `src`/`SRC` on Windows, is walked once) and
+  then files by resolved identity, with the first root winning the prefix; the cap is
+  global. A non-object argument (a string or an array) is rejected instead of
+  silently meaning "every file". `.git`, `node_modules`, symlinks, binaries, and
+  files over 1 MiB are skipped in content mode; results default to 100 (clamped
+  1–100) and set `truncated`; `.gitignore` is deliberately not read.
+- **Content matching is time-bounded.** `content` is a JavaScript regex, and
+  JavaScript regexes backtrack: `(a+)+$` blocks the process for seconds on a 31-byte
+  line. `tools/files/bounded-regex.ts` therefore runs the match loop inside
+  `node:vm` with a cumulative 2-second budget across the whole search (one context
+  and one precompiled script per search, one call per FILE, so ordinary greps cost
+  the same as before). Exhausting the budget throws a `HarnessError` that names the
+  budget and the likely cause. It is a timeout, not a sandbox; an invalid pattern
+  still fails in the host realm so the caller gets the parser's own `SyntaxError`.
 - **`gitDiff` is the read-only git path.** A fixed argv with no shell, no colour,
   no external diff drivers, no textconv; `ref` may not start with `-`, and paths
   go after `--`. Non-zero exit is data, like `commandRun`.

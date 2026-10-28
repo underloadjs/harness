@@ -6,9 +6,10 @@
 //   - parent directories are created and an existing file is overwritten;
 //   - the schema declares exactly one array property (`files`), so the harness's
 //     single-property rule hands `execute` the array itself;
-//   - the WHOLE batch is validated and every target resolved (and deduplicated)
-//     BEFORE the first write, so a bad entry in the last position leaves the first
-//     file untouched;
+//   - the WHOLE batch is validated and every target resolved (and deduplicated by
+//     FILE IDENTITY — T16: Windows case aliases and symlink aliases are one file,
+//     Linux `a.txt`/`A.txt` are two) BEFORE the first write, so a bad entry in the
+//     last position leaves the first file untouched;
 //   - a filesystem error part-way through is reported honestly: the completed paths
 //     are named and there is no claim of a transaction or rollback.
 //
@@ -16,7 +17,14 @@
 // run, removed afterwards (module-relative, same convention as fileRead.test.ts).
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { mkdir, mkdtemp, readFile as readTextFile, rm, writeFile as writeTextFile } from 'node:fs/promises';
+import {
+    mkdir,
+    mkdtemp,
+    readFile as readTextFile,
+    rm,
+    symlink,
+    writeFile as writeTextFile
+} from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { toolParameterKey } from '../../core';
@@ -112,6 +120,96 @@ describe('fileWrite', () => {
 
         // Nothing was written by the rejected batch.
         await expect(readTextFile(target, 'utf8')).rejects.toThrow();
+    });
+
+    it('rejects a batch whose two spellings are one file on this platform', async () => {
+        // T16: uniqueness is by FILE IDENTITY, not by the resolved string. On
+        // Windows "aliases.txt" and "ALIASES.TXT" are ONE file, so the batch must be
+        // rejected before the first write; on Linux they are two files and the batch
+        // is legitimate. The fixture is created for both cases, so each branch
+        // asserts the true behaviour of this host instead of skipping.
+        const lower = join(workdir, 'aliases.txt');
+        const upper = join(workdir, 'ALIASES.TXT');
+        await writeTextFile(lower, 'first', 'utf8');
+
+        if (process.platform === 'win32') {
+            await expect(
+                fileWrite([
+                    { path: lower, content: 'one' },
+                    { path: upper, content: 'two' }
+                ])
+            ).rejects.toThrow(
+                `fileWrite received the same target path twice (${upper}); write each file once per call.`
+            );
+
+            // Preflight means the first entry never ran: the file keeps its text.
+            await expect(readTextFile(lower, 'utf8')).resolves.toBe('first');
+            return;
+        }
+
+        // Linux: two distinct files, so both are written and both are reported.
+        await expect(
+            fileWrite([
+                { path: lower, content: 'one' },
+                { path: upper, content: 'two' }
+            ])
+        ).resolves.toEqual([
+            { path: lower, bytes: 3 },
+            { path: upper, bytes: 3 }
+        ]);
+        await expect(readTextFile(lower, 'utf8')).resolves.toBe('one');
+        await expect(readTextFile(upper, 'utf8')).resolves.toBe('two');
+    });
+
+    it('rejects two spellings of a not-yet-created file', async () => {
+        // A new target has no realpath, so the identity comes from the nearest
+        // existing ancestor plus the missing segments. Both spellings below name the
+        // same file on EVERY platform, so this needs no platform branch.
+        const plain = join(workdir, 'fresh', 'new.txt');
+        const dotted = join(workdir, 'fresh', '.', 'new.txt');
+
+        await expect(
+            fileWrite([
+                { path: plain, content: 'one' },
+                { path: dotted, content: 'two' }
+            ])
+        ).rejects.toThrow(
+            `fileWrite received the same target path twice (${dotted}); write each file once per call.`
+        );
+
+        await expect(readTextFile(plain, 'utf8')).rejects.toThrow();
+    });
+
+    it('rejects a second spelling that reaches the target through a symlink', async () => {
+        // A symlinked parent is a different string but the same file. Creating the
+        // link is privileged on Windows (Developer Mode or elevated), so the guard
+        // is the ability to create it, not the platform name.
+        const real = join(workdir, 'linked', 'target.txt');
+        await mkdir(join(workdir, 'linked'), { recursive: true });
+        await writeTextFile(real, 'original', 'utf8');
+
+        const alias = join(workdir, 'linked-alias');
+
+        try {
+            await symlink(join(workdir, 'linked'), alias, 'dir');
+        } catch {
+            // No symlink privilege on this host: nothing to prove here.
+            await expect(readTextFile(real, 'utf8')).resolves.toBe('original');
+            return;
+        }
+
+        const throughLink = join(alias, 'target.txt');
+
+        await expect(
+            fileWrite([
+                { path: real, content: 'one' },
+                { path: throughLink, content: 'two' }
+            ])
+        ).rejects.toThrow(
+            `fileWrite received the same target path twice (${throughLink}); write each file once per call.`
+        );
+
+        await expect(readTextFile(real, 'utf8')).resolves.toBe('original');
     });
 
     it('rejects an empty array, a non-array, and malformed entries', async () => {

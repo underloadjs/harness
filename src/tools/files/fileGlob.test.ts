@@ -13,7 +13,13 @@
 //     roots/patterns, and one GLOBAL cap;
 //   - content mode: one match per line with a 1-based line number, the same
 //     adversarial skip list (.git, node_modules, binary, symlinks), regex
-//     semantics, caps, and truncation;
+//     semantics, caps, truncation, and the T16 matching BUDGET that stops a
+//     catastrophic pattern instead of hanging;
+//   - T16 argument rules: a non-object argument (string, array) is rejected rather
+//     than defaulted to "every file", and patterns are matched relative to EACH
+//     root (results are root-prefixed);
+//   - T16 root identity: roots that are ONE directory (a case alias on Windows, a
+//     symlink alias anywhere) are walked once, so files are never listed twice;
 //   - argument validation: non-empty `patterns`/`paths` arrays, string `content`,
 //     and the documented defaults.
 //
@@ -23,7 +29,7 @@
 // `Temp/`, one unique directory per run, removed afterwards.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { mkdir, mkdtemp, rm, writeFile as writeTextFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, rm, symlink, writeFile as writeTextFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { globToRegExp, matchGlob } from './glob';
@@ -33,6 +39,9 @@ const TEMP_ROOT = fileURLToPath(new URL('../../../../../../Temp', import.meta.ur
 
 let workdir: string;
 let previousCwd: string;
+// A directory symlink is privileged on Windows (Developer Mode or elevated); the
+// alias assertions run only when the host let us create one.
+let rootAlias: string | undefined;
 
 const seed = async (relativePath: string, content = 'x\n'): Promise<void> => {
     const path = join(workdir, relativePath);
@@ -61,6 +70,16 @@ beforeAll(async () => {
     await seed('src/nested/deep/d.ts', 'no match here\n');
     await seed('task/e.ts', '// TODO: five\n');
     await seed('root.txt', 'TODO: six\n');
+
+    // The budget fixture: 31 bytes that make `(a+)+$` backtrack catastrophically.
+    await seed('evil/line.txt', `${'a'.repeat(31)}b\n`);
+
+    try {
+        await symlink(join(workdir, 'src'), join(workdir, 'src-alias'), 'dir');
+        rootAlias = 'src-alias';
+    } catch {
+        rootAlias = undefined;
+    }
 });
 
 afterAll(async () => {
@@ -76,6 +95,7 @@ describe('fileGlob — filename mode', () => {
             files: [
                 'binary.bin',
                 'docs/readme.md',
+                'evil/line.txt',
                 'root.txt',
                 'src/a.ts',
                 'src/b.ts',
@@ -177,6 +197,63 @@ describe('fileGlob — filename mode', () => {
             'fileGlob content must be a regular-expression string when provided.'
         );
     });
+
+    it('rejects a non-object argument instead of defaulting to every file', async () => {
+        // T16: a string or an array used to slip past the property reads and mean
+        // "use every default" — i.e. list the whole tree. A wrong answer that looks
+        // complete is worse than an error, so the shape is checked first.
+        const message =
+            'fileGlob expects an object with optional "patterns", "paths", "content", and "maxResults" properties, e.g. {"patterns":["**/*.ts"]}.';
+
+        await expect(fileGlob('*.ts' as never)).rejects.toThrow(message);
+        await expect(fileGlob(['**/*.ts'] as never)).rejects.toThrow(message);
+        await expect(fileGlob(7 as never)).rejects.toThrow(message);
+
+        // `null` and `undefined` are "no argument at all", which is a legitimate
+        // documented request: every file under ".".
+        await expect(fileGlob(undefined as never)).resolves.toEqual({
+            files: [
+                'binary.bin',
+                'docs/readme.md',
+                'evil/line.txt',
+                'root.txt',
+                'src/a.ts',
+                'src/b.ts',
+                'src/nested/c.js',
+                'src/nested/deep/d.ts',
+                'task/e.ts'
+            ],
+            truncated: false
+        });
+    });
+
+    it('matches patterns relative to each root and prefixes results with it', async () => {
+        // The documented contract: a pattern is never matched against the absolute
+        // path or against the root's own name, only against the path of the file
+        // relative to the root that found it.
+        await expect(fileGlob({ paths: ['src'], patterns: ['**/*.ts'] })).resolves.toEqual({
+            files: ['src/a.ts', 'src/b.ts', 'src/nested/deep/d.ts'],
+            truncated: false
+        });
+
+        // "src/*.ts" therefore matches NOTHING when "src" is the root (the relative
+        // paths are "a.ts", "b.ts", …), even though it matches two files when "."
+        // is the root. This is the exact confusion the docs now spell out.
+        await expect(fileGlob({ paths: ['src'], patterns: ['src/*.ts'] })).resolves.toEqual({
+            files: [],
+            truncated: false
+        });
+        await expect(fileGlob({ paths: ['.'], patterns: ['src/*.ts'] })).resolves.toEqual({
+            files: ['src/a.ts', 'src/b.ts'],
+            truncated: false
+        });
+
+        // Two roots keep two prefixes, and each root is matched on its own paths.
+        await expect(fileGlob({ paths: ['task', 'src'], patterns: ['**/*.ts'] })).resolves.toEqual({
+            files: ['task/e.ts', 'src/a.ts', 'src/b.ts', 'src/nested/deep/d.ts'],
+            truncated: false
+        });
+    });
 });
 
 describe('fileGlob — content mode', () => {
@@ -269,6 +346,75 @@ describe('fileGlob — content mode', () => {
         // what makes the dedupe invisible to a caller that lists one root.
         await expect(fileGlob({ content: 'TODO: one', paths: ['.'] })).resolves.toEqual({
             matches: [{ path: 'src/a.ts', line: 2, text: '// TODO: one' }],
+            truncated: false
+        });
+    });
+
+    it('stops a catastrophic pattern instead of hanging, with a clear error', async () => {
+        // T16 regression: `(a+)+$` against 31 "a"s and a "b" used to block the whole
+        // process for seconds. It now runs inside a vm with the documented cumulative
+        // budget, so the call fails instead of freezing the harness. Restricted to
+        // the one file, so no other fixture is scanned before the stop.
+        await expect(
+            fileGlob({ patterns: ['line.txt'], content: '(a+)+$' })
+        ).rejects.toThrow(
+            'fileGlob content pattern did not finish within its 2000ms matching budget and was stopped. Simplify the pattern: nested quantifiers such as "(a+)+" can backtrack exponentially.'
+        );
+    });
+
+    it('keeps ordinary content searches unaffected by the budget', async () => {
+        // The same fixture set as before, with the vm-backed matcher: same matches,
+        // same order, same line numbers.
+        await expect(fileGlob({ patterns: ['*.ts'], content: 'TODO' })).resolves.toEqual({
+            matches: [
+                { path: 'src/a.ts', line: 2, text: '// TODO: one' },
+                { path: 'src/b.ts', line: 1, text: '// TODO: two' },
+                { path: 'task/e.ts', line: 1, text: '// TODO: five' }
+            ],
+            truncated: false
+        });
+    });
+});
+
+// T16: two roots that are ONE directory must be walked once. Both cases are about
+// file identity rather than spelling, which is what the old `resolve()`-based
+// dedupe missed.
+describe('fileGlob — aliased roots', () => {
+    it('walks a case-aliased root once on Windows and keeps it distinct on Linux', async () => {
+        // NTFS is case-insensitive, so 'src' and 'SRC' are the same directory and a
+        // second pass would list every file twice under a second prefix. Linux has no
+        // 'SRC' at all, so that spelling is a missing root — asserted as its own
+        // truth instead of being skipped.
+        if (process.platform === 'win32') {
+            await expect(fileGlob({ paths: ['src', 'SRC'], patterns: ['**/*.ts'] })).resolves.toEqual({
+                files: ['src/a.ts', 'src/b.ts', 'src/nested/deep/d.ts'],
+                truncated: false
+            });
+            return;
+        }
+
+        await expect(fileGlob({ paths: ['src', 'SRC'], patterns: ['**/*.ts'] })).rejects.toThrow(
+            /ENOENT/
+        );
+    });
+
+    it('walks a symlinked root once when the host allows symlinks', async () => {
+        if (rootAlias === undefined) return;
+
+        // 'src-alias' resolves to 'src', so the second root contributes only
+        // duplicates. The first root wins the prefix, exactly like overlapping roots.
+        await expect(
+            fileGlob({ paths: ['src', rootAlias], patterns: ['**/*.ts'] })
+        ).resolves.toEqual({
+            files: ['src/a.ts', 'src/b.ts', 'src/nested/deep/d.ts'],
+            truncated: false
+        });
+
+        // Reverse order: the alias is walked first, so its prefix is the one kept.
+        await expect(
+            fileGlob({ paths: [rootAlias, 'src'], patterns: ['**/*.ts'] })
+        ).resolves.toEqual({
+            files: ['src-alias/a.ts', 'src-alias/b.ts', 'src-alias/nested/deep/d.ts'],
             truncated: false
         });
     });

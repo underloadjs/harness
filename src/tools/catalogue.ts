@@ -195,6 +195,11 @@ export const PRESET_TOOLS = {
     // fileList is BATCHED (T14): one property, an array of directories. Every
     // result is prefixed with its directory so a flat list stays readable.
     // Deliberately NOT recursive — fileGlob is the walking tool.
+    //
+    // T16: the documented default is an explicit `default: ["."]` as well as an
+    // omitted `required`, and the implementation accepts the shapes an empty
+    // argument box actually produces (`undefined`, `null`, `{}`) so a manual call
+    // and a model call agree.
     fileList: {
         name: 'fileList',
         description:
@@ -206,6 +211,7 @@ export const PRESET_TOOLS = {
                 paths: {
                     type: 'array',
                     items: { type: 'string' },
+                    default: ['.'],
                     description:
                         'Directories to list, absolute or relative to the working directory, in the order the results are grouped. Defaults to ["."].'
                 }
@@ -216,10 +222,15 @@ export const PRESET_TOOLS = {
     // fileGlob is the ONE search surface (T14): filename matching, plus an
     // optional content regex that switches the result shape. The description must
     // state the mode rule, because a model reads it and nothing else.
+    //
+    // T16 adds the two things a model got wrong from the old text: patterns are
+    // relative to EACH root (results are root-prefixed, never absolute-matched),
+    // and content matching is time-bounded, so an exponential pattern fails with a
+    // message instead of hanging the call.
     fileGlob: {
         name: 'fileGlob',
         description:
-            'Find files by glob pattern, and optionally search their contents in the same call. `patterns` (default ["**/*"]) supports *, ?, **, and [abc] classes; a pattern with no slash also matches file names at any depth. `paths` (default ["."]) lists directories to walk, in order; overlapping roots and patterns are deduplicated and results are prefixed with their root. WITHOUT `content` the result is { files, truncated }. WITH `content` (a JavaScript regular expression) every file matching the patterns is read and each matching line is returned as { matches: [{ path, line, text }], truncated }. Content mode skips .git, node_modules, symlinks, binary files, and files larger than 1 MiB. Results are capped (100 by default) across all roots. Does not read .gitignore files.',
+            'Find files by glob pattern, and optionally search their contents in the same call. `patterns` (default ["**/*"]) supports *, ?, **, and [abc] classes; a pattern with no slash also matches file names at any depth. Patterns are matched against each file\'s path RELATIVE TO THE ROOT that found it, never against an absolute path, and every result is prefixed with that root: { "paths": ["src"], "patterns": ["**/*.ts"] } returns "src/a.ts" and "src/nested/b.ts". `paths` (default ["."]) lists the roots to walk, in order; overlapping roots and patterns are deduplicated by real file identity (a symlink alias or a case-alias root is walked once), so a file is reported once, under the first root that reached it. WITHOUT `content` the result is { files, truncated }. WITH `content` (a JavaScript regular expression) every file matching the patterns is read and each matching line is returned as { matches: [{ path, line, text }], truncated }; a pattern that backtracks past the 2-second matching budget is stopped with an error rather than allowed to hang. Content mode skips .git, node_modules, symlinks, binary files, and files larger than 1 MiB. Results are capped (100 by default) across all roots. Does not read .gitignore files.',
         tags: ['files', 'glob', 'search', 'grep', 'find', 'content', 'filesystem'],
         parameters: {
             type: 'object',
@@ -228,18 +239,18 @@ export const PRESET_TOOLS = {
                     type: 'array',
                     items: { type: 'string' },
                     description:
-                        'Glob patterns, OR-ed together, e.g. ["**/*.test.ts"] or ["*.md", "*.txt"]. Defaults to ["**/*"].'
+                        'Glob patterns, OR-ed together and matched against each file path relative to its root, e.g. ["**/*.test.ts"] or ["*.md", "*.txt"]. Defaults to ["**/*"].'
                 },
                 paths: {
                     type: 'array',
                     items: { type: 'string' },
                     description:
-                        'Directories to walk, absolute or relative to the working directory, in the order they are visited. Defaults to ["."].'
+                        'Root directories to walk, absolute or relative to the working directory, in the order they are visited. Results are prefixed with the root that found them. Defaults to ["."].'
                 },
                 content: {
                     type: 'string',
                     description:
-                        'JavaScript regular expression to match inside each file, e.g. "TODO|FIXME". Providing it switches the result from file paths to matching lines.'
+                        'JavaScript regular expression to match inside each file, e.g. "TODO|FIXME". Providing it switches the result from file paths to matching lines. Matching is time-bounded.'
                 },
                 maxResults: {
                     type: 'number',

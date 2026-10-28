@@ -6,7 +6,9 @@
 //     files in one flat list stay distinguishable;
 //   - directories keep the trailing "/" and each listing is sorted by code point
 //     (locale-independent), which is why "B.ts" sorts before "a.ts";
-//   - "." adds no prefix, so the default `["."]` still returns bare entry names;
+//   - "." adds no prefix, so the default `["."]` still returns bare entry names, and
+//     `undefined` / `null` / `{}` / `{ paths }` all normalize to that same default
+//     (T16: the server's direct-call route passes the parameter object through);
 //   - an explicit empty array is rejected instead of answering `[]` (an empty
 //     result would read as "the directory is empty");
 //   - the traversal stays NON-recursive: a child directory appears as "child/",
@@ -101,6 +103,38 @@ describe('fileList', () => {
         await expect(fileList(['.'])).resolves.toEqual(['root.txt', 'src/', 'task/']);
     });
 
+    it('normalizes null, {}, and a { paths } wrapper to the same default', async () => {
+        // T16: the server's direct-call route hands `execute` the parameter OBJECT
+        // as-is, so an empty argument box arrives as `{}` (or `null`) rather than as
+        // `undefined`. All of those mean "no preference", never an error, and the
+        // result is identical to the documented default.
+        const expected = ['root.txt', 'src/', 'task/'];
+
+        await expect(fileList(null)).resolves.toEqual(expected);
+        await expect(fileList({} as never)).resolves.toEqual(expected);
+        // A model-shaped body ({ "paths": [...] }) is unwrapped here as well, so
+        // both entry points agree.
+        await expect(fileList({ paths: ['task'] } as never)).resolves.toEqual([
+            'task/b.ts',
+            'task/work/'
+        ]);
+        await expect(fileList({ paths: ['task', 'src'] } as never)).resolves.toEqual([
+            'task/b.ts',
+            'task/work/',
+            'src/B.ts',
+            'src/a.ts',
+            'src/nested/'
+        ]);
+    });
+
+    it('rejects an object that is not an empty argument or a paths wrapper', async () => {
+        // Only `{}` is a no-argument call: anything else is malformed for this tool
+        // and is reported rather than guessed at.
+        await expect(fileList({ paths: ['src'], task: 'x' } as never)).rejects.toThrow(
+            'fileList paths must be non-empty strings.'
+        );
+    });
+
     it('normalizes a redundant "./" and a trailing slash on the requested directory', async () => {
         // join() collapses both forms, so the prefix never doubles a separator.
         await expect(fileList(['./task'])).resolves.toEqual(['task/b.ts', 'task/work/']);
@@ -137,12 +171,15 @@ describe('fileList', () => {
     it('declares a single "paths" array property, so the harness unwraps to the array', () => {
         // The model sends {"paths": ["src","task"]}; the single-property rule hands
         // execute the array itself, which is exactly what a direct call passes.
+        // T16: the documented default ["."] is declared in the schema as well as in
+        // the description, so a client can read it instead of parsing prose.
         expect(fileList.parameters).toEqual({
             type: 'object',
             properties: {
                 paths: {
                     type: 'array',
                     items: { type: 'string' },
+                    default: ['.'],
                     description:
                         'Directories to list, absolute or relative to the working directory, in the order the results are grouped. Defaults to ["."].'
                 }

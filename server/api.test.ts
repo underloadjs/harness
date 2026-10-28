@@ -42,7 +42,7 @@ const DEFAULTS = {
 // review and manually execute them against a session.
 const CORE_TOOL_NAMES = ['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate'];
 
-// The exact catalogue order after the core set: nine package presets, six harness
+// The exact catalogue order after the core set: eight package presets, six harness
 // tools, webSearch.
 const CATALOGUE_TOOL_NAMES = [
     'syntaxCheck',
@@ -281,7 +281,7 @@ describe('canonical bootstrap document', () => {
 // an explicit `env`, so the test never reads or mutates the real process
 // environment.
 describe('preset descriptor tool metadata', () => {
-    // The exact shared toolbox every live preset advertises: nine package tools,
+    // The exact shared toolbox every live preset advertises: eight package tools,
     // then five app tools. No live card gets a subset any more.
     const TOOLBOX = [
         'syntaxCheck',
@@ -674,6 +674,9 @@ describe('canonical sessions', () => {
                 paths: {
                     type: 'array',
                     items: { type: 'string' },
+                    // T16: the documented default is declared in the schema, so a
+                    // client does not have to parse the description to find it.
+                    default: ['.'],
                     description:
                         'Directories to list, absolute or relative to the working directory, in the order the results are grouped. Defaults to ["."].'
                 }
@@ -723,6 +726,52 @@ describe('canonical sessions', () => {
             );
             expect(missing.status).toBe(200);
             expect(missing.body.ok).toBe(false);
+
+            // T16: the direct-call route hands `execute` the `parameters` object
+            // as-is (no single-property unwrapping), so an empty argument box and a
+            // model-shaped body both arrive here. They must mean the documented
+            // default, not an error — and the wrapper form must list what the array
+            // form lists.
+            const emptyBox = await jsonBody<ToolCallResult>(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/fileList', {
+                    body: { parameters: {} }
+                })
+            );
+            const nullBox = await jsonBody<ToolCallResult>(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/fileList', {
+                    body: { parameters: null }
+                })
+            );
+            const wrapped = await jsonBody<ToolCallResult>(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/fileList', {
+                    body: { parameters: { paths: [join(fixture, 'task')] } }
+                })
+            );
+
+            // `{}` and `null` list the server process's working directory with bare
+            // entry names: compared against the same directory requested explicitly
+            // as ".", so the assertion is exact without depending on what the package
+            // folder happens to contain.
+            const explicitCwd = await jsonBody<ToolCallResult>(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/fileList', {
+                    body: { parameters: ['.'] }
+                })
+            );
+
+            for (const box of [emptyBox, nullBox]) {
+                expect(box.status).toBe(200);
+                expect(box.body).toEqual({
+                    ok: true,
+                    result: (explicitCwd.body as { result: unknown }).result,
+                    durationMs: expect.any(Number)
+                });
+            }
+
+            expect(wrapped.body).toEqual({
+                ok: true,
+                result: [`${posix(fixture)}/task/b.ts`],
+                durationMs: expect.any(Number)
+            });
         } finally {
             await rm(fixture, { recursive: true, force: true });
         }

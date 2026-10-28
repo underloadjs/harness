@@ -16,10 +16,12 @@
 // PREFLIGHT (before the first byte hits disk)
 // -------------------------------------------
 // Every entry is validated — object shape, non-empty path, string content, no NUL,
-// and UNIQUE resolved target path — before anything is written. A duplicate
-// resolved path is rejected because "write it twice with different content" has no
-// honest answer. Parent directories are created as needed and an existing file is
-// overwritten, exactly as before.
+// and UNIQUE resolved target file — before anything is written. A duplicate target
+// is rejected because "write it twice with different content" has no honest answer.
+// Uniqueness is by FILE IDENTITY (./identity.ts), not by spelling: on Windows
+// `notes.txt`/`NOTES.TXT` and a symlink alias are the same file, so a batch that
+// names it twice is rejected before any write. Parent directories are created as
+// needed and an existing file is overwritten, exactly as before.
 //
 // FAILURE SEMANTICS (honest, not transactional)
 // ---------------------------------------------
@@ -43,6 +45,7 @@ import { dirname, resolve } from 'node:path';
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
 import { PRESET_TOOLS } from '../catalogue';
+import { fileIdentity } from './identity';
 
 // One file to write.
 export type FileWriteEntry = {
@@ -76,8 +79,11 @@ type PreparedWrite = {
 // Validate the whole batch and resolve every target BEFORE the first write.
 //
 // Ordering is preserved: the result array and the write order both follow the
-// caller. Uniqueness is by RESOLVED path, so "a.txt" and "./a.txt" collide.
-const prepareWrites = (files: FileWriteParameters): PreparedWrite[] => {
+// caller. Uniqueness is by FILE IDENTITY (./identity.ts), so "a.txt" and "./a.txt"
+// collide, and so do two spellings of one file that only the filesystem considers
+// equal (Windows case aliases, symlink aliases). The identity lookup is a read
+// (`realpath` on the nearest existing ancestor); nothing is created here.
+const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[]> => {
     if (!Array.isArray(files)) {
         throw new HarnessError(
             'fileWrite expects an array of { path, content } entries, e.g. [{"path":"a.txt","content":"hi"}].'
@@ -119,13 +125,17 @@ const prepareWrites = (files: FileWriteParameters): PreparedWrite[] => {
 
         // Same file twice in one batch: the second write would silently win, so
         // the batch is rejected instead of guessing an order-independent answer.
-        if (seen.has(target)) {
+        // The message names the resolved path (what a caller can act on) while the
+        // comparison uses the real file identity.
+        const identity = await fileIdentity(target);
+
+        if (seen.has(identity)) {
             throw new HarnessError(
                 `fileWrite received the same target path twice (${target}); write each file once per call.`
             );
         }
 
-        seen.add(target);
+        seen.add(identity);
         prepared.push({ target, content });
     }
 
@@ -137,7 +147,7 @@ const prepareWrites = (files: FileWriteParameters): PreparedWrite[] => {
 export const fileWrite = tool<FileWriteParameters, FileWriteResult>({
     ...PRESET_TOOLS.fileWrite,
     execute: async ({ parameters: files }) => {
-        const prepared = prepareWrites(files);
+        const prepared = await prepareWrites(files);
         const written: FileWriteResultEntry[] = [];
 
         for (const { target, content } of prepared) {

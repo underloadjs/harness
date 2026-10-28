@@ -47,7 +47,7 @@ import { normalizeTags } from './tool';
 // Default cap on one discovery result, and the hard maximum (R7). Discovery
 // trades context for an extra round trip, so the shortlist is deliberately small:
 // five schemas is what a model can weigh in one turn, and a broad tag such as
-// "files" (six matching tools today) must not re-flood the context. A query that
+// "files" (five matching tools today) must not re-flood the context. A query that
 // matches more reports the excess as the `remaining` COUNT, and the model refines
 // its tags to drill deeper — there is no pagination and no list of omitted names.
 //
