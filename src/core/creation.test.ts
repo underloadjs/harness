@@ -56,8 +56,8 @@ describe('createDynamicTool', () => {
     });
 
     it('rejects reserved names case-insensitively', () => {
-        expect(() => createDynamicTool({ ...creation, name: 'GetTools' }, { reserved: ['getTools'] })).toThrow(
-            'Tool name "GetTools" is reserved by the harness.'
+        expect(() => createDynamicTool({ ...creation, name: 'requestTools' }, { reserved: ['requestTools'] })).toThrow(
+            'Tool name "requestTools" is reserved by the harness.'
         );
     });
 
@@ -81,7 +81,7 @@ describe('createDynamicTool', () => {
         );
 
         expect(() => createDynamicTool({ ...creation, tags: [] })).toThrow(
-            'Tool "double" requires at least one tag, so getTools can find it.'
+            'Tool "double" requires at least one tag, so requestTools can find it.'
         );
 
         expect(() =>

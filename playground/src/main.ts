@@ -14,12 +14,45 @@
 // local: which tile is expanded, which session id was last viewed, the request
 // spinner.
 //
+// Shell (three columns, R1–R3):
+//   - left rail  — harnesses (built-ins and user-created) plus the create form,
+//                  and a collapsed endpoint/model panel at the bottom;
+//   - centre     — a Chat/Tools tablist. Chat shows the selected harness title,
+//                  its agent row (with a per-agent model dropdown), the transcript
+//                  and the composer. Tools is the full-width list of EVERY server
+//                  tool — core entries included — plus the manual runner; a direct
+//                  tool call opens there too;
+//   - right rail — the core-tools disclosure, the complete tool catalogue, and
+//                  the sessions for the selected harness only.
+//
+// Agent editing is deliberately scoped to *new* sessions. A saved session carries
+// a frozen `harnessDefinition` and frozen effective `agentModels`; the row renders
+// those and explains why it is locked, with a New session action. Editing (team or
+// model) therefore never rewrites a conversation that is already on screen.
+//
+// Execution is server-only. A catalogue tool is a direct call; a core tool
+// (`sessionBound`) is sent with the selected session's id so requestTools,
+// createTool, todoTools and delegate change THAT conversation — and the snapshot is
+// re-read afterwards so discoveries/todos show up. The browser never evaluates a
+// tool.
+//
+// Activity: every `HarnessEvent` names an agent, and the live set per instance
+// draws a rotating ring on that agent's tile (ui/activity.ts, styles.css). Start
+// activates, done/error removes only that agent, and terminal/cancel/reset/switch/
+// pagehide clear everything. A hydrated or polled RUNNING turn derives activity
+// from its own events; settled history never lights a tile.
+//
+// Run/cancel is single-flight and instance-scoped: the stop button uses the
+// instance that started the run (never "whatever is selected now"), and harness
+// switching/editing is disabled while a run is in flight.
+//
 // API root: `./api.ts` resolves it at runtime (?apiRoot → injected config →
 // build-time VITE_HARNESS_API → /api) and `loadBootstrap` works against the
 // canonical `/v1/harness` root document or the standalone `/api` routes.
 
 import './styles.css';
 import type {
+    AgentDescriptor,
     HarnessDescriptor,
     RunnerSettings,
     SessionSnapshot,
@@ -31,15 +64,35 @@ import {
     API_ROOT,
     callTool,
     cancelSession,
+    createHarness,
     createSession,
     getSession,
     listProviderModels,
     listSessions,
     loadBootstrap,
     resetSession,
-    submitMessage
+    submitMessage,
+    updateHarness
 } from './api';
 import type { HarnessBootstrap } from './api';
+import {
+    HARNESS_CORE_TOOL_DESCRIPTIONS,
+    agentModelsOf,
+    agentsFromDescriptors,
+    builtinOf,
+    canonicalHarnessName,
+    coreToolsOf,
+    editableOf,
+    frameAtOf,
+    frozenDefinitionOf,
+    membersOf,
+    modelsForMembers,
+    primaryOf,
+    uniqueNames
+} from './contract';
+import { createCreateHarnessPanel } from './ui/create-harness';
+import { createAgentRow } from './ui/agents';
+import { applyActivity, activityOfTurns, paintActivity } from './ui/activity';
 import { highlightCode, looksLikeJson, prettyJson } from './ui/markdown';
 import { createTurnBoard } from './ui/turns';
 import type { TurnHandle } from './ui/turns';
@@ -135,13 +188,12 @@ const forgetRememberedSession = (): void => {
 };
 
 // ---------------------------------------------------------------------------
-// One view per harness
+// One transcript view per harness
 // ---------------------------------------------------------------------------
 //
-// Each view owns one turn board: the tiles are per preset, so switching presets
-// never destroys a conversation you wanted to compare against. The conversation
-// itself lives on the server; this map only remembers which session belongs to
-// which card.
+// Each view owns one turn board: switching harnesses never destroys a
+// conversation you wanted to compare against. The conversation itself lives on
+// the server; this map only remembers which session belongs to which harness.
 
 type View = {
     pane: HTMLElement;
@@ -158,17 +210,25 @@ type View = {
     hydrate: (turns: readonly SessionTurn[], model?: string, keep?: string) => TurnHandle[];
     // Look up a tile by the server turn id carried on a stream `event` frame.
     turn: (id: string) => TurnHandle | undefined;
+    // Stop every live timer this view owns (elapsed labels, tool durations).
+    dispose: () => void;
 };
 
 const createView = (descriptor: HarnessDescriptor): View => {
     const pane = el('div', 'pane');
     const logWrap = el('div', 'log-wrap');
 
+    // The empty state is deliberately short: the agent row above already explains
+    // *who* will run, and the old description wall made the centre noisy.
     const empty = el('div', 'empty');
     empty.append(
         el('h2', 'empty-title', descriptor.title),
-        el('p', 'empty-text', descriptor.description),
-        el('p', 'empty-hint', 'Send a task below. The harness server runs it and streams every progress event back here.')
+        el('p', 'empty-text', 'Send a task below to start this harness.'),
+        el(
+            'p',
+            'empty-hint',
+            'Tools are discovered inside the chat with requestTools; the catalogue never assigns them.'
+        )
     );
 
     // One tile per user turn. The board owns expansion state (exactly one tile
@@ -224,23 +284,24 @@ const createView = (descriptor: HarnessDescriptor): View => {
             stick(follow);
             return handles;
         },
-        turn: (id) => board.find(id)
+        turn: (id) => board.find(id),
+        dispose: () => board.destroy()
     };
 };
-
 
 // ---------------------------------------------------------------------------
 // Direct tool calls
 // ---------------------------------------------------------------------------
 //
-// The Tools tab exercises the other entry point of `tool()`: calling it as a
-// function, with no harness, no agent, and no loop. The server runs the exact
+// The Tools catalogue exercises the other entry point of `tool()`: calling it as
+// a function, with no harness, no agent, and no loop. The server runs the exact
 // implementation a session registers, so package presets work here too.
 
 // A few tools deserve a real starting value rather than a schema-derived blank.
 const EXAMPLES: Readonly<Record<string, unknown>> = {
-    javascriptSyntax: 'const answer = 42;\nconsole.log(answer);',
-    pythonSyntax: 'def add(a, b):\n    return a + b',
+    // Two properties, so the runner sends the whole object (no single-property
+    // unwrapping): the language is part of the input, not a separate mode.
+    syntaxCheck: { code: 'const answer = 42;\nconsole.log(answer);', language: 'javascript' },
     readFile: 'package.json',
     writeFile: { path: 'notes/hello.txt', content: 'hello from the harness UI\n' },
     listFiles: '.',
@@ -300,22 +361,71 @@ const templateFor = (parameters: Record<string, unknown> | undefined): string =>
     return JSON.stringify(value, null, 2);
 };
 
+// What the runner needs from the shell for a session-bound core tool.
+//
+// `context` is read at show time and before every call; `ensureSession` creates
+// the SELECTED harness's session when none exists yet; `refreshSession` re-reads
+// the server snapshot after a call so requestTools discoveries and todo state are
+// on screen immediately. None of these live in this module: the runner must not
+// own the selection, and it must not guess a session id.
+export type ToolRunnerOptions = {
+    context: () => { harness?: string; sessionId?: string };
+    ensureSession: () => Promise<string | undefined>;
+    refreshSession: (sessionId: string) => Promise<void>;
+};
+
 type ToolRunner = {
     pane: HTMLElement;
     show: (entry: ToolDescriptor) => void;
+    // Repaint the session-context line (selection or session changed underneath
+    // an already-open runner).
+    sync: () => void;
 };
 
-const createToolRunner = (): ToolRunner => {
+// The cap the server applies to `requestTools` (5). Kept here only to explain
+// truncation: the UI never slices the result itself.
+const REQUEST_TOOLS_LIMIT = 5;
+
+// Turn a requestTools result into one actionable sentence. The structured result
+// is still rendered verbatim above; this line exists because a truncated list is
+// useless unless it says how much is missing and what to do next.
+const resultHintFor = (name: string, result: unknown): string | undefined => {
+    if (name !== 'requestTools' || typeof result !== 'object' || result === null) return undefined;
+
+    const value = result as { truncated?: unknown; remaining?: unknown; enabled?: unknown };
+
+    const remaining =
+        typeof value.remaining === 'number' && Number.isFinite(value.remaining) && value.remaining > 0
+            ? value.remaining
+            : undefined;
+
+    // `truncated` is the explicit flag; `remaining > 0` alone is enough for a
+    // server that omits it, because the count is the actionable number.
+    if (value.truncated !== true && remaining === undefined) return undefined;
+
+    const enabled = Array.isArray(value.enabled) ? value.enabled.length : undefined;
+    const lead =
+        enabled === undefined ? undefined : `${enabled} tool${enabled === 1 ? '' : 's'} enabled`;
+
+    if (remaining === undefined) {
+        return `${lead === undefined ? 'More tools match' : `${lead}; more tools match`} than the ${REQUEST_TOOLS_LIMIT}-tool limit. Refine the tags to see the rest.`;
+    }
+
+    return `${lead === undefined ? '' : `${lead}; `}${remaining} more tool${remaining === 1 ? '' : 's'} match. Refine the tags to see them.`;
+};
+
+const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     const pane = el('div', 'pane');
     const wrap = el('div', 'log-wrap');
     const log = el('div', 'log');
     const card = el('section', 'tool-card');
 
-    const note = el(
-        'p',
-        'tool-note',
-        'Direct call — no harness, no agent, no tool loop. This is the same implementation a session registers, invoked as a function.'
-    );
+    // The introduction changes with the entry: a catalogue tool is a bare
+    // function call; a core tool needs a session and mutates that conversation.
+    const note = el('p', 'tool-note', '');
+    const sessionNote = el('p', 'tool-note tool-session', '');
+    sessionNote.hidden = true;
+    sessionNote.setAttribute('role', 'note');
     const safetyNote = el(
         'p',
         'tool-note is-warning',
@@ -352,7 +462,23 @@ const createToolRunner = (): ToolRunner => {
     const outputBody = el('pre', 'card-body', '');
     output.append(outputHead, outputBody);
 
-    card.append(note, safetyNote, availabilityNote, schema, argsField, rule, actions, output);
+    // Guidance for a truncated requestTools answer. Separate from the raw result:
+    // the structured payload is never rewritten.
+    const resultHint = el('p', 'field-hint tool-hint', '');
+    resultHint.hidden = true;
+
+    card.append(
+        note,
+        sessionNote,
+        safetyNote,
+        availabilityNote,
+        schema,
+        argsField,
+        rule,
+        actions,
+        output,
+        resultHint
+    );
     log.append(card);
     wrap.append(log);
     pane.append(wrap);
@@ -370,11 +496,37 @@ const createToolRunner = (): ToolRunner => {
         outputBody.dataset.language = looksLikeJson(text) ? 'json' : 'text';
     };
 
+    // Session context line. Read live so a session created after the runner
+    // opened is shown instead of "no session yet", and so a frozen chat reports
+    // the session the call will actually use.
+    const sync = (): void => {
+        if (active?.sessionBound !== true) {
+            sessionNote.hidden = true;
+            sessionNote.textContent = '';
+            return;
+        }
+
+        const context = options.context();
+        sessionNote.hidden = false;
+        sessionNote.dataset.harness = context.harness ?? '';
+        if (context.harness === undefined) {
+            sessionNote.textContent =
+                'Session-bound: select a harness first. This tool executes inside that harness’s session.';
+            return;
+        }
+
+        sessionNote.textContent =
+            context.sessionId === undefined
+                ? `Session-bound: runs inside ${context.harness}. No session yet — Call creates one for this harness.`
+                : `Session-bound: runs inside ${context.harness} · session ${context.sessionId}.`;
+    };
+
     callButton.addEventListener('click', async () => {
         // The button is disabled for an unconfigured entry; this guard keeps a
         // programmatic click (or a stale handler) from asking a server that has
         // already answered "no credential".
-        if (active === undefined || active.availability?.state === 'unconfigured') return;
+        const entry = active;
+        if (entry === undefined || entry.availability?.state === 'unconfigured') return;
 
         let parameters: unknown;
         try {
@@ -386,9 +538,42 @@ const createToolRunner = (): ToolRunner => {
 
         callButton.disabled = true;
         setOutput('running…', false);
+        resultHint.hidden = true;
 
         try {
-            const response = await callTool(active.name, parameters);
+            // Capture the session id BEFORE any await. If the selection changes
+            // while the call is in flight, the request still runs in the session
+            // the runner displayed — never in whatever happens to be selected when
+            // the response lands.
+            let sessionId: string | undefined;
+            if (entry.sessionBound === true) {
+                sessionId = options.context().sessionId;
+
+                if (sessionId === undefined) {
+                    // A manual core call needs a real server session (the tool
+                    // mutates discovery/todos/runtime tools). Creating one here is
+                    // the documented equivalent of the chat's first submit.
+                    setOutput('No session for this harness yet — creating one…', false);
+                    try {
+                        sessionId = await options.ensureSession();
+                    } catch (error) {
+                        setOutput(`Could not create a session: ${messageOf(error)}`, true);
+                        return;
+                    }
+
+                    if (sessionId === undefined) {
+                        setOutput(
+                            'No harness is selected, so this core tool has no session to run in. Select a harness first.',
+                            true
+                        );
+                        return;
+                    }
+                }
+
+                sync();
+            }
+
+            const response = await callTool(entry.name, parameters, sessionId);
 
             if (!response.ok) {
                 setOutput(response.error.message, true);
@@ -402,17 +587,39 @@ const createToolRunner = (): ToolRunner => {
 
             setOutput(rendered, false);
             outputHead.textContent = `result · ${response.durationMs}ms`;
+
+            // requestTools caps its answer (5 tools). The raw payload stays; the
+            // hint names the remaining count and the next move.
+            const hint = resultHintFor(entry.name, response.result);
+            resultHint.hidden = hint === undefined;
+            resultHint.textContent = hint ?? '';
+
+            // Core calls mutate the session (enabled tools, created tools, todos),
+            // so re-read the server's snapshot. A refresh failure must not hide the
+            // result that just arrived; the caller's status pill reports it.
+            if (entry.sessionBound === true && sessionId !== undefined) {
+                try {
+                    await options.refreshSession(sessionId);
+                } catch {
+                    // Deliberately silent here: the tool answer above is the
+                    // primary outcome, and main.ts reports refresh trouble.
+                }
+            }
         } catch (error) {
+            // Request-level failures (no session 400, unknown session 404, active
+            // run 409, offline) arrive here with the server's own message.
             setOutput(messageOf(error), true);
         } finally {
             // The early guard returned for an unconfigured entry, so reaching here
             // means the tool is callable and the button may be offered again.
             callButton.disabled = false;
+            sync();
         }
     });
 
     return {
         pane,
+        sync,
         show: (entry) => {
             active = entry;
 
@@ -422,6 +629,11 @@ const createToolRunner = (): ToolRunner => {
             // 'unconfigured' is the server's answer that the tool exists but has
             // no credential. Listing it is the point; calling it is not offered.
             const unavailable = entry.availability?.state === 'unconfigured';
+            const sessionBound = entry.sessionBound === true;
+
+            note.textContent = sessionBound
+                ? 'Core tool — it runs inside the selected session’s harness on the server, so its result changes that conversation.'
+                : 'Direct call — no harness, no agent, no tool loop. This is the same implementation a session registers, invoked as a function.';
 
             schemaBody.textContent = JSON.stringify(entry.parameters, null, 2);
 
@@ -448,6 +660,10 @@ const createToolRunner = (): ToolRunner => {
                 unavailable
             );
             outputHead.textContent = unavailable ? 'unconfigured' : 'result';
+            resultHint.hidden = true;
+            resultHint.textContent = '';
+
+            sync();
         }
     };
 };
@@ -483,77 +699,26 @@ const statusText = el('span', 'status-text', 'idle');
 statusPill.append(statusDot, statusText);
 topbar.append(brand, statusPill);
 
-const layout = el('div', 'layout');
+const shell = el('div', 'shell');
 
-const sidebar = el('aside', 'sidebar');
+// --- left rail: harnesses + endpoint ---------------------------------------
+const leftRail = el('aside', 'rail rail-left');
+leftRail.setAttribute('aria-label', 'Harnesses');
+const harnessHead = el('div', 'rail-head');
+const harnessHeading = el('h2', 'rail-title', 'Harnesses');
+const createHarnessButton = el('button', 'button small new-harness', '+ New');
+createHarnessButton.type = 'button';
+createHarnessButton.disabled = true;
+createHarnessButton.setAttribute('aria-expanded', 'false');
+harnessHead.append(harnessHeading, createHarnessButton);
 
-// Two catalogues, one sidebar: harness presets (the loop), and the tools
-// themselves (direct calls, no harness).
-const modeSwitch = el('div', 'modes');
-const harnessMode = el('button', 'mode', 'Harnesses');
-harnessMode.type = 'button';
-harnessMode.setAttribute('aria-pressed', 'true');
-const toolsMode = el('button', 'mode', 'Tools');
-toolsMode.type = 'button';
-toolsMode.setAttribute('aria-pressed', 'false');
-modeSwitch.append(harnessMode, toolsMode);
+const harnessList = el('div', 'harness-list');
 
-const presetList = el('div', 'presets');
-const toolList = el('div', 'tool-list');
-toolList.hidden = true;
-
-// --- session directory -----------------------------------------------------
-//
-// The server owns sessions; this list is a view of GET /sessions. Selecting an
-// entry loads that session's snapshot, which is how a reload, a second tab or
-// the CLI's conversation becomes visible in this UI. "New" is an explicit action
-// that forgets the current pointer (it never deletes server state).
-const sessionsSection = el('section', 'sessions');
-const sessionsActions = el('div', 'sessions-actions');
-
-const newSessionButton = el('button', 'button small', 'New session');
-newSessionButton.type = 'button';
-newSessionButton.disabled = true;
-
-const refreshSessionsButton = el('button', 'button small', 'Refresh');
-refreshSessionsButton.type = 'button';
-refreshSessionsButton.disabled = true;
-
-sessionsActions.append(newSessionButton, refreshSessionsButton);
-const sessionList = el('div', 'session-list');
-sessionsSection.append(el('h2', 'sidebar-head', 'Sessions'), sessionsActions, sessionList);
-
-const main = el('main', 'main');
-const head = el('div', 'main-head');
-const headTitle = el('h1', 'main-title', '');
-const headDescription = el('p', 'main-description', '');
-const headBadges = el('div', 'badges');
-head.append(headTitle, headDescription, headBadges);
-
-const stage = el('div', 'stage');
-
-const composer = el('form', 'composer');
-const input = el('textarea', 'input composer-input');
-input.rows = 3;
-input.placeholder = 'Ask the harness something…  (Enter to run, Shift+Enter for a newline)';
-input.spellcheck = false;
-
-const actions = el('div', 'composer-actions');
-const runButton = el('button', 'button primary', 'Run');
-runButton.type = 'submit';
-runButton.disabled = true;
-const stopButton = el('button', 'button', 'Stop');
-stopButton.type = 'button';
-stopButton.disabled = true;
-const resetButton = el('button', 'button', 'Reset');
-resetButton.type = 'button';
-actions.append(runButton, stopButton, resetButton);
-composer.append(input, actions);
-
-main.append(head, stage, composer);
-
-const endpoint = el('section', 'endpoint');
-endpoint.append(el('h2', 'sidebar-head', 'Endpoint'));
+// Endpoint/model stays reachable but compact: a native disclosure at the bottom
+// of the rail, closed until the user needs it. No "needs endpoint" badge clutter.
+const endpoint = el('details', 'endpoint');
+endpoint.append(el('summary', 'endpoint-summary', 'Endpoint & model'));
+const endpointBody = el('div', 'endpoint-body');
 
 const controls = new Map<keyof RunnerSettings, HTMLInputElement>();
 
@@ -731,6 +896,11 @@ const refreshModels = async (): Promise<void> => {
         modelLoading = false;
         manualFallback = ids.length === 0;
         renderModelOptions();
+        // Per-agent model dropdowns are built from this catalogue. Re-render the
+        // chrome so an already-open harness (or a boot that opened a remembered
+        // session before the provider answered) offers the real ids instead of
+        // only inherit/current.
+        if (current !== undefined) renderHarnessChrome();
         setModelStatus(
             ids.length === 0
                 ? 'The provider returned no models. Enter a model manually.'
@@ -788,7 +958,7 @@ modelManual.addEventListener('input', () => {
 const modelField = el('div', 'field');
 modelField.append(el('span', 'field-label', 'Model'), modelSelect, modelManual, modelStatus);
 
-endpoint.append(
+endpointBody.append(
     field('Base URL', 'baseURL', 'text', 'http://localhost:5500/providers/private/v1'),
     field('API key', 'apiKey', 'password', 'optional'),
     modelField,
@@ -802,149 +972,783 @@ endpoint.append(
     // runtime; this text is the value actually in use.
     el('p', 'field-hint', `API root: ${API_ROOT.length > 0 ? API_ROOT : '(origin)'} · override with ?apiRoot=/v1/harness`)
 );
+endpoint.append(endpointBody);
 
 // Initial paint: the stored model is a valid selection even before the server
 // answers, so the dropdown must show it rather than an empty control.
 renderModelOptions();
 
-sidebar.append(modeSwitch, presetList, toolList, sessionsSection, endpoint);
-layout.append(sidebar, main);
-app.append(topbar, layout);
+// --- centre: view tabs, harness head, agent row, transcript, composer ------
+const center = el('main', 'center');
+
+// Chat / Tools are real tabs (role="tablist"), not a mode switch hidden in the
+// catalogue: the user asked for an obvious Tools tab, and it has to be reachable
+// without discovering the right rail. One panel (`stage`) is shared because both
+// views replace the same centre column; `aria-labelledby` names whichever tab is
+// selected.
+const tabs = el('div', 'tabs');
+tabs.setAttribute('role', 'tablist');
+tabs.setAttribute('aria-label', 'Harness views');
+
+const chatTab = el('button', 'tab', 'Chat');
+chatTab.type = 'button';
+chatTab.id = 'harness-tab-chat';
+chatTab.setAttribute('role', 'tab');
+chatTab.setAttribute('aria-selected', 'true');
+chatTab.setAttribute('aria-controls', 'harness-tabpanel');
+chatTab.tabIndex = 0;
+
+const toolsTab = el('button', 'tab', 'Tools');
+toolsTab.type = 'button';
+toolsTab.id = 'harness-tab-tools';
+toolsTab.setAttribute('role', 'tab');
+toolsTab.setAttribute('aria-selected', 'false');
+toolsTab.setAttribute('aria-controls', 'harness-tabpanel');
+toolsTab.tabIndex = -1;
+
+tabs.append(chatTab, toolsTab);
+
+const mainHead = el('header', 'harness-head');
+const titleRow = el('div', 'harness-title-row');
+const headTitle = el('h1', 'main-title', '');
+const headName = el('span', 'harness-id', '');
+titleRow.append(headTitle, headName);
+const headNote = el('p', 'harness-note', '');
+mainHead.append(titleRow, headNote);
+
+const agentSlot = el('div', 'agent-slot');
+
+const stage = el('div', 'stage');
+stage.id = 'harness-tabpanel';
+stage.setAttribute('role', 'tabpanel');
+stage.setAttribute('aria-labelledby', 'harness-tab-chat');
+
+const composer = el('form', 'composer');
+const input = el('textarea', 'input composer-input');
+input.rows = 3;
+input.placeholder = 'Ask the harness something…  (Enter to run, Shift+Enter for a newline)';
+input.spellcheck = false;
+
+const actions = el('div', 'composer-actions');
+const runButton = el('button', 'button primary run', 'Run');
+runButton.type = 'submit';
+runButton.disabled = true;
+const stopButton = el('button', 'button stop', 'Stop');
+stopButton.type = 'button';
+stopButton.disabled = true;
+const resetButton = el('button', 'button reset', 'Reset');
+resetButton.type = 'button';
+actions.append(runButton, stopButton, resetButton);
+composer.append(input, actions);
+
+center.append(tabs, mainHead, agentSlot, stage, composer);
+
+// --- right rail: core tools, catalogue, sessions ----------------------------
+const rightRail = el('aside', 'rail rail-right');
+rightRail.setAttribute('aria-label', 'Core tools, tool catalogue and sessions');
+
+const coreSection = el('section', 'rail-section core-section');
+const coreDetails = el('details', 'core-tools');
+const coreSummary = el('summary', 'core-summary', 'Core tools');
+const coreBody = el('div', 'core-body');
+const coreHint = el(
+    'p',
+    'field-hint',
+    'Always available in chat. requestTools enables more tools for this session; discovered tools stay enabled for it.'
+);
+const coreList = el('div', 'core-list');
+// Tools requestTools enabled for the selected session, from the server snapshot
+// (`discoveredTools`). Kept separate from the core list: these are session state,
+// not the harness-owned set, and a core-tool call refreshes the snapshot so this
+// line updates without a reload.
+const coreDiscovered = el('p', 'core-discovered', '');
+coreDiscovered.hidden = true;
+coreBody.append(coreHint, coreList, coreDiscovered);
+coreDetails.append(coreSummary, coreBody);
+coreSection.append(coreDetails);
+
+const catalogueSection = el('section', 'rail-section catalogue-section');
+const catalogueHead = el('div', 'rail-head');
+const catalogueHeading = el('h2', 'rail-title', 'Tool catalogue');
+const catalogueCount = el('span', 'catalogue-count', '0');
+catalogueHead.append(catalogueHeading, catalogueCount);
+const catalogueHint = el(
+    'p',
+    'field-hint',
+    'Every tool the server can call, core tools included. Nothing is assigned here: chat discovers tools with requestTools by tag.'
+);
+const toolList = el('div', 'tool-list');
+catalogueSection.append(catalogueHead, catalogueHint, toolList);
+
+const sessionsSection = el('section', 'rail-section sessions');
+const sessionsHead = el('div', 'rail-head');
+const sessionsHeading = el('h2', 'rail-title', 'Sessions');
+sessionsHead.append(sessionsHeading);
+
+// The lock is stated in text, not just implied by a filtered list.
+const sessionsScope = el('p', 'sessions-scope', 'Locked to the selected harness.');
+
+const sessionsActions = el('div', 'sessions-actions');
+const newSessionButton = el('button', 'button small new-session', 'New session');
+newSessionButton.type = 'button';
+newSessionButton.disabled = true;
+const refreshSessionsButton = el('button', 'button small', 'Refresh');
+refreshSessionsButton.type = 'button';
+refreshSessionsButton.disabled = true;
+sessionsActions.append(newSessionButton, refreshSessionsButton);
+const sessionList = el('div', 'session-list');
+sessionsSection.append(sessionsHead, sessionsScope, sessionsActions, sessionList);
+
+rightRail.append(coreSection, catalogueSection, sessionsSection);
+shell.append(leftRail, center, rightRail);
+app.append(topbar, shell);
 
 // ---------------------------------------------------------------------------
-// Instances
+// Instances and selection state
 // ---------------------------------------------------------------------------
-//
-// Each view owns one turn board: the tiles are per preset, so switching presets
-// never destroys a conversation you wanted to compare against. The conversation
-// itself lives on the server; this map only remembers which session belongs to
-// which card, and it is never the source of truth for turn content.
 
 type Instance = {
     descriptor: HarnessDescriptor;
     view: View;
     sessionId?: string;
+    // The definition the current conversation was created with. When present the
+    // agent row renders this and editing is locked, so an updated harness cannot
+    // pretend to have changed a chat that is already on screen.
+    frozen?: HarnessDescriptor;
+    // Effective per-agent models frozen by the server at creation
+    // (SessionSnapshot.agentModels). Used only while a saved session is on screen;
+    // an editable harness reads its override map from the descriptor.
+    sessionModels?: Record<string, string>;
+    // The session's settings model: the value the per-agent "inherit" choice names
+    // for a frozen chat, and the fallback when a member is absent from the map.
+    sessionModel?: string;
+    // Tools requestTools enabled for this session (SessionSnapshot.discoveredTools),
+    // shown under the core dropdown. Refreshed by the snapshot a core call triggers.
+    discovered?: readonly string[];
+    // Per-instance live activity set for the tile rings. Never a module global:
+    // two harness views must not share who is busy.
+    activity: Set<string>;
 };
 
 const instances = new Map<string, Instance>();
 let current: Instance | undefined;
+let selectedName: string | undefined;
+let presetDescriptors: readonly HarnessDescriptor[] = [];
+let agentLibrary: readonly AgentDescriptor[] = [];
+let sessions: SessionSnapshot[] = [];
+let currentTool: ToolDescriptor | undefined;
+// The complete server catalogue (core entries included) for the Tools tab. Boot
+// replaces it from the bootstrap document; the right rail renders the same list.
+let toolEntries: readonly ToolDescriptor[] = [];
+// Which centre view is showing. The Tools tab is not the catalogue: it is a
+// full-width, keyed list of every tool plus the manual runner.
+let activeTab: 'chat' | 'tools' = 'chat';
+
+// Single-flight run state. `activeRun` names the instance that owns the stream,
+// which is what Stop cancels — never "the harness selected when Stop is pressed".
+let running = false;
+let booted = false;
+let activeRun: { controller: AbortController; instance: Instance } | undefined;
+// Guards a double PATCH while an agent edit is in flight.
+let savingAgents = false;
+
+// Session context the manual runner needs. `current` is the selected harness (the
+// runner is opened from it and never changes the selection); `ensureSession`
+// creates that harness's session on demand, exactly like the first chat submit.
+const runner = createToolRunner({
+    context: () => {
+        const instance = current;
+        if (instance === undefined) return {};
+        return {
+            harness: instance.descriptor.name,
+            ...(instance.sessionId === undefined ? {} : { sessionId: instance.sessionId })
+        };
+    },
+    ensureSession: async () => {
+        const instance = current;
+        if (instance === undefined) return undefined;
+
+        return ensureSession(instance);
+    },
+    refreshSession: async (sessionId) => {
+        // Re-read the captured session, not whatever is selected now: a core call
+        // changes the session it ran in, and the answer must land there.
+        const session = await getSession(sessionId);
+
+        // Find the card that still points at that session. If the reader started a
+        // new session (or opened another one) meanwhile, no card owns it: do not
+        // re-point one, because that would undo their explicit choice.
+        let owner: Instance | undefined;
+        for (const instance of instances.values()) {
+            if (instance.sessionId === sessionId) {
+                owner = instance;
+                break;
+            }
+        }
+        if (owner === undefined) return;
+
+        applySnapshot(owner, session);
+        rememberSession(session.id);
+        runner.sync();
+    }
+});
+
+let sessionsPollTimer: number | undefined;
+let pollToken = 0;
+
+const descriptorFor = (name: string): HarnessDescriptor | undefined =>
+    presetDescriptors.find((candidate) => candidate.name === name);
 
 const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
     const existing = instances.get(descriptor.name);
-    if (existing !== undefined) return existing;
+    if (existing !== undefined) {
+        // The catalogue can replace a descriptor (PATCH); the session pointer and
+        // view survive, but the current configuration is the server's answer.
+        existing.descriptor = descriptor;
+        return existing;
+    }
 
-    const instance: Instance = { descriptor, view: createView(descriptor) };
+    const instance: Instance = { descriptor, view: createView(descriptor), activity: new Set<string>() };
     instances.set(descriptor.name, instance);
     return instance;
 };
 
-// Create a session only when this card has none. Settings drafts are read here
-// and nowhere else: editing the endpoint, model or key afterwards must not
-// recreate, replace or delete the conversation the user already has (H4). A new
-// session is an explicit "New session" click, and the first submit after it
-// creates the server record.
-const ensureSession = async (instance: Instance): Promise<string> => {
-    if (instance.sessionId !== undefined) return instance.sessionId;
+// Replace one descriptor in the catalogue (create or update). The view is kept:
+// an edit changes the *next* session, not the transcript already rendered.
+const replaceDescriptor = (updated: HarnessDescriptor): void => {
+    presetDescriptors = presetDescriptors.some((candidate) => candidate.name === updated.name)
+        ? presetDescriptors.map((candidate) => (candidate.name === updated.name ? updated : candidate))
+        : [...presetDescriptors, updated];
 
-    const session = await createSession(instance.descriptor.name, settings);
-
-    instance.sessionId = session.id;
-    rememberSession(session.id);
-    upsertSession(session);
-    renderSessions();
-
-    return session.id;
+    const existing = instances.get(updated.name);
+    if (existing !== undefined) existing.descriptor = updated;
 };
 
 // ---------------------------------------------------------------------------
-// Preset and tool selection
+// Harness rail and centre chrome
 // ---------------------------------------------------------------------------
 
-const buttons = new Map<string, HTMLButtonElement>();
-const toolButtons = new Map<string, HTMLButtonElement>();
-const runner = createToolRunner();
+const harnessButtons = new Map<string, HTMLButtonElement>();
 
-let currentTool: ToolDescriptor | undefined;
-let presetDescriptors: readonly HarnessDescriptor[] = [];
+// Tab visuals only. Content switching lives in `setTab` (declared with the tool
+// runner, because it needs `toolEntries`), so this is safe to call from selection
+// and busy-state code without re-entering the runner.
+const paintTabs = (): void => {
+    const chat = activeTab === 'chat';
+    chatTab.setAttribute('aria-selected', chat ? 'true' : 'false');
+    toolsTab.setAttribute('aria-selected', chat ? 'false' : 'true');
+    chatTab.tabIndex = chat ? 0 : -1;
+    toolsTab.tabIndex = chat ? -1 : 0;
+    stage.setAttribute('aria-labelledby', chat ? 'harness-tab-chat' : 'harness-tab-tools');
+};
 
-const badge = (text: string): HTMLElement => el('span', 'badge', text);
+// Remove every activity ring. Called on terminal frames, cancel, reset, new
+// session, harness switch and pagehide: after those there is no in-flight agent
+// in view, and a leftover ring would claim work that is not happening.
+const clearActivity = (): void => {
+    for (const instance of instances.values()) instance.activity.clear();
+    paintActivity(agentSlot, new Set<string>());
+};
 
-const select = (instance: Instance): void => {
-    current = instance;
+const harnessMeta = (descriptor: HarnessDescriptor): string => {
+    const members = membersOf(descriptor).length;
+    const kind = builtinOf(descriptor) ? 'builtin' : 'custom';
+    const access = editableOf(descriptor) ? 'editable' : 'read-only';
 
-    for (const [name, button] of buttons) {
-        button.setAttribute('aria-pressed', name === instance.descriptor.name ? 'true' : 'false');
+    return `${kind} · ${members} agent${members === 1 ? '' : 's'} · ${access}`;
+};
+
+const selectHarness = (name: string): void => {
+    const descriptor = descriptorFor(name);
+    if (descriptor === undefined) return;
+
+    // Selecting anything cancels a background poll; a poll must never paint a
+    // card the reader has left.
+    stopPolling();
+
+    // Switching harness leaves the Tools tab and drops every ring: the activity
+    // belonged to the view being left.
+    activeTab = 'chat';
+    paintTabs();
+    clearActivity();
+
+    selectedName = descriptor.name;
+    currentTool = undefined;
+    current = ensureInstance(descriptor);
+
+    for (const [key, button] of harnessButtons) {
+        button.setAttribute('aria-pressed', key === name ? 'true' : 'false');
+    }
+    for (const button of toolButtons.values()) button.setAttribute('aria-pressed', 'false');
+    for (const button of toolTabButtons.values()) button.setAttribute('aria-pressed', 'false');
+
+    agentSlot.hidden = false;
+    composer.hidden = false;
+    stage.replaceChildren(current.view.pane);
+    renderHarnessChrome();
+    renderSessions();
+    runner.sync();
+    setStatus('idle');
+};
+
+const buildHarnesses = (): void => {
+    harnessList.replaceChildren();
+    harnessButtons.clear();
+
+    for (const descriptor of presetDescriptors) {
+        const button = el('button', 'harness-item');
+        button.type = 'button';
+        button.dataset.harness = descriptor.name;
+        button.setAttribute('aria-pressed', selectedName === descriptor.name ? 'true' : 'false');
+        button.disabled = running;
+        // The description is available on hover/focus without becoming a wall of
+        // prose in the centre column.
+        button.title = descriptor.description;
+
+        button.append(
+            el('span', 'harness-title', descriptor.title),
+            el('span', 'harness-name', descriptor.name),
+            el('span', 'harness-meta', harnessMeta(descriptor))
+        );
+
+        button.addEventListener('click', () => {
+            if (running) return;
+            selectHarness(descriptor.name);
+        });
+
+        harnessButtons.set(descriptor.name, button);
+        harnessList.append(button);
     }
 
-    const descriptor = instance.descriptor;
-    headTitle.textContent = descriptor.title;
-    headDescription.textContent = descriptor.description;
-    headBadges.replaceChildren(
-        badge(`agents: ${descriptor.agents.join(', ')}`),
-        // Core tools are server-owned (HarnessDescriptor.coreTools): the server
-        // knows whether delegate exists from the preset's subagent allowlist, so
-        // the UI never hardcodes a core catalogue. The fallback keeps an older
-        // server's descriptor renderable.
-        badge(`core: ${descriptor.coreTools?.join(', ') ?? 'getTools'}`),
-        badge(`catalogue: ${descriptor.tools.length > 0 ? descriptor.tools.join(', ') : 'none'}`),
-        badge(descriptor.requiresEndpoint ? 'needs endpoint' : 'offline')
-    );
-
-    stage.replaceChildren(instance.view.pane);
-    stage.dataset.preset = descriptor.name;
-    setStatus('idle');
-
-    // The list highlights whichever row this card is pointed at.
-    renderSessions();
+    if (presetDescriptors.length === 0) {
+        harnessList.append(el('p', 'field-hint', 'No harnesses reported by the server yet.'));
+    }
 };
 
+// Rebuild the header, agent row and core-tool list from the instance's current
+// (or frozen) definition. Called after every server-confirmed change and on
+// snapshot hydration.
+const renderHarnessChrome = (): void => {
+    const instance = current;
+    if (instance === undefined) return;
+
+    const display = instance.frozen ?? instance.descriptor;
+
+    // The right-rail core section always describes the SELECTED harness — it is
+    // visible while the Tools tab owns the centre, and a snapshot refreshed by a
+    // manual core call must update its "enabled for this session" line there.
+    renderCoreTools(display, membersOf(display).length, instance.discovered);
+
+    // While a tool runner owns the centre, the head/agent row belong to the tool;
+    // do not overwrite them.
+    if (currentTool !== undefined) return;
+
+    const locked = instance.sessionId !== undefined;
+
+    headTitle.textContent = display.title;
+    headName.textContent = display.name;
+    headNote.textContent = locked
+        ? instance.frozen !== undefined
+            ? 'Viewing a saved session · agent team frozen'
+            : 'Viewing a saved session'
+        : editableOf(display)
+          ? 'Edits apply to new sessions'
+          : 'Read-only harness';
+
+    // A locked session renders the definition it started with; the live harness
+    // may already have moved on.
+    agentSlot.replaceChildren(renderAgents(instance));
+};
+
+const renderAgents = (instance: Instance): HTMLElement => {
+    const display = instance.frozen ?? instance.descriptor;
+    const members = membersOf(display);
+    const locked = instance.sessionId !== undefined;
+    const editable = editableOf(display) && !locked && !running;
+
+    const lockReason = !editableOf(display)
+        ? 'The server marks this harness read-only.'
+        : locked
+          ? instance.frozen !== undefined
+              ? 'This saved session keeps the agent team it started with.'
+              : 'This saved session cannot change its agent team here.'
+          : running
+            ? 'Stop the run before changing the agent team.'
+            : undefined;
+
+    // Effective model per member.
+    //
+    // Locked chat: the server froze `agentModels` at creation with every member
+    // present, so displaying it is the truth even if the live harness was edited
+    // afterwards. Before that field existed, fall back to the frozen descriptor's
+    // overrides and finally to the session model.
+    //
+    // Editable harness: only overrides are relevant; a member without one shows
+    // the "inherit" option naming the current global model, and a session started
+    // later resolves it from its settings.
+    const overrides = agentModelsOf(display);
+    const models: Record<string, string> = {};
+    for (const name of members) {
+        const model = locked
+            ? (instance.sessionModels?.[name] ?? overrides[name] ?? instance.sessionModel)
+            : overrides[name];
+        if (model !== undefined && model.length > 0) models[name] = model;
+    }
+
+    return createAgentRow({
+        members,
+        primary: primaryOf(display),
+        agents: agentLibrary,
+        editable,
+        ...(lockReason === undefined ? {} : { lockReason }),
+        models: {
+            models,
+            catalogue: modelIds,
+            ...(locked
+                ? instance.sessionModel === undefined
+                    ? {}
+                    : { inheritModel: instance.sessionModel }
+                : { inheritModel: settings.model }),
+            editable: editableOf(display) && !locked && !running,
+            onChange: (name, model) => void setAgentModel(name, model)
+        },
+        activity: [...instance.activity],
+        onNewSession: () => newSession(),
+        onSelectPrimary: (name) => void selectPrimary(name),
+        onAdd: (name) => void addAgent(name),
+        onRemove: (name) => void removeAgent(name)
+    });
+};
+
+// Send the complete team on every change: `primary` plus every other member as
+// `subagents`. That is what makes a demotion atomic — the old primary is listed
+// as a secondary exactly once and no stale duplicate can survive.
+//
+// `models` is the COMPLETE override map the caller wants stored. The server
+// replaces its map with what it receives, so every mutation sends the whole map:
+// promotion keeps each member's entry, add leaves the new member inheriting, and
+// remove drops the removed member's key via `modelsForMembers` (the server offers
+// the same guarantee, but a complete map never depends on it).
+//
+// When `models` is omitted, agent moves preserve the descriptor's current
+// overrides and omit the field entirely if there is nothing to preserve — the
+// exact pre-R9 request body for a harness that has no per-agent models.
+const patchAgents = async (
+    primary: string,
+    members: readonly string[],
+    models?: Readonly<Record<string, string>>,
+    label = 'agent team'
+): Promise<void> => {
+    const instance = current;
+    if (instance === undefined || savingAgents) return;
+
+    const display = instance.frozen ?? instance.descriptor;
+    if (!editableOf(display) || instance.sessionId !== undefined || running) return;
+
+    const unique = uniqueNames(members);
+    const nextPrimary = unique.includes(primary) ? primary : unique[0];
+    if (nextPrimary === undefined) return;
+
+    const subagents = unique.filter((name) => name !== nextPrimary);
+
+    const nextModels = modelsForMembers(models ?? agentModelsOf(display), unique);
+    const includeModels = models !== undefined || Object.keys(nextModels).length > 0;
+
+    savingAgents = true;
+    setStatus('running', `saving ${label}`);
+
+    try {
+        const updated = await updateHarness(display.name, {
+            primary: nextPrimary,
+            subagents,
+            ...(includeModels ? { agentModels: nextModels } : {})
+        });
+        replaceDescriptor(updated);
+        buildHarnesses();
+        renderHarnessChrome();
+        setStatus('idle', `${label} saved · applies to new sessions`);
+    } catch (error) {
+        // The descriptor on screen is still the last server answer, so a failed
+        // PATCH leaves a truthful row.
+        setStatus('error', `${label}: ${messageOf(error)}`);
+        renderHarnessChrome();
+    } finally {
+        savingAgents = false;
+    }
+};
+
+// Change one member's model. An empty value is the "inherit" choice: delete the
+// key so the member resolves to the session's settings model, and send the
+// resulting map explicitly (even `{}`) so clearing the last override really clears
+// it on the server.
+const setAgentModel = async (name: string, model: string): Promise<void> => {
+    const instance = current;
+    if (instance === undefined) return;
+
+    const display = instance.frozen ?? instance.descriptor;
+    // A saved chat keeps the models it started with; the tile dropdown is disabled
+    // in that state, and this guard covers a stale handler.
+    if (!editableOf(display) || instance.sessionId !== undefined || running) return;
+
+    const members = membersOf(display);
+    if (!members.includes(name)) return;
+
+    const overrides = { ...agentModelsOf(display) };
+    if (model.length === 0) delete overrides[name];
+    else overrides[name] = model;
+
+    await patchAgents(primaryOf(display), members, overrides, 'agent models');
+};
+
+const selectPrimary = async (name: string): Promise<void> => {
+    const instance = current;
+    if (instance === undefined) return;
+
+    const display = instance.frozen ?? instance.descriptor;
+    // Selecting a member promotes it and demotes the old primary to a secondary,
+    // in place (order is preserved so the row does not shuffle unexpectedly).
+    const members = membersOf(display);
+    await patchAgents(name, members);
+};
+
+const addAgent = async (name: string): Promise<void> => {
+    const instance = current;
+    if (instance === undefined) return;
+
+    const display = instance.frozen ?? instance.descriptor;
+    const members = membersOf(display);
+    if (members.includes(name)) return;
+
+    await patchAgents(primaryOf(display), [...members, name]);
+};
+
+const removeAgent = async (name: string): Promise<void> => {
+    const instance = current;
+    if (instance === undefined) return;
+
+    const display = instance.frozen ?? instance.descriptor;
+    const members = membersOf(display);
+    if (members.length <= 1 || !members.includes(name)) return;
+
+    const remaining = members.filter((member) => member !== name);
+    // Removing the primary promotes the next member; the team never ends up with
+    // zero or two primaries.
+    const nextPrimary = name === primaryOf(display) ? remaining[0] : primaryOf(display);
+    await patchAgents(nextPrimary, remaining);
+};
+
+// Core tools live ONLY in this collapsible dropdown (R3): the harness-owned set,
+// where delegate appears exactly when there is somewhere to delegate. The Tools tab
+// and the right-rail catalogue list every tool including these; this dropdown stays
+// as the informational view of what a session always has.
+const renderCoreTools = (
+    descriptor: HarnessDescriptor,
+    memberCount: number,
+    discovered?: readonly string[]
+): void => {
+    const names = coreToolsOf(descriptor, memberCount);
+    coreSummary.textContent = `Core tools · ${names.length}`;
+    coreList.replaceChildren();
+
+    for (const name of names) {
+        const row = el('div', 'core-tool');
+        row.dataset.tool = name;
+        row.append(
+            el('span', 'core-tool-name', name),
+            el(
+                'span',
+                'core-tool-description',
+                HARNESS_CORE_TOOL_DESCRIPTIONS[name] ?? 'Harness core tool.'
+            )
+        );
+        coreList.append(row);
+    }
+
+    // Discovered tools are session state: a manual requestTools (Tools tab) or a
+    // chat discovery refreshes the snapshot, and this line follows it.
+    const enabled = discovered ?? [];
+    coreDiscovered.hidden = enabled.length === 0;
+    coreDiscovered.textContent = enabled.length === 0 ? '' : `enabled for this session: ${enabled.join(', ')}`;
+};
+
+// ---------------------------------------------------------------------------
+// Tool catalogue (right rail + Tools tab) and the manual runner (centre)
+// ---------------------------------------------------------------------------
+//
+// Two listings of the SAME server data, on purpose:
+//   - the right rail is the compact catalogue that stays visible while chatting;
+//   - the Tools tab is the full-width, keyed list the user asked for, and it
+//     includes the core tools (requestTools/createTool/todoTools/delegate) even
+//     though the harness also shows them informationally in its core dropdown.
+// Selecting either listing opens the same runner, and a core entry runs inside the
+// selected harness's session (api.ts `callTool(name, parameters, sessionId)`).
+
+const toolButtons = new Map<string, HTMLButtonElement>();
+const toolTabButtons = new Map<string, HTMLButtonElement>();
+
+const toolsPane = el('div', 'pane tools-pane');
+const toolsTabHead = el('div', 'tools-tab-head');
+toolsTabHead.append(
+    el('h2', 'tools-tab-title', 'Tools'),
+    el(
+        'p',
+        'tools-tab-hint',
+        'Every tool the server lists, core tools included. Calls execute on the harness server — nothing runs in this browser. Core tools run inside the selected harness’s session; ordinary tools run directly.'
+    )
+);
+const toolsTabList = el('div', 'tool-tab-list');
+const runnerSlot = el('div', 'tool-runner-slot');
+toolsPane.append(toolsTabHead, toolsTabList, runnerSlot);
+
 const selectTool = (entry: ToolDescriptor): void => {
+    if (running) return;
+
+    stopPolling();
+
     currentTool = entry;
+    // Selecting a tool is what the Tools tab is for: switch to it so the full list
+    // and the runner are both visible, whichever listing was clicked.
+    activeTab = 'tools';
+    paintTabs();
 
     for (const [name, button] of toolButtons) {
         button.setAttribute('aria-pressed', name === entry.name ? 'true' : 'false');
     }
+    for (const [name, button] of toolTabButtons) {
+        button.setAttribute('aria-pressed', name === entry.name ? 'true' : 'false');
+    }
+    // The harness stays selected: the sessions rail is still scoped to it, and
+    // clicking a harness row returns to that chat.
+    for (const [name, button] of harnessButtons) {
+        button.setAttribute('aria-pressed', name === selectedName ? 'true' : 'false');
+    }
 
+    const unavailable = entry.availability?.state === 'unconfigured';
     headTitle.textContent = entry.name;
-    headDescription.textContent = entry.description;
-    headBadges.replaceChildren(
-        badge(entry.group),
-        badge(`tags: ${entry.tags.join(', ')}`),
-        badge(entry.visibility),
-        // Only credential-dependent tools carry availability; other entries keep
-        // the original three-badge header.
-        ...(entry.availability === undefined ? [] : [badge(entry.availability.state)])
-    );
+    headName.textContent = entry.group;
+    headNote.textContent = [
+        entry.visibility,
+        `tags: ${entry.tags.length > 0 ? entry.tags.join(', ') : 'none'}`,
+        ...(entry.sessionBound === true ? ['session-bound'] : []),
+        ...(unavailable ? ['unconfigured'] : [])
+    ].join(' · ');
 
+    agentSlot.hidden = true;
+    composer.hidden = true;
     runner.show(entry);
-    stage.replaceChildren(runner.pane);
+    runnerSlot.replaceChildren(runner.pane);
+    stage.replaceChildren(toolsPane);
     delete stage.dataset.preset;
     setStatus('idle');
 };
 
-const buildPresets = (descriptors: readonly HarnessDescriptor[]): void => {
-    presetList.replaceChildren();
-    presetDescriptors = descriptors;
-    buttons.clear();
+// Switch between the chat and the Tools tab. The panel (`stage`) is shared; the
+// rest of the centre chrome (head, agent row, composer) is shown or hidden to
+// match. A run in flight keeps the tabs locked, exactly like harness switching.
+const setTab = (tab: 'chat' | 'tools'): void => {
+    if (running || activeTab === tab) return;
 
-    for (const descriptor of descriptors) {
-        const button = el('button', 'preset');
-        button.type = 'button';
-        button.setAttribute('aria-pressed', 'false');
-        button.append(
-            el('span', 'preset-title', descriptor.title),
-            el('span', 'preset-name', descriptor.name),
-            el('span', 'preset-meta', descriptor.requiresEndpoint ? 'live' : 'offline · no endpoint')
+    if (tab === 'chat') {
+        activeTab = 'chat';
+        paintTabs();
+
+        currentTool = undefined;
+        for (const button of toolButtons.values()) button.setAttribute('aria-pressed', 'false');
+        for (const button of toolTabButtons.values()) button.setAttribute('aria-pressed', 'false');
+
+        agentSlot.hidden = false;
+        composer.hidden = false;
+        if (current !== undefined) {
+            stage.replaceChildren(current.view.pane);
+            renderHarnessChrome();
+            renderSessions();
+        } else {
+            stage.replaceChildren();
+        }
+        setStatus('idle');
+        return;
+    }
+
+    // Tools tab with nothing chosen yet: open the first entry (core tools are
+    // listed first by the server) so the tab is never an empty shell. An empty
+    // catalogue explains itself instead.
+    const entry = currentTool ?? toolEntries[0];
+    if (entry === undefined) {
+        activeTab = 'tools';
+        paintTabs();
+        currentTool = undefined;
+        agentSlot.hidden = true;
+        composer.hidden = true;
+        headTitle.textContent = 'Tools';
+        headName.textContent = '';
+        headNote.textContent = 'The server reported no tools.';
+        const empty = el('div', 'pane');
+        const wrap = el('div', 'log-wrap');
+        wrap.append(
+            el('p', 'field-hint', 'The server reported no tools. Check that the harness server is reachable.')
         );
-        button.addEventListener('click', () => select(ensureInstance(descriptor)));
+        empty.append(wrap);
+        stage.replaceChildren(empty);
+        return;
+    }
 
-        buttons.set(descriptor.name, button);
-        presetList.append(button);
+    selectTool(entry);
+};
+
+chatTab.addEventListener('click', () => setTab('chat'));
+toolsTab.addEventListener('click', () => setTab('tools'));
+
+// Full-width Tools tab listing. Same grouping as the rail, but every entry is a
+// keyed button with enough room to show what it is and whether a session is needed.
+const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
+    toolsTabList.replaceChildren();
+    toolTabButtons.clear();
+
+    let lastGroup = '';
+
+    for (const entry of entries) {
+        if (entry.group !== lastGroup) {
+            toolsTabList.append(el('div', 'tool-tab-group', entry.group));
+            lastGroup = entry.group;
+        }
+
+        const button = el('button', 'tool-tab-button');
+        button.type = 'button';
+        button.dataset.tool = entry.name;
+        button.setAttribute('aria-pressed', 'false');
+        button.disabled = running;
+
+        const unavailable = entry.availability?.state === 'unconfigured';
+        const kind = [
+            entry.visibility,
+            ...(entry.sessionBound === true ? ['session'] : []),
+            ...(unavailable ? ['unconfigured'] : [])
+        ].join(' · ');
+        if (unavailable) button.dataset.availability = 'unconfigured';
+
+        button.append(
+            el('span', 'tool-tab-name', entry.name),
+            el('span', 'tool-tab-kind', kind)
+        );
+        button.addEventListener('click', () => selectTool(entry));
+
+        toolTabButtons.set(entry.name, button);
+        toolsTabList.append(button);
+    }
+
+    if (entries.length === 0) {
+        toolsTabList.append(
+            el('p', 'field-hint', 'The server reported no tools. Check that the harness server is reachable.')
+        );
     }
 };
 
 const buildTools = (entries: readonly ToolDescriptor[]): void => {
+    toolEntries = entries;
     toolList.replaceChildren();
+    toolButtons.clear();
+    catalogueCount.textContent = String(entries.length);
+    buildToolsTab(entries);
 
     let lastGroup = '';
 
@@ -956,9 +1760,11 @@ const buildTools = (entries: readonly ToolDescriptor[]): void => {
 
         const button = el('button', 'tool-button');
         button.type = 'button';
+        button.dataset.tool = entry.name;
         button.setAttribute('aria-pressed', 'false');
+        button.disabled = running;
 
-        // The sidebar has to answer "is websearch available here?" before a click.
+        // The rail has to answer "is websearch available here?" before a click.
         // The kind text is the existing visibility, with an explicit unconfigured
         // suffix and a data attribute for styling; a configured tool is unchanged.
         const unavailable = entry.availability?.state === 'unconfigured';
@@ -977,40 +1783,15 @@ const buildTools = (entries: readonly ToolDescriptor[]): void => {
         toolButtons.set(entry.name, button);
         toolList.append(button);
     }
-};
 
-const setMode = (next: 'harness' | 'tool'): void => {
-    harnessMode.setAttribute('aria-pressed', next === 'harness' ? 'true' : 'false');
-    toolsMode.setAttribute('aria-pressed', next === 'tool' ? 'true' : 'false');
-
-    presetList.hidden = next !== 'harness';
-    toolList.hidden = next !== 'tool';
-    // The session directory belongs to harness runs, not to direct tool calls.
-    sessionsSection.hidden = next !== 'harness';
-    endpoint.hidden = next !== 'harness';
-    composer.hidden = next !== 'harness';
-
-    if (next === 'harness') {
-        if (current !== undefined) select(current);
-        else if (presetDescriptors.length > 0) select(ensureInstance(presetDescriptors[0]));
-    } else if (currentTool !== undefined) {
-        selectTool(currentTool);
+    if (entries.length === 0) {
+        toolList.append(el('p', 'field-hint', 'The server reported no direct-call tools.'));
     }
 };
 
-harnessMode.addEventListener('click', () => setMode('harness'));
-toolsMode.addEventListener('click', () => setMode('tool'));
-
 // ---------------------------------------------------------------------------
-// Session directory (server-owned)
+// Session directory (server-owned, filtered by harness)
 // ---------------------------------------------------------------------------
-//
-// `sessions` is a cache of the server's answers, not a record: the UI asks again
-// on refresh, after every run and while polling a running session, and every
-// answer replaces the cache entries it mentions. Local edits never add or remove
-// server sessions.
-
-let sessions: SessionSnapshot[] = [];
 
 const upsertSession = (session: SessionSnapshot): void => {
     const index = sessions.findIndex((candidate) => candidate.id === session.id);
@@ -1018,9 +1799,19 @@ const upsertSession = (session: SessionSnapshot): void => {
     else sessions.push(session);
 };
 
-// Eight characters is the same prefix the server's logs are readable by, and a
-// full uuid would not fit the 272px sidebar.
+// Eight characters is the same prefix the server's logs are readable by.
 const shortId = (id: string): string => (id.length <= 8 ? id : id.slice(0, 8));
+
+// Sessions belong to one canonical harness. The rail shows only the selected one,
+// which is the "locked to selected harness" rule in R3 — opening a row can never
+// silently move the reader to another harness, because no other row is offered.
+const visibleSessions = (): SessionSnapshot[] => {
+    if (selectedName === undefined) return [];
+
+    return sessions.filter(
+        (session) => canonicalHarnessName(session.harness, presetDescriptors) === selectedName
+    );
+};
 
 // Rows are buttons: keyboard reachable and self-explanatory with a status text
 // and turn count. The active row is marked for styling only — selection is state
@@ -1028,31 +1819,56 @@ const shortId = (id: string): string => (id.length <= 8 ? id : id.slice(0, 8));
 const renderSessions = (): void => {
     sessionList.replaceChildren();
 
-    if (sessions.length === 0) {
-        sessionList.append(el('p', 'field-hint', 'No sessions on this server yet. Send a task to create one.'));
+    sessionsScope.textContent =
+        selectedName === undefined
+            ? 'Select a harness to see its sessions.'
+            : `Locked to ${selectedName}.`;
+
+    const visible = visibleSessions();
+
+    if (visible.length === 0) {
+        sessionList.append(
+            el(
+                'p',
+                'field-hint',
+                selectedName === undefined
+                    ? 'Select a harness first.'
+                    : 'No sessions for this harness yet. Send a task to create one.'
+            )
+        );
         return;
     }
 
     const activeId = current?.sessionId;
 
-    for (const session of sessions) {
+    for (const session of visible) {
         const row = el('button', 'session');
         row.type = 'button';
         row.dataset.sessionId = session.id;
         row.dataset.status = session.status;
         if (session.id === activeId) row.dataset.active = 'true';
+        row.disabled = running;
 
         // `turns.length` is the server's count; the UI does not compute a turn
         // count from event frames (it could disagree after a reload).
         const turns = session.turns.length;
         row.append(
             el('span', 'session-harness', session.harness),
-            el('span', 'session-meta', `${session.status} · ${turns} turn${turns === 1 ? '' : 's'} · ${shortId(session.id)}`),
-            el('span', 'session-prompt', session.turns.length > 0 ? session.turns[session.turns.length - 1].prompt : 'no turns yet')
+            el(
+                'span',
+                'session-meta',
+                `${session.status} · ${turns} turn${turns === 1 ? '' : 's'} · ${shortId(session.id)}`
+            ),
+            el(
+                'span',
+                'session-prompt',
+                session.turns.length > 0 ? session.turns[session.turns.length - 1].prompt : 'no turns yet'
+            )
         );
         row.title = `${session.harness} · ${session.id}`;
 
         row.addEventListener('click', () => {
+            if (running) return;
             void openSession(session.id);
         });
 
@@ -1075,17 +1891,45 @@ const refreshSessions = async (): Promise<void> => {
     }
 };
 
-// Draw a snapshot into its card. The turns are the authoritative transcript;
-// `messages` is the entry agent's own view of the same run and is informational.
+// Draw a snapshot into its harness view. The turns are the authoritative
+// transcript; `messages` is the entry agent's own view of the same run and is
+// informational. The frozen definition, when sent, becomes the displayed team.
 const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     instance.sessionId = session.id;
+
+    // The frozen definition is the conversation's own team. Assign even when the
+    // server omitted it (legacy): keeping a previous session's frozen team would
+    // describe the wrong chat.
+    instance.frozen = frozenDefinitionOf(session);
+
+    // Frozen per-agent models + the settings model they inherit from. A PATCH
+    // after creation does not change these, which is why a saved chat can show the
+    // models it started with while the live harness has moved on.
+    instance.sessionModels = agentModelsOf(session);
+    instance.sessionModel = typeof session.model === 'string' ? session.model : undefined;
+    instance.discovered = Array.isArray(session.discoveredTools)
+        ? [...session.discoveredTools]
+        : undefined;
+
+    // Activity from a hydrated/polled record: ONLY a still-running turn can make
+    // an agent busy. Replaying a settled turn (done/error/cancelled) lights
+    // nothing, so opening history never animates old work.
+    instance.activity.clear();
+    if (session.status === 'running') {
+        for (const name of activityOfTurns(session.turns)) instance.activity.add(name);
+    }
+
     instance.view.hydrate(session.turns, session.model);
     instance.view.setTranscript(JSON.stringify(session.messages, null, 2));
+    upsertSession(session);
     renderSessions();
-};
 
-const descriptorFor = (name: string): HarnessDescriptor | undefined =>
-    presetDescriptors.find((candidate) => candidate.name === name);
+    if (current === instance) {
+        paintActivity(agentSlot, instance.activity);
+        renderHarnessChrome();
+        runner.sync();
+    }
+};
 
 // ---------------------------------------------------------------------------
 // Polling a running session (reload / late attach)
@@ -1101,17 +1945,14 @@ const POLL_INTERVAL_MS = 1_000;
 // session stops asking rather than polling forever.
 const POLL_MAX_ATTEMPTS = 120;
 
-let pollTimer: number | undefined;
-let pollToken = 0;
-
 const stopPolling = (): void => {
     // The token invalidates an in-flight `getSession` response: a stale answer
     // must not repaint the card after the reader moved to another session.
     pollToken += 1;
 
-    if (pollTimer !== undefined) {
-        window.clearTimeout(pollTimer);
-        pollTimer = undefined;
+    if (sessionsPollTimer !== undefined) {
+        window.clearTimeout(sessionsPollTimer);
+        sessionsPollTimer = undefined;
     }
 };
 
@@ -1161,12 +2002,12 @@ const pollSession = (instance: Instance, id: string): void => {
             return;
         }
 
-        pollTimer = window.setTimeout(() => {
+        sessionsPollTimer = window.setTimeout(() => {
             void tick();
         }, POLL_INTERVAL_MS);
     };
 
-    pollTimer = window.setTimeout(() => {
+    sessionsPollTimer = window.setTimeout(() => {
         void tick();
     }, POLL_INTERVAL_MS);
 };
@@ -1190,7 +2031,11 @@ const openSession = async (id: string): Promise<void> => {
         return;
     }
 
-    const descriptor = descriptorFor(session.harness);
+    // Opening a session keeps its canonical harness (including a legacy alias):
+    // the row's harness is what is selected, so the chat never lands in another
+    // harness's transcript.
+    const harnessName = canonicalHarnessName(session.harness, presetDescriptors);
+    const descriptor = descriptorFor(harnessName);
     if (descriptor === undefined) {
         setStatus('error', `unknown harness "${session.harness}"`);
         return;
@@ -1204,10 +2049,10 @@ const openSession = async (id: string): Promise<void> => {
     }
 
     target.sessionId = id;
-    select(target);
+    target.frozen = frozenDefinitionOf(session);
+
+    selectHarness(descriptor.name);
     applySnapshot(target, session);
-    upsertSession(session);
-    renderSessions();
     rememberSession(id);
 
     if (session.status === 'running') {
@@ -1216,12 +2061,16 @@ const openSession = async (id: string): Promise<void> => {
         return;
     }
 
-    setStatus(session.status === 'error' ? 'error' : 'idle', session.status === 'error' ? (session.lastError ?? 'session error') : undefined);
+    setStatus(
+        session.status === 'error' ? 'error' : 'idle',
+        session.status === 'error' ? (session.lastError ?? 'session error') : undefined
+    );
 };
 
 // Explicit new conversation: forget the pointer and drop the local projection.
-// The previous session stays on the server and in the list — nothing is deleted.
-newSessionButton.addEventListener('click', () => {
+// The previous session stays on the server and can be reopened from the rail;
+// clearing the pointer is also what unlocks agent editing again.
+const newSession = (): void => {
     const instance = current;
     if (instance === undefined) return;
 
@@ -1232,37 +2081,45 @@ newSessionButton.addEventListener('click', () => {
 
     stopPolling();
     instance.sessionId = undefined;
+    instance.frozen = undefined;
+    instance.sessionModels = undefined;
+    instance.sessionModel = undefined;
+    instance.discovered = undefined;
+    clearActivity();
     instance.view.clear();
     instance.view.setTranscript('[]');
-    forgetRememberedSession();
+    if (instance === current) forgetRememberedSession();
+    renderHarnessChrome();
     renderSessions();
     setStatus('idle');
     input.focus();
-});
-
-refreshSessionsButton.addEventListener('click', () => {
-    void refreshSessions();
-});
-
-// A polling loop must never outlive the page; a reload re-reads the snapshot.
-window.addEventListener('pagehide', () => {
-    stopPolling();
-});
-
+};
 
 // ---------------------------------------------------------------------------
 // Running
 // ---------------------------------------------------------------------------
-
-let running = false;
-let controller: AbortController | undefined;
-let booted = false;
 
 const setBusy = (value: boolean): void => {
     running = value;
     runButton.disabled = value || !booted;
     stopButton.disabled = !value;
     resetButton.disabled = value;
+    newSessionButton.disabled = value || !booted;
+    createHarnessButton.disabled = value || !booted;
+
+    // A creation form left open while a run starts would still be submittable;
+    // close it so no POST can race the stream.
+    if (value && createPanel.isOpen()) createPanel.close();
+
+    for (const button of harnessButtons.values()) button.disabled = value || !booted;
+    for (const button of toolButtons.values()) button.disabled = value;
+    for (const button of toolTabButtons.values()) button.disabled = value;
+    chatTab.disabled = value;
+    toolsTab.disabled = value;
+    for (const row of sessionList.querySelectorAll<HTMLButtonElement>('.session')) row.disabled = value;
+
+    // The agent row follows the same lock: no editing while a run streams.
+    if (current !== undefined) renderHarnessChrome();
 };
 
 // `state` drives the pill's colour and spinner; `detail` is the human sentence.
@@ -1275,12 +2132,45 @@ const setStatus = (state: 'idle' | 'running' | 'done' | 'error' | 'connecting', 
     statusText.textContent = detail === undefined ? state : detail;
 };
 
+// Create a session only when this harness has none. Settings drafts are read here
+// and nowhere else: editing the endpoint, model or key afterwards must not
+// recreate, replace or delete the conversation the user already has (H4). A new
+// session is an explicit "New session" click, and the first submit after it
+// creates the server record.
+const ensureSession = async (instance: Instance): Promise<string> => {
+    if (instance.sessionId !== undefined) return instance.sessionId;
+
+    const session = await createSession(instance.descriptor.name, settings);
+
+    instance.sessionId = session.id;
+    instance.frozen = frozenDefinitionOf(session);
+    // The creation answer carries the effective frozen model map, so the tile
+    // dropdowns can show what this conversation actually runs.
+    instance.sessionModels = agentModelsOf(session);
+    instance.sessionModel = typeof session.model === 'string' ? session.model : undefined;
+    instance.discovered = Array.isArray(session.discoveredTools)
+        ? [...session.discoveredTools]
+        : undefined;
+    rememberSession(session.id);
+    upsertSession(session);
+    renderSessions();
+
+    // A manual core call may have created this session; its runner shows the
+    // session id now instead of "no session yet".
+    if (current === instance) {
+        renderHarnessChrome();
+        runner.sync();
+    }
+
+    return session.id;
+};
+
 const run = async (): Promise<void> => {
     const prompt = input.value.trim();
-    if (running || prompt.length === 0) return;
+    if (running || savingAgents || prompt.length === 0) return;
 
     const instance = current;
-    if (instance === undefined) return;
+    if (instance === undefined || currentTool !== undefined) return;
 
     if (instance.descriptor.requiresEndpoint && settings.baseURL.trim().length === 0) {
         instance.view.notice('set a base URL in Endpoint, then run again');
@@ -1296,12 +2186,16 @@ const run = async (): Promise<void> => {
     // lifecycle visible instead of the view looking idle until the first token.
     const turn = instance.view.begin(prompt);
 
+    // A new run owns the rings from zero: nothing from the previous turn may
+    // carry over before the first `start` event arrives.
+    clearActivity();
+
     const requestController = new AbortController();
 
     // Take the request lock *before* `await ensureSession(...)`. Session creation
     // is part of the request, so Run must be disabled (and Enter must be a no-op)
     // for its whole duration — otherwise a double submit creates two sessions.
-    controller = requestController;
+    activeRun = { controller: requestController, instance };
     input.value = '';
     setBusy(true);
 
@@ -1355,8 +2249,18 @@ const run = async (): Promise<void> => {
                     // up by that id; an event for a turn this view does not hold
                     // (another tab's stream, a stale frame) is dropped. The
                     // terminal snapshot reconciles anything missed.
+                    //
+                    // `frameAtOf` is the server clock for this event (new
+                    // servers); absent means the tile falls back to the local
+                    // clock for tool timing.
                     const target = instance.view.turn(item.turnId) ?? turn;
-                    target.apply(item.event);
+                    target.apply(item.event, frameAtOf(item));
+
+                    // Per-agent ring. `start` activates the agent, text/reasoning/
+                    // tool events keep it active, and a `done`/`error` for one agent
+                    // removes only that agent (a delegated sibling keeps spinning).
+                    applyActivity(instance.activity, item.event);
+                    if (current === instance) paintActivity(agentSlot, instance.activity);
                     return;
                 }
 
@@ -1366,6 +2270,10 @@ const run = async (): Promise<void> => {
                 if (item.type === 'snapshot' || item.type === 'failed') {
                     terminal = item.session;
                     instance.view.setTranscript(JSON.stringify(item.session.messages, null, 2));
+
+                    // The run is over: no agent may stay marked busy.
+                    instance.activity.clear();
+                    if (current === instance) paintActivity(agentSlot, instance.activity);
                 }
 
                 if (item.type === 'failed') failure = item.error.message;
@@ -1388,6 +2296,7 @@ const run = async (): Promise<void> => {
         // browser held. A frame without turns (older server) falls back to
         // settling the live tile so nothing is lost.
         if (stillShown && terminal !== undefined && terminal.turns.length > 0) {
+            instance.frozen = frozenDefinitionOf(terminal) ?? instance.frozen;
             instance.view.hydrate(terminal.turns, terminal.model, turn.id());
         } else if (stillShown && failure !== undefined) {
             turn.setState('error', failure);
@@ -1406,6 +2315,7 @@ const run = async (): Promise<void> => {
         upsertSession(terminal ?? snapshot);
         if (stillShown) rememberSession(sessionId);
         renderSessions();
+        if (current === instance) renderHarnessChrome();
     } catch (error) {
         turn.flush();
 
@@ -1422,6 +2332,7 @@ const run = async (): Promise<void> => {
                 // pointer so the next run creates a fresh conversation; the
                 // session list is re-read to show what actually exists now.
                 instance.sessionId = undefined;
+                instance.frozen = undefined;
                 if (instance === current) forgetRememberedSession();
                 void refreshSessions();
             }
@@ -1431,7 +2342,11 @@ const run = async (): Promise<void> => {
             setStatus('error', message);
         }
     } finally {
-        if (controller === requestController) controller = undefined;
+        if (activeRun?.controller === requestController) activeRun = undefined;
+        // Reset/cancel/failure/terminal all leave through here: clear the rings
+        // for the instance that owned the run (not whichever is selected now).
+        instance.activity.clear();
+        if (current === instance) paintActivity(agentSlot, instance.activity);
         setBusy(false);
         turn.flush();
         input.focus();
@@ -1451,18 +2366,28 @@ input.addEventListener('keydown', (event) => {
 });
 
 stopButton.addEventListener('click', () => {
-    const active = controller;
-    active?.abort();
+    const active = activeRun;
+    if (active === undefined) return;
+
+    active.controller.abort();
 
     // Immediate acknowledgement: aborting the fetch and asking the server to
     // cancel both take a round trip, so the pill says what is happening.
-    if (active !== undefined) setStatus('running', 'stopping');
+    setStatus('running', 'stopping');
 
-    const instance = current;
-    if (instance?.sessionId !== undefined) {
+    // Stopping is the user's terminal signal: no ring may keep spinning while the
+    // cancellation round-trip finishes. Cleared on the ORIGIN instance.
+    active.instance.activity.clear();
+    if (current === active.instance) paintActivity(agentSlot, active.instance.activity);
+
+    // The origin instance owns the session to cancel — never whatever harness is
+    // selected now. Harness switching is disabled during a run, so this also
+    // survives a selection that raced the first render.
+    const sessionId = active.instance.sessionId;
+    if (sessionId !== undefined) {
         // The server records the cancellation as the turn's terminal status; the
         // directory row should stop saying "running" once it has.
-        void cancelSession(instance.sessionId)
+        void cancelSession(sessionId)
             .catch(() => undefined)
             .finally(() => {
                 void refreshSessions();
@@ -1482,6 +2407,7 @@ resetButton.addEventListener('click', () => {
     const sessionId = instance.sessionId;
     instance.view.clear();
     instance.view.setTranscript('[]');
+    clearActivity();
     setStatus('idle');
 
     if (sessionId === undefined) return;
@@ -1498,12 +2424,63 @@ resetButton.addEventListener('click', () => {
             // The server may have restarted since this card was opened. Forget the
             // stale id so the next run creates a fresh session.
             instance.sessionId = undefined;
+            instance.frozen = undefined;
             if (instance === current) forgetRememberedSession();
             instance.view.notice(`reset failed: ${messageOf(error)}`);
             setStatus('error', messageOf(error));
             void refreshSessions();
         }
     );
+});
+
+// ---------------------------------------------------------------------------
+// Create harness panel
+// ---------------------------------------------------------------------------
+
+const createPanel = createCreateHarnessPanel({
+    agents: () => agentLibrary,
+    existingNames: () => presetDescriptors.map((descriptor) => descriptor.name),
+    onCancel: () => createHarnessButton.setAttribute('aria-expanded', 'false'),
+    onSubmit: async (request) => {
+        // The server stores the harness and answers with its descriptor; the rail
+        // and the centre are rebuilt from that answer, never from the draft.
+        const descriptor = await createHarness(request);
+        replaceDescriptor(descriptor);
+        buildHarnesses();
+        selectHarness(descriptor.name);
+        setStatus('idle', `created ${descriptor.name} · choose the team if needed`);
+    }
+});
+createPanel.element.id = 'create-harness-panel';
+createHarnessButton.setAttribute('aria-controls', createPanel.element.id);
+leftRail.append(harnessHead, harnessList, createPanel.element, endpoint);
+
+createHarnessButton.addEventListener('click', () => {
+    if (running || !booted) return;
+
+    if (createPanel.isOpen()) {
+        createPanel.close();
+        createHarnessButton.setAttribute('aria-expanded', 'false');
+        return;
+    }
+
+    createPanel.open();
+    createHarnessButton.setAttribute('aria-expanded', 'true');
+});
+
+newSessionButton.addEventListener('click', newSession);
+
+refreshSessionsButton.addEventListener('click', () => {
+    void refreshSessions();
+});
+
+// A polling loop or a live tick must never outlive the page; a reload re-reads
+// the snapshot and every elapsed label from the server.
+window.addEventListener('pagehide', () => {
+    stopPolling();
+    clearActivity();
+
+    for (const instance of instances.values()) instance.view.dispose();
 });
 
 // ---------------------------------------------------------------------------
@@ -1549,6 +2526,14 @@ const showOffline = (message: string): void => {
     wrap.append(box);
     pane.append(wrap);
     stage.replaceChildren(pane);
+
+    // No catalogue, no tab switch: the only useful action is Retry.
+    chatTab.disabled = true;
+    toolsTab.disabled = true;
+
+    if (presetDescriptors.length === 0) {
+        harnessList.replaceChildren(el('p', 'field-hint', 'No server connection.'));
+    }
 };
 
 const boot = async (): Promise<void> => {
@@ -1558,7 +2543,8 @@ const boot = async (): Promise<void> => {
         // One bootstrap document on the canonical mount; the standalone `/api`
         // root is a 404, so the client falls back to /harnesses + /tools +
         // /sessions there. Both bring the full session list, which is what makes
-        // a reload land on an existing conversation.
+        // a reload land on an existing conversation, and both carry the agent
+        // presets on the new server.
         const data = await loadBootstrap();
 
         applyDefaults(data.defaults);
@@ -1570,7 +2556,16 @@ const boot = async (): Promise<void> => {
         renderModelOptions();
         void refreshModels();
 
-        buildPresets(data.presets);
+        presetDescriptors = data.presets;
+        // The agent library is server data. An older server has no list, so derive
+        // a minimal one from its descriptors: the picker still works, and the
+        // detail panel says the server did not advertise instructions.
+        agentLibrary =
+            Array.isArray(data.agents) && data.agents.length > 0
+                ? data.agents
+                : agentsFromDescriptors(data.presets);
+
+        buildHarnesses();
         buildTools(data.tools);
 
         sessions = data.sessions;
@@ -1579,8 +2574,9 @@ const boot = async (): Promise<void> => {
         // Catalogue-dependent actions become usable only now.
         refreshSessionsButton.disabled = false;
         newSessionButton.disabled = false;
+        createHarnessButton.disabled = false;
 
-        if (data.presets.length === 0) {
+        if (presetDescriptors.length === 0) {
             showOffline('The server reported no harnesses.');
             setStatus('error', 'no harnesses');
             return;
@@ -1588,7 +2584,7 @@ const boot = async (): Promise<void> => {
 
         booted = true;
         runButton.disabled = false;
-        setMode('harness');
+        selectHarness(presetDescriptors[0].name);
 
         // Resume the last conversation this browser looked at, but only if this
         // server still holds it (sessions are in memory, so a restart loses
@@ -1609,5 +2605,4 @@ const boot = async (): Promise<void> => {
     }
 };
 
-setMode('harness');
 void boot();

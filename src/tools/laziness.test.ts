@@ -44,10 +44,13 @@ describe('lazy preset tools', () => {
         const { presetTools } = await import('./index');
 
         // Full metadata is available — the description the model reads, the tags
-        // getTools matches, and the schema the harness declares — with no body.
+        // discovery matches (or the visibility flag), and the schema the harness
+        // declares - with no body.
         expect(presetTools.readFile.name).toBe('readFile');
         expect(presetTools.readFile.description).toBe('Read a UTF-8 text file from disk and return its contents. Throws when the file does not exist or is not readable.');
         expect(presetTools.readFile.tags).toEqual(['files', 'read', 'filesystem']);
+        // Searchable by catalogue metadata: discovery must enable it, but that
+        // changes no laziness property.
         expect(presetTools.readFile.visibility).toBe('searchable');
         expect(presetTools.readFile.parameters).toEqual({
             type: 'object',

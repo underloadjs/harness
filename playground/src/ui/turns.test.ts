@@ -357,3 +357,131 @@ describe('server turns', () => {
 const tileIndexes = (board: ReturnType<typeof createTurnBoard>): (string | null)[] =>
     [...board.element.querySelectorAll<HTMLElement>('.tile-index')].map((node) => node.textContent);
 
+// ---------------------------------------------------------------------------
+// Elapsed timing (R4)
+// ---------------------------------------------------------------------------
+//
+// Live labels tick from the local clock; hydration uses the server's
+// startedAt/updatedAt and eventTimes, and a rebuild must not reset them. A legacy
+// record (no eventTimes) must show no tool duration rather than a fabricated one.
+
+describe('elapsed timing', () => {
+    const T = 1_700_000_000_000;
+
+    const serverTurn = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
+        id: 't1',
+        index: 0,
+        prompt: 'server prompt',
+        status: 'done',
+        startedAt: 1,
+        updatedAt: 2,
+        events: [],
+        ...overrides
+    });
+
+    afterEach(() => {
+        vi.useRealTimers();
+    });
+
+    it('counts a live turn and freezes it when the turn settles', () => {
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T));
+
+        const { board } = mount();
+        const turn = board.begin('live');
+        const label = turn.element.querySelector<HTMLElement>('.tile-elapsed');
+
+        expect(turn.elapsed()).toBe('0ms');
+        expect(label?.hidden).toBe(false);
+
+        vi.advanceTimersByTime(2500);
+        expect(turn.elapsed()).toBe('2.5s');
+
+        turn.setState('done');
+        expect(turn.elapsed()).toBe('2.5s');
+
+        // A settled tile stops counting; a stray interval would keep growing.
+        vi.advanceTimersByTime(10_000);
+        expect(turn.elapsed()).toBe('2.5s');
+    });
+
+    it('hydrates elapsed from the server span and keeps it across a rebuild', () => {
+        const { board } = mount();
+        const source = serverTurn({
+            startedAt: T,
+            updatedAt: T + 3600,
+            events: [{ type: 'start', agent: 'writer', model: 'm1' }]
+        });
+
+        const [first] = board.hydrate([source], { model: 'm1' });
+        expect(first.elapsed()).toBe('3.6s');
+
+        // The same record re-rendered by a poll/snapshot: same duration, because
+        // it comes from the record, not from "now".
+        const [second] = board.hydrate([source], { model: 'm1', keep: 't1' });
+        expect(second.elapsed()).toBe('3.6s');
+        expect(second.elapsed()).toBe(first.elapsed());
+    });
+
+    it('matches tool results by callId and reads durations from eventTimes', () => {
+        const { board } = mount();
+        const [turn] = board.hydrate([
+            serverTurn({
+                startedAt: T,
+                updatedAt: T + 2200,
+                events: [
+                    { type: 'start', agent: 'writer', model: 'm1' },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'readFile', arguments: '{"path":"a"}' } },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c2', name: 'readFile', arguments: '{"path":"b"}' } },
+                    // Results arrive out of call order; the call id is the match.
+                    { type: 'tool_result', agent: 'writer', name: 'readFile', content: 'b', isError: false, callId: 'c2' },
+                    { type: 'tool_result', agent: 'writer', name: 'readFile', content: 'a', isError: false, callId: 'c1' },
+                    { type: 'done', agent: 'writer', message: doneMessage('writer') }
+                ],
+                eventTimes: [T, T + 100, T + 500, T + 900, T + 1500, T + 2200]
+            } as SessionTurn)
+        ]);
+
+        expect(
+            [...turn.element.querySelectorAll<HTMLElement>('.tool-duration')].map((node) => node.textContent)
+        ).toEqual(['1.4s', '400ms']);
+    });
+
+    it('leaves legacy records without a fabricated tool duration', () => {
+        const { board } = mount();
+        const [turn] = board.hydrate([
+            serverTurn({
+                startedAt: T,
+                updatedAt: T + 1000,
+                events: [
+                    { type: 'start', agent: 'writer', model: 'm1' },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'readFile', arguments: '{}' } },
+                    { type: 'tool_result', agent: 'writer', name: 'readFile', content: 'ok', isError: false }
+                ]
+            })
+        ]);
+
+        expect(turn.elapsed()).toBe('1.0s');
+        expect(turn.element.querySelector<HTMLElement>('.tool-duration')?.textContent).toBe('');
+        expect(turn.element.querySelector<HTMLElement>('.tool-duration')?.hidden).toBe(true);
+        expect(turn.element.textContent ?? '').not.toContain('NaN');
+    });
+
+    it('uses the server clock carried on a live event for a tool duration', () => {
+        const { board } = mount();
+        const turn = board.begin('live call');
+
+        turn.apply({ type: 'start', agent: 'writer', model: 'm1' }, T);
+        turn.apply(
+            { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'readFile', arguments: '{}' } },
+            T
+        );
+        turn.apply(
+            { type: 'tool_result', agent: 'writer', name: 'readFile', content: 'ok', isError: false },
+            T + 750
+        );
+
+        expect(turn.element.querySelector('.tool-duration')?.textContent).toBe('750ms');
+    });
+});
+

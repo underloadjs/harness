@@ -37,29 +37,47 @@
 //
 // A registry can hold thousands of tools, so a request declares only:
 //   - every `visibility: 'core'` tool, and
-//   - every searchable tool that getTools has enabled so far.
+//   - every searchable tool that requestTools has enabled so far.
 //
-// getTools is itself core and is always registered here. It ranks the catalogue
+// The only core tools are the harness-owned ones below; the ENTIRE catalogue,
+// including the bundled file tools, is searchable. That is deliberate: one
+// discovery surface means a file tool costs the same round trip as runCommand,
+// and the set of core tools can never silently grow with a preset import.
+//
+// requestTools is itself core and is always registered here. It ranks the catalogue
 // against the tags the model passes (core/discovery), enables the best matches,
 // and the next request declares them. Ranking is OR-style — a tool needs only one
 // query tag to be a candidate, and its rank is its best single-tag score — so the
 // order is deterministic and a broad tool cannot outrank an exact tag hit.
-// Matches are capped at 10 by default (the model may pass `limit`, hard maximum
-// 50) because a query that matches a whole family must not re-flood the context.
-// Undiscovered tools are not callable, so the model cannot skip discovery by
-// guessing a name.
+// Matches are capped at MAX_DISCOVERY_MATCHES (5) per request (R7): the model may
+// pass a SMALLER `limit`, never a larger one, and the result reports `remaining`
+// — the count of additional tools that matched but were not listed — so the model
+// refines its tags to drill deeper instead of paging through names. Undiscovered
+// tools are not callable, so the model cannot skip discovery by guessing a name.
+// The enabled set is per harness and survives across calls (turns), so a
+// capability discovered once stays declared until reset().
 //
 // Harness-owned names sit outside that scheme:
-//   - getTools    — discovery, described above.     (every agent, core)
-//   - createTool  — compile-and-register a tool.    (every agent, core)
-//   - todoTools   — the session todo list.           (every agent, core)
-//   - delegate    — hand a task to a subagent.      (primary agent only, core)
+//   - requestTools — discovery, described above.     (every agent, core)
+//   - createTool   — compile-and-register a tool.    (every agent, core)
+//   - todoTools    — the session todo list.           (every agent, core)
+//   - delegate     — hand a task to a subagent.      (primary agent only, core)
 //
 // createTool is the R2b capability: the model can author a JavaScript tool body
 // mid-conversation, and the tool is registered searchable and enabled at once. The
 // source is compiled but never executed at registration. There is NO sandbox: a
 // created tool runs with this process's permissions, the same trust model as the
 // runCommand preset. See core/creation.ts for the validated bounds.
+//
+// Manual execution (R8): `harness.executeTool(name, parameters)` runs one
+// REGISTERED tool directly, with this harness's context. It is the host/server path
+// behind the UI's Tools tab (server/sessions.ts → executeTool), so a manual
+// requestTools/createTool/todoTools/delegate call changes this session rather than
+// a detached copy. Discovery gates the model only: an explicit user call may run
+// a searchable tool that was never enabled. Everything else still applies —
+// createTool keeps its guarded registration, delegate keeps its primary-only check,
+// and a tool this harness did not register (delegate without subagents) is an
+// honest error, never a fabricated implementation.
 //
 // todoTools is session state, not catalogue state: a fresh list is created for
 // each harness() call, shared by every agent in that harness, and cleared by
@@ -73,13 +91,14 @@
 // also closes ctx.run cycles.
 //
 // The bundled preset catalogue (./tools) is preloaded into the registry by
-// default — all of it searchable — so a new harness can discover readFile,
-// runCommand, … without the caller importing anything. `presets: false` opts out.
+// default, so a new harness can discover readFile/runCommand/… without the caller
+// importing anything; every preset is searchable, so preloading costs no context.
+// `presets: false` opts out.
 //
 // Cross-references:
 //   - core/agent     — the brain being driven (turn())
 //   - core/tool      — what gets executed, and where tags/visibility live
-//   - core/discovery — the tag ranking behind getTools
+//   - core/discovery — the tag ranking behind requestTools
 //   - core/creation  — compile-and-register behind createTool
 //   - core/todo      — the per-harness todo list behind todoTools
 //   - types          — Harness, HarnessEvent, HarnessConfiguration
@@ -95,7 +114,14 @@ import {
     searchTools,
     toolParameterKey,
     createDynamicTool,
-    createTodoTool
+    createTodoTool,
+    CREATE_TOOL_METADATA,
+    CREATE_TOOL_NAME,
+    DELEGATE_TOOL_NAME,
+    REQUEST_TOOLS_METADATA,
+    REQUEST_TOOLS_NAME,
+    TODO_TOOLS_NAME,
+    delegateMetadata
 } from './core';
 import { presetTools, createWebsearchTool, WEBSEARCH_TOOL_NAME } from './tools';
 import { runPlugins } from './plugin';
@@ -143,18 +169,20 @@ const resolveMaxIterations = (value: number | undefined): number => {
 
 // The discovery entry point. The harness owns this name: the whole visibility
 // scheme depends on there being exactly one tool that can enable the rest.
-const GET_TOOLS = 'getTools';
+const REQUEST_TOOLS = REQUEST_TOOLS_NAME;
 
 // Runtime tool creation (R2b), the session todo list, and bounded delegation
 // (R4). All are model-facing core tools, so their wire names are part of the
-// harness contract.
-const CREATE_TOOL = 'createTool';
-const TODO_TOOLS = 'todoTools';
-const DELEGATE = 'delegate';
+// harness contract. The names come from core/metadata.ts, which the server's tool
+// catalogue also describes — one copy, so a descriptor cannot advertise a name the
+// runtime does not register.
+const CREATE_TOOL = CREATE_TOOL_NAME;
+const TODO_TOOLS = TODO_TOOLS_NAME;
+const DELEGATE = DELEGATE_TOOL_NAME;
 
 // Names no configured, preset, plugin, or model-created tool may take. Keeping
 // the whole list in one place is what makes the reservation check exhaustive.
-const RESERVED_TOOL_NAMES = [GET_TOOLS, CREATE_TOOL, TODO_TOOLS, DELEGATE] as const;
+const RESERVED_TOOL_NAMES = [REQUEST_TOOLS, CREATE_TOOL, TODO_TOOLS, DELEGATE] as const;
 
 // Budget for createTool: registration is cheap but not free, and an unbounded
 // registry defeats the point of discovery. Session-local (no filesystem writes),
@@ -172,8 +200,9 @@ const serialize = (value: unknown): string => {
 // Apply the single-property rule (see core/tool.ts): when a tool's schema
 // declares exactly one property, the implementation receives that property's
 // value rather than an object wrapping it. This is what keeps a direct call
-// (`pythonSyntax('print(1)')`) and a model call
-// (`python_syntax({ "code": "print(1)" })`) identical inside `execute`.
+// (`readFile('package.json')`) and a model call
+// (`readFile({ "path": "package.json" })`) identical inside `execute`.
+// Multi-property tools such as syntaxCheck receive the whole object.
 const unwrapParameters = (definition: Tool, parsed: Record<string, unknown>): unknown => {
     const key = toolParameterKey(definition.parameters);
     if (key === undefined) return parsed;
@@ -296,7 +325,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     }
 
     // The harness owns its core names. Checked after presets and configured tools
-    // so a collision is reported once, up front, in the same place as getTools
+    // so a collision is reported once, up front, in the same place as requestTools
     // always was. Model-created tools are checked separately (they arrive later,
     // see createToolFrom).
     for (const reserved of RESERVED_TOOL_NAMES) {
@@ -310,10 +339,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         await configuration.report?.progress?.(event);
     };
 
-    // Tools getTools has enabled, in discovery order. Searchable tools stay in the
-    // registry but are not declared — and not callable — until they land here.
-    // The set is per harness, so a discovered tool stays available for the rest of
-    // the conversation.
+    // Tools requestTools has enabled, in discovery order. Searchable tools stay
+    // in the registry but are not declared — and not callable — until they land
+    // here. Core tools bypass the set entirely. The set is per harness, so a
+    // discovered tool stays available for the rest of the conversation.
     const activeTools = new Set<string>();
 
     const enableTools = (names: readonly string[]): void => {
@@ -322,37 +351,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
-    // getTools is the one discovery tool every harness provides. It is core, so
+    // requestTools is the one discovery tool every harness provides. It is core, so
     // the model can always reach it, and its result both explains the matches and
     // enables them for the next turn.
     //
-    // Two schema properties, so the single-property rule does not apply and
-    // `parameters` arrives as an object. `limit` is optional; the cap itself lives
-    // in core/discovery.ts (default 10, hard maximum 50).
-    tools[GET_TOOLS] = defineTool<{ tags: string[]; limit?: number }, ToolSearchResult>({
-        name: GET_TOOLS,
-        description:
-            'Find tools by capability tag and enable them. Only a few core tools are visible at first because the catalogue is large: pass the tags you need (for example ["files", "read"]) and the closest matches become available on your next turn. Call this before concluding that something cannot be done.',
-        tags: ['discovery', 'tools', 'catalogue'],
-        visibility: 'core',
-        parameters: {
-            type: 'object',
-            properties: {
-                tags: {
-                    type: 'array',
-                    items: { type: 'string' },
-                    description: 'Capability tags to look for, e.g. ["files", "read", "shell"].'
-                },
-                limit: {
-                    type: 'integer',
-                    minimum: 1,
-                    maximum: 50,
-                    description: 'How many matches to enable. Defaults to 10; maximum 50.'
-                }
-            },
-            required: ['tags'],
-            additionalProperties: false
-        },
+    // Name, description, tags, and schema come from core/metadata.ts (R7): at most
+    // five matches per request, `remaining` as the count of further matches, and a
+    // `limit` that can only narrow the shortlist. Two schema properties, so the
+    // single-property rule does not apply and `parameters` arrives as an object.
+    tools[REQUEST_TOOLS] = defineTool<{ tags: string[]; limit?: number }, ToolSearchResult>({
+        ...REQUEST_TOOLS_METADATA,
         execute: ({ parameters }) => {
             // Tolerate a bare array (a model ignoring the schema) and a missing
             // `tags`, so a sloppy call still gets the catalogue vocabulary back.
@@ -405,7 +413,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         createdTools++;
 
         // Registered searchable AND enabled immediately: the model just asked for
-        // this tool, so making it spend a getTools round trip to call it would be
+        // this tool, so making it spend a requestTools round trip to call it would be
         // wasteful. It stays in the searchable catalogue, so it remains
         // discoverable (and a reset() only clears the enabled set).
         activeTools.add(definition.name);
@@ -414,33 +422,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     tools[CREATE_TOOL] = defineTool<ToolCreation, ToolCreationResult>({
-        name: CREATE_TOOL,
-        description:
-            "Create a tool for yourself from JavaScript source. `source` is the BODY of an async function, for example `return args.toUpperCase();`: it receives `args` (the call arguments; a one-property schema passes the value itself) and `context` (agent, agents, run). Registering validates and compiles the source and enables the tool for your next turn, without running it. The body runs with this process's full permissions - there is no sandbox - so only create tools you are willing to run, and keep them small.",
-        tags: ['tools', 'create', 'extension', 'dynamic'],
-        visibility: 'core',
-        parameters: {
-            type: 'object',
-            properties: {
-                name: {
-                    type: 'string',
-                    description: 'Wire name: a letter first, then letters, digits, "_" or "-", at most 64 characters.'
-                },
-                description: { type: 'string', description: 'What the tool does, shown to getTools and the model.' },
-                tags: {
-                    type: 'array',
-                    items: { type: 'string' },
-                    description: 'Capability tags, e.g. ["text", "upper"]. Required so getTools can find it.'
-                },
-                parameters: { type: 'object', description: "Optional JSON Schema for the new tool's arguments." },
-                source: {
-                    type: 'string',
-                    description: 'Async function body, e.g. "return args.trim().toUpperCase();".'
-                }
-            },
-            required: ['name', 'description', 'tags', 'source'],
-            additionalProperties: false
-        },
+        ...CREATE_TOOL_METADATA,
         execute: ({ parameters }) => {
             // Throwing is the error path the harness turns into a readable tool
             // result: invalid name, reserved name, collision, budget, or a body
@@ -476,23 +458,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // cycle as well.
     if (subagentNames.length > 0) {
         tools[DELEGATE] = defineTool<{ agent: string; input: string }, HarnessDelegationResult>({
-            name: DELEGATE,
-            description: `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${subagentNames.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.`,
-            tags: ['agents', 'delegate', 'subagent', 'team'],
-            visibility: 'core',
-            parameters: {
-                type: 'object',
-                properties: {
-                    agent: {
-                        type: 'string',
-                        enum: [...subagentNames],
-                        description: 'Subagent name, one of the configured allowlist.'
-                    },
-                    input: { type: 'string', description: 'The full brief the subagent should act on.' }
-                },
-                required: ['agent', 'input'],
-                additionalProperties: false
-            },
+            // Description and schema (including the `agent` enum) come from the
+            // shared metadata: the runtime declaration names the allowlist, and the
+            // server catalogue describes the same capability generically.
+            ...delegateMetadata(subagentNames),
             execute: async ({ agent: caller, run, parameters }) => {
                 // Defence in depth: the tool is not declared to subagents, but a
                 // model can guess a name, so the caller is checked here too.
@@ -560,7 +529,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     // Declarations handed to every request. Rebuilt per run so a plugin that
-    // registers tools mid-flight is picked up on the next call, and so a getTools
+    // registers tools mid-flight is picked up on the next call, and so a requestTools
     // round shows up in the very next request. Per-brain because `delegate` is a
     // primary-only declaration.
     const declarations = (brain: Agent): HarnessStreamTool[] =>
@@ -579,7 +548,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         const fail = async (content: string): Promise<void> => {
             appendToolResult(brain, call, content);
-            await progress({ type: 'tool_result', agent: brain.name, name: call.name, content, isError: true });
+            // `callId` pairs the result with the exact tool_call that caused it,
+            // even when two calls in one turn share a name. The server's timing
+            // record uses it to attribute elapsed time without guesswork.
+            await progress({
+                type: 'tool_result',
+                agent: brain.name,
+                name: call.name,
+                callId: call.id,
+                content,
+                isError: true
+            });
         };
 
         const definition = tools[call.name];
@@ -590,7 +569,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         if (!definition) {
             const available = declared(brain).map((tool) => tool.name).join(', ') || 'none';
             await fail(
-                `Tool "${call.name}" is not registered. Available tools: ${available}. Call ${GET_TOOLS} with capability tags to search the catalogue.`
+                `Tool "${call.name}" is not registered. Available tools: ${available}. Call ${REQUEST_TOOLS} with capability tags to search the catalogue.`
             );
             return;
         }
@@ -605,11 +584,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         // A searchable tool the model has not discovered is not callable, even when
         // it guesses the name: being declared is what makes a tool available, and
-        // getTools is how a tool gets declared.
+        // requestTools is how a tool gets declared.
         if (definition.visibility !== 'core' && !activeTools.has(call.name)) {
             const tags = definition.tags.slice(0, 3).map((tag) => `"${tag}"`).join(', ');
             await fail(
-                `Tool "${call.name}" is registered but not enabled yet. Call ${GET_TOOLS} with tags like ${tags} to enable it.`
+                `Tool "${call.name}" is registered but not enabled yet. Call ${REQUEST_TOOLS} with tags like ${tags} to enable it.`
             );
             return;
         }
@@ -642,7 +621,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             const result = await definition.execute(context);
             const content = serialize(result);
             appendToolResult(brain, call, content);
-            await progress({ type: 'tool_result', agent: brain.name, name: call.name, content, isError: false });
+            await progress({
+                type: 'tool_result',
+                agent: brain.name,
+                name: call.name,
+                callId: call.id,
+                content,
+                isError: false
+            });
         } catch (error) {
             await fail(`Tool "${call.name}" failed: ${toErrorInfo(error).message}`);
         }
@@ -777,10 +763,59 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     });
 
+    // The host/server-facing execution path (R8): run one REGISTERED tool by name
+    // with the session it belongs to, exactly like the model would, but without
+    // spending a discovery round trip. The server's `POST /tools/:name` calls this
+    // through its session, which is what makes a manual requestTools/createTool/
+    // todoTools/delegate call mutate THIS harness instead of a detached copy.
+    //
+    // Gating difference, on purpose: discovery gates the MODEL. An explicit user
+    // action may run any registered tool even when requestTools never enabled it;
+    // the model still cannot. Nothing else is bypassed — createTool goes through
+    // createToolFrom (validation, budget, collisions, guarded compilation) and
+    // delegate's own execute re-checks the primary's authority.
+    //
+    // No progress events are emitted: a manual call is not a conversation turn, so
+    // there is no transcript position for a tool_call/tool_result pair. The
+    // caller's request/response carries the duration (ToolCallResult).
+    const executeTool = async (name: string, parameters: unknown): Promise<unknown> => {
+        const definition = tools[name];
+
+        // The session owns which tools exist: a harness without subagents has no
+        // delegate, so an operator asking for one gets an honest error here (the
+        // server maps it to 404) instead of a fabricated implementation.
+        if (!definition) {
+            throw new HarnessError(`Tool "${name}" is not registered in this harness.`);
+        }
+
+        return definition.execute({
+            parameters,
+            // An explicit host call acts as the session's entry agent: `delegate`
+            // therefore stays primary-only, and ctx.run cycles are still rejected
+            // by runAgent.
+            agent: primary,
+            agents,
+            run: (agentName: string, input: string) => {
+                const target = agents[agentName];
+                if (!target) {
+                    throw new HarnessError(`Agent "${agentName}" is not registered.`);
+                }
+                return runAgent(target, input);
+            }
+        });
+    };
+
     // The harness is a function you call. Properties ride on it so a CLI has
     // everything in one handle without a second lookup object.
     const run = (input: string, options?: HarnessRunOptions) => runAgent(primary, input, options);
 
+    // Every Harness field except `name` and `discoveredTools` is assigned here.
+    // Those two are defineProperty'd below: `name` is a built-in function property
+    // that cannot be assigned, and `discoveredTools` must be a getter so a caller
+    // can never mutate the enabled set. The `unknown`-mediated cast is therefore
+    // describing exactly that: a complete handle assembled from two sources. Keep
+    // this list in step with the Harness type — an omitted accessor typechecks as
+    // `never` here and the cast would silently hide it.
     const handle = Object.assign(run, {
         agent: primary,
         agents,
@@ -792,6 +827,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // are identical. Throws HarnessError, unlike the model path which turns
         // the failure into a tool result.
         createTool: createToolFrom,
+        // Server-facing manual execution (R8): the session-bound tool invocation
+        // `POST /tools/:name` uses when a client supplies a sessionId.
+        executeTool,
         // reset() is "start over": the conversation goes back to the seeded
         // instructions, tool discovery is forgotten with it, and the session
         // todo list is cleared (ids restart at "1"), so the next run begins from
@@ -803,12 +841,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             activeTools.clear();
             todo.reset();
         }
-    }) as Harness;
+    }) as unknown as Harness;
 
     // `name` is a built-in, read-only property of every function, so it must be
     // defined rather than assigned. The entry agent's name is the harness name.
     Object.defineProperty(handle, 'name', {
         value: primary.name,
+        enumerable: true,
+        configurable: true
+    });
+
+    // Read-only discovery view (`Harness.discoveredTools`). A getter that copies
+    // the Set on every read: a caller must never be able to mutate the enabled
+    // set through the handle, and a server snapshot can record the list so a
+    // reload still knows which capabilities were discovered.
+    Object.defineProperty(handle, 'discoveredTools', {
+        get: () => [...activeTools],
         enumerable: true,
         configurable: true
     });
@@ -841,8 +889,7 @@ export { agent, tool, searchTools, compileToolSource, createDynamicTool } from '
 export { openAICompatible, listModels, ModelListError } from './transport';
 export type { ModelListConfiguration, ModelListErrorKind } from './transport';
 export {
-    javascriptSyntax,
-    pythonSyntax,
+    syntaxCheck,
     readFile,
     writeFile,
     editFile,
@@ -857,6 +904,8 @@ export {
     presetTools
 } from './tools';
 export type {
+    SyntaxCheckLanguage,
+    SyntaxCheckParameters,
     WriteFileResult,
     EditFileParameters,
     EditFileResult,

@@ -41,7 +41,7 @@
 // -------------
 // This module imports only `tool`, the types, HarnessError, and the small shared
 // request helpers. The Exa/Tavily adapters are `import()`ed inside `execute`, so
-// constructing a harness, listing tools, or calling getTools never loads them.
+// constructing a harness, listing tools, or calling requestTools never loads them.
 // There is no SDK dependency: both adapters use `fetch` and plain JSON.
 //
 // Cross-references:
@@ -213,7 +213,7 @@ const readInvocation = (
     fallback: WebsearchProvider
 ): Invocation => {
     // Direct callers may pass the bare query (`websearch('cats')`), mirroring how
-    // pythonSyntax accepts the string itself. A model always passes an object,
+    // readFile accepts the path string itself. A model always passes an object,
     // because the schema has more than one property.
     const input = typeof parameters === 'string' ? { query: parameters } : parameters;
 

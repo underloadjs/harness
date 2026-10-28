@@ -35,10 +35,13 @@
 // Cross-references:
 //   - tool cards: playground/src/ui/tools.ts
 //   - lifecycle status (topbar pill): playground/src/main.ts (`setLifecycle`)
+//   - elapsed formatting: playground/src/ui/time.ts
 //   - styles: playground/src/styles.css (`.turns`, `.tile`, `.agent`)
 
 import type { HarnessEvent, SessionTurn, SessionTurnStatus } from '../../../server/protocol';
+import { callIdOf, eventTimesOf, finiteOf } from '../contract';
 import { markdownFragment, plainPreview } from './markdown';
+import { elapsedBetween, formatDuration } from './time';
 import { createToolCallCard } from './tools';
 import type { ToolCallCard, ToolState } from './tools';
 
@@ -62,7 +65,11 @@ export type TurnHandle = {
     // `detail` is short status text shown next to the state (a model name, an
     // error message, a cancellation reason).
     setState: (state: TurnState, detail?: string) => void;
-    apply: (event: HarnessEvent) => void;
+    // Apply one recorded/streamed event. `at` is the server clock for this event
+    // (SSE `at` or an `eventTimes` entry). `origin` says whether a missing `at`
+    // should fall back to the local clock (`live`) or to no timing at all
+    // (`recorded`, the legacy-replay path).
+    apply: (event: HarnessEvent, at?: number, origin?: ApplyOrigin) => void;
     // Render every pending incremental update immediately. Called when a turn
     // settles so the final text is never one frame behind the status.
     flush: () => void;
@@ -71,11 +78,26 @@ export type TurnHandle = {
     id: () => string | undefined;
     // Attach the server's identity for this turn and mirror its 1-based display
     // position. Called on the opening `turn` frame and when adopting a snapshot.
-    bind: (turn: Pick<SessionTurn, 'id' | 'index'>) => void;
+    bind: (turn: Pick<SessionTurn, 'id' | 'index'> & { startedAt?: number }) => void;
+    // Replace the timing baseline. Hydration passes the server's `startedAt` and
+    // (for a settled turn) `updatedAt`; a running turn gets no `endedAt` and the
+    // label keeps ticking. Values may be undefined for legacy fixtures, in which
+    // case no duration is shown.
+    setTiming: (timing: { startedAt?: number; endedAt?: number }) => void;
+    // Current elapsed label text ('' when the span is unknown). Exposed for the
+    // meta line tests and for callers that need the value without reading DOM.
+    elapsed: () => string;
     // Number of agent sections, tool cards and the primary agent name. Exposed
     // for tests and for the tile's meta line.
     summary: () => { agents: number; tools: number; primary?: string };
+    // Stop every timer the tile owns (elapsed tick, tool timers, pending text
+    // frame). Called when the board clears or the page is hidden.
+    destroy: () => void;
 };
+
+// A missing timestamp is either a live gap (use the local clock) or an old record
+// (show nothing rather than inventing a duration).
+export type ApplyOrigin = 'live' | 'recorded';
 
 export type HydrateOptions = {
     // Session model, appended to a settled tile's meta so a reloaded transcript
@@ -103,6 +125,9 @@ export type TurnBoard = {
     // Replace the whole board with the server's turns. Returns the new handles;
     // any previous handle is detached and must not be used again.
     hydrate: (turns: readonly SessionTurn[], options?: HydrateOptions) => TurnHandle[];
+    // Stop every live timer the board owns. Safe to call repeatedly; the page's
+    // `pagehide` handler and a view teardown both use it.
+    destroy: () => void;
 };
 
 const STATE_TEXT: Readonly<Record<TurnState, string>> = {
@@ -183,6 +208,15 @@ type AgentSection = {
     tools: ToolCallCard[];
 };
 
+// One unresolved tool call. `callId` is the authoritative match; name+order is the
+// fallback for a server that sends `tool_result` without a call id.
+type PendingTool = {
+    card: ToolCallCard;
+    name: string;
+    callId: string | undefined;
+    startedAt: number | undefined;
+};
+
 export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoard => {
     const element = el('div', 'turns');
 
@@ -240,6 +274,10 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
         const top = el('span', 'tile-top');
         const index = el('span', 'tile-index', `#${label}`);
+        // Server-recorded or live elapsed time. Painted from `startedAt`; hidden
+        // when the span is unknown (legacy fixture), never "NaN".
+        const elapsedLabel = el('span', 'tile-elapsed');
+        elapsedLabel.hidden = true;
         const badge = el('span', 'tile-status');
         badge.dataset.state = 'queued';
         const dot = el('span', 'tile-dot');
@@ -249,7 +287,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
         const promptPreview = el('span', 'tile-prompt', plainPreview(prompt, 220));
         const meta = el('span', 'tile-meta', 'waiting for the first event');
-        top.append(index, badge);
+        top.append(index, elapsedLabel, badge);
         select.append(top, promptPreview, meta);
 
         const body = el('div', 'tile-body');
@@ -272,11 +310,57 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         // Server identity for this tile. Absent until `bind()` or a snapshot.
         let serverId: string | undefined;
 
+        // --- timing --------------------------------------------------------
+        // An optimistic tile starts on the local clock; `bind()`/`setTiming()`
+        // replace that with the server's `startedAt`. `endedAt` is set when the
+        // turn settles: the local clock for a live run, `updatedAt` on hydration
+        // (which is why a poll/rebuild never resets the shown duration).
+        let startedAt: number | undefined = Date.now();
+        let endedAt: number | undefined;
+        let elapsedTick: number | undefined;
+        // True once `setTiming` supplied recorded server stamps. A replay calls
+        // `apply`/`setState` for every recorded event, and those must not wipe
+        // the hydrated `endedAt` or start a local tick.
+        let recordedTiming = false;
+
+        const paintElapsed = (): void => {
+            const span = elapsedBetween(startedAt, endedAt ?? Date.now());
+            elapsedLabel.textContent = span === undefined ? '' : formatDuration(span);
+            elapsedLabel.hidden = span === undefined;
+        };
+
+        const stopElapsed = (): void => {
+            if (elapsedTick === undefined) return;
+
+            window.clearInterval(elapsedTick);
+            elapsedTick = undefined;
+        };
+
+        const startElapsed = (): void => {
+            if (elapsedTick !== undefined || endedAt !== undefined || startedAt === undefined) return;
+
+            // The label renders tenths of a second, so the tick is a quarter
+            // second: enough resolution to look live, cheap enough to ignore.
+            elapsedTick = window.setInterval(paintElapsed, 250);
+        };
+
+        const setTiming = (timing: { startedAt?: number; endedAt?: number }): void => {
+            // Assign explicitly: an unknown server start must stay unknown, not
+            // fall back to "now" (which would render a fabricated 0ms).
+            recordedTiming = true;
+            startedAt = finiteOf(timing.startedAt);
+            endedAt = finiteOf(timing.endedAt);
+
+            stopElapsed();
+            paintElapsed();
+            startElapsed();
+        };
+
         const sections = new Map<string, AgentSection>();
-        // Calls whose result has not arrived yet. The protocol does not carry a
-        // call id on `tool_result`, so the match is by tool name, oldest first —
-        // which is the order the harness runs them in.
-        const pendingTools: ToolCallCard[] = [];
+        // Calls whose result has not arrived yet. `callId` is the authoritative
+        // match when the server sends it; otherwise the match is by tool name,
+        // oldest first — which is the order the harness runs them in.
+        const pendingTools: PendingTool[] = [];
 
         const updateMeta = (): void => {
             const live = isLive(state);
@@ -294,6 +378,25 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             state = next;
             detail = nextDetail;
 
+            // Terminal states freeze the elapsed label. Hydration may already have
+            // supplied the server's `updatedAt`; in that case keep it instead of
+            // overwriting it with the replay's local clock.
+            if (next === 'done' || next === 'error' || next === 'cancelled') {
+                if (endedAt === undefined && !recordedTiming) endedAt = Date.now();
+                stopElapsed();
+                // A tool call left pending when the run ended must not keep a live
+                // ticker running on a settled tile.
+                for (const section of sections.values()) {
+                    for (const tool of section.tools) {
+                        if (tool.state() === 'running') tool.destroy();
+                    }
+                }
+            } else if (!recordedTiming) {
+                endedAt = undefined;
+                startElapsed();
+            }
+
+            paintElapsed();
             card.dataset.state = next;
             badge.dataset.state = next;
             statusText.textContent = STATE_TEXT[next];
@@ -393,25 +496,61 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             block.summary.textContent = `reasoning · ${block.buffer.length.toLocaleString()} chars`;
         };
 
-        const appendTool = (section: AgentSection, name: string, rawArguments: string): void => {
+        const appendTool = (
+            section: AgentSection,
+            name: string,
+            rawArguments: string,
+            callId: string | undefined,
+            at: number | undefined,
+            origin: ApplyOrigin
+        ): void => {
             // Text written before a tool call is finished text: close it so the
             // card lands *after* it, and so post-tool prose starts a new block.
             closeText(section);
 
-            const card = createToolCallCard(name, rawArguments);
+            // A live frame without `at` still deserves a live label; a recorded
+            // replay without `eventTimes` must not invent one.
+            const startedAt = at ?? (origin === 'live' ? Date.now() : undefined);
+            const card = createToolCallCard(name, rawArguments, {
+                ...(callId === undefined ? {} : { callId }),
+                ...(startedAt === undefined ? {} : { startedAt })
+            });
+
             section.tools.push(card);
             section.flow.append(card.element);
-            pendingTools.push(card);
+            pendingTools.push({ card, name, callId, startedAt });
             toolCount += 1;
             updateMeta();
         };
 
-        const resolveTool = (name: string, content: string, isError: boolean): void => {
-            const index = pendingTools.findIndex((tool) => tool.name === name && tool.state() === 'running');
+        const resolveTool = (
+            name: string,
+            content: string,
+            isError: boolean,
+            callId: string | undefined,
+            at: number | undefined,
+            origin: ApplyOrigin
+        ): void => {
+            // Authoritative match first, then the documented fallback: same name,
+            // oldest running call.
+            let index =
+                callId === undefined
+                    ? -1
+                    : pendingTools.findIndex(
+                          (tool) => tool.callId === callId && tool.card.state() === 'running'
+                      );
+
+            if (index < 0) {
+                index = pendingTools.findIndex(
+                    (tool) => tool.name === name && tool.card.state() === 'running'
+                );
+            }
+
+            const finishedAt = at ?? (origin === 'live' ? Date.now() : undefined);
 
             if (index >= 0) {
                 const [tool] = pendingTools.splice(index, 1);
-                tool.resolve(content, isError);
+                tool.card.resolve(content, isError, elapsedBetween(tool.startedAt, finishedAt));
                 return;
             }
 
@@ -432,7 +571,10 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         };
 
         // --- events -------------------------------------------------------
-        const apply = (event: HarnessEvent): void => {
+        // `at` is the server clock for this event. A live frame arrives with one
+        // on the new server; local date is only the fallback. `origin` keeps the
+        // replay path honest for records that predate timing support.
+        const apply = (event: HarnessEvent, at?: number, origin: ApplyOrigin = 'live'): void => {
             if (isLive(state) && state !== 'streaming') setState('streaming');
 
             switch (event.type) {
@@ -455,11 +597,25 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     break;
 
                 case 'tool_call':
-                    appendTool(ensureSection(event.agent), event.call.name, event.call.arguments);
+                    appendTool(
+                        ensureSection(event.agent),
+                        event.call.name,
+                        event.call.arguments,
+                        event.call.id,
+                        at,
+                        origin
+                    );
                     break;
 
                 case 'tool_result':
-                    resolveTool(event.name, event.content, event.isError);
+                    resolveTool(
+                        event.name,
+                        event.content,
+                        event.isError,
+                        callIdOf(event),
+                        at,
+                        origin
+                    );
                     break;
 
                 case 'done': {
@@ -499,11 +655,18 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         // Attach the server identity. `index` is 0-based on the wire; tiles are
         // numbered from 1 so the first turn reads "#1". A late bind (the opening
         // `turn` frame) is normal, not an error: the optimistic tile existed
-        // before the request reached the server.
-        const bind = (server: Pick<SessionTurn, 'id' | 'index'>): void => {
+        // before the request reached the server. When the start stamp arrives it
+        // replaces the local baseline, so a later hydrate and the live label agree.
+        const bind = (server: Pick<SessionTurn, 'id' | 'index'> & { startedAt?: number }): void => {
             serverId = server.id;
             card.dataset.turnId = server.id;
             index.textContent = `#${server.index + 1}`;
+
+            const serverStart = finiteOf(server.startedAt);
+            if (serverStart !== undefined) {
+                startedAt = serverStart;
+                paintElapsed();
+            }
         };
 
         // Clicking the header expands a compact tile; clicking the expanded tile
@@ -514,6 +677,17 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             else expand(turn);
         });
 
+        // Stop every timer this tile owns. Tool cards hold their own live label;
+        // a cleared board or a hidden page must not keep ticking.
+        const destroy = (): void => {
+            stopElapsed();
+
+            for (const section of sections.values()) {
+                if (section.text !== undefined) cancel(section.text);
+                for (const tool of section.tools) tool.destroy();
+            }
+        };
+
         const turn: TurnHandle = {
             element: card,
             prompt,
@@ -523,11 +697,18 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             flush,
             id: () => serverId,
             bind,
-            summary: () => ({ agents: sections.size, tools: toolCount, primary: primaryAgent })
+            setTiming,
+            elapsed: () => elapsedLabel.textContent ?? '',
+            summary: () => ({ agents: sections.size, tools: toolCount, primary: primaryAgent }),
+            destroy
         };
 
         turns.push(turn);
         element.append(card);
+        // Paint the optimistic "0ms" and start counting; `bind`/`setTiming`
+        // re-baseline without ever showing a negative or a NaN.
+        paintElapsed();
+        startElapsed();
         // Newest turn opens full-width. This is the *only* moment the board
         // changes the selection on its own: stream deltas never steal the view.
         expand(turn);
@@ -545,7 +726,10 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
     };
 
     const clear = (): void => {
-        for (const turn of turns) turn.element.remove();
+        for (const turn of turns) {
+            turn.destroy();
+            turn.element.remove();
+        }
         turns.length = 0;
 
         for (const node of [...element.querySelectorAll<HTMLElement>('.notice')]) node.remove();
@@ -568,7 +752,21 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         const handle = create(source.prompt, source.index + 1);
         handle.bind(source);
 
-        for (const event of source.events) handle.apply(event);
+        // Server timing wins over the replay clock. A running turn keeps ticking
+        // from `startedAt`; a settled turn freezes at `updatedAt`. Legacy records
+        // have neither, so `setTiming` gets undefined and the label stays hidden.
+        handle.setTiming({
+            startedAt: finiteOf(source.startedAt),
+            endedAt: source.status === 'running' ? undefined : finiteOf(source.updatedAt)
+        });
+
+        // `eventTimes` is aligned 1:1 with `events`. When the server sent none,
+        // pass no timestamp at all in recorded mode: tool cards then show no
+        // duration instead of a fabricated one.
+        const times = eventTimesOf(source);
+        for (let index = 0; index < source.events.length; index += 1) {
+            handle.apply(source.events[index], times?.[index], 'recorded');
+        }
 
         const next = stateOf(source.status);
         const settled = next === 'done' || next === 'error' || next === 'cancelled';
@@ -597,6 +795,12 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         return handles;
     };
 
+    // Stop every timer the board owns without discarding its DOM. Used by the
+    // view teardown and on `pagehide`; a reload re-reads server state anyway.
+    const destroy = (): void => {
+        for (const turn of turns) turn.destroy();
+    };
+
     return {
         element,
         begin,
@@ -608,7 +812,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         turns: () => turns,
         find,
         adopt,
-        hydrate
+        hydrate,
+        destroy
     };
 };
 

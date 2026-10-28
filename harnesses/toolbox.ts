@@ -16,16 +16,19 @@
 //
 // WHAT IS IN THE SHARED TOOLBOX
 // -----------------------------
-//   - package presets  — src/tools: javascriptSyntax, pythonSyntax, readFile,
-//                        writeFile, editFile, listFiles, searchFiles, globFiles,
-//                        runCommand, gitDiff (lazy proxies, see src/tools/lazy.ts)
+//   - package presets  — src/tools: syntaxCheck, readFile, writeFile, editFile,
+//                        listFiles, searchFiles, globFiles, runCommand, gitDiff
+//                        (lazy proxies, see src/tools/lazy.ts)
 //   - harness tools    — ./tools: clock, wordCount, roll, searchNotes, summarize
 //   - websearch        — environment-backed (EXA_API_KEY / TAVILY_API_KEY); the
 //                        harness factory registers it only when a key resolves,
 //                        so a keyless host is offline-safe. The global catalogue
 //                        still lists it as `unconfigured`, never fake-callable.
-//   - core tools       — harness-owned: getTools, createTool, todoTools, plus
-//                        delegate for a preset that declares subagents.
+//   - core tools       — harness-owned only: requestTools, createTool, todoTools,
+//                        and delegate for a preset that declares subagents. Every
+//                        package and app tool (including the file tools) is
+//                        searchable, so a live harness declares nothing else up
+//                        front.
 //
 // DELIBERATE EXCEPTIONS
 // ---------------------
@@ -49,8 +52,9 @@
 //   - ../src/harness.ts — `presets: false` + explicit `tools` registry semantics
 //   - ../server/api.ts  — descriptors resolved from the same preset metadata
 
-import { harness, presetTools } from '../src/harness';
+import { agent, harness, presetTools } from '../src/harness';
 import type { Agent, Harness, HarnessProgress, Tool } from '../src/harness';
+import { agentInstruction, agentProfile } from '../src/agents';
 import { harnessTools } from './tools';
 import type { RunnerSettings } from './types';
 
@@ -91,13 +95,20 @@ export const SHARED_TOOLS: Readonly<Record<string, Tool>> = {
 export const SHARED_TOOL_NAMES: readonly string[] = Object.freeze(Object.keys(SHARED_TOOLS));
 
 // Harness-owned core names. `delegate` is capability-by-configuration: the
-// harness registers it only when the preset declares subagents, so a single-agent
+// harness registers it only when the harness declares subagents, so a single-agent
 // Instruct has no delegation tool while Research does. That difference is the
 // agent configuration, not a difference in the shareable toolbox.
-export const CORE_TOOL_NAMES = ['getTools', 'createTool', 'todoTools'] as const;
+//
+// No preset entry is core any more: every registered package/app tool is
+// searchable, so a descriptor advertises exactly these names (plus delegate).
+// `presetCore` is kept out of the signature deliberately — there is no second
+// source of core tools that could disagree with this list.
+export const CORE_TOOL_NAMES = ['requestTools', 'createTool', 'todoTools'] as const;
 
-export const coreToolNames = (subagents: readonly string[] = []): string[] =>
-    subagents.length > 0 ? [...CORE_TOOL_NAMES, 'delegate'] : [...CORE_TOOL_NAMES];
+export const coreToolNames = (subagents: readonly string[] = []): string[] => [
+    ...CORE_TOOL_NAMES,
+    ...(subagents.length > 0 ? ['delegate'] : [])
+];
 
 // Provider settings are never used by construction; they only feed `agent(...)`.
 // An empty key is omitted rather than sent as `Bearer `.
@@ -106,6 +117,64 @@ export const providerOf = (settings: RunnerSettings) => ({
     apiKey: settings.apiKey.trim().length === 0 ? undefined : settings.apiKey,
     sampling: { temperature: 0.3 }
 });
+
+// Build one agent from a TRUSTED profile. The profile supplies the identity and
+// the guidelines (composed into system messages by `agentInstruction`), and this
+// application layer supplies the provider transport. A client never contributes
+// either, which is what makes "select an agent" safe.
+//
+// `model` is the optional per-agent override (R9). Only the model id is
+// overridable: the provider, base URL, and credential always come from the
+// session's trusted RunnerSettings. An absent or blank override falls back to the
+// session model, so a map that omits an agent behaves exactly like today.
+export const agentFromProfile = (name: string, settings: RunnerSettings, model?: string): Agent => {
+    const profile = agentProfile(name);
+    const override = model === undefined ? '' : model.trim();
+
+    return agent({
+        name,
+        model: override.length > 0 ? override : settings.model,
+        instruction: agentInstruction(profile),
+        provider: providerOf(settings)
+    });
+};
+
+// Build the agent registry for a selected set. Order is the caller's: primary
+// first, then the allowlist, matching the descriptor's `agents` list. `agentModels`
+// is the validated override map from the harness registry; it is applied per agent
+// so one member can run a different model from its siblings.
+export const agentsFromProfiles = (
+    names: readonly string[],
+    settings: RunnerSettings,
+    agentModels: Readonly<Record<string, string>> = {}
+): Record<string, Agent> => {
+    const agents: Record<string, Agent> = {};
+
+    for (const name of names) agents[name] = agentFromProfile(name, settings, agentModels[name]);
+
+    return agents;
+};
+
+// A live harness factory for a primary + subagent selection. Used by the built-in
+// presets and by user-created/overridden harnesses, so a harness choice can only
+// change the agents — the toolbox and the loop budget are identical by
+// construction.
+//
+// The model map is captured by the closure, not read at run time: `update()`
+// builds a NEW factory for the new map, and a session created before that keeps
+// the closure (and therefore the models) it was built with.
+export const createProfiledHarness =
+    (primary: string, subagents: readonly string[], agentModels: Readonly<Record<string, string>> = {}) =>
+    (settings: RunnerSettings, progress: HarnessProgress): Harness =>
+        createToolboxHarness(
+            {
+                agents: agentsFromProfiles([primary, ...subagents], settings, agentModels),
+                primary,
+                subagents: [...subagents]
+            },
+            settings,
+            progress
+        );
 
 // What a live preset supplies: the agents and how they are routed. Everything
 // else is the shared toolbox, so two presets cannot end up with different tools.

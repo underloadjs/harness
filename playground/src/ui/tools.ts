@@ -17,20 +17,49 @@
 //   - styles: playground/src/styles.css (`.tool`, `.tool-*`)
 
 import { highlightCode, looksLikeJson, prettyJson } from './markdown';
+import { formatDuration } from './time';
 
 export type ToolState = 'running' | 'ok' | 'error';
+
+// Timing for one call:
+//   - `callId` comes from `tool_call.call.id` and is what a server that sends
+//     `tool_result.callId` matches on;
+//   - `startedAt` is the epoch-ms the call was observed (server `at` for a live
+//     frame, an `eventTimes` entry on hydration, or the local clock as fallback);
+//   - passing `startedAt` starts the live ticking label. Hydration resolves the
+//     card immediately, so the interval never survives the replay.
+export type ToolTiming = {
+    callId?: string;
+    startedAt?: number;
+};
 
 export type ToolCallCard = {
     // The card itself, appended to the agent's flow.
     element: HTMLDetailsElement;
     // Tool name, as reported by the model.
     name: string;
+    // Call id when the server supplied one; matching falls back to the name.
+    callId?: string;
     // Current state; also mirrored into `data-state` for CSS.
     state: () => ToolState;
+    // Final duration in ms, once known. Undefined for a legacy record with no
+    // timing data — never NaN.
+    durationMs: () => number | undefined;
     // Attach the matching `tool_result`. Idempotent: a duplicate result for the
-    // same call is ignored instead of overwriting the first answer.
-    resolve: (content: string, isError: boolean) => void;
+    // same call is ignored instead of overwriting the first answer. `durationMs`
+    // overrides the local measurement (used when replaying `eventTimes`).
+    resolve: (content: string, isError: boolean, durationMs?: number) => void;
+    // Stop the live timer. Called when the owning turn is cleared or the page is
+    // hidden; a resolved card also stops it itself.
+    destroy: () => void;
 };
+
+// A 250ms cadence keeps the tenth-of-a-second label honest while staying cheap:
+// the label shows a sub-second value, so a one-second tick would visibly lag.
+const DURATION_TICK_MS = 250;
+
+const formatKnown = (milliseconds: number | undefined): string =>
+    milliseconds === undefined ? '' : formatDuration(milliseconds);
 
 // A tool result can be a whole file or a command log. Past this size the card
 // shows the head plus a truncation note: the transcript stays responsive and the
@@ -75,10 +104,15 @@ const createCodeBlock = (code: string, language: string | undefined): HTMLElemen
     return pre;
 };
 
-export const createToolCallCard = (name: string, rawArguments: string): ToolCallCard => {
+export const createToolCallCard = (
+    name: string,
+    rawArguments: string,
+    timing: ToolTiming = {}
+): ToolCallCard => {
     const element = document.createElement('details');
     element.className = 'tool';
     element.dataset.state = 'running';
+    if (timing.callId !== undefined) element.dataset.callId = timing.callId;
 
     const summary = document.createElement('summary');
     summary.className = 'tool-summary';
@@ -96,11 +130,16 @@ export const createToolCallCard = (name: string, rawArguments: string): ToolCall
     state.className = 'tool-state';
     state.textContent = STATE_TEXT.running;
 
+    // Elapsed time is its own element: `running · 1.2s`, then the frozen final
+    // span once the result lands. Always text, never colour-only.
+    const duration = document.createElement('span');
+    duration.className = 'tool-duration';
+
     const peek = document.createElement('span');
     peek.className = 'tool-peek';
     peek.textContent = previewArguments(rawArguments);
 
-    summary.append(glyph, label, state, peek);
+    summary.append(glyph, label, state, duration, peek);
 
     const body = document.createElement('div');
     body.className = 'tool-body';
@@ -132,9 +171,47 @@ export const createToolCallCard = (name: string, rawArguments: string): ToolCall
     let current: ToolState = 'running';
     let settled = false;
 
-    const resolve = (content: string, isError: boolean): void => {
+    // Live label. Only starts when the caller supplied a start stamp; a recorded
+    // replay without `eventTimes` passes none, so no duration is invented.
+    let measured: number | undefined;
+    let ticker: number | undefined;
+
+    const paintDuration = (): void => {
+        const now = Date.now();
+        const live = measured ?? (timing.startedAt === undefined ? undefined : Math.max(0, now - timing.startedAt));
+        duration.textContent = formatKnown(live);
+        duration.hidden = live === undefined;
+    };
+
+    const stopTicker = (): void => {
+        if (ticker !== undefined) {
+            window.clearInterval(ticker);
+            ticker = undefined;
+        }
+    };
+
+    if (timing.startedAt !== undefined) {
+        paintDuration();
+        ticker = window.setInterval(paintDuration, DURATION_TICK_MS);
+    } else {
+        duration.hidden = true;
+    }
+
+    const resolve = (content: string, isError: boolean, durationMs?: number): void => {
         if (settled) return;
         settled = true;
+
+        // Prefer the caller's authoritative span (server `eventTimes`); otherwise
+        // freeze the local measurement at the moment the result arrived.
+        measured =
+            durationMs !== undefined && Number.isFinite(durationMs) && durationMs >= 0
+                ? durationMs
+                : timing.startedAt === undefined
+                  ? undefined
+                  : Math.max(0, Date.now() - timing.startedAt);
+
+        stopTicker();
+        paintDuration();
 
         current = isError ? 'error' : 'ok';
         element.dataset.state = current;
@@ -167,7 +244,15 @@ export const createToolCallCard = (name: string, rawArguments: string): ToolCall
             : `${previewArguments(rawArguments)} · ${text.length.toLocaleString()} chars`;
     };
 
-    return { element, name, state: () => current, resolve };
+    return {
+        element,
+        name,
+        ...(timing.callId === undefined ? {} : { callId: timing.callId }),
+        state: () => current,
+        durationMs: () => measured,
+        resolve,
+        destroy: stopTicker
+    };
 };
 
 // Small helper the direct-call runner reuses so its JSON result looks exactly

@@ -27,9 +27,13 @@
 //   - ./index       — builds the named exports + `presetTools` from this table
 //   - ../core/tool  — normalizes tags and defines the Tool contract
 //
-// Discovery: every entry is `searchable` (the tool() default) unless a metadata
-// row says otherwise. Searchable means the harness declares it only after getTools
-// matches its tags, so the catalogue can grow without spending context.
+// Discovery: EVERY entry is `searchable` (the tool() default). Searchable means
+// the harness declares it only after requestTools matches its tags, so the
+// catalogue can grow without spending context. The only core tools are the
+// harness-owned requestTools/createTool/todoTools (plus delegate for a primary
+// with subagents); no preset — including the file tools — is declared up front.
+// This is the latest scope decision: one discovery surface for the whole
+// catalogue, so a file tool costs the same round trip as runCommand.
 
 import type { Tool, ToolVisibility } from '../types';
 
@@ -47,36 +51,31 @@ export type PresetToolMetadata = {
 
 // The catalogue. Key order is the order `presetTools` is built in, which is the
 // order the harness preloads — grouped syntax, files, command so the folder
-// structure and the registry read the same way.
+// structure and the registry read the same way. No entry is core: the whole
+// catalogue is declared only after requestTools enables it.
 //
 // `as const` keeps literal tag tuples (so a parity test can compare them exactly)
 // while `satisfies` proves every row is complete enough to become a Tool.
 export const PRESET_TOOLS = {
-    javascriptSyntax: {
-        name: 'javascriptSyntax',
+    syntaxCheck: {
+        name: 'syntaxCheck',
         description:
-            'Check whether a JavaScript snippet parses as a classic script. Returns true when the syntax is valid, false otherwise. Does not execute the code, and does not support ES module syntax (import/export) or top-level await.',
-        tags: ['code', 'syntax', 'javascript', 'validation'],
+            'Check whether a code snippet parses, without executing it. Pass language "javascript" (JavaScript as a classic script: no import/export and no top-level await) or "python" (Python; needs a Python 3 interpreter on PATH). Returns true when the syntax is valid, false otherwise.',
+        tags: ['code', 'syntax', 'javascript', 'python', 'validation'],
+        // Two properties, so the single-property rule does not apply: execute
+        // receives the whole { code, language } object, exactly what a direct
+        // call passes.
         parameters: {
             type: 'object',
             properties: {
-                code: { type: 'string', description: 'JavaScript source to check.' }
+                code: { type: 'string', description: 'Source code to check.' },
+                language: {
+                    type: 'string',
+                    enum: ['javascript', 'python'],
+                    description: 'Language to parse the snippet as.'
+                }
             },
-            required: ['code'],
-            additionalProperties: false
-        }
-    },
-    pythonSyntax: {
-        name: 'pythonSyntax',
-        description:
-            'Check whether a Python snippet parses. Returns true when the syntax is valid, false otherwise. Does not execute the code.',
-        tags: ['code', 'syntax', 'python', 'validation'],
-        parameters: {
-            type: 'object',
-            properties: {
-                code: { type: 'string', description: 'Python source to check.' }
-            },
-            required: ['code'],
+            required: ['code', 'language'],
             additionalProperties: false
         }
     },
@@ -257,10 +256,8 @@ export const PRESET_TOOL_NAMES = Object.keys(PRESET_TOOLS) as PresetToolName[];
 // split and hoist the Node built-in imports back to the entry, so don't.
 export const loadPresetTool = (name: PresetToolName): Promise<Tool> => {
     switch (name) {
-        case 'javascriptSyntax':
-            return import('./syntax/javascriptSyntax').then((module) => module.javascriptSyntax);
-        case 'pythonSyntax':
-            return import('./syntax/pythonSyntax').then((module) => module.pythonSyntax);
+        case 'syntaxCheck':
+            return import('./syntax/syntaxCheck').then((module) => module.syntaxCheck);
         case 'readFile':
             return import('./files/readFile').then((module) => module.readFile);
         case 'writeFile':

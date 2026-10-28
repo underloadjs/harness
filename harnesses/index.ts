@@ -29,6 +29,9 @@ import { presetTools } from '../src/harness';
 import type { Tool } from '../src/harness';
 import { harnessTools } from './tools';
 import { presets, PRESET_MAX_ITERATIONS } from './presets';
+// Value import for the local findPreset() below. The barrel also re-exports the
+// constant so callers keep importing it from here.
+import { PRESET_ALIASES } from './registry';
 import { createWebsearchCatalogueEntry } from './websearch';
 import type { WebsearchCatalogueEntry } from './websearch';
 import type { CatalogueEntry, HarnessPreset, ToolGroup } from './types';
@@ -39,15 +42,40 @@ export {
     SHARED_APP_TOOL_NAMES,
     SHARED_TOOL_NAMES,
     SHARED_TOOLS,
+    agentFromProfile,
+    agentsFromProfiles,
     coreToolNames,
+    createProfiledHarness,
     createToolboxHarness,
     providerOf
 } from './toolbox';
 export type { ToolboxHarnessConfiguration } from './toolbox';
+export { createHarnessRegistry, HarnessRegistryError, PRESET_ALIASES } from './registry';
+export type { HarnessPatch, HarnessRegistration, HarnessRegistry } from './registry';
+export { describeAgent, describeAgents, describeHarness } from './descriptor';
+export type { DescriptorCatalogue } from './descriptor';
+export {
+    CORE_TOOL_GROUP,
+    CORE_TOOL_SESSION_HINT,
+    createCoreToolEntries
+} from './core';
 export { scriptedDemo } from './demo';
 export { createWebsearchCatalogueEntry, WEBSEARCH_ENVIRONMENT, WEBSEARCH_UNCONFIGURED_HINT } from './websearch';
 export type { WebsearchCatalogueEntry, WebsearchCatalogueOptions } from './websearch';
 export type { CatalogueEntry, HarnessPreset, RunnerSettings, ToolAvailability, ToolGroup } from './types';
+
+// The trusted agent registry is re-exported through the app barrel because the
+// server and the CLI both need the same ids when they validate a harness request
+// or build an agent. The profiles themselves live in src/agents.
+export {
+    AGENT_PROFILES,
+    AGENT_PROFILE_NAMES,
+    agentInstruction,
+    agentProfile,
+    agentProfiles,
+    isAgentProfileName
+} from '../src/agents';
+export type { AgentProfile } from '../src/agents';
 
 // One catalogue built for one host. `entries` is the display order (grouped, and
 // stable so a UI never has to sort); `tools` holds only executable definitions;
@@ -125,22 +153,11 @@ export const createToolCatalogue = (options: ToolCatalogueOptions = {}): ToolCat
     };
 };
 
-// Backward-compatible preset identifiers. The live catalogue is now agent-named
-// (`instruct`, `research`, `workspace`), but a CLI invocation, script, or
-// bookmarked API client written against the old names must still run. Aliases
-// resolve to the canonical preset and are NOT listed separately, so the UI shows
-// each capability once. `writer`/`assistant` both meant "one agent" and now map to
-// the single Instruct harness; `researcher` maps to Research.
-export const PRESET_ALIASES: Readonly<Record<string, string>> = {
-    writer: 'instruct',
-    assistant: 'instruct',
-    researcher: 'research'
-};
-
-// Resolve a preset name, including an alias, against any catalogue. The catalogue
-// parameter lets SessionStore keep using its injected preset list (tests run
-// scripted harnesses) while still honouring aliases when the canonical entry is
-// present.
+// Resolve a preset name, including an alias, against any static catalogue. The
+// catalogue parameter lets a caller (the CLI) keep using the shipped list; the
+// server resolves sessions through a live HarnessRegistry instead, so a
+// user-created harness participates there. Aliases themselves are re-exported
+// from ./registry.ts above.
 export const findPreset = (
     name: string,
     catalogue: readonly HarnessPreset[] = presets

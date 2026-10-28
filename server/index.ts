@@ -6,8 +6,8 @@
 
 import http from 'node:http';
 import { fileURLToPath } from 'node:url';
-import { createToolCatalogue } from '../harnesses';
-import type { ToolCatalogue } from '../harnesses';
+import { createHarnessRegistry, createToolCatalogue, describeHarness } from '../harnesses';
+import type { HarnessRegistry, ToolCatalogue } from '../harnesses';
 import { loadConfiguration } from './config';
 import { loadEnvironmentFile } from './environment';
 import { createHarnessHandler } from './handler';
@@ -29,6 +29,9 @@ export type StartServerOptions = {
     // Tests inject one to pin a configured/unconfigured websearch without
     // touching the test runner's environment.
     catalogue?: ToolCatalogue;
+    // The in-memory harness registry shared by the store and the API. Omitted
+    // means the shipped catalogue; tests inject one to add scripted harnesses.
+    registry?: HarnessRegistry;
 };
 
 export type HarnessServer = {
@@ -75,16 +78,30 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
     loadEnvironmentFile();
 
     const configuration = loadConfiguration();
-    const store = new SessionStore(options.settings ?? configuration.settings);
 
     // Built after loadEnvironmentFile() on purpose: websearch resolves its
     // provider key here, once, and the handler keeps the snapshot for its whole
     // lifetime. A keyless host still gets the entry, marked unconfigured.
     const catalogue = options.catalogue ?? createToolCatalogue();
 
+    // ONE registry: the store resolves a session through it and the API creates
+    // and patches through it, so a harness created over HTTP is immediately
+    // runnable and an override is visible to the next session.
+    const registry = options.registry ?? createHarnessRegistry();
+
+    // The store owns no catalogue, so bind the describer here: every session's
+    // frozen `harnessDefinition` reflects what THIS host can actually run
+    // (websearch only when a key resolved).
+    const store = new SessionStore(
+        options.settings ?? configuration.settings,
+        registry,
+        (preset) => describeHarness(preset, catalogue)
+    );
+
     const api: HarnessHandler = createHarnessHandler({
         store,
         defaults: options.defaults ?? configuration.defaults,
+        registry,
         catalogue
     });
 

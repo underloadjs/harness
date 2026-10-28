@@ -5,6 +5,11 @@
 // Run: npx vitest run --config playground/vitest.config.ts
 import { createToolCallCard } from './tools';
 
+// A failed fake-timer assertion must not leak the fake clock into the next test.
+afterEach(() => {
+    vi.useRealTimers();
+});
+
 describe('createToolCallCard', () => {
     it('starts collapsed and reports a running state in text', () => {
         const card = createToolCallCard('readFile', '{"path":"package.json"}');
@@ -65,5 +70,55 @@ describe('createToolCallCard', () => {
             '(no arguments) · 14 chars'
         );
         expect(card.element.querySelector('.tool-result code')?.textContent).toBe('(empty result)');
+    });
+
+    it('ticks a live duration and freezes the final span', () => {
+        const T = 1_700_000_000_000;
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T));
+
+        const card = createToolCallCard('runCommand', '{"command":"slow"}', { startedAt: T });
+        const label = card.element.querySelector<HTMLElement>('.tool-duration');
+
+        expect(label?.hidden).toBe(false);
+        expect(label?.textContent).toBe('0ms');
+
+        vi.advanceTimersByTime(1500);
+        expect(label?.textContent).toBe('1.5s');
+
+        vi.advanceTimersByTime(500);
+        card.resolve('done', false);
+        expect(card.durationMs()).toBe(2000);
+        expect(label?.textContent).toBe('2.0s');
+
+        // Settled: the interval is gone, so the label cannot keep counting.
+        vi.advanceTimersByTime(10_000);
+        expect(label?.textContent).toBe('2.0s');
+        vi.useRealTimers();
+    });
+
+    it('uses an authoritative recorded duration when one is supplied', () => {
+        const card = createToolCallCard('readFile', '{}');
+        expect(card.element.querySelector<HTMLElement>('.tool-duration')?.hidden).toBe(true);
+
+        card.resolve('ok', false, 1500);
+        expect(card.durationMs()).toBe(1500);
+        expect(card.element.querySelector('.tool-duration')?.textContent).toBe('1.5s');
+        expect(card.element.querySelector<HTMLElement>('.tool-duration')?.hidden).toBe(false);
+    });
+
+    it('stops the live ticker when destroyed', () => {
+        const T = 1_700_000_000_000;
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T));
+
+        const card = createToolCallCard('clock', '', { startedAt: T });
+        vi.advanceTimersByTime(1000);
+        expect(card.element.querySelector('.tool-duration')?.textContent).toBe('1.0s');
+
+        card.destroy();
+        vi.advanceTimersByTime(5000);
+        expect(card.element.querySelector('.tool-duration')?.textContent).toBe('1.0s');
+        vi.useRealTimers();
     });
 });

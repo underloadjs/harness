@@ -29,6 +29,7 @@
 
 import { HarnessError } from '../util';
 import type { TodoAction, TodoItem, TodoParameters, TodoResult, TodoToolset } from '../types';
+import { TODO_TOOLS_METADATA } from './metadata';
 import { tool } from './tool';
 
 // The accepted actions, in the order the error message and schema advertise
@@ -107,40 +108,17 @@ export const createTodoTool = (): TodoToolset => {
         return item;
     };
 
+    // The name, description, tags, schema, and visibility come from the shared
+    // metadata module (./metadata.ts): the server describes this same tool in its
+    // catalogue from that one copy, so a runtime registration and a descriptor can
+    // never disagree. Core on purpose: a session todo list is useless if the model
+    // has to discover it before its first plan.
     const implementation = tool<TodoParameters, TodoResult>({
-        name: 'todoTools',
-        description:
-            'Manage the todo list for this harness session. Actions: "add" (requires text), "remove" (requires id), "check" (requires id; completed defaults to true, false unchecks), "uncheck" (requires id), and "list". Ids are stable strings returned by "add". The list is shared by every agent in this harness, kept across turns, and cleared by reset. Returns todos plus counts { total, completed, remaining }, and the affected todo (or removed item).',
-        tags: ['todo', 'todos', 'task', 'tasks', 'checklist', 'plan'],
-        // Core on purpose: a session todo list is useless if the model has to
-        // discover it before its first plan. This is the one context cost the
-        // harness accepts for todoTools.
-        visibility: 'core',
-        parameters: {
-            type: 'object',
-            properties: {
-                action: {
-                    type: 'string',
-                    enum: [...ACTIONS],
-                    description: `One of: ${ACTION_HINT}.`
-                },
-                text: {
-                    type: 'string',
-                    description: 'Todo text for "add". Required for that action; trimmed before storage.'
-                },
-                id: {
-                    type: 'string',
-                    description: 'Todo id returned by "add". Required for remove/check/uncheck.'
-                },
-                completed: {
-                    type: 'boolean',
-                    description:
-                        'For "check" only: true (default) marks complete, false unchecks. "uncheck" is the same as false.'
-                }
-            },
-            required: ['action'],
-            additionalProperties: false
-        },
+        name: TODO_TOOLS_METADATA.name,
+        description: TODO_TOOLS_METADATA.description,
+        tags: TODO_TOOLS_METADATA.tags,
+        visibility: TODO_TOOLS_METADATA.visibility,
+        parameters: TODO_TOOLS_METADATA.parameters,
         execute: ({ parameters }) => {
             // A model can pass anything. Keep one readable error for "not an
             // object" so every action below can assume a record.

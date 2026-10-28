@@ -44,6 +44,21 @@ export type HarnessPreset = {
     // Every live preset declares `websearch`; the scripted demo and the
     // recoverable-failure example do not.
     environmentTools?: readonly string[];
+    // Per-agent model overrides (R9): agent id → model id. A member that is absent
+    // falls back to `RunnerSettings.model`, so a harness can swap the model of one
+    // agent (the summarizer on a small model, the primary on a large one) without
+    // touching the others. Only ids are overridable — never a provider, base URL,
+    // or credential. Empty/absent means "the session model for every member".
+    agentModels?: Readonly<Record<string, string>>;
+    // Shipped with the application (`true`) or registered by a client through
+    // POST /harnesses (`false`). A built-in is not deletable/renamable; the flag
+    // only tells the UI where the card came from.
+    builtin: boolean;
+    // Whether PATCH /harnesses/:name may change this harness. The live built-ins
+    // (instruct, research, workspace) are editable through the in-memory registry;
+    // the fixtures (demo, flaky) are not, because their behaviour is scripted by a
+    // test/example and an override would make the fixture lie.
+    editable: boolean;
     // Build a fresh harness. Progress is routed by the caller (a CLI renderer or
     // one HTTP session), which is why it is a parameter rather than a field.
     create: (settings: RunnerSettings, progress: HarnessProgress) => Harness;
@@ -51,8 +66,10 @@ export type HarnessPreset = {
 
 // How a tool is grouped in the direct-call catalogue. 'Web search' is separate
 // from the presets because websearch is credential-dependent and opt-in: a host
-// must see at a glance whether this deployment can run it.
-export type ToolGroup = 'Package presets' | 'Harness tools' | 'Web search';
+// must see at a glance whether this deployment can run it. 'Core tools' holds the
+// harness-owned set (requestTools, createTool, todoTools, delegate), which are
+// listed for review and manual execution but only ever run inside a session.
+export type ToolGroup = 'Package presets' | 'Harness tools' | 'Web search' | 'Core tools';
 
 // Whether a catalogue entry can actually run on this host.
 //
@@ -73,6 +90,12 @@ export type ToolAvailability = {
 // description, tags, and schema to render. `tool` is present exactly when the
 // entry is executable: a credential-dependent tool with no key has no callable
 // definition, which is what keeps "listed" from meaning "pretends to work".
+//
+// `sessionBound` marks the harness-owned CORE tools (R8). They have no `tool` and
+// can never be called with a dummy implementation: they run inside a session's
+// harness, so the server requires a `sessionId` and forwards the call to
+// `harness.executeTool`. Listing them is what lets the UI's Tools tab show the
+// core set and run it against the selected session.
 export type CatalogueEntry = {
     name: string;
     group: ToolGroup;
@@ -82,4 +105,5 @@ export type CatalogueEntry = {
     visibility: ToolVisibility;
     parameters: Record<string, unknown>;
     availability?: ToolAvailability;
+    sessionBound?: boolean;
 };

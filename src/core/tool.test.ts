@@ -5,7 +5,7 @@
 //     harness runs, with no agent and no registry;
 //   - the single-property rule: a schema with exactly one property delivers that
 //     property's value to `execute`, so a direct call and a model call agree;
-//   - tags and visibility: every tool is tagged (that is how getTools finds it)
+//   - tags and visibility: every tool is tagged (that is how requestTools finds it)
 //     and searchable by default (that is what keeps a big catalogue out of the
 //     context window).
 

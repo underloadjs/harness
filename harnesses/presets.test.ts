@@ -23,6 +23,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { HarnessProgress } from '../src/harness';
 import { findPreset, presets, PRESET_ALIASES, PRESET_MAX_ITERATIONS, SHARED_TOOL_NAMES } from './index';
+import { AGENT_PROFILES } from '../src/agents';
 
 // Provider settings are never used by construction; they only feed `agent(...)`.
 const SETTINGS = {
@@ -53,10 +54,9 @@ const instructionOf = (presetName: string, agentName: string): string => {
     return message.content;
 };
 
-// The exact shared registry order: ten package tools, then five app tools.
+// The exact shared registry order: nine package tools, then five app tools.
 const TOOLBOX = [
-    'javascriptSyntax',
-    'pythonSyntax',
+    'syntaxCheck',
     'readFile',
     'writeFile',
     'editFile',
@@ -177,14 +177,14 @@ describe('one toolbox, different agents', () => {
         expect(registeredTools('instruct')).toEqual([
             ...TOOLBOX,
             'websearch',
-            'getTools',
+            'requestTools',
             'createTool',
             'todoTools'
         ]);
         expect(registeredTools('research')).toEqual([
             ...TOOLBOX,
             'websearch',
-            'getTools',
+            'requestTools',
             'createTool',
             'todoTools',
             'delegate'
@@ -192,7 +192,7 @@ describe('one toolbox, different agents', () => {
         expect(registeredTools('workspace')).toEqual([
             ...TOOLBOX,
             'websearch',
-            'getTools',
+            'requestTools',
             'createTool',
             'todoTools'
         ]);
@@ -202,28 +202,28 @@ describe('one toolbox, different agents', () => {
             ...TOOLBOX,
             'flaky',
             'websearch',
-            'getTools',
+            'requestTools',
             'createTool',
             'todoTools'
         ]);
 
         // The scripted offline fixture is a documented exception.
-        expect(registeredTools('demo')).toEqual(['clock', 'getTools', 'createTool', 'todoTools']);
+        expect(registeredTools('demo')).toEqual(['clock', 'requestTools', 'createTool', 'todoTools']);
     });
 
     it('registers the identical toolbox on every live preset when the host is keyless', () => {
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
 
-        expect(registeredTools('instruct')).toEqual([...TOOLBOX, 'getTools', 'createTool', 'todoTools']);
+        expect(registeredTools('instruct')).toEqual([...TOOLBOX, 'requestTools', 'createTool', 'todoTools']);
         expect(registeredTools('research')).toEqual([
             ...TOOLBOX,
-            'getTools',
+            'requestTools',
             'createTool',
             'todoTools',
             'delegate'
         ]);
-        expect(registeredTools('workspace')).toEqual([...TOOLBOX, 'getTools', 'createTool', 'todoTools']);
+        expect(registeredTools('workspace')).toEqual([...TOOLBOX, 'requestTools', 'createTool', 'todoTools']);
 
         // No key means the factory registers no websearch at all; the global
         // catalogue is where a keyless host learns it exists but is unconfigured.
@@ -241,20 +241,55 @@ describe('one toolbox, different agents', () => {
         expect(registeredTools('flaky')).toContain('flaky');
     });
 
-    it('keeps every shared tool searchable so discovery is still the gate', () => {
+    it('keeps every shared tool searchable, file tools included', () => {
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
 
         const harness = presetOf('instruct').create(SETTINGS, progress);
 
-        expect(Object.fromEntries(TOOLBOX.map((name) => [name, harness.tools[name].visibility]))).toEqual(
-            Object.fromEntries(TOOLBOX.map((name) => [name, 'searchable']))
-        );
+        // The latest scope: discovery is the only way to reach a catalogue tool,
+        // so no preset entry is declared up front. Only the harness-owned core
+        // tools bypass requestTools.
+        expect(
+            Object.fromEntries(
+                [
+                    'readFile',
+                    'writeFile',
+                    'editFile',
+                    'listFiles',
+                    'searchFiles',
+                    'globFiles',
+                    'syntaxCheck',
+                    'runCommand',
+                    'gitDiff',
+                    'clock',
+                    'wordCount',
+                    'roll',
+                    'searchNotes',
+                    'summarize'
+                ].map((name) => [name, harness.tools[name].visibility])
+            )
+        ).toEqual({
+            readFile: 'searchable',
+            writeFile: 'searchable',
+            editFile: 'searchable',
+            listFiles: 'searchable',
+            searchFiles: 'searchable',
+            globFiles: 'searchable',
+            syntaxCheck: 'searchable',
+            runCommand: 'searchable',
+            gitDiff: 'searchable',
+            clock: 'searchable',
+            wordCount: 'searchable',
+            roll: 'searchable',
+            searchNotes: 'searchable',
+            summarize: 'searchable'
+        });
 
         // Names and metadata are registered without eager implementation loading
         // (the package entries are lazy proxies, see src/tools/lazy.ts).
         expect(harness.tools.readFile.tags).toEqual(['files', 'read', 'filesystem']);
-        expect(harness.tools.getTools.visibility).toBe('core');
+        expect(harness.tools.requestTools.visibility).toBe('core');
         expect(harness.tools.createTool.visibility).toBe('core');
         expect(harness.tools.todoTools.visibility).toBe('core');
         expect(harness.tools.delegate).toBeUndefined();
@@ -279,6 +314,63 @@ describe('one toolbox, different agents', () => {
         expect(Object.keys(researchHarness.subagents)).toEqual(['summarizer']);
         expect(Object.keys(presetOf('instruct').create(SETTINGS, progress).subagents)).toEqual([]);
         expect(Object.keys(presetOf('workspace').create(SETTINGS, progress).subagents)).toEqual([]);
+    });
+
+    it('seeds the trusted profile instruction and guidelines into the runtime', () => {
+        const research = presetOf('research').create(SETTINGS, progress);
+
+        // Agent messages start with the profile's instruction, then ONE composed
+        // guidelines block. The same composition is used for the summarizer, so a
+        // guideline cannot be documentation that never reaches a model.
+        expect(research.agents.research.messages.slice(0, 2)).toEqual([
+            { role: 'system', content: AGENT_PROFILES.research.instruction },
+            {
+                role: 'system',
+                content: [
+                    'Guidelines:',
+                    ...AGENT_PROFILES.research.guidelines.map((line) => `- ${line}`)
+                ].join('\n')
+            }
+        ]);
+        expect(research.agents.summarizer.messages.slice(0, 2)).toEqual([
+            { role: 'system', content: AGENT_PROFILES.summarizer.instruction },
+            {
+                role: 'system',
+                content: [
+                    'Guidelines:',
+                    ...AGENT_PROFILES.summarizer.guidelines.map((line) => `- ${line}`)
+                ].join('\n')
+            }
+        ]);
+
+        // The exact identity sentence, not just a substring: the profile is the
+        // source and the harness must not append or rewrite it.
+        expect(research.agents.research.messages[0]).toEqual({
+            role: 'system',
+            content: 'You are the Research agent. Investigate before you answer, and separate what you found from what you inferred.'
+        });
+        // The delegate guideline is what makes the subagent reachable in words.
+        expect((research.agents.research.messages[1] as { content: string }).content).toContain(
+            'You may call delegate with agent "summarizer" for a self-contained brief'
+        );
+    });
+
+    it('marks the catalogue builtin/editable for future registry mutations', () => {
+        expect(
+            presets.map((preset) => ({
+                name: preset.name,
+                builtin: preset.builtin,
+                editable: preset.editable
+            }))
+        ).toEqual([
+            { name: 'instruct', builtin: true, editable: true },
+            { name: 'research', builtin: true, editable: true },
+            { name: 'workspace', builtin: true, editable: true },
+            // Fixtures are not overridable: an override would make the scripted
+            // demo / failure example claim behaviour it does not run.
+            { name: 'demo', builtin: true, editable: false },
+            { name: 'flaky', builtin: true, editable: false }
+        ]);
     });
 });
 

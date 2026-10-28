@@ -1,8 +1,8 @@
 // Transport-neutral harness HTTP API.
 //
-// One dispatcher owns the whole routing surface (health, presets, tools, models,
-// sessions) and knows nothing about Node's IncomingMessage, Hono's Context, or
-// SSE writers. Two adapters consume it:
+// One dispatcher owns the whole routing surface (health, harnesses, agents, tools,
+// models, sessions) and knows nothing about Node's IncomingMessage, Hono's Context,
+// or SSE writers. Two adapters consume it:
 //
 //   - server/handler.ts  — standalone node:http server, mounted at `/api`
 //   - server/service.ts  — @underload/service endpoint, mounted at `/v1/harness`
@@ -25,9 +25,27 @@
 //   - POST /tools/:name additionally requires a `parameters` own-property, so a
 //     body the service loader reduced to `{}` after a parse failure cannot
 //     execute a tool. `{ "parameters": {} }` stays valid for argument-less tools.
+//   - POST/PATCH /harnesses reject unknown fields outright: instruction text,
+//     provider settings, or a tool list are never client-supplied. The one
+//     model-shaped field, `agentModels`, is a validated agent id → model id map.
 //   - byte bounds live in the adapters: the Node adapter rejects while streaming,
 //     the service adapter checks content-length and the serialized parsed body
 //     (see service.ts, which also documents the upstream-allocation residual).
+//
+// TOOL EXECUTION (R8): every tool runs on the server. GET /tools (and
+// /tools/bootstrap, and the bootstrap document) lists the whole catalogue PLUS the
+// harness-owned core tools — requestTools, createTool, todoTools, delegate — marked
+// `visibility: 'core'` and `sessionBound: true`. A sessionBound entry has no
+// standalone implementation: POST /tools/:name requires `sessionId`, rejects 400
+// without one, 404 for an unknown session or a core tool that session's harness
+// does not register (delegate without subagents), and 409 while the session is
+// busy (a streaming run, a reset, or another manual call) so a manual mutation
+// cannot race an active operation. A directly callable catalogue tool keeps its
+// old session-less runner and simply ignores `sessionId`.
+//
+// HARNESS REGISTRY: POST/PATCH /harnesses mutate the in-memory registry the store
+// resolves sessions through (see ../harnesses/registry.ts). They affect FUTURE
+// sessions only; an existing session keeps the preset and descriptor it captured.
 //
 // BOOTSTRAP ROOT: `rootPath` is the canonical API URL this document is served
 // from (`/v1/harness`), NOT a filesystem path. File tools resolve relative paths
@@ -36,17 +54,21 @@
 // have (see ./runtime.ts).
 //
 // Cross-references:
-//   - ./protocol.ts  — wire types (HarnessDescriptor, SessionStreamItem, …)
+//   - ./protocol.ts  — wire types (HarnessDescriptor, AgentDescriptor, SessionStreamItem, …)
 //   - ./handler.ts   — Node adapter, `/api` prefix, X-Harness-Client gate
 //   - ./service.ts   — service adapter, `/v1/harness` prefix, Origin gate
-//   - ./runtime.ts   — lazy shared store/catalogue for the service endpoints
+//   - ./runtime.ts   — lazy shared store/catalogue/registry for the service endpoints
 //   - ./config.ts    — mergeSettings credential rule and settings caps
+//   - ../harnesses/registry.ts — create/patch validation and the in-memory entries
 
-import { coreToolNames, createToolCatalogue, presets } from '../harnesses';
-import type { CatalogueEntry, ToolCatalogue } from '../harnesses';
-import type { HarnessPreset } from '../harnesses/types';
+import { createToolCatalogue, describeAgent, describeHarness } from '../harnesses';
+import { createCoreToolEntries } from '../harnesses';
+import { createHarnessRegistry } from '../harnesses';
+import type { CatalogueEntry, HarnessRegistry, ToolCatalogue } from '../harnesses';
 import { listModels, ModelListError } from '../src/transport/models';
 import type {
+    AgentDescriptor,
+    CreateHarnessRequest,
     CreateSessionRequest,
     HarnessDescriptor,
     HarnessIndex,
@@ -58,9 +80,11 @@ import type {
     ToolCallRequest,
     ToolCallResult,
     ToolDescriptor,
-    ToolIndex
+    ToolIndex,
+    UpdateHarnessRequest
 } from './protocol';
 import { mergeSettings, SettingsError } from './config';
+import { HarnessRegistryError } from '../harnesses/registry';
 import { SessionError, SessionStore } from './sessions';
 
 const MAX_BODY_BYTES = 1_000_000;
@@ -125,7 +149,11 @@ export type HarnessBootstrap = {
     // relative paths against the server process's working directory and no
     // workspace sandbox exists, so there is no file root to advertise.
     rootPath: string;
+    // Named `presets` for compatibility; the values are harness descriptors.
     presets: HarnessDescriptor[];
+    // The trusted agent registry, so a client can render primary/subagent pickers
+    // from the same document that lists the harnesses.
+    agents: AgentDescriptor[];
     tools: ToolDescriptor[];
     defaults: HarnessIndex['defaults'];
     sessions: SessionSnapshot[];
@@ -135,6 +163,10 @@ export type HarnessApiOptions = {
     store: SessionStore;
     // Key-free provider defaults advertised to clients.
     defaults: HarnessIndex['defaults'];
+    // Shared with the store: a harness created through POST /harnesses is
+    // resolvable by a session created through the same API instance. Defaults to a
+    // fresh registry over the shipped presets (convenient for a focused test).
+    registry?: HarnessRegistry;
     // Built by the host AFTER it loads `.env`, so a search key in the process
     // environment is captured here and not at import time.
     catalogue?: ToolCatalogue;
@@ -142,41 +174,52 @@ export type HarnessApiOptions = {
 
 export type HarnessApi = (request: HarnessApiRequest) => Promise<HarnessApiResult>;
 
-// Resolve one preset onto the wire. `tools` is the declared list plus the
-// environment-backed names (`environmentTools`, see harnesses/types.ts) that this
-// host can ACTUALLY run: the name is appended only when the runtime catalogue has
-// an executable definition for it. A keyless deployment therefore advertises
-// exactly what it did before and never claims a search tool it cannot call
-// (POST /tools/websearch would answer `ok: false` in that case).
-//
+// Descriptors are projected by ../harnesses/descriptor.ts, which server/sessions.ts
+// also uses for its frozen `harnessDefinition`. Keeping one projection means a
+// card and a session snapshot cannot disagree about agents, tools, or editability.
 // Cheap on purpose: the catalogue is already built by the host (after .env load,
 // see runtime.ts), so answering /harnesses never constructs a harness or a live
 // agent just to learn which tools a preset would register.
-const describePreset = (preset: HarnessPreset, catalogue: ToolCatalogue): HarnessDescriptor => ({
-    name: preset.name,
-    title: preset.title,
-    description: preset.description,
-    requiresEndpoint: preset.requiresEndpoint,
-    agents: [...preset.agents],
-    tools: [
-        ...preset.tools,
-        // `preset.tools.includes` guards a preset that ever declares the same
-        // environment-backed name statically: it must not appear twice.
-        ...(preset.environmentTools ?? []).filter(
-            (name) => catalogue.tools[name] !== undefined && !preset.tools.includes(name)
-        )
-    ],
-    // Core tools are harness-owned, so the server states them instead of the UI
-    // hardcoding "getTools": delegate is present exactly when the preset declares
-    // a subagent allowlist (Research), which is an agent-configuration difference
-    // and therefore legitimately absent from a single-agent preset.
-    coreTools: coreToolNames(preset.subagents)
-});
+
+// Body fields a client may send. Anything else is a 400: instruction text,
+// provider settings, a model, or a tool list must never be client-supplied.
+// `agentModels` (R9) is the one model-shaped field: a map of selected agent id →
+// model id, validated against the final member set by the registry.
+const CREATE_HARNESS_FIELDS = [
+    'name',
+    'title',
+    'description',
+    'primary',
+    'subagents',
+    'agentModels'
+] as const;
+const UPDATE_HARNESS_FIELDS = [
+    'title',
+    'description',
+    'primary',
+    'subagents',
+    'agentModels'
+] as const;
+
+// Reject unknown properties instead of ignoring them. A request that tries to set
+// `instructions` is then a visible contract violation rather than a silent no-op
+// that leaves the client believing it changed a prompt.
+const requireKnownFields = (body: object, allowed: readonly string[]): void => {
+    for (const key of Object.keys(body)) {
+        if (!allowed.includes(key)) {
+            throw new HttpError(
+                400,
+                `Unknown field "${key}". Allowed fields: ${allowed.join(', ')}.`
+            );
+        }
+    }
+};
 
 // Copy one catalogue entry onto the wire. Metadata comes from the entry, not the
 // Tool, because an unconfigured credential-dependent entry has no Tool to read.
 // `availability` is only sent when the entry has something to say; existing tools
-// keep the exact descriptor shape they had before C1.
+// keep the exact descriptor shape they had before C1. `sessionBound` (R8) is sent
+// only for the core entries, which have no standalone implementation.
 const describeTool = (entry: CatalogueEntry): ToolDescriptor => {
     const descriptor: ToolDescriptor = {
         name: entry.name,
@@ -197,11 +240,13 @@ const describeTool = (entry: CatalogueEntry): ToolDescriptor => {
         };
     }
 
+    if (entry.sessionBound === true) descriptor.sessionBound = true;
+
     return descriptor;
 };
 
-const toolIndex = (catalogue: ToolCatalogue): ToolIndex => ({
-    tools: catalogue.entries.map(describeTool)
+const toolIndex = (entries: readonly CatalogueEntry[]): ToolIndex => ({
+    tools: entries.map(describeTool)
 });
 
 // Split the path below the mount. Both mounts are plain prefixes; a path that
@@ -248,19 +293,39 @@ const TOOL_WRAPPER_MESSAGE =
 export const createHarnessApi = ({
     store,
     defaults,
+    registry = createHarnessRegistry(),
     catalogue = createToolCatalogue()
 }: HarnessApiOptions): HarnessApi => {
     // `catalogue` is resolved once per API instance, not per request: the
     // credential tools close over the key resolved at construction, exactly like
     // a session harness. An HTTP request never triggers a fresh environment read.
     //
+    // The core (harness-owned) descriptors are built once too. They are listed
+    // alongside the catalogue — the Tools tab shows every tool including the core
+    // set (R8) — and they carry `sessionBound`, which is what makes a call require
+    // a sessionId. Metadata comes from src/core/metadata.ts, the same copy the
+    // harness registers, so a descriptor cannot advertise a different schema.
+    const coreEntries = createCoreToolEntries();
+
+    // One ordered list for every listing surface: core first (always declared in
+    // chat), then the directly callable catalogue in its stable group order.
+    const toolEntries = (): CatalogueEntry[] => [...coreEntries, ...catalogue.entries];
+
     // The document is built per mount because `rootPath` is the mount URL: the
     // service adapter is the only caller with `bootstrapRoot: true`, and it must
     // see the URL the client actually used.
+    const describeAll = (): HarnessDescriptor[] =>
+        registry.list().map((preset) => describeHarness(preset, catalogue));
+
+    const agentList = (): AgentDescriptor[] => registry.agents().map(describeAgent);
+
     const bootstrap = (mount: string): HarnessBootstrap => ({
         rootPath: mount,
-        presets: presets.map((preset) => describePreset(preset, catalogue)),
-        tools: catalogue.entries.map(describeTool),
+        presets: describeAll(),
+        agents: agentList(),
+        // Core tools included: the bootstrap payload IS the catalogue a client
+        // boots from, and every tool executes server-side.
+        tools: toolEntries().map(describeTool),
         defaults,
         sessions: store.list()
     });
@@ -328,7 +393,19 @@ export const createHarnessApi = ({
         }
     };
 
-    // POST /tools/:name — direct call, no harness, no model, no loop.
+    // POST /tools/:name — call one tool.
+    //
+    // Two execution paths, because there are two kinds of entry:
+    //
+    //   core (sessionBound) — requestTools, createTool, todoTools, delegate. These
+    //     have no standalone implementation by design; they run inside a session's
+    //     harness so a manual call changes THAT conversation (enabled tools,
+    //     registered tools, todos, a delegated subagent turn). A call must carry
+    //     `sessionId`, and the store rejects a session that is already busy
+    //     (running, resetting, or serving another manual call).
+    //   catalogue            — the direct runner that predates R8: no harness, no
+    //     model, no loop. A `sessionId` may still be present (one request shape)
+    //     and is ignored.
     //
     // The entry is looked up BEFORE reading the body so an unknown name answers a
     // 404 without consuming a request the adapter may not need to drain.
@@ -336,21 +413,65 @@ export const createHarnessApi = ({
         name: string,
         readBody: HarnessApiRequest['readBody']
     ): Promise<HarnessApiResult> => {
-        const entry = catalogue.find(name);
+        const coreEntry = coreEntries.find((candidate) => candidate.name === name);
+        const entry = coreEntry ?? catalogue.find(name);
+
         if (!entry) {
             throw new HttpError(404, `Unknown tool "${name}".`);
         }
 
         // The body is validated before either branch runs, so a swallowed parse
-        // failure (`{}` from the service loader) cannot reach `entry.tool` with
-        // no arguments — see TOOL_WRAPPER_MESSAGE above.
+        // failure (`{}` from the service loader) cannot reach a tool with no
+        // arguments — see TOOL_WRAPPER_MESSAGE above.
         const body = requireObjectBody<ToolCallRequest>(await readBody<ToolCallRequest>());
 
         if (!Object.prototype.hasOwnProperty.call(body, 'parameters')) {
             throw new HttpError(400, TOOL_WRAPPER_MESSAGE);
         }
 
+        // A present-but-unusable id (`0`, `true`, `{}`) must not be coerced into a
+        // session lookup: it would answer 404 for a request that is really a 400.
+        if (body.sessionId !== undefined && typeof body.sessionId !== 'string') {
+            throw new HttpError(400, '`sessionId` must be a string when present.');
+        }
+
         const started = Date.now();
+
+        // Session-bound core tool: real harness, real session state.
+        if (entry.sessionBound === true) {
+            const sessionId = body.sessionId;
+
+            // An empty string is "no session" for this purpose: the tool cannot run
+            // without a harness, and the message says how to fix it.
+            if (sessionId === undefined || sessionId.length === 0) {
+                throw new HttpError(
+                    400,
+                    `Tool "${name}" runs inside a session; send a "sessionId" with the call.`
+                );
+            }
+
+            try {
+                const result = await store.callTool(sessionId, name, body.parameters as never);
+                const payload: ToolCallResult = { ok: true, result, durationMs: Date.now() - started };
+                return { kind: 'json', status: 200, body: payload };
+            } catch (error) {
+                // Unknown session (404), a busy session (409, run or another
+                // manual call), and a core tool the session's harness does not
+                // register (delegate without subagents, 404) are REQUEST failures:
+                // the client must be able to distinguish "did not run" from "ran
+                // and failed".
+                if (error instanceof SessionError) throw error;
+
+                // A tool that ran and threw is data, exactly like a throwing
+                // catalogue tool below.
+                const payload: ToolCallResult = {
+                    ok: false,
+                    error: { message: messageOf(error) },
+                    durationMs: Date.now() - started
+                };
+                return { kind: 'json', status: 200, body: payload };
+            }
+        }
 
         // A listed-but-unconfigured tool is not a 404 and not a fake success: it
         // is a tool failure reported as data, exactly like a throwing tool. The
@@ -460,15 +581,111 @@ export const createHarnessApi = ({
             }
 
             // `/presets` is an alias of `/harnesses` so canonical clients can use
-            // catalogue language while standalone clients keep the old name.
-            if ((head === 'harnesses' || head === 'presets') && segments.length === 1) {
-                if (method !== 'GET') throw new HttpError(405, `Use GET for ${mount}/${head}.`);
+            // catalogue language while standalone clients keep the old name. Only
+            // the canonical `/harnesses` mount accepts writes (POST/PATCH): an
+            // alias must not become a second, undocumented mutation surface.
+            if (head === 'harnesses' && segments.length === 1) {
+                if (method === 'GET') {
+                    const index: HarnessIndex = {
+                        harnesses: describeAll(),
+                        defaults,
+                        agents: agentList()
+                    };
+                    return { kind: 'json', status: 200, body: index };
+                }
+
+                if (method === 'POST') {
+                    const body = requireObjectBody<CreateHarnessRequest>(
+                        await readBody<CreateHarnessRequest>()
+                    );
+
+                    // Reject instruction/provider/tool fields outright: only a
+                    // trusted agent id is a valid selection.
+                    requireKnownFields(body, CREATE_HARNESS_FIELDS);
+
+                    // Semantic validation (known agents, duplicate ids, reserved
+                    // names, title bounds) belongs to the registry, which throws a
+                    // HarnessRegistryError with the right status.
+                    const preset = registry.create({
+                        name: body.name,
+                        ...(body.title === undefined ? {} : { title: body.title }),
+                        ...(body.description === undefined ? {} : { description: body.description }),
+                        primary: body.primary,
+                        ...(body.subagents === undefined ? {} : { subagents: body.subagents }),
+                        // Per-agent model overrides (R9). Shape (object of strings)
+                        // is the registry's semantic validation, not this layer's:
+                        // it knows the final member set and the id bounds.
+                        ...(body.agentModels === undefined
+                            ? {}
+                            : { agentModels: body.agentModels })
+                    });
+
+                    return {
+                        kind: 'json',
+                        status: 201,
+                        body: { harness: describeHarness(preset, catalogue) }
+                    };
+                }
+
+                throw new HttpError(405, `Use GET or POST for ${mount}/harnesses.`);
+            }
+
+            if (head === 'presets' && segments.length === 1) {
+                if (method !== 'GET') throw new HttpError(405, `Use GET for ${mount}/presets.`);
 
                 const index: HarnessIndex = {
-                    harnesses: presets.map((preset) => describePreset(preset, catalogue)),
-                    defaults
+                    harnesses: describeAll(),
+                    defaults,
+                    agents: agentList()
                 };
                 return { kind: 'json', status: 200, body: index };
+            }
+
+            // PATCH /harnesses/:name — override a built-in live harness's metadata
+            // or agent routing. Registry changes affect FUTURE sessions only; an
+            // existing session keeps its captured preset and descriptor.
+            if (head === 'harnesses' && segments.length === 2) {
+                if (method !== 'PATCH') {
+                    throw new HttpError(405, `Use PATCH for ${mount}/harnesses/:name.`);
+                }
+
+                const body = requireObjectBody<UpdateHarnessRequest>(
+                    await readBody<UpdateHarnessRequest>()
+                );
+
+                requireKnownFields(body, UPDATE_HARNESS_FIELDS);
+
+                if (UPDATE_HARNESS_FIELDS.every((field) => body[field] === undefined)) {
+                    throw new HttpError(
+                        400,
+                        `A patch must change at least one of: ${UPDATE_HARNESS_FIELDS.join(', ')}.`
+                    );
+                }
+
+                const preset = registry.update(first, {
+                    ...(body.title === undefined ? {} : { title: body.title }),
+                    ...(body.description === undefined ? {} : { description: body.description }),
+                    ...(body.primary === undefined ? {} : { primary: body.primary }),
+                    ...(body.subagents === undefined ? {} : { subagents: body.subagents }),
+                    // Present = REPLACE the override map; absent = keep it (minus
+                    // members the patch just removed, which the registry drops).
+                    ...(body.agentModels === undefined
+                        ? {}
+                        : { agentModels: body.agentModels })
+                });
+
+                return {
+                    kind: 'json',
+                    status: 200,
+                    body: { harness: describeHarness(preset, catalogue) }
+                };
+            }
+
+            // GET /agents — the trusted agent registry. Values are catalogue data
+            // (src/agents); no client input reaches this list.
+            if (head === 'agents' && segments.length === 1) {
+                if (method !== 'GET') throw new HttpError(405, `Use GET for ${mount}/agents.`);
+                return { kind: 'json', status: 200, body: { agents: agentList() } };
             }
 
             if (head === 'models' && segments.length === 1) {
@@ -479,11 +696,34 @@ export const createHarnessApi = ({
             if (head === 'tools') {
                 if (segments.length === 1) {
                     if (method !== 'GET') throw new HttpError(405, `Use GET for ${mount}/tools.`);
-                    return { kind: 'json', status: 200, body: toolIndex(catalogue) };
+                    return { kind: 'json', status: 200, body: toolIndex(toolEntries()) };
+                }
+
+                // GET /tools/bootstrap — the same document as GET /tools, named for
+                // the client that synchronises its tool list from the bootstrap
+                // payload. An alias, not a second catalogue: one projection decides
+                // what a tool is.
+                if (segments.length === 2 && first === 'bootstrap') {
+                    if (method !== 'GET') {
+                        throw new HttpError(405, `Use GET for ${mount}/tools/bootstrap.`);
+                    }
+                    return { kind: 'json', status: 200, body: toolIndex(toolEntries()) };
                 }
 
                 if (segments.length === 2) {
                     if (method !== 'POST') throw new HttpError(405, 'Use POST to call a tool.');
+                    return await callToolRoute(first, readBody);
+                }
+
+                // POST /tools/:name/call — the verb-named alias of the route above.
+                // Both spellings reach the same dispatcher, so a client that reads
+                // "call a tool" as a `/call` suffix (the wording of the R8 contract)
+                // is not answered with a 404 for a request the server understands.
+                // The canonical route stays the short one.
+                if (segments.length === 3 && second === 'call') {
+                    if (method !== 'POST') {
+                        throw new HttpError(405, `Use POST for ${mount}/tools/:name/call.`);
+                    }
                     return await callToolRoute(first, readBody);
                 }
             }
@@ -565,9 +805,13 @@ export const createHarnessApi = ({
             // Every known failure becomes a JSON result; adapters never need to
             // replicate the status mapping. An unexpected error is still a 500
             // with the same `{ error: { message } }` envelope as before.
-            // SettingsError carries a 400 for the shared settings caps/type checks.
+            // SettingsError carries a 400 for the shared settings caps/type checks;
+            // HarnessRegistryError carries 400/403/404/409 for create/patch.
             const status =
-                error instanceof HttpError || error instanceof SessionError || error instanceof SettingsError
+                error instanceof HttpError ||
+                error instanceof SessionError ||
+                error instanceof SettingsError ||
+                error instanceof HarnessRegistryError
                     ? error.status
                     : 500;
             return { kind: 'json', status, body: { error: { message: messageOf(error) } } };

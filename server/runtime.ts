@@ -24,8 +24,8 @@
 //   - ./environment.ts  — the .env loader (Node entry points only)
 //   - ./config.ts       — HARNESS_* defaults and the mergeSettings credential rule
 
-import { createToolCatalogue } from '../harnesses';
-import type { ToolCatalogue } from '../harnesses';
+import { createHarnessRegistry, createToolCatalogue, describeHarness } from '../harnesses';
+import type { HarnessRegistry, ToolCatalogue } from '../harnesses';
 import type { RunnerSettings } from '../harnesses/types';
 import { createHarnessApi } from './api';
 import type { HarnessApi } from './api';
@@ -38,6 +38,9 @@ export type HarnessRuntime = {
     store: SessionStore;
     defaults: HarnessIndex['defaults'];
     catalogue: ToolCatalogue;
+    // The shared in-memory harness registry, so a canonical route module and the
+    // standalone adapter resolve sessions and accept create/patch identically.
+    registry: HarnessRegistry;
     // Dispatcher bound to the mount the service exposes.
     api: HarnessApi;
 };
@@ -52,6 +55,10 @@ export type HarnessRuntimeOptions = {
     // own settings; the dispatcher only uses it for sessions and health.
     catalogue?: ToolCatalogue;
     store?: SessionStore;
+    // Inject a registry (tests). When omitted a fresh one is created and shared by
+    // the store and the dispatcher; an injected store must have been built with
+    // the same registry, or a created harness would not resolve.
+    registry?: HarnessRegistry;
     // Skip the .env load. Tests that inject every dependency use this to avoid
     // mutating process environment; production always loads.
     loadEnvironment?: boolean;
@@ -63,13 +70,25 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
     if (options.loadEnvironment !== false) loadEnvironmentFile();
 
     const configuration = loadConfiguration();
-    const store = options.store ?? new SessionStore(options.settings ?? configuration.settings);
+
+    // Catalogue first: the describer below needs it, and it is the runtime
+    // snapshot of which credential-backed tools this host can run.
     const catalogue = options.catalogue ?? createToolCatalogue();
+    const registry = options.registry ?? createHarnessRegistry();
+
+    // The store owns no catalogue, so bind its describer to this runtime's. A
+    // supplied store keeps its own registry/settings (tests) and is used as-is.
+    const store =
+        options.store ??
+        new SessionStore(options.settings ?? configuration.settings, registry, (preset) =>
+            describeHarness(preset, catalogue)
+        );
+
     const defaults = options.defaults ?? configuration.defaults;
 
-    const api = createHarnessApi({ store, defaults, catalogue });
+    const api = createHarnessApi({ store, defaults, registry, catalogue });
 
-    return { store, defaults, catalogue, api };
+    return { store, defaults, catalogue, registry, api };
 };
 
 // Module-level singleton: every discovered service route shares one store, so a

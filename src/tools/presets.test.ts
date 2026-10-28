@@ -11,11 +11,10 @@ import { join } from 'node:path';
 import {
     agent,
     harness,
-    javascriptSyntax,
     listFiles,
-    pythonSyntax,
     readFile,
     runCommand,
+    syntaxCheck,
     writeFile
 } from '@underload/harness';
 import type { HarnessStream, HarnessStreamEvent } from '@underload/harness';
@@ -55,36 +54,67 @@ const answer = (text: string): HarnessStreamEvent[] => [
     { type: 'done', stopReason: 'stop', toolCalls: [] }
 ];
 
-describe('javascriptSyntax', () => {
-    it('is callable on its own', async () => {
-        await expect(javascriptSyntax('const a = 1; function f() { return a; }')).resolves.toBe(true);
-        await expect(javascriptSyntax('const = ;')).resolves.toBe(false);
+describe('syntaxCheck', () => {
+    it('checks JavaScript when the caller names the language', async () => {
+        await expect(
+            syntaxCheck({ code: 'const a = 1; function f() { return a; }', language: 'javascript' })
+        ).resolves.toBe(true);
+        await expect(syntaxCheck({ code: 'const = ;', language: 'javascript' })).resolves.toBe(false);
     });
 
-    it('accepts a whole program and rejects module syntax', async () => {
-        await expect(javascriptSyntax('for (const x of [1]) { console.log(x); }')).resolves.toBe(true);
+    it('parses JavaScript as a classic script only', async () => {
+        await expect(
+            syntaxCheck({ code: 'for (const x of [1]) { console.log(x); }', language: 'javascript' })
+        ).resolves.toBe(true);
         // Classic-script parser: import/export is module syntax.
-        await expect(javascriptSyntax('import x from "y";')).resolves.toBe(false);
+        await expect(syntaxCheck({ code: 'import x from "y";', language: 'javascript' })).resolves.toBe(
+            false
+        );
     });
 
-    it('has a standard tool shape', () => {
-        expect(javascriptSyntax.name).toBe('javascriptSyntax');
-        expect(javascriptSyntax.description).toContain('JavaScript');
-        expect(javascriptSyntax.parameters).toMatchObject({ type: 'object', required: ['code'] });
-    });
-});
-
-describe('pythonSyntax', () => {
-    it('is callable on its own', async () => {
-        await expect(pythonSyntax('def f(x):\n    return x + 1')).resolves.toBe(true);
-        await expect(pythonSyntax('def f(x) return x')).resolves.toBe(false);
+    it('checks Python when the caller names the language', async () => {
+        await expect(
+            syntaxCheck({ code: 'def f(x):\n    return x + 1', language: 'python' })
+        ).resolves.toBe(true);
+        await expect(syntaxCheck({ code: 'def f(x) return x', language: 'python' })).resolves.toBe(
+            false
+        );
     });
 
     it('does not execute the code it checks', async () => {
-        // If this ran, it would create the file.
-        await expect(pythonSyntax('open("executed.txt", "w").write("x")')).resolves.toBe(true);
+        // If either ran, it would create the file.
+        await expect(
+            syntaxCheck({ code: 'open("executed.txt", "w").write("x")', language: 'python' })
+        ).resolves.toBe(true);
+        await expect(
+            syntaxCheck({
+                code: 'require("node:fs").writeFileSync("executed-js.txt", "x");',
+                language: 'javascript'
+            })
+        ).resolves.toBe(true);
 
         await expect(readFile('executed.txt')).rejects.toThrow();
+        await expect(readFile('executed-js.txt')).rejects.toThrow();
+    });
+
+    it('rejects an unsupported language instead of guessing', async () => {
+        // The schema's enum catches a model call; a direct call bypasses the
+        // schema, so the implementation refuses rather than returning a verdict.
+        await expect(
+            syntaxCheck({ code: 'puts 1', language: 'ruby' as never })
+        ).rejects.toThrow(
+            'syntaxCheck requires language to be "javascript" or "python"; received "ruby".'
+        );
+    });
+
+    it('has a standard tool shape', () => {
+        expect(syntaxCheck.name).toBe('syntaxCheck');
+        expect(syntaxCheck.description).toContain('JavaScript');
+        expect(syntaxCheck.description).toContain('Python');
+        expect(syntaxCheck.parameters).toMatchObject({
+            type: 'object',
+            required: ['code', 'language']
+        });
     });
 });
 
@@ -148,20 +178,25 @@ describe('runCommand', () => {
 });
 
 describe('presets inside a harness', () => {
-    it('ships tags and stays discoverable rather than core', () => {
-        // Every preset is searchable: a harness that registers the whole family
-        // still declares only getTools until the model asks for a capability.
+    it('ships every preset searchable, file tools included', () => {
         expect(readFile.tags).toEqual(['files', 'read', 'filesystem']);
-        expect(pythonSyntax.tags).toEqual(['code', 'syntax', 'python', 'validation']);
+        expect(syntaxCheck.tags).toEqual([
+            'code',
+            'syntax',
+            'javascript',
+            'python',
+            'validation'
+        ]);
         expect(readFile.visibility).toBe('searchable');
         expect(runCommand.visibility).toBe('searchable');
+        expect(syntaxCheck.visibility).toBe('searchable');
     });
 
-    it('registers under its export name and runs from a model tool call', async () => {
+    it('registers a file tool under its export name and runs it after discovery', async () => {
         const entry = agent({
             model: 'm',
             stream: scripted([
-                callTool('c0', 'getTools', '{"tags":["files","read"]}'),
+                callTool('c0', 'requestTools', '{"tags":["read"]}'),
                 callTool('c1', 'readFile', '{"path":"harness.txt"}'),
                 answer('read it')
             ])
@@ -177,25 +212,41 @@ describe('presets inside a harness', () => {
         const message = await writer('read the file');
 
         expect(message.content).toBe('read it');
-        // user -> getTools call -> result -> readFile call -> result -> answer
+        // user -> requestTools -> readFile call -> result -> answer. Discovery is
+        // OR-ranked, so description mentions of "read" ("Read-only", "Does not
+        // read .gitignore files.") also enable those tools as weak matches.
+        expect(JSON.parse((entry.messages[2] as { content: string }).content).enabled).toEqual([
+            'readFile',
+            'gitDiff',
+            'globFiles',
+            'searchFiles'
+        ]);
         expect((entry.messages[4] as { content: string }).content).toBe('seeded content');
     });
 
-    it('unwraps a single-property schema before execute sees it', async () => {
-        // pythonSyntax declares one property (`code`), so the harness hands the
-        // implementation the string, exactly like a direct call would.
+    it('discovers syntaxCheck and hands it the whole two-property object', async () => {
+        // syntaxCheck declares `code` and `language`, so the single-property rule
+        // does not apply: the implementation receives the object a direct call
+        // would pass.
         const entry = agent({
             model: 'm',
             stream: scripted([
-                callTool('c0', 'getTools', '{"tags":["python"]}'),
-                callTool('c1', 'pythonSyntax', '{"code":"def f():\\n    pass"}'),
+                callTool('c0', 'requestTools', '{"tags":["python"]}'),
+                callTool(
+                    'c1',
+                    'syntaxCheck',
+                    '{"code":"def f():\\n    pass","language":"python"}'
+                ),
                 answer('valid')
             ])
         });
 
-        const writer = harness({ agents: { writer: entry }, tools: { pythonSyntax } });
+        const writer = harness({ agents: { writer: entry }, tools: { syntaxCheck } });
         await writer('check it');
 
+        expect(JSON.parse((entry.messages[2] as { content: string }).content).enabled).toEqual([
+            'syntaxCheck'
+        ]);
         expect((entry.messages[4] as { content: string }).content).toBe('true');
     });
 });

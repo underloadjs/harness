@@ -234,10 +234,10 @@ export type Agent = {
 // A large catalogue cannot be declared on every request — thousands of tools
 // would flood the context window before the first prompt. So a request declares:
 //   - every 'core' tool (keep that list tiny), and
-//   - every 'searchable' tool that getTools has already enabled.
+//   - every 'searchable' tool that requestTools has already enabled.
 export type ToolVisibility = 'core' | 'searchable';
 
-// One entry in a getTools result: enough for the model to decide whether to call
+// One entry in a requestTools result: enough for the model to decide whether to call
 // it, without shipping the whole schema again.
 export type ToolMatch = {
     name: string;
@@ -245,22 +245,33 @@ export type ToolMatch = {
     tags: string[];
 };
 
-// The result of a getTools call, and the return value of the pure
+// The result of a requestTools call, and the return value of the pure
 // `searchTools()` helper. Shaped as data because it travels back to the model as
 // a tool result.
+//
+// DISCOVERY CAP (R7): at most MAX_DISCOVERY_MATCHES (5) matches are returned and
+// enabled per request. The cap is deliberately tight: five schemas is a focused
+// shortlist the model can actually weigh, and it keeps one broad tag from
+// re-flooding the context. Anything beyond that is reported as a COUNT only —
+// `remaining` — so the model refines its tags to drill deeper instead of paging
+// through a list of names it cannot see.
 export type ToolSearchResult = {
-    // Tools the model can call from the next turn onward, best match first. This
-    // list is capped (10 by default, 50 maximum) so a query that matches a whole
-    // family cannot flood the context either.
+    // Tools the model can call from the next turn onward, best match first. At
+    // most 5 entries (see MAX_DISCOVERY_MATCHES in core/discovery.ts); a caller
+    // may pass a smaller `limit` but can never raise the cap.
     enabled: string[];
     // Metadata for the enabled tools, in the same order.
     tools: ToolMatch[];
+    // How many additional tools matched the query but were excluded by the cap.
+    // Always present (0 when every match fits). No names are exposed for the
+    // excluded tail: tag refinement, not pagination, is the way to reach them.
+    remaining: number;
     // Query tags that matched no tag, name, or description.
     unmatchedTags?: string[];
     // Every tag in the searchable catalogue. Present only when nothing matched,
     // so the model can retry with real vocabulary instead of guessing.
     availableTags?: string[];
-    // True when more tools matched than the cap and the tail was dropped.
+    // Retained for compatibility: true exactly when `remaining > 0`.
     truncated?: boolean;
 };
 
@@ -282,7 +293,7 @@ export type ToolCreation = {
     // Wire name the model calls. Must match the registry-safe pattern in
     // src/core/creation.ts and must not collide with a registered name.
     name: string;
-    // Shown to the model and used by getTools matching.
+    // Shown to the model and used by requestTools matching.
     description: string;
     // Capability tags. Required: an untagged creation could never be discovered.
     tags: readonly string[];
@@ -300,7 +311,7 @@ export type ToolCreationResult = {
     tags: string[];
     parameters?: Record<string, unknown>;
     // A created tool is registered `searchable` and enabled at once, so the very
-    // next turn can call it without a second getTools round.
+    // next turn can call it without a second requestTools round.
     enabled: true;
 };
 
@@ -369,7 +380,7 @@ export type TodoToolset = {
 // What a tool implementation is handed when the model calls it.
 //
 // The harness fields are optional because a tool can also be executed on its
-// own: `pythonSyntax('print(1)')` runs the same implementation with no agent, no
+// own: `readFile('package.json')` runs the same implementation with no agent, no
 // registry, and no run(). A tool that needs them must check, and the presets in
 // src/tools deliberately do not.
 export type ToolContext<TParameters = any> = {
@@ -393,11 +404,11 @@ export type ToolConfiguration<TParameters = any, TResult = any> = {
     // Shown to the model. Required — an undescribed tool is an unusable tool.
     description: string;
     // Capability tags, used by tool discovery to find close matches. Required:
-    // an untagged tool is invisible to getTools, so it could never be found.
+    // an untagged tool is invisible to requestTools, so it could never be found.
     // Stored trimmed, lowercased, and deduplicated.
     tags: readonly string[];
     // 'core' tools are declared on every request; 'searchable' ones (the
-    // default) stay hidden until getTools enables them.
+    // default) stay hidden until requestTools enables them.
     visibility?: ToolVisibility;
     // JSON Schema for the arguments. A TypeBox schema works as-is: TypeBox
     // output is plain JSON Schema.
@@ -410,9 +421,9 @@ export type ToolConfiguration<TParameters = any, TResult = any> = {
 // A tool is an executable object: it can be called directly, or registered on a
 // harness and called by the model. Both paths run the same implementation.
 //
-//     const pythonSyntax = tool<string, boolean>({...});
-//     await pythonSyntax('print(1)');         // direct, no harness
-//     harness({ tools: { pythonSyntax } });   // the model calls it
+//     const readFile = tool<string, string>({...});
+//     await readFile('package.json');         // direct, no harness
+//     harness({ tools: { readFile } });       // the model calls it
 export type Tool<TParameters = any, TResult = any> = {
     // Execute directly. The argument is the parameter value, exactly as
     // `execute` receives it.
@@ -508,7 +519,17 @@ export type HarnessEvent =
     | { type: 'text'; agent: string; delta: string }
     | { type: 'reasoning'; agent: string; delta: string }
     | { type: 'tool_call'; agent: string; call: HarnessToolCall }
-    | { type: 'tool_result'; agent: string; name: string; content: string; isError: boolean }
+    // `callId` is the id of the tool_call this result answers. Optional so an
+    // older recorded event (or a hand-written progress reporter) stays valid, and
+    // so a same-name pairing in a UI can be exact instead of positional.
+    | {
+          type: 'tool_result';
+          agent: string;
+          name: string;
+          callId?: string;
+          content: string;
+          isError: boolean;
+      }
     | { type: 'done'; agent: string; message: HarnessAssistantMessage }
     | { type: 'error'; agent: string; error: HarnessErrorInfo };
 
@@ -545,7 +566,7 @@ export type HarnessConfiguration = {
 
     // Every tool the harness can run. Keyed by the name the model calls. Only
     // `visibility: 'core'` tools are declared up front; the rest are found
-    // through the built-in getTools tool and enabled for the next turn.
+    // through the built-in requestTools tool and enabled for the next turn.
     tools?: Record<string, Tool>;
     // Preload the bundled preset catalogue (src/tools/) into the registry. True by
     // default: discovery exists so a large catalogue costs nothing until it is
@@ -583,7 +604,7 @@ export type Harness = {
     // not configured.
     readonly subagents: Readonly<Record<string, Agent>>;
     // The registered tools, keyed by the names the model calls. Includes the
-    // built-in getTools, createTool, and todoTools entries, plus delegate when
+    // built-in requestTools, createTool, and todoTools entries, plus delegate when
     // there is at least one subagent.
     readonly tools: Readonly<Record<string, Tool>>;
     // Register a tool from source at runtime. This is the host-side path the
@@ -591,9 +612,36 @@ export type Harness = {
     // "searchable and enabled at once" behaviour. Throws HarnessError on invalid
     // or colliding input, so a host sees creation failures as exceptions.
     createTool: (configuration: ToolCreation) => Tool;
+    // Execute one registered tool by name, outside the model's discovery gate
+    // (R8). This is the server/host path for an EXPLICIT user action — the CLI or
+    // the UI's Tools tab — and it runs the SAME session-bound implementation the
+    // model calls, so discovery, runtime creation, todos, and delegation all
+    // mutate this harness exactly as they would during a run.
+    //
+    // `parameters` is the value `execute` receives, i.e. already unwrapped by the
+    // single-property rule: `executeTool('readFile', 'package.json')`, never
+    // `{ path: 'package.json' }` for a one-property schema. Same convention as the
+    // tool's direct callable.
+    //
+    // GATING: discovery gates the MODEL, not its operator. A searchable tool that
+    // requestTools has not enabled is still runnable here; the model remains
+    // unable to call it. Reserved policy is NOT bypassed: `createTool` here goes
+    // through the same validated registration path (budget, name rules,
+    // collisions, compilation), and `delegate` still requires a harness that
+    // actually registered it (no subagents means no delegate tool).
+    //
+    // Throws HarnessError when the name is not registered in this harness, or
+    // whatever the implementation throws; unlike the model path there is no
+    // tool-result envelope, because a host caller can see an exception.
+    executeTool: (name: string, parameters: unknown) => Promise<unknown>;
     // Names of the applied plugins, in order.
     readonly plugins: readonly string[];
-    // Reset the entry agent's conversation, forget which tools getTools had
+    // Names of the tools requestTools has enabled so far, in discovery order.
+    // Persists for the harness's lifetime (not just one call), which is what lets a
+    // later turn call a tool discovered earlier. Copied on read; `reset()` empties
+    // it.
+    readonly discoveredTools: string[];
+    // Reset the entry agent's conversation, forget which tools requestTools had
     // enabled, and clear the session todo list, so the next run starts from the
     // core set again. Created tools stay registered (they are part of the
     // catalogue), just not enabled.

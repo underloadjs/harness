@@ -35,7 +35,7 @@ const answer = (text: string): HarnessStreamEvent[] => [
 const idle = () => agent({ model: 'm', stream: scripted([answer('idle')]) });
 
 const discoveryAndSearch = (): HarnessStreamEvent[][] => [
-    callTool('c0', 'getTools', '{"tags":["web","search"]}'),
+    callTool('c0', 'requestTools', '{"tags":["web","search"]}'),
     callTool('c1', 'websearch', '{"query":"harness","maxResults":2}'),
     answer('found it')
 ];
@@ -157,7 +157,7 @@ describe('registration', () => {
 });
 
 describe('discovery and execution', () => {
-    it('is enabled by getTools and returns the normalized result', async () => {
+    it('is enabled by requestTools and returns the normalized result', async () => {
         const fetchMock = stubFetch();
         const events: string[] = [];
 
@@ -194,7 +194,7 @@ describe('discovery and execution', () => {
             contents: { highlights: true }
         });
 
-        // user -> getTools call -> result -> websearch call -> result -> answer
+        // user -> requestTools call -> result -> websearch call -> result -> answer
         const resultMessage = entry.messages[4] as { role: string; content: string };
         expect(resultMessage.role).toBe('tool');
 
@@ -215,7 +215,7 @@ describe('discovery and execution', () => {
         expect(JSON.parse(resultMessage.content)).toEqual(expected);
 
         // Nothing secret in the transcript or the progress stream. The tool is
-        // declared (getTools enabled it), so the declaration text is in history.
+        // declared (requestTools enabled it), so the declaration text is in history.
         const transcript = JSON.stringify(entry.messages);
         expect(transcript).not.toContain('exa-secret-key');
         expect(transcript).not.toContain('EXA_API_KEY');
@@ -272,7 +272,7 @@ describe('discovery and execution', () => {
         const entry = agent({
             model: 'm',
             stream: scripted([
-                callTool('c0', 'getTools', '{"tags":["web","search"]}'),
+                callTool('c0', 'requestTools', '{"tags":["web","search"]}'),
                 callTool('c1', 'websearch', '{"query":"harness"}'),
                 answer('done')
             ])

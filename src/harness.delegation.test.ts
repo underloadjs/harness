@@ -137,10 +137,10 @@ describe('delegate', () => {
         const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
         await writer('go');
 
-        // The primary sees getTools, createTool, delegate. The subagent never sees
+        // The primary sees requestTools, createTool, delegate. The subagent never sees
         // the delegation control.
-        expect(declaredNames(seenWriter[0])).toEqual(['getTools', 'createTool', 'todoTools', 'delegate']);
-        expect(declaredNames(seenResearcher[0])).toEqual(['getTools', 'createTool', 'todoTools']);
+        expect(declaredNames(seenWriter[0])).toEqual(['requestTools', 'createTool', 'todoTools', 'delegate']);
+        expect(declaredNames(seenResearcher[0])).toEqual(['requestTools', 'createTool', 'todoTools']);
     });
 
     it('runs the subagent under its own instructions and returns only its answer', async () => {

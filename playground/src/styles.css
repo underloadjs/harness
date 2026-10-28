@@ -7,6 +7,7 @@
     --bg-elevated: #12151c;
     --bg-input: #0e1117;
     --bg-bar: #0f1218;
+    --bg-deep: #0a0d13;
     --border: #232a38;
     --border-strong: #2f3849;
     --text: #d8deea;
@@ -45,6 +46,19 @@ body {
     height: 100%;
 }
 
+[hidden] {
+    display: none !important;
+}
+
+button {
+    font: inherit;
+}
+
+:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
 /* Topbar --------------------------------------------------------------- */
 
 .topbar {
@@ -52,7 +66,7 @@ body {
     align-items: center;
     justify-content: space-between;
     gap: 16px;
-    padding: 13px 20px;
+    padding: 12px 20px;
     border-bottom: 1px solid var(--border);
     background: linear-gradient(180deg, #11141b, var(--bg-bar));
 }
@@ -89,7 +103,7 @@ body {
     align-items: center;
     gap: 7px;
     flex: 0 1 auto;
-    max-width: 60%;
+    max-width: 62%;
     padding: 4px 11px;
     border: 1px solid var(--border-strong);
     border-radius: 999px;
@@ -151,25 +165,42 @@ body {
     border-color: rgba(248, 113, 113, 0.45);
 }
 
-/* Layout --------------------------------------------------------------- */
+/* Three-column shell --------------------------------------------------- */
 
-.layout {
+.shell {
     display: grid;
-    grid-template-columns: 272px minmax(0, 1fr);
+    grid-template-columns: 248px minmax(0, 1fr) 320px;
     flex: 1;
     min-height: 0;
 }
 
-.sidebar {
+.rail {
     display: flex;
     flex-direction: column;
     gap: 12px;
-    padding: 16px;
-    border-right: 1px solid var(--border);
+    padding: 14px;
+    min-height: 0;
     overflow: auto;
 }
 
-.sidebar-head {
+.rail-left {
+    border-right: 1px solid var(--border);
+    background: var(--bg-bar);
+}
+
+.rail-right {
+    border-left: 1px solid var(--border);
+    background: var(--bg-bar);
+}
+
+.rail-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.rail-title {
     margin: 0;
     color: var(--muted);
     font-family: var(--mono);
@@ -179,153 +210,62 @@ body {
     letter-spacing: 0.12em;
 }
 
-.presets {
+.rail-section {
     display: flex;
     flex-direction: column;
-    gap: 7px;
+    gap: 8px;
 }
 
-.preset {
+/* Harness rail --------------------------------------------------------- */
+
+.harness-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.harness-item {
     display: flex;
     flex-direction: column;
     gap: 1px;
-    padding: 9px 11px;
+    padding: 8px 10px;
     border: 1px solid transparent;
     border-radius: var(--radius);
     background: var(--bg-elevated);
     color: inherit;
-    font: inherit;
     text-align: left;
     cursor: pointer;
     transition: border-color 120ms ease, background 120ms ease;
 }
 
-.preset:hover {
+.harness-item:hover:not(:disabled) {
     border-color: var(--border-strong);
 }
 
-.preset[aria-pressed='true'] {
+.harness-item[aria-pressed='true'] {
     border-color: var(--accent);
     background: var(--accent-soft);
 }
 
-.preset-title {
+.harness-item:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.harness-title {
     font-weight: 600;
 }
 
-.preset-name {
+.harness-name {
     color: var(--accent);
     font-family: var(--mono);
     font-size: 11px;
 }
 
-.preset-meta {
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 11px;
-}
-
-[hidden] {
-    display: none !important;
-}
-
-/* Mode switch ---------------------------------------------------------- */
-.modes {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 6px;
-}
-
-.mode {
-    padding: 6px 8px;
-    border: 1px solid var(--border-strong);
-    border-radius: 8px;
-    background: transparent;
-    color: var(--muted);
-    font: inherit;
-    font-size: 12px;
-    cursor: pointer;
-}
-
-.mode[aria-pressed='true'] {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-    color: var(--text);
-}
-
-/* Tool catalogue ------------------------------------------------------- */
-
-.tool-list {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-}
-
-.tool-group {
-    margin: 10px 0 2px;
+.harness-meta {
     color: var(--muted);
     font-family: var(--mono);
     font-size: 10.5px;
-    letter-spacing: 0.09em;
-    text-transform: uppercase;
-}
-
-.tool-button {
-    display: flex;
-    align-items: baseline;
-    justify-content: space-between;
-    gap: 8px;
-    padding: 7px 10px;
-    border: 1px solid transparent;
-    border-radius: 8px;
-    background: var(--bg-elevated);
-    color: inherit;
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
-}
-
-.tool-button:hover {
-    border-color: var(--border-strong);
-}
-
-.tool-button[aria-pressed='true'] {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-}
-
-.tool-name {
-    font-family: var(--mono);
-    font-size: 12px;
-}
-
-.tool-kind {
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 10.5px;
-}
-
-/* A listed-but-unconfigured tool (websearch without a provider key) stays
-   clickable so its hint and schema are readable, but the state must not look
-   like a working tool. Colour is decoration; the text says "unconfigured". */
-.tool-button[data-availability='unconfigured'] .tool-kind {
-    color: var(--warn);
-}
-
-/* Session directory ----------------------------------------------------- */
-/* Server-owned conversations. The active row is the session this card is
-   pointed at; the status text (not just colour) says whether it is running. */
-
-.sessions {
-    display: flex;
-    flex-direction: column;
-    gap: 7px;
-}
-
-.sessions-actions {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 6px;
 }
 
 .button.small {
@@ -333,101 +273,147 @@ body {
     font-size: 12px;
 }
 
-.session-list {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
+/* Create harness ------------------------------------------------------- */
+
+.create-harness {
+    padding: 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    background: var(--bg-input);
 }
 
-.session {
+.create-form {
     display: flex;
     flex-direction: column;
-    gap: 2px;
-    padding: 7px 10px;
-    border: 1px solid transparent;
-    border-radius: 8px;
-    background: var(--bg-elevated);
-    color: inherit;
-    font: inherit;
-    text-align: left;
+    gap: 10px;
+}
+
+.create-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 2px;
+}
+
+.create-title {
+    margin: 0;
+    font-size: 14px;
+}
+
+.icon-button {
+    padding: 0 6px;
+    border: 0;
+    background: transparent;
+    color: var(--muted);
+    font-size: 16px;
     cursor: pointer;
 }
 
-.session:hover {
-    border-color: var(--border-strong);
+.icon-button:hover {
+    color: var(--text);
 }
 
-.session[data-active='true'] {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-}
-
-.session-harness {
-    font-family: var(--mono);
-    font-size: 11.5px;
-    color: var(--accent);
-}
-
-.session-meta {
+.create-label {
     color: var(--muted);
     font-family: var(--mono);
     font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
 }
 
-.session[data-status='running'] .session-meta {
-    color: var(--warn);
+.create-add-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 6px;
 }
 
-.session-prompt {
-    overflow: hidden;
-    color: var(--muted);
-    font-size: 11px;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-}
-
-/* Direct tool runner --------------------------------------------------- */
-
-.tool-card {
+.create-chosen {
     display: flex;
-    flex-direction: column;
-    gap: 12px;
-    padding: 16px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--bg-elevated);
+    flex-wrap: wrap;
+    gap: 5px;
 }
 
-.tool-note {
-    margin: 0;
+.create-empty {
     color: var(--muted);
-    font-size: 12.5px;
+    font-size: 11.5px;
 }
 
-.tool-note.is-warning {
-    color: var(--warn);
-}
-
-.tool-args {
-    min-height: 120px;
-    resize: vertical;
+.create-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    padding: 2px 4px 2px 8px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    background: var(--bg-elevated);
     font-family: var(--mono);
-    font-size: 12px;
+    font-size: 11px;
 }
 
-.tool-output .card-body {
-    max-height: 320px;
+.chip-remove {
+    padding: 0 4px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+}
+
+.chip-remove:hover {
+    color: var(--danger);
+}
+
+.create-error {
+    margin: 0;
+    color: var(--danger);
+    font-size: 11.5px;
+}
+
+.create-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 6px;
 }
 
 /* Endpoint ------------------------------------------------------------- */
 
 .endpoint {
+    margin-top: auto;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+}
+
+.endpoint-summary {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+    list-style: none;
+}
+
+.endpoint-summary::-webkit-details-marker {
+    display: none;
+}
+
+.endpoint-summary::before {
+    content: '▸';
+    display: inline-block;
+    margin-right: 6px;
+    transition: transform 120ms ease;
+}
+
+.endpoint[open] > .endpoint-summary::before {
+    transform: rotate(90deg);
+}
+
+.endpoint-body {
     display: flex;
     flex-direction: column;
     gap: 9px;
-    margin-top: auto;
-    padding-top: 14px;
-    border-top: 1px solid var(--border);
+    padding-top: 10px;
 }
 
 .field {
@@ -460,8 +446,6 @@ body {
     outline: 2px solid var(--accent-soft);
 }
 
-/* The model dropdown. Same box as .field-input, with a pointer only while it
-   can actually be changed (it is disabled during a catalogue lookup). */
 .field-select {
     cursor: pointer;
 }
@@ -471,10 +455,6 @@ body {
     cursor: default;
 }
 
-.field-hint.is-warning {
-    color: var(--warn);
-}
-
 .field-hint {
     margin: 0;
     color: var(--muted);
@@ -482,50 +462,595 @@ body {
     line-height: 1.45;
 }
 
-/* Main ----------------------------------------------------------------- */
+.field-hint.is-warning {
+    color: var(--warn);
+}
 
-.main {
+/* Centre --------------------------------------------------------------- */
+
+.center {
     display: flex;
     flex-direction: column;
     min-width: 0;
     min-height: 0;
 }
 
-.main-head {
+/* Chat / Tools tabs. Accessible role="tablist"; the selected tab is also the
+   panel's aria-labelledby. Text and border carry selection, not colour alone. */
+.tabs {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 4px;
+    padding: 6px 14px 0;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-bar);
+}
+
+.tab {
+    padding: 6px 14px;
+    border: 1px solid transparent;
+    border-bottom: 0;
+    border-radius: 8px 8px 0 0;
+    background: transparent;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.04em;
+    cursor: pointer;
+}
+
+.tab:hover:not(:disabled) {
+    color: var(--text);
+}
+
+.tab[aria-selected='true'] {
+    border-color: var(--border-strong);
+    background: var(--bg-elevated);
+    color: var(--text);
+}
+
+.tab:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+/* Tools tab ------------------------------------------------------------- */
+/* Full-width, keyed list of every server tool (core entries included) above the
+   manual runner. The right rail keeps its compact catalogue; both open the same
+   runner and a call always executes on the server. */
+
+.tools-pane {
+    gap: 12px;
+    padding: 14px;
+    overflow: auto;
+}
+
+.tools-tab-head {
     display: flex;
     flex-direction: column;
+    gap: 3px;
+}
+
+.tools-tab-title {
+    margin: 0;
+    font-size: 15px;
+    font-weight: 600;
+}
+
+.tools-tab-hint {
+    margin: 0;
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.tool-tab-list {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
     gap: 6px;
-    padding: 15px 20px 12px;
+    max-height: 32vh;
+    padding-right: 2px;
+    overflow: auto;
+}
+
+.tool-tab-group {
+    grid-column: 1 / -1;
+    margin: 6px 0 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+}
+
+.tool-tab-group:first-child {
+    margin-top: 0;
+}
+
+.tool-tab-button {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 8px 10px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: var(--bg-elevated);
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.tool-tab-button:hover:not(:disabled) {
+    border-color: var(--border-strong);
+}
+
+.tool-tab-button[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+.tool-tab-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.tool-tab-button[data-availability='unconfigured'] .tool-tab-kind {
+    color: var(--warn);
+}
+
+.tool-tab-name {
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.tool-tab-kind {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+}
+
+.tool-runner-slot {
+    display: flex;
+    flex: 1;
+    min-height: 0;
+}
+
+.tool-session {
+    padding: 7px 9px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--bg-input);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11.5px;
+}
+
+.tool-hint {
+    margin: 0;
+    color: var(--warn);
+}
+
+.harness-head {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding: 12px 20px 10px;
     border-bottom: 1px solid var(--border);
+}
+
+.harness-title-row {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    min-width: 0;
 }
 
 .main-title {
     margin: 0;
     font-size: 16px;
     font-weight: 600;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
-.main-description {
+.harness-name,
+.harness-id {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.harness-note {
     margin: 0;
-    max-width: 74ch;
     color: var(--muted);
-    font-size: 13px;
+    font-size: 12px;
 }
 
-.badges {
+/* Agent row ------------------------------------------------------------ */
+
+.agent-slot {
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-bar);
+}
+
+.agent-row-wrap {
     display: flex;
-    flex-wrap: wrap;
-    gap: 6px;
+    flex-direction: column;
+    gap: 8px;
+    max-width: 1180px;
+    margin: 0 auto;
 }
 
-.badge {
-    padding: 2px 8px;
+.agent-row {
+    display: flex;
+    align-items: stretch;
+    gap: 8px;
+    padding-bottom: 2px;
+    overflow-x: auto;
+}
+
+.agent-tile {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    flex: 0 0 auto;
+    min-width: 148px;
+    max-width: 220px;
+    /* The tile's own border is the dim track the activity ring sweeps around
+       (see .agent-tile[data-activity='active']::before). */
     border: 1px solid var(--border);
+    border-radius: 12px;
+    background: var(--bg-elevated);
+    transition: border-color 120ms ease, background 120ms ease;
+}
+
+.agent-tile[data-role='primary'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+/* Top row: promotion button + remove button. The model dropdown is a sibling
+   below, never inside the promotion button, so choosing a model cannot promote. */
+.agent-tile-top {
+    display: flex;
+    align-items: stretch;
+    flex: 1;
+    min-width: 0;
+}
+
+.agent-main {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    flex: 1;
+    min-width: 0;
+    padding: 8px 10px;
+    border: 0;
+    border-radius: 12px 0 0 0;
+    background: transparent;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.agent-main:disabled {
+    cursor: default;
+}
+
+.agent-main:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+/* Role is text first: the colour is decoration. */
+.agent-role {
+    width: fit-content;
+    padding: 0 6px;
+    border: 1px solid var(--border-strong);
     border-radius: 999px;
     color: var(--muted);
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 9.5px;
+    line-height: 16px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
 }
+
+.agent-tile[data-role='primary'] .agent-role {
+    border-color: rgba(122, 162, 255, 0.5);
+    color: var(--accent);
+}
+
+.agent-tile[data-role='secondary'] .agent-role {
+    border-color: rgba(251, 191, 36, 0.4);
+    color: var(--warn);
+}
+
+.agent-tile-name {
+    overflow: hidden;
+    font-family: var(--mono);
+    font-size: 12px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.agent-tile-title {
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.agent-remove {
+    padding: 0 8px;
+    border: 0;
+    border-radius: 0 12px 0 0;
+    background: transparent;
+    color: var(--muted);
+    font-size: 14px;
+    cursor: pointer;
+}
+
+.agent-remove:hover:not(:disabled) {
+    color: var(--danger);
+}
+
+.agent-remove:disabled {
+    opacity: 0.35;
+    cursor: not-allowed;
+}
+
+/* Agent activity ring --------------------------------------------------- */
+/* A conic-gradient arc sweeping around the tile border while the agent is active
+   in the current turn (distribution/comfy-dashboard global.ts:69-105 is the
+   reference pattern). @property makes the angle animatable; a browser without
+   support renders the static arc instead of losing the ring. The tile's own
+   border is the dim track.
+
+   `aria-busy` on the tile (agents.ts/activity.ts) is the assistive signal; the
+   ring is decoration, so reduced motion can freeze it without losing meaning. */
+
+@property --agent-ring-angle {
+    syntax: '<angle>';
+    initial-value: 0deg;
+    inherits: false;
+}
+
+.agent-tile[data-activity='active']::before {
+    content: '';
+    position: absolute;
+    inset: -1px;
+    padding: 1px;
+    border-radius: inherit;
+    background: conic-gradient(
+        from var(--agent-ring-angle, 0deg),
+        transparent 0deg,
+        transparent 250deg,
+        var(--accent) 330deg,
+        #b9cdff 360deg
+    );
+    -webkit-mask:
+        linear-gradient(#fff 0 0) content-box,
+        linear-gradient(#fff 0 0);
+    -webkit-mask-composite: xor;
+    mask:
+        linear-gradient(#fff 0 0) content-box,
+        linear-gradient(#fff 0 0);
+    mask-composite: exclude;
+    animation: agent-ring-spin 900ms linear infinite;
+    pointer-events: none;
+}
+
+@keyframes agent-ring-spin {
+    to {
+        --agent-ring-angle: 360deg;
+    }
+}
+
+
+.agent-model {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 8px 7px;
+    border-top: 1px solid var(--border);
+    border-radius: 0 0 12px 12px;
+}
+
+.agent-model-label {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 9.5px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+}
+
+.agent-model-select {
+    flex: 1;
+    min-width: 0;
+    padding: 2px 4px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-input);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 10.5px;
+}
+
+.agent-model-select:disabled {
+    opacity: 0.65;
+    cursor: not-allowed;
+}
+
+.agent-add {
+    flex: 0 0 auto;
+    width: 46px;
+    border: 1px dashed var(--border-strong);
+    border-radius: 12px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 19px;
+    cursor: pointer;
+}
+
+.agent-add:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+.agent-add:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.agent-picker {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    max-height: 330px;
+    padding: 10px;
+    overflow: auto;
+    border: 1px solid var(--border-strong);
+    border-radius: 12px;
+    background: var(--bg-input);
+}
+
+.agent-picker-hint {
+    margin: 0;
+    color: var(--muted);
+    font-size: 11.5px;
+}
+
+.agent-option {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 8px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: var(--bg-elevated);
+}
+
+.agent-option[data-state='member'] {
+    opacity: 0.65;
+}
+
+.agent-option-add {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    width: 100%;
+    padding: 2px 0;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.agent-option-add:disabled {
+    cursor: default;
+}
+
+.agent-option-name {
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.agent-option-title {
+    color: var(--text);
+    font-size: 12px;
+}
+
+.agent-option-description {
+    color: var(--muted);
+    font-size: 11.5px;
+}
+
+.agent-option-state {
+    margin-top: 2px;
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+.agent-option[data-state='member'] .agent-option-state {
+    color: var(--muted);
+}
+
+.agent-detail {
+    border-top: 1px solid var(--border);
+    padding-top: 4px;
+}
+
+.agent-detail-summary {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    cursor: pointer;
+}
+
+.agent-detail-body {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+    padding-top: 5px;
+}
+
+.agent-instruction {
+    margin: 0;
+    max-height: 160px;
+    overflow: auto;
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.45;
+    white-space: pre-wrap;
+}
+
+.agent-detail-label {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+.agent-guidelines {
+    margin: 0;
+    padding-left: 18px;
+    color: var(--muted);
+    font-size: 11.5px;
+}
+
+.agent-lock {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 6px;
+    margin: 0;
+    color: var(--warn);
+    font-size: 11.5px;
+}
+
+.link-button {
+    padding: 0;
+    border: 0;
+    background: none;
+    color: var(--accent);
+    font: inherit;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+    cursor: pointer;
+}
+
+/* Stage / log ---------------------------------------------------------- */
 
 .stage {
     display: flex;
@@ -539,8 +1064,6 @@ body {
     flex-direction: column;
     min-height: 0;
 }
-
-/* Log ------------------------------------------------------------------ */
 
 .log-wrap {
     flex: 1;
@@ -568,7 +1091,7 @@ body {
 }
 
 .empty-text {
-    margin: 0 0 10px;
+    margin: 0 0 8px;
 }
 
 .empty-hint {
@@ -662,7 +1185,6 @@ body {
 .tile-top {
     display: flex;
     align-items: center;
-    justify-content: space-between;
     gap: 8px;
     min-width: 0;
 }
@@ -673,11 +1195,20 @@ body {
     font-size: 10.5px;
 }
 
+/* Live then frozen elapsed time. Text carries the value; no colour-only state. */
+.tile-elapsed {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    font-variant-numeric: tabular-nums;
+}
+
 .tile-status {
     display: inline-flex;
     align-items: center;
     gap: 5px;
     min-width: 0;
+    margin-left: auto;
     color: var(--muted);
     font-family: var(--mono);
     font-size: 10.5px;
@@ -789,18 +1320,6 @@ body {
     text-transform: uppercase;
 }
 
-.agent-role {
-    padding: 0 6px;
-    border: 1px solid var(--border-strong);
-    border-radius: 999px;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 10px;
-    line-height: 16px;
-}
-
-/* The primary agent is the unmarked default; only a delegated agent needs a
-   label, and it is labelled in text as well as colour. */
 .agent[data-role='primary'] .agent-role {
     display: none;
 }
@@ -942,6 +1461,18 @@ body {
 
 .tool[data-state='error'] .tool-state {
     color: var(--danger);
+}
+
+/* Elapsed/final call duration, e.g. `running 1.2s`, `ok 812ms`. */
+.tool-duration {
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.tool-duration:not(:empty)::before {
+    content: '·';
+    margin-right: 6px;
+    color: var(--border-strong);
 }
 
 .tool-peek {
@@ -1108,7 +1639,7 @@ body {
     padding: 1px 5px;
     border: 1px solid var(--border);
     border-radius: 5px;
-    background: #0a0d13;
+    background: var(--bg-deep);
     font-family: var(--mono);
     font-size: 12px;
 }
@@ -1141,14 +1672,13 @@ body {
     overflow: auto;
     border: 1px solid var(--border);
     border-radius: 8px;
-    background: #0a0d13;
+    background: var(--bg-deep);
     color: #c7cedb;
     font-family: var(--mono);
     font-size: 12px;
     line-height: 1.55;
 }
 
-/* A fence inside rendered Markdown keeps the block spacing of prose. */
 .markdown .code-block {
     margin-bottom: 10px;
 }
@@ -1239,43 +1769,6 @@ body {
     font-weight: 600;
 }
 
-/* Card (direct tool runner) -------------------------------------------- */
-
-.card {
-    padding: 9px 12px;
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    background: var(--bg-input);
-}
-
-.card-head {
-    margin-bottom: 5px;
-    color: var(--warn);
-    font-family: var(--mono);
-    font-size: 11.5px;
-}
-
-.card-body {
-    max-height: 260px;
-    margin: 0;
-    overflow: auto;
-    color: #c7cedb;
-    font-family: var(--mono);
-    font-size: 11.5px;
-    line-height: 1.5;
-    white-space: pre-wrap;
-    word-break: break-word;
-}
-
-.card.is-error {
-    border-color: rgba(248, 113, 113, 0.4);
-}
-
-.card.is-error .card-head {
-    color: var(--danger);
-}
-
-
 /* Transcript ----------------------------------------------------------- */
 
 .transcript {
@@ -1365,18 +1858,340 @@ body {
     font-weight: 600;
 }
 
-/* Narrow screens ------------------------------------------------------- */
+/* Core tools (right rail) ---------------------------------------------- */
+/* R3: the harness core set lives here, collapsed, and nowhere else. */
 
-@media (max-width: 860px) {
-    .layout {
-        grid-template-columns: minmax(0, 1fr);
-        grid-template-rows: auto minmax(0, 1fr);
+.core-tools {
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+}
+
+.core-summary {
+    padding: 8px 10px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    cursor: pointer;
+    list-style: none;
+}
+
+.core-summary::-webkit-details-marker {
+    display: none;
+}
+
+.core-summary::before {
+    content: '▸';
+    display: inline-block;
+    margin-right: 6px;
+    transition: transform 120ms ease;
+}
+
+.core-tools[open] > .core-summary::before {
+    transform: rotate(90deg);
+}
+
+.core-body {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 0 10px 10px;
+}
+
+.core-list {
+    display: flex;
+    flex-direction: column;
+    gap: 5px;
+}
+
+.core-tool {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-input);
+}
+
+.core-tool-name {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 11.5px;
+}
+
+.core-tool-description {
+    color: var(--muted);
+    font-size: 11px;
+}
+
+/* Tool catalogue ------------------------------------------------------- */
+
+.catalogue-count {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+}
+
+.tool-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.tool-group {
+    margin: 8px 0 2px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+}
+
+.tool-group:first-child {
+    margin-top: 0;
+}
+
+.tool-button {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 7px 10px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: var(--bg-elevated);
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.tool-button:hover:not(:disabled) {
+    border-color: var(--border-strong);
+}
+
+.tool-button[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+.tool-button:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.tool-name {
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.tool-kind {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+}
+
+/* A listed-but-unconfigured tool (websearch without a provider key) stays
+   clickable so its hint and schema are readable, but the state must not look
+   like a working tool. Colour is decoration; the text says "unconfigured". */
+.tool-button[data-availability='unconfigured'] .tool-kind {
+    color: var(--warn);
+}
+
+/* Direct tool runner --------------------------------------------------- */
+
+.tool-card {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    padding: 16px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+}
+
+.tool-note {
+    margin: 0;
+    color: var(--muted);
+    font-size: 12.5px;
+}
+
+.tool-note.is-warning {
+    color: var(--warn);
+}
+
+.tool-args {
+    min-height: 120px;
+    resize: vertical;
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.tool-output .card-body {
+    max-height: 320px;
+}
+
+/* Card (direct tool runner) -------------------------------------------- */
+
+.card {
+    padding: 9px 12px;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-input);
+}
+
+.card-head {
+    margin-bottom: 5px;
+    color: var(--warn);
+    font-family: var(--mono);
+    font-size: 11.5px;
+}
+
+.card-body {
+    max-height: 260px;
+    margin: 0;
+    overflow: auto;
+    color: #c7cedb;
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.5;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.card.is-error {
+    border-color: rgba(248, 113, 113, 0.4);
+}
+
+.card.is-error .card-head {
+    color: var(--danger);
+}
+
+/* Session directory ----------------------------------------------------- */
+/* Server-owned conversations, filtered to the selected canonical harness. The
+   active row is the session this card is pointed at; the status text (not just
+   colour) says whether it is running. */
+
+.sessions {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+}
+
+.sessions-scope {
+    margin: 0;
+    color: var(--muted);
+    font-size: 11px;
+}
+
+.sessions-actions {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 6px;
+}
+
+.session-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.session {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 7px 10px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: var(--bg-elevated);
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.session:hover:not(:disabled) {
+    border-color: var(--border-strong);
+}
+
+.session[data-active='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+.session:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.session-harness {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 11.5px;
+}
+
+.session-meta {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+}
+
+.session[data-status='running'] .session-meta {
+    color: var(--warn);
+}
+
+.session-prompt {
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 11px;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* Responsive ----------------------------------------------------------- */
+
+/* Tablet: keep the chat widest, move the right rail under it as a strip. */
+@media (max-width: 1180px) {
+    .shell {
+        grid-template-columns: 216px minmax(0, 1fr);
+        grid-template-rows: minmax(0, 1fr) auto;
     }
 
-    .sidebar {
-        max-height: 44vh;
-        border-right: none;
+    .rail-right {
+        grid-column: 1 / -1;
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+        max-height: 40vh;
+        border-left: 0;
+        border-top: 1px solid var(--border);
+    }
+
+    .rail-right > .rail-section {
+        min-height: 0;
+        overflow: auto;
+    }
+}
+
+/* Phone: one column; the rails become short scrolling strips. */
+@media (max-width: 860px) {
+    .shell {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: auto minmax(0, 1fr) auto;
+    }
+
+    .rail-left {
+        max-height: 34vh;
+        border-right: 0;
         border-bottom: 1px solid var(--border);
+    }
+
+    .rail-right {
+        max-height: 38vh;
+        grid-template-columns: minmax(0, 1fr);
     }
 
     .composer {
@@ -1414,19 +2229,44 @@ body {
     .status {
         max-width: 50%;
     }
+
+    .agent-slot {
+        padding: 10px 14px;
+    }
+
+    .harness-head {
+        padding: 10px 14px 8px;
+    }
 }
 
-/* Motion preferences: the pulsing dots are decoration on top of the text, so
-   turning them off loses no information. */
+/* Motion preferences: the pulsing dots and the activity ring are decoration on
+   top of text/aria-busy, so turning them off loses no information. The ring stays
+   as a static bright arc (the animation is what is removed, not the state). */
 @media (prefers-reduced-motion: reduce) {
     .status-dot,
-    .tile-dot {
+    .tile-dot,
+    .agent-tile[data-activity='active']::before {
         animation: none !important;
     }
 
     .tile,
-    .tool-summary::before {
+    .tool-summary::before,
+    .endpoint-summary::before,
+    .core-summary::before,
+    .harness-item {
         transition: none;
     }
 }
 
+/* Forced colors: a conic-gradient/mask ring can disappear entirely, so the busy
+   state falls back to a system-colour outline. */
+@media (forced-colors: active) {
+    .agent-tile[data-activity='active'] {
+        outline: 2px solid CanvasText;
+        outline-offset: 1px;
+    }
+
+    .agent-tile[data-activity='active']::before {
+        display: none;
+    }
+}

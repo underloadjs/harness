@@ -87,7 +87,7 @@ export const compileToolSource = (source: string): ToolBody => {
 // anything a model can get wrong, so the harness can surface the text as a tool
 // result instead of crashing the run.
 //
-// `options.reserved` is the registry's own name list (getTools/createTool/delegate
+// `options.reserved` is the registry's own name list (requestTools/createTool/delegate
 // in the harness). Comparison is case-insensitive so a near-collision cannot make
 // the catalogue ambiguous.
 export const createDynamicTool = (
@@ -119,7 +119,7 @@ export const createDynamicTool = (
     }
 
     if (!Array.isArray(tags) || tags.length === 0) {
-        throw new HarnessError(`Tool "${name}" requires at least one tag, so getTools can find it.`);
+        throw new HarnessError(`Tool "${name}" requires at least one tag, so requestTools can find it.`);
     }
 
     if (tags.length > MAX_TAGS) {

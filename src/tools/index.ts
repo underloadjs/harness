@@ -3,7 +3,7 @@
 // One file per tool, one folder per capability, so the folder reads as the list of
 // what ships out of the box:
 //
-//   syntax/   javascriptSyntax, pythonSyntax
+//   syntax/   syntaxCheck (javascript or python, named by the caller)
 //   files/    readFile, writeFile, editFile, listFiles, searchFiles, globFiles
 //   command/  runCommand, gitDiff
 //   websearch/ websearch — opt-in, per-harness (NOT in `presetTools`: it needs a
@@ -18,18 +18,18 @@
 // construct and a catalogue cheap to enumerate, while preserving the exact Tool
 // contract the registry relies on:
 //
-//     await pythonSyntax('print(1)');                 // true — loads syntax/pythonSyntax now
-//     await readFile('package.json');                 // the file, as text
-//     harness({ tools: { pythonSyntax, readFile } }); // the model calls them
+//     await syntaxCheck({ code: 'print(1)', language: 'python' }); // true
+//     await readFile('package.json');                              // the file, as text
+//     harness({ tools: { syntaxCheck, readFile } });                // the model calls them
 //
 // Every proxy has writable `name`, `description`, `tags`, `visibility`, `parameters`
 // and a deferred `execute`, so harness registration/rename and the server's direct
 // calls behave exactly as they did with eager tools. See ./lazy.
 //
-// Every preset is **searchable**, so registering the whole catalogue still declares
-// only getTools: the model asks for `files`, `shell`, `git`, … and discovery enables
-// the matches. A harness preloads `presetTools` unless it is created with
-// `presets: false`.
+// Every preset is **searchable**, so the model asks requestTools for `files`,
+// `read`, `shell`, `git`, … and discovery enables the matches; nothing in this
+// catalogue is declared up front. A harness preloads `presetTools` unless it is
+// created with `presets: false`.
 //
 // They are deliberately opinionated about *shape* and unopinionated about
 // *policy*: no sandboxing, no confirmation prompts, no allowlists. A harness that
@@ -50,12 +50,12 @@ import type {
     WriteFileResult
 } from './files';
 import type { GitDiffParameters, GitDiffResult, RunCommandResult } from './command';
+import type { SyntaxCheckParameters } from './syntax';
 import type { Tool } from '../types';
 
 // The named exports. Type parameters are spelled out so a direct call keeps its
 // precise signature even though the implementation is loaded lazily.
-export const javascriptSyntax = lazyTool<string, boolean>('javascriptSyntax');
-export const pythonSyntax = lazyTool<string, boolean>('pythonSyntax');
+export const syntaxCheck = lazyTool<SyntaxCheckParameters, boolean>('syntaxCheck');
 
 export const readFile = lazyTool<string, string>('readFile');
 export const writeFile = lazyTool<{ path: string; content: string }, WriteFileResult>('writeFile');
@@ -67,6 +67,7 @@ export const globFiles = lazyTool<GlobFilesParameters, GlobFilesResult>('globFil
 export const runCommand = lazyTool<{ command: string; cwd?: string }, RunCommandResult>('runCommand');
 export const gitDiff = lazyTool<GitDiffParameters, GitDiffResult>('gitDiff');
 
+export type { SyntaxCheckLanguage, SyntaxCheckParameters } from './syntax';
 export type { WriteFileResult } from './files';
 export type {
     EditFileParameters,
@@ -99,8 +100,7 @@ export type {
 // direct calls without building a harness. Values are lazy proxies, so spreading
 // this object costs no implementation imports.
 export const presetTools = {
-    javascriptSyntax,
-    pythonSyntax,
+    syntaxCheck,
     readFile,
     writeFile,
     editFile,

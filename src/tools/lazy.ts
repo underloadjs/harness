@@ -18,7 +18,7 @@
 //     harness.ts calls `definition.execute(...)` directly;
 //   - `name` is a writable, enumerable own property, so `definition.name = key`
 //     during registration does not throw in strict mode;
-//   - tags are normalized exactly like tool() normalizes them, so getTools ranks
+//   - tags are normalized exactly like tool() normalizes them, so requestTools ranks
 //     a lazy preset identically to an eager one.
 //
 // Failure behaviour: a failed import clears the cache so a later call retries

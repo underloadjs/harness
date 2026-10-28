@@ -1,10 +1,14 @@
-// Tools-tab rendering for the credential-dependent websearch entry.
+// Tool-catalogue rendering for the credential-dependent websearch entry.
 //
-// C1 is a visibility fix: the sidebar must show websearch even when the server
-// has no key, the button must say so before a click, and the runner must offer the
-// example arguments while refusing to call it. With a key, the same entry is a
-// normal callable tool. `main.ts` is imported with a stubbed fetch, exactly like
-// main.test.ts, so no server runs and no key exists anywhere.
+// C1 is a visibility fix: the right-rail catalogue must show websearch even when
+// the server has no key, the button must say so before a click, and the runner
+// must offer the example arguments while refusing to call it. With a key, the
+// same entry is a normal callable tool. `main.ts` is imported with a stubbed
+// fetch, exactly like main.test.ts, so no server runs and no key exists anywhere.
+//
+// The right-rail catalogue stays visible on every view, and clicking a tool opens
+// the direct runner in the centre (switching to the Tools tab) while the rails stay
+// usable. The Tools tab lists the same entries plus the core tools.
 //
 // Run: npx vitest run --config playground/vitest.config.ts
 
@@ -72,15 +76,10 @@ const flush = async (): Promise<void> => {
     await new Promise((resolve) => setTimeout(resolve, 30));
 };
 
-const openTools = async (): Promise<void> => {
+const boot = async (): Promise<void> => {
     await import('./main');
     await flush();
     await flush();
-
-    // The second mode button is Tools; harness mode is selected at boot.
-    const modes = document.querySelectorAll<HTMLButtonElement>('.modes .mode');
-    expect(modes.length).toBe(2);
-    modes[1].click();
 };
 
 const selectWebsearch = (): void => {
@@ -107,9 +106,11 @@ it('lists an unconfigured websearch, explains it, and disables the call', async 
         'Web search is not configured on this server. Set EXA_API_KEY or TAVILY_API_KEY in packages/underload/harness/.env (or the process environment) and restart the harness server.';
 
     stubFetch({ state: 'unconfigured', environment: ['EXA_API_KEY', 'TAVILY_API_KEY'], hint });
-    await openTools();
+    await boot();
 
-    // Grouped under Web search with the state visible in the list itself.
+    // The catalogue is always visible: no mode switch needed.
+    expect(document.querySelectorAll('.modes')).toHaveLength(0);
+    expect(document.querySelector('.catalogue-count')?.textContent).toBe('1');
     expect(document.querySelector('.tool-group')?.textContent).toBe('Web search');
 
     const button = document.querySelector<HTMLButtonElement>('.tool-button');
@@ -118,13 +119,15 @@ it('lists an unconfigured websearch, explains it, and disables the call', async 
 
     selectWebsearch();
 
+    // The tool opens in the centre; the header describes it without badge clutter.
     expect(document.querySelector('.main-title')?.textContent).toBe('websearch');
-    expect(Array.from(document.querySelectorAll('.badge')).map((badge) => badge.textContent)).toEqual([
-        'Web search',
-        'tags: web, search, internet, news, research',
-        'searchable',
-        'unconfigured'
-    ]);
+    expect(document.querySelector('.harness-id')?.textContent).toBe('Web search');
+    expect(document.querySelector('.harness-note')?.textContent).toBe(
+        'searchable · tags: web, search, internet, news, research · unconfigured'
+    );
+    // The rails stay accessible around the runner.
+    expect(document.querySelector('.rail-left')).not.toBeNull();
+    expect(document.querySelector('.rail-right')).not.toBeNull();
 
     // The example arguments are still offered (they are useful documentation),
     // but both inputs that could start a call are disabled.
@@ -148,7 +151,7 @@ it('lists an unconfigured websearch, explains it, and disables the call', async 
 
 it('enables the same entry when the server reports it configured', async () => {
     stubFetch({ state: 'available', environment: ['EXA_API_KEY', 'TAVILY_API_KEY'] });
-    await openTools();
+    await boot();
 
     const button = document.querySelector<HTMLButtonElement>('.tool-button');
     expect(button?.dataset.availability).toBeUndefined();
@@ -156,12 +159,10 @@ it('enables the same entry when the server reports it configured', async () => {
 
     selectWebsearch();
 
-    expect(Array.from(document.querySelectorAll('.badge')).map((badge) => badge.textContent)).toEqual([
-        'Web search',
-        'tags: web, search, internet, news, research',
-        'searchable',
-        'available'
-    ]);
+    expect(document.querySelector('.main-title')?.textContent).toBe('websearch');
+    expect(document.querySelector('.harness-note')?.textContent).toBe(
+        'searchable · tags: web, search, internet, news, research'
+    );
 
     const args = document.querySelector<HTMLTextAreaElement>('.tool-args');
     expect(args?.disabled).toBe(false);

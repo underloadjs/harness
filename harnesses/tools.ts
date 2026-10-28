@@ -3,7 +3,7 @@
 // These are ordinary `tool()` definitions, now executed by the server instead of
 // being stubbed in a browser. They are deliberately dependency-free so the
 // catalogue stays useful without an endpoint, and they show the discovery flow:
-// every one is searchable, so a model must call getTools before it can use one.
+// every one is searchable, so a model must call requestTools before it can use one.
 
 import { tool } from '../src/harness';
 import type { Tool } from '../src/harness';
@@ -83,7 +83,7 @@ const NOTES: readonly { title: string; body: string }[] = [
     },
     {
         title: 'Single-property rule',
-        body: 'When a tool schema declares exactly one property, execute receives that property value instead of the wrapper object. That is why pythonSyntax("print(1)") and a model call carrying { "code": "print(1)" } run the same code path.'
+        body: 'When a tool schema declares exactly one property, execute receives that property value instead of the wrapper object. That is why readFile("package.json") and a model call carrying { "path": "package.json" } run the same code path.'
     },
     {
         title: 'Progress events',

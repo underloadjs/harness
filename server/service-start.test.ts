@@ -87,9 +87,14 @@ process.on('SIGINT', shutdown);
 
 const PRESET_NAMES = ['instruct', 'research', 'workspace', 'demo', 'flaky'];
 
+// Core tools lead the catalogue (R8) in every listing surface, including the
+// bootstrap document the service loader serves at GET /v1/harness.
 const TOOL_NAMES = [
-    'javascriptSyntax',
-    'pythonSyntax',
+    'requestTools',
+    'createTool',
+    'todoTools',
+    'delegate',
+    'syntaxCheck',
     'readFile',
     'writeFile',
     'editFile',
@@ -227,7 +232,7 @@ describeService('service endpoint discovery and canonical API', () => {
         expect(response.headers.get('access-control-allow-origin')).toBe('*');
 
         const body = await json<Record<string, any>>(response);
-        expect(Object.keys(body)).toEqual(['rootPath', 'presets', 'tools', 'defaults', 'sessions']);
+        expect(Object.keys(body)).toEqual(['rootPath', 'presets', 'agents', 'tools', 'defaults', 'sessions']);
         // The advertised root is the canonical API URL, not a filesystem path:
         // the file tools use the server process's cwd and have no sandbox.
         expect(body.rootPath).toBe('/v1/harness');
@@ -265,7 +270,7 @@ describeService('service endpoint discovery and canonical API', () => {
         expect(session.harness).toBe('demo');
         expect(session.status).toBe('idle');
         expect(session.turns).toEqual([]);
-        expect(session.messages.map((message) => message.role)).toEqual(['system']);
+        expect(session.messages.map((message) => message.role)).toEqual(['system', 'system']);
 
         const listed = await json<{ sessions: SessionSnapshot[] }>(
             await fetch(`${base}/v1/harness/sessions`)
@@ -295,7 +300,7 @@ describeService('service endpoint discovery and canonical API', () => {
         expect(first.turn.status).toBe('running');
 
         const events = items.flatMap((item) => (item.type === 'event' ? [item.event] : []));
-        // The scripted demo always runs: getTools, clock, answer. Asserting the
+        // The scripted demo always runs: requestTools, clock, answer. Asserting the
         // non-delta sequence pins the frame passthrough without depending on
         // whitespace chunking.
         expect(

@@ -12,7 +12,7 @@
 //   - ./index.ts    — starts a real node:http server around this handler
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
-import type { ToolCatalogue } from '../harnesses';
+import type { HarnessRegistry, ToolCatalogue } from '../harnesses';
 import type { SessionStreamItem } from './protocol';
 import type { HarnessIndex } from './protocol';
 import { SessionStore } from './sessions';
@@ -40,6 +40,10 @@ export type HarnessHandlerOptions = {
     // `defaults` comes from the environment; the store only needs the secret
     // settings it actually builds harnesses with.
     defaults: HarnessIndex['defaults'];
+    // The same registry the store resolves sessions through. Required: a handler
+    // with its own default registry could create a harness that its store cannot
+    // see, which would make POST /harnesses succeed and the session 404.
+    registry: HarnessRegistry;
     // Built by the host AFTER it loads `.env` (see server/index.ts), so a search
     // key in the environment is captured here and not at import time. Omitting it
     // builds a catalogue now, which is still runtime — never module evaluation.
@@ -162,6 +166,7 @@ const runStream = async (
 export const createHarnessHandler = ({
     store,
     defaults,
+    registry,
     catalogue
 }: HarnessHandlerOptions): HarnessHandler => {
     // One dispatcher per handler: the catalogue snapshot (and therefore any
@@ -169,6 +174,7 @@ export const createHarnessHandler = ({
     const api = createHarnessApi({
         store,
         defaults,
+        registry,
         ...(catalogue === undefined ? {} : { catalogue })
     });
 

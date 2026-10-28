@@ -42,6 +42,23 @@ export type SessionTurn = {
     startedAt: number;
     updatedAt: number;
     events: HarnessEvent[];
+    // Epoch milliseconds parallel to `events`: entry i is when events[i] was
+    // recorded. Persisted with the turn so a reload can show per-step and
+    // per-tool elapsed time without replaying the stream. Optional so an older
+    // recorded turn (or a hand-built one) stays valid.
+    eventTimes?: number[];
+};
+
+// One trusted agent, as the UI needs it to choose a primary/subagent. The text
+// fields are trusted catalogue content (src/agents), never client input and never
+// secret: `instruction` is the identity system message and `guidelines` are the
+// rules appended to it at runtime.
+export type AgentDescriptor = {
+    name: string;
+    title: string;
+    description: string;
+    instruction: string;
+    guidelines: string[];
 };
 
 // What the UI needs to draw a preset card without importing the catalogue.
@@ -50,13 +67,55 @@ export type HarnessDescriptor = {
     title: string;
     description: string;
     requiresEndpoint: boolean;
+    // The selected entry agent, and the exact allowlist the primary may delegate
+    // to. `agents` is derived: [primary, ...subagents].
+    primary: string;
+    subagents: string[];
     agents: string[];
     tools: string[];
-    // The harness-owned core tools this card's runs will declare: getTools,
-    // createTool, and todoTools for every harness, plus delegate when the preset
-    // declares subagents. Optional so a client can still render an older server's
-    // descriptor; when present the UI has no hardcoded core-tool label.
+    // The core tools this card's runs will declare: requestTools, createTool,
+    // todoTools for every harness, plus delegate when a subagent allowlist exists.
+    // No preset tool is core any more (the whole catalogue is searchable).
     coreTools?: string[];
+    // Per-agent model overrides (R9): agent id → model id. PRESENT ONLY WHEN a
+    // harness actually overrides something, so existing cards keep their exact
+    // shape. A member absent from the map uses the session's model — that is the
+    // "default" a per-agent dropdown should show, not the resolved id.
+    agentModels?: Record<string, string>;
+    // Shipped with the application vs created through POST /harnesses.
+    builtin: boolean;
+    // Whether PATCH /harnesses/:name may change it (live built-ins and user-created
+    // harnesses are editable; the demo/flaky fixtures are not).
+    editable: boolean;
+};
+
+// Body of POST /harnesses. A client selects trusted agents; it cannot supply
+// instruction text, a provider, a model, or a tool list. It CAN pick the model id
+// each selected agent runs (`agentModels`, R9) — an id only, never a provider or
+// credential, because those come from the session settings.
+export type CreateHarnessRequest = {
+    name: string;
+    title?: string;
+    description?: string;
+    primary: string;
+    subagents?: string[];
+    agentModels?: Record<string, string>;
+};
+
+// Body of PATCH /harnesses/:name. `name` is immutable; an omitted field keeps its
+// current value. Changing `primary` without `subagents` removes the new primary
+// from the old allowlist.
+//
+// `agentModels`, when present, REPLACES the harness's override map: `{}` clears
+// every per-agent model, and every key must name a member of the resulting harness
+// (400 otherwise). An existing override for a member the same patch removes is
+// dropped rather than rejected.
+export type UpdateHarnessRequest = {
+    title?: string;
+    description?: string;
+    primary?: string;
+    subagents?: string[];
+    agentModels?: Record<string, string>;
 };
 
 // Whether the server can actually run a listed tool. Omitted means "available":
@@ -74,12 +133,19 @@ export type ToolAvailability = {
 // What the UI needs to draw a direct-call tool without importing the tool object.
 export type ToolDescriptor = {
     name: string;
+    // Display group. 'Core tools' is the harness-owned set (R8), listed for review
+    // and manual execution but only runnable inside a session.
     group: string;
     description: string;
     tags: string[];
     visibility: 'core' | 'searchable';
     parameters: Record<string, unknown>;
     availability?: ToolAvailability;
+    // True for the harness-owned core tools (requestTools, createTool, todoTools,
+    // delegate). They have no standalone implementation: a call must carry a
+    // `sessionId` and executes through that session's harness. Omitted for every
+    // directly callable entry, so existing descriptors keep their shape.
+    sessionBound?: boolean;
 };
 
 // A conversation held by the server. `messages` is the entry agent's transcript.
@@ -93,15 +159,32 @@ export type SessionSnapshot = {
     harness: string;
     status: SessionStatus;
     model: string;
+    // The model each agent in this session actually runs (R9), keyed by agent id.
+    // Frozen at creation with the harness: an agent absent from the preset's
+    // `agentModels` map appears here with the session's settings.model, so a reload
+    // can render every agent's model without knowing the creation settings. A later
+    // PATCH does not change this snapshot.
+    agentModels?: Record<string, string>;
     createdAt: number;
     updatedAt: number;
     messages: HarnessMessage[];
     turns: SessionTurn[];
+    // The configuration this session was built with, captured at creation. A
+    // registry change (POST/PATCH) therefore cannot rewrite what an existing
+    // session reports: the UI can always render the frozen agents/toolbox/card.
+    harnessDefinition?: HarnessDescriptor;
+    // The tools requestTools had enabled when this snapshot was taken, in
+    // discovery order. Read-only; reset() empties it. Optional so a client can
+    // still read an older server's snapshot.
+    discoveredTools?: string[];
     lastError?: string;
 };
 
 // Payload of GET /api/harnesses. Provider defaults come from the server
 // environment; the API key itself is never sent, only whether one exists.
+// `agents` is the trusted agent registry, so a client can offer primary/subagent
+// choices without a second request. The list name stays `harnesses` (and the
+// bootstrap list stays `presets`) for compatibility.
 export type HarnessIndex = {
     harnesses: HarnessDescriptor[];
     defaults: {
@@ -109,6 +192,7 @@ export type HarnessIndex = {
         model: string;
         hasApiKey: boolean;
     };
+    agents: AgentDescriptor[];
 };
 
 // Payload of GET /api/tools.
@@ -145,7 +229,10 @@ export type ModelIndex = {
 //     Both carry the complete turn list, so the final frame is self-sufficient.
 export type SessionStreamItem =
     | { type: 'turn'; turn: SessionTurn }
-    | { type: 'event'; turnId: string; event: HarnessEvent }
+    // `at` is the epoch-ms time the server recorded this event, the same value
+    // appended to the turn's `eventTimes` entry. Optional for compatibility with
+    // an older server frame.
+    | { type: 'event'; turnId: string; event: HarnessEvent; at?: number }
     | { type: 'snapshot'; session: SessionSnapshot }
     | { type: 'failed'; error: HarnessErrorInfo; session: SessionSnapshot };
 
@@ -160,6 +247,17 @@ export type SubmitMessageRequest = {
 
 export type ToolCallRequest = {
     parameters?: unknown;
+    // Which session also runs the call (R8). REQUIRED for `sessionBound` core
+    // tools (requestTools, createTool, todoTools, delegate): they execute inside
+    // that session's harness so discovery, runtime creation, todos, and delegation
+    // affect the conversation the user is looking at. Accepted but ignored for a
+    // directly callable catalogue tool, which keeps one request shape for the UI.
+    //
+    // 400 when a core call omits it; 404 when the session (or the tool inside that
+    // session, e.g. delegate without subagents) does not exist; 409 when the
+    // session is busy (a run, a reset, or another manual call), so a manual
+    // mutation cannot race an active operation.
+    sessionId?: string;
 };
 
 export type ToolCallResult =

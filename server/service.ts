@@ -57,6 +57,7 @@
 
 import { MAX_API_BODY_BYTES, SERVICE_MOUNT } from './api';
 import type { HarnessApiEmit, HarnessApiStream } from './api';
+import { isLoopbackHostname } from './origin';
 import type { HarnessRuntime } from './runtime';
 import { getHarnessRuntime } from './runtime';
 
@@ -96,10 +97,9 @@ export type ServiceEndpointHandler = (
     variables?: Record<string, unknown>
 ) => Promise<ServiceEndpointResult>;
 
-// Only these hostnames may use a cross-origin browser request. `URL.hostname`
-// keeps IPv6 brackets, hence '[::1]'; the bare form is accepted defensively.
-const LOOPBACK_HOSTNAMES = new Set(['localhost', '127.0.0.1', '[::1]', '::1']);
-
+// Same-host (including port) OR a loopback hostname. The loopback list is
+// shared with the playground's runtime API-root gate (./origin.ts), so "which
+// origins count as local" has exactly one definition in the package.
 const isAllowedOrigin = (origin: string, host: string | undefined): boolean => {
     let parsed: URL;
 
@@ -112,7 +112,7 @@ const isAllowedOrigin = (origin: string, host: string | undefined): boolean => {
 
     if (host !== undefined && parsed.host.toLowerCase() === host.toLowerCase()) return true;
 
-    return LOOPBACK_HOSTNAMES.has(parsed.hostname.toLowerCase());
+    return isLoopbackHostname(parsed.hostname);
 };
 
 // Build the canonical SSE response. Frames use the same `data: <json>\n\n`

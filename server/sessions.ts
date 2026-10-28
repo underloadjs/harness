@@ -5,23 +5,47 @@
 // model still sees the earlier transcript. Nothing is persisted: restarting the
 // server is a clean slate.
 //
+// FROZEN CONFIGURATION (R4): create() resolves a harness through the live registry
+// exactly once. The preset object and a descriptor snapshot are captured on the
+// session, so a later POST/PATCH — even one that rebrands the same built-in —
+// affects only FUTURE sessions. This session keeps running (and reporting) what it
+// was built with.
+//
+// SINGLE FLIGHT: every operation that mutates a session's harness is mutually
+// exclusive. A streaming run, a manual `callTool` (R8), and a reset all check the
+// private `busy` flag and reject with 409 when it is taken. A manual call is NOT a
+// turn, so it never changes `status` or appends a SessionTurn; `busy` is released
+// in a `finally` on success, failure, and cancellation, so the UI cannot be left
+// stuck. cancel() only aborts a streaming run (a manual call has no controller).
+//
 // Record ownership (H3): the server — not the browser — is the source of truth for
 // the renderable transcript. Each submitted task becomes one SessionTurn that owns
 // the prompt, status, timestamps, and every HarnessEvent the run produced
-// (including events from subagents reached by delegation). Snapshots clone the
-// turns, so a client that mutates a response cannot corrupt the live record and a
-// reload can always render the same thing through list()/get().
+// (including events from subagents reached by delegation). `eventTimes` is a
+// parallel epoch-ms array, so per-step and per-tool elapsed time survives a
+// reload. Snapshots clone the turns, so a client that mutates a response cannot
+// corrupt the live record.
 //
 // Cross-references:
 //   - ./protocol.ts — SessionSnapshot.turns, SessionTurn, SessionStreamItem
 //   - ./handler.ts  — forwards stream items verbatim; no turn inference there
+//   - ../harnesses/registry.ts — the in-memory harness registry
+//   - ../harnesses/descriptor.ts — describeHarness, the frozen definition
 
 import { randomUUID } from 'node:crypto';
 import type { Harness, HarnessEvent, HarnessMessage } from '../src/harness';
-import { findPreset, presets } from '../harnesses';
 import type { HarnessPreset, RunnerSettings } from '../harnesses/types';
+import { describeHarness } from '../harnesses/descriptor';
+import { createHarnessRegistry } from '../harnesses/registry';
+import type { HarnessRegistry } from '../harnesses/registry';
 import { mergeSettings } from './config';
-import type { SessionSnapshot, SessionStatus, SessionStreamItem, SessionTurn } from './protocol';
+import type {
+    HarnessDescriptor,
+    SessionSnapshot,
+    SessionStatus,
+    SessionStreamItem,
+    SessionTurn
+} from './protocol';
 
 const MAX_INPUT_LENGTH = 200_000;
 
@@ -29,7 +53,12 @@ type Emit = (item: SessionStreamItem) => void | Promise<void>;
 
 type Session = {
     id: string;
+    // The resolved preset THIS session runs. Captured at creation; the registry
+    // replacing its entry later does not reach into this object.
     preset: HarnessPreset;
+    // Metadata snapshot of the same preset, so a reload can render the frozen
+    // configuration without re-resolving anything (which may have changed).
+    definition: HarnessDescriptor;
     settings: RunnerSettings;
     harness: Harness;
     status: SessionStatus;
@@ -40,6 +69,13 @@ type Session = {
     // Assigned only while a run is streaming. A progress event with no sink (the
     // harness should not produce one then) is dropped rather than buffered.
     sink?: (event: HarnessEvent) => Promise<void>;
+    // Single-flight gate for EVERY operation that mutates this harness: a
+    // streaming run AND a manual tool call. Manual calls are not turns, so they
+    // cannot use `status` (`running`/`idle`/`error` is what the UI renders);
+    // this private flag is what makes them mutually exclusive with a run, a
+    // reset, or a second manual call. It is set synchronously before the first
+    // await and released in a `finally`, so no path can leave it stuck.
+    busy: boolean;
     cancelled: boolean;
     // Every task the session has run, oldest first. Cleared by reset(), removed
     // with the session. This is server state, never rebuildable from messages.
@@ -74,6 +110,7 @@ const copyEvent = (event: HarnessEvent): HarnessEvent =>
 
 // A turn copy is the only shape a client ever receives. The live SessionTurn stays
 // private to the store; list()/get()/terminal frames all go through here.
+// `eventTimes` is copied when present, preserving the parallel array contract.
 const copyTurn = (turn: SessionTurn): SessionTurn => ({
     id: turn.id,
     index: turn.index,
@@ -81,8 +118,15 @@ const copyTurn = (turn: SessionTurn): SessionTurn => ({
     status: turn.status,
     startedAt: turn.startedAt,
     updatedAt: turn.updatedAt,
-    events: turn.events.map(copyEvent)
+    events: turn.events.map(copyEvent),
+    ...(turn.eventTimes === undefined ? {} : { eventTimes: [...turn.eventTimes] })
 });
+
+// A descriptor is plain JSON, so a round trip is a safe deep copy. The session
+// keeps the original; every snapshot hands out its own copy so a client cannot
+// mutate the frozen definition through a response.
+const copyDescriptor = (descriptor: HarnessDescriptor): HarnessDescriptor =>
+    JSON.parse(JSON.stringify(descriptor)) as HarnessDescriptor;
 
 const copyTurns = (turns: readonly SessionTurn[]): SessionTurn[] => turns.map(copyTurn);
 
@@ -98,13 +142,16 @@ const safeEmit = async (emit: Emit, item: SessionStreamItem): Promise<void> => {
 export class SessionStore {
     private readonly sessions = new Map<string, Session>();
 
-    // `catalogue` defaults to the shipped presets. It is injectable so tests can
-    // run scripted harnesses (including subagents and failures) without reaching a
-    // provider; production (`server/index.ts`) passes only the defaults and keeps
-    // the real catalogue. The lookup is by name, exactly like findPreset().
+    // `registry` defaults to a fresh in-memory registry over the shipped presets.
+    // It is injectable so tests can run scripted harnesses (including subagents and
+    // failures) without reaching a provider, and so the host can share ONE registry
+    // with the API. `describe` captures host-specific availability (websearch) in
+    // the frozen snapshot: the store owns no catalogue, so production injects a
+    // describer bound to the runtime catalogue.
     constructor(
         readonly defaults: RunnerSettings,
-        private readonly catalogue: readonly HarnessPreset[] = presets
+        private readonly registry: HarnessRegistry = createHarnessRegistry(),
+        private readonly describe: (preset: HarnessPreset) => HarnessDescriptor = describeHarness
     ) {}
 
     get size(): number {
@@ -114,8 +161,10 @@ export class SessionStore {
     create(presetName: string, input?: Partial<RunnerSettings>): SessionSnapshot {
         // Alias-aware: `writer`/`assistant` resolve to `instruct` and
         // `researcher` to `research`, so an older client keeps working. The
-        // snapshot reports the canonical preset name below.
-        const preset = findPreset(presetName, this.catalogue);
+        // snapshot reports the canonical preset name below. Resolution consults
+        // the live registry, so a harness created through POST /harnesses is
+        // runnable by name exactly like a built-in.
+        const preset = this.registry.find(presetName);
         if (!preset) {
             throw new SessionError(404, `Unknown harness "${presetName}".`);
         }
@@ -147,11 +196,15 @@ export class SessionStore {
         session = {
             id: randomUUID(),
             preset,
+            // Frozen metadata for this session. Built once, from the preset the
+            // harness above was constructed from, so the pair can never disagree.
+            definition: this.describe(preset),
             settings,
             harness,
             status: 'idle',
             createdAt: now,
             updatedAt: now,
+            busy: false,
             cancelled: false,
             turns: []
         };
@@ -170,11 +223,66 @@ export class SessionStore {
     }
 
     // Called before a stream is opened so a busy session is rejected with a real
-    // JSON status, not an SSE frame.
+    // JSON status, not an SSE frame. `busy` (not `status`) is checked because a
+    // manual tool call also holds the session without becoming a turn.
     assertRunnable(id: string): void {
         const session = this.require(id);
-        if (session.status === 'running') {
+        if (session.busy) {
             throw new SessionError(409, 'A task is already running in this session.');
+        }
+    }
+
+    // Run one REGISTERED tool inside a session's harness (R8).
+    //
+    // This is the server path behind `POST /tools/:name` when the caller supplies a
+    // sessionId: the core tools (requestTools/createTool/todoTools/delegate) have
+    // no standalone implementation, so they must execute against the harness the
+    // session owns — a manual discovery or todo call then affects the very
+    // conversation the user is looking at. Registered, non-core tools are also
+    // reachable here if a client asks (they run the same implementation either
+    // way); the API keeps their direct runner for session-less calls.
+    //
+    // Failure mapping is the caller's job (server/api.ts):
+    //   - unknown session            → SessionError 404 (require)
+    //   - session busy (run/manual)  → SessionError 409 (single-flight gate)
+    //   - tool absent from the run   → SessionError 404 (delegate without subagents)
+    //   - the tool itself throws     → whatever it throws (reported as ok:false)
+    //
+    // `parameters` is the value `execute` receives, i.e. already unwrapped by the
+    // single-property rule — exactly like the direct tool callable.
+    async callTool(id: string, name: string, parameters: unknown): Promise<unknown> {
+        const session = this.require(id);
+
+        // A manual core call mutates harness state (enabled tools, created tools,
+        // the todo list, a subagent turn). Letting it interleave with a streaming
+        // run would make that run's transcript internally inconsistent, so it is
+        // rejected like a second submitted task rather than queued.
+        //
+        // The same holds for a SECOND manual call: an async `delegate` holds the
+        // session across awaits, so without this check two manual mutations (or a
+        // reset) could interleave even though `status` was never `running`.
+        if (session.busy) {
+            throw new SessionError(409, 'A task is running in this session; try again when it finishes.');
+        }
+
+        // The session's own registry decides what exists. `executeTool` would also
+        // throw, but this check gives the caller a lookup status (404) with a
+        // sentence that names the real reason instead of a generic harness error.
+        // It runs BEFORE the busy flag is taken so a 404 does not touch the gate.
+        if (session.harness.tools[name] === undefined) {
+            throw new SessionError(404, `Tool "${name}" is not available in this session.`);
+        }
+
+        session.busy = true;
+
+        try {
+            // A manual call is NOT a turn: no SessionTurn, no events, and no change
+            // to `status`. Only the private `busy` flag exists while it runs.
+            return await session.harness.executeTool(name, parameters);
+        } finally {
+            // Success, a throwing tool, and a rejected execute all release the
+            // gate here, so a later run/reset/manual call resumes.
+            session.busy = false;
         }
     }
 
@@ -184,10 +292,19 @@ export class SessionStore {
             harness: session.preset.name,
             status: session.status,
             model: session.harness.agent.model(),
+            // Per-agent models THIS session runs (R9), frozen with the harness: an
+            // override from the preset, otherwise the session's settings.model. A
+            // UI can therefore render every agent's model after a reload, and a
+            // later PATCH cannot rewrite what this session reports.
+            agentModels: Object.fromEntries(
+                Object.entries(session.harness.agents).map(([name, brain]) => [name, brain.model()])
+            ),
             createdAt: session.createdAt,
             updatedAt: session.updatedAt,
             messages: copyMessages(session.harness.agent.messages),
             turns: copyTurns(session.turns),
+            harnessDefinition: copyDescriptor(session.definition),
+            discoveredTools: [...session.harness.discoveredTools],
             ...(session.lastError !== undefined ? { lastError: session.lastError } : {})
         };
     }
@@ -206,7 +323,8 @@ export class SessionStore {
         // Validate everything BEFORE mutating the session. A rejected request
         // (busy, empty, too long) therefore leaves the previous turns untouched,
         // which is what makes the 409 safe for a client to retry on another id.
-        if (session.status === 'running') {
+        // A manual tool call holds `busy` too, so chat cannot start while one runs.
+        if (session.busy) {
             throw new SessionError(409, 'A task is already running in this session.');
         }
 
@@ -218,6 +336,10 @@ export class SessionStore {
         if (input.length > MAX_INPUT_LENGTH) {
             throw new SessionError(413, `A task cannot exceed ${MAX_INPUT_LENGTH} characters.`);
         }
+
+        // Take the single-flight gate BEFORE the first await. Everything below
+        // either completes or unwinds through the main `finally`, which releases it.
+        session.busy = true;
 
         const controller = new AbortController();
         const startedAt = Date.now();
@@ -232,7 +354,9 @@ export class SessionStore {
             status: 'running',
             startedAt,
             updatedAt: startedAt,
-            events: []
+            events: [],
+            // Parallel to `events` from the first record on; see the protocol type.
+            eventTimes: []
         };
 
         session.turns.push(turn);
@@ -245,9 +369,13 @@ export class SessionStore {
         session.sink = async (event) => {
             // Record first: the server's turn is authoritative even when the client
             // that opened the stream disappeared (a reload, a cancel by disconnect).
+            // `at` is the one server timestamp shared by the frame and the parallel
+            // `eventTimes` entry, so a client and a reload agree exactly.
             const record = copyEvent(event);
+            const at = Date.now();
             turn.events.push(record);
-            turn.updatedAt = Date.now();
+            turn.eventTimes?.push(at);
+            turn.updatedAt = at;
 
             // A cancelled run keeps recording but stops sending: the stream is gone
             // or the client asked to stop. No progress event is buffered.
@@ -256,7 +384,7 @@ export class SessionStore {
             try {
                 // The emitted frame is another copy so a stream listener cannot
                 // mutate the record the snapshot will hand to the next client.
-                await emit({ type: 'event', turnId: turn.id, event: copyEvent(record) });
+                await emit({ type: 'event', turnId: turn.id, event: copyEvent(record), at });
             } catch {
                 // The client went away mid-run. Abort the harness instead of
                 // letting it keep spending provider time on a dead stream.
@@ -291,6 +419,9 @@ export class SessionStore {
         } finally {
             session.sink = undefined;
             session.controller = undefined;
+            // Release the single-flight gate on success, failure, and cancellation
+            // alike: a stuck gate would reject every later chat/reset/manual call.
+            session.busy = false;
             session.updatedAt = Date.now();
             turn.updatedAt = session.updatedAt;
         }
@@ -303,6 +434,9 @@ export class SessionStore {
         await safeEmit(emit, { type: 'snapshot', session: this.snapshot(session) });
     }
 
+    // Cancels a streaming RUN only. A manual tool call has no AbortController and
+    // is not a turn, so it is not cancellable here (its request stays open and
+    // releases the gate when it settles); returning false is the truthful answer.
     cancel(id: string): boolean {
         const session = this.sessions.get(id);
         if (!session || session.status !== 'running') return false;
@@ -315,7 +449,10 @@ export class SessionStore {
     reset(id: string): SessionSnapshot {
         const session = this.require(id);
 
-        if (session.status === 'running') {
+        // `busy`, not `status`: a manual delegate/createTool call holds the
+        // session without a turn, and resetting its harness mid-call would clear
+        // state the tool is still mutating.
+        if (session.busy) {
             throw new SessionError(409, 'Cancel the running task before resetting the session.');
         }
 
@@ -339,6 +476,10 @@ export class SessionStore {
         return this.snapshot(session);
     }
 
+    // Deleting a session never waits for an in-flight operation: a run is
+    // aborted, and a manual call is detached but allowed to settle against the
+    // removed harness (its result is simply no longer listed). No other session
+    // shares that object, so nothing else is affected.
     remove(id: string): boolean {
         const session = this.sessions.get(id);
         if (!session) return false;

@@ -1,5 +1,6 @@
 // @underload/harness tools/syntax — parse a snippet without running it.
 //
-// Neither tool executes the code it checks, and both are executable standalone.
-export { javascriptSyntax } from './javascriptSyntax';
-export { pythonSyntax } from './pythonSyntax';
+// One public tool, `syntaxCheck({ code, language })`. The language-specific
+// parsers (./javascript, ./python) are internal and loaded on demand by the tool.
+export { syntaxCheck } from './syntaxCheck';
+export type { SyntaxCheckLanguage, SyntaxCheckParameters } from './syntaxCheck';

@@ -1,35 +1,77 @@
 // End-to-end shell + request lifecycle against stubbed server answers.
 //
-// H4 pins what this file has to prove:
-//   - boot consumes the server catalogue (bootstrap document or the standalone
-//     routes) and the server's session list;
-//   - a reload with a remembered session id renders the server's turns, including
-//     subagent events and tool cards, without POSTing a message (no model run);
-//   - stream frames carry explicit turn ids, and the terminal snapshot replaces
-//     whatever the browser projected;
-//   - editing endpoint settings never creates, replaces or deletes a session;
-//   - a session that is still running after a reload is polled until terminal.
+// This file pins the redesigned three-column playground and the behaviours the
+// change is for:
+//   - R1: the harness rail lists the server catalogue and offers a create action;
+//   - R2: a horizontal agent row labels primary/secondary, the trailing + opens a
+//     trusted preset picker, selecting a member promotes it, and a saved session
+//     freezes its team (editing is locked with a New session affordance);
+//   - R3: the core tools live only in a collapsed dropdown, the complete catalogue
+//     is on the right, and sessions are filtered/locked to the selected harness;
+//   - R4: turn and tool-call durations come from the server on reload;
+//   - R5: existing streaming, snapshot hydration, endpoint drafts and polling are
+//     preserved.
 //
 // `main.ts` is a module with side effects: it builds the shell and boots against
 // the API. `fetch` is stubbed and the SSE body is a real ReadableStream, so
 // api.ts parses its own frames. No server, no provider.
 //
 // Run: npx vitest run --config playground/vitest.config.ts
-import type { HarnessAssistantMessage, SessionSnapshot, SessionStreamItem, SessionTurn } from '../../server/protocol';
+import type {
+    HarnessAssistantMessage,
+    HarnessDescriptor,
+    SessionSnapshot,
+    SessionStreamItem,
+    SessionTurn
+} from '../../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
-const descriptor = {
-    name: 'demo',
-    title: 'Demo harness',
-    description: 'A harness for the lifecycle test.',
-    requiresEndpoint: true,
-    agents: ['writer'],
-    tools: []
-};
+const SESSION_KEY = 'underload-harness-app:session';
+// Realistic epoch stamps: the UI formats real server milliseconds, and a tiny
+// value would make the live label look like a clock-skew bug.
+const T = 1_700_000_000_000;
 
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 
-const SESSION_KEY = 'underload-harness-app:session';
+const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor =>
+    ({
+        name: 'instruct',
+        title: 'Instruct',
+        description: 'A general instruction-following agent.',
+        requiresEndpoint: true,
+        agents: ['instruct'],
+        tools: ['readFile'],
+        coreTools: ['requestTools', 'createTool', 'todoTools', 'readFile'],
+        primary: 'instruct',
+        subagents: [],
+        builtin: true,
+        editable: true,
+        ...overrides
+    }) as HarnessDescriptor;
+
+const agents = [
+    {
+        name: 'instruct',
+        title: 'Instruct',
+        description: 'Answers directly with the full toolbox.',
+        instruction: 'Answer the request directly and keep the answer focused.',
+        guidelines: ['Prefer a tool over memory.', 'Be concise.']
+    },
+    {
+        name: 'summarizer',
+        title: 'Summarizer',
+        description: 'Compresses notes into two sentences.',
+        instruction: 'Compress notes into at most two sentences.',
+        guidelines: ['Keep names and numbers.']
+    },
+    {
+        name: 'workspace',
+        title: 'Workspace',
+        description: 'A coding-focused agent.',
+        instruction: 'Inspect before you change anything.',
+        guidelines: []
+    }
+];
 
 const assistant = (overrides: Partial<HarnessAssistantMessage> = {}): HarnessAssistantMessage => ({
     role: 'assistant',
@@ -41,24 +83,27 @@ const assistant = (overrides: Partial<HarnessAssistantMessage> = {}): HarnessAss
     ...overrides
 });
 
-const snapshot = (overrides: Partial<SessionSnapshot> = {}): SessionSnapshot => ({
-    id: 's1',
-    harness: 'demo',
-    status: 'idle',
-    model: 'm1',
-    createdAt: 1,
-    updatedAt: 2,
-    messages: [],
-    turns: [],
-    ...overrides
-});
+const snapshot = (overrides: Partial<SessionSnapshot> = {}): SessionSnapshot =>
+    ({
+        id: 's1',
+        harness: 'instruct',
+        status: 'idle',
+        model: 'm1',
+        createdAt: 1,
+        updatedAt: 2,
+        messages: [],
+        turns: [],
+        ...overrides
+    }) as SessionSnapshot;
 
-const bootstrap = (sessions: SessionSnapshot[] = []) => ({
-    rootPath: 'D:/repo',
-    presets: [descriptor],
+const bootstrap = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
+    rootPath: '/api',
+    presets: [descriptor()],
     tools: [],
     defaults,
-    sessions
+    sessions: [],
+    agents,
+    ...overrides
 });
 
 // One SSE frame per `SessionStreamItem`, exactly the shape api.ts parses.
@@ -74,26 +119,64 @@ const sse = (items: readonly unknown[]): Response => {
     return new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
 };
 
-const json = (value: unknown): Response =>
-    new Response(JSON.stringify(value), { status: 200, headers: { 'Content-Type': 'application/json' } });
-
-const notFound = (): Response =>
-    new Response(JSON.stringify({ error: { message: 'Unknown API route.' } }), {
-        status: 404,
-        headers: { 'Content-Type': 'application/json' }
-    });
+const json = (value: unknown, status = 200): Response =>
+    new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
 
 const flush = async (): Promise<void> => {
     await new Promise((resolve) => setTimeout(resolve, 30));
 };
 
-const statusText = (): string | null | undefined => document.querySelector('.status-text')?.textContent;
+type Call = { url: string; method: string | undefined; body: unknown };
 
+// A tiny router for the stubbed server: log every call, answer what the test
+// declares, and fail loudly on anything unexpected.
+const stubFetch = (
+    handler: (url: string, method: string | undefined, body: unknown) => Response | undefined
+): Call[] => {
+    const calls: Call[] = [];
+
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            const method = init?.method;
+            const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
+            calls.push({ url, method, body });
+
+            const response = handler(url, method, body);
+            if (response === undefined) throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
+
+            return response;
+        })
+    );
+
+    return calls;
+};
+
+const statusText = (): string | null | undefined => document.querySelector('.status-text')?.textContent;
 const tileStates = (): (string | null | undefined)[] =>
     [...document.querySelectorAll<HTMLElement>('.tile')].map((tile) => tile.dataset.state);
+const tileElapsed = (): (string | null)[] =>
+    [...document.querySelectorAll<HTMLElement>('.tile-elapsed')].map((node) => node.textContent);
+const agentRoles = (): (string | undefined)[] =>
+    [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.dataset.role);
+const agentNames = (): (string | null)[] =>
+    [...document.querySelectorAll<HTMLElement>('.agent-tile-name')].map((node) => node.textContent);
+const harnessNames = (): (string | null)[] =>
+    [...document.querySelectorAll<HTMLElement>('.harness-item .harness-name')].map((node) => node.textContent);
+const coreToolNames = (): (string | null)[] =>
+    [...document.querySelectorAll<HTMLElement>('.core-tool-name')].map((node) => node.textContent);
+const sessionIds = (): (string | undefined)[] =>
+    [...document.querySelectorAll<HTMLElement>('.session')].map((node) => node.dataset.sessionId);
 
-const tileIndexes = (): (string | null)[] =>
-    [...document.querySelectorAll<HTMLElement>('.tile-index')].map((index) => index.textContent);
+const byClass = <K extends keyof HTMLElementTagNameMap>(
+    selector: string,
+    tag: K
+): HTMLElementTagNameMap[K] => {
+    const found = document.querySelector<HTMLElementTagNameMap[K]>(selector);
+    if (found === null) throw new Error(`missing element ${selector}`);
+    return found;
+};
 
 beforeEach(() => {
     vi.resetModules();
@@ -106,74 +189,105 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-it('boots, streams a turn by explicit id, then renders the server snapshot', async () => {
+it('boots the three-column shell, streams a turn and resolves server timings', async () => {
     let messageRequests = 0;
 
-    const start = { type: 'start' as const, agent: 'writer', model: 'm1' };
-    const done = {
-        type: 'done' as const,
-        agent: 'writer',
-        message: assistant({ content: 'a b' })
+    const start = { type: 'start' as const, agent: 'instruct', model: 'm1' };
+    const call = {
+        type: 'tool_call' as const,
+        agent: 'instruct',
+        call: { id: 'c1', name: 'readFile', arguments: '{"path":"package.json"}' }
     };
+    const result = {
+        type: 'tool_result' as const,
+        agent: 'instruct',
+        name: 'readFile',
+        content: '{"ok":true}',
+        isError: false,
+        callId: 'c1'
+    };
+    const done = { type: 'done' as const, agent: 'instruct', message: assistant({ content: 'a b' }) };
 
-    // The turn the server records: identical events to the stream, which is what
-    // makes the hydration assertion meaningful (the DOM could not tell them
-    // apart if the snapshot were ignored, so test 4 breaks that tie).
     const recorded: SessionTurn = {
         id: 't1',
         index: 0,
         prompt: 'say hi',
         status: 'done',
-        startedAt: 1,
-        updatedAt: 2,
-        events: [start, { type: 'text', agent: 'writer', delta: '# Hi\n\n' }, { type: 'text', agent: 'writer', delta: 'a **b**' }, done]
-    };
-
+        startedAt: T,
+        updatedAt: T + 3600,
+        events: [
+            start,
+            call,
+            result,
+            { type: 'text', agent: 'instruct', delta: '# Hi\n\n' },
+            { type: 'text', agent: 'instruct', delta: 'a **b**' },
+            done
+        ],
+        eventTimes: [T, T + 200, T + 1000, T + 1500, T + 1700, T + 2400]
+    } as SessionTurn;
     const opening: SessionTurn = { ...recorded, status: 'running', events: [] };
-    const finished = snapshot({ turns: [recorded] });
+    const finished = snapshot({ harnessDefinition: descriptor(), turns: [recorded] });
 
-    vi.stubGlobal(
-        'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = String(input);
+    stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap());
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions' && method === 'POST')
+            return json({ session: snapshot({ harnessDefinition: descriptor() }) });
 
-            if (url === '/api') return json(bootstrap());
-            if (url === '/api/models') return json({ models: ['m1'] });
-            if (url === '/api/sessions' && init?.method === 'POST') return json({ session: snapshot() });
+        if (url === '/api/sessions/s1/messages' && method === 'POST') {
+            messageRequests += 1;
+            const at = (offset: number): number => T + offset;
 
-            if (url === '/api/sessions/s1/messages' && init?.method === 'POST') {
-                messageRequests += 1;
+            const items: SessionStreamItem[] = [
+                { type: 'turn', turn: opening },
+                { type: 'event', turnId: 't1', event: start, at: at(0) },
+                { type: 'event', turnId: 't1', event: call, at: at(200) },
+                { type: 'event', turnId: 't1', event: result, at: at(1000) },
+                { type: 'event', turnId: 't1', event: { type: 'text', agent: 'instruct', delta: '# Hi\n\n' }, at: at(1500) },
+                { type: 'event', turnId: 't1', event: { type: 'text', agent: 'instruct', delta: 'a **b**' }, at: at(1700) },
+                { type: 'event', turnId: 't1', event: done, at: at(2400) },
+                { type: 'snapshot', session: finished }
+            ];
 
-                const items: SessionStreamItem[] = [
-                    { type: 'turn', turn: opening },
-                    { type: 'event', turnId: 't1', event: start },
-                    { type: 'event', turnId: 't1', event: { type: 'text', agent: 'writer', delta: '# Hi\n\n' } },
-                    { type: 'event', turnId: 't1', event: { type: 'text', agent: 'writer', delta: 'a **b**' } },
-                    { type: 'event', turnId: 't1', event: done },
-                    { type: 'snapshot', session: finished }
-                ];
+            return sse(items);
+        }
 
-                return sse(items);
-            }
-
-            throw new Error(`unexpected request: ${url}`);
-        })
-    );
+        return undefined;
+    });
 
     await import('./main');
     await flush();
 
+    // --- shell (R1/R2/R3) ---------------------------------------------
     expect(statusText()).toBe('idle');
-    expect(document.querySelector('.main-title')?.textContent).toBe('Demo harness');
-    // The bootstrap session list is empty and rendered as such.
+    expect(document.querySelectorAll('.shell > .rail-left, .shell > .center, .shell > .rail-right')).toHaveLength(3);
+    expect(harnessNames()).toEqual(['instruct']);
+    expect(byClass('.harness-item', 'button').getAttribute('aria-pressed')).toBe('true');
+    expect(document.querySelector('.main-title')?.textContent).toBe('Instruct');
+
+    // The agent row replaced the description wall.
+    expect(agentNames()).toEqual(['instruct']);
+    expect(agentRoles()).toEqual(['primary']);
+    expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
+    expect(document.querySelector('.agent-add')).not.toBeNull();
+
+    // Core tools are a collapsed dropdown, only the harness core set.
+    const core = byClass('.core-tools', 'details');
+    expect(core.open).toBe(false);
+    expect(document.querySelector('.core-summary')?.textContent).toBe('Core tools · 3');
+    expect(coreToolNames()).toEqual(['requestTools', 'createTool', 'todoTools']);
+    // No badge wall in the header any more.
+    expect(document.querySelector('.badges')).toBeNull();
+
+    // Sessions are scoped and locked to the selected harness.
+    expect(document.querySelector('.sessions-scope')?.textContent).toBe('Locked to instruct.');
     expect(document.querySelector('.session-list .field-hint')?.textContent).toBe(
-        'No sessions on this server yet. Send a task to create one.'
+        'No sessions for this harness yet. Send a task to create one.'
     );
 
-    const input = document.querySelector<HTMLTextAreaElement>('.composer-input');
-    const form = document.querySelector<HTMLFormElement>('.composer');
-    const run = document.querySelector<HTMLButtonElement>('button.primary');
-    if (input === null || form === null || run === null) throw new Error('shell did not render');
+    const input = byClass('.composer-input', 'textarea');
+    const form = byClass('.composer', 'form');
+    const runButton = byClass('.run', 'button');
 
     input.value = 'say hi';
     form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
@@ -181,6 +295,7 @@ it('boots, streams a turn by explicit id, then renders the server snapshot', asy
     // The tile exists before the server answers; while the stream is open the
     // request lock is held, so a second submit is ignored.
     expect(document.querySelector('.tile')).not.toBeNull();
+    expect(byClass('.agent-main', 'button').disabled).toBe(true);
     form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
 
     await flush();
@@ -188,157 +303,354 @@ it('boots, streams a turn by explicit id, then renders the server snapshot', asy
 
     expect(messageRequests).toBe(1);
 
-    const tile = document.querySelector<HTMLElement>('.tile');
-    expect(tile?.getAttribute('data-state')).toBe('done');
-    // The server's turn index (0) is displayed 1-based.
-    expect(tile?.querySelector('.tile-index')?.textContent).toBe('#1');
-    expect(tile?.querySelector('.tile-status-text')?.textContent).toBe('done');
-    expect(tile?.querySelector('.turn-prompt')?.textContent).toBe('say hi\n');
-    expect(tile?.querySelector('.agent-text')?.innerHTML).toBe('<h1>Hi</h1>\n<p>a <strong>b</strong></p>\n');
-    expect(tile?.querySelector('.agent-meta')?.textContent).toBe('m1 · stop');
-    expect(tile?.querySelector('.tile-meta')?.textContent).toBe('1 agent · m1 · done');
-    expect(tile?.classList.contains('is-expanded')).toBe(true);
+    const tile = byClass('.tile', 'article');
+    expect(tile.dataset.state).toBe('done');
+    expect(tile.querySelector('.tile-index')?.textContent).toBe('#1');
+    expect(tile.querySelector('.tile-status-text')?.textContent).toBe('done');
+    expect(tile.querySelector('.turn-prompt')?.textContent).toBe('say hi\n');
+    expect(tile.querySelector('.agent-text')?.innerHTML).toBe('<h1>Hi</h1>\n<p>a <strong>b</strong></p>\n');
+    expect(tile.querySelector('.agent-meta')?.textContent).toBe('m1 · stop');
+
+    // R4: the server's startedAt/updatedAt and eventTimes decide the labels.
+    expect(tile.querySelector('.tile-elapsed')?.textContent).toBe('3.6s');
+    expect(tile.querySelector('.tool-name')?.textContent).toBe('readFile');
+    expect(tile.querySelector('.tool-duration')?.textContent).toBe('800ms');
+    expect(tile.classList.contains('is-expanded')).toBe(true);
 
     // The terminal snapshot populated the directory and the remembered pointer.
-    const row = document.querySelector<HTMLElement>('.session');
-    expect(row?.dataset.status).toBe('idle');
-    expect(row?.dataset.active).toBe('true');
-    expect(row?.querySelector('.session-meta')?.textContent).toBe('idle · 1 turn · s1');
-    expect(row?.querySelector('.session-prompt')?.textContent).toBe('say hi');
+    const row = byClass('.session', 'button');
+    expect(row.dataset.status).toBe('idle');
+    expect(row.dataset.active).toBe('true');
+    expect(row.querySelector('.session-meta')?.textContent).toBe('idle · 1 turn · s1');
     expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
 
     expect(statusText()).toBe('done · m1 · idle');
-    expect(run.disabled).toBe(false);
+    expect(runButton.disabled).toBe(false);
+    // A session exists now, so the team is frozen: editing needs a New session.
+    expect(byClass('.agent-main', 'button').disabled).toBe(true);
+    expect(document.querySelector('.agent-lock-text')?.textContent).toBe(
+        'This saved session keeps the agent team it started with.'
+    );
 });
 
-it('restores a remembered session from the server without starting a model run', async () => {
-    const messages = [assistant({ content: 'sub answer' })];
+it('restores a remembered session with its frozen team and server timings', async () => {
+    const frozen = descriptor({
+        agents: ['instruct', 'summarizer'],
+        primary: 'instruct',
+        subagents: ['summarizer']
+    });
 
     const first: SessionTurn = {
         id: 't1',
         index: 0,
         prompt: 'first task',
         status: 'done',
-        startedAt: 10,
-        updatedAt: 20,
+        startedAt: T,
+        updatedAt: T + 3600,
         events: [
-            { type: 'start', agent: 'writer', model: 'm1' },
-            { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'readFile', arguments: '{"path":"package.json"}' } },
-            { type: 'start', agent: 'helper', model: 'm2' },
-            { type: 'text', agent: 'helper', delta: 'sub **answer**' },
-            { type: 'done', agent: 'helper', message: assistant({ content: 'sub answer', model: 'm2' }) },
-            { type: 'tool_result', agent: 'writer', name: 'readFile', content: '{"ok":true}', isError: false },
-            { type: 'text', agent: 'writer', delta: '## Answer\n\nfinal' },
-            { type: 'done', agent: 'writer', message: assistant() }
-        ]
-    };
+            { type: 'start', agent: 'instruct', model: 'm1' },
+            {
+                type: 'tool_call',
+                agent: 'instruct',
+                call: { id: 'c1', name: 'readFile', arguments: '{"path":"package.json"}' }
+            },
+            {
+                type: 'tool_result',
+                agent: 'instruct',
+                name: 'readFile',
+                content: '{"ok":true}',
+                isError: false,
+                callId: 'c1'
+            },
+            { type: 'text', agent: 'instruct', delta: '## Answer\n\nfinal' },
+            { type: 'done', agent: 'instruct', message: assistant() }
+        ],
+        eventTimes: [T, T + 200, T + 1700, T + 2000, T + 3000]
+    } as SessionTurn;
 
-    const second: SessionTurn = {
+    // A turn recorded before the server sent timing data: no eventTimes, but the
+    // turn span still renders, and no tool duration is invented.
+    const legacy: SessionTurn = {
         id: 't2',
         index: 1,
         prompt: 'second task',
         status: 'error',
-        startedAt: 30,
-        updatedAt: 40,
+        startedAt: T + 4000,
+        updatedAt: T + 5000,
         events: [
-            { type: 'start', agent: 'writer', model: 'm1' },
-            { type: 'error', agent: 'writer', error: { message: 'provider exploded' } }
+            { type: 'start', agent: 'instruct', model: 'm1' },
+            { type: 'tool_call', agent: 'instruct', call: { id: 'c2', name: 'clock', arguments: '{}' } },
+            { type: 'error', agent: 'instruct', error: { message: 'provider exploded' } }
         ]
     };
 
-    const restored = snapshot({ turns: [first, second], messages });
-
-    const other = snapshot({ id: 's2', createdAt: 3, updatedAt: 4 });
-
+    const restored = snapshot({ harnessDefinition: frozen, turns: [first, legacy] });
     localStorage.setItem(SESSION_KEY, 's1');
 
     let messageRequests = 0;
-    let getRequests = 0;
-    let listRequests = 0;
+    let writes = 0;
 
-    vi.stubGlobal(
-        'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = String(input);
-
-            if (url === '/api') return json(bootstrap([restored]));
-            if (url === '/api/models') return json({ models: ['m1'] });
-
-            if (url === '/api/sessions' && init?.method === undefined) {
-                listRequests += 1;
-                // The refresh answer includes a session this page never created.
-                return json({ sessions: [restored, other] });
+    stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap({ presets: [descriptor()], sessions: [restored] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/s1') {
+            if (method !== undefined) {
+                writes += 1;
+                throw new Error('opening a session must be read-only');
             }
-
-            if (url === '/api/sessions/s1') {
-                if (init?.method === 'POST' || init?.method === 'DELETE') throw new Error('unexpected write');
-                getRequests += 1;
-                return json({ session: restored });
-            }
-
-            if (url.endsWith('/messages')) messageRequests += 1;
-
-            throw new Error(`unexpected request: ${url}`);
-        })
-    );
+            return json({ session: restored });
+        }
+        if (url === '/api/sessions' && method === undefined) return json({ sessions: [restored] });
+        if (url.endsWith('/messages')) messageRequests += 1;
+        return undefined;
+    });
 
     await import('./main');
     await flush();
     await flush();
 
-    expect(getRequests).toBe(1);
     expect(messageRequests).toBe(0);
-
-    expect(tileIndexes()).toEqual(['#1', '#2']);
+    expect(writes).toBe(0);
     expect(tileStates()).toEqual(['done', 'error']);
+    expect(tileElapsed()).toEqual(['3.6s', '1.0s']);
+    // R4: recorded tool span from eventTimes (T+200 → T+1700).
+    expect(document.querySelector('.tool-duration')?.textContent).toBe('1.5s');
+    // The legacy call has no recorded duration.
+    expect(document.querySelectorAll('.tool-duration')[1]?.textContent).toBe('');
+    // No NaN anywhere, including legacy timing.
+    expect(document.body.textContent ?? '').not.toContain('NaN');
 
-    const tiles = [...document.querySelectorAll<HTMLElement>('.tile')];
+    // The frozen definition is what is displayed, not the live descriptor.
+    expect(agentNames()).toEqual(['instruct', 'summarizer']);
+    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(document.querySelector('.harness-note')?.textContent).toBe(
+        'Viewing a saved session · agent team frozen'
+    );
+    expect(coreToolNames()).toEqual(['requestTools', 'createTool', 'todoTools', 'delegate']);
+    for (const button of document.querySelectorAll<HTMLButtonElement>('.agent-main')) {
+        expect(button.disabled).toBe(true);
+    }
+    expect(byClass('.agent-add', 'button').disabled).toBe(true);
+    expect(document.querySelector('.agent-lock-text')?.textContent).toBe(
+        'This saved session keeps the agent team it started with.'
+    );
 
-    // Newest turn is expanded; the older one stays compact but fully rendered.
-    expect(tiles[0].classList.contains('is-expanded')).toBe(false);
-    expect(tiles[1].classList.contains('is-expanded')).toBe(true);
-    expect(tiles[0].querySelector('.tile-meta')?.textContent).toBe('2 agents · 1 tool call · m1 · done');
-
-    // Subagent labelling and tool pairing come from the recorded event order.
-    const agents = [...tiles[0].querySelectorAll<HTMLElement>('.agent')];
-    expect(agents.map((agent) => agent.dataset.agent)).toEqual(['writer', 'helper']);
-    expect(agents.map((agent) => agent.dataset.role)).toEqual(['primary', 'subagent']);
-    expect(agents[1].querySelector('.agent-meta')?.textContent).toBe('m2 · stop');
-    expect(tiles[0].querySelector<HTMLElement>('details.tool')?.dataset.state).toBe('ok');
-    expect(tiles[0].querySelector('.tool-state')?.textContent).toBe('ok');
-    expect(agents[0].querySelector('.agent-text')?.innerHTML).toBe('<h2>Answer</h2>\n<p>final</p>\n');
-
-    // The failed turn renders its error event, not a synthesised message.
-    expect(tiles[1].querySelector('.tile-status-text')?.textContent).toBe('error');
-    expect(tiles[1].querySelector('.agent-error-label')?.textContent).toBe('error');
-    expect(tiles[1].querySelector('.agent-error-text')?.textContent).toBe('provider exploded');
-    expect(tiles[1].querySelector('.tile-meta')?.textContent).toBe('1 agent · m1 · error');
-
-    // Prompt markdown and the informational entry-agent transcript.
-    expect(tiles[1].querySelector('.turn-prompt')?.innerHTML).toBe('<p>second task</p>\n');
-    expect(document.querySelector('.transcript-body')?.textContent).toBe(JSON.stringify(messages, null, 2));
-
-    const row = document.querySelector<HTMLElement>('.session');
-    expect(row?.dataset.active).toBe('true');
-    expect(row?.querySelector('.session-meta')?.textContent).toBe('idle · 2 turns · s1');
-
-    // Refresh re-reads the directory: a session created outside this page shows
-    // up without touching the open transcript.
-    const refresh = document.querySelectorAll<HTMLButtonElement>('.sessions-actions button')[1];
-    refresh.click();
+    // The lock's affordance starts a new conversation, which unlocks editing.
+    byClass('.agent-lock .link-button', 'button').click();
     await flush();
 
-    expect(listRequests).toBe(1);
-    const rows = [...document.querySelectorAll<HTMLElement>('.session')];
-    expect(rows).toHaveLength(2);
-    expect(rows[0].dataset.active).toBe('true');
-    expect(rows[1].dataset.sessionId).toBe('s2');
-    expect(rows[1].querySelector('.session-meta')?.textContent).toBe('idle · 0 turns · s2');
-    expect(rows[1].querySelector('.session-prompt')?.textContent).toBe('no turns yet');
-    // The open transcript was not rebuilt from the list answer.
-    expect(tileIndexes()).toEqual(['#1', '#2']);
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
+    expect(agentNames()).toEqual(['instruct']);
+    expect(byClass('.agent-main', 'button').disabled).toBe(false);
+    expect(localStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(writes).toBe(0);
+});
 
-    expect(statusText()).toBe('idle');
+it('creates a harness from preset agents with an initial primary', async () => {
+    const calls = stubFetch((url, method, body) => {
+        if (url === '/api') return json(bootstrap());
+        if (url === '/api/models') return json({ models: ['m1'] });
+
+        if (url === '/api/harnesses' && method === 'POST') {
+            const request = body as { name: string; title: string; primary: string; subagents: string[] };
+            return json(
+                {
+                    harness: descriptor({
+                        name: request.name,
+                        title: request.title,
+                        agents: [request.primary, ...request.subagents],
+                        primary: request.primary,
+                        subagents: request.subagents,
+                        builtin: false,
+                        editable: true,
+                        tools: []
+                    })
+                },
+                201
+            );
+        }
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    byClass('.new-harness', 'button').click();
+    const panel = byClass('.create-harness', 'section');
+    expect(panel.hidden).toBe(false);
+    expect(byClass('.new-harness', 'button').getAttribute('aria-expanded')).toBe('true');
+
+    byClass('.create-name', 'input').value = 'release-captain';
+    byClass('.create-title-input', 'input').value = 'Release captain';
+
+    const primary = byClass('.create-primary', 'select');
+    primary.value = 'workspace';
+    primary.dispatchEvent(new Event('change', { bubbles: true }));
+
+    // The secondary select cannot offer the primary agent.
+    const secondary = byClass('.create-agent-select', 'select');
+    expect([...secondary.options].map((option) => option.value)).toEqual(['instruct', 'summarizer']);
+    secondary.value = 'summarizer';
+    byClass('.create-agent-add', 'button').click();
+
+    expect([...document.querySelectorAll('.create-chip-name')].map((chip) => chip.textContent)).toEqual([
+        'summarizer'
+    ]);
+
+    byClass('.create-form', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+    await flush();
+    await flush();
+
+    const post = calls.find((call) => call.url === '/api/harnesses' && call.method === 'POST');
+    expect(post?.body).toEqual({
+        name: 'release-captain',
+        title: 'Release captain',
+        primary: 'workspace',
+        subagents: ['summarizer']
+    });
+
+    // The server's descriptor wins: the new harness is listed and selected.
+    expect(panel.hidden).toBe(true);
+    expect(harnessNames()).toEqual(['instruct', 'release-captain']);
+    const selected = byClass('.harness-item[data-harness="release-captain"]', 'button');
+    expect(selected.getAttribute('aria-pressed')).toBe('true');
+    expect(document.querySelector('.main-title')?.textContent).toBe('Release captain');
+    expect(agentNames()).toEqual(['workspace', 'summarizer']);
+    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(coreToolNames()).toEqual(['requestTools', 'createTool', 'todoTools', 'delegate']);
+});
+
+it('adds a picker agent, promotes it to primary and never duplicates a member', async () => {
+    const base = descriptor();
+    let current = base;
+    const calls = stubFetch((url, method, body) => {
+        if (url === '/api') return json(bootstrap({ presets: [base] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+
+        if (url === '/api/harnesses/instruct' && method === 'PATCH') {
+            const request = body as { primary: string; subagents: string[] };
+            current = descriptor({
+                agents: [request.primary, ...request.subagents],
+                primary: request.primary,
+                subagents: request.subagents
+            });
+            return json({ harness: current });
+        }
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // The picker is the trusted preset list, with read-only instructions.
+    byClass('.agent-add', 'button').click();
+    const picker = byClass('.agent-picker', 'div');
+    expect(picker.hidden).toBe(false);
+    expect(byClass('.agent-add', 'button').getAttribute('aria-expanded')).toBe('true');
+
+    const options = [...document.querySelectorAll<HTMLElement>('.agent-option')];
+    expect(options.map((option) => option.dataset.agent)).toEqual(['instruct', 'summarizer', 'workspace']);
+    expect(options[0].dataset.state).toBe('member');
+    expect(options[0].querySelector<HTMLButtonElement>('.agent-option-add')?.disabled).toBe(true);
+    expect(options[1].querySelector('.agent-instruction')?.textContent).toBe(
+        'Compress notes into at most two sentences.'
+    );
+    expect(options[1].querySelector('.agent-guideline')?.textContent).toBe('Keep names and numbers.');
+
+    options[1].querySelector<HTMLButtonElement>('.agent-option-add')?.click();
+    await flush();
+
+    // Complete team in one PATCH: primary + every remaining member as subagent.
+    expect(calls.find((call) => call.method === 'PATCH')?.body).toEqual({
+        primary: 'instruct',
+        subagents: ['summarizer']
+    });
+    expect(picker.hidden).toBe(true);
+    expect(agentNames()).toEqual(['instruct', 'summarizer']);
+    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(coreToolNames()).toContain('delegate');
+
+    // Selecting a secondary demotes the old primary; the request lists it once.
+    document.querySelectorAll<HTMLButtonElement>('.agent-main')[1].click();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')[1]?.body).toEqual({
+        primary: 'summarizer',
+        subagents: ['instruct']
+    });
+    expect(agentNames()).toEqual(['summarizer', 'instruct']);
+    expect(agentRoles()).toEqual(['primary', 'secondary']);
+
+    // Removing a secondary keeps exactly one primary and the complete list.
+    document.querySelectorAll<HTMLButtonElement>('.agent-remove')[1].click();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')[2]?.body).toEqual({
+        primary: 'summarizer',
+        subagents: []
+    });
+    expect(agentNames()).toEqual(['summarizer']);
+    expect(byClass('.agent-remove', 'button').disabled).toBe(true);
+});
+
+it('filters the sessions rail to the selected harness and opens within it', async () => {
+    const instruct = descriptor();
+    const workspace = descriptor({
+        name: 'workspace',
+        title: 'Workspace',
+        agents: ['workspace'],
+        primary: 'workspace',
+        requiresEndpoint: false
+    });
+
+    const instructSession = snapshot({ id: 's1', harness: 'instruct' });
+    const workspaceSession = snapshot({ id: 's2', harness: 'workspace' });
+    const foreign = snapshot({ id: 's3', harness: 'retired' });
+
+    stubFetch((url) => {
+        if (url === '/api') {
+            return json(
+                bootstrap({
+                    presets: [instruct, workspace],
+                    sessions: [instructSession, workspaceSession, foreign]
+                })
+            );
+        }
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/s2') return json({ session: workspaceSession });
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    expect(harnessNames()).toEqual(['instruct', 'workspace']);
+    expect(sessionIds()).toEqual(['s1']);
+    expect(document.querySelector('.sessions-scope')?.textContent).toBe('Locked to instruct.');
+
+    byClass('.harness-item[data-harness="workspace"]', 'button').click();
+    await flush();
+
+    expect(sessionIds()).toEqual(['s2']);
+    expect(document.querySelector('.sessions-scope')?.textContent).toBe('Locked to workspace.');
+    expect(agentNames()).toEqual(['workspace']);
+
+    byClass('.session[data-session-id="s2"]', 'button').click();
+    await flush();
+    await flush();
+
+    // Opening a session keeps its harness selected — never switches it.
+    expect(byClass('.harness-item[data-harness="workspace"]', 'button').getAttribute('aria-pressed')).toBe(
+        'true'
+    );
+    expect(document.querySelector('.main-title')?.textContent).toBe('Workspace');
+    expect(sessionIds()).toEqual(['s2']);
 });
 
 it('keeps the existing session when endpoint settings change', async () => {
@@ -347,9 +659,12 @@ it('keeps the existing session when endpoint settings change', async () => {
         index: 0,
         prompt: 'keep me',
         status: 'done',
-        startedAt: 1,
-        updatedAt: 2,
-        events: [{ type: 'start', agent: 'writer', model: 'm1' }, { type: 'text', agent: 'writer', delta: 'kept' }]
+        startedAt: T,
+        updatedAt: T + 1000,
+        events: [
+            { type: 'start', agent: 'instruct', model: 'm1' },
+            { type: 'text', agent: 'instruct', delta: 'kept' }
+        ]
     };
 
     const existing = snapshot({ turns: [recorded] });
@@ -358,28 +673,23 @@ it('keeps the existing session when endpoint settings change', async () => {
     let created = 0;
     let deleted = 0;
 
-    vi.stubGlobal(
-        'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = String(input);
+    stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap({ sessions: [existing] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/s1') return json({ session: existing });
 
-            if (url === '/api') return json(bootstrap([existing]));
-            if (url === '/api/models') return json({ models: ['m1'] });
-            if (url === '/api/sessions/s1') return json({ session: existing });
+        if (url === '/api/sessions') {
+            if (method === 'POST') created += 1;
+            return json({ session: snapshot() });
+        }
 
-            if (url === '/api/sessions') {
-                if (init?.method === 'POST') created += 1;
-                return json({ session: snapshot() });
-            }
+        if (method === 'DELETE') {
+            deleted += 1;
+            return json({ deleted: true });
+        }
 
-            if (init?.method === 'DELETE') {
-                deleted += 1;
-                return json({ deleted: true });
-            }
-
-            throw new Error(`unexpected request: ${url}`);
-        })
-    );
+        return undefined;
+    });
 
     await import('./main');
     await flush();
@@ -389,8 +699,7 @@ it('keeps the existing session when endpoint settings change', async () => {
 
     // Change the base URL through the real input path (this is a *draft*: it is
     // only used the next time a session is created).
-    const baseURL = document.querySelector<HTMLInputElement>('.endpoint input.field-input');
-    if (baseURL === null) throw new Error('the endpoint fields did not render');
+    const baseURL = byClass('.endpoint input.field-input', 'input');
     baseURL.value = 'http://other-provider/v1';
     baseURL.dispatchEvent(new Event('input', { bubbles: true }));
 
@@ -402,46 +711,94 @@ it('keeps the existing session when endpoint settings change', async () => {
     expect(created).toBe(0);
     expect(deleted).toBe(0);
     expect(document.querySelectorAll('.tile')).toHaveLength(1);
-    expect(document.querySelector('.tile')?.isConnected).toBe(true);
     expect(document.querySelector('.agent-text')?.textContent).toBe('kept\n');
     expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
-    expect(document.querySelector<HTMLElement>('.session')?.dataset.active).toBe('true');
+    expect(byClass('.session', 'button').dataset.active).toBe('true');
 });
 
 it('replaces the projected stream with the authoritative terminal snapshot', async () => {
-    const start = { type: 'start' as const, agent: 'writer', model: 'm1' };
+    const start = { type: 'start' as const, agent: 'instruct', model: 'm1' };
     const recorded: SessionTurn = {
         id: 't1',
         index: 0,
         prompt: 'go',
         status: 'done',
-        startedAt: 1,
-        updatedAt: 2,
-        events: [start, { type: 'text', agent: 'writer', delta: 'server wins' }]
+        startedAt: T,
+        updatedAt: T + 500,
+        events: [start, { type: 'text', agent: 'instruct', delta: 'server wins' }]
     };
 
     const finished = snapshot({ turns: [recorded] });
     const opening: SessionTurn = { ...recorded, status: 'running', events: [] };
+
+    stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap());
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions' && method === 'POST') return json({ session: snapshot() });
+
+        if (url === '/api/sessions/s1/messages') {
+            return sse([
+                { type: 'turn', turn: opening },
+                { type: 'event', turnId: 't1', event: start },
+                // A transient projection the server did not record.
+                { type: 'event', turnId: 't1', event: { type: 'text', agent: 'instruct', delta: 'draft ' } },
+                { type: 'event', turnId: 't1', event: { type: 'text', agent: 'instruct', delta: 'that differs' } },
+                { type: 'snapshot', session: finished }
+            ]);
+        }
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+
+    const input = byClass('.composer-input', 'textarea');
+    input.value = 'go';
+    byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+
+    await flush();
+    await flush();
+
+    expect(document.querySelectorAll('.tile')).toHaveLength(1);
+    expect(document.querySelector('.agent-text')?.innerHTML).toBe('<p>server wins</p>\n');
+    expect(document.querySelector('.agent-text')?.textContent).not.toContain('draft');
+});
+
+it('stops the originating session and locks selection while a run is in flight', async () => {
+    let cancelRequests = 0;
+    let messageStarted: (() => void) | undefined;
+    const started = new Promise<void>((resolve) => {
+        messageStarted = resolve;
+    });
+
+    const other = descriptor({ name: 'workspace', title: 'Workspace', agents: ['workspace'], primary: 'workspace' });
 
     vi.stubGlobal(
         'fetch',
         vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
-            if (url === '/api') return json(bootstrap());
+            if (url === '/api') return json(bootstrap({ presets: [descriptor(), other] }));
             if (url === '/api/models') return json({ models: ['m1'] });
             if (url === '/api/sessions' && init?.method === 'POST') return json({ session: snapshot() });
 
             if (url === '/api/sessions/s1/messages') {
-                return sse([
-                    { type: 'turn', turn: opening },
-                    { type: 'event', turnId: 't1', event: start },
-                    // A transient projection the server did not record.
-                    { type: 'event', turnId: 't1', event: { type: 'text', agent: 'writer', delta: 'draft ' } },
-                    { type: 'event', turnId: 't1', event: { type: 'text', agent: 'writer', delta: 'that differs' } },
-                    { type: 'snapshot', session: finished }
-                ]);
+                messageStarted?.();
+                // A stream that stays open until the request is aborted.
+                return new Promise<Response>((_resolve, reject) => {
+                    init?.signal?.addEventListener('abort', () =>
+                        reject(new DOMException('The operation was aborted.', 'AbortError'))
+                    );
+                });
             }
+
+            if (url === '/api/sessions/s1/cancel' && init?.method === 'POST') {
+                cancelRequests += 1;
+                return json({ cancelled: true });
+            }
+
+            if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [] });
 
             throw new Error(`unexpected request: ${url}`);
         })
@@ -450,20 +807,109 @@ it('replaces the projected stream with the authoritative terminal snapshot', asy
     await import('./main');
     await flush();
 
-    const input = document.querySelector<HTMLTextAreaElement>('.composer-input');
-    const form = document.querySelector<HTMLFormElement>('.composer');
-    if (input === null || form === null) throw new Error('shell did not render');
+    const input = byClass('.composer-input', 'textarea');
+    input.value = 'long one';
+    byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+    await started;
+    await flush();
 
-    input.value = 'go';
-    form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+    // While the stream owns the instance, selection and edits are locked.
+    expect(byClass('.harness-item[data-harness="workspace"]', 'button').disabled).toBe(true);
+    expect(byClass('.new-session', 'button').disabled).toBe(true);
+    expect(byClass('.agent-add', 'button').disabled).toBe(true);
 
+    byClass('.stop', 'button').click();
     await flush();
     await flush();
 
-    expect(document.querySelectorAll('.tile')).toHaveLength(1);
-    expect(document.querySelector('.agent-text')?.innerHTML).toBe('<p>server wins</p>\n');
-    expect(document.querySelector('.agent-text')?.textContent).not.toContain('draft');
-    expect(document.querySelector('.tile-meta')?.textContent).toBe('1 agent · m1 · done');
+    // Stop cancels the session the run started on, not a later selection.
+    expect(cancelRequests).toBe(1);
+    expect(tileStates()).toEqual(['cancelled']);
+    expect(statusText()).toBe('cancelled');
+    expect(byClass('.harness-item[data-harness="workspace"]', 'button').disabled).toBe(false);
+    expect(byClass('.stop', 'button').disabled).toBe(true);
+});
+
+it('stops polling a running session when another harness is selected', async () => {
+    vi.useFakeTimers();
+
+    const runningTurn: SessionTurn = {
+        id: 'r1',
+        index: 0,
+        prompt: 'long task',
+        status: 'running',
+        startedAt: T,
+        updatedAt: T + 500,
+        events: [{ type: 'start', agent: 'instruct', model: 'm1' }]
+    };
+    const running = snapshot({ id: 'r1', status: 'running', turns: [runningTurn] });
+    const other = descriptor({ name: 'workspace', title: 'Workspace', agents: ['workspace'], primary: 'workspace' });
+    localStorage.setItem(SESSION_KEY, 'r1');
+
+    let gets = 0;
+    stubFetch((url) => {
+        if (url === '/api') return json(bootstrap({ presets: [descriptor(), other], sessions: [running] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/r1') {
+            gets += 1;
+            return json({ session: running });
+        }
+        return undefined;
+    });
+
+    await import('./main');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(gets).toBe(1);
+
+    // The reader moves on before the first poll fires.
+    byClass('.harness-item[data-harness="workspace"]', 'button').click();
+    await vi.advanceTimersByTimeAsync(3000);
+
+    expect(gets).toBe(1);
+    expect(sessionIds()).toEqual([]);
+    expect(statusText()).toBe('idle');
+});
+
+it('clears polling and elapsed timers on pagehide', async () => {
+    vi.useFakeTimers();
+
+    const runningTurn: SessionTurn = {
+        id: 'r1',
+        index: 0,
+        prompt: 'long task',
+        status: 'running',
+        startedAt: Date.now() - 500,
+        updatedAt: Date.now(),
+        events: [{ type: 'start', agent: 'instruct', model: 'm1' }]
+    };
+    const running = snapshot({ id: 'r1', status: 'running', turns: [runningTurn] });
+    localStorage.setItem(SESSION_KEY, 'r1');
+
+    let gets = 0;
+    stubFetch((url) => {
+        if (url === '/api') return json(bootstrap({ sessions: [running] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/r1') {
+            gets += 1;
+            return json({ session: running });
+        }
+        return undefined;
+    });
+
+    await import('./main');
+    await vi.advanceTimersByTimeAsync(50);
+    expect(gets).toBe(1);
+
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(gets).toBe(2);
+    const before = tileElapsed()[0];
+
+    window.dispatchEvent(new Event('pagehide'));
+    // Both the poll and the live tick are gone: neither may fire again.
+    await vi.advanceTimersByTimeAsync(5000);
+
+    expect(gets).toBe(2);
+    expect(tileElapsed()[0]).toBe(before);
 });
 
 it('polls a session that is still running after reload until it is terminal', async () => {
@@ -474,17 +920,20 @@ it('polls a session that is still running after reload until it is terminal', as
         index: 0,
         prompt: 'long task',
         status: 'running',
-        startedAt: 1,
-        updatedAt: 2,
-        events: [{ type: 'start', agent: 'writer', model: 'm1' }, { type: 'text', agent: 'writer', delta: 'half' }]
+        startedAt: T,
+        updatedAt: T + 500,
+        events: [
+            { type: 'start', agent: 'instruct', model: 'm1' },
+            { type: 'text', agent: 'instruct', delta: 'half' }
+        ]
     };
 
     const running = snapshot({ id: 'r1', status: 'running', turns: [runningTurn] });
     const finishedTurn: SessionTurn = {
         ...runningTurn,
         status: 'done',
-        updatedAt: 9,
-        events: [...runningTurn.events, { type: 'text', agent: 'writer', delta: ' and done' }]
+        updatedAt: T + 2500,
+        events: [...runningTurn.events, { type: 'text', agent: 'instruct', delta: ' and done' }]
     };
     const finished = snapshot({ id: 'r1', turns: [finishedTurn] });
 
@@ -493,30 +942,24 @@ it('polls a session that is still running after reload until it is terminal', as
     let gets = 0;
     let messageRequests = 0;
 
-    vi.stubGlobal(
-        'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
-            const url = String(input);
+    stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap({ sessions: [running] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
 
-            if (url === '/api') return json(bootstrap([running]));
-            if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/r1') {
+            gets += 1;
+            if (method !== undefined) throw new Error('polling must be a GET');
+            // 1 = initial load, 2 = first poll (still running), 3 = terminal.
+            return json({ session: gets < 3 ? running : finished });
+        }
 
-            if (url === '/api/sessions/r1') {
-                gets += 1;
-                if (init?.method !== undefined) throw new Error('polling must be a GET');
-                // 1 = initial load, 2 = first poll (still running), 3 = terminal.
-                return json({ session: gets < 3 ? running : finished });
-            }
+        if (url.endsWith('/messages')) {
+            messageRequests += 1;
+            return json({ error: { message: 'Unknown API route.' } }, 404);
+        }
 
-            if (url.endsWith('/messages')) {
-                messageRequests += 1;
-                if (init?.method === undefined) throw new Error('messages must be POSTed');
-                return notFound();
-            }
-
-            throw new Error(`unexpected request: ${url}`);
-        })
-    );
+        return undefined;
+    });
 
     await import('./main');
     await vi.advanceTimersByTimeAsync(50);
@@ -539,9 +982,9 @@ it('polls a session that is still running after reload until it is terminal', as
     expect(gets).toBe(3);
     expect(tileStates()).toEqual(['done']);
     expect(document.querySelector('.agent-text')?.innerHTML).toBe('<p>half and done</p>\n');
-    expect(document.querySelector('.tile-meta')?.textContent).toBe('1 agent · m1 · done');
+    expect(tileElapsed()).toEqual(['2.5s']);
     expect(statusText()).toBe('idle');
-    expect(document.querySelector<HTMLElement>('.session')?.dataset.status).toBe('idle');
+    expect(byClass('.session', 'button').dataset.status).toBe('idle');
 
     // Polling is GET-only: it never starts a model run.
     expect(messageRequests).toBe(0);
@@ -549,86 +992,4 @@ it('polls a session that is still running after reload until it is terminal', as
     // No further polls after the terminal answer.
     await vi.advanceTimersByTimeAsync(3_000);
     expect(gets).toBe(3);
-});
-
-it('renders the server harness descriptors as the catalogue and selects the first card', async () => {
-    // The server is the only catalogue: every live card advertises the same tool
-    // list, and only the agents/core tools differ by agent configuration.
-    const sharedTools = ['readFile', 'clock'];
-    const instruct = {
-        name: 'instruct',
-        title: 'Instruct',
-        description: 'A general agent.',
-        requiresEndpoint: true,
-        agents: ['instruct'],
-        tools: sharedTools,
-        coreTools: ['getTools', 'createTool', 'todoTools']
-    };
-    const research = {
-        name: 'research',
-        title: 'Research',
-        description: 'A research agent.',
-        requiresEndpoint: true,
-        agents: ['research', 'summarizer'],
-        tools: sharedTools,
-        coreTools: ['getTools', 'createTool', 'todoTools', 'delegate']
-    };
-
-    vi.stubGlobal(
-        'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
-            const url = String(input);
-
-            if (url === '/api') {
-                return json({
-                    rootPath: '/api',
-                    presets: [instruct, research],
-                    tools: [],
-                    defaults,
-                    sessions: []
-                });
-            }
-
-            if (url === '/api/models') return json({ models: ['m1'] });
-
-            throw new Error(`unexpected request: ${url}`);
-        })
-    );
-
-    await import('./main');
-    await flush();
-    await flush();
-
-    const cards = [...document.querySelectorAll<HTMLButtonElement>('.presets .preset')];
-    expect(cards.map((card) => card.querySelector('.preset-name')?.textContent)).toEqual([
-        'instruct',
-        'research'
-    ]);
-
-    // The UI selects the first server descriptor at boot (the server lists the
-    // live Instruct harness first), not a hardcoded default.
-    expect(cards.map((card) => card.getAttribute('aria-pressed'))).toEqual(['true', 'false']);
-    expect(document.querySelector('.main-title')?.textContent).toBe('Instruct');
-
-    const badges = (): (string | null)[] =>
-        [...document.querySelectorAll('.badges .badge')].map((badge) => badge.textContent);
-
-    expect(badges()).toEqual([
-        'agents: instruct',
-        // Server-owned: the UI does not invent or hardcode the core set.
-        'core: getTools, createTool, todoTools',
-        'catalogue: readFile, clock',
-        'needs endpoint'
-    ]);
-
-    cards[1].click();
-
-    // Same catalogue, different agent configuration: delegate appears only here.
-    expect(document.querySelector('.main-title')?.textContent).toBe('Research');
-    expect(badges()).toEqual([
-        'agents: research, summarizer',
-        'core: getTools, createTool, todoTools, delegate',
-        'catalogue: readFile, clock',
-        'needs endpoint'
-    ]);
 });

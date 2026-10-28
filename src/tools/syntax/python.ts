@@ -1,18 +1,16 @@
-// pythonSyntax — parse a Python snippet without running it.
+// Python half of syntaxCheck — parse a snippet without running it.
 //
 // Pipes the source to `compile()` through the interpreter, which also only parses.
 // Requires a Python 3 interpreter on PATH; the lookup is cached after the first
-// call.
+// call. Loaded through `import()` by ./syntaxCheck only when the caller asks for
+// language "python", so a JavaScript check never pays for node:child_process.
 //
-// Executable on its own and registerable on a harness:
-//
-//     await pythonSyntax('def f():\n    pass');      // true
-//     harness({ tools: { pythonSyntax } });
+// Cross-references:
+//   - ./syntaxCheck   — the public tool and its language dispatch
+//   - ../catalogue    — metadata (name, description, tags, schema)
 
 import { spawnSync } from 'node:child_process';
-import { tool } from '../../core';
 import { HarnessError } from '../../util';
-import { PRESET_TOOLS } from '../catalogue';
 
 // Interpreter candidates, in preference order. `python3` is the POSIX name;
 // `python` is the Windows one. The Windows Store `python3` shim exists but exits
@@ -46,26 +44,22 @@ const findPython = (): string | null => {
     return pythonInterpreter;
 };
 
-// Metadata (name, description, tags, schema) lives in ../catalogue so the preset
-// can be enumerated without importing this module — and so text can't drift.
-export const pythonSyntax = tool<string, boolean>({
-    ...PRESET_TOOLS.pythonSyntax,
-    execute: ({ parameters: code }) => {
-        const interpreter = findPython();
+// A missing interpreter is a setup problem, not a syntax verdict. Throwing keeps
+// "false" meaning "your code is wrong"; the harness turns this into a readable
+// tool result the model can recover from.
+export const checkPython = (code: string): boolean => {
+    const interpreter = findPython();
 
-        // A missing interpreter is a setup problem, not a syntax verdict.
-        // Throwing keeps "false" meaning "your code is wrong".
-        if (!interpreter) {
-            throw new HarnessError(
-                'pythonSyntax requires a Python 3 interpreter on PATH (tried: python3, python).'
-            );
-        }
-
-        const result = spawnSync(interpreter, ['-c', PYTHON_CHECK_SCRIPT], {
-            input: code,
-            encoding: 'utf8'
-        });
-
-        return result.status === 0;
+    if (!interpreter) {
+        throw new HarnessError(
+            'syntaxCheck requires a Python 3 interpreter on PATH (tried: python3, python).'
+        );
     }
-});
+
+    const result = spawnSync(interpreter, ['-c', PYTHON_CHECK_SCRIPT], {
+        input: code,
+        encoding: 'utf8'
+    });
+
+    return result.status === 0;
+};

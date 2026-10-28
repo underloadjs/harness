@@ -10,9 +10,10 @@
 // by shape and by identity relative to the emitted frames.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { agent, harness } from '../src/harness';
+import { agent, harness, tool } from '../src/harness';
 import type { HarnessStream, HarnessStreamEvent } from '../src/harness';
 import type { HarnessPreset, RunnerSettings } from '../harnesses/types';
+import { createHarnessRegistry } from '../harnesses';
 import { SessionError, SessionStore } from './sessions';
 import type { SessionStreamItem } from './protocol';
 
@@ -36,8 +37,12 @@ const presetOf = (
     title: name,
     description: `${name} scripted preset`,
     requiresEndpoint: false,
+    primary: agents[0] ?? name,
+    subagents: agents.slice(1),
     agents,
     tools: [],
+    builtin: true,
+    editable: true,
     create
 });
 
@@ -146,7 +151,7 @@ const teamPreset = (): HarnessPreset =>
 describe('SessionStore turns', () => {
     it('opens the stream with the running turn and records every event', async () => {
         const setClock = pinClock(1_000);
-        const store = new SessionStore(DEFAULTS, [singlePreset()]);
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
         const created = store.create('single');
         expect(created.turns).toEqual([]);
 
@@ -171,7 +176,9 @@ describe('SessionStore turns', () => {
             status: 'running',
             startedAt: 2_000,
             updatedAt: 2_000,
-            events: []
+            events: [],
+            // Parallel to `events` and empty until the first record arrives.
+            eventTimes: []
         });
 
         // 2. Every event frame names the turn, and the events are exactly the
@@ -219,7 +226,9 @@ describe('SessionStore turns', () => {
                 status: 'done',
                 startedAt: 2_000,
                 updatedAt: 2_000,
-                events
+                events,
+                // The clock is pinned, so every record shares this timestamp.
+                eventTimes: [2_000, 2_000, 2_000]
             }
         ]);
 
@@ -233,7 +242,7 @@ describe('SessionStore turns', () => {
 
     it('records subagent events in the primary turn', async () => {
         const setClock = pinClock(1_000);
-        const store = new SessionStore(DEFAULTS, [teamPreset()]);
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([teamPreset()]));
         const created = store.create('team');
         setClock(2_000);
 
@@ -286,6 +295,7 @@ describe('SessionStore turns', () => {
                 type: 'tool_result',
                 agent: 'lead',
                 name: 'delegate',
+                callId: 'call_1',
                 content: '{"agent":"helper","content":"helper answer"}',
                 isError: false
             },
@@ -318,7 +328,7 @@ describe('SessionStore turns', () => {
 
     it('keeps sequential turns in order and leaves earlier turns untouched', async () => {
         const setClock = pinClock(1_000);
-        const store = new SessionStore(DEFAULTS, [singlePreset()]);
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
         const created = store.create('single');
 
         setClock(2_000);
@@ -397,7 +407,7 @@ describe('SessionStore turns', () => {
             })
         );
 
-        const store = new SessionStore(DEFAULTS, [gatedPreset]);
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([gatedPreset]));
         const created = store.create('gated');
         setClock(2_000);
 
@@ -475,7 +485,7 @@ describe('SessionStore turns', () => {
             })
         );
 
-        const store = new SessionStore(DEFAULTS, [hangingPreset]);
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([hangingPreset]));
         const created = store.create('hanging');
         setClock(2_000);
 
@@ -518,7 +528,8 @@ describe('SessionStore turns', () => {
                     { type: 'start', agent: 'hanging', model: 'scripted/test' },
                     { type: 'text', agent: 'hanging', delta: 'partial' },
                     { type: 'error', agent: 'hanging', error: { message: 'The run was aborted.' } }
-                ]
+                ],
+                eventTimes: [2_000, 2_000, 2_000]
             }
         ]);
 
@@ -548,7 +559,7 @@ describe('SessionStore turns', () => {
             })
         );
 
-        const store = new SessionStore(DEFAULTS, [brokenPreset]);
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([brokenPreset]));
         const created = store.create('broken');
         setClock(2_000);
 
@@ -579,7 +590,8 @@ describe('SessionStore turns', () => {
                 events: [
                     { type: 'start', agent: 'broken', model: 'scripted/test' },
                     { type: 'error', agent: 'broken', error: { message: 'provider exploded' } }
-                ]
+                ],
+                eventTimes: [2_000, 2_000]
             }
         ]);
 
@@ -589,7 +601,7 @@ describe('SessionStore turns', () => {
 
     it('clears turns on reset and isolates sessions from each other', async () => {
         const setClock = pinClock(1_000);
-        const store = new SessionStore(DEFAULTS, [singlePreset()]);
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
         const first = store.create('single');
         const second = store.create('single');
 
@@ -618,7 +630,7 @@ describe('SessionStore turns', () => {
 
     it('returns copies, so a client cannot mutate the stored session', async () => {
         pinClock(2_000);
-        const store = new SessionStore(DEFAULTS, [singlePreset()]);
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
         const created = store.create('single');
 
         const items: SessionStreamItem[] = [];
@@ -653,6 +665,9 @@ describe('SessionStore turns', () => {
             harness: 'single',
             status: 'idle',
             model: 'scripted/test',
+            // Every agent's effective model is part of the snapshot (R9); this
+            // harness has one agent and no override, so it reports the session model.
+            agentModels: { single: 'scripted/test' },
             createdAt: 2_000,
             updatedAt: 2_000,
             messages: [
@@ -684,17 +699,377 @@ describe('SessionStore turns', () => {
                                 usage: { input: 3, output: 2, total: 5 }
                             }
                         }
-                    ]
+                    ],
+                    eventTimes: [2_000, 2_000, 2_000]
                 }
-            ]
+            ],
+            // The frozen configuration captured at creation, and the (empty)
+            // discovery set. Both survive a reload.
+            harnessDefinition: {
+                name: 'single',
+                title: 'single',
+                description: 'single scripted preset',
+                requiresEndpoint: false,
+                primary: 'single',
+                subagents: [],
+                agents: ['single'],
+                tools: [],
+                coreTools: ['requestTools', 'createTool', 'todoTools'],
+                builtin: true,
+                editable: true
+            },
+            discoveredTools: []
         });
     });
 
     it('reports unknown harnesses and sessions with the existing statuses', () => {
-        const store = new SessionStore(DEFAULTS, [singlePreset()]);
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
 
         expect(() => store.create('missing')).toThrow('Unknown harness "missing".');
         expect(() => store.create('missing')).toThrow(SessionError);
         expect(() => store.get('missing')).toThrow('Unknown session "missing".');
     });
 });
+
+// Registry interactions and discovery retention through the session record.
+describe('SessionStore and the harness registry', () => {
+    // Replay one scripted frame list per request, like src/harness.test.ts does.
+    const scriptedStream = (turns: HarnessStreamEvent[][]): HarnessStream => {
+        let index = 0;
+
+        return async function* (): AsyncGenerator<HarnessStreamEvent> {
+            const frames = turns[index] ?? turns[turns.length - 1];
+            index++;
+            for (const frame of frames) yield frame;
+        };
+    };
+
+    it('freezes the harness definition at creation', () => {
+        pinClock(1_000);
+        const registry = createHarnessRegistry();
+        const store = new SessionStore(DEFAULTS, registry);
+        const before = store.create('instruct');
+
+        expect(before.harnessDefinition?.title).toBe('Instruct');
+        expect(before.messages[0]).toEqual({
+            role: 'system',
+            content:
+                'You are the Instruct agent. Answer the request directly and keep the answer focused.'
+        });
+
+        // A registry override replaces the entry; it cannot reach the session that
+        // captured the old preset (and its factory).
+        registry.update('instruct', { title: 'Edited', primary: 'workspace' });
+        expect(store.get(before.id).harnessDefinition?.title).toBe('Instruct');
+        expect(store.get(before.id).harnessDefinition?.primary).toBe('instruct');
+        expect(store.get(before.id).messages[0]).toEqual({
+            role: 'system',
+            content:
+                'You are the Instruct agent. Answer the request directly and keep the answer focused.'
+        });
+
+        // A new session resolves the patched entry and is built from it.
+        const after = store.create('instruct');
+        expect(after.harnessDefinition?.title).toBe('Edited');
+        expect(after.harnessDefinition?.primary).toBe('workspace');
+        expect(after.harnessDefinition?.agents).toEqual(['workspace']);
+        expect(after.messages[0]).toEqual({ role: 'system', content: 'You are a workspace coding agent.' });
+    });
+
+    it('keeps discovery enabled across two turns in one session', async () => {
+        const setClock = pinClock(1_000);
+
+        const reader = tool({
+            description: 'Read a text file.',
+            tags: ['files', 'read'],
+            execute: () => 'file contents'
+        });
+
+        const discovering = presetOf('discovering', (settings, progress) =>
+            harness({
+                agents: {
+                    discovering: agent({
+                        model: settings.model,
+                        instruction: 'Discover, then read.',
+                        stream: scriptedStream([
+                            [{ type: 'done', stopReason: 'tool_calls', toolCalls: [{ id: 'c1', name: 'requestTools', arguments: '{"tags":["read"]}' }] }],
+                            [{ type: 'done', stopReason: 'tool_calls', toolCalls: [{ id: 'c2', name: 'reader', arguments: '{"path":"a.txt"}' }] }],
+                            [{ type: 'text', delta: 'first' }, { type: 'done', stopReason: 'stop', toolCalls: [] }],
+                            [{ type: 'text', delta: 'second' }, { type: 'done', stopReason: 'stop', toolCalls: [] }]
+                        ])
+                    })
+                },
+                primary: 'discovering',
+                tools: { reader },
+                presets: false,
+                report: { progress }
+            })
+        );
+
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([discovering]));
+        const created = store.create('discovering');
+
+        setClock(2_000);
+        await store.run(created.id, 'first', async () => {});
+        expect(store.get(created.id).discoveredTools).toEqual(['reader']);
+
+        // The second turn starts from the harness's existing enabled set: no new
+        // requestTools round, and the tool is still declared/callable.
+        setClock(3_000);
+        const items: SessionStreamItem[] = [];
+        await store.run(created.id, 'second', async (item) => {
+            items.push(item);
+        });
+
+        const second = store.get(created.id).turns[1];
+        expect(second.events.map((event) => event.type)).toEqual(['start', 'text', 'done']);
+        expect(second.eventTimes).toEqual([3_000, 3_000, 3_000]);
+        expect(store.get(created.id).discoveredTools).toEqual(['reader']);
+
+        // reset() clears the discovery record with the conversation.
+        store.reset(created.id);
+        expect(store.get(created.id).discoveredTools).toEqual([]);
+        expect(store.get(created.id).turns).toEqual([]);
+    });
+});
+
+// Manual tool execution through a session (R8).
+//
+// The server's POST /tools/:name calls this path when a client supplies a
+// sessionId. What matters here: the call runs the SESSION's harness (so state
+// really changes), it does not need the model's discovery gate, it cannot race a
+// running turn, and a missing capability is a lookup error rather than an invented
+// implementation.
+describe('SessionStore manual tool calls', () => {
+    // A harness with one searchable tool, so discovery and direct execution both
+    // have something to act on.
+    const toolPreset = (): HarnessPreset =>
+        presetOf('toolbox', (settings, progress) =>
+            harness({
+                agents: {
+                    toolbox: agent({
+                        model: settings.model,
+                        instruction: 'Tool holder.',
+                        stream: answerStream('ok')
+                    })
+                },
+                tools: {
+                    digest: tool({
+                        description: 'Summarise text.',
+                        tags: ['text', 'summary'],
+                        execute: () => 'digested'
+                    })
+                },
+                primary: 'toolbox',
+                presets: false,
+                report: { progress }
+            })
+        );
+
+    it('runs a core tool in that session and isolates its state', async () => {
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
+        const mine = store.create('single');
+        const other = store.create('single');
+
+        expect(await store.callTool(mine.id, 'todoTools', { action: 'add', text: '  only mine ' })).toEqual({
+            todos: [{ id: '1', text: 'only mine', completed: false }],
+            todo: { id: '1', text: 'only mine', completed: false },
+            counts: { total: 1, completed: 0, remaining: 1 }
+        });
+
+        // The state lives in the session's harness: the same session sees the item,
+        // a sibling session does not.
+        expect(await store.callTool(mine.id, 'todoTools', { action: 'list' })).toEqual({
+            todos: [{ id: '1', text: 'only mine', completed: false }],
+            counts: { total: 1, completed: 0, remaining: 1 }
+        });
+        expect(await store.callTool(other.id, 'todoTools', { action: 'list' })).toEqual({
+            todos: [],
+            counts: { total: 0, completed: 0, remaining: 0 }
+        });
+    });
+
+    it('runs a searchable tool without the model discovery gate, then records discovery', async () => {
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([toolPreset()]));
+        const session = store.create('toolbox');
+
+        // Discovery gates the MODEL. An explicit operator call may run any
+        // registered tool even before requestTools enabled it.
+        expect(store.get(session.id).discoveredTools).toEqual([]);
+        expect(await store.callTool(session.id, 'digest', 'anything')).toBe('digested');
+
+        // requestTools through the same path enables it for the model, and the
+        // snapshot reports the change (the session really was mutated).
+        expect(await store.callTool(session.id, 'requestTools', { tags: ['text'] })).toEqual({
+            enabled: ['digest'],
+            tools: [{ name: 'digest', description: 'Summarise text.', tags: ['text', 'summary'] }],
+            remaining: 0
+        });
+        expect(store.get(session.id).discoveredTools).toEqual(['digest']);
+    });
+
+    it('maps unknown sessions and unavailable tools to 404 and keeps tool errors intact', async () => {
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
+        const session = store.create('single');
+
+        await expect(store.callTool('missing', 'todoTools', { action: 'list' })).rejects.toMatchObject({
+            status: 404,
+            message: 'Unknown session "missing".'
+        });
+
+        // singlePreset has no subagents, so its harness registers no delegate.
+        await expect(store.callTool(session.id, 'delegate', { agent: 'x', input: 'go' })).rejects.toMatchObject({
+            status: 404,
+            message: 'Tool "delegate" is not available in this session.'
+        });
+
+        // A tool that throws keeps its own message: the API layer reports it as
+        // ok:false, exactly like a throwing catalogue tool.
+        await expect(store.callTool(session.id, 'todoTools', { action: 'add' })).rejects.toThrow(
+            'todoTools "add" requires a non-empty "text" string.'
+        );
+    });
+
+    // A manual tool call is not a turn, so `status` stays idle while it runs.
+    // The store's private `busy` flag is the single-flight gate (F5): it must
+    // reject chat, reset, and another manual call, and it must always release.
+    const slowPreset = (gate: { promise: Promise<void> }, fail = false): HarnessPreset =>
+        presetOf('slow', (settings, progress) =>
+            harness({
+                agents: {
+                    slow: agent({
+                        model: settings.model,
+                        instruction: 'Hold the session.',
+                        stream: answerStream('chat answer')
+                    })
+                },
+                tools: {
+                    slowTool: tool({
+                        description: 'Wait for the gate.',
+                        tags: ['slow'],
+                        execute: async () => {
+                            await gate.promise;
+                            if (fail) throw new Error('slow tool failed');
+                            return 'slow result';
+                        }
+                    })
+                },
+                primary: 'slow',
+                presets: false,
+                report: { progress }
+            })
+        );
+
+    it('rejects chat, reset, and a second manual call while a manual call is pending', async () => {
+        const gate = deferred();
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([slowPreset(gate)]));
+        const session = store.create('slow');
+
+        const pending = store.callTool(session.id, 'slowTool', {});
+
+        // The UI state is deliberately untouched: no turn, no running status, so
+        // a reload cannot show a phantom turn or a stuck spinner.
+        expect(store.get(session.id)).toMatchObject({ status: 'idle', turns: [] });
+
+        await expect(store.run(session.id, 'chat', async () => {})).rejects.toMatchObject({
+            status: 409,
+            message: 'A task is already running in this session.'
+        });
+
+        // reset is synchronous, so both the type and the status matter.
+        expect(() => store.reset(session.id)).toThrow(SessionError);
+        expect(() => store.reset(session.id)).toThrow(
+            'Cancel the running task before resetting the session.'
+        );
+
+        await expect(store.callTool(session.id, 'slowTool', {})).rejects.toMatchObject({
+            status: 409,
+            message: 'A task is running in this session; try again when it finishes.'
+        });
+
+        // Cancelling a manual call is not supported (no turn/controller); it does
+        // not silently release the gate either.
+        expect(store.cancel(session.id)).toBe(false);
+
+        gate.resolve();
+        expect(await pending).toBe('slow result');
+
+        // Every operation resumes after the successful manual call.
+        expect(await store.callTool(session.id, 'slowTool', {})).toBe('slow result');
+        await store.run(session.id, 'chat now', async () => {});
+        expect(store.get(session.id).turns.map((turn) => turn.prompt)).toEqual(['chat now']);
+    });
+
+    it('releases the gate after a manual call fails', async () => {
+        const gate = deferred();
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([slowPreset(gate, true)]));
+        const session = store.create('slow');
+
+        const pending = store.callTool(session.id, 'slowTool', {});
+        // Attach the rejection handler before the deliberate delay below, so the
+        // held promise is never reported as an unhandled rejection.
+        const settled = pending.catch((error: unknown) => error);
+
+        await expect(store.callTool(session.id, 'todoTools', { action: 'list' })).rejects.toMatchObject({
+            status: 409
+        });
+
+        gate.resolve();
+        expect(String(await settled)).toBe('Error: slow tool failed');
+
+        // The failure path must release exactly like the success path: a chat and
+        // a fresh manual call both work afterwards, and status was never error.
+        await store.run(session.id, 'after failure', async () => {});
+        expect(store.get(session.id).status).toBe('idle');
+        await expect(store.callTool(session.id, 'slowTool', {})).rejects.toThrow('slow tool failed');
+    });
+
+    it('rejects a manual call while a task is running', async () => {
+        const gate = deferred();
+
+        const gated = presetOf('gated', (settings, progress) =>
+            harness({
+                agents: {
+                    gated: agent({
+                        model: settings.model,
+                        instruction: 'Wait for the gate.',
+                        stream: async function* (): AsyncGenerator<HarnessStreamEvent> {
+                            await gate.promise;
+                            yield { type: 'text', delta: 'released' };
+                            yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                        }
+                    })
+                },
+                primary: 'gated',
+                presets: false,
+                report: { progress }
+            })
+        );
+
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([gated]));
+        const session = store.create('gated');
+
+        const started = deferred();
+        const running = store.run(session.id, 'first', async (item) => {
+            if (item.type === 'event' && item.event.type === 'start') started.resolve();
+        });
+        await started.promise;
+
+        // A manual mutation cannot interleave with a live turn: the running
+        // transcript depends on the state it would change.
+        await expect(store.callTool(session.id, 'todoTools', { action: 'list' })).rejects.toMatchObject({
+            status: 409,
+            message: 'A task is running in this session; try again when it finishes.'
+        });
+
+        gate.resolve();
+        await running;
+
+        // Once the turn is done, the same call works.
+        expect(await store.callTool(session.id, 'todoTools', { action: 'list' })).toEqual({
+            todos: [],
+            counts: { total: 0, completed: 0, remaining: 0 }
+        });
+    });
+});
+

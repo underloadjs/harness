@@ -69,8 +69,8 @@ describe('todoTools', () => {
 
         await writer('start a plan');
 
-        // getTools is never called, yet todoTools was declared and executed.
-        expect(declaredNames(seen[0])).toEqual(['getTools', 'createTool', 'todoTools']);
+        // requestTools is never called, yet todoTools was declared and executed.
+        expect(declaredNames(seen[0])).toEqual(['requestTools', 'createTool', 'todoTools']);
         expect((entry.messages[2] as { content: string }).content).toBe(
             '{"todos":[{"id":"1","text":"Draft plan","completed":false}],"counts":{"total":1,"completed":0,"remaining":1},"todo":{"id":"1","text":"Draft plan","completed":false}}'
         );
@@ -150,8 +150,8 @@ describe('todoTools', () => {
 
         // Both agents see todoTools as core; the primary additionally sees delegate.
         // `peek` was configured, so it precedes the harness-owned names.
-        expect(declaredNames(writerSeen[0])).toEqual(['peek', 'getTools', 'createTool', 'todoTools', 'delegate']);
-        expect(declaredNames(researcherSeen[0])).toEqual(['peek', 'getTools', 'createTool', 'todoTools']);
+        expect(declaredNames(writerSeen[0])).toEqual(['peek', 'requestTools', 'createTool', 'todoTools', 'delegate']);
+        expect(declaredNames(researcherSeen[0])).toEqual(['peek', 'requestTools', 'createTool', 'todoTools']);
     });
 
     it('isolates harnesses and clears on reset', async () => {
@@ -219,7 +219,7 @@ describe('todoTools', () => {
             'Tool name "TodoTools" is reserved by the harness.'
         );
 
-        expect(Object.keys(writer.tools)).toEqual(['getTools', 'createTool', 'todoTools']);
+        expect(Object.keys(writer.tools)).toEqual(['requestTools', 'createTool', 'todoTools']);
     });
 
     it('turns invalid todo input into a recoverable tool result', async () => {

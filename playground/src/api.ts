@@ -19,8 +19,21 @@
 //
 // The root is only ever a base URL/prefix. No credential, query string or hash
 // is accepted on it, so a secret can never be pushed into a URL by this module.
+//
+// TRUST: sources 1 and 2 are RUNTIME and therefore untrusted. The UI posts the
+// provider key saved in this browser to whatever root it resolves, so an absolute
+// root from a query string or injected config must be same-origin with the page
+// or a loopback host (server/origin.ts, shared with the service's Origin gate).
+// Otherwise a crafted link such as `?apiRoot=https://evil.example/api` would
+// receive the saved credential on the next model lookup or session creation.
+// Source 3 is compiled into the bundle by the operator and is deliberately
+// trusted: a cross-origin `VITE_HARNESS_API` is a supported deployment, and it
+// cannot be changed by a URL the user is tricked into opening.
 
+import { isTrustedRuntimeOrigin } from '../../server/origin';
 import type {
+    AgentDescriptor,
+    CreateHarnessRequest,
     HarnessDescriptor,
     HarnessIndex,
     ModelIndex,
@@ -29,18 +42,24 @@ import type {
     SessionStreamItem,
     ToolCallResult,
     ToolDescriptor,
-    ToolIndex
+    ToolIndex,
+    UpdateHarnessRequest
 } from '../../server/protocol';
 
 // Payload of GET `/v1/harness`. `server/api.ts` owns this shape (HarnessBootstrap)
 // but protocol.ts is not ours to extend, so the browser mirrors the fields it
 // consumes. Keep in sync with server/api.ts `HarnessBootstrap`.
+//
+// `agents` is part of the agreed contract (the bootstrap document now carries the
+// same agent presets as GET /agents). It stays optional so an older server still
+// boots; main.ts then derives a minimal library from the descriptors.
 export type HarnessBootstrap = {
     rootPath: string;
     presets: HarnessDescriptor[];
     tools: ToolDescriptor[];
     defaults: HarnessIndex['defaults'];
     sessions: SessionSnapshot[];
+    agents?: AgentDescriptor[];
 };
 
 const FALLBACK_ROOT = '/api';
@@ -50,6 +69,10 @@ const FALLBACK_ROOT = '/api';
 // query, a hash, or embedded userinfo) is rejected: this value ends up in every
 // request URL, so it must not be able to carry credentials or change meaning
 // when concatenated.
+//
+// This function is SYNTAX only. Whether an absolute origin may be used depends
+// on the source: `resolveApiRoot` applies the same-origin/loopback rule to
+// runtime sources, and trusts the build-time value (see the header).
 export const normalizeApiRoot = (value: string | null | undefined, fallback: string): string => {
     const raw = (value ?? '').trim();
     if (raw.length === 0) return fallback;
@@ -89,6 +112,14 @@ export const normalizeApiRoot = (value: string | null | undefined, fallback: str
         throw new Error('The API root cannot carry a query string or a fragment.');
     }
 
+    // A backslash is a path separator for a browser's special-scheme URL parser:
+    // fetch("/\\evil.example/x") resolves to a DIFFERENT origin, even though the
+    // value looks like a rooted path here. Reject it (and control characters,
+    // which the parser strips) so a relative root cannot escape this origin.
+    if (raw.includes('\\') || /[\u0000-\u001f\u007f]/.test(raw)) {
+        throw new Error('A relative API root cannot contain backslashes or control characters.');
+    }
+
     // A trailing slash would produce `//sessions`; strip every one. A root of
     // just "/" becomes "" so `${root}${path}` stays correct.
     return raw.replace(/\/+$/, '');
@@ -110,22 +141,44 @@ const injectedRoot = (): string | undefined => {
 export const resolveApiRoot = (): string => {
     const query = new URLSearchParams(globalThis.location?.search ?? '').get('apiRoot') ?? undefined;
 
+    // An absolute (origin+path) root is the only kind that can point somewhere
+    // else; a rooted path stays on the page's origin by construction. The test
+    // is intentionally anchored on the normalized value, whose only absolute
+    // form is http(s) — normalizeApiRoot rejects every other scheme.
+    const isAbsolute = (root: string): boolean => /^https?:\/\//i.test(root);
+
     // An invalid *query* value is ignored rather than fatal: a hand-edited URL
     // must not stop the UI from booting against its documented default. An
-    // invalid injected root is also ignored for the same reason; the build-time
-    // value is trusted and validated last.
-    const attempt = (value: string | undefined): string | undefined => {
+    // invalid injected root is also ignored for the same reason.
+    //
+    // An ABSENT/blank value must return undefined, not the fallback: otherwise
+    // the first `attempt` (the query) would always answer "/api" and the later
+    // sources — injected config, VITE_HARNESS_API — would never be consulted.
+    //
+    // `trusted` is false for both runtime sources: they may only name the page's
+    // own origin or a loopback host, because the saved provider key travels to
+    // this root. The build-time value is operator-controlled and may be
+    // cross-origin, so it skips the origin check (still syntactically validated).
+    const attempt = (value: string | undefined, trusted: boolean): string | undefined => {
+        if (value === undefined || value.trim().length === 0) return undefined;
+
         try {
-            return normalizeApiRoot(value, FALLBACK_ROOT);
+            const root = normalizeApiRoot(value, FALLBACK_ROOT);
+
+            if (!trusted && isAbsolute(root) && !isTrustedRuntimeOrigin(root, globalThis.location?.origin)) {
+                return undefined;
+            }
+
+            return root;
         } catch {
             return undefined;
         }
     };
 
     return (
-        attempt(query) ??
-        attempt(injectedRoot()) ??
-        attempt(import.meta.env.VITE_HARNESS_API) ??
+        attempt(query, false) ??
+        attempt(injectedRoot(), false) ??
+        attempt(import.meta.env.VITE_HARNESS_API, true) ??
         FALLBACK_ROOT
     );
 };
@@ -177,6 +230,41 @@ export const listHarnesses = (): Promise<HarnessIndex> => request<HarnessIndex>(
 
 export const listTools = (): Promise<ToolIndex> => request<ToolIndex>('/tools');
 
+// GET /agents — the trusted preset library the picker offers. Harnesses are built
+// by choosing one of these agents, never by typing a new instruction here. The
+// index document also carries the same list, so this route is the standalone/
+// refresh path rather than the only source.
+export const listAgents = async (): Promise<AgentDescriptor[]> => {
+    const body = await request<{ agents: AgentDescriptor[] }>('/agents');
+    return Array.isArray(body.agents) ? body.agents : [];
+};
+
+// POST /harnesses — create a user harness. The server answers 201 with the
+// descriptor it actually stored, which is what the UI renders (never a local
+// guess: names can be normalised server-side).
+export const createHarness = async (input: CreateHarnessRequest): Promise<HarnessDescriptor> => {
+    const body = await request<{ harness: HarnessDescriptor }>('/harnesses', {
+        method: 'POST',
+        body: JSON.stringify(input)
+    });
+
+    return body.harness;
+};
+
+// PATCH /harnesses/:name — change the agent team of a harness. The response is
+// the authoritative descriptor; callers replace their cached copy with it.
+export const updateHarness = async (
+    name: string,
+    input: UpdateHarnessRequest
+): Promise<HarnessDescriptor> => {
+    const body = await request<{ harness: HarnessDescriptor }>(`/harnesses/${encodeURIComponent(name)}`, {
+        method: 'PATCH',
+        body: JSON.stringify(input)
+    });
+
+    return body.harness;
+};
+
 // GET root. Only the canonical mount (`/v1/harness`) answers this with the
 // bootstrap document; the standalone `/api` root is a deliberate 404. Callers
 // use `loadBootstrap` rather than this directly.
@@ -204,6 +292,11 @@ export const loadBootstrap = async (): Promise<HarnessBootstrap> => {
 
     const [index, tools, sessions] = await Promise.all([listHarnesses(), listTools(), listSessions()]);
 
+    // The harness index carries the agent library on the new server. Read it
+    // defensively: an older index has no `agents`, and the UI then derives a
+    // minimal library from the descriptors (main.ts) instead of failing boot.
+    const agents = index.agents;
+
     return {
         // Standalone has no advertised filesystem root; the UI treats "" as
         // "not reported" and never prints it as a path.
@@ -211,7 +304,8 @@ export const loadBootstrap = async (): Promise<HarnessBootstrap> => {
         presets: index.harnesses,
         tools: tools.tools,
         defaults: index.defaults,
-        sessions
+        sessions,
+        ...(Array.isArray(agents) ? { agents } : {})
     };
 };
 
@@ -269,10 +363,24 @@ export const cancelSession = async (id: string): Promise<boolean> => {
     return body.cancelled;
 };
 
-export const callTool = (name: string, parameters: unknown): Promise<ToolCallResult> =>
+// POST /tools/:name — call one tool on the server.
+//
+// `sessionId` is only meaningful for a `sessionBound` core tool (requestTools,
+// createTool, todoTools, delegate): the server runs it inside that session's
+// harness, so discovery, runtime tools, todos and delegation change the
+// conversation the user is looking at. It is omitted for a catalogue tool, whose
+// request body therefore stays byte-identical to the pre-R8 contract.
+export const callTool = (
+    name: string,
+    parameters: unknown,
+    sessionId?: string
+): Promise<ToolCallResult> =>
     request<ToolCallResult>(`/tools/${encodeURIComponent(name)}`, {
         method: 'POST',
-        body: JSON.stringify({ parameters })
+        body: JSON.stringify({
+            parameters,
+            ...(sessionId === undefined || sessionId.length === 0 ? {} : { sessionId })
+        })
     });
 
 // Read a `text/event-stream` body and hand every `data:` payload to the caller.
