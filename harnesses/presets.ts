@@ -199,7 +199,8 @@ const demo: HarnessPreset = {
 
 // Recoverable failures is a live example, so it gets the shared toolbox too and
 // adds `testFlaky` as an extra. `testFlaky` stays out of the shared table on
-// purpose: it throws two calls out of three and keeps module-level attempt state,
+// purpose: it throws two calls out of three and keeps its attempt count per AGENT
+// (a WeakMap keyed by the requesting agent, so two sessions never share a count),
 // which must never be part of what Instruct/Research/Workspace can call. The
 // example's failure behaviour is its point, so its template is `flaky`: a
 // metadata-only PATCH keeps this factory and its extra tool, while an executable

@@ -1397,9 +1397,11 @@ describe('executeTool', () => {
         expect(writer.agent.messages).toEqual([]);
         expect(writer.agents.helper.messages.map((message) => message.role)).toEqual(['user', 'assistant']);
 
-        // The allowlist is still enforced on the manual path.
+        // The allowlist is still enforced on the manual path (R11: the schema enum
+        // is checked before the implementation's own guard, so the message names
+        // the allowed value).
         await expect(writer.executeTool('agentDelegate', { agent: 'lead', input: 'go' })).rejects.toThrow(
-            'Agent "lead" is not a configured subagent. Allowed: helper.'
+            '$.agent must be one of: "helper".'
         );
     });
 });

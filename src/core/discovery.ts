@@ -31,6 +31,14 @@
 // a broad query for "code" returns a shortlist plus the `remaining` count of
 // additional matches, never the whole family.
 //
+// PROGRESSIVE DISCOVERY (R12): the cap used to be stationary — repeating the same
+// query returned the same five tools and the same `remaining` count forever, so
+// the omitted tail was unreachable by any tag refinement. `searchTools` now takes
+// an `offset` into the ranked list, and the harness advances it for an identical
+// query. The second identical call returns the NEXT tranche, `remaining` still
+// counts the matches left AFTER the returned page, and the pure function stays
+// pure — a caller that never passes an offset keeps the old first-page result.
+//
 // Only `visibility: 'searchable'` tools are candidates: core tools are already
 // declared, so returning them would waste the model's turn. Only metadata is ever
 // read here — name, description, tags — never `execute`, so a lazily-imported
@@ -131,10 +139,17 @@ const resolveLimit = (limit: number | undefined): number => {
 // `limit` narrows the shortlist below the 5-match cap (toolRequest's optional
 // `limit` argument). It can never raise it: the cap is a context guard, so a host
 // calling searchTools directly gets the same semantics as the model.
+//
+// `offset` skips that many ranked matches before the shortlist starts, which is
+// how the harness walks the tail a capped query would otherwise never show (R12).
+// It is clamped to the ranked list, so an over-large offset is simply an empty
+// page. The result carries `offset` only when it is non-zero, so a first-page
+// result keeps its original exact shape.
 export const searchTools = (
     tools: readonly Tool[],
     tags: readonly string[],
-    limit?: number
+    limit?: number,
+    offset = 0
 ): ToolSearchResult => {
     const needles = normalizeTags(tags);
     const catalogue = tools.filter((tool) => tool.visibility === 'searchable');
@@ -181,9 +196,13 @@ export const searchTools = (
 
     // Split the ranked list into what is returned and what is only counted. The
     // omitted tail never leaks a name: `remaining` is the whole answer for it, so
-    // the model refines tags (e.g. "files" then "write") rather than paging.
-    const kept = scored.slice(0, cap);
-    const remaining = scored.length - kept.length;
+    // the model refines tags (e.g. "files" then "write") rather than paging — but
+    // a repeated identical query now advances by one capped page (see the header).
+    const start = Math.min(Math.max(0, Math.floor(offset)), scored.length);
+    const kept = scored.slice(start, start + cap);
+    // Counted AFTER this page, so "remaining" always means "further matches you
+    // have not seen yet" and reaches 0 exactly when the catalogue is exhausted.
+    const remaining = scored.length - start - kept.length;
 
     const result: ToolSearchResult = {
         enabled: kept.map(({ tool }) => tool.name),
@@ -195,7 +214,9 @@ export const searchTools = (
         remaining
     };
 
+    // Present only for a later page, so a first-page result keeps its old shape.
     if (unmatchedTags.length > 0) result.unmatchedTags = unmatchedTags;
+    if (start > 0) result.offset = start;
     if (remaining > 0) result.truncated = true;
 
     return result;

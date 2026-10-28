@@ -33,7 +33,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile as writeTextFile } from 'node:fs
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { globToRegExp, matchGlob } from './glob';
-import { fileGlob } from './fileGlob';
+import { FILE_GLOB_CONTENT_BUDGET, FILE_GLOB_MATCH_TEXT_BYTES, fileGlob } from './fileGlob';
 
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../../Temp', import.meta.url));
 
@@ -74,6 +74,16 @@ beforeAll(async () => {
     // The budget fixture: 31 bytes that make `(a+)+$` backtrack catastrophically.
     await seed('evil/line.txt', `${'a'.repeat(31)}b\n`);
 
+    // Content-bound fixtures, use the unique token NEEDLE so the TODO
+    // expectations below stay untouched:
+    //   - a 2000-character ASCII line (cut at 1024 bytes on a code-point boundary),
+    //   - a line of 300 four-byte emoji (a naive UTF-16 slice would split a pair),
+    //   - 70 lines of exactly 1024 bytes each: 64 fit the 64 KiB aggregate budget
+    //     EXACTLY and the 65th proves truncation.
+    await seed('huge/ascii.txt', `NEEDLE ${'a'.repeat(2000)}\n`);
+    await seed('huge/emoji.txt', `NEEDLE ${'😀'.repeat(300)}\n`);
+    await seed('budget/lines.txt', `${`${'Q'.repeat(1024)}\n`.repeat(70)}`);
+
     try {
         await symlink(join(workdir, 'src'), join(workdir, 'src-alias'), 'dir');
         rootAlias = 'src-alias';
@@ -94,8 +104,11 @@ describe('fileGlob — filename mode', () => {
         await expect(fileGlob({})).resolves.toEqual({
             files: [
                 'binary.bin',
+                'budget/lines.txt',
                 'docs/readme.md',
                 'evil/line.txt',
+                'huge/ascii.txt',
+                'huge/emoji.txt',
                 'root.txt',
                 'src/a.ts',
                 'src/b.ts',
@@ -214,8 +227,11 @@ describe('fileGlob — filename mode', () => {
         await expect(fileGlob(undefined as never)).resolves.toEqual({
             files: [
                 'binary.bin',
+                'budget/lines.txt',
                 'docs/readme.md',
                 'evil/line.txt',
+                'huge/ascii.txt',
+                'huge/emoji.txt',
                 'root.txt',
                 'src/a.ts',
                 'src/b.ts',
@@ -260,45 +276,53 @@ describe('fileGlob — content mode', () => {
     it('returns every non-skipped match in walk order', async () => {
         await expect(fileGlob({ content: 'TODO' })).resolves.toEqual({
             matches: [
-                { path: 'docs/readme.md', line: 1, text: 'TODO: four' },
-                { path: 'root.txt', line: 1, text: 'TODO: six' },
-                { path: 'src/a.ts', line: 2, text: '// TODO: one' },
-                { path: 'src/b.ts', line: 1, text: '// TODO: two' },
-                { path: 'src/nested/c.js', line: 1, text: 'TODO: three' },
-                { path: 'task/e.ts', line: 1, text: '// TODO: five' }
+                { path: 'docs/readme.md', line: 1, text: 'TODO: four', textTruncated: false, bytes: 10 },
+                { path: 'root.txt', line: 1, text: 'TODO: six', textTruncated: false, bytes: 9 },
+                { path: 'src/a.ts', line: 2, text: '// TODO: one', textTruncated: false, bytes: 12 },
+                { path: 'src/b.ts', line: 1, text: '// TODO: two', textTruncated: false, bytes: 12 },
+                { path: 'src/nested/c.js', line: 1, text: 'TODO: three', textTruncated: false, bytes: 11 },
+                { path: 'task/e.ts', line: 1, text: '// TODO: five', textTruncated: false, bytes: 13 }
             ],
-            truncated: false
+            truncated: false,
+            bytes: 67,
+            contentBudget: 65536
         });
     });
 
     it('restricts the content search to files matching the patterns', async () => {
         await expect(fileGlob({ patterns: ['*.ts'], content: 'TODO' })).resolves.toEqual({
             matches: [
-                { path: 'src/a.ts', line: 2, text: '// TODO: one' },
-                { path: 'src/b.ts', line: 1, text: '// TODO: two' },
-                { path: 'task/e.ts', line: 1, text: '// TODO: five' }
+                { path: 'src/a.ts', line: 2, text: '// TODO: one', textTruncated: false, bytes: 12 },
+                { path: 'src/b.ts', line: 1, text: '// TODO: two', textTruncated: false, bytes: 12 },
+                { path: 'task/e.ts', line: 1, text: '// TODO: five', textTruncated: false, bytes: 13 }
             ],
-            truncated: false
+            truncated: false,
+            bytes: 37,
+            contentBudget: 65536
         });
     });
 
     it('treats content as a JavaScript regular expression', async () => {
         await expect(fileGlob({ content: 'TODO: (one|three)' })).resolves.toEqual({
             matches: [
-                { path: 'src/a.ts', line: 2, text: '// TODO: one' },
-                { path: 'src/nested/c.js', line: 1, text: 'TODO: three' }
+                { path: 'src/a.ts', line: 2, text: '// TODO: one', textTruncated: false, bytes: 12 },
+                { path: 'src/nested/c.js', line: 1, text: 'TODO: three', textTruncated: false, bytes: 11 }
             ],
-            truncated: false
+            truncated: false,
+            bytes: 23,
+            contentBudget: 65536
         });
     });
 
     it('caps matches globally and flags truncation', async () => {
         await expect(fileGlob({ content: 'TODO', maxResults: 2 })).resolves.toEqual({
             matches: [
-                { path: 'docs/readme.md', line: 1, text: 'TODO: four' },
-                { path: 'root.txt', line: 1, text: 'TODO: six' }
+                { path: 'docs/readme.md', line: 1, text: 'TODO: four', textTruncated: false, bytes: 10 },
+                { path: 'root.txt', line: 1, text: 'TODO: six', textTruncated: false, bytes: 9 }
             ],
-            truncated: true
+            truncated: true,
+            bytes: 19,
+            contentBudget: 65536
         });
     });
 
@@ -307,21 +331,25 @@ describe('fileGlob — content mode', () => {
         // must not claim truncation when everything fits.
         await expect(fileGlob({ content: 'TODO', maxResults: 1000 })).resolves.toEqual({
             matches: [
-                { path: 'docs/readme.md', line: 1, text: 'TODO: four' },
-                { path: 'root.txt', line: 1, text: 'TODO: six' },
-                { path: 'src/a.ts', line: 2, text: '// TODO: one' },
-                { path: 'src/b.ts', line: 1, text: '// TODO: two' },
-                { path: 'src/nested/c.js', line: 1, text: 'TODO: three' },
-                { path: 'task/e.ts', line: 1, text: '// TODO: five' }
+                { path: 'docs/readme.md', line: 1, text: 'TODO: four', textTruncated: false, bytes: 10 },
+                { path: 'root.txt', line: 1, text: 'TODO: six', textTruncated: false, bytes: 9 },
+                { path: 'src/a.ts', line: 2, text: '// TODO: one', textTruncated: false, bytes: 12 },
+                { path: 'src/b.ts', line: 1, text: '// TODO: two', textTruncated: false, bytes: 12 },
+                { path: 'src/nested/c.js', line: 1, text: 'TODO: three', textTruncated: false, bytes: 11 },
+                { path: 'task/e.ts', line: 1, text: '// TODO: five', textTruncated: false, bytes: 13 }
             ],
-            truncated: false
+            truncated: false,
+            bytes: 67,
+            contentBudget: 65536
         });
     });
 
     it('returns an empty match list when nothing matches', async () => {
         await expect(fileGlob({ content: 'ZZZ' })).resolves.toEqual({
             matches: [],
-            truncated: false
+            truncated: false,
+            bytes: 0,
+            contentBudget: 65536
         });
     });
 
@@ -338,15 +366,23 @@ describe('fileGlob — content mode', () => {
         // same presentation fileList uses), and the FIRST root wins, so the file is
         // reported once as "src/a.ts" — never twice, and never "src/src/a.ts".
         await expect(fileGlob({ content: 'TODO: one', paths: ['src', '.'] })).resolves.toEqual({
-            matches: [{ path: 'src/a.ts', line: 2, text: '// TODO: one' }],
-            truncated: false
+            matches: [
+                { path: 'src/a.ts', line: 2, text: '// TODO: one', textTruncated: false, bytes: 12 }
+            ],
+            truncated: false,
+            bytes: 12,
+            contentBudget: 65536
         });
 
         // The same request rooted at "." alone produces the identical path, which is
         // what makes the dedupe invisible to a caller that lists one root.
         await expect(fileGlob({ content: 'TODO: one', paths: ['.'] })).resolves.toEqual({
-            matches: [{ path: 'src/a.ts', line: 2, text: '// TODO: one' }],
-            truncated: false
+            matches: [
+                { path: 'src/a.ts', line: 2, text: '// TODO: one', textTruncated: false, bytes: 12 }
+            ],
+            truncated: false,
+            bytes: 12,
+            contentBudget: 65536
         });
     });
 
@@ -367,12 +403,83 @@ describe('fileGlob — content mode', () => {
         // same order, same line numbers.
         await expect(fileGlob({ patterns: ['*.ts'], content: 'TODO' })).resolves.toEqual({
             matches: [
-                { path: 'src/a.ts', line: 2, text: '// TODO: one' },
-                { path: 'src/b.ts', line: 1, text: '// TODO: two' },
-                { path: 'task/e.ts', line: 1, text: '// TODO: five' }
+                { path: 'src/a.ts', line: 2, text: '// TODO: one', textTruncated: false, bytes: 12 },
+                { path: 'src/b.ts', line: 1, text: '// TODO: two', textTruncated: false, bytes: 12 },
+                { path: 'task/e.ts', line: 1, text: '// TODO: five', textTruncated: false, bytes: 13 }
             ],
-            truncated: false
+            truncated: false,
+            bytes: 37,
+            contentBudget: 65536
         });
+    });
+
+    // R4: one match on a giant line used to copy the WHOLE line. The snippet cap
+    // cuts it on a code-point boundary and says so per match.
+    it('cuts a giant ASCII line to the 1 KiB snippet cap and flags it, keeping the line number', async () => {
+        await expect(fileGlob({ patterns: ['ascii.txt'], content: 'NEEDLE' })).resolves.toEqual({
+            matches: [
+                {
+                    path: 'huge/ascii.txt',
+                    line: 1,
+                    // Exactly 1024 bytes: 7 for "NEEDLE " plus 1017 "a"s.
+                    text: `NEEDLE ${'a'.repeat(1017)}`,
+                    textTruncated: true,
+                    bytes: 1024
+                }
+            ],
+            truncated: false,
+            bytes: 1024,
+            contentBudget: 65536
+        });
+    });
+
+    it('never splits a surrogate pair when cutting a giant non-ASCII line', async () => {
+        // The fixture is "NEEDLE " (7 bytes) plus 300 four-byte emoji. 7 + 4 * 254 =
+        // 1023 bytes fit; the 255th emoji would take it to 1027, so the cut lands
+        // BEFORE it. A UTF-16 slice at 1024 units would have produced a lone
+        // surrogate, i.e. a character that is not in the file.
+        await expect(fileGlob({ patterns: ['emoji.txt'], content: 'NEEDLE' })).resolves.toEqual({
+            matches: [
+                {
+                    path: 'huge/emoji.txt',
+                    line: 1,
+                    text: `NEEDLE ${'😀'.repeat(254)}`,
+                    textTruncated: true,
+                    bytes: 1023
+                }
+            ],
+            truncated: false,
+            bytes: 1023,
+            contentBudget: 65536
+        });
+    });
+
+    it('stops at the aggregate 64 KiB budget and reports truncation instead of dropping matches silently', async () => {
+        // budget/lines.txt has 70 matching lines of exactly 1024 bytes. 64 matches
+        // charge 64 * 1024 = 65536 bytes — the budget EXACTLY — so all 64 are
+        // returned; the 65th match is the one that cannot fit, which is what makes
+        // `truncated: true` a proven fact rather than a guess.
+        const expectedBudgetMatches = Array.from({ length: 64 }, (_unused, index) => ({
+            path: 'budget/lines.txt',
+            line: index + 1,
+            text: 'Q'.repeat(1024),
+            textTruncated: false,
+            bytes: 1024
+        }));
+
+        await expect(fileGlob({ patterns: ['lines.txt'], content: 'Q' })).resolves.toEqual({
+            matches: expectedBudgetMatches,
+            truncated: true,
+            bytes: 65536,
+            contentBudget: 65536
+        });
+    });
+
+    it('reports the byte budget it enforces as exported constants', async () => {
+        // The numbers a caller reads in the result must be the numbers the module
+        // documents, so a host cannot quietly widen them.
+        expect(FILE_GLOB_MATCH_TEXT_BYTES).toBe(1024);
+        expect(FILE_GLOB_CONTENT_BUDGET).toBe(65536);
     });
 });
 

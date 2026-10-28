@@ -13,6 +13,27 @@
 import { tool, toolUi } from '../src/harness';
 import type { Tool, ToolUiEnvelope } from '../src/harness';
 
+// Demo-tool bounds (R8). These are validation limits, not knobs: the demo tools
+// exist to be predictable examples, so an out-of-range argument is rejected with a
+// readable error instead of silently clamped into a different answer.
+//
+//   - timezone is a LABEL only (it does not change the clock), capped at 64 chars
+//     so a model cannot turn the demo panel into an arbitrary text sink;
+//   - dice sides are a whole number 2..1000, default 6 (the same default the
+//     schema advertises);
+//   - notes handed to the summarizer are capped at 20k characters, with the
+//     truncation stated in both the delegated prompt and the returned summary.
+const MAX_TIMEZONE_CHARS = 64;
+const DEFAULT_DICE_SIDES = 6;
+const MIN_DICE_SIDES = 2;
+const MAX_DICE_SIDES = 1_000;
+const MAX_SUMMARIZE_NOTES = 20_000;
+
+// Shown in the summary and in the delegated prompt whenever the notes were cut, so
+// the model (and the user reading the panel) can tell a short answer from a
+// truncated input. Fixed text: it names the bound, never the content.
+const NOTES_TRUNCATED = `[notes truncated to ${MAX_SUMMARIZE_NOTES} characters]`;
+
 // timeNow — the current time. The timezone argument is only a label for the answer.
 //
 // R20.2 DEMONSTRATION: this is the shipped example of a declarative panel. It
@@ -32,15 +53,31 @@ const timeNow = tool<string | undefined, ToolUiEnvelope<{ timezone: string; iso:
     parameters: {
         type: 'object',
         properties: {
-            timezone: { type: 'string', description: 'Label for the timezone being asked about, e.g. "UTC".' }
+            timezone: {
+                type: 'string',
+                // The label is echoed into a panel block, so it is bounded here and
+                // validated again for direct callers (who skip JSON Schema).
+                maxLength: MAX_TIMEZONE_CHARS,
+                description: 'Label for the timezone being asked about, e.g. "UTC".'
+            }
         },
         required: ['timezone'],
         additionalProperties: false
     },
     execute: ({ parameters: timezone }) => {
+        // `?? 'UTC'` keeps the documented default for a direct call that omits the
+        // label. Any present label must be a bounded, non-blank string: a non-string
+        // (direct callers bypass the schema) or an oversized one is refused rather
+        // than coerced into the panel.
+        const label = timezone ?? 'UTC';
+
+        if (typeof label !== 'string' || label.trim().length === 0 || label.length > MAX_TIMEZONE_CHARS) {
+            throw new Error(`timeNow timezone must be a non-empty string of at most ${MAX_TIMEZONE_CHARS} characters.`);
+        }
+
         const now = new Date();
         const content = {
-            timezone: timezone ?? 'UTC',
+            timezone: label,
             iso: now.toISOString(),
             unix: Math.floor(now.getTime() / 1000)
         };
@@ -68,13 +105,19 @@ const timeNow = tool<string | undefined, ToolUiEnvelope<{ timezone: string; iso:
 });
 
 // textCount — words and characters, so a model can check a length claim.
+//
+// Character count is UTF-16 code units (`String.prototype.length`), i.e. the unit
+// JavaScript strings use. An astral character such as an emoji counts as two.
+// Switching to code points would change existing answers, so the unit is
+// documented in the description and parameter text instead.
 const textCount = tool<string, { words: number; characters: number }>({
-    description: 'Count the words and characters in a text. Useful before claiming a length.',
+    description:
+        'Count the words and characters in a text. Useful before claiming a length. Characters are UTF-16 code units (JavaScript string length), so characters outside the basic plane, such as many emoji, count as two.',
     tags: ['text', 'words', 'count'],
     parameters: {
         type: 'object',
         properties: {
-            text: { type: 'string', description: 'Text to measure.' }
+            text: { type: 'string', description: 'Text to measure. Characters are counted in UTF-16 code units.' }
         },
         required: ['text'],
         additionalProperties: false
@@ -90,19 +133,44 @@ const textCount = tool<string, { words: number; characters: number }>({
 });
 
 // diceRoll — a fair die, so the random path is exercised without a network call.
+//
+// The schema and the implementation now state the same default (6) and the same
+// domain (a whole number of faces, 2..1000). The old code silently clamped any
+// input (`Math.max(2, Math.floor(sides))`) and advertised a default while marking
+// the argument required, so `{}` and a negative number both returned a die that
+// did not match what was asked for.
 const diceRoll = tool<number | undefined, { sides: number; value: number }>({
-    description: 'Roll a fair die and return the value. Defaults to six sides.',
+    description: `Roll a fair die and return the value. Sides must be a whole number from ${MIN_DICE_SIDES} to ${MAX_DICE_SIDES}; defaults to ${DEFAULT_DICE_SIDES} sides.`,
     tags: ['random', 'dice', 'chance'],
     parameters: {
         type: 'object',
         properties: {
-            sides: { type: 'number', description: 'Number of faces on the die, e.g. 6.' }
+            sides: {
+                type: 'integer',
+                minimum: MIN_DICE_SIDES,
+                maximum: MAX_DICE_SIDES,
+                default: DEFAULT_DICE_SIDES,
+                description: `Number of faces on the die, a whole number from ${MIN_DICE_SIDES} to ${MAX_DICE_SIDES}. Defaults to ${DEFAULT_DICE_SIDES}.`
+            }
         },
-        required: ['sides'],
+        // Optional: the default is part of the documented contract, so the schema
+        // must not claim the argument is required.
+        required: [],
         additionalProperties: false
     },
     execute: ({ parameters: sides }) => {
-        const faces = Math.max(2, Math.floor(sides ?? 6));
+        // Single-property rule: `sides` is the number itself, or undefined.
+        const faces = sides ?? DEFAULT_DICE_SIDES;
+
+        if (
+            typeof faces !== 'number' ||
+            !Number.isFinite(faces) ||
+            !Number.isInteger(faces) ||
+            faces < MIN_DICE_SIDES ||
+            faces > MAX_DICE_SIDES
+        ) {
+            throw new Error(`diceRoll sides must be a whole number from ${MIN_DICE_SIDES} to ${MAX_DICE_SIDES}.`);
+        }
 
         return { sides: faces, value: 1 + Math.floor(Math.random() * faces) };
     }
@@ -191,10 +259,26 @@ const textSummarize = tool<string, string>({
         // documented agent-configuration difference, not an error.
         const summarizer = agents?.summarizer;
 
-        if (!run || summarizer === undefined) return condense(notes);
+        // Bound what reaches a subagent (or the local condenser): a model-supplied
+        // note block is otherwise an unbounded prompt. The cut is STATED in the
+        // prompt, not silent, so a summarizer never reports a false "complete".
+        const truncated = typeof notes === 'string' && notes.length > MAX_SUMMARIZE_NOTES;
+        const boundedNotes = truncated ? notes.slice(0, MAX_SUMMARIZE_NOTES) : notes;
+        const truncationNote = truncated ? `\n\n${NOTES_TRUNCATED}` : '';
 
-        const message = await run('summarizer', `Summarise these notes in at most two sentences:\n\n${notes}`);
-        return message.content;
+        const summary =
+            !run || summarizer === undefined
+                ? condense(boundedNotes)
+                : (
+                      await run(
+                          'summarizer',
+                          `Summarise these notes in at most two sentences:\n\n${boundedNotes}${truncationNote}`
+                      )
+                  ).content;
+
+        // The result carries the same truncation marker as the prompt: the caller
+        // must be able to tell why a summary of a long document is incomplete.
+        return `${summary}${truncationNote}`;
     }
 });
 
@@ -202,7 +286,35 @@ const textSummarize = tool<string, string>({
 // the recoverable-failure path is visible — the harness feeds the error back as a
 // tool result and the model gets another turn. The harness id stays `flaky`; only
 // the TOOL is testFlaky.
-let flakyAttempts = 0;
+//
+// State is per AGENT, not per process (R8): the old module-level counter made two
+// sessions share one attempt count, so session A's failures could "heal" session
+// B's first call. The harness passes the requesting `agent` in the tool context
+// (src/types ToolContext, populated at harness.ts:~655), and each session builds
+// its own Agent objects, so a WeakMap keyed by that object is session isolation
+// with automatic garbage collection.
+//
+// A direct `testFlaky()` call has no agent; that path keeps one explicit fallback
+// counter. It is deliberately not a factory: the preset/toolbox registry shares
+// this singleton on purpose, and the WeakMap is what makes sharing safe.
+const flakyAttempts = new WeakMap<object, number>();
+let directFlakyAttempts = 0;
+
+// Count one attempt for this caller: the agent object inside a harness, or the
+// single module fallback for a direct call (and for any future context that does
+// not carry an agent).
+const nextFlakyAttempt = (agent: unknown): number => {
+    const key = agent !== null && (typeof agent === 'object' || typeof agent === 'function') ? agent : undefined;
+
+    if (key === undefined) {
+        directFlakyAttempts += 1;
+        return directFlakyAttempts;
+    }
+
+    const attempt = (flakyAttempts.get(key) ?? 0) + 1;
+    flakyAttempts.set(key, attempt);
+    return attempt;
+};
 
 const testFlaky = tool<Record<string, never>, string>({
     description:
@@ -213,14 +325,14 @@ const testFlaky = tool<Record<string, never>, string>({
         properties: {},
         additionalProperties: false
     },
-    execute: () => {
-        flakyAttempts += 1;
+    execute: ({ agent }) => {
+        const attempt = nextFlakyAttempt(agent);
 
-        if (flakyAttempts % 3 !== 0) {
-            throw new Error(`Temporary failure (attempt ${flakyAttempts}). Retry the same call.`);
+        if (attempt % 3 !== 0) {
+            throw new Error(`Temporary failure (attempt ${attempt}). Retry the same call.`);
         }
 
-        return `Success on attempt ${flakyAttempts}.`;
+        return `Success on attempt ${attempt}.`;
     }
 });
 

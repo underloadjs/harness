@@ -31,40 +31,52 @@
 
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
-import { StringDecoder } from 'node:string_decoder';
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
 import { PRESET_TOOLS } from '../catalogue';
+import { BoundedText, COMMAND_STDERR_MAX_BYTES, COMMAND_STDOUT_MAX_BYTES } from './boundedText';
+import { processGroupOptions, terminateTree } from './processTree';
 
 export type GitDiffParameters = {
     // Commit/branch/range to diff against. Rejected when option-like.
     ref?: string;
     // Diff the index instead of the working tree.
     staged?: boolean;
-    // Pathspecs, sent after "--".
+    // Pathspecs, sent after "--". An explicitly empty array is rejected rather
+    // than silently diffing everything.
     paths?: string | string[];
     // Repository directory. Defaults to the process working directory.
     cwd?: string;
 };
 
 export type GitDiffResult = {
-    // Process exit code, or -1 when the process was terminated by a signal.
+    // Process exit code, or -1 when a signal/this tool terminated the process.
     exitCode: number;
     stdout: string;
     stderr: string;
-    // True when stdout exceeded MAX_OUTPUT_BYTES and the tail was dropped.
+    // True when STDOUT exceeded MAX_OUTPUT_BYTES and the tail was dropped.
     truncated: boolean;
+    // True when STDERR exceeded the stderr cap and the tail was dropped.
+    stderrTruncated: boolean;
     // True when the timeout killed the process.
     timedOut: boolean;
+    // True when context.signal killed the process.
+    aborted: boolean;
 };
 
 // A diff can be arbitrarily large; a model cannot use more than this in one turn
-// and an unbounded string would just burn memory.
-const MAX_OUTPUT_BYTES = 128 * 1024;
+// and an unbounded string would just burn memory. The stderr cap (16 KiB) is the
+// shared command cap: git diagnostics can be long, but a wall of warnings must
+// not dominate the result.
+const MAX_OUTPUT_BYTES = COMMAND_STDOUT_MAX_BYTES;
 
 // git diff on a big tree can legitimately take seconds; more than this means
 // something is wrong (huge repository, slow filesystem), and the run must end.
 const TIMEOUT_MS = 10_000;
+
+// Backstop after a timeout/abort kill, so a stuck tree cannot hang the tool.
+const KILL_GRACE_MS = 2_000;
+
 
 // A ref is a user-controlled argv element, so validate it rather than relying on
 // "--" (which only protects pathspecs, not the revision position):
@@ -94,11 +106,18 @@ const validateRef = (ref: string): string => {
 
 // Normalize the pathspec argument into a list of non-empty strings. Each entry is
 // placed after "--" later, so option-like paths are safe; only obviously broken
-// values (empty, NUL) are rejected.
+// values (empty string, empty array, NUL) are rejected. An empty ARRAY is rejected
+// rather than treated as "no paths": "paths: []" almost always means a computed
+// list came out empty, and silently diffing the whole tree would hide that bug.
 const normalizePaths = (paths: string | string[] | undefined): string[] => {
     if (paths === undefined) return [];
 
     const list = Array.isArray(paths) ? paths : [paths];
+
+    if (list.length === 0) {
+        throw new HarnessError('gitDiff paths array must not be empty when provided.');
+    }
+
     const normalized: string[] = [];
 
     for (const path of list) {
@@ -118,28 +137,48 @@ const normalizePaths = (paths: string | string[] | undefined): string[] => {
 
 export const gitDiff = tool<GitDiffParameters, GitDiffResult>({
     ...PRESET_TOOLS.gitDiff,
-    execute: ({ parameters: { ref, staged, paths, cwd } }) =>
-        new Promise<GitDiffResult>((resolvePromise, rejectPromise) => {
-            // The harness does not validate JSON Schema, so a model can send
-            // "true" instead of true. Reject that instead of silently diffing the
-            // wrong side of the index.
-            if (staged !== undefined && typeof staged !== 'boolean') {
-                throw new HarnessError('gitDiff staged must be a boolean.');
-            }
+    execute: (context) => {
+        const { ref, staged, paths, cwd } = context.parameters;
 
-            const args = ['--no-pager', 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '--abbrev=40'];
+        // context.signal is being added to ToolContext by a parallel change; read
+        // it structurally so this module works with or without that field typed.
+        const signal = (context as { signal?: AbortSignal }).signal;
 
-            // --staged before the revision, matching git's own usage examples.
-            if (staged === true) args.push('--staged');
+        // The harness does not validate JSON Schema, so a model can send
+        // "true" instead of true. Reject that instead of silently diffing the
+        // wrong side of the index.
+        if (staged !== undefined && typeof staged !== 'boolean') {
+            throw new HarnessError('gitDiff staged must be a boolean.');
+        }
 
-            if (ref !== undefined) args.push(validateRef(ref));
+        const args = ['--no-pager', 'diff', '--no-color', '--no-ext-diff', '--no-textconv', '--abbrev=40'];
 
-            const pathspecs = normalizePaths(paths);
+        // --staged before the revision, matching git's own usage examples.
+        if (staged === true) args.push('--staged');
 
-            // "--" ends option parsing: every remaining token is a pathspec, even
-            // one that starts with "-".
-            if (pathspecs.length > 0) args.push('--', ...pathspecs);
+        if (ref !== undefined) args.push(validateRef(ref));
 
+        const pathspecs = normalizePaths(paths);
+
+        // "--" ends option parsing: every remaining token is a pathspec, even
+        // one that starts with "-".
+        if (pathspecs.length > 0) args.push('--', ...pathspecs);
+
+        // Already cancelled before anything started: report a clean aborted
+        // result instead of spawning git just to kill it.
+        if (signal?.aborted) {
+            return Promise.resolve({
+                exitCode: -1,
+                stdout: '',
+                stderr: '',
+                truncated: false,
+                stderrTruncated: false,
+                timedOut: false,
+                aborted: true
+            });
+        }
+
+        return new Promise<GitDiffResult>((resolvePromise, rejectPromise) => {
             const child = spawn('git', args, {
                 cwd: cwd ? resolve(cwd) : undefined,
                 shell: false,
@@ -147,66 +186,108 @@ export const gitDiff = tool<GitDiffParameters, GitDiffResult>({
                     ...process.env,
                     // Read-only intent: do not refresh or write the index.
                     GIT_OPTIONAL_LOCKS: '0'
-                }
+                },
+                ...processGroupOptions()
             });
 
             // Decode incrementally so a multi-byte character split across chunks
             // is not mangled (except at the truncation boundary, where a partial
-            // sequence necessarily becomes a replacement character).
-            const decoder = new StringDecoder('utf8');
-            let stdout = '';
-            let stderr = '';
-            let captured = 0;
-            let truncated = false;
+            // sequence necessarily becomes a replacement character). Both streams
+            // are byte-capped; stderr keeps the head up to the shared 16 KiB cap.
+            const stdout = new BoundedText(MAX_OUTPUT_BYTES);
+            const stderr = new BoundedText(COMMAND_STDERR_MAX_BYTES);
+
             let timedOut = false;
+            let aborted = false;
+            let settled = false;
+            let timer: ReturnType<typeof setTimeout> | undefined;
+            let graceTimer: ReturnType<typeof setTimeout> | undefined;
+            // Shared kill promise: timeout and abort may both fire; the tree is
+            // terminated (and awaited) once.
+            let treeKill: Promise<void> | undefined;
 
-            const timer = setTimeout(() => {
-                timedOut = true;
-                child.kill();
-            }, TIMEOUT_MS);
+            // Settle exactly once; also releases the timer and abort listener.
+            const settle = (finish: () => void): void => {
+                if (settled) return;
 
-            child.stdout?.on('data', (chunk: Buffer) => {
-                if (captured >= MAX_OUTPUT_BYTES) {
-                    truncated = true;
-                    return;
+                settled = true;
+                if (timer) clearTimeout(timer);
+                if (graceTimer) clearTimeout(graceTimer);
+                signal?.removeEventListener('abort', onAbort);
+                finish();
+            };
+
+            // Backstop: resolve with the captured head even if a killed git tree
+            // never emits 'close'. Scheduled only after terminateTree resolves, so
+            // it cannot race ahead of the Windows taskkill wait.
+            const finishKilled = (): void =>
+                settle(() =>
+                    resolvePromise({
+                        exitCode: -1,
+                        stdout: stdout.end(),
+                        stderr: stderr.end(),
+                        truncated: stdout.truncated,
+                        stderrTruncated: stderr.truncated,
+                        timedOut,
+                        aborted
+                    })
+                );
+
+            const scheduleGrace = (): void => {
+                if (graceTimer === undefined) graceTimer = setTimeout(finishKilled, KILL_GRACE_MS);
+            };
+
+            const terminate = (): Promise<void> => {
+                if (!treeKill) {
+                    treeKill = terminateTree(child).then(scheduleGrace, scheduleGrace);
                 }
 
-                const remaining = MAX_OUTPUT_BYTES - captured;
+                return treeKill;
+            };
 
-                // Keep the head of the diff; the model sees whole early hunks
-                // rather than a random slice.
-                const slice = chunk.length > remaining ? chunk.subarray(0, remaining) : chunk;
+            const onAbort = (): void => {
+                aborted = true;
+                void terminate();
+            };
 
-                if (chunk.length > remaining) truncated = true;
+            timer = setTimeout(() => {
+                timedOut = true;
+                void terminate();
+            }, TIMEOUT_MS);
 
-                captured += slice.length;
-                stdout += decoder.write(slice);
-            });
+            signal?.addEventListener('abort', onAbort, { once: true });
 
-            child.stderr?.on('data', (chunk: Buffer) => {
-                // stderr is git's own diagnostics: small, and worth keeping whole
-                // up to a modest bound so a wall of warnings cannot dominate.
-                if (stderr.length < 16 * 1024) stderr += chunk.toString('utf8');
-            });
+            child.stdout?.on('data', (chunk: Buffer) => stdout.write(chunk));
+            child.stderr?.on('data', (chunk: Buffer) => stderr.write(chunk));
 
             // Spawn failures (git missing, cwd missing) are setup problems, not
             // diff results: throw so the harness reports a real error.
-            child.on('error', (error) => {
-                clearTimeout(timer);
-                rejectPromise(error);
-            });
+            child.on('error', (error) => settle(() => rejectPromise(error)));
 
-            child.on('close', (code, signal) => {
-                clearTimeout(timer);
-                stdout += decoder.end();
+            child.on('close', (code, exitSignal) => {
+                const finish = (): void =>
+                    settle(() =>
+                        resolvePromise({
+                            exitCode: timedOut || aborted ? -1 : code ?? (exitSignal ? -1 : 0),
+                            stdout: stdout.end(),
+                            stderr: stderr.end(),
+                            truncated: stdout.truncated,
+                            stderrTruncated: stderr.truncated,
+                            timedOut,
+                            aborted
+                        })
+                    );
 
-                resolvePromise({
-                    exitCode: code ?? (signal ? -1 : 0),
-                    stdout,
-                    stderr,
-                    truncated,
-                    timedOut
-                });
+                // A timed-out/aborted close is reported only after the tree kill
+                // has completed, so the result cannot precede the grandchild kill.
+                if (treeKill) {
+                    void treeKill.then(finish, finish);
+                    return;
+                }
+
+                finish();
             });
-        })
+        });
+    }
 });
+

@@ -203,7 +203,7 @@ describe('agentDelegate', () => {
         await writer('go');
 
         expect(content(writerAgent.messages[2])).toBe(
-            'Tool "agentDelegate" failed: Agent "editor" is not a configured subagent. Allowed: researcher.'
+            'Tool "agentDelegate" received arguments that do not match its schema: $.agent must be one of: "researcher".'
         );
     });
 
@@ -232,7 +232,6 @@ describe('agentDelegate', () => {
         );
         expect(content(writerAgent.messages[2])).toBe('{"agent":"researcher","content":"blocked"}');
     });
-
     it('refuses to re-enter a running agent through ctx.run', async () => {
         const recurse = tool({
             description: 'Re-enter the writer.',
@@ -249,5 +248,43 @@ describe('agentDelegate', () => {
         expect(content(entry.messages[2])).toBe(
             'Tool "recurse" failed: Agent "writer" is already running; it cannot be re-entered (delegation cycle).'
         );
+    });
+
+    // R12: reset() is a session restart, so it must clear EVERY agent's
+    // transcript — a subagent used to keep its conversation across a reset, which
+    // leaked one session into the next. Seeded instructions stay.
+    it('reset() clears every agent transcript, not just the entry agent', async () => {
+        const researcher = brain(scripted([answer('facts')]), {
+            instruction: 'You are a researcher.'
+        });
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"find facts"}'),
+                answer('final')
+            ]),
+            { instruction: 'You are a writer.' }
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        await writer('go');
+
+        // Both agents really have a conversation before the reset.
+        expect(writerAgent.messages.map((message) => message.role)).toEqual([
+            'system',
+            'user',
+            'assistant',
+            'tool',
+            'assistant'
+        ]);
+        expect(researcher.messages.map((message) => message.role)).toEqual([
+            'system',
+            'user',
+            'assistant'
+        ]);
+
+        writer.reset();
+
+        expect(writerAgent.messages).toEqual([{ role: 'system', content: 'You are a writer.' }]);
+        expect(researcher.messages).toEqual([{ role: 'system', content: 'You are a researcher.' }]);
     });
 });

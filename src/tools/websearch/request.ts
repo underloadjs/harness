@@ -13,10 +13,17 @@
 // harness promises a small, predictable tool result, so a provider cannot flood
 // the context or the process:
 //   - 5 results by default, 20 maximum (the tool clamps the model's request);
-//   - 1,000 characters of snippet per result, 300 of title;
-//   - 512,000 characters of response body, checked by content-length and again
-//     after read;
+//   - 1,000 characters of snippet per result, 300 of title, 64 of publication
+//     date, and 2,048 characters of URL (a longer URL drops the row instead of
+//     being truncated into a different link);
+//   - 512 KiB of response body, enforced while streaming so an oversized body is
+//     never allocated in full, plus a content-length pre-check;
 //   - 15 s per request, enforced with AbortController and cleaned up in `finally`.
+//
+// Redaction order is a security property, not a style choice: every field is
+// redacted FIRST and bounded second. Bounding first (the old behaviour) could cut
+// a configured credential in half, leaving a prefix of the secret in the result at
+// the truncation boundary.
 //
 // Errors are sanitized on purpose: a provider status is reported, a provider
 // body never is (it could echo the key or an unrelated secret), and a network
@@ -46,13 +53,21 @@ export const MAX_RESULTS_LIMIT = 20;
 // Per-request budget. No retry: a timeout is reported once.
 export const SEARCH_TIMEOUT_MS = 15_000;
 
-// Response ceiling. Exa highlights and Tavily content are the only large fields
-// we ask for, and both are capped again per result, so this is defence in depth
-// against a provider (or a proxy) returning something far larger than requested.
-export const MAX_RESPONSE_CHARS = 512 * 1024;
+// Response ceiling, in bytes (512 KiB). The body is read through a stream and the
+// budget is checked per chunk, so a provider cannot force a full allocation first.
+// Content-length is checked too, when the provider sends it.
+export const MAX_RESPONSE_BYTES = 512 * 1024;
 
 export const MAX_TITLE_CHARS = 300;
 export const MAX_SNIPPET_CHARS = 1_000;
+
+// A provider date is a label, not free text: anything longer is dropped rather
+// than emitted as a misleading "publication date".
+export const MAX_PUBLISHED_CHARS = 64;
+
+// A URL is a link the model is expected to cite. A URL longer than this cannot be
+// truncated without corrupting it, so `validUrl` rejects the row instead.
+export const MAX_URL_CHARS = 2_048;
 
 // How a configured key is replaced when a provider echoes it back inside a
 // snippet, title, or URL. Fixed text: the replacement must not hint at the value.
@@ -129,6 +144,14 @@ export const text = (value: unknown, max: number): string => {
     return value.replace(/\s+/g, ' ').trim().slice(0, max);
 };
 
+// Redact the RAW provider string, then collapse and bound it.
+//
+// This order matters: redacting after truncation can leave the first characters of
+// a configured key at the cut (the old `redact(text(raw, max))` bug). A redaction
+// marker itself may be cut by the bound, but a marker is not secret.
+export const bounded = (value: unknown, max: number, redact: (text: string) => string): string =>
+    typeof value === 'string' ? text(redact(value), max) : '';
+
 // A snippet source may be a string (Tavily content) or a list of strings (Exa
 // highlights). Join highlights with a space, then let `text` bound the result.
 export const excerpt = (value: unknown): string => {
@@ -146,13 +169,26 @@ export const date = (value: unknown): string | undefined =>
 
 // Accept only absolute http(s) URLs. A provider is data, so a `javascript:` or
 // relative value is dropped from the result instead of handed to the model.
+//
+// Two bounds that are not cosmetic:
+//   - a URL longer than MAX_URL_CHARS is rejected, not sliced: a truncated URL
+//     looks valid but points somewhere else;
+//   - a URL carrying userinfo (`https://user:pass@host/`) is rejected. These are
+//     links the model reads and cites, never fetches by this tool, so this is a
+//     display/phishing bound rather than SSRF protection.
 const validUrl = (value: unknown): string | undefined => {
-    if (typeof value !== 'string' || value.trim().length === 0) return undefined;
+    if (typeof value !== 'string') return undefined;
+
+    const trimmed = value.trim();
+    if (trimmed.length === 0 || trimmed.length > MAX_URL_CHARS) return undefined;
 
     try {
-        const parsed = new URL(value);
+        const parsed = new URL(trimmed);
         if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return undefined;
-        return parsed.toString();
+        if (parsed.username.length > 0 || parsed.password.length > 0) return undefined;
+
+        const normalized = parsed.toString();
+        return normalized.length > MAX_URL_CHARS ? undefined : normalized;
     } catch {
         return undefined;
     }
@@ -162,6 +198,9 @@ const validUrl = (value: unknown): string | undefined => {
 // drop rows without a valid URL, bound every field, and redact every string.
 // Invalid rows are skipped rather than failing the whole search: one bad row is
 // not a reason to lose the good ones.
+//
+// Order per field: validate raw -> redact -> bound. Redaction happens on the raw
+// string so a credential can never be cut at a truncation boundary.
 export const normalizeMatches = (
     rows: readonly unknown[],
     maxResults: number,
@@ -177,15 +216,20 @@ export const normalizeMatches = (
         const url = validUrl(fields.url);
         if (url === undefined) continue;
 
+        // Redaction can lengthen a URL (`[redacted]` is longer than a short key).
+        // If the safe form no longer fits, drop the row rather than truncate it.
+        const safeUrl = redact(url);
+        if (safeUrl.length > MAX_URL_CHARS) continue;
+
         const match: WebSearchMatch = {
             // Fall back to the URL so a result never has an empty title.
-            title: redact(text(fields.title, MAX_TITLE_CHARS) || url),
-            url: redact(url),
-            snippet: redact(text(fields.snippet, MAX_SNIPPET_CHARS))
+            title: bounded(fields.title, MAX_TITLE_CHARS, redact) || safeUrl,
+            url: safeUrl,
+            snippet: bounded(fields.snippet, MAX_SNIPPET_CHARS, redact)
         };
 
-        const published = date(fields.published);
-        if (published !== undefined) match.published = redact(published);
+        const published = bounded(date(fields.published), MAX_PUBLISHED_CHARS, redact);
+        if (published.length > 0) match.published = published;
 
         matches.push(match);
     }
@@ -214,6 +258,90 @@ const statusFailure = (label: string, status: number): HarnessError => {
     }
 
     return new HarnessError(`${label} search failed (HTTP ${status}).`);
+};
+
+// One fixed sentence for the size bound, shared by the content-length pre-check
+// and the streaming budget so both report the same thing.
+const oversizedResponse = (label: string): HarnessError =>
+    new HarnessError(`${label} search returned a response larger than ${MAX_RESPONSE_BYTES} bytes.`);
+
+// Read a response body without ever holding more than MAX_RESPONSE_BYTES.
+//
+// `response.text()` allocates the whole body first, so a provider (or a proxy)
+// could force a huge allocation before any check ran. Reading chunk by chunk lets
+// us count bytes and cancel the stream the moment the budget is crossed. The same
+// budget is checked on content-length before this is called, and again on the
+// no-stream fallback so a runtime without `body` is not exempt.
+//
+// `failure` is the caller's network/timeout classifier: a read that rejects is
+// either the request signal aborting or a broken transport, and the caller is the
+// only place that can tell them apart.
+const readBody = async (response: Response, label: string, failure: () => HarnessError): Promise<string> => {
+    const stream = response.body;
+
+    if (!stream || typeof stream.getReader !== 'function') {
+        let body: string;
+
+        try {
+            body = await response.text();
+        } catch {
+            throw failure();
+        }
+
+        if (new TextEncoder().encode(body).byteLength > MAX_RESPONSE_BYTES) throw oversizedResponse(label);
+
+        return body;
+    }
+
+    const reader = stream.getReader();
+    // TextDecoder streams across chunk boundaries so a multi-byte character split
+    // between two chunks is decoded once, not turned into a replacement character.
+    const decoder = new TextDecoder();
+    const parts: string[] = [];
+    let received = 0;
+
+    try {
+        for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+
+            received += value.byteLength;
+
+            // Stop the transfer before throwing: returning while the provider is
+            // still sending would leave the socket busy for the rest of the budget.
+            if (received > MAX_RESPONSE_BYTES) {
+                try {
+                    await reader.cancel();
+                } catch {
+                    // The stream may already be closed; the size error is the one
+                    // the caller needs.
+                }
+
+                throw oversizedResponse(label);
+            }
+
+            parts.push(decoder.decode(value, { stream: true }));
+        }
+
+        // Flush any bytes held back as a partial character.
+        parts.push(decoder.decode());
+
+        return parts.join('');
+    } catch (error) {
+        // A HarnessError here is our own size error: keep it.
+        if (error instanceof HarnessError) throw error;
+
+        throw failure();
+    } finally {
+        // Releasing the lock is best-effort: cancel() in the limit path already
+        // closes the reader, and a release on a closed reader is a no-op we do not
+        // want to surface.
+        try {
+            reader.releaseLock();
+        } catch {
+            // Ignore: the stream is already done or cancelled.
+        }
+    }
 };
 
 // The one place a network request is made. Resolves the parsed JSON body; throws
@@ -249,28 +377,14 @@ export const requestSearch = async (request: SearchRequest): Promise<unknown> =>
 
         if (!response.ok) throw statusFailure(request.label, response.status);
 
-        // Reject an oversized declared body before reading it. The post-read check
-        // below still applies when the header is absent or wrong.
+        // Reject an oversized declared body before reading it. The streaming budget
+        // in `readBody` still applies when the header is absent or wrong.
         const declared = Number(response.headers.get('content-length') ?? '');
-        if (Number.isFinite(declared) && declared > MAX_RESPONSE_CHARS) {
-            throw new HarnessError(
-                `${request.label} search returned a response larger than ${MAX_RESPONSE_CHARS} characters.`
-            );
+        if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+            throw oversizedResponse(request.label);
         }
 
-        let body: string;
-
-        try {
-            body = await response.text();
-        } catch {
-            throw networkFailure();
-        }
-
-        if (body.length > MAX_RESPONSE_CHARS) {
-            throw new HarnessError(
-                `${request.label} search returned a response larger than ${MAX_RESPONSE_CHARS} characters.`
-            );
-        }
+        const body = await readBody(response, request.label, networkFailure);
 
         try {
             return JSON.parse(body) as unknown;

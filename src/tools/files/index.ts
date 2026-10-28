@@ -15,7 +15,15 @@
 // fileGlob is the one search surface: filename matching, plus an optional `content`
 // regex that switches the result to matching lines. It uses ./glob's walker, so
 // .git, node_modules, and symlinks are skipped, results are capped, and .gitignore
-// is deliberately not read.
+// is deliberately not read. Content mode is also byte-bounded: each match text is
+// cut to 1 KiB with an explicit `textTruncated`, and a call stops at 64 KiB of
+// match text with `truncated: true` (see ./fileGlob).
+//
+// fileList returns a bounded PAGE, not the whole listing: `{ entries, truncated,
+// nextOffset, offset, limit, bytes, contentBudget }`, 200 entries by default and
+// 1000 at most, 64 KiB of entry text per call, resumed by passing `nextOffset` as
+// `offset` (see ./fileList). fileWrite refuses NUL content because it would create
+// a file fileRead rejects as binary.
 //
 // Two private helpers sit beside the tool and are shared by the batch:
 //   - ./identity — one canonical key per real file, so duplicate targets (Windows
@@ -23,7 +31,7 @@
 //   - ./bounded-regex — content matching inside node:vm with a timeout, so a
 //     catastrophic pattern fails instead of hanging the process.
 export { fileRead } from './fileRead';
-export type { FileReadEntry, FileReadParameters, FileReadResult } from './fileRead';
+export type { FileReadEntry, FileReadParameters, FileReadResult, FileReadTarget } from './fileRead';
 export { fileWrite } from './fileWrite';
 export type {
     FileWriteEntry,
@@ -38,9 +46,9 @@ export type {
     FileEditResult,
     FileEditResultEntry
 } from './fileEdit';
-export { fileList } from './fileList';
-export type { FileListParameters } from './fileList';
-export { fileGlob } from './fileGlob';
+export { fileList, FILE_LIST_CONTENT_BUDGET, FILE_LIST_DEFAULT_LIMIT, FILE_LIST_MAX_LIMIT } from './fileList';
+export type { FileListParameters, FileListQuery, FileListResult } from './fileList';
+export { fileGlob, FILE_GLOB_CONTENT_BUDGET, FILE_GLOB_MATCH_TEXT_BYTES } from './fileGlob';
 export type {
     FileGlobFilesResult,
     FileGlobMatch,

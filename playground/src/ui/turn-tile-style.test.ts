@@ -4,12 +4,14 @@
 // Like activity-style.test.ts this test reads the stylesheet source and pins the
 // properties that make the design work:
 //   - no square `aspect-ratio` on a collapsed tile (it reserved ~210px of empty
-//     space under the prompt) and a two-line prompt clamp;
+//     space under the prompt) and no multi-line clamp: a compact task is ONE
+//     full-width line (R1);
+//   - no timeline rule and no marker dot (R1): rows only;
 //   - a compact status whose word is clipped, not removed (assistive tech keeps
 //     it), so "done" is never a second visible label;
 //   - green/red/neutral tile borders for done/error/cancelled;
 //   - the same conic-gradient ring and `agent-ring-spin` keyframes the agent row
-//     uses while a tile is queued/waiting/streaming;
+//     uses while a tile is waiting/streaming;
 //   - reduced motion freezes that ring and forced colors replaces it with an
 //     outline.
 
@@ -38,22 +40,34 @@ const blockOf = (selector: string): string => {
     return css.slice(open + 1, close);
 };
 
-it('keeps a collapsed tile content-high instead of square', () => {
+it('keeps a collapsed tile a single full-width line instead of a square card', () => {
     const compact = blockOf('.tile:not(.is-expanded) {');
 
     // The empty middle came from `aspect-ratio: 1 / 1`; it must not come back.
     expect(compact).not.toContain('aspect-ratio');
-    expect(compact).toContain('align-self: start');
+    // R1: a compact task is a FULL-WIDTH row, not a card that hugs its content.
+    expect(compact).toContain('width: 100%');
+    expect(compact).not.toContain('align-self: start');
 
     const select = blockOf('.tile:not(.is-expanded) .tile-select {');
-    expect(select).toContain('padding: 8px 10px 9px');
-    expect(select).toContain('gap: 4px');
+    // ONE line: the header lays out as a row (prompt + metadata group).
+    expect(select).toContain('flex-direction: row');
+    expect(select).toContain('align-items: center');
+    expect(select).toContain('padding: 6px 10px');
 
     const prompt = blockOf('.tile:not(.is-expanded) .tile-prompt {');
-    expect(prompt).toContain('-webkit-line-clamp: 2');
+    // Clamped by ellipsis, never by a multi-line clamp: the row cannot grow.
+    expect(prompt).toContain('white-space: nowrap');
+    expect(prompt).toContain('text-overflow: ellipsis');
+    expect(prompt).not.toContain('-webkit-line-clamp');
+
+    // The meta line would be a second line, so it is clipped (still in the DOM
+    // for assistive tech, exactly like the status word).
+    const meta = blockOf('.tile:not(.is-expanded) .tile-meta {');
+    expect(meta).toContain('clip-path: inset(50%)');
 });
 
-it('clips the compact status word and colour-codes the timeline states', () => {
+it('clips the compact status word and colour-codes the rows', () => {
     const statusText = blockOf('.tile:not(.is-expanded) .tile-status-text {');
     expect(statusText).toContain('position: absolute');
     expect(statusText).toContain('clip-path: inset(50%)');
@@ -105,19 +119,21 @@ it('sweeps the agent activity ring around the active tile only', () => {
     expect(ringSelectors).not.toContain("[data-state='cancelled']");
 });
 
-it('lays the turns out as one linear timeline with grey completed markers', () => {
-    // R4: a single vertical timeline, not the old responsive grid.
+it('lays the turns out as one plain full-width list with no timeline decoration', () => {
+    // R1: a single vertical list, not the old responsive grid, and no left gutter
+    // reserved for a rule/marker column.
     const turns = blockOf('.turns {');
     expect(turns).toContain('display: flex');
     expect(turns).toContain('flex-direction: column');
     expect(turns).not.toContain('grid-template-columns');
+    expect(turns).not.toContain('padding-left');
 
-    // Completed rows are grey; the active one is the only green marker.
-    expect(blockOf(".turn-row[data-state='done'] .turn-marker {")).toContain("background: var(--muted)");
-    expect(blockOf(".turn-row[data-state='streaming'] .turn-marker {")).toContain('background: var(--ok)');
-    expect(blockOf(".turn-row[data-state='queued'] .turn-marker {")).toContain(
-        'background: var(--border-strong)'
-    );
+    // No rule drawn behind the rows.
+    expect(css).not.toContain('.turns::before');
+    // No marker dot: the element and every one of its state colours is gone.
+    expect(css).not.toContain('.turn-marker');
+    // Rows are full width, one line each.
+    expect(blockOf('.turn-row {')).toContain('width: 100%');
     // Queued status text is neutral, never green.
     expect(blockOf(".tile[data-state='queued'] .tile-status {")).toContain('color: var(--muted)');
 });

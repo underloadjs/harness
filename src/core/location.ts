@@ -7,29 +7,40 @@
 // A location is deliberately small (name, description, optional notes), so every
 // result carries the full record; there is no summary/body split like chapters.
 //
+// R9 (tool audit) — bounded results, identical policy in profile/chapter/location:
+//   - at most LOCATION_MAX_RECORDS (200) locations may be stored; `add` past the
+//     cap is an actionable error, never a silent drop of stored data;
+//   - per-field caps: name LOCATION_MAX_NAME (200), description/notes
+//     LOCATION_MAX_TEXT (4000) characters. Oversized writes are rejected with the
+//     actual size so the model can shorten and retry;
+//   - `list` is paginated: `offset` defaults to 0, `limit` defaults to 20 and is
+//     hard-capped at 100, and the page stops before the UTF-8 payload exceeds
+//     LOCATION_RESPONSE_BUDGET_BYTES (64 KiB). `page.hasMore` /
+//     `page.nextOffset` walk every record without gaps;
+//   - mutation results return only the changed record and the counts, never the
+//     whole store.
+//
 // ACTIONS (shared by profile/chapter/location):
 //   add     — requires name + description; notes optional (defaults to '').
-//   list    — the full snapshot, in insertion order.
+//   list    — one bounded page, in insertion order.
 //   get     — one record by id.
 //   update  — partial: only the fields present in the arguments change.
 //             name/description must stay non-empty; notes may be cleared to ''.
 //   remove  — one record by id, returned as `removed`.
 //
 // Cross-references:
-//   - ../types   — RecordAction, LocationItem, LocationParameters,
-//                  LocationResult, LocationToolset
+//   - ../types   — LocationItem, LocationParameters, Tool, RecordAction
 //   - ./metadata — LOCATION_MANAGE_METADATA (name, description, tags, schema)
 //   - ./todo     — the template this factory follows
 //   - ../harness — registers the tool as core, reserves the name, resets it
+//
+// Result contracts (all list-shaped results carry `page`, mutations do not):
+//   list                 → { locations, counts, page }
+//   add | get | update   → { location, counts }
+//   remove               → { removed, counts }
 
 import { HarnessError } from '../util';
-import type {
-    LocationItem,
-    LocationParameters,
-    LocationResult,
-    LocationToolset,
-    RecordAction
-} from '../types';
+import type { LocationItem, LocationParameters, RecordAction, Tool } from '../types';
 import { LOCATION_MANAGE_METADATA } from './metadata';
 import { tool } from './tool';
 
@@ -41,6 +52,53 @@ const ACTION_HINT = ACTIONS.join(', ');
 
 // The mutable fields an `update` may carry; used to reject an empty update.
 const UPDATE_FIELDS = ['name', 'description', 'notes'] as const;
+
+// R9 bounds. Exported so tests (and any UI) assert the exact limits.
+export const LOCATION_MAX_RECORDS = 200;
+export const LOCATION_MAX_NAME = 200;
+export const LOCATION_MAX_TEXT = 4000;
+export const LOCATION_LIST_DEFAULT_LIMIT = 20;
+export const LOCATION_LIST_MAX_LIMIT = 100;
+export const LOCATION_RESPONSE_BUDGET_BYTES = 64 * 1024;
+
+// One page of a bounded list. `nextOffset` is present only when `hasMore`, so a
+// caller loops `while (page.hasMore) { list(offset: page.nextOffset) }` and never
+// skips records trimmed by the byte budget.
+export type LocationPageInfo = {
+    offset: number;
+    limit: number;
+    hasMore: boolean;
+    nextOffset?: number;
+};
+
+// Counts are always derived from the whole store, never from the page.
+export type LocationCounts = {
+    total: number;
+};
+
+// `list` result: the requested page (not a snapshot of the store).
+export type LocationListResult = {
+    locations: LocationItem[];
+    counts: LocationCounts;
+    page: LocationPageInfo;
+};
+
+// Mutation result: the changed record and the counts. No `locations` array.
+export type LocationChangeResult = {
+    location?: LocationItem;
+    removed?: LocationItem;
+    counts: LocationCounts;
+};
+
+export type LocationResult = LocationListResult | LocationChangeResult;
+
+// What createLocationTool() returns. Declared here (rather than in ../types)
+// because the R9 bounded shape is owned by this module while ../types is shared
+// with units still editing the same file; see the final report for the migration.
+export type LocationToolset = {
+    tool: Tool<LocationParameters, LocationResult>;
+    reset: () => void;
+};
 
 // Arrays are rejected: valid JSON, but it cannot carry an `action`.
 const isRecord = (value: unknown): value is Record<string, unknown> =>
@@ -54,21 +112,76 @@ const copyLocation = (item: LocationItem): LocationItem => ({
     notes: item.notes
 });
 
-// The result envelope every action returns. `locations` is always the current
-// snapshot; `location` is present for add/get/update and `removed` for remove.
-const compose = (
+const countsOf = (items: readonly LocationItem[]): LocationCounts => ({ total: items.length });
+
+// Read `offset` once, for every action: a negative or fractional cursor is a
+// validation error, not a clamp.
+const readOffset = (value: unknown): number => {
+    if (value === undefined) return 0;
+
+    if (!Number.isSafeInteger(value) || (value as number) < 0) {
+        throw new HarnessError(
+            'locationManage "offset" must be a non-negative integer when provided.'
+        );
+    }
+
+    return value as number;
+};
+
+// Read `limit` once, for every action. 1..LOCATION_LIST_MAX_LIMIT; a bigger limit
+// is rejected (not clamped) so the caller knows its page was not silently shrunk.
+const readLimit = (value: unknown): number => {
+    if (value === undefined) return LOCATION_LIST_DEFAULT_LIMIT;
+
+    if (
+        !Number.isSafeInteger(value) ||
+        (value as number) < 1 ||
+        (value as number) > LOCATION_LIST_MAX_LIMIT
+    ) {
+        throw new HarnessError(
+            `locationManage "limit" must be an integer between 1 and ${LOCATION_LIST_MAX_LIMIT} when provided.`
+        );
+    }
+
+    return value as number;
+};
+
+// Build one budgeted page from an ordered view of the store:
+//   - records are copied first, so the live store is never handed out;
+//   - they are added while the serialized UTF-8 size stays inside
+//     LOCATION_RESPONSE_BUDGET_BYTES (a comma per record is counted too);
+//   - the first record of a non-empty page is always included, so `nextOffset`
+//     always advances (no stall, no gaps).
+// `hasMore` is computed against the full store length, so a budget-truncated
+// page reports the cursor of its last included record rather than offset + limit.
+const paginate = (
     items: readonly LocationItem[],
-    extra: { location?: LocationItem; removed?: LocationItem } = {}
-): LocationResult => {
-    const result: LocationResult = {
-        locations: items.map(copyLocation),
-        counts: { total: items.length }
+    offset: number,
+    limit: number
+): { locations: LocationItem[]; page: LocationPageInfo } => {
+    const locations: LocationItem[] = [];
+    let bytes = 0;
+
+    for (const item of items.slice(offset, offset + limit)) {
+        const copy = copyLocation(item);
+        const size = Buffer.byteLength(JSON.stringify(copy), 'utf8') + 1;
+
+        if (locations.length > 0 && bytes + size > LOCATION_RESPONSE_BUDGET_BYTES) break;
+
+        locations.push(copy);
+        bytes += size;
+    }
+
+    const consumed = offset + locations.length;
+    const page: LocationPageInfo = {
+        offset,
+        limit,
+        hasMore: consumed < items.length
     };
 
-    if (extra.location) result.location = copyLocation(extra.location);
-    if (extra.removed) result.removed = copyLocation(extra.removed);
+    if (page.hasMore) page.nextOffset = consumed;
 
-    return result;
+    return { locations, page };
 };
 
 // The per-harness location list. Ids are decimal strings, monotonic for the life
@@ -100,16 +213,44 @@ export const createLocationTool = (): LocationToolset => {
         return item;
     };
 
-    // A required text field, trimmed. Missing/blank is reported against the
-    // action ("add" or "update") that needed it.
-    const requireText = (value: unknown, action: RecordAction, field: string): string => {
+    // A required text field, trimmed, non-empty, and within `max` characters.
+    // Missing/blank is reported against the action ("add" or "update") that
+    // needed it; an oversized value reports both the length and the limit.
+    const requireText = (
+        value: unknown,
+        action: RecordAction,
+        field: string,
+        max: number
+    ): string => {
         if (typeof value !== 'string' || value.trim().length === 0) {
             throw new HarnessError(
                 `locationManage "${action}" requires a non-empty "${field}" string.`
             );
         }
 
-        return value.trim();
+        const text = value.trim();
+
+        if (text.length > max) {
+            throw new HarnessError(
+                `locationManage "${field}" is ${text.length} characters; the limit is ${max}. Shorten it and retry.`
+            );
+        }
+
+        return text;
+    };
+
+    // An optional text field: absent becomes '', otherwise the trimmed value,
+    // still under the same character cap. Notes may be cleared to "".
+    const optionalText = (value: unknown, field: string, max: number): string => {
+        const text = typeof value === 'string' ? value.trim() : '';
+
+        if (text.length > max) {
+            throw new HarnessError(
+                `locationManage "${field}" is ${text.length} characters; the limit is ${max}. Shorten it and retry.`
+            );
+        }
+
+        return text;
     };
 
     // Name, description, tags, schema, and visibility come from the shared
@@ -159,6 +300,15 @@ export const createLocationTool = (): LocationToolset => {
                 throw new HarnessError('locationManage "notes" must be a string when provided.');
             }
 
+            // The pagination cursor is validated for every action too, so a
+            // stray `limit: 500` on `add` is reported instead of ignored. The
+            // schema declares offset/limit (see ./metadata.ts); LocationParameters
+            // is read through a raw record because this module's bounded result
+            // contract is declared locally (see LocationToolset above).
+            const raw = parameters as unknown as Record<string, unknown>;
+            const offset = readOffset(raw.offset);
+            const limit = readLimit(raw.limit);
+
             switch (resolvedAction) {
                 case 'add': {
                     // Build the whole record before touching the store: any
@@ -166,25 +316,40 @@ export const createLocationTool = (): LocationToolset => {
                     // consumed.
                     const item: LocationItem = {
                         id: String(nextId),
-                        name: requireText(parameters.name, 'add', 'name'),
-                        description: requireText(parameters.description, 'add', 'description'),
-                        notes:
-                            parameters.notes === undefined ? '' : String(parameters.notes).trim()
+                        name: requireText(parameters.name, 'add', 'name', LOCATION_MAX_NAME),
+                        description: requireText(
+                            parameters.description,
+                            'add',
+                            'description',
+                            LOCATION_MAX_TEXT
+                        ),
+                        notes: optionalText(parameters.notes, 'notes', LOCATION_MAX_TEXT)
                     };
+
+                    // Capacity is checked before the id is consumed: a full store
+                    // is an actionable error, and a failed add never burns an id.
+                    if (items.length >= LOCATION_MAX_RECORDS) {
+                        throw new HarnessError(
+                            `locationManage already holds the maximum of ${LOCATION_MAX_RECORDS} locations; remove one before adding another.`
+                        );
+                    }
 
                     nextId++;
                     items.push(item);
 
-                    return compose(items, { location: item });
+                    return { location: copyLocation(item), counts: countsOf(items) };
                 }
 
-                case 'list':
-                    return compose(items);
+                case 'list': {
+                    const { locations, page } = paginate(items, offset, limit);
+
+                    return { locations, counts: countsOf(items), page };
+                }
 
                 case 'get': {
                     const item = requireItem(requireId(parameters, resolvedAction));
 
-                    return compose(items, { location: item });
+                    return { location: copyLocation(item), counts: countsOf(items) };
                 }
 
                 case 'update': {
@@ -196,20 +361,26 @@ export const createLocationTool = (): LocationToolset => {
                     const patch: Partial<LocationItem> = {};
 
                     if (parameters.name !== undefined) {
-                        patch.name = requireText(parameters.name, 'update', 'name');
+                        patch.name = requireText(
+                            parameters.name,
+                            'update',
+                            'name',
+                            LOCATION_MAX_NAME
+                        );
                     }
 
                     if (parameters.description !== undefined) {
                         patch.description = requireText(
                             parameters.description,
                             'update',
-                            'description'
+                            'description',
+                            LOCATION_MAX_TEXT
                         );
                     }
 
                     // Notes may be cleared to "": empty is a valid state.
                     if (parameters.notes !== undefined) {
-                        patch.notes = String(parameters.notes).trim();
+                        patch.notes = optionalText(parameters.notes, 'notes', LOCATION_MAX_TEXT);
                     }
 
                     if (Object.keys(patch).length === 0) {
@@ -220,7 +391,7 @@ export const createLocationTool = (): LocationToolset => {
 
                     Object.assign(item, patch);
 
-                    return compose(items, { location: item });
+                    return { location: copyLocation(item), counts: countsOf(items) };
                 }
 
                 case 'remove': {
@@ -233,7 +404,7 @@ export const createLocationTool = (): LocationToolset => {
 
                     const [removed] = items.splice(index, 1);
 
-                    return compose(items, { removed });
+                    return { removed: copyLocation(removed), counts: countsOf(items) };
                 }
             }
         }

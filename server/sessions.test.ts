@@ -488,7 +488,8 @@ describe('SessionStore turns', () => {
                 agent: 'rounds',
                 name: 'todoManage',
                 callId: 'c1',
-                content: '{"todos":[],"counts":{"total":0,"completed":0,"remaining":0}}',
+                content:
+                    '{"todos":[],"counts":{"total":0,"completed":0,"remaining":0},"page":{"offset":0,"limit":20,"hasMore":false}}',
                 isError: false
             },
             { type: 'text', agent: 'rounds', delta: 'all done' },
@@ -586,6 +587,82 @@ describe('SessionStore turns', () => {
             total: 6,
             cached: 0
         });
+    });
+
+    it('keeps the partial tally of the completed requests when a run is cancelled', async () => {
+        // R3: a cancelled run bills only what the provider had already answered.
+        // Request 0 settles with usage and asks for a tool round; request 1 hangs
+        // until the abort, so it never reports usage. The tally must be request
+        // 0's figures exactly — no zero-filled request, no double count.
+        const first = { input: 100, output: 5, total: 105, cached: 40 };
+        const secondRequest = deferred();
+
+        const partialPreset = presetOf('partial', (settings, progress) =>
+            harness({
+                agents: {
+                    partial: agent({
+                        model: settings.model,
+                        instruction: 'One tool round, then wait for the abort.',
+                        stream: async function* (request): AsyncGenerator<HarnessStreamEvent> {
+                            const last = request.messages[request.messages.length - 1];
+
+                            if (last !== undefined && last.role === 'tool' && last.name === 'todoManage') {
+                                // Request 1 is now in flight; the test cancels from here.
+                                secondRequest.resolve();
+
+                                await new Promise<void>((_resolve, reject) => {
+                                    if (request.signal?.aborted === true) {
+                                        reject(new Error('The run was aborted.'));
+                                        return;
+                                    }
+
+                                    request.signal?.addEventListener(
+                                        'abort',
+                                        () => reject(new Error('The run was aborted.')),
+                                        { once: true }
+                                    );
+                                });
+                                return;
+                            }
+
+                            yield {
+                                type: 'done',
+                                stopReason: 'tool_calls',
+                                toolCalls: [
+                                    { id: 'c1', name: 'todoManage', arguments: '{"action":"list"}' }
+                                ],
+                                usage: first
+                            };
+                        }
+                    })
+                },
+                primary: 'partial',
+                presets: false,
+                report: { progress }
+            })
+        );
+
+        const setClock = pinClock(1_000);
+        const store = new SessionStore(DEFAULTS, createHarnessRegistry([partialPreset]));
+        const created = store.create('partial');
+        setClock(2_000);
+
+        const items: SessionStreamItem[] = [];
+        const running = store.run(created.id, 'cancel mid-run', async (item) => {
+            items.push(item);
+        });
+
+        await secondRequest.promise;
+        expect(store.cancel(created.id)).toBe(true);
+        await running;
+
+        const turn = store.get(created.id).turns[0];
+        expect(turn.status).toBe('cancelled');
+        // Exactly one usage event (request 0); the aborted request reported none.
+        expect(turn.events.filter((event) => event.type === 'usage')).toEqual([
+            { type: 'usage', agent: 'partial', usage: first }
+        ]);
+        expect(turn.usage).toEqual(first);
     });
 
     it('records subagent events in the primary turn', async () => {
@@ -1475,7 +1552,6 @@ describe('SessionStore manual tool calls', () => {
         const other = store.create('single');
 
         expect(await store.callTool(mine.id, 'todoManage', { action: 'add', text: '  only mine ' })).toEqual({
-            todos: [{ id: '1', text: 'only mine', completed: false }],
             todo: { id: '1', text: 'only mine', completed: false },
             counts: { total: 1, completed: 0, remaining: 1 }
         });
@@ -1484,11 +1560,13 @@ describe('SessionStore manual tool calls', () => {
         // a sibling session does not.
         expect(await store.callTool(mine.id, 'todoManage', { action: 'list' })).toEqual({
             todos: [{ id: '1', text: 'only mine', completed: false }],
-            counts: { total: 1, completed: 0, remaining: 1 }
+            counts: { total: 1, completed: 0, remaining: 1 },
+            page: { offset: 0, limit: 20, hasMore: false }
         });
         expect(await store.callTool(other.id, 'todoManage', { action: 'list' })).toEqual({
             todos: [],
-            counts: { total: 0, completed: 0, remaining: 0 }
+            counts: { total: 0, completed: 0, remaining: 0 },
+            page: { offset: 0, limit: 20, hasMore: false }
         });
     });
 
@@ -1671,7 +1749,8 @@ describe('SessionStore manual tool calls', () => {
         // Once the turn is done, the same call works.
         expect(await store.callTool(session.id, 'todoManage', { action: 'list' })).toEqual({
             todos: [],
-            counts: { total: 0, completed: 0, remaining: 0 }
+            counts: { total: 0, completed: 0, remaining: 0 },
+            page: { offset: 0, limit: 20, hasMore: false }
         });
     });
 });

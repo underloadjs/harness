@@ -64,9 +64,20 @@ const CORE_ORDER = [
     'locationManage'
 ];
 
-const emptyProfiles = { profiles: [], counts: { total: 0 } };
-const emptyChapters = { chapters: [], counts: { total: 0, planned: 0, draft: 0, complete: 0 } };
-const emptyLocations = { locations: [], counts: { total: 0 } };
+// R9 bounded shapes (src/core/{profile,chapter,location}.ts):
+//   list  -> { <kind>s, counts, page }  (default 20, max 100, 64 KiB page budget)
+//   write -> { <kind>|removed, counts } (no list)
+//   get   -> { <kind>, counts }         (chapter adds `content`)
+// `nextOffset` is omitted when `hasMore` is false, hence the exact shape here.
+const page = (offset = 0, limit = 20, hasMore = false) => ({ offset, limit, hasMore });
+
+const emptyProfiles = { profiles: [], counts: { total: 0 }, page: page() };
+const emptyChapters = {
+    chapters: [],
+    counts: { total: 0, planned: 0, draft: 0, complete: 0 },
+    page: page()
+};
+const emptyLocations = { locations: [], counts: { total: 0 }, page: page() };
 
 // The one profile every add in this file creates.
 const ELENA = { id: '1', name: 'Elena', description: 'A cartographer.', traits: [], notes: '' };
@@ -98,7 +109,7 @@ describe('session record tools', () => {
         // toolRequest is never called, yet the record tools were declared.
         expect(declaredNames(seen[0])).toEqual(CORE_ORDER);
         expect((entry.messages[2] as { content: string }).content).toBe(
-            `{"profiles":[${JSON.stringify(ELENA)}],"counts":{"total":1},"profile":${JSON.stringify(ELENA)}}`
+            `{"profile":${JSON.stringify(ELENA)},"counts":{"total":1}}`
         );
     });
 
@@ -148,7 +159,8 @@ describe('session record tools', () => {
         // The researcher's list is the primary's profile, not an empty list.
         expect(JSON.parse((researcher.messages[2] as { content: string }).content)).toEqual({
             profiles: [ELENA],
-            counts: { total: 1 }
+            counts: { total: 1 },
+            page: page()
         });
 
         // Configured tools precede the harness-owned set; agentDelegate is
@@ -187,7 +199,6 @@ describe('session record tools', () => {
 
         // The chapter body is only available from `get`, on the same session.
         expect(await writerA.executeTool('chapterManage', { action: 'get', id: '1' })).toEqual({
-            chapters: [{ id: '1', title: 'Arrival', summary: 'They land.', status: 'planned' }],
             chapter: { id: '1', title: 'Arrival', summary: 'They land.', status: 'planned' },
             content: 'The ship settles.',
             counts: { total: 1, planned: 1, draft: 0, complete: 0 }
@@ -207,9 +218,6 @@ describe('session record tools', () => {
                 description: 'Fresh.'
             })
         ).toEqual({
-            profiles: [
-                { id: '1', name: 'After reset', description: 'Fresh.', traits: [], notes: '' }
-            ],
             profile: { id: '1', name: 'After reset', description: 'Fresh.', traits: [], notes: '' },
             counts: { total: 1 }
         });
@@ -220,7 +228,6 @@ describe('session record tools', () => {
                 summary: 'Fresh.'
             })
         ).toEqual({
-            chapters: [{ id: '1', title: 'After reset', summary: 'Fresh.', status: 'planned' }],
             chapter: { id: '1', title: 'After reset', summary: 'Fresh.', status: 'planned' },
             counts: { total: 1, planned: 1, draft: 0, complete: 0 }
         });
@@ -231,7 +238,6 @@ describe('session record tools', () => {
                 description: 'Fresh.'
             })
         ).toEqual({
-            locations: [{ id: '1', name: 'After reset', description: 'Fresh.', notes: '' }],
             location: { id: '1', name: 'After reset', description: 'Fresh.', notes: '' },
             counts: { total: 1 }
         });

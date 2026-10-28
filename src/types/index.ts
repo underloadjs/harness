@@ -280,6 +280,12 @@ export type ToolSearchResult = {
     // Every tag in the searchable catalogue. Present only when nothing matched,
     // so the model can retry with real vocabulary instead of guessing.
     availableTags?: string[];
+    // Where this page starts in the ranked match list. Present only for a LATER
+    // page (progressive discovery, R12): repeating an identical query advances by
+    // one capped page, and this field reports the position so the model can tell
+    // a fresh shortlist from a continued one. Absent on the first page, so an
+    // existing first-page result keeps its exact shape.
+    offset?: number;
     // Retained for compatibility: true exactly when `remaining > 0`.
     truncated?: boolean;
 };
@@ -323,6 +329,12 @@ export type ToolCreationResult = {
     // next turn can call it without a second toolRequest round.
     enabled: true;
 };
+
+// Who may create tools at runtime (R12). See HarnessConfiguration.toolCreation:
+// 'all' (default, every agent), 'primary' (primary only; subagents neither see
+// nor can call the tool), false (no model-facing toolCreate at all — the host
+// `harness.toolCreate()` path remains available).
+export type ToolCreationPolicy = 'all' | 'primary' | false;
 
 // What a delegation hands back to the primary agent: the subagent's answer, not
 // its transcript (history stays with the subagent).
@@ -409,23 +421,8 @@ export type TodoCounts = {
     remaining: number;
 };
 
-// Every todoManage result is a snapshot: `todos` is always a copy of the current
-// list, plus the affected item and/or counts. `todo` is present for add/check/
-// uncheck, `removed` for remove.
-export type TodoResult = {
-    todos: TodoItem[];
-    todo?: TodoItem;
-    removed?: TodoItem;
-    counts: TodoCounts;
-};
-
-// What createTodoTool() returns: the core tool plus the reset hook a harness
-// stores with its own handle. State lives in the factory closure, never in a
-// module singleton, so two harnesses cannot share todos.
-export type TodoToolset = {
-    tool: Tool<TodoParameters, TodoResult>;
-    reset: () => void;
-};
+// Every todoManage result is a bounded page or a single mutation result; the
+// canonical types live in ./core/todo.ts and are re-exported below (R9).
 
 // ---------------------------------------------------------------------------
 // profileManage / chapterManage / locationManage (per-harness session records)
@@ -488,20 +485,39 @@ export type ProfileCounts = {
     total: number;
 };
 
-// Every profileManage result is a snapshot: `profiles` is a copied list, plus the
-// affected profile for add/get/update and `removed` for remove.
-export type ProfileResult = {
-    profiles: ProfileItem[];
-    profile?: ProfileItem;
-    removed?: ProfileItem;
-    counts: ProfileCounts;
-};
-
-// What createProfileTool() returns: the core tool plus reset().
-export type ProfileToolset = {
-    tool: Tool<ProfileParameters, ProfileResult>;
-    reset: () => void;
-};
+// R9: result and toolset shapes are OWNED by ./core/todo.ts, ./core/profile.ts,
+// ./core/chapter.ts, and ./core/location.ts (they build the bounded pages), and
+// re-exported here so the public surface cannot drift. Type-only, so there is no
+// runtime cycle even though those modules import their item/parameter types from
+// this file.
+export type {
+    TodoPageInfo,
+    TodoListResult,
+    TodoChangeResult,
+    TodoResult,
+    TodoToolset
+} from '../core/todo';
+export type {
+    ProfilePageInfo,
+    ProfileListResult,
+    ProfileChangeResult,
+    ProfileResult,
+    ProfileToolset
+} from '../core/profile';
+export type {
+    ChapterPageInfo,
+    ChapterListResult,
+    ChapterChangeResult,
+    ChapterResult,
+    ChapterToolset
+} from '../core/chapter';
+export type {
+    LocationPageInfo,
+    LocationListResult,
+    LocationChangeResult,
+    LocationResult,
+    LocationToolset
+} from '../core/location';
 
 // ---------------------------------------------------------------------------
 // chapterManage — ordered chapter tracking
@@ -547,21 +563,8 @@ export type ChapterCounts = {
     complete: number;
 };
 
-// Every chapterManage result is a snapshot of summaries. `content` is present
-// only for `get`; `chapter` for add/get/update; `removed` for remove.
-export type ChapterResult = {
-    chapters: ChapterSummary[];
-    chapter?: ChapterSummary;
-    content?: string;
-    removed?: ChapterSummary;
-    counts: ChapterCounts;
-};
-
-// What createChapterTool() returns: the core tool plus reset().
-export type ChapterToolset = {
-    tool: Tool<ChapterParameters, ChapterResult>;
-    reset: () => void;
-};
+// Every chapterManage result is a bounded page of summaries or one mutation
+// result; `content` is present only for `get`. Canonical types: ./core/chapter.ts.
 
 // ---------------------------------------------------------------------------
 // locationManage — places / settings
@@ -590,20 +593,8 @@ export type LocationCounts = {
     total: number;
 };
 
-// Every locationManage result is a snapshot: `locations` is a copied list, plus
-// the affected location for add/get/update and `removed` for remove.
-export type LocationResult = {
-    locations: LocationItem[];
-    location?: LocationItem;
-    removed?: LocationItem;
-    counts: LocationCounts;
-};
-
-// What createLocationTool() returns: the core tool plus reset().
-export type LocationToolset = {
-    tool: Tool<LocationParameters, LocationResult>;
-    reset: () => void;
-};
+// Every locationManage result is a bounded page or one mutation result; canonical
+// types live in ./core/location.ts and are re-exported above (R9).
 
 // What a tool implementation is handed when the model calls it.
 //
@@ -623,6 +614,16 @@ export type ToolContext<TParameters = any> = {
     // Run a full turn (including tool execution) on a named agent. Present only
     // inside a harness.
     run?: (agentName: string, input: string) => Promise<HarnessAssistantMessage>;
+    // Cancellation for the run that invoked this tool (R10), forwarded from
+    // `HarnessRunOptions.signal`. Present only when a run supplied one.
+    //
+    // A tool SHOULD observe it (pass it to fetch/spawn, or call throwIfAborted()
+    // between steps): the harness only checks it BEFORE starting a tool call, so
+    // a tool that ignores it keeps running to completion after a cancel. That is
+    // deliberate — the harness never claims to have stopped side effects it does
+    // not control, and it keeps awaiting the call rather than releasing the run
+    // while the process may still be mutating.
+    signal?: AbortSignal;
 };
 
 // A tool definition. `name` is optional: inside a harness the registry key names
@@ -777,6 +778,17 @@ export type HarnessEvent =
 export type HarnessProgress = (event: HarnessEvent) => void | Promise<void>;
 
 export type HarnessRunOptions = {
+    // Cancellation for this run. Forwarded to every model request, into each
+    // tool's `ToolContext.signal`, and to every run it causes (ctx.run and
+    // agentDelegate) so a cancel reaches subagents too (R10).
+    //
+    // The harness checks it BEFORE each model turn and before each tool call, so
+    // an aborted run starts no new side effects. A tool that is ALREADY running is
+    // awaited to completion even when it ignores the signal: the harness never
+    // claims to have stopped work it does not control, and it does not release the
+    // run (or the server's single-flight gate) while that work may still be
+    // mutating. The run then fails, history is truncated back to where the call
+    // started, and the error propagates.
     signal?: AbortSignal;
 };
 
@@ -804,6 +816,28 @@ export type HarnessConfiguration = {
     // own budget. The bundled application presets set 1000 for real work — see
     // harnesses/presets.ts.
     maxIterations?: number;
+
+    // Who may create tools at runtime (R12). Defaults to 'all', the historical
+    // behaviour:
+    //   - 'all'     — every agent (primary and subagents) gets toolCreate;
+    //   - 'primary' — only the primary agent gets it. The tool is not declared to
+    //                 subagents and a guessed call is rejected, so a subagent can
+    //                 neither see nor use creation;
+    //   - false     — no model-facing toolCreate at all (a session without it
+    //                 answers an honest "not registered" error). The HOST path
+    //                 `harness.toolCreate()` still works: an operator action is
+    //                 not a model privilege.
+    // The lifetime creation budget (`maxCreatedTools`) still applies either way.
+    toolCreation?: ToolCreationPolicy;
+
+    // How many tools this harness instance may create over its LIFETIME.
+    // Defaults to 32 (DEFAULT_CREATED_TOOLS_LIMIT in core/creation.ts).
+    //
+    // Lifetime, not per-turn: created tools stay registered after reset(), so
+    // reset() does NOT restore this budget — restoring it would let a session
+    // grow the registry without bound one reset at a time. Must be a positive
+    // safe integer; validated at construction.
+    maxCreatedTools?: number;
 
     // Every tool the harness can run. Keyed by the name the model calls. Only
     // `visibility: 'core'` tools are declared up front; the rest are found
@@ -860,10 +894,15 @@ export type Harness = {
     // model calls, so discovery, runtime creation, todos, and delegation all
     // mutate this harness exactly as they would during a run.
     //
-    // `parameters` is the value `execute` receives, i.e. already unwrapped by the
-    // single-property rule: `executeTool('fileRead', ['package.json'])`, never
-    // `{ paths: ['package.json'] }` for a one-property schema. Same convention as the
-    // tool's direct callable.
+    // `parameters` may be EITHER form (R11):
+    //   - the value `execute` receives, i.e. already unwrapped by the
+    //     single-property rule: `executeTool('fileRead', ['package.json'])`;
+    //   - the schema wrapper object, like the model sends:
+    //     `executeTool('fileRead', { paths: ['package.json'] })`.
+    // Both are validated against the tool's JSON Schema and resolved to the same
+    // value, so the legacy direct-call convention keeps working and a manual call
+    // cannot smuggle arguments past the runtime check. A schema mismatch throws
+    // HarnessError (no tool-result envelope: a host caller sees an exception).
     //
     // GATING: discovery gates the MODEL, not its operator. A searchable tool that
     // toolRequest has not enabled is still runnable here; the model remains
@@ -874,7 +913,11 @@ export type Harness = {
     //
     // Throws HarnessError when the name is not registered in this harness, or
     // whatever the implementation throws; unlike the model path there is no
-    // tool-result envelope, because a host caller can see an exception.
+    // tool-result envelope, because a host caller can see an exception. The return
+    // value is the tool's raw result (UI panels are NOT unwrapped here — the caller
+    // owns presentation), and it is NOT subject to the model-facing 64 KiB text
+    // budget; a server that serializes it for a client should apply
+    // `boundToolResult` (exported from the package root) itself.
     executeTool: (name: string, parameters: unknown) => Promise<unknown>;
     // Names of the applied plugins, in order.
     readonly plugins: readonly string[];
@@ -883,10 +926,12 @@ export type Harness = {
     // later turn call a tool discovered earlier. Copied on read; `reset()` empties
     // it.
     readonly discoveredTools: string[];
-    // Reset the entry agent's conversation, forget which tools toolRequest had
-    // enabled, and clear the session todo list, so the next run starts from the
-    // core set again. Created tools stay registered (they are part of the
-    // catalogue), just not enabled.
+    // Reset to "start over": EVERY agent's conversation goes back to its seeded
+    // instructions (R12 — a subagent kept its old transcript before this), tool
+    // discovery is forgotten, and the session todo list and record stores are
+    // cleared. Created tools stay registered (they are catalogue state) and are
+    // simply no longer enabled; the creation budget is a lifetime budget and is
+    // NOT restored by reset().
     reset: () => void;
 };
 

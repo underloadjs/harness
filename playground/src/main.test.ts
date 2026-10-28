@@ -397,7 +397,8 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     expect(row.querySelector('.session-meta')?.textContent).toBe('idle · 1 turn · s1');
     expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
 
-    expect(statusText()).toBe('done · m1 · idle');
+    // The header is app-scoped: a settled run is reported by the tile, not here.
+    expect(statusText()).toBe('idle');
     expect(runButton.disabled).toBe(false);
     // A session exists now, so the TEAM is frozen: editing needs a New session.
     expect(byClass('.agent-main', 'button').disabled).toBe(true);
@@ -412,21 +413,33 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     );
 });
 
-// Token tally: the server OWNS the running sum. Each event frame carries it
-// (`SessionStreamItem.usage`), main.ts forwards it to the tile (`setUsage`) and
-// the tile prints INPUT with the cached part in brackets — see
-// playground/src/ui/tokens.ts, which is why `48/0` renders '48 (0)' and
-// `144/48` renders '144 (48)'; `output` is never printed.
-it('prints the running tally per frame and keeps it through the terminal snapshot', async () => {
+// Token tally: the row shows TWO scopes. The primary is the LATEST request's
+// input/context size (derived from the last `usage` event in the turn), and the
+// bracket is the server's cumulative cached input across the turn. See
+// playground/src/ui/tokens.ts and the tally block in ui/turns.ts. Here request 1
+// sends 48/0 and request 2 sends 96/48, while the server tally sums to 144/48:
+// the row renders '48 (0)' then '96 (48)' — never '144 (48)'. `output` is never
+// printed.
+it('prints the latest request context with the cumulative cache per frame', async () => {
     const firstTally = { input: 48, output: 18, total: 66, cached: 0 };
     const lastTally = { input: 144, output: 40, total: 184, cached: 48 };
 
     const start = { type: 'start' as const, agent: 'instruct', model: 'm1' };
     const text = { type: 'text' as const, agent: 'instruct', delta: 'hi' };
+    const usageFirst = {
+        type: 'usage' as const,
+        agent: 'instruct',
+        usage: { input: 48, output: 18, total: 66, cached: 0 }
+    };
+    const usageLast = {
+        type: 'usage' as const,
+        agent: 'instruct',
+        usage: { input: 96, output: 22, total: 118, cached: 48 }
+    };
     const done = { type: 'done' as const, agent: 'instruct', message: assistant({ content: 'hi' }) };
 
-    // The recorded turn is what the terminal snapshot re-hydrates from, tally
-    // included: a reload must show the same figure the live stream ended on.
+    // The recorded turn is what the terminal snapshot re-hydrates from, events
+    // and cumulative tally included: a reload must show the same row as live.
     const recorded: SessionTurn = {
         id: 't1',
         index: 0,
@@ -434,8 +447,8 @@ it('prints the running tally per frame and keeps it through the terminal snapsho
         status: 'done',
         startedAt: T,
         updatedAt: T + 3600,
-        events: [start, text, done],
-        eventTimes: [T, T + 100, T + 200],
+        events: [start, usageFirst, text, usageLast, done],
+        eventTimes: [T, T + 50, T + 100, T + 150, T + 200],
         usage: lastTally
     } as SessionTurn;
     const opening: SessionTurn = { ...recorded, status: 'running', events: [], usage: firstTally };
@@ -471,12 +484,14 @@ it('prints the running tally per frame and keeps it through the terminal snapsho
             const stream = splitSse(
                 [
                     { type: 'turn', turn: opening },
-                    { type: 'event', turnId: 't1', event: start, at: T, usage: firstTally }
+                    { type: 'event', turnId: 't1', event: start, at: T, usage: firstTally },
+                    { type: 'event', turnId: 't1', event: usageFirst, at: T + 50, usage: firstTally }
                 ],
                 [
                     // A frame with NO tally between two tallied ones: it must leave
                     // the figure alone rather than clear it.
                     { type: 'event', turnId: 't1', event: text, at: T + 100 },
+                    { type: 'event', turnId: 't1', event: usageLast, at: T + 150, usage: lastTally },
                     { type: 'event', turnId: 't1', event: done, at: T + 200, usage: lastTally },
                     { type: 'snapshot', session: finished }
                 ]
@@ -513,7 +528,7 @@ it('prints the running tally per frame and keeps it through the terminal snapsho
     expect(document.querySelectorAll('.tile')).toHaveLength(1);
     const tile = byClass('.tile', 'article');
     expect(tile.dataset.state).toBe('done');
-    expect(tile.querySelector<HTMLElement>('.tile-tokens')?.textContent).toBe('144 (48)');
+    expect(tile.querySelector<HTMLElement>('.tile-tokens')?.textContent).toBe('96 (48)');
     expect(tile.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(false);
     // The recorded stamps (not the local clock) prove this tile is the rehydrated
     // one: the live tile ran from T to "now".
@@ -1181,11 +1196,14 @@ it('stops every task in the originating session while a run is in flight', async
     await flush();
 
     // Stop is total: the body says `{ all: true }` so retained queue records are
-    // cancelled too, and the tile/status show the server's cancellation.
+    // cancelled too, and the tile shows the server's cancellation.
     expect(cancelRequests).toBe(1);
     expect(cancelBody).toEqual({ all: true });
     expect(tileStates()).toEqual(['cancelled']);
-    expect(statusText()).toBe('cancelled');
+    // A deliberate stop is a session outcome: the tile says `cancelled`, and the
+    // global header stays app-scoped instead of announcing the run's end.
+    expect(statusText()).toBe('idle');
+    expect(document.querySelector('.session-note')?.hasAttribute('hidden')).toBe(true);
     expect(byClass('.harness-item[data-harness="workspace"]', 'button').disabled).toBe(false);
     expect(byClass('.stop', 'button').disabled).toBe(true);
 });
@@ -1433,7 +1451,365 @@ it('queues a second task behind the active one and advances it automatically', a
     expect(byClass('.stop', 'button').disabled).toBe(true);
 });
 
+// R2 regression: a delayed 202 answer must not revert a model edit.
+//
+// The 202 body is captured at ENQUEUE time. A model PATCH made while that answer
+// is still in flight changes `sessionModels`/`sessionModel` immediately, so a stale
+// body applied afterwards must not rewrite the definition, the model map, the
+// discovery list or the rail cache (it may only reconcile turn records).
+it('keeps a live model edit when the delayed 202 answer lands afterwards', async () => {
+    let sendAnswer!: (value: unknown) => void;
+    const answer = new Response(
+        new ReadableStream<Uint8Array>({
+            start(controller) {
+                sendAnswer = (value) => {
+                    controller.enqueue(new TextEncoder().encode(JSON.stringify(value)));
+                    controller.close();
+                };
+            }
+        }),
+        { status: 202, headers: { 'Content-Type': 'application/json' } }
+    );
+
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const stream = new ReadableStream<Uint8Array>({
+        start(next) {
+            controller = next;
+        }
+    });
+    const push = (items: readonly unknown[]): void => {
+        controller?.enqueue(
+            new TextEncoder().encode(items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join(''))
+        );
+    };
+
+    const start = { type: 'start' as const, agent: 'instruct', model: 'm1' };
+
+    const runningA = {
+        id: 'ta',
+        index: 0,
+        prompt: 'first task',
+        status: 'running',
+        startedAt: T,
+        updatedAt: T + 10,
+        events: [start]
+    } as SessionTurn;
+    const queuedB = {
+        id: 'tb',
+        index: 1,
+        prompt: 'second task',
+        status: 'queued',
+        updatedAt: T + 20,
+        events: []
+    } as unknown as SessionTurn;
+
+    // What the still-in-flight 202 body says (captured before the PATCH).
+    const staleBoth = snapshot({
+        harnessDefinition: descriptor(),
+        status: 'running',
+        model: 'm1',
+        agentModels: { instruct: 'm1' },
+        updatedAt: T + 20,
+        turns: [runningA, queuedB]
+    } as SessionSnapshot);
+    // The PATCH answer: the session now runs m2, stamped NEWER.
+    const patched = snapshot({
+        harnessDefinition: descriptor(),
+        status: 'running',
+        model: 'm2',
+        agentModels: { instruct: 'm2' },
+        updatedAt: T + 300,
+        turns: [runningA, queuedB]
+    } as SessionSnapshot);
+
+    let tasks = 0;
+    const patches: unknown[] = [];
+
+    stubFetch((url, method, body) => {
+        if (url === '/api') return json(bootstrap());
+        if (url === '/api/models') return json({ models: ['m1', 'm2'] });
+        if (url === '/api/sessions' && method === 'POST')
+            return json({ session: snapshot({ harnessDefinition: descriptor() }) });
+
+        if (url === '/api/sessions/s1/tasks' && method === 'POST') {
+            tasks += 1;
+            return tasks === 1
+                ? json(
+                      {
+                          session: snapshot({
+                              harnessDefinition: descriptor(),
+                              status: 'running',
+                              model: 'm1',
+                              agentModels: { instruct: 'm1' },
+                              updatedAt: T + 10,
+                              turns: [runningA]
+                          } as SessionSnapshot),
+                          turn: runningA
+                      },
+                      202
+                  )
+                : answer;
+        }
+
+        if (url === '/api/sessions/s1' && method === 'PATCH') {
+            patches.push(body);
+            return json({ session: patched });
+        }
+
+        if (url === '/api/sessions/s1/events')
+            return new Response(stream, {
+                status: 200,
+                headers: { 'Content-Type': 'text/event-stream' }
+            });
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+
+    const form = byClass('.composer', 'form');
+    const input = byClass('.composer-input', 'textarea');
+
+    // A runs, then B is submitted with its 202 answer held open.
+    input.value = 'first task';
+    form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+    await flush();
+    await flush();
+    push([{ type: 'turn', turn: runningA }]);
+    await flush();
+
+    input.value = 'second task';
+    form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+    await flush();
+    expect(tasks).toBe(2);
+
+    // B's queued upsert claims the optimistic row.
+    push([{ type: 'turn', turn: queuedB }]);
+    await flush();
+    expect(tileStates()).toEqual(['streaming', 'queued']);
+
+    // While the answer is in flight the reader changes the session's model. The
+    // effective model is what the dropdown DISPLAYS: an override equal to the
+    // session fallback is represented by option 0 (ui/agents.ts dedupe rule).
+    const shownModel = (): string | null =>
+        byClass('.agent-model-select', 'select').selectedOptions[0]?.textContent ?? null;
+
+    const select = byClass('.agent-model-select', 'select');
+    expect(select.disabled).toBe(false);
+    select.value = 'm2';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    await flush();
+
+    expect(patches).toEqual([{ agentModels: { instruct: 'm2' } }]);
+    expect(shownModel()).toBe('m2');
+
+    // The stale 202 body lands now: it predates the PATCH.
+    sendAnswer({ session: staleBoth, turn: queuedB });
+    await flush();
+    await flush();
+
+    // The model edit survives: the definition and model map came from the PATCH,
+    // and the stale body may only reconcile the turns.
+    expect(shownModel()).toBe('m2');
+    expect(tileStates()).toEqual(['streaming', 'queued']);
+    expect(document.querySelectorAll('.tile')).toHaveLength(2);
+});
+
+// R2 regression: the enqueue/observer race.
+//
+// server/sessions.ts publishes the queued `turn` upsert BEFORE the 202 body, and
+// the 202 body itself is captured at ENQUEUE time. So a task submitted while
+// another runs can produce, in this order on the client:
+//   1. observer `turn` frames for the new turn (queued, then running),
+//   2. the older 202 snapshot (A still running, B still queued).
+// Before this was reconciled, (1) adopted a SECOND tile for the new prompt, and
+// (2) then regressed the tiles to the stale statuses — leaving duplicated,
+// out-of-order green rows above the completed ones. One row per task, one
+// processing row, chronological order.
+it('keeps one row per task when the observer beats the POST answer', async () => {
+    // A POST answer whose body is only closed when the test says so: this is what
+    // makes the observer frames arrive BEFORE the ack, deterministically.
+    let sendAnswer!: (value: unknown) => void;
+    const answer = new Response(
+        new ReadableStream<Uint8Array>({
+            start(controller) {
+                sendAnswer = (value) => {
+                    controller.enqueue(new TextEncoder().encode(JSON.stringify(value)));
+                    controller.close();
+                };
+            }
+        }),
+        { status: 202, headers: { 'Content-Type': 'application/json' } }
+    );
+
+    let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
+    const stream = new ReadableStream<Uint8Array>({
+        start(next) {
+            controller = next;
+        }
+    });
+    const push = (items: readonly unknown[]): void => {
+        controller?.enqueue(
+            new TextEncoder().encode(items.map((item) => `data: ${JSON.stringify(item)}\n\n`).join(''))
+        );
+    };
+
+    const start = { type: 'start' as const, agent: 'instruct', model: 'm1' };
+
+    const runningA = {
+        id: 'ta',
+        index: 0,
+        prompt: 'first task',
+        status: 'running',
+        startedAt: T,
+        updatedAt: T + 10,
+        events: [start]
+    } as SessionTurn;
+    const queuedB = {
+        id: 'tb',
+        index: 1,
+        prompt: 'second task',
+        status: 'queued',
+        updatedAt: T + 20,
+        events: []
+    } as unknown as SessionTurn;
+    const runningB = {
+        ...queuedB,
+        status: 'running' as const,
+        startedAt: T + 200,
+        updatedAt: T + 210,
+        events: [start]
+    } as SessionTurn;
+    const doneA = {
+        ...runningA,
+        status: 'done' as const,
+        startedAt: T,
+        updatedAt: T + 100,
+        events: [...runningA.events, { type: 'done' as const, agent: 'instruct', message: assistant() }]
+    } as SessionTurn;
+
+    // The 202 body: captured when B was enqueued, i.e. A running + B queued.
+    const staleBoth = snapshot({
+        harnessDefinition: descriptor(),
+        status: 'running',
+        updatedAt: T + 20,
+        turns: [runningA, queuedB]
+    } as SessionSnapshot);
+    // What the observer already knows when that body finally resolves.
+    const fresh = snapshot({
+        harnessDefinition: descriptor(),
+        status: 'running',
+        updatedAt: T + 500,
+        turns: [doneA, runningB]
+    } as SessionSnapshot);
+
+    let tasks = 0;
+
+    stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap());
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions' && method === 'POST')
+            return json({ session: snapshot({ harnessDefinition: descriptor() }) });
+
+        if (url === '/api/sessions/s1/tasks' && method === 'POST') {
+            tasks += 1;
+            return tasks === 1
+                ? json(
+                      {
+                          session: snapshot({
+                              harnessDefinition: descriptor(),
+                              status: 'running',
+                              updatedAt: T + 10,
+                              turns: [runningA]
+                          } as SessionSnapshot),
+                          turn: runningA
+                      },
+                      202
+                  )
+                : answer;
+        }
+
+        if (url === '/api/sessions/s1/events')
+            return new Response(stream, {
+                status: 200,
+                headers: { 'Content-Type': 'text/event-stream' }
+            });
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+
+    const form = byClass('.composer', 'form');
+    const input = byClass('.composer-input', 'textarea');
+
+    // A starts processing.
+    input.value = 'first task';
+    form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+    await flush();
+    await flush();
+    push([{ type: 'turn', turn: runningA }]);
+    await flush();
+    expect(tileStates()).toEqual(['streaming']);
+
+    // B is submitted while A runs; its 202 answer is still on the wire.
+    input.value = 'second task';
+    form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
+    await flush();
+    expect(tasks).toBe(2);
+
+    // The observer describes B first. It must CLAIM the optimistic row, not add
+    // a second one for the same prompt.
+    push([{ type: 'turn', turn: queuedB }]);
+    await flush();
+
+    expect(tileStates()).toEqual(['streaming', 'queued']);
+    expect(document.querySelectorAll('.tile')).toHaveLength(2);
+    expect(document.querySelectorAll('.turn-row')).toHaveLength(2);
+    expect([...document.querySelectorAll('.tile-prompt')].map((node) => node.textContent)).toEqual([
+        'first task',
+        'second task'
+    ]);
+    // B is neutral: no clock runs until the server actually starts it.
+    expect(
+        document.querySelectorAll<HTMLElement>('.tile')[1]?.querySelector<HTMLElement>('.tile-elapsed')?.hidden
+    ).toBe(true);
+
+    // A settles and B starts, all before the 202 answer resolves.
+    push([{ type: 'turn', turn: doneA }]);
+    push([{ type: 'turn', turn: runningB }]);
+    push([{ type: 'snapshot', session: fresh }]);
+    await flush();
+
+    expect(tileStates()).toEqual(['done', 'streaming']);
+
+    // Now the stale 202 body lands. It must not duplicate, re-order, or regress.
+    sendAnswer({ session: staleBoth, turn: queuedB });
+    await flush();
+    await flush();
+
+    expect(document.querySelectorAll('.tile')).toHaveLength(2);
+    expect(document.querySelectorAll('.turn-row')).toHaveLength(2);
+    expect(tileStates()).toEqual(['done', 'streaming']);
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.turn-row')].map((row) => row.dataset.state)
+    ).toEqual(['done', 'streaming']);
+    expect([...document.querySelectorAll('.tile-prompt')].map((node) => node.textContent)).toEqual([
+        'first task',
+        'second task'
+    ]);
+    // A keeps its recorded duration; B still owns the live clock.
+    expect(tileElapsed()[0]).toBe('100ms');
+    expect(
+        document.querySelectorAll<HTMLElement>('.tile')[1]?.querySelector<HTMLElement>('.tile-elapsed')?.hidden
+    ).toBe(false);
+    expect(document.querySelectorAll('.tile')[1]?.classList.contains('is-expanded')).toBe(true);
+});
+
 it('hydrates a queued session on reload and stops the whole queue explicitly', async () => {
+
     let cancelBody: unknown;
     const runningA = {
         id: 'ta',
@@ -1577,17 +1953,18 @@ it('polls a session that is still running after reload until it is terminal', as
     await vi.advanceTimersByTimeAsync(50);
 
     // The reload rendered the running turn; the observer route is absent in this
-    // stub, so the UI reports the documented polling fallback.
+    // stub, so the UI falls back to GET polling without turning the app header into
+    // a run-status display.
     expect(gets).toBe(1);
     expect(tileStates()).toEqual(['streaming']);
     expect(document.querySelector('.agent-text')?.textContent).toBe('half\n');
-    expect(statusText()).toBe('live stream lost · polling server');
+    expect(statusText()).toBe('idle');
 
     // First poll: still running, snapshot re-rendered, same single turn.
     await vi.advanceTimersByTimeAsync(1_000);
     expect(gets).toBe(2);
     expect(tileStates()).toEqual(['streaming']);
-    expect(statusText()).toBe('session running · polling server');
+    expect(statusText()).toBe('idle');
 
     // Second poll: terminal. The server turn list replaces the projection.
     await vi.advanceTimersByTimeAsync(1_000);
@@ -1597,8 +1974,8 @@ it('polls a session that is still running after reload until it is terminal', as
     expect(tileStates()).toEqual(['done']);
     expect(document.querySelector('.agent-text')?.innerHTML).toBe('<p>half and done</p>\n');
     expect(tileElapsed()).toEqual(['2.5s']);
-    // The transition out of pending reports completion (R4), not a bare idle.
-    expect(statusText()).toBe('done · m1 · idle');
+    // The transition out of pending is reported by the tile, not the app header.
+    expect(statusText()).toBe('idle');
     expect(byClass('.session', 'button').dataset.status).toBe('idle');
 
     // Polling is GET-only: it never starts a model run.

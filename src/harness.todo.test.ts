@@ -52,9 +52,16 @@ const brain = (stream: HarnessStream, extra: Record<string, unknown> = {}): Agen
 const quiet = (entry: Agent, tools: Record<string, any> = {}) =>
     harness({ agents: { writer: entry }, tools, presets: false });
 
+// R9 bounded shapes (src/core/todo.ts):
+//   list  -> { todos, counts, page }        (one page, default 20, max 100)
+//   write -> { todo|removed, counts }       (no list: a model calls `list`)
+// `nextOffset` is omitted when `hasMore` is false, hence the explicit shape here.
+const page = (offset = 0, limit = 20, hasMore = false) => ({ offset, limit, hasMore });
+
 const empty = {
     todos: [],
-    counts: { total: 0, completed: 0, remaining: 0 }
+    counts: { total: 0, completed: 0, remaining: 0 },
+    page: page()
 };
 
 describe('todoManage', () => {
@@ -79,7 +86,7 @@ describe('todoManage', () => {
             'locationManage'
         ]);
         expect((entry.messages[2] as { content: string }).content).toBe(
-            '{"todos":[{"id":"1","text":"Draft plan","completed":false}],"counts":{"total":1,"completed":0,"remaining":1},"todo":{"id":"1","text":"Draft plan","completed":false}}'
+            '{"todo":{"id":"1","text":"Draft plan","completed":false},"counts":{"total":1,"completed":0,"remaining":1}}'
         );
     });
 
@@ -100,7 +107,6 @@ describe('todoManage', () => {
         const toolMessages = entry.messages.filter((message) => message.role === 'tool');
 
         expect(JSON.parse((toolMessages[0] as { content: string }).content)).toEqual({
-            todos: [{ id: '1', text: 'Draft plan', completed: false }],
             todo: { id: '1', text: 'Draft plan', completed: false },
             counts: { total: 1, completed: 0, remaining: 1 }
         });
@@ -108,7 +114,8 @@ describe('todoManage', () => {
         // Second call: the todo is still there, with no surrounding context.
         expect(JSON.parse((toolMessages[1] as { content: string }).content)).toEqual({
             todos: [{ id: '1', text: 'Draft plan', completed: false }],
-            counts: { total: 1, completed: 0, remaining: 1 }
+            counts: { total: 1, completed: 0, remaining: 1 },
+            page: page()
         });
     });
 
@@ -152,7 +159,8 @@ describe('todoManage', () => {
         // The researcher's tool result is the primary's todo, not an empty list.
         expect(JSON.parse((researcher.messages[2] as { content: string }).content)).toEqual({
             todos: [{ id: '1', text: 'Shared item', completed: false }],
-            counts: { total: 1, completed: 0, remaining: 1 }
+            counts: { total: 1, completed: 0, remaining: 1 },
+            page: page()
         });
 
         // Both agents see todoManage as core; the primary additionally sees delegate.
@@ -194,7 +202,6 @@ describe('todoManage', () => {
 
         expect(await writerA.tools.todoManage({ action: 'list' })).toEqual(empty);
         expect(await writerA.tools.todoManage({ action: 'add', text: 'After reset' })).toEqual({
-            todos: [{ id: '1', text: 'After reset', completed: false }],
             todo: { id: '1', text: 'After reset', completed: false },
             counts: { total: 1, completed: 0, remaining: 1 }
         });

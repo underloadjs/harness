@@ -230,6 +230,28 @@ describe('fileWrite', () => {
         );
     });
 
+    it('rejects NUL content in preflight, without creating the earlier valid entry', async () => {
+        // A NUL byte is the harness's own binary marker, so a file containing one is
+        // rejected by fileRead. Writing it would create an artifact this package
+        // cannot read back; the whole batch is refused before the first write.
+        const untouched = join(workdir, 'nul', 'first.txt');
+        const rejected = join(workdir, 'nul', 'second.txt');
+
+        await expect(
+            fileWrite([
+                { path: untouched, content: 'fine' },
+                { path: rejected, content: 'a\u0000b' }
+            ])
+        ).rejects.toThrow(
+            `fileWrite content must not contain NUL characters (${rejected}): the file would be unreadable by fileRead, which rejects binary content.`
+        );
+
+        // Proof that the rejection happened in preflight, not mid-batch: the valid
+        // first entry was NOT written either, so no side effect exists.
+        await expect(readTextFile(untouched, 'utf8')).rejects.toThrow(/ENOENT/);
+        await expect(readTextFile(rejected, 'utf8')).rejects.toThrow(/ENOENT/);
+    });
+
     it('reports the completed paths when a later write fails, with no rollback claim', async () => {
         const completed = join(workdir, 'partial', 'completed.txt');
         // A regular FILE where the second target needs a parent directory: mkdir

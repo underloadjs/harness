@@ -18,6 +18,14 @@
 //                  ../harness.ts and the server catalogue both read this copy.
 //   MAX_DISCOVERY_MATCHES — the discovery cap (R7) the toolRequest schema
 //                  advertises and searchTools enforces.
+//   boundToolResult()/MODEL_TOOL_RESULT_BUDGET_BYTES — the model-facing 64 KiB
+//                  tool-result/error cap (R10). Reusable by a server that
+//                  serializes a manual result for a client.
+//   resolveToolParameters()/validateSchemaValue()/checkToolSchemaComplexity() —
+//                  the runtime JSON Schema gate and the single-property unwrap
+//                  (R11). Shared with the harness's manual tool path so both
+//                  resolve arguments identically.
+//   DEFAULT_CREATED_TOOLS_LIMIT — the lifetime toolCreate budget (R12).
 //
 // These factories are usable on their own. An agent on its own means writing the
 // loop by hand: send a message, read `message.toolCalls`, run the tools, append
@@ -30,7 +38,22 @@
 export { agent } from './agent';
 export { tool, toolParameterKey, normalizeTags } from './tool';
 export { MAX_DISCOVERY_MATCHES, searchTools } from './discovery';
-export { compileToolSource, createDynamicTool } from './creation';
+export { compileToolSource, createDynamicTool, DEFAULT_CREATED_TOOLS_LIMIT } from './creation';
+export {
+    MODEL_TOOL_RESULT_BUDGET_BYTES,
+    boundToolResult,
+    utf8ByteLength
+} from './result-budget';
+export type { BoundedToolResult } from './result-budget';
+export {
+    MAX_CREATED_SCHEMA_BYTES,
+    MAX_CREATED_SCHEMA_DEPTH,
+    MAX_CREATED_SCHEMA_NODES,
+    checkToolSchemaComplexity,
+    resolveToolParameters,
+    validateSchemaValue
+} from './schema-validation';
+export type { SchemaCheck, ToolArgumentMode } from './schema-validation';
 export { createTodoTool } from './todo';
 export { createProfileTool } from './profile';
 export { createChapterTool } from './chapter';

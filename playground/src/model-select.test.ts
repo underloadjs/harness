@@ -472,11 +472,10 @@ it('changes a RUNNING session’s model without cancelling the stream', async ()
     await flush();
 
     // The observer route is not stubbed here, so the UI falls back to the
-    // documented GET polling path; either way the session is running.
-    expect(byClass('.status', 'span').dataset.state).toBe('running');
-    expect(document.querySelector('.status-text')?.textContent).toBe(
-        'live stream lost · polling server'
-    );
+    // documented GET polling path; either way the session is running and the app
+    // header stays neutral (run state belongs to the tiles).
+    expect(byClass('.status', 'span').dataset.state).toBe('idle');
+    expect(document.querySelector('.status-text')?.textContent).toBe('idle');
     // Team still frozen while running; MODELS editable (R2).
     expect(byClass('.agent-main', 'button').disabled).toBe(true);
     expect(modelSelects().map((select) => select.disabled)).toEqual([false, false]);
@@ -500,11 +499,12 @@ it('changes a RUNNING session’s model without cancelling the stream', async ()
     expect(byClass('.stop', 'button').disabled).toBe(false);
 
     expect(modelSelects().map((select) => select.value)).toEqual(['m3', '']);
-    // The session is still running, so the pill reports that instead of "idle".
+    // The save is config feedback; the session's run state stays on its tile, so the
+    // header does not claim "session running".
     expect(document.querySelector('.status-text')?.textContent).toBe(
-        'agent models saved · session running'
+        'agent models saved · next request'
     );
-    expect(byClass('.status', 'span').dataset.state).toBe('running');
+    expect(byClass('.status', 'span').dataset.state).toBe('idle');
     expect(document.querySelectorAll('.tile')).toHaveLength(1);
 
     // Stop the background poll this view scheduled before the test ends.

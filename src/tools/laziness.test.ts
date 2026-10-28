@@ -20,7 +20,29 @@ vi.mock('./files/fileRead', () => {
     loads.fileRead += 1;
 
     return {
-        fileRead: async (paths: string[]) => paths.map((path) => ({ path, content: `mocked read:${path}` }))
+        fileRead: async (paths: (string | { path: string })[]) => {
+            const files = paths.map((target) => {
+                const path = typeof target === 'string' ? target : target.path;
+                const content = `mocked read:${path}`;
+                return {
+                    path,
+                    content,
+                    startLine: 1,
+                    endLine: 1,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: Buffer.byteLength(content, 'utf8')
+                };
+            });
+
+            return {
+                files,
+                truncated: false,
+                bytes: files.reduce((total, file) => total + file.bytes, 0),
+                contentBudget: 65536
+            };
+        }
     };
 });
 
@@ -52,7 +74,7 @@ describe('lazy preset tools', () => {
         // declares - with no body.
         expect(presetTools.fileRead.name).toBe('fileRead');
         expect(presetTools.fileRead.description).toBe(
-            'Read one or more UTF-8 text files and return their contents. Pass an array of paths and get an ordered array of { path, content } entries in the same order. One missing or unreadable path rejects the whole call, so a short answer never looks complete. Paths are absolute or relative to the working directory.'
+            'Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes }], truncated, bytes, contentBudget }. Defaults: startLine 1, startColumn 0, maxLines 200 (hard maximum 5000). `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. When an entry is truncated, request { path, startLine: nextLine, startColumn: nextColumn } to continue; nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. The whole batch shares a fixed 64 KiB UTF-8 CONTENT budget (not counting JSON escaping), split fairly between the requested files, and reading stops at that budget instead of loading huge files or lines wholesale. A call accepts at most 100 paths. One missing or unreadable path, or binary bytes (NUL or invalid UTF-8) encountered while streaming the file, rejects the whole call, so a short answer never looks complete. Binary detection covers decoded chunks, not the whole file beyond the last chunk read. A window at a deep line rescans from the start to count lines. Paths are absolute or relative to the working directory.'
         );
         expect(presetTools.fileRead.tags).toEqual(['files', 'read', 'filesystem']);
         // Core by catalogue metadata (R18): declared up front, but that changes no
@@ -63,9 +85,44 @@ describe('lazy preset tools', () => {
             properties: {
                 paths: {
                     type: 'array',
-                    items: { type: 'string' },
+                    maxItems: 100,
+                    items: {
+                        oneOf: [
+                            { type: 'string' },
+                            {
+                                type: 'object',
+                                properties: {
+                                    path: {
+                                        type: 'string',
+                                        description:
+                                            'File to read, absolute or relative to the working directory.'
+                                    },
+                                    startLine: {
+                                        type: 'integer',
+                                        minimum: 1,
+                                        description: '1-based first line to return. Defaults to 1.'
+                                    },
+                                    startColumn: {
+                                        type: 'integer',
+                                        minimum: 0,
+                                        description:
+                                            '0-based UTF-8 byte offset within startLine, for continuing a giant line. Defaults to 0.'
+                                    },
+                                    maxLines: {
+                                        type: 'integer',
+                                        minimum: 1,
+                                        maximum: 5000,
+                                        description:
+                                            'Maximum lines to return. Defaults to 200 and is capped at 5000.'
+                                    }
+                                },
+                                required: ['path'],
+                                additionalProperties: false
+                            }
+                        ]
+                    },
                     description:
-                        'Files to read, absolute or relative to the working directory, in the order the results are returned.'
+                        'Files to read, in the order the results are returned. A string reads a default window; an object selects a line/byte range.'
                 }
             },
             required: ['paths'],
@@ -75,15 +132,43 @@ describe('lazy preset tools', () => {
         // Still no implementation import.
         expect(loads).toEqual({ fileRead: 0, fileEdit: 0 });
 
-        await expect(presetTools.fileRead(['a.txt'])).resolves.toEqual([
-            { path: 'a.txt', content: 'mocked read:a.txt' }
-        ]);
+        await expect(presetTools.fileRead(['a.txt'])).resolves.toEqual({
+            files: [
+                {
+                    path: 'a.txt',
+                    content: 'mocked read:a.txt',
+                    startLine: 1,
+                    endLine: 1,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 17
+                }
+            ],
+            truncated: false,
+            bytes: 17,
+            contentBudget: 65536
+        });
         expect(loads.fileRead).toBe(1);
 
         // The module is cached: a second call does not re-import.
-        await expect(presetTools.fileRead(['b.txt'])).resolves.toEqual([
-            { path: 'b.txt', content: 'mocked read:b.txt' }
-        ]);
+        await expect(presetTools.fileRead(['b.txt'])).resolves.toEqual({
+            files: [
+                {
+                    path: 'b.txt',
+                    content: 'mocked read:b.txt',
+                    startLine: 1,
+                    endLine: 1,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 17
+                }
+            ],
+            truncated: false,
+            bytes: 17,
+            contentBudget: 65536
+        });
         expect(loads.fileRead).toBe(1);
     });
 

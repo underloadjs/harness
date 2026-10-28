@@ -9,11 +9,16 @@
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile as writeTextFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { gitDiff } from './gitDiff';
 import { HarnessError } from '../../util';
+
+// Fixtures live under the repo-root Temp/ (five levels up from
+// src/tools/command/: command -> tools -> src -> harness -> underload -> packages
+// -> repo root), never OS temp.
+const TEMP_ROOT = fileURLToPath(new URL('../../../../../../Temp', import.meta.url));
 
 let workdir: string;
 let repo: string;
@@ -47,7 +52,7 @@ const expectedDiff = (file: string, before: string, after: string): string =>
     ].join('\n') + '\n';
 
 beforeAll(async () => {
-    workdir = await mkdtemp(join(tmpdir(), 'underload-git-diff-'));
+    workdir = await mkdtemp(join(TEMP_ROOT, 'underload-git-diff-'));
 
     // A repository nested in the temporary directory, so "not a repository" can be
     // tested against the parent.
@@ -79,7 +84,9 @@ describe('gitDiff', () => {
             stdout: '',
             stderr: '',
             truncated: false,
-            timedOut: false
+            stderrTruncated: false,
+            timedOut: false,
+            aborted: false
         });
     });
 
@@ -91,7 +98,9 @@ describe('gitDiff', () => {
             stdout: expectedDiff('a.txt', 'hello\n', 'goodbye\n'),
             stderr: '',
             truncated: false,
-            timedOut: false
+            stderrTruncated: false,
+            timedOut: false,
+            aborted: false
         });
 
         // Restore so the following tests start from a clean tree.
@@ -108,7 +117,9 @@ describe('gitDiff', () => {
             stdout: expectedDiff('a.txt', 'hello\n', 'goodbye\n'),
             stderr: '',
             truncated: false,
-            timedOut: false
+            stderrTruncated: false,
+            timedOut: false,
+            aborted: false
         });
 
         // The change is staged, so the default (working tree) view is empty.
@@ -117,7 +128,9 @@ describe('gitDiff', () => {
             stdout: '',
             stderr: '',
             truncated: false,
-            timedOut: false
+            stderrTruncated: false,
+            timedOut: false,
+            aborted: false
         });
 
         git('reset', '--quiet');
@@ -134,7 +147,9 @@ describe('gitDiff', () => {
             stdout: expectedDiff('a.txt', 'hello\n', 'goodbye\n'),
             stderr: '',
             truncated: false,
-            timedOut: false
+            stderrTruncated: false,
+            timedOut: false,
+            aborted: false
         });
 
         git('checkout', '--', 'a.txt', 'b.txt');
@@ -175,7 +190,37 @@ describe('gitDiff', () => {
         expect(result.stdout).toBe('');
         expect(result.stderr.startsWith('fatal:')).toBe(true);
         expect(result.truncated).toBe(false);
+        expect(result.stderrTruncated).toBe(false);
         expect(result.timedOut).toBe(false);
+        expect(result.aborted).toBe(false);
+    });
+
+    it('rejects an explicitly empty paths array instead of diffing everything', async () => {
+        // A computed path list that came out empty must not silently widen the
+        // diff to the whole tree.
+        await expect(gitDiff({ cwd: repo, paths: [] })).rejects.toThrow(
+            new HarnessError('gitDiff paths array must not be empty when provided.')
+        );
+    });
+
+    it('does not spawn when the signal is already aborted', async () => {
+        const controller = new AbortController();
+        controller.abort();
+
+        const result = await gitDiff.execute({
+            parameters: { cwd: repo },
+            signal: controller.signal
+        } as unknown as Parameters<typeof gitDiff.execute>[0]);
+
+        expect(result).toEqual({
+            exitCode: -1,
+            stdout: '',
+            stderr: '',
+            truncated: false,
+            stderrTruncated: false,
+            timedOut: false,
+            aborted: true
+        });
     });
 
     it('caps a large diff and flags truncation', async () => {
@@ -186,9 +231,12 @@ describe('gitDiff', () => {
 
         expect(result.exitCode).toBe(0);
         expect(result.truncated).toBe(true);
-        // 128 KiB cap; the decoder may add one replacement character at a split
-        // multi-byte boundary.
-        expect(result.stdout.length).toBeLessThanOrEqual(128 * 1024 + 1);
+        // 128 KiB cap on BYTES; the fixture is ASCII, so the captured string is
+        // exactly the cap with no replacement character.
+        expect(result.stdout.length).toBe(128 * 1024);
+        expect(result.stderrTruncated).toBe(false);
+        expect(result.timedOut).toBe(false);
+        expect(result.aborted).toBe(false);
 
         git('checkout', '--', 'a.txt');
     });

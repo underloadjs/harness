@@ -956,6 +956,20 @@ describe('canonical sessions', () => {
                     default: ['.'],
                     description:
                         'Directories to list, absolute or relative to the working directory, in the order the results are grouped. Defaults to ["."].'
+                },
+                // R9 paging cursor: the listing is a bounded page, so the schema must
+                // carry the two knobs the implementation reads.
+                offset: {
+                    type: 'integer',
+                    minimum: 0,
+                    description:
+                        '0-based index into the flat entry list. Defaults to 0; use nextOffset from the previous page.'
+                },
+                limit: {
+                    type: 'integer',
+                    minimum: 1,
+                    maximum: 1000,
+                    description: 'Maximum entries in this page, 1-1000. Defaults to 200.'
                 }
             },
             additionalProperties: false
@@ -984,13 +998,27 @@ describe('canonical sessions', () => {
 
             // Absolute inputs keep their absolute prefix, posix-normalized, and the
             // directory order is the caller's: src (with its child) then task.
+            // R9: the answer is one bounded PAGE (the whole listing here), so the
+            // cursor fields are part of the exact result.
+            const expectedEntries = [
+                `${posix(fixture)}/src/a.ts`,
+                `${posix(fixture)}/src/nested/`,
+                `${posix(fixture)}/task/b.ts`
+            ];
             expect(result.body).toEqual({
                 ok: true,
-                result: [
-                    `${posix(fixture)}/src/a.ts`,
-                    `${posix(fixture)}/src/nested/`,
-                    `${posix(fixture)}/task/b.ts`
-                ],
+                result: {
+                    entries: expectedEntries,
+                    truncated: false,
+                    nextOffset: null,
+                    offset: 0,
+                    limit: 200,
+                    bytes: expectedEntries.reduce(
+                        (total, entry) => total + Buffer.byteLength(entry, 'utf8'),
+                        0
+                    ),
+                    contentBudget: 64 * 1024
+                },
                 durationMs: expect.any(Number)
             });
 
@@ -1004,11 +1032,12 @@ describe('canonical sessions', () => {
             expect(missing.status).toBe(200);
             expect(missing.body.ok).toBe(false);
 
-            // T16: the direct-call route hands `execute` the `parameters` object
-            // as-is (no single-property unwrapping), so an empty argument box and a
-            // model-shaped body both arrive here. They must mean the documented
-            // default, not an error — and the wrapper form must list what the array
-            // form lists.
+            // T16/R13: the direct route resolves `parameters` through the shared
+            // validator (`resolveToolParameters`, 'direct' mode) before `execute`
+            // sees it. Both shapes therefore mean the same request: the legacy
+            // unwrapped value (`["."]`, which `fileList` also accepts directly) and
+            // the schema wrapper (`{ paths: [...] }`). An empty argument box is
+            // valid and means the documented default.
             const emptyBox = await jsonBody<ToolCallResult>(
                 await callHandler(runtime, 'POST', '/v1/harness/tools/fileList', {
                     body: { parameters: {} }
@@ -1044,9 +1073,18 @@ describe('canonical sessions', () => {
                 });
             }
 
+            const wrappedEntry = `${posix(fixture)}/task/b.ts`;
             expect(wrapped.body).toEqual({
                 ok: true,
-                result: [`${posix(fixture)}/task/b.ts`],
+                result: {
+                    entries: [wrappedEntry],
+                    truncated: false,
+                    nextOffset: null,
+                    offset: 0,
+                    limit: 200,
+                    bytes: Buffer.byteLength(wrappedEntry, 'utf8'),
+                    contentBudget: 64 * 1024
+                },
                 durationMs: expect.any(Number)
             });
         } finally {
@@ -1234,7 +1272,25 @@ describe('all-tools manual execution', () => {
             expect(result.status).toBe(200);
             expect(result.body).toEqual({
                 ok: true,
-                result: [{ path, content: 'core file' }],
+                // fileRead now returns a bounded batch object, not a bare array.
+                // 'core file' is one unterminated line of 9 UTF-8 bytes.
+                result: {
+                    files: [
+                        {
+                            path,
+                            content: 'core file',
+                            startLine: 1,
+                            endLine: 1,
+                            truncated: false,
+                            nextLine: null,
+                            nextColumn: null,
+                            bytes: 9
+                        }
+                    ],
+                    truncated: false,
+                    bytes: 9,
+                    contentBudget: 65536
+                },
                 durationMs: expect.any(Number)
             });
         } finally {
@@ -1385,7 +1441,6 @@ describe('all-tools manual execution', () => {
         expect(added.body).toEqual({
             ok: true,
             result: {
-                todos: [{ id: '1', text: 'check bounds', completed: false }],
                 todo: { id: '1', text: 'check bounds', completed: false },
                 counts: { total: 1, completed: 0, remaining: 1 }
             },
@@ -1403,7 +1458,9 @@ describe('all-tools manual execution', () => {
             ok: true,
             result: {
                 todos: [{ id: '1', text: 'check bounds', completed: false }],
-                counts: { total: 1, completed: 0, remaining: 1 }
+                counts: { total: 1, completed: 0, remaining: 1 },
+                // R9: `list` is one bounded page (default 20).
+                page: { offset: 0, limit: 20, hasMore: false }
             },
             durationMs: expect.any(Number)
         });
@@ -1473,13 +1530,19 @@ describe('all-tools manual execution', () => {
                 }
             }
         });
+        // R13: with a session named, an unknown name is resolved against THAT
+        // session's registry (created/plugin tools), so the 404 names the session
+        // rather than the global catalogue. Without a session it stays "Unknown tool".
         expect(
             await jsonBody(
                 await callHandler(runtime, 'POST', '/v1/harness/tools/nope', {
                     body: { sessionId: session.id, parameters: {} }
                 })
             )
-        ).toEqual({ status: 404, body: { error: { message: 'Unknown tool "nope".' } } });
+        ).toEqual({
+            status: 404,
+            body: { error: { message: 'Tool "nope" is not available in this session.' } }
+        });
     });
 
     it('answers 404 for an unknown session and for a core tool that session lacks', async () => {
@@ -1572,7 +1635,11 @@ describe('all-tools manual execution', () => {
 
         expect(alias.body).toEqual({
             ok: true,
-            result: { todos: [], counts: { total: 0, completed: 0, remaining: 0 } },
+            result: {
+                todos: [],
+                counts: { total: 0, completed: 0, remaining: 0 },
+                page: { offset: 0, limit: 20, hasMore: false }
+            },
             durationMs: expect.any(Number)
         });
 
@@ -1656,10 +1723,9 @@ describe('body policy and bounds', () => {
             }
         });
 
-        // An explicit empty wrapper stays a valid call (the UI sends this when
-        // the argument box is empty). `clock` has one property, so the
-        // single-property rule hands `execute` the wrapper object as the value;
-        // that is the tool contract, not an HTTP concern, and it stays `ok: true`.
+        // An explicit empty wrapper stays a VALID CALL (the UI sends this when the
+        // argument box is empty): the single-property rule unwraps it to
+        // `undefined`, and `timeNow` documents "UTC" as the omitted-label default.
         const clock = await jsonBody<ToolCallResult>(
             await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', { body: { parameters: {} } })
         );
@@ -1667,8 +1733,189 @@ describe('body policy and bounds', () => {
         expect(clock.body.ok).toBe(true);
         if (clock.body.ok) {
             const result = clock.body.result as { timezone: unknown };
-            expect(result.timezone).toEqual({});
+            expect(result.timezone).toBe('UTC');
         }
+    });
+
+    it('bounds a huge manual result with the shared truncation envelope', async () => {
+        const runtime = createRuntime();
+
+        // A file long enough that even a bounded read serializes past the 64 KiB
+        // manual cap: fileRead's own 64 KiB content budget fills the page, and the
+        // JSON envelope around it crosses the cap. That is exactly the "huge value"
+        // case the manual route must not return verbatim.
+        const fixture = await mkdtemp(join(TEMP_LIST_ROOT, 'harness-bounds-api-'));
+        try {
+            const path = join(fixture, 'big.txt');
+            await writeTextFile(path, 'x'.repeat(70_000), 'utf8');
+
+            const read = await jsonBody<ToolCallResult>(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/fileRead', {
+                    body: { parameters: [path] }
+                })
+            );
+
+            expect(read.status).toBe(200);
+            if (!read.body.ok) throw new Error('expected a successful read');
+
+            // R13: the result is the SHARED envelope, parsed back into an object so
+            // the HTTP body stays valid JSON instead of a half-written document.
+            const bounded = read.body.result as {
+                truncated: boolean;
+                originalBytes: number;
+                budgetBytes: number;
+                content: string;
+            };
+
+            expect(Object.keys(bounded).sort()).toEqual([
+                'budgetBytes',
+                'content',
+                'originalBytes',
+                'truncated'
+            ]);
+            expect(bounded.truncated).toBe(true);
+            expect(bounded.budgetBytes).toBe(64 * 1024);
+            // EXACT and PORTABLE: `originalBytes` is the UTF-8 length of the tool's
+            // own serialized result, so the expectation is derived from the fixture
+            // instead of hard-coded. fileRead returns the 64 KiB content budget as
+            // ONE unterminated line for this fixture, and its metadata is fixed
+            // (1-based line 1, `nextColumn` at the cut, the same byte count at both
+            // levels). `JSON.stringify(path)` makes the separator/prefix handling the
+            // platform's problem, so the number holds on any OS and TEMP root.
+            const expectedResult = {
+                files: [
+                    {
+                        path,
+                        content: 'x'.repeat(64 * 1024),
+                        startLine: 1,
+                        endLine: 1,
+                        truncated: true,
+                        nextLine: 1,
+                        nextColumn: 64 * 1024,
+                        bytes: 64 * 1024
+                    }
+                ],
+                truncated: true,
+                bytes: 64 * 1024,
+                contentBudget: 64 * 1024
+            };
+            expect(bounded.originalBytes).toBe(
+                Buffer.byteLength(JSON.stringify(expectedResult), 'utf8')
+            );
+            // The prefix is preserved (it IS the beginning of the tool's JSON text,
+            // which starts with the serialized result object).
+            expect(bounded.content.startsWith('{"files":[{"path"')).toBe(true);
+            expect(Buffer.byteLength(JSON.stringify(bounded), 'utf8')).toBeLessThanOrEqual(
+                64 * 1024
+            );
+        } finally {
+            await rm(fixture, { recursive: true, force: true });
+        }
+    });
+
+    it('accepts the legacy and wrapped direct argument shapes identically', async () => {
+        const runtime = createRuntime();
+
+        const fixture = await mkdtemp(join(TEMP_LIST_ROOT, 'harness-parity-api-'));
+        try {
+            const path = join(fixture, 'note.txt');
+            await writeTextFile(path, 'one line\n', 'utf8');
+
+            // R13: the direct route now validates through the shared resolver in
+            // 'direct' mode, so both documented shapes reach `execute` with the same
+            // value. A wrong type is a tool error, not an implementation crash.
+            const legacy = await jsonBody<ToolCallResult>(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/fileRead', {
+                    body: { parameters: [path] }
+                })
+            );
+            const wrapped = await jsonBody<ToolCallResult>(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/fileRead', {
+                    body: { parameters: { paths: [path] } }
+                })
+            );
+
+            expect(legacy.status).toBe(200);
+            expect(wrapped.status).toBe(200);
+            expect(legacy.body.ok).toBe(true);
+            expect(wrapped.body).toEqual(legacy.body);
+            if (legacy.body.ok) {
+                expect(legacy.body.result).toMatchObject({ files: [{ content: 'one line\n' }] });
+            }
+
+            // A number where an array of paths belongs is rejected by the schema.
+            const wrong = await jsonBody<ToolCallResult>(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/fileRead', {
+                    body: { parameters: 7 }
+                })
+            );
+            expect(wrong.status).toBe(200);
+            expect(wrong.body).toEqual({
+                ok: false,
+                error: { message: '$.paths must be of type array.' },
+                durationMs: expect.any(Number)
+            });
+        } finally {
+            await rm(fixture, { recursive: true, force: true });
+        }
+    });
+
+    it('runs a session-created tool through its own session and nowhere else', async () => {
+        const runtime = createRuntime();
+        const owner = await createDemo(runtime);
+        const sibling = await createDemo(runtime);
+
+        // toolCreate in the owner session registers a runtime tool in THAT harness.
+        const created = await jsonBody<ToolCallResult>(
+            await callHandler(runtime, 'POST', '/v1/harness/tools/toolCreate', {
+                body: {
+                    sessionId: owner.id,
+                    parameters: {
+                        name: 'shout',
+                        description: 'Uppercase a string.',
+                        tags: ['text'],
+                        // `source` is the BODY of an async function taking (args, context).
+                        source: 'return String(args ?? "").toUpperCase();'
+                    }
+                }
+            })
+        );
+
+        expect(created.body.ok).toBe(true);
+
+        // R13: the name is not in the static catalogue, so the route resolves it
+        // through the named session's registry.
+        const call = await jsonBody<ToolCallResult>(
+            await callHandler(runtime, 'POST', '/v1/harness/tools/shout', {
+                body: { sessionId: owner.id, parameters: 'hello' }
+            })
+        );
+        expect(call.body).toEqual({
+            ok: true,
+            result: 'HELLO',
+            durationMs: expect.any(Number)
+        });
+
+        // ISOLATION: a different session does not see it ...
+        expect(
+            await jsonBody(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/shout', {
+                    body: { sessionId: sibling.id, parameters: 'hello' }
+                })
+            )
+        ).toEqual({
+            status: 404,
+            body: { error: { message: 'Tool "shout" is not available in this session.' } }
+        });
+
+        // ... and neither does a session-less call, which only knows the catalogue.
+        expect(
+            await jsonBody(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/shout', {
+                    body: { parameters: 'hello' }
+                })
+            )
+        ).toEqual({ status: 404, body: { error: { message: 'Unknown tool "shout".' } } });
     });
 
     it('rejects an over-sized body by declared length or serialized size with 413', async () => {

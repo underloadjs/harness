@@ -163,18 +163,22 @@ A tool is an **executable object**, not a passive descriptor. The same
 implementation has two entry points: a direct call, and a call from the model.
 
 ```ts
-const fileRead = tool<string[], FileReadResult>({
-    description: 'Read one or more UTF-8 text files.',
+// The preset's real shape: one array property, so `execute` receives the array
+// itself. Items may be strings or `{ path, startLine?, startColumn?, maxLines? }`.
+const fileRead = tool<FileReadParameters, FileReadResult>({
+    description: 'Read a bounded window of UTF-8 text files.',
     tags: ['files', 'read'],
     parameters: {
         type: 'object',
-        properties: { paths: { type: 'array', items: { type: 'string' } } },
+        properties: { paths: { type: 'array', items: { oneOf: [{ type: 'string' }, { type: 'object' }] } } },
         required: ['paths']
     },
-    execute: async ({ parameters: paths }) => Promise.all(paths.map(async (path) => ({ path, content: await read(path) })))
+    execute: async ({ parameters }) => readBounded(parameters)
 });
 
-await fileRead(['package.json']);                // [{ path, content }] — no harness, no agent
+// { files: [{ path, content, startLine, endLine, truncated,
+//             nextLine, nextColumn, bytes }], truncated, bytes, contentBudget }
+await fileRead(['package.json']);                // no harness, no agent
 harness({ tools: { fileRead } });                // the model calls fileRead
 ```
 
@@ -267,21 +271,28 @@ without a discovery round. It is **incremental** and **session-scoped**:
 
 | Action | Input | Result |
 |---|---|---|
-| `add` | `text` (non-blank; trimmed) | The new todo, with the next stable id (`"1"`, `"2"`, …). |
-| `remove` | `id` | `removed` plus the remaining `todos`. |
-| `check` | `id`, optional `completed` (default `true`; `false` unchecks) | The updated todo. |
-| `uncheck` | `id` | The updated todo with `completed: false` (alias for `check` + `completed: false`). |
-| `list` | — | Every todo plus `counts: { total, completed, remaining }`. |
+| `add` | `text` (non-blank; trimmed, max 4000 chars) | `{ todo, counts }` — the new todo with the next stable id (`"1"`, `"2"`, …) |
+| `remove` | `id` | `{ removed, counts }` |
+| `check` | `id`, optional `completed` (default `true`; `false` unchecks) | `{ todo, counts }` |
+| `uncheck` | `id` | `{ todo, counts }` with `completed: false` (alias for `check` + `completed: false`) |
+| `list` | optional `offset` (≥ 0) and `limit` (1-100, default 20) | ONE page: `{ todos, counts: { total, completed, remaining }, page: { offset, limit, hasMore, nextOffset? } }` |
 
 ```text
 todoManage({ "action": "add", "text": "Draft the plan" })
-  -> { todos: [{ id: "1", text: "Draft the plan", completed: false }],
-       todo: { id: "1", text: "Draft the plan", completed: false },
+  -> { todo: { id: "1", text: "Draft the plan", completed: false },
        counts: { total: 1, completed: 0, remaining: 1 } }
+
+todoManage({ "action": "list", "offset": 20, "limit": 20 })
+  -> { todos: [...], counts: { total: 42, completed: 3, remaining: 39 },
+       page: { offset: 20, limit: 20, hasMore: true, nextOffset: 40 } }
 ```
 
-- Every result carries the current `todos` (copies, never live references) and
-  `counts`. `todo` appears for add/check/uncheck; `removed` for remove.
+- Results are **bounded and split by action**: `list` returns one page (20 by
+  default, max 100, and a 64 KiB serialized page budget that stops before an item
+  which would cross it), while every mutation returns only the changed item and the
+  counts — no list. `page.nextOffset` is omitted when `hasMore` is false; loop on it
+  to read the rest. Caps: 200 todos, 4000 characters of text each.
+- Every result is a defensive copy, never a live reference.
 - Invalid input is a readable, recoverable tool result: unknown action, blank
   `text`, blank `id`, unknown id, and non-boolean `completed` all name the action
   and field. A failed call never changes the list.
@@ -308,13 +319,16 @@ stable decimal-string ids from `"1"`, and cleared by `reset()` (ids restart at
 
 | Action | Input | Result |
 |---|---|---|
-| `add` | the tool's required fields plus optionals | the stored record, with the next stable id |
-| `list` | — | every record (summaries for chapters) plus `counts` |
-| `get` | `id` | one record; for chapters this is the only action that returns `content` |
-| `update` | `id` plus at least one mutable field | the patched record; fields you omit are unchanged |
-| `remove` | `id` | `removed` plus the remaining records |
+| `add` | the tool's required fields plus optionals | `{ profile \| chapter \| location, counts }` — no list |
+| `list` | optional `offset` (≥ 0) and `limit` (1-100, default 20) | ONE page: the records (summaries for chapters) plus `counts` and `page: { offset, limit, hasMore, nextOffset? }` |
+| `get` | `id` | one record plus `counts`; for chapters this is the only action that returns `content` |
+| `update` | `id` plus at least one mutable field | the patched record plus `counts`; fields you omit are unchanged |
+| `remove` | `id` | `{ removed, counts }` |
 
-Every result is a defensive snapshot (arrays and records are copies). A rejected
+Pages default to 20 records (max 100) with a 64 KiB serialized page budget; caps are
+200 records, 200-character names/titles, 4000-character text, and at most 32 profile
+traits of 200 characters. Every result is a defensive snapshot (arrays and records
+are copies). A rejected
 call changes nothing: unknown action, missing/blank `id`, unknown id, wrong field
 type, an update that names no field, and every tool-specific rule below are
 readable errors naming the tool and field.
@@ -346,10 +360,10 @@ groups related tools for discovery; the action is what the model calls.
 | `createTool` (tool) | `toolCreate` | core; the host method is `harness.createTool()` |
 | `todoTools` | `todoManage` | core; always declared |
 | `delegate` | `agentDelegate` | core; primary only, when subagents exist |
-| `readFile` | `fileRead` | **batched**: `(paths: string[])` → `{ path, content }[]` |
+| `readFile` | `fileRead` | **batched and bounded**: `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` → `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes }], truncated, bytes, contentBudget }` |
 | `writeFile` | `fileWrite` | **batched**: `({ path, content }[])` → `{ path, bytes }[]` |
 | `editFile` | `fileEdit` | **batched**: `({ path, oldString, newString, replaceAll? }[])` → `{ path, replacements, bytes }[]` |
-| `listFiles` | `fileList` | unchanged shape: `(paths?)` → `string[]` |
+| `listFiles` | `fileList` | **paged**: `(paths?)` or `({ paths?, offset?, limit? })` → `{ entries, truncated, nextOffset, offset, limit, bytes, contentBudget }` |
 | `globFiles` + `searchFiles` | `fileGlob` | **unified**: filename mode, or content mode when `content` is supplied |
 | `runCommand` | `commandRun` | unchanged shape |
 | `gitDiff` | `gitDiff` | unchanged (already `namespace`+`action` shape) |
@@ -390,14 +404,16 @@ import {
 } from '@underload/harness';
 
 await syntaxCheck({ code: 'def f():\n    pass', language: 'python' }); // true
-await fileRead(['package.json']);                                   // [{ path, content }]
+await fileRead(['package.json']);                                   // { files: [{ path, content, … }], truncated, bytes, contentBudget }
 await fileWrite([{ path: 'notes.md', content: '# Notes' }]);         // [{ path, bytes }]
-await fileList(['src', 'task']);                                    // ['src/a.ts', 'src/nested/', 'task/b.ts', ...]
+await fileList(['src', 'task']);                                    // { entries: ['src/a.ts', 'src/nested/', 'task/b.ts', ...], truncated, nextOffset, offset, limit, bytes, contentBudget }
+await fileList({ paths: ['src'], offset: 200, limit: 100 });        // page 2 of the same list
 await fileEdit([{ path: 'a.ts', oldString: 'let x', newString: 'let y' }]);
 await fileGlob({ patterns: ['src/**/*.ts'] });                      // { files, truncated }
 await fileGlob({ patterns: ['*.ts'], content: 'TODO' });             // { matches, truncated }
-await gitDiff();                                                    // { exitCode, stdout, stderr, ... }
-await commandRun({ command: 'git status' });                        // { exitCode, stdout, stderr }
+await gitDiff();                                                    // { exitCode, stdout, stderr, truncated, timedOut, stderrTruncated, aborted }
+await commandRun({ command: 'git status' });                        // { exitCode, stdout, stderr, truncated, timedOut, aborted }
+await commandRun({ command: 'npm test', timeoutMs: 600_000 });      // 1..600000 ms; tree killed on timeout
 ```
 
 Each tool lives in its own file under a capability folder (`tools/syntax/`,
@@ -422,10 +438,31 @@ single-property rule hands `execute` the array itself. A direct call and a model
 call therefore reach the same code:
 
 ```ts
-await fileRead(['a.ts', 'b.ts']);                                  // [{ path, content }, …]
+await fileRead(['a.ts', 'b.ts']);                                  // { files: [{ path, content, … }, …], … }
+await fileRead([{ path: 'big.ts', startLine: 400, maxLines: 50 }]); // one bounded window
 await fileWrite([{ path: 'a.ts', content: 'a' }, { path: 'b.ts', content: 'b' }]);
 await fileEdit([{ path: 'a.ts', oldString: 'a', newString: 'b' }]);
 ```
+
+**`fileRead` is bounded by default.** Each result window returns at most 200 lines
+(`maxLines`, hard maximum 5000) starting at `startLine` (1-based, default 1). The
+whole batch shares a fixed 64 KiB UTF-8 **content** budget, split fairly between the
+requested files; reading streams in 64 KiB chunks and stops at the cap, so a huge
+file or a single giant line is never loaded wholesale. `content` is raw text whose
+first line is `startLine` — line numbering is metadata, not a prefix, so a model can
+still copy exact text into `fileEdit`. A truncated entry reports `nextLine` and
+`nextColumn` (a 0-based UTF-8 byte offset within that line, normally 0; non-zero
+only when a giant line was cut mid-line), and `{ path, startLine: nextLine,
+startColumn: nextColumn }` resumes exactly there. Binary rejection is based on the
+bytes DECODED WHILE STREAMING: a NUL or invalid UTF-8 sequence in a chunk that was
+read rejects the call instead of returning replacement characters. It is not
+whole-file validation — bytes after the last read chunk (for example far past a
+truncated window) are never inspected. A call accepts at most 100 paths, which
+bounds the metadata side of the response as well as the content. The budget covers
+content bytes, not JSON escaping; `contentBudget` reports the fixed cap and `bytes`
+reports what the response consumed. Because line numbers require counting from the
+beginning, a deep `startLine`/`startColumn` rescan the file from byte 0 each time:
+memory stays bounded, but the skipped prefix costs time.
 
 `fileWrite` and `fileEdit` validate **every** entry (shape, non-empty strings, no
 NUL, unique target file) before the first write, and `fileEdit` also reads and
@@ -439,7 +476,7 @@ with the paths already completed: there is **no transaction and no rollback**.
 | Tool | Signatures | Result |
 |---|---|---|
 | `syntaxCheck` | `({ code, language: 'javascript' \| 'python' })` | `true` when the snippet parses; JavaScript is a classic script (no `import`/`export` or top-level await) |
-| `fileRead` | `(paths: string[])` — non-empty | ordered `{ path, content }[]`; one missing/unreadable path rejects the whole call |
+| `fileRead` | `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` — non-empty | `{ files, truncated, bytes, contentBudget }`; one window per path, ordered; one missing/unreadable/binary path rejects the whole call |
 | `fileWrite` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`, creating parent directories; duplicate target files rejected |
 | `fileEdit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes }[]`; `oldString` must be unique unless `replaceAll`; all edits preflighted |
 | `fileList` | `(paths?)` — string or string[]; defaults to `["."]` | `string[]` of `dir/entry`, directories end with `/`; non-recursive |
@@ -664,10 +701,22 @@ it runs when the tool is called, receiving `args` (the parameter value, followin
 the single-property rule) and `context` (the `ToolContext`). Registering rejects an
 invalid name (letter first, then letters/digits/`_`/`-`, ≤64 chars), a reserved or
 case-insensitively colliding name, a blank description, more than 16 tags, a
-non-JSON-Schema `parameters`, and a body that does not parse. Bounds: description
-≤2 000 chars, source ≤20 000 chars, **32 created tools per harness**. Creation is
+non-JSON-Schema `parameters`, and a body that does not parse. A created SCHEMA is
+also traversal-bounded, because it is re-sent on every request: at most 12 levels of
+container nesting, 256 nested objects/arrays **anywhere** in the value (`$defs`,
+`patternProperties`, or a keyword nobody implements all count), and 16 KiB of
+serialized bytes (which is what catches one enormous scalar `description`/`enum`).
+Those are size limits only — the validator still enforces just the JSON Schema
+vocabulary it documents, so a `$defs` entry is counted, not resolved. Bounds:
+description ≤2 000 chars, source ≤20 000 chars, **32 created tools per harness**. Creation is
 **session-local**: nothing is written to disk and two harnesses cannot see each
-other's tools.
+other's tools. The 32-tool budget is per harness for its LIFETIME: `harness.reset()`
+clears conversations, discovery, todos and records, but created tools stay
+registered (so a session cannot mint an unbounded number of them by resetting), and
+only a new harness starts the count again. `toolCreation` configures the capability:
+`'all'` (default — `toolCreate` is declared to every agent), `'primary'` (declared to
+the primary only; a subagent that guesses the name gets a clear refusal), or `false`
+(no model-facing tool at all — the host method `harness.createTool()` still works).
 
 **No sandbox.** A created tool is compiled with the host realm's `Function`
 constructor and runs with the process's full permissions — the same trust model as
@@ -844,6 +893,21 @@ Transport behaviour:
   reload shows the same panels and `eventTimes` stays aligned;
 - `POST /tools/:name` (direct and session-bound) returns `{ ok: true, result,
   panels?, durationMs }` — `result` is the underlying content;
+- both manual paths share the model budget: a result or error over **64 KiB of
+  UTF-8** is returned as the explicit envelope `{ truncated: true, originalBytes,
+  budgetBytes, content }` (panels stay on the separate tool-UI limit), and a result
+  that fits is returned exactly as before. This is a post-serialization cap: it
+  bounds the response/context cost, **not** the process's peak memory;
+- the direct runner validates `parameters` with the same schema the model sees, in
+  "direct" mode, so both `["src"]` and `{ "paths": ["src"] }` reach the tool and a
+  wrong type is an `ok: false` tool error. `parameters: null` means "no arguments";
+- a tool created at runtime (`toolCreate`) or added by a plugin lives in its
+  session's harness, not in the static catalogue: `POST /tools/:name` with that
+  `sessionId` resolves it, any other session answers `404 Tool "<name>" is not
+  available in this session.`, and a session-less call answers `404 Unknown tool`.
+  For listing, read the session (`GET /sessions/:id`): a created tool is registered
+  AND enabled at once, so its name appears in `discoveredTools` alongside the
+  discovered catalogue tools. `GET /tools` stays the static catalogue;
 - `GET /tools` is unchanged. The shipped `timeNow` tool is the in-app
   demonstration: its API result is still `{ timezone, iso, unix }`, with a
   right-slot key/value panel attached.
@@ -1082,7 +1146,10 @@ POST /api/tools/toolRequest { "parameters": { "tags": ["files"] }, "sessionId": 
 
 The single-property tools are `fileRead`, `fileWrite`, `fileEdit`, and `fileList`;
 `fileGlob`, `syntaxCheck`, `commandRun`, `gitDiff`, and every core tool carry several
-properties. `fileList` normalizes the tolerated "no preference" shapes itself
+properties. `fileRead`'s single `paths` property still accepts range objects as its
+ITEMS (`{ "paths": [{ "path": "big.ts", "startLine": 400, "maxLines": 50 }] }`), so
+per-file windows do not add a second top-level property and the unwrapping rule is
+unchanged. `fileList` normalizes the tolerated "no preference" shapes itself
 (`undefined`, `null`, `{}`, and a `{ "paths": [...] }` wrapper all mean `["."]`), so an
 empty argument box and a model-shaped body agree, while an explicit `[]` is still an
 error.
@@ -1199,6 +1266,16 @@ allows subagents; otherwise the call answers a clear `404`. The **Web search** g
 shows whether this server has `EXA_API_KEY`/`TAVILY_API_KEY`; an unconfigured entry
 keeps its schema and example arguments visible but disables **Call tool** and prints
 the server's hint, so it never looks like a working tool.
+
+**Cancellation is cooperative.** Aborting a run (`POST /sessions/:id/cancel`,
+`DELETE /sessions/:id`, or a closed legacy stream) signals the harness, which stops
+BEFORE the next tool call and forwards the signal to the tool context
+(`ToolContext.signal`). A tool that ignores it — a long `commandRun`, a scripted
+created tool — keeps running to completion, and the session stays `busy` (so manual
+calls still answer `409`) for exactly as long as it does. The server never reports a
+cancel it did not achieve and never releases the gate while a tool might still be
+mutating state. A manual call has no turn/controller, so `cancel()` does not abort
+it; only its own completion releases the gate.
 
 `--tools` (and `/tools` in an interactive CLI session) uses the same runtime
 catalogue and appends `[unconfigured — …]` to an entry that needs a missing key.

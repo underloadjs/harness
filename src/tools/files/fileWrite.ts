@@ -15,13 +15,27 @@
 //
 // PREFLIGHT (before the first byte hits disk)
 // -------------------------------------------
-// Every entry is validated — object shape, non-empty path, string content, no NUL,
-// and UNIQUE resolved target file — before anything is written. A duplicate target
-// is rejected because "write it twice with different content" has no honest answer.
-// Uniqueness is by FILE IDENTITY (./identity.ts), not by spelling: on Windows
-// `notes.txt`/`NOTES.TXT` and a symlink alias are the same file, so a batch that
-// names it twice is rejected before any write. Parent directories are created as
-// needed and an existing file is overwritten, exactly as before.
+// Every entry is validated — object shape, non-empty path, string content, no NUL
+// in the path OR THE CONTENT, and UNIQUE resolved target file — before anything is
+// written. A duplicate target is rejected because "write it twice with different
+// content" has no honest answer. Uniqueness is by FILE IDENTITY (./identity.ts),
+// not by spelling: on Windows `notes.txt`/`NOTES.TXT` and a symlink alias are the
+// same file, so a batch that names it twice is rejected before any write. Parent
+// directories are created as needed and an existing file is overwritten, exactly as
+// before.
+//
+// WHY NUL CONTENT IS REJECTED (binary consistency)
+// ------------------------------------------------
+// This tool advertises UTF-8 TEXT: the description says text, the encoding is utf8,
+// and the only reader in the package (fileRead) treats a NUL byte as binary and
+// refuses the file outright (see fileRead's binary rejection). Writing a NUL
+// therefore produces a file that the harness itself cannot read back — a write that
+// silently breaks the read side. There is no binary write API here to opt into, so
+// the content is rejected during preflight, before any file is touched, rather than
+// creating an unreadable artifact. Every other character, including invalid
+// Unicode escapes the caller built by hand, still writes (Node substitutes U+FFFD
+// for lone surrogates; that is documented behavior of the encoding, not a NUL
+// binary marker).
 //
 // FAILURE SEMANTICS (honest, not transactional)
 // ---------------------------------------------
@@ -116,12 +130,21 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
         }
 
         // Content is required, and an empty string is a legitimate "truncate the
-        // file" request, so only the type is checked.
+        // file" request, so only the type and the binary marker are checked.
         if (typeof content !== 'string') {
             throw new HarnessError('fileWrite files require a "content" string.');
         }
 
+        // A NUL byte is the harness's own binary marker (fileRead rejects it), so
+        // writing one creates a file this package cannot read back. Rejected in
+        // preflight — before any write — so nothing is created meanwhile.
         const target = resolve(path);
+
+        if (content.includes('\u0000')) {
+            throw new HarnessError(
+                `fileWrite content must not contain NUL characters (${target}): the file would be unreadable by fileRead, which rejects binary content.`
+            );
+        }
 
         // Same file twice in one batch: the second write would silently win, so
         // the batch is rejected instead of guessing an order-independent answer.

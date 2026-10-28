@@ -444,9 +444,9 @@ describeService('service endpoint discovery and canonical API', () => {
             });
         }
 
-        // An explicit empty wrapper is still a valid call. `clock` has one
-        // property, so the wrapper object is the value `execute` receives — the
-        // call is accepted, which is what this asserts.
+        // An explicit empty wrapper is still a VALID CALL (a 400 would mean the
+        // wrapper was missing). The single-property rule unwraps it to `undefined`,
+        // and `timeNow` documents "UTC" as the omitted-label default.
         const empty = await fetch(`${base}/v1/harness/tools/timeNow`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
@@ -455,7 +455,7 @@ describeService('service endpoint discovery and canonical API', () => {
         expect(empty.status).toBe(200);
         const result = await json<ToolCallResult>(empty);
         expect(result.ok).toBe(true);
-        if (result.ok) expect((result.result as { timezone: unknown }).timezone).toEqual({});
+        if (result.ok) expect((result.result as { timezone: unknown }).timezone).toBe('UTC');
     });
 
     it('rejects an over-sized parsed body with 413 through the real loader', async () => {

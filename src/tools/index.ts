@@ -23,7 +23,7 @@
 // contract the registry relies on:
 //
 //     await syntaxCheck({ code: 'print(1)', language: 'python' }); // true
-//     await fileRead(['package.json']);                            // [{ path, content }]
+//     await fileRead(['package.json']);                            // { files: [{ path, content, … }], truncated, bytes, contentBudget }
 //     await fileWrite([{ path: 'a.txt', content: 'hi' }]);         // [{ path, bytes }]
 //     harness({ tools: { syntaxCheck, fileRead } });                // the model calls them
 //
@@ -52,10 +52,12 @@ import type {
     FileGlobParameters,
     FileGlobResult,
     FileListParameters,
+    FileListResult,
+    FileReadParameters,
     FileReadResult,
     FileWriteResult
 } from './files';
-import type { CommandRunResult, GitDiffParameters, GitDiffResult } from './command';
+import type { CommandRunParameters, CommandRunResult, GitDiffParameters, GitDiffResult } from './command';
 import type { SyntaxCheckParameters } from './syntax';
 import type { Tool } from '../types';
 
@@ -65,17 +67,20 @@ export const syntaxCheck = lazyTool<SyntaxCheckParameters, boolean>('syntaxCheck
 
 // The four file tools are BATCHED: each takes the array its single schema property
 // declares, so a direct call and a model call reach `execute` identically.
-export const fileRead = lazyTool<string[], FileReadResult>('fileRead');
+export const fileRead = lazyTool<FileReadParameters, FileReadResult>('fileRead');
 export const fileWrite = lazyTool<{ path: string; content: string }[], FileWriteResult>('fileWrite');
 export const fileEdit = lazyTool<FileEditParameters, FileEditResult>('fileEdit');
-export const fileList = lazyTool<FileListParameters, string[]>('fileList');
+export const fileList = lazyTool<FileListParameters, FileListResult>('fileList');
 // fileGlob declares four properties, so it receives the whole object and its
 // result shape depends on whether `content` was supplied.
 export const fileGlob = lazyTool<FileGlobParameters, FileGlobResult>('fileGlob');
 
-export const commandRun = lazyTool<{ command: string; cwd?: string }, CommandRunResult>('commandRun');
+export const commandRun = lazyTool<CommandRunParameters, CommandRunResult>('commandRun');
 export const gitDiff = lazyTool<GitDiffParameters, GitDiffResult>('gitDiff');
 
+// NOTE: the bounded-read constants live in ./files/fileRead and are deliberately
+// NOT re-exported here. A value re-export from './files' would statically evaluate
+// the implementation module and destroy the lazy-loading contract this file tests.
 export type { SyntaxCheckLanguage, SyntaxCheckParameters } from './syntax';
 export type {
     FileEditEntry,
@@ -88,15 +93,23 @@ export type {
     FileGlobParameters,
     FileGlobResult,
     FileListParameters,
+    FileListQuery,
+    FileListResult,
     FileReadEntry,
     FileReadParameters,
     FileReadResult,
+    FileReadTarget,
     FileWriteEntry,
     FileWriteParameters,
     FileWriteResult,
     FileWriteResultEntry
 } from './files';
-export type { CommandRunResult, GitDiffParameters, GitDiffResult } from './command';
+export type {
+    CommandRunParameters,
+    CommandRunResult,
+    GitDiffParameters,
+    GitDiffResult
+} from './command';
 
 // Web search is intentionally outside `presetTools`: a preset is shared by every
 // harness, while a search tool closes over that harness's key. harness.ts calls

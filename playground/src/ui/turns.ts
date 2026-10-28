@@ -1,5 +1,5 @@
 // Turn tiles: one tile per logical user → assistant exchange, laid out as a
-// single vertical timeline.
+// single vertical list of full-width rows.
 //
 // Turn boundaries are server data, not browser inference. The server records one
 // `SessionTurn` per submitted task (`id`, `index`, `prompt`, `status`, `events`)
@@ -18,12 +18,13 @@
 //     snapshot. This is how a reload, a session selection or an in-progress poll
 //     renders history: the server record wins over anything the browser projected.
 //
-// Timeline model (R4):
-//   - one linear, vertical list — completed tasks grey, the active task green,
-//     queued tasks neutral. Order is the server's FIFO submission order, so a
-//     task submitted while another runs visibly sits BEHIND it;
-//   - every tile is a compact content-height row on a shared vertical rule; only
-//     the active (or user-selected) tile expands;
+// List model (R1/R4):
+//   - one linear, vertical list, chronological (the server's FIFO submission
+//     order), so a task submitted while another runs visibly sits BEHIND it —
+//     completed tasks grey, the single active task green, queued tasks neutral;
+//   - NO timeline rule and NO marker dot: each task is a plain full-width row;
+//   - every tile is a compact ONE-LINE row across the full width; only the active
+//     (or user-selected) tile expands into the reading surface;
 //   - expanding an older tile never destroys the newest turn's content: tiles
 //     keep their DOM, only visibility changes, so a user reading turn 3 is not
 //     pulled away by deltas arriving for turn 7.
@@ -42,6 +43,9 @@
 //   - lifecycle status (topbar pill): playground/src/main.ts (`setLifecycle`)
 //   - elapsed formatting: playground/src/ui/time.ts
 //   - styles: playground/src/styles.css (`.turns`, `.turn-row`, `.tile`, `.agent`)
+//   - queue/ack race (R2): server/sessions.ts `enqueue` publishes the queued
+//     `turn` upsert BEFORE the 202 body is returned, so an observer frame can
+//     describe a turn whose optimistic tile is still unbound (`claim`).
 
 import type { HarnessEvent, HarnessUsage, SessionTurn, SessionTurnStatus } from '../../../server/protocol';
 import { callIdOf, eventTimesOf, finiteOf, usageOf } from '../contract';
@@ -67,6 +71,13 @@ export type TurnState = 'queued' | 'waiting' | 'streaming' | 'done' | 'error' | 
 // neutral instead of pretending to run.
 const stateOf = (status: SessionTurnStatus | 'queued'): TurnState =>
     status === 'running' ? 'streaming' : status;
+
+// Progress rank of a server status, used only to break an `updatedAt` TIE in the
+// monotonic record guard (`merge`). The queue pump can stamp enqueue and start in
+// the same millisecond, so an equal stamp must not let the LOWER record win: a
+// queued record may never replace a running one, nor a running one a terminal one.
+const rankOf = (status: SessionTurnStatus | 'queued'): number =>
+    status === 'queued' ? 0 : status === 'running' ? 1 : 2;
 
 export type TurnHandle = {
     element: HTMLElement;
@@ -107,13 +118,18 @@ export type TurnHandle = {
     // Current elapsed label text ('' when the span is unknown). Exposed for the
     // meta line tests and for callers that need the value without reading DOM.
     elapsed: () => string;
-    // Server-supplied token tally for this turn: `122,111 (100,301)` — input tokens
-    // with the cached part in brackets — or '' when nothing has reported usage yet.
-    // Set from a live frame (`SessionStreamItem.usage`) or from a hydrated
-    // `SessionTurn.usage`; the tile never invents a figure.
+    // Token label for this turn, TWO scopes — `150 (140)`:
+    //   - primary: input/context size of the LATEST model request (provider
+    //     `prompt_tokens`, including that request's cached subset);
+    //   - bracket: total cached (replayed) input sent across the whole turn.
+    // '' when nothing has reported usage yet, and no bracket when no cache figure
+    // was reported. Set from live `usage` events + the frame/record tally; the
+    // tile never invents a figure (see ui/tokens.ts and the tally block below).
     tokens: () => string;
-    // Replace the shown tally with the server's running sum. Called per streamed
-    // frame and once per hydrated turn; `undefined` clears the label.
+    // Replace the cumulative server tally. Called per streamed frame and once per
+    // hydrated turn; the latest-input primary is derived from the usage events,
+    // not from this sum. `undefined` only clears the figure when no usage event
+    // was recorded (a record's tally can be absent on legacy turns).
     setUsage: (usage?: HarnessUsage) => void;
     // Number of agent sections, tool cards and the primary agent name. Exposed
     // for tests and for the tile's meta line.
@@ -148,6 +164,13 @@ export type TurnBoard = {
     // Find a tile by server turn id. This is how a stream `event` frame with an
     // explicit `turnId` finds its tile without guessing from stream order.
     find: (id: string) => TurnHandle | undefined;
+    // Claim the oldest UNBOUND optimistic tile that was started for `prompt` and
+    // return it, so a server record that arrives before the POST /tasks answer
+    // (server/sessions.ts publishes the queued `turn` upsert first, line ~633)
+    // merges into the tile the user is already looking at instead of adopting a
+    // SECOND tile for the same turn. Returns undefined when no tile is waiting for
+    // that prompt. Callers merge the record into the returned handle.
+    claim: (prompt: string) => TurnHandle | undefined;
     // Build one tile from an authoritative server record (replays its events).
     adopt: (turn: SessionTurn, model?: string) => TurnHandle;
     // Replace the whole board with the server's turns. Returns the new handles;
@@ -306,15 +329,13 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         const card = el('article', 'tile');
         card.dataset.state = 'queued';
 
-        // Timeline row: the marker is a SIBLING of the card so the card can keep
-        // `overflow: hidden` (the active ring is drawn inside its border) while the
-        // marker still sits on the shared vertical rule at negative x. The row
-        // mirrors the tile state so CSS can colour the marker (styles.css).
+        // Row wrapper (R1): a plain full-width block, no marker and no rule
+        // decoration. It stays a wrapper (rather than appending the card directly)
+        // so `clear()`/`reconcile()` can remove a row without ever touching
+        // `.turns` itself, and it mirrors the tile state for CSS (styles.css).
         const row = el('div', 'turn-row');
         row.dataset.state = 'queued';
-        const marker = el('span', 'turn-marker');
-        marker.setAttribute('aria-hidden', 'true');
-        row.append(marker, card);
+        row.append(card);
 
         const select = el('button', 'tile-select');
         select.type = 'button';
@@ -327,19 +348,21 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         // when the span is unknown (legacy fixture), never "NaN".
         const elapsedLabel = el('span', 'tile-elapsed');
         elapsedLabel.hidden = true;
-        // Server-summed token tally, right after the elapsed label: input tokens
-        // with the cached part in brackets (`122,111 (100,301)`). Hidden until the
-        // first request reports usage, so a provider that sends none leaves the
+        // Token tally, right after the elapsed label: the latest request's input
+        // context with the turn's cumulative cached input in brackets
+        // (`150 (140)`, different scopes; the title explains both). Hidden until
+        // the first request reports usage, so a provider that sends none leaves the
         // header clean instead of claiming "0". The `|` separator is CSS
         // decoration (styles.css), not part of either value.
         const tokensLabel = el('span', 'tile-tokens');
         tokensLabel.hidden = true;
         const badge = el('span', 'tile-status');
         badge.dataset.state = 'queued';
-        const dot = el('span', 'tile-dot');
-        dot.setAttribute('aria-hidden', 'true');
+        // No decorative dot: the status is TEXT (`tile-status-text`), visible on
+        // an expanded tile and clipped — not removed — on a compact row, and the
+        // colour lives on the row's border/status word. The compact row is plain.
         const statusText = el('span', 'tile-status-text', STATE_TEXT.queued);
-        badge.append(dot, statusText);
+        badge.append(statusText);
 
         const promptPreview = el('span', 'tile-prompt', plainPreview(prompt, 220));
         const meta = el('span', 'tile-meta', 'waiting for the first event');
@@ -373,6 +396,16 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         // against these: identical means "append the remainder"; different means
         // the server record won and the projection must be rebuilt.
         const appliedEvents: HarnessEvent[] = [];
+        // Monotonic guard for server records (R2). Every authoritative record
+        // carries `updatedAt` (server/sessions.ts stamps it on enqueue, on start,
+        // on every event and on the terminal transition), so a record OLDER than
+        // the last one this tile applied can only be a stale snapshot — chiefly
+        // the 202 body from POST /tasks, which is captured at enqueue time but can
+        // resolve after newer observer frames. Ignoring it is what stops a running
+        // row regressing to `queued` (no green / two greens) and a settled row
+        // re-opening.
+        let recordAt: number | undefined;
+        let recordStatus: SessionTurnStatus | undefined;
 
         // --- timing --------------------------------------------------------
         // A queued tile has NO clock (R4): the task may wait behind another run for
@@ -423,23 +456,60 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         };
 
         // --- token tally ----------------------------------------------------
-        // The SERVER owns the sum (server/sessions.ts addUsage): every stream frame
-        // carries the turn's running total and a hydrated turn carries it as
-        // `SessionTurn.usage`, so this tile only ever prints a figure it was given.
-        // It deliberately does NOT accumulate the per-request `usage` events itself:
-        // two accumulators would be two numbers, and a re-render (poll, reload,
-        // terminal snapshot) would have to know which one to trust.
-        //
-        // The label shows input tokens with the cached part in brackets — the same
-        // shape the gateway logs — because input grows cumulatively across a run's
-        // requests (each request re-sends the transcript), which is what "tokens
-        // spent so far" means while the run iterates. See ui/tokens.ts.
+        // TWO scopes, deliberately different (user-selected semantics, R1/R2):
+        //   - primary: the LATEST model request's input/context size. The provider
+        //     `input` (prompt_tokens) includes that request's cached subset, so
+        //     this is "latest prompt sent", not a sum. Derived from the LAST
+        //     `usage` event applied (emission order — so a delegated subagent's
+        //     request counts as latest if it reported last, deterministically).
+        //   - bracket: total cached (replayed) input sent across the whole turn.
+        //     Taken from the SERVER's cumulative tally (`SessionTurn.usage.cached`,
+        //     server/sessions.ts addUsage), with a per-event sum as the fallback
+        //     for a legacy record that carries events but no tally.
+        // The cumulative tally's `input` is NOT used as the primary when events
+        // exist: it is the sum of every re-sent transcript. It is only the
+        // conservative fallback for a record whose events were trimmed/absent
+        // (the latest request is then unknowable and the cumulative input is an
+        // upper bound that never understates the context). See ui/tokens.ts.
         let tally: HarnessUsage | undefined;
+        let latestInput: number | undefined;
+        let eventCached = 0;
+        let eventCachedReported = false;
+
+        // Same grouping as the visible figure, for the explanatory title only.
+        const titleNumber = new Intl.NumberFormat('en-US');
+        const titleCount = (value: number): string => titleNumber.format(Math.trunc(Math.max(value, 0)));
 
         const paintTokens = (): void => {
-            const text = formatTokens(tally);
+            // Latest reported context; fall back to the cumulative input only when
+            // no usage event was recorded (never on a live/hydrated turn that has
+            // one, so the two scopes cannot silently collapse).
+            const input = latestInput ?? tally?.input;
+            const cached = tally?.cached ?? (eventCachedReported ? eventCached : undefined);
+            const text = formatTokens(input, cached);
+
             tokensLabel.textContent = text;
             tokensLabel.hidden = text.length === 0;
+
+            // R2: the compact numbers alone cannot express that they measure
+            // different scopes. The title spells it out for both sighted and
+            // assistive readers without adding a second visible line.
+            if (text.length === 0) {
+                tokensLabel.removeAttribute('title');
+                return;
+            }
+
+            const context = input === undefined ? 'unknown' : titleCount(input);
+            const cache = cached === undefined ? 'unknown' : titleCount(cached);
+            // A legacy record with no events can only show the cumulative input;
+            // say so instead of claiming it is the latest request's context.
+            const scope =
+                latestInput === undefined && tally !== undefined
+                    ? 'Cumulative input (latest request not recorded)'
+                    : 'Latest request context';
+            tokensLabel.title =
+                `${scope}: ${context} input tokens · ` +
+                `Total cached input sent: ${cache} tokens`;
         };
 
         const setUsage = (usage?: HarnessUsage): void => {
@@ -497,8 +567,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
             paintElapsed();
             card.dataset.state = next;
-            // The row mirrors the state so the timeline marker and the tile never
-            // disagree (green only for the active task, grey when completed).
+            // The row mirrors the state so the row and the tile never disagree
+            // (styles.css keys the row's compact/active treatment off it).
             row.dataset.state = next;
             badge.dataset.state = next;
             statusText.textContent = STATE_TEXT[next];
@@ -717,6 +787,11 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             toolCount = 0;
             appliedCount = 0;
             appliedEvents.length = 0;
+            // Token figures derived from the discarded events must go too; the
+            // server tally is re-applied by the caller after the rebuild.
+            latestInput = undefined;
+            eventCached = 0;
+            eventCachedReported = false;
         };
 
         // --- events -------------------------------------------------------
@@ -773,12 +848,27 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     );
                     break;
 
-                // Per-request usage. Nothing to accumulate here on purpose: the
-                // server sums it and hands the running total over (setUsage) on the
-                // frame that carries this event, and on the recorded turn. Replayed
-                // usage events therefore cost the tile nothing.
-                case 'usage':
+                // Per-request usage. The tile keeps two derived facts: the LATEST
+                // reported request's input (primary) and, as a fallback for records
+                // without a server tally, the per-request cached sum (bracket).
+                // The authoritative bracket still comes from the server's
+                // SessionTurn.usage.cached via setUsage; this case only fills the
+                // legacy/missing-tally path and refreshes the latest context on
+                // every live usage event. A missing cache figure stays absent
+                // (never zero-filled).
+                case 'usage': {
+                    const reported = finiteOf(event.usage.input);
+                    if (reported !== undefined) latestInput = reported;
+
+                    const cached = finiteOf(event.usage.cached);
+                    if (cached !== undefined) {
+                        eventCachedReported = true;
+                        eventCached += Math.max(cached, 0);
+                    }
+
+                    paintTokens();
                     break;
+                }
 
                 case 'done': {
                     const section = ensureSection(event.agent);
@@ -851,6 +941,21 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         // terminal one freezes at `updatedAt` (never at "now", so a poll and the
         // live view agree). The model detail follows the existing tile convention.
         const merge = (source: SessionTurn, model?: string): void => {
+            // Stale-record guard (R2). A record older than the last one applied is
+            // an out-of-order snapshot (see `recordAt` above): the tile already
+            // knows more than this record does, so applying it would only regress
+            // status/timing. An equal stamp is allowed only when it is not a
+            // regression in progress rank (same-millisecond enqueue/start).
+            const stamp = finiteOf(source.updatedAt);
+            if (recordAt !== undefined && stamp !== undefined) {
+                if (stamp < recordAt) return;
+                if (stamp === recordAt && recordStatus !== undefined && rankOf(source.status) < rankOf(recordStatus)) {
+                    return;
+                }
+            }
+            if (stamp !== undefined) recordAt = stamp;
+            recordStatus = source.status;
+
             bind(source);
 
             const terminal =
@@ -886,8 +991,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         };
 
         // Clicking the header expands a compact tile; clicking the expanded tile
-        // collapses it back to the timeline (so the whole conversation is visible
-        // at once). Only one tile is ever expanded.
+        // collapses it back to the compact list (so the whole conversation is
+        // visible at once). Only one tile is ever expanded.
         select.addEventListener('click', () => {
             if (expandedTurn === turn) collapse();
             else expand(turn);
@@ -924,8 +1029,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         };
 
         turns.push(turn);
-        // The card lives inside its timeline row; the row is what the board
-        // appends, removes and reorders, and it carries the marker state.
+        // The card lives inside its row; the row is what the board appends,
+        // removes and reorders, and it mirrors the tile state.
         element.append(row);
         // A queued tile paints no clock (nothing is running yet). `bind()` and
         // `setState('streaming')` start it from the server's start stamp, so a
@@ -950,8 +1055,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
     const clear = (): void => {
         for (const turn of turns) {
             turn.destroy();
-            // The tile is wrapped in its timeline row; removing the card alone
-            // would leave an empty marker on the rule.
+            // The tile is wrapped in its row; removing the card alone would leave
+            // an empty row in the list.
             turn.element.parentElement?.remove();
         }
         turns.length = 0;
@@ -966,6 +1071,31 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
     // Route lookup by explicit server id. A stream frame names its `turnId`, so
     // the board never has to guess which tile a delta belongs to.
     const find = (id: string): TurnHandle | undefined => turns.find((candidate) => candidate.id() === id);
+
+    // Claim the oldest optimistic tile started for `prompt` (R2). The submit path
+    // calls `begin(prompt)` before the request leaves the browser and binds the
+    // server id only when the POST answer arrives, but the server publishes the
+    // queued `turn` upsert BEFORE that answer (server/sessions.ts enqueue), so the
+    // observer can describe the turn first. Without this claim the observer would
+    // `adopt` a second tile for the same turn; the ack then bound the optimistic
+    // one and the adopted tile stayed behind as a stale green row.
+    //
+    // FIFO: only unbound tiles are candidates, and the first match in board order
+    // wins, so two identical prompts still map to their own records in order.
+    // `merge` binds the tile immediately, so one tile can never be claimed twice.
+    //
+    // ONLY pending rows are claimable (queued/waiting): a tile left in a terminal
+    // state by a failed submit is a report of that failure, not a request in
+    // flight. Claiming it would turn "task failed" into a running row for an
+    // identical prompt submitted afterwards — its own `begin` already made the
+    // newer, genuinely pending tile that must be claimed instead.
+    const claim = (prompt: string): TurnHandle | undefined =>
+        turns.find((candidate) => {
+            if (candidate.id() !== undefined || candidate.prompt !== prompt) return false;
+
+            const state = candidate.state();
+            return state === 'queued' || state === 'waiting';
+        });
 
     // Rebuild one tile from the server's record. Replaying the events (rather
     // than trusting browser state) is what makes a reload render the same
@@ -991,9 +1121,11 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
     // re-ordered to the server's index order (a reconnect can otherwise append a
     // turn that belongs in the middle).
     //
-    // An UNBOUND tile (id undefined: enqueue still in flight, or a failed submit)
-    // is kept after the server turns: the browser must not silently discard the
-    // user's prompt, and the POST answer will bind it shortly.
+    // An UNBOUND tile (id undefined) is CLAIMED by the record for its prompt when
+    // the snapshot already lists it (the observer can beat the POST answer), and
+    // while it is still PENDING (queued/waiting) it is otherwise kept after the
+    // server turns: the browser must not silently discard a submit in flight. A
+    // terminal unbound row (a failed submit) is retired — see below.
     const reconcile = (
         sources: readonly SessionTurn[],
         options: HydrateOptions = {}
@@ -1003,34 +1135,59 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         const ordered: TurnHandle[] = [];
 
         for (const source of sources) {
+            // A snapshot that names one id twice is a server/reconnect artefact:
+            // the first record wins and the repeat must not add a second row.
+            if (seen.has(source.id)) continue;
             seen.add(source.id);
 
             const existing = find(source.id);
             if (existing !== undefined) {
                 existing.merge(source, options.model);
                 ordered.push(existing);
-            } else {
-                ordered.push(adopt(source, options.model));
-            }
-        }
-
-        // Server authority: a turn the snapshot no longer lists is gone (reset, or
-        // a queued task cancelled from the queue). Drop it from the timeline.
-        const unbound: TurnHandle[] = [];
-        for (const turn of [...turns]) {
-            const id = turn.id();
-            if (id === undefined) {
-                unbound.push(turn);
                 continue;
             }
 
-            if (seen.has(id)) continue;
+            // The record for a task this browser submitted but has not been
+            // answered for yet: bind the tile the user is already reading rather
+            // than adopting a duplicate (R2).
+            const claimed = claim(source.prompt);
+            if (claimed !== undefined) {
+                claimed.merge(source, options.model);
+                ordered.push(claimed);
+                continue;
+            }
+
+            ordered.push(adopt(source, options.model));
+        }
+
+        const next = [...ordered];
+
+        // An optimistic tile survives the snapshot only while it is GENUINELY
+        // PENDING (queued/waiting: the enqueue is still in flight, or the ack has
+        // not been applied yet) — see `claim`. Anything else unbound is a
+        // browser-only projection the server never accepted: chiefly a FAILED
+        // submit, whose tile would otherwise linger as a ghost row across every
+        // later snapshot (its outcome stays reported by the `.notice` the submit
+        // path added, which this list never touches).
+        for (const turn of [...turns]) {
+            if (turn.id() !== undefined) continue;
+
+            const state = turn.state();
+            if (state === 'queued' || state === 'waiting') next.push(turn);
+        }
+
+        // Server authority: every bound tile that this pass did not place is gone
+        // — dropped by the server (reset, cancelled backlog) or a DUPLICATE tile
+        // bound to an id another tile now owns. Remove it and its row, so a stale
+        // green duplicate can never outlive the record it described (R2).
+        for (const turn of [...turns]) {
+            if (next.includes(turn)) continue;
 
             turn.destroy();
             turn.element.parentElement?.remove();
         }
 
-        const next = [...ordered, ...unbound];
+        // Surviving bound tiles keep their place in the array order `next` defines.
         turns.length = 0;
         turns.push(...next);
 
@@ -1082,6 +1239,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         expanded: () => expandedTurn,
         turns: () => turns,
         find,
+        claim,
         adopt,
         hydrate,
         reconcile,

@@ -278,16 +278,17 @@ A tool is an **executable object**. `tool()` returns a callable with `name`,
 runs from a direct call or from the model's tool call.
 
 ```ts
-const fileRead = tool<string[], { path: string; content: string }[]>({
-    description: 'Read one or more UTF-8 text files.',
+const fileRead = tool<FileReadParameters, FileReadResult>({
+    description: 'Read a bounded window of UTF-8 text files.',
     tags: ['files', 'read'],
-    parameters: { type: 'object', properties: { paths: { type: 'array', items: { type: 'string' } } }, required: ['paths'] },
-    execute: async ({ parameters: paths }) =>
-        Promise.all(paths.map(async (path) => ({ path, content: await reads(path) })))
+    parameters: { type: 'object', properties: { paths: { type: 'array', items: { oneOf: [{ type: 'string' }, { type: 'object' }] } } }, required: ['paths'] },
+    execute: async ({ parameters }) => readBounded(parameters)
 });
 
 await fileRead(['package.json']);                // direct: no harness, no agent
 harness({ tools: { fileRead } });                // the model calls it
+// Result: { files: [{ path, content, startLine, endLine, truncated,
+//                     nextLine, nextColumn, bytes }], truncated, bytes, contentBudget }
 ```
 
 - `name` is optional (default `'tool'`). **A harness overwrites it with its
@@ -451,9 +452,14 @@ const { tool, reset } = createTodoTool();   // fresh list + id counter
   clear it. `uncheck` ignores `completed` (it is always false).
 - Ids are decimal strings (`"1"`, `"2"`, …), monotonic per instance. `reset()`
   clears both the list and the counter.
-- Results are `{ todos, todo?, removed?, counts: { total, completed, remaining } }`.
-  `todos`, `todo`, and `removed` are defensive copies, so mutating a result can
-  never mutate the session list.
+- Results are bounded and split by action (R9): `list` returns ONE page,
+  `{ todos, counts: { total, completed, remaining }, page: { offset, limit, hasMore,
+  nextOffset? } }` (20 items by default, hard maximum 100, and a 64 KiB serialized
+  page budget that stops BEFORE an item which would cross it); every mutation returns
+  only `{ todo | removed, counts }` with NO list, so a caller that needs the list
+  calls `list` with `offset`/`limit`. `todos`, `todo`, and `removed` are defensive
+  copies, so mutating a result can never mutate the session list. Caps:
+  200 todos and 4000 characters of text each.
 - Validation is per action and type-checked consistently: not an object, unknown
   action, non-string `text`/`id`, non-boolean `completed`, blank text/id, and an
   unknown id all throw `HarnessError` with the action/field named. The harness
@@ -500,9 +506,18 @@ Shared action set (`RecordAction = 'add' | 'list' | 'get' | 'update' | 'remove'`
 
 | Tool | `add` requires | Optional (default) | `update` mutable fields | Result extras |
 |---|---|---|---|---|
-| `profileManage` | `name`, `description` | `traits` (`[]`), `notes` (`''`) | name, description, traits, notes | `profiles`, `profile?`, `removed?`, `counts: { total }` |
-| `chapterManage` | `title`, `summary` | `content` (`''`), `status` (`planned`), `order` (unset) | title, summary, content, status, order | `chapters`, `chapter?`, `content?`, `removed?`, `counts: { total, planned, draft, complete }` |
-| `locationManage` | `name`, `description` | `notes` (`''`) | name, description, notes | `locations`, `location?`, `removed?`, `counts: { total }` |
+| `profileManage` | `name`, `description` | `traits` (`[]`), `notes` (`''`) | name, description, traits, notes | `list` → `{ profiles, counts: { total }, page }`; `get` → `{ profile, counts }`; writes → `{ profile \| removed, counts }` |
+| `chapterManage` | `title`, `summary` | `content` (`''`), `status` (`planned`), `order` (unset) | title, summary, content, status, order | `list` → `{ chapters, counts: { total, planned, draft, complete }, page }`; `get` → `{ chapter, content, counts }`; writes → `{ chapter \| removed, counts }` |
+| `locationManage` | `name`, `description` | `notes` (`''`) | name, description, notes | `list` → `{ locations, counts: { total }, page }`; `get` → `{ location, counts }`; writes → `{ location \| removed, counts }` |
+
+`page` is `{ offset, limit, hasMore, nextOffset? }`: 20 records by default, hard
+maximum 100 per call, and a 64 KiB serialized page budget, so a model reads a long
+cast one bounded page at a time (`nextOffset` is omitted when `hasMore` is false).
+Caps: 200 records per tool, 200-character names/titles, 4000-character descriptions,
+summaries, chapter bodies and notes, and at most 32 profile traits of 200 characters.
+The paged result types are owned by `core/{todo,profile,chapter,location}.ts` and
+re-exported from `types/index.ts`, so the public surface cannot drift from what the
+tools return.
 
 - **Partial update is atomic.** The tool validates into a patch object and then
   assigns; a later invalid field cannot leave earlier ones applied. An update that
@@ -565,14 +580,14 @@ searchable remainder (`fileList`, `syntaxCheck`, `commandRun`, `gitDiff`) waits 
 | Export | Call | Result |
 |---|---|---|
 | `syntaxCheck` | `({ code, language: 'javascript' \| 'python' })` | `boolean` |
-| `fileRead` | `(paths: string[])` — non-empty | ordered `{ path, content }[]`; one bad path rejects the call |
+| `fileRead` | `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` — non-empty | `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes }], truncated, bytes, contentBudget }`; one bad/binary path rejects the call |
 | `fileWrite` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`; all validated first, duplicate targets rejected |
 | `fileEdit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes }[]`; all preflighted before the first write |
-| `fileList` | `(paths?)` — string or string[]; defaults to `["."]` | `string[]` of `dir/entry`, directories end with `/`; non-recursive |
+| `fileList` | `(paths?)` legacy string/string[] or `({ paths?, offset?, limit? })`; defaults to `["."]` | `{ entries: string[], truncated, nextOffset, offset, limit, bytes, contentBudget }` — ONE page of `dir/entry`, directories end with `/`; non-recursive |
 | `fileGlob` | `({ patterns?, paths?, maxResults? })` | `{ files, truncated }` (filename mode) |
-| `fileGlob` | `({ patterns?, paths?, content, maxResults? })` | `{ matches: [{ path, line, text }], truncated }` (content mode) |
-| `commandRun` | `({ command, cwd? })` | `{ exitCode, stdout, stderr }` |
-| `gitDiff` | `({ ref?, staged?, paths?, cwd? })` | `{ exitCode, stdout, stderr, truncated, timedOut }` |
+| `fileGlob` | `({ patterns?, paths?, content, maxResults? })` | `{ matches: [{ path, line, text }], truncated, textTruncated, bytes, contentBudget }` (content mode; 1 KiB snippet per line, 64 KiB aggregate) |
+| `commandRun` | `({ command, cwd?, timeoutMs? })` | `{ exitCode, stdout, stderr, truncated, timedOut, aborted }`; stdout 128 KiB / stderr 16 KiB, timeout 1..600000 ms (default 120000), process tree killed best-effort |
+| `gitDiff` | `({ ref?, staged?, paths?, cwd? })` | `{ exitCode, stdout, stderr, truncated, timedOut, stderrTruncated, aborted }`; `paths` is one path or a non-empty array |
 
 Implementation notes worth keeping:
 
@@ -588,7 +603,22 @@ Implementation notes worth keeping:
 - **The four batched file tools declare ONE array property** (`paths` / `files` /
   `edits`), so the single-property rule hands `execute` the array itself. That is
   what makes `fileRead(['a', 'b'])` and a model call carrying
-  `{ "paths": ["a", "b"] }` the same code path.
+  `{ "paths": ["a", "b"] }` the same code path. `fileRead` keeps that property while
+  allowing range objects as ITEMS (`{ path, startLine?, startColumn?, maxLines? }`);
+  per-file windows are not a second top-level property.
+- **`fileRead` is bounded by default.** 200 lines per file (`maxLines`, hard max
+  5000) from a 1-based `startLine`, plus a fixed 64 KiB aggregate UTF-8 content
+  budget split fairly across the batch. It streams 64 KiB chunks and stops at the
+  cap, so a huge file or giant line is never read wholesale. `content` is raw text
+  (line 1 is `startLine`); a truncated entry reports `nextLine`/`nextColumn`, where
+  `nextColumn` is a 0-based byte offset inside the line (non-zero only for a line cut
+  mid-line) and can be passed back as `startColumn`. A NUL or invalid UTF-8 sequence
+  in the chunks DECODED WHILE STREAMING rejects the call as binary; this is not
+  whole-file validation, since bytes after the last read chunk are never inspected.
+  A call accepts at most 100 paths so metadata cannot grow without bound either.
+  Ranges/continuations rescan from byte 0 to count lines: bounded memory, but a deep
+  offset costs time proportional to the skipped prefix. `contentBudget` labels the
+  cap honestly: content bytes, not the JSON envelope.
 - **`fileWrite` / `fileEdit` preflight everything.** Every entry is shape-checked,
   every target must be unique **by real file identity** (`tools/files/identity.ts`:
   `realpath`, plus the nearest existing ancestor for a file that does not exist yet,
@@ -600,16 +630,24 @@ Implementation notes worth keeping:
 - **`fileEdit` is exact and guarded.** `oldString` must appear exactly once or
   `replaceAll: true` must be passed; a missing file is an error (use `fileWrite`
   for new files), and the result reports `replacements` and the new byte size.
-- **`fileList` takes a directory array.** `fileList(['src', 'task'])` returns one
-  flat list whose entries are prefixed with their directory (`src/a.ts`,
+- **`fileList` takes a directory array and returns ONE PAGE.** `fileList(['src', 'task'])`
+  returns one flat list whose entries are prefixed with their directory (`src/a.ts`,
   `src/nested/`, `task/b.ts`); directories keep the trailing `/`. It stays
   **non-recursive** — `fileGlob({ patterns: ['**/*'] })` is the walking tool — and
   the default `paths: ["."]` returns bare entry names (the schema declares
   `default: ["."]`). `undefined`, `null`, `{}`, and a `{ "paths": [...] }` wrapper
-  all normalize to that default in the implementation, because the server's
-  direct-call route hands over the `parameters` object as-is; an explicit `[]` is
-  still an error. Directories are visited in the caller's order, each listing sorted
-  by code point, and a missing directory rejects the whole call (no partial result).
+  all normalize to that default; the server's direct-call route resolves both the
+  legacy bare value and the wrapper through the shared validator
+  (`resolveToolParameters`, 'direct' mode), so they are the same request. An explicit
+  `[]` is still an error. Directories are visited in the caller's order, each listing
+  sorted by code point, and a missing directory rejects the whole call (no partial
+  result).
+  The result is `{ entries, truncated, nextOffset, offset, limit, bytes, contentBudget }`:
+  a page holds at most 200 entries by default (hard maximum 1000) and at most 64 KiB
+  of UTF-8 entry text. `truncated` is measured against the WHOLE list and `nextOffset`
+  is always `offset + entries.length`, so passing it back as `offset` walks the tree
+  once, in order, with no gaps or duplicates. The old `string[]` return is gone: a
+  caller that only wants names reads `.entries`.
 - **`fileGlob` is ONE tool with two modes**, discriminated by the presence of
   `content`: absent → `{ files, truncated }`, present → `{ matches, truncated }`.
   `patterns` default `['**/*']` and are OR-ed; a pattern with no `/` also matches
@@ -711,6 +749,14 @@ only.
 not decide the tool's context cost. `score` is ignored; highlights are joined into
 one snippet.
 
+**R12 hardening.** A snippet is redacted BEFORE it is cut to the per-result limit, so
+a secret cannot survive in the retained prefix of a truncated highlight. A URL is
+accepted only when it parses, is `http(s)`, has NO userinfo, and is at most 2048
+characters; `published` is kept only when it is a string of at most 64 characters.
+The provider response is read through a streamed 512 KiB body cap, so a runaway page
+or a hostile provider cannot allocate an unbounded buffer. These are input/output
+bounds, not a claim that a search result is trustworthy.
+
 **Bounds** (`tools/websearch/request.ts`): 5 results by default, 20 maximum
 (clamped), 300-character title, 1,000-character snippet, 512,000-character response
 (content-length then post-read), 15 s timeout via `AbortController` cleared in
@@ -786,6 +832,17 @@ const tool = writer.toolCreate({
   registered tool is rejected ("fileread" cannot shadow "fileRead"), and a harness
   may create at most **32** tools (`MAX_CREATED_TOOLS`). The model path returns the
   failure as a tool result; the host path throws.
+- **Schema gate is a traversal limit, not schema validation**
+  (`checkToolSchemaComplexity`): a created schema is re-sent on every request, so it
+  is bounded to 12 levels of container nesting, 256 nested objects/arrays anywhere in
+  the value, and 16 KiB of serialized bytes. The walk follows EVERY container —
+  `properties`/`items`/`oneOf`, but equally `$defs`, `patternProperties`,
+  `dependentSchemas`, or an unknown keyword — because a keyword-only walk let 400
+  objects under `$defs` through; the byte cap is what catches one enormous scalar
+  `description`/`enum` string. Cycles are rejected explicitly (a host can pass a live
+  object; `JSON.stringify` would otherwise throw). `validateSchemaValue` still
+  enforces only the vocabulary it documents, so these keywords are counted, not
+  resolved.
 - **Registered searchable and enabled immediately**, so the next turn can call it
   without a second toolRequest round. It stays in the searchable catalogue afterwards.
 - **Session-local, no persistence.** Created tools live in that harness's registry
@@ -1011,8 +1068,10 @@ a run going — `done` only ever reports the final request, so this is the only
 per-request feed a client can tally. It is absent when the provider reported no
 usage block for that request. The server folds every one of them into
 `SessionTurn.usage` (subagent requests included) and repeats the running sum on
-each SSE frame; the UI prints it next to the turn's elapsed label as
-`input (cached)`, e.g. `122,111 (100,301)`.
+each SSE frame; the UI prints the LATEST model request's input/context size with
+the turn's cumulative cached input in brackets, e.g. `150 (140)` (the label's
+title names both scopes). The wire tally's `input` stays the cumulative sum for
+other metrics.
 
 ## HarnessMessage
 
@@ -1308,12 +1367,39 @@ the canonical document is the API URL (`/v1/harness`), not a filesystem path.
 **Body policy (both mounts).** Action endpoints require a JSON object; `null`,
 arrays, and primitives are `400`. `POST /tools/:name` requires a `parameters`
 property, so an empty body cannot run a tool — `{ "parameters": {} }` is the
-explicit argument-less call. Bounds: the Node adapter stops a streamed body over
+explicit argument-less call (it is unwrapped to "no arguments", the documented
+default, rather than being rejected). An unknown name is `404` whatever the body
+looks like. Bounds: the Node adapter stops a streamed body over
 1,000,000 bytes with `413`; the service adapter checks declared `content-length`
 and the serialized parsed body before dispatch. The service loader parses JSON
 before the endpoint runs, so it cannot prevent that upstream allocation and a
 parse failure arrives as `{}` — a documented residual, not something this package
 can fix.
+
+**R13: the manual route validates and bounds like the model path.**
+
+- The direct (session-less) runner resolves `parameters` through
+  `resolveToolParameters(schema, raw, 'direct')` before `execute` sees them. Both
+  documented shapes therefore work — the legacy unwrapped value (a bare array for a
+  single-property schema, or `fileList(['src'])`) and the schema wrapper
+  (`{ "paths": ["src"] }`) — and a wrong type is a `{ ok: false }` tool error with a
+  JSON path instead of an implementation crash. `null` is normalized to `{}`.
+- Result and error TEXT share the model-facing 64 KiB cap (`boundToolResult` in
+  `src/core/result-budget.ts`, applied AFTER the `toolUi()` unwrap so panels stay on
+  their own limit). A result that fits is returned byte-for-byte unchanged; a result
+  that does not is returned as the parsed truncation envelope
+  `{ truncated, originalBytes, budgetBytes, content }`, so the HTTP body stays valid
+  JSON with an explicit marker rather than a half-written document. This is a
+  post-serialization cap: it bounds the wire/context cost, **not** the process's peak
+  memory (the tool's own budget has to do that).
+- A tool that exists only in ONE session's registry (created by `toolCreate`, or
+  added by a plugin to that session's harness) is not in the static catalogue. With a
+  `sessionId`, an unknown name is resolved against THAT session's registry; without
+  one it stays `Unknown tool "<name>"`. A sibling session answers
+  `Tool "<name>" is not available in this session.` — one session's tools are never
+  listed or callable through another session's id. Listing surface: a created tool is
+  registered and enabled at once, so `GET /sessions/:id` reports its name in
+  `discoveredTools`; `GET /tools` remains the static catalogue.
 
 **Core tools in the catalogue (R8).** `harnesses/core.ts` adds six entries —
 `toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`,

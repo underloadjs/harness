@@ -92,13 +92,15 @@ export const PRESET_TOOLS = {
             additionalProperties: false
         }
     },
-    // fileRead is BATCHED (T14): one property, an array of paths, so the
-    // single-property rule hands execute the array itself and the result is an
-    // ordered [{ path, content }] array. A missing file rejects the whole call.
+    // fileRead is BATCHED (T14): one property, an array of paths/ranges, so the
+    // single-property rule hands execute the array itself. Per-path ranges stay on
+    // the ITEM: a second top-level property would disable the single-property rule
+    // and break every existing paths-only call. Reading is bounded by default (line
+    // window + fixed aggregate content budget) because the harness has no output cap.
     fileRead: {
         name: 'fileRead',
         description:
-            'Read one or more UTF-8 text files and return their contents. Pass an array of paths and get an ordered array of { path, content } entries in the same order. One missing or unreadable path rejects the whole call, so a short answer never looks complete. Paths are absolute or relative to the working directory.',
+            'Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes }], truncated, bytes, contentBudget }. Defaults: startLine 1, startColumn 0, maxLines 200 (hard maximum 5000). `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. When an entry is truncated, request { path, startLine: nextLine, startColumn: nextColumn } to continue; nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. The whole batch shares a fixed 64 KiB UTF-8 CONTENT budget (not counting JSON escaping), split fairly between the requested files, and reading stops at that budget instead of loading huge files or lines wholesale. A call accepts at most 100 paths. One missing or unreadable path, or binary bytes (NUL or invalid UTF-8) encountered while streaming the file, rejects the whole call, so a short answer never looks complete. Binary detection covers decoded chunks, not the whole file beyond the last chunk read. A window at a deep line rescans from the start to count lines. Paths are absolute or relative to the working directory.',
         tags: ['files', 'read', 'filesystem'],
         // R18: everyday file access is core — always declared, never discovered.
         visibility: 'core',
@@ -107,9 +109,44 @@ export const PRESET_TOOLS = {
             properties: {
                 paths: {
                     type: 'array',
-                    items: { type: 'string' },
+                    maxItems: 100,
+                    items: {
+                        oneOf: [
+                            { type: 'string' },
+                            {
+                                type: 'object',
+                                properties: {
+                                    path: {
+                                        type: 'string',
+                                        description:
+                                            'File to read, absolute or relative to the working directory.'
+                                    },
+                                    startLine: {
+                                        type: 'integer',
+                                        minimum: 1,
+                                        description: '1-based first line to return. Defaults to 1.'
+                                    },
+                                    startColumn: {
+                                        type: 'integer',
+                                        minimum: 0,
+                                        description:
+                                            '0-based UTF-8 byte offset within startLine, for continuing a giant line. Defaults to 0.'
+                                    },
+                                    maxLines: {
+                                        type: 'integer',
+                                        minimum: 1,
+                                        maximum: 5000,
+                                        description:
+                                            'Maximum lines to return. Defaults to 200 and is capped at 5000.'
+                                    }
+                                },
+                                required: ['path'],
+                                additionalProperties: false
+                            }
+                        ]
+                    },
                     description:
-                        'Files to read, absolute or relative to the working directory, in the order the results are returned.'
+                        'Files to read, in the order the results are returned. A string reads a default window; an object selects a line/byte range.'
                 }
             },
             required: ['paths'],
@@ -204,18 +241,21 @@ export const PRESET_TOOLS = {
             additionalProperties: false
         }
     },
-    // fileList is BATCHED (T14): one property, an array of directories. Every
-    // result is prefixed with its directory so a flat list stays readable.
-    // Deliberately NOT recursive — fileGlob is the walking tool.
+    // fileList is BATCHED (T14) and PAGINATED (R9). The object schema carries the
+    // paging cursor, so a model that hits a full page can continue instead of
+    // believing the directory has 200 entries. Every result is prefixed with its
+    // directory so a flat list stays readable; deliberately NOT recursive —
+    // fileGlob is the walking tool.
     //
     // T16: the documented default is an explicit `default: ["."]` as well as an
     // omitted `required`, and the implementation accepts the shapes an empty
     // argument box actually produces (`undefined`, `null`, `{}`) so a manual call
-    // and a model call agree.
+    // and a model call agree. The direct runner additionally accepts the legacy
+    // string/array argument (core/schema-validation.ts 'direct' mode).
     fileList: {
         name: 'fileList',
         description:
-            'List the immediate entries of one or more directories, non-recursively. Every result is prefixed with the directory it came from (e.g. ["src/a.ts", "src/nested/", "task/b.ts"]), directories end with a trailing slash so they are distinguishable from files, and entries are sorted. Pass several directories to survey them in one call; the default is ["."], which returns bare entry names.',
+            'List the immediate entries of one or more directories, non-recursively, ONE PAGE at a time. Every entry is prefixed with the directory it came from (e.g. ["src/a.ts", "src/nested/", "task/b.ts"]), directories end with a trailing slash so they are distinguishable from files, and entries are sorted. Pass several directories to survey them in one call; the default is ["."], which returns bare entry names. The result is { entries, truncated, nextOffset, offset, limit, bytes, contentBudget }: a page holds at most 200 entries by default (maximum 1000) and at most 64 KiB of UTF-8 entry text, so when `truncated` is true pass `nextOffset` back as `offset` to read the rest. A missing or unreadable directory fails the whole call rather than returning a partial list.',
         tags: ['files', 'list', 'filesystem'],
         parameters: {
             type: 'object',
@@ -226,6 +266,18 @@ export const PRESET_TOOLS = {
                     default: ['.'],
                     description:
                         'Directories to list, absolute or relative to the working directory, in the order the results are grouped. Defaults to ["."].'
+                },
+                offset: {
+                    type: 'integer',
+                    minimum: 0,
+                    description:
+                        '0-based index into the flat entry list. Defaults to 0; use nextOffset from the previous page.'
+                },
+                limit: {
+                    type: 'integer',
+                    minimum: 1,
+                    maximum: 1000,
+                    description: 'Maximum entries in this page, 1-1000. Defaults to 200.'
                 }
             },
             additionalProperties: false
@@ -242,7 +294,7 @@ export const PRESET_TOOLS = {
     fileGlob: {
         name: 'fileGlob',
         description:
-            'Find files by glob pattern, and optionally search their contents in the same call. `patterns` (default ["**/*"]) supports *, ?, **, and [abc] classes; a pattern with no slash also matches file names at any depth. Patterns are matched against each file\'s path RELATIVE TO THE ROOT that found it, never against an absolute path, and every result is prefixed with that root: { "paths": ["src"], "patterns": ["**/*.ts"] } returns "src/a.ts" and "src/nested/b.ts". `paths` (default ["."]) lists the roots to walk, in order; overlapping roots and patterns are deduplicated by real file identity (a symlink alias or a case-alias root is walked once), so a file is reported once, under the first root that reached it. WITHOUT `content` the result is { files, truncated }. WITH `content` (a JavaScript regular expression) every file matching the patterns is read and each matching line is returned as { matches: [{ path, line, text }], truncated }; a pattern that backtracks past the 2-second matching budget is stopped with an error rather than allowed to hang. Content mode skips .git, node_modules, symlinks, binary files, and files larger than 1 MiB. Results are capped (100 by default) across all roots. Does not read .gitignore files.',
+            'Find files by glob pattern, and optionally search their contents in the same call. `patterns` (default ["**/*"]) supports *, ?, **, and [abc] classes; a pattern with no slash also matches file names at any depth. Patterns are matched against each file\'s path RELATIVE TO THE ROOT that found it, never against an absolute path, and every result is prefixed with that root: { "paths": ["src"], "patterns": ["**/*.ts"] } returns "src/a.ts" and "src/nested/b.ts". `paths` (default ["."]) lists the roots to walk, in order; overlapping roots and patterns are deduplicated by real file identity (a symlink alias or a case-alias root is walked once), so a file is reported once, under the first root that reached it. WITHOUT `content` the result is { files, truncated }. WITH `content` (a JavaScript regular expression) every file matching the patterns is read and each matching line is returned as { matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }; a pattern that backtracks past the 2-second matching budget is stopped with an error rather than allowed to hang. A matched line is reported as a 1024-byte UTF-8 snippet (that match carries `textTruncated` when the line was cut, and its `bytes` is the returned snippet size), and the whole content result shares a 64 KiB aggregate budget (top-level `bytes` / `contentBudget`). Content mode skips .git, node_modules, symlinks, binary files, and files larger than 1 MiB. Results are capped (100 by default) across all roots. Does not read .gitignore files.',
         tags: ['files', 'glob', 'search', 'grep', 'find', 'content', 'filesystem'],
         // R18: fileGlob is core because it is the ONE search surface (filename and
         // content). There is deliberately no fileSearch alias/tool: the previous
@@ -280,7 +332,7 @@ export const PRESET_TOOLS = {
     commandRun: {
         name: 'commandRun',
         description:
-            'Run a shell command and return its exit code, stdout, and stderr. The command string is passed to the platform shell, so pipes, redirects, and quoting work. A non-zero exit code is returned as data, not thrown.',
+            'Run a shell command and return its exit code, stdout, and stderr. The command string is passed to the platform shell, so pipes, redirects, and quoting work. A non-zero exit code is returned as data, not thrown. `timeoutMs` bounds the run (integer milliseconds, 1-600000, default 120000); a command that exceeds it is killed together with its process tree on a best-effort basis and the result reports `timedOut: true`. Output is capped at 128 KiB of stdout and 16 KiB of stderr, with `truncated: true` when either cap was applied, and an aborted run reports `aborted: true`.',
         tags: ['shell', 'command', 'process'],
         parameters: {
             type: 'object',
@@ -289,6 +341,14 @@ export const PRESET_TOOLS = {
                 cwd: {
                     type: 'string',
                     description: 'Working directory. Defaults to the directory the harness was started in.'
+                },
+                timeoutMs: {
+                    type: 'integer',
+                    minimum: 1,
+                    maximum: 600000,
+                    default: 120000,
+                    description:
+                        'Wall-clock limit in milliseconds, 1-600000. Defaults to 120000 (2 minutes); the process tree is killed when it is exceeded.'
                 }
             },
             required: ['command'],
@@ -298,7 +358,7 @@ export const PRESET_TOOLS = {
     gitDiff: {
         name: 'gitDiff',
         description:
-            'Show the unified diff of uncommitted changes in a git repository, with colour, external diff drivers, and textconv disabled. Optionally diff against a ref, the staged index, or a set of paths. Read-only: nothing is staged, committed, or written. Returns exit code, stdout, stderr, and truncation/timeout flags; a non-zero exit is data, not an error.',
+            'Show the unified diff of uncommitted changes in a git repository, with colour, external diff drivers, and textconv disabled. Optionally diff against a ref, the staged index, or a set of paths. Read-only: nothing is staged, committed, or written. Returns exit code, stdout, stderr, and truncation/timeout flags; a non-zero exit is data, not an error. `stderrTruncated` reports that stderr was capped (16 KiB) and `aborted` that the run was cancelled.',
         tags: ['git', 'diff', 'vcs', 'review', 'command'],
         parameters: {
             type: 'object',
@@ -312,8 +372,13 @@ export const PRESET_TOOLS = {
                     description: 'Diff the staged index instead of the working tree (git diff --staged). Defaults to false.'
                 },
                 paths: {
-                    oneOf: [{ type: 'string' }, { type: 'array', items: { type: 'string' } }],
-                    description: 'Path or paths to restrict the diff to. Passed after "--" so they are always pathspecs.'
+                    // Non-empty by contract: an empty pathspec list would read as
+                    // "no restriction" while the caller asked for one.
+                    oneOf: [
+                        { type: 'string', minLength: 1 },
+                        { type: 'array', items: { type: 'string' }, minItems: 1 }
+                    ],
+                    description: 'Path or paths to restrict the diff to (at least one). Passed after "--" so they are always pathspecs.'
                 },
                 cwd: {
                     type: 'string',

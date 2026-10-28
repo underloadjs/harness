@@ -41,8 +41,10 @@
 // DELIBERATE EXCEPTIONS
 // ---------------------
 //   - `testFlaky` is NOT in the shared toolbox. It fails two calls out of three on
-//     purpose and carries module-level mutable state; it belongs to the
-//     "Recoverable failures" example harness, which adds it as an extra tool.
+//     purpose and keeps its attempt count per AGENT (a WeakMap in ./tools keyed by
+//     the requesting agent object, plus one module fallback for a direct call), so
+//     sharing the singleton is safe: it belongs to the "Recoverable failures"
+//     example harness, which adds it as an extra tool.
 //   - the `demo` preset stays the scripted offline fixture (timeNow only): it is
 //     not a live harness, so the equal-toolbox rule does not apply to it.
 //

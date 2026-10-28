@@ -130,7 +130,16 @@ describe('preset catalogue', () => {
         expect(toolParameterKey(PRESET_TOOLS.fileRead.parameters)).toBe('paths');
         expect(toolParameterKey(PRESET_TOOLS.fileWrite.parameters)).toBe('files');
         expect(toolParameterKey(PRESET_TOOLS.fileEdit.parameters)).toBe('edits');
-        expect(toolParameterKey(PRESET_TOOLS.fileList.parameters)).toBe('paths');
+
+        // R9: fileList is the exception — its paged contract needs `offset`/`limit`
+        // beside `paths`, so it is a multi-property object with no `required`. The
+        // implementation (and the direct runner) still accept the legacy bare array.
+        expect(toolParameterKey(PRESET_TOOLS.fileList.parameters)).toBeUndefined();
+        expect(Object.keys(PRESET_TOOLS.fileList.parameters.properties ?? {})).toEqual([
+            'paths',
+            'offset',
+            'limit'
+        ]);
 
         expect(PRESET_TOOLS.fileRead.parameters.required).toEqual(['paths']);
         expect(PRESET_TOOLS.fileWrite.parameters.required).toEqual(['files']);
@@ -235,8 +244,10 @@ describe('preset catalogue', () => {
         // The description IS the contract the model reads, so the two result shapes
         // and the mode rule have to be stated there.
         expect(PRESET_TOOLS.fileGlob.description).toContain('{ files, truncated }');
+        // U11: the documented content-mode shape carries the per-match bounds, not
+        // top-level `textTruncated` (see fileGlob.ts FileGlobMatch).
         expect(PRESET_TOOLS.fileGlob.description).toContain(
-            'matches: [{ path, line, text }], truncated'
+            'matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget'
         );
         expect(PRESET_TOOLS.fileGlob.description).toContain('Does not read .gitignore files.');
     });

@@ -67,7 +67,7 @@ import { createToolCatalogue, describeAgent, describeHarness } from '../harnesse
 import { createCoreToolEntries } from '../harnesses';
 import { createHarnessRegistry } from '../harnesses';
 import type { CatalogueEntry, HarnessRegistry, ToolCatalogue } from '../harnesses';
-import { toolUiOf } from '../src/harness';
+import { toolUiOf, boundToolResult, resolveToolParameters } from '../src/harness';
 import { listModels, ModelListError } from '../src/transport/models';
 import type {
     AgentDescriptor,
@@ -267,22 +267,66 @@ const toolIndex = (entries: readonly CatalogueEntry[]): ToolIndex => ({
     tools: entries.map(describeTool)
 });
 
+// Bound ONE manual tool value for the HTTP result (R13).
+//
+// The model-facing transcript is bounded in harness.ts; the manual (host) route is
+// a second way to obtain a tool result, and a huge fileRead/webSearch result would
+// otherwise travel as one enormous JSON body. The SAME shared cap is applied here —
+// to the serialized text, not to a reimplementation of the limit — with two rules:
+//
+//   1. a value that fits stays EXACT: `JSON.stringify` is only measured and then
+//      discarded, so every small structured result is byte-for-byte what it was;
+//   2. a truncated result is the envelope TEXT that `boundToolResult` produced,
+//      parsed back into an object when possible (`{truncated, originalBytes,
+//      budgetBytes, content}`). The body therefore stays valid JSON with an
+//      explicit, machine-readable truncation marker instead of a half-written
+//      document or a JSON blob that is really a string.
+//
+// Strings are bounded directly (no double-serialization, so the reported
+// `originalBytes` is the text the tool produced). Values JSON cannot encode
+// (`undefined`, a function) are returned untouched: there is no wire cost to cap.
+const boundToolValue = (value: unknown): unknown => {
+    const text = typeof value === 'string' ? value : JSON.stringify(value);
+
+    if (text === undefined) return value;
+
+    const bounded = boundToolResult(text);
+    if (!bounded.truncated) return value;
+
+    try {
+        return JSON.parse(bounded.content);
+    } catch {
+        // Defensive only: boundToolResult always emits JSON. Returning the envelope
+        // text is still a bounded, honest answer.
+        return bounded.content;
+    }
+};
+
+// Bound a manual tool ERROR message with the same shared cap. The envelope text is
+// kept as the message because `error.message` is a string by protocol; it is still
+// valid JSON, so a client can parse it to learn how much was dropped.
+const boundErrorMessage = (error: unknown): string => boundToolResult(messageOf(error)).content;
+
 // Build the success envelope for a manual tool call. R20.2: a tool may return the
 // branded `toolUi(content, panels)` envelope. The HTTP result must stay the
 // ordinary content (`result`) and may carry the optional declarative `panels`;
 // `toolUiOf` also re-validates and bounds them here, at the server boundary, so a
 // hand-built or malformed envelope cannot reach the client unbounded. An ordinary
 // value is returned untouched, which keeps standard tools byte-for-byte stable.
+//
+// R13: the result content is bounded AFTER the unwrap (panels are bounded by
+// core/tool-ui.ts, a separate surface), so a huge content cannot smuggle an
+// unbounded body through the UI envelope.
 const successfulToolResult = (value: unknown, started: number): ToolCallResult => {
     const ui = toolUiOf(value);
 
     if (ui === undefined) {
-        return { ok: true, result: value, durationMs: Date.now() - started };
+        return { ok: true, result: boundToolValue(value), durationMs: Date.now() - started };
     }
 
     return {
         ok: true,
-        result: ui.content,
+        result: boundToolValue(ui.content),
         // Omit an empty list: an envelope with nothing renderable is
         // indistinguishable from a standard tool response.
         ...(ui.panels.length === 0 ? {} : { panels: ui.panels }),
@@ -459,18 +503,10 @@ export const createHarnessApi = ({
         const coreEntry = coreEntries.find((candidate) => candidate.name === name);
         const entry = coreEntry ?? catalogue.find(name);
 
-        if (!entry) {
-            throw new HttpError(404, `Unknown tool "${name}".`);
-        }
-
         // The body is validated before either branch runs, so a swallowed parse
         // failure (`{}` from the service loader) cannot reach a tool with no
         // arguments — see TOOL_WRAPPER_MESSAGE above.
         const body = requireObjectBody<ToolCallRequest>(await readBody<ToolCallRequest>());
-
-        if (!Object.prototype.hasOwnProperty.call(body, 'parameters')) {
-            throw new HttpError(400, TOOL_WRAPPER_MESSAGE);
-        }
 
         // A present-but-unusable id (`0`, `true`, `{}`) must not be coerced into a
         // session lookup: it would answer 404 for a request that is really a 400.
@@ -479,6 +515,46 @@ export const createHarnessApi = ({
         }
 
         const started = Date.now();
+
+        // R13: a tool that exists only in ONE session's registry (created by
+        // toolCreate, or contributed by a plugin at session construction) is not in
+        // the static catalogue. It is resolved HERE, through the session the caller
+        // named, and never by scanning every session — one session's tools must not
+        // become callable (or even discoverable) through another session's id.
+        // Everything static keeps its existing shape: an unknown name WITHOUT a
+        // session is still a 404, and that 404 is decided before the wrapper rule
+        // (an unknown tool is unknown whatever the body looks like).
+        if (entry === undefined) {
+            if (body.sessionId === undefined || body.sessionId.length === 0) {
+                throw new HttpError(404, `Unknown tool "${name}".`);
+            }
+
+            // A session IS named, so the wrapper rule applies before the call: a
+            // swallowed parse failure must not reach a session tool as `undefined`.
+            if (!Object.prototype.hasOwnProperty.call(body, 'parameters')) {
+                throw new HttpError(400, TOOL_WRAPPER_MESSAGE);
+            }
+
+            try {
+                const result = await store.callTool(body.sessionId, name, body.parameters as never);
+                return { kind: 'json', status: 200, body: successfulToolResult(result, started) };
+            } catch (error) {
+                // Unknown session, a busy session, or a name absent from THIS
+                // session's registry are request failures (404/409), not tool data.
+                if (error instanceof SessionError) throw error;
+
+                const payload: ToolCallResult = {
+                    ok: false,
+                    error: { message: boundErrorMessage(error) },
+                    durationMs: Date.now() - started
+                };
+                return { kind: 'json', status: 200, body: payload };
+            }
+        }
+
+        if (!Object.prototype.hasOwnProperty.call(body, 'parameters')) {
+            throw new HttpError(400, TOOL_WRAPPER_MESSAGE);
+        }
 
         // Session-bound core tool: real harness, real session state.
         if (entry.sessionBound === true) {
@@ -508,7 +584,10 @@ export const createHarnessApi = ({
                 // catalogue tool below.
                 const payload: ToolCallResult = {
                     ok: false,
-                    error: { message: messageOf(error) },
+                    // R13: the error text is bounded by the shared 64 KiB cap, so a
+                    // commandRun failure that dumps a build log cannot bloat the HTTP
+                    // body either.
+                    error: { message: boundErrorMessage(error) },
                     durationMs: Date.now() - started
                 };
                 return { kind: 'json', status: 200, body: payload };
@@ -532,14 +611,25 @@ export const createHarnessApi = ({
         }
 
         try {
-            // The value is the parameter as `execute` receives it, including the
-            // single-property rule the UI already mirrors.
-            const result = await entry.tool(body.parameters as never);
+            // R13: the direct runner now validates its arguments with the SAME
+            // resolver the model and manual executeTool paths use, in 'direct' mode.
+            // That keeps both documented shapes working — the legacy unwrapped value
+            // (`["a.txt"]`) and the schema wrapper (`{ "paths": ["a.txt"] }`) — and
+            // rejects a wrong type with a readable tool error instead of an
+            // implementation crash.
+            //
+            // `parameters: null` is normalized to `{}` first: the wire sends null for
+            // an empty argument box, and the empty wrapper is documented as valid
+            // (see schema-validation.ts). Without this, a null argument box would be
+            // schema-invalid even though it means "no arguments".
+            const raw = body.parameters === null ? {} : body.parameters;
+            const parameters = resolveToolParameters(entry.parameters, raw, 'direct');
+            const result = await entry.tool(parameters as never);
             return { kind: 'json', status: 200, body: successfulToolResult(result, started) };
         } catch (error) {
             const payload: ToolCallResult = {
                 ok: false,
-                error: { message: messageOf(error) },
+                error: { message: boundErrorMessage(error) },
                 durationMs: Date.now() - started
             };
             return { kind: 'json', status: 200, body: payload };

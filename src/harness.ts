@@ -55,11 +55,15 @@
 // order is deterministic and a broad tool cannot outrank an exact tag hit.
 // Matches are capped at MAX_DISCOVERY_MATCHES (5) per request (R7): the model may
 // pass a SMALLER `limit`, never a larger one, and the result reports `remaining`
-// — the count of additional tools that matched but were not listed — so the model
-// refines its tags to drill deeper instead of paging through names. Undiscovered
-// tools are not callable, so the model cannot skip discovery by guessing a name.
-// The enabled set is per harness and survives across calls (turns), so a
-// capability discovered once stays declared until reset().
+// — the count of additional tools that matched but were not listed. Refining the
+// tags is the main way to drill deeper, and (R12) repeating the SAME query
+// advances to the next capped tranche: the harness tracks an offset per identical
+// query (normalized tags + limit), so the omitted tail is reachable instead of the
+// cap being a stationary dead end. `remaining` always counts the matches still
+// unseen AFTER the returned page. Undiscovered tools are not callable, so the model
+// cannot skip discovery by guessing a name. The enabled set is per harness and
+// survives across calls (turns), so a capability discovered once stays declared
+// until reset().
 //
 // Harness-owned names sit outside that scheme:
 //   - toolRequest  — discovery, described above.     (every agent, core)
@@ -75,6 +79,31 @@
 // source is compiled but never executed at registration. There is NO sandbox: a
 // created tool runs with this process's permissions, the same trust model as the
 // commandRun preset. See core/creation.ts for the validated bounds.
+//
+// Tool creation is additionally bounded by policy and budget (R12):
+//   - `toolCreation` is 'all' (default), 'primary' (the tool is not declared to
+//     subagents and a guessed call is rejected), or false (no model-facing tool at
+//     all; the host's `harness.createTool` still works);
+//   - `maxCreatedTools` (default 32) is a LIFETIME budget per harness: reset()
+//     does not restore it, because created tools stay registered across a reset.
+//
+// Cancellation (R10): `HarnessRunOptions.signal` reaches every model request, every
+// tool's `ToolContext.signal`, and every run a tool or agentDelegate starts. The
+// harness checks it BEFORE each turn and before each tool CALL, so a cancelled run
+// starts no new side effects; a call already running is awaited to completion (no
+// racing), because a tool that ignores the signal may still be mutating and the
+// harness must not claim to have stopped it nor release exclusivity early.
+//
+// Model-facing output cap (R10): every serialized tool result AND tool error is
+// passed through `boundToolResult` (64 KiB UTF-8 by default, core/result-budget.ts).
+// Small outputs are byte-exact; a large one becomes a small, valid JSON truncation
+// envelope. The cap is post-serialization, so it bounds conversation cost, not the
+// process's peak memory; UI panels are bounded separately (core/tool-ui.ts).
+//
+// Arguments (R11): the model's JSON is validated against the tool's schema before
+// `execute` sees it (core/schema-validation.ts), then unwrapped by the
+// single-property rule. The manual `executeTool` path validates identically and
+// also accepts the legacy already-unwrapped direct-call form.
 //
 // Manual execution (R8): `harness.executeTool(name, parameters)` runs one
 // REGISTERED tool directly, with this harness's context. It is the host/server path
@@ -99,7 +128,10 @@
 // `subagents` is the allowlist the primary may delegate to. The tool is not
 // declared to subagents (and a guessed call is rejected), so delegation is one
 // level deep; re-entering an already-running agent is rejected by runAgent, which
-// also closes ctx.run cycles.
+// also closes ctx.run cycles. runAgent additionally enforces MAX_RUN_DEPTH
+// centrally (R12), so a created tool that received the whole context and calls
+// `context.run` cannot widen the hierarchy either — while the primary's own
+// trusted ctx.run (textSummarize) still works at depth 2.
 //
 // The bundled preset catalogue (./tools) is preloaded into the registry by
 // default, so a new harness gets fileRead/fileWrite/fileEdit/fileGlob as declared
@@ -124,8 +156,11 @@ import {
     agent as createAgent,
     tool as defineTool,
     searchTools,
-    toolParameterKey,
+    normalizeTags,
     toolUiOf,
+    resolveToolParameters,
+    boundToolResult,
+    DEFAULT_CREATED_TOOLS_LIMIT,
     createDynamicTool,
     createTodoTool,
     createProfileTool,
@@ -158,6 +193,7 @@ import type {
     Tool,
     ToolContext,
     ToolCreation,
+    ToolCreationPolicy,
     ToolCreationResult,
     ToolSearchResult
 } from './types';
@@ -218,28 +254,64 @@ const RESERVED_TOOL_NAMES = [
 
 // Budget for toolCreate: registration is cheap but not free, and an unbounded
 // registry defeats the point of discovery. Session-local (no filesystem writes),
-// reset with the harness object, counted per harness.
-const MAX_CREATED_TOOLS = 32;
+// counted per harness for the LIFETIME of the harness, and configured with
+// `maxCreatedTools`. The default lives in core/creation.ts so the constant is
+// part of the public surface a host can quote.
+const resolveMaxCreatedTools = (value: number | undefined): number => {
+    if (value === undefined) return DEFAULT_CREATED_TOOLS_LIMIT;
+
+    if (!Number.isSafeInteger(value) || value < 1) {
+        throw new HarnessError(
+            `maxCreatedTools must be a positive safe integer; received ${String(value)}.`
+        );
+    }
+
+    return value;
+};
+
+// Who may create tools at runtime (R12). Validated at construction so a typo
+// cannot silently disable (or widen) creation.
+const CREATION_POLICIES: readonly ToolCreationPolicy[] = ['all', 'primary', false];
+
+const resolveToolCreation = (value: ToolCreationPolicy | undefined): ToolCreationPolicy => {
+    if (value === undefined) return 'all';
+
+    if (!CREATION_POLICIES.includes(value)) {
+        throw new HarnessError(
+            `toolCreation must be one of: "all", "primary", false. Received ${String(value)}.`
+        );
+    }
+
+    return value;
+};
+
+// How deeply agent runs may nest (R12): the entry run, plus at most ONE
+// delegation level. Enforced centrally in runAgent so every door — the model's
+// agentDelegate tool, `ctx.run`, and a model-created tool that received the whole
+// `context` and calls `context.run` — obeys the same rule. Without this, a
+// subagent's tool (created or not) could call `run()` on a third agent and turn
+// "one level deep" into an unstated hierarchy.
+//
+// Depth 1 = the run the caller started; depth 2 = a delegated/ctx.run agent. Note
+// that a trusted PRIMARY-triggered ctx.run (the bundled textSummarize preset) is
+// depth 2 and therefore still allowed — the limit only blocks a run STARTED from
+// inside another one at the limit.
+const MAX_RUN_DEPTH = 2;
 
 // Tool results are text on the wire. Strings pass through untouched so a tool
-// can return prose; everything else is JSON.
+// can return prose; everything else is JSON. The model-facing cap is applied by
+// boundToolResult at the ONE place a result is appended (see executeToolCall).
 const serialize = (value: unknown): string => {
     if (value === undefined) return '';
     if (typeof value === 'string') return value;
     return JSON.stringify(value) ?? String(value);
 };
 
-// Apply the single-property rule (see core/tool.ts): when a tool's schema
-// declares exactly one property, the implementation receives that property's
-// value rather than an object wrapping it. This is what keeps a direct call
-// (`fileRead(['package.json'])`) and a model call
-// (`fileRead({ "paths": ["package.json"] })`) identical inside `execute`.
-// Multi-property tools such as syntaxCheck receive the whole object.
-const unwrapParameters = (definition: Tool, parsed: Record<string, unknown>): unknown => {
-    const key = toolParameterKey(definition.parameters);
-    if (key === undefined) return parsed;
-    return parsed[key];
-};
+// The single-property rule (see core/tool.ts) plus runtime schema validation
+// (R11) now live in core/schema-validation.ts, because the MANUAL path
+// (`harness.executeTool`) must resolve arguments identically and must accept the
+// already-unwrapped legacy form. The model path always unwraps the wrapper object.
+
 
 export const harness = (configuration: HarnessConfiguration): Harness => {
     // Resolve the loop bound once, before anything is built, so a bad value fails
@@ -247,6 +319,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // run in this harness (entry, ctx.run, and delegated subagents); each run gets
     // its own budget because the check lives in runAgentCore's loop.
     const maxIterations = resolveMaxIterations(configuration.maxIterations);
+
+    // R12 policy resolved once, at construction: a bad `toolCreation` or
+    // `maxCreatedTools` fails here rather than after a run has started spending.
+    const toolCreation = resolveToolCreation(configuration.toolCreation);
+    const maxCreatedTools = resolveMaxCreatedTools(configuration.maxCreatedTools);
 
     const agentNames = Object.keys(configuration.agents ?? {});
     if (agentNames.length === 0) {
@@ -378,6 +455,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // discovered tool stays available for the rest of the conversation.
     const activeTools = new Set<string>();
 
+    // Progressive discovery (R12). The cap keeps one query to five matches, so a
+    // broad query used to be stationary: the omitted tail was unreachable. This
+    // map remembers, per identical query (normalized tags + limit), how many ranked
+    // matches have already been shown, so repeating the query returns the NEXT
+    // tranche. It is harness state, cleared by reset() with the discovery set.
+    const discoveryOffsets = new Map<string, number>();
+
+    // Key that makes "the same query" exact: normalized and ORDER-INDEPENDENT
+    // (two tag orders are the same question), with the limit included because a
+    // narrower shortlist is a different page size.
+    const discoveryQueryKey = (query: readonly string[], limit: number | undefined): string =>
+        JSON.stringify([[...normalizeTags(query)].sort(), limit ?? null]);
+
     const enableTools = (names: readonly string[]): void => {
         for (const name of names) {
             if (tools[name]) activeTools.add(name);
@@ -404,8 +494,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                   : [];
             const limit = Array.isArray(parameters) ? undefined : parameters?.limit;
 
-            const result = searchTools(Object.values(tools), query, limit);
+            // Repeat the same query to advance through the omitted tail (R12).
+            const key = discoveryQueryKey(query, limit);
+            const offset = discoveryOffsets.get(key) ?? 0;
+
+            const result = searchTools(Object.values(tools), query, limit, offset);
             enableTools(result.enabled);
+
+            // Advance only when this page actually returned matches AND more are
+            // left; when the tail is exhausted the key is dropped so a later
+            // identical query starts a fresh first page instead of an empty one.
+            if (result.remaining > 0 && result.enabled.length > 0) {
+                discoveryOffsets.set(key, offset + result.enabled.length);
+            } else {
+                discoveryOffsets.delete(key);
+            }
 
             return result;
         }
@@ -421,9 +524,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     let createdTools = 0;
 
     const createToolFrom = (configuration: ToolCreation): Tool => {
-        if (createdTools >= MAX_CREATED_TOOLS) {
+        if (createdTools >= maxCreatedTools) {
             throw new HarnessError(
-                `This harness already created ${MAX_CREATED_TOOLS} tools; reuse an existing tool instead of creating more.`
+                `This harness already created ${maxCreatedTools} tools; reuse an existing tool instead of creating more.`
             );
         }
 
@@ -454,26 +557,42 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return definition;
     };
 
-    tools[TOOL_CREATE] = defineTool<ToolCreation, ToolCreationResult>({
-        ...TOOL_CREATE_METADATA,
-        execute: ({ parameters }) => {
-            // Throwing is the error path the harness turns into a readable tool
-            // result: invalid name, reserved name, collision, budget, or a body
-            // that does not parse.
-            const definition = createToolFrom(parameters);
+    // The model-facing toolCreate tool (R2b), gated by the creation policy (R12).
+    // `toolCreation: false` means the tool is not registered at all — a session
+    // without the capability gives an honest "not registered" instead of a tool
+    // that always fails. The host path `harness.createTool` stays available in
+    // every policy: an operator action is not a model privilege.
+    if (toolCreation !== false) {
+        tools[TOOL_CREATE] = defineTool<ToolCreation, ToolCreationResult>({
+            ...TOOL_CREATE_METADATA,
+            execute: ({ parameters, agent: caller }) => {
+                // 'primary' policy: the tool is also not DECLARED to subagents
+                // (see declared()), so this is the defence-in-depth check for a
+                // guessed name — same shape as agentDelegate's own guard.
+                if (toolCreation === 'primary' && caller !== primary) {
+                    throw new HarnessError(
+                        `Only the primary agent "${primaryName}" can create tools; "${caller?.name ?? 'a host'}" cannot.`
+                    );
+                }
 
-            const result: ToolCreationResult = {
-                name: definition.name,
-                description: definition.description,
-                tags: [...definition.tags],
-                enabled: true
-            };
+                // Throwing is the error path the harness turns into a readable tool
+                // result: invalid name, reserved name, collision, budget, or a body
+                // that does not parse.
+                const definition = createToolFrom(parameters);
 
-            if (definition.parameters) result.parameters = definition.parameters;
+                const result: ToolCreationResult = {
+                    name: definition.name,
+                    description: definition.description,
+                    tags: [...definition.tags],
+                    enabled: true
+                };
 
-            return result;
-        }
-    });
+                if (definition.parameters) result.parameters = definition.parameters;
+
+                return result;
+            }
+        });
+    }
 
     // Session todos (R1/R2). One instance per harness: the tool closes over its
     // own list and id counter, so two harnesses (and therefore two server
@@ -557,7 +676,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // so far. Everything else stays out of the context window on purpose.
     //
     // agentDelegate is core for the primary only: it is skipped for every other
-    // agent, so a subagent cannot even see the delegation control.
+    // agent, so a subagent cannot even see the delegation control. toolCreate is
+    // the same under the 'primary' creation policy (R12).
     const declared = (brain: Agent): Tool[] => {
         const core: Tool[] = [];
         const discovered: Tool[] = [];
@@ -565,6 +685,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         for (const definition of Object.values(tools)) {
             if (definition.visibility === 'core') {
                 if (definition.name === AGENT_DELEGATE && brain !== primary) continue;
+                if (definition.name === TOOL_CREATE && toolCreation === 'primary' && brain !== primary) continue;
                 core.push(definition);
             } else if (activeTools.has(definition.name)) {
                 discovered.push(definition);
@@ -589,11 +710,28 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     // Execute one tool call and report it. Every failure mode is converted into a
     // tool result the model can read, so one bad call cannot end the run.
+    //
+    // EXCEPTION: an abort is not a tool failure. It propagates out of this function
+    // (no tool message is written for it) so the run stops and rolls back instead
+    // of inviting the model to retry a call the operator cancelled. See the abort
+    // boundary at the top.
     const executeToolCall = async (brain: Agent, call: HarnessToolCall): Promise<void> => {
+        // ABORT BOUNDARY (R10). Checked BEFORE any work: starting a call that has
+        // already been cancelled would add side effects nobody asked for. The
+        // signal is never raced against the implementation below, because a tool
+        // that ignores it may keep mutating after we stopped awaiting — the harness
+        // therefore always awaits the call it started and makes no claim about
+        // stopping side effects it does not control.
+        runSignal?.throwIfAborted();
+
         await progress({ type: 'tool_call', agent: brain.name, call });
 
+        // Bound every model-facing failure too (R10): a throwing tool can carry an
+        // arbitrarily large message, and it would be replayed for the rest of the
+        // conversation just like a result.
         const fail = async (content: string): Promise<void> => {
-            appendToolResult(brain, call, content);
+            const bounded = boundToolResult(content).content;
+            appendToolResult(brain, call, bounded);
             // `callId` pairs the result with the exact tool_call that caused it,
             // even when two calls in one turn share a name. The server's timing
             // record uses it to attribute elapsed time without guesswork.
@@ -602,7 +740,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 agent: brain.name,
                 name: call.name,
                 callId: call.id,
-                content,
+                content: bounded,
                 isError: true
             });
         };
@@ -628,6 +766,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return;
         }
 
+        // Creation policy (R12) is the same shape of defence for toolCreate.
+        if (call.name === TOOL_CREATE && toolCreation === 'primary' && brain !== primary) {
+            await fail(`Tool "${TOOL_CREATE}" is only available to the primary agent "${primaryName}".`);
+            return;
+        }
+
         // A searchable tool the model has not discovered is not callable, even when
         // it guesses the name: being declared is what makes a tool available, and
         // toolRequest is how a tool gets declared.
@@ -639,14 +783,25 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return;
         }
 
-        // Malformed arguments never reach the implementation.
+        // Malformed JSON never reaches validation, and unmatched arguments never
+        // reach the implementation (R11). The two are reported separately so the
+        // model knows whether to fix its syntax or its shape.
         let parameters: unknown;
         try {
-            const parsed: Record<string, unknown> =
+            const parsed: unknown =
                 call.arguments.trim().length > 0 ? JSON.parse(call.arguments) : {};
-            parameters = unwrapParameters(definition, parsed);
+            parameters = resolveToolParameters(definition.parameters, parsed, 'model');
         } catch (error) {
-            await fail(`Tool "${call.name}" received malformed JSON arguments: ${toErrorInfo(error).message}`);
+            const info = toErrorInfo(error);
+
+            // A SyntaxError came from JSON.parse; anything else is a schema
+            // mismatch raised by resolveToolParameters.
+            const malformed = error instanceof SyntaxError;
+            await fail(
+                malformed
+                    ? `Tool "${call.name}" received malformed JSON arguments: ${info.message}`
+                    : `Tool "${call.name}" received arguments that do not match its schema: ${info.message}`
+            );
             return;
         }
 
@@ -654,12 +809,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             parameters,
             agent: brain,
             agents,
+            // Only present when a run supplied one, so a context object keeps its
+            // original shape for every existing tool and test.
+            ...(runSignal === undefined ? {} : { signal: runSignal }),
             run: (agentName: string, input: string) => {
                 const target = agents[agentName];
                 if (!target) {
                     throw new HarnessError(`Agent "${agentName}" is not registered.`);
                 }
-                return runAgent(target, input);
+                // The run's cancellation and the central depth rule both apply to a
+                // tool-triggered run, exactly as they do to agentDelegate.
+                return runAgent(target, input, runSignal);
             }
         };
 
@@ -671,7 +831,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // the client gets optional declarative panels. Ordinary values pass
             // through unchanged, and a malformed/fake envelope is not recognized.
             const ui = toolUiOf(result);
-            const content = serialize(ui === undefined ? result : ui.content);
+            // R10: the ONE place a model-facing result is capped. Small results are
+            // returned byte-exact; a large one becomes a small, valid truncation
+            // envelope. Panels are bounded separately by core/tool-ui.ts.
+            const content = boundToolResult(serialize(ui === undefined ? result : ui.content)).content;
             appendToolResult(brain, call, content);
             await progress({
                 type: 'tool_result',
@@ -685,6 +848,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 ...(ui === undefined ? {} : { ui: ui.panels })
             });
         } catch (error) {
+            // An abort raised by a cooperating tool is a cancellation, not a tool
+            // failure: propagate it so the run rolls back instead of feeding the
+            // model a "failed" result it would try to work around.
+            if (runSignal?.aborted === true) throw error;
+
             await fail(`Tool "${call.name}" failed: ${toErrorInfo(error).message}`);
         }
     };
@@ -692,11 +860,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // Run one agent to completion. This is the loop the harness exists for.
     //
     // Renamed from runAgent: the guarded entry point is the wrapper below, so
-    // every path (harness call, ctx.run, agentDelegate) shares one recursion check.
+    // every path (harness call, ctx.run, agentDelegate) shares one recursion check,
+    // one depth rule, and one cancellation signal.
     const runAgentCore = async (
         brain: Agent,
         input: string,
-        options?: HarnessRunOptions
+        signal?: AbortSignal
     ): Promise<HarnessAssistantMessage> => {
         // Everything past this index belongs to this run. A failure truncates
         // back to it, so a failed call is never replayed on the next attempt.
@@ -707,9 +876,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         try {
             for (let iteration = 0; iteration < maxIterations; iteration++) {
+                // ABORT BOUNDARY (R10): no new model request once cancelled. The
+                // check sits at the top of the loop AND at the top of
+                // executeToolCall (so a cancellation during a tool round stops the
+                // remaining calls of that round instead of starting them).
+                signal?.throwIfAborted();
+
                 let message: HarnessAssistantMessage | undefined;
 
-                for await (const event of brain.turn({ signal: options?.signal, tools: declarations(brain) })) {
+                for await (const event of brain.turn({ signal, tools: declarations(brain) })) {
                     switch (event.type) {
                         case 'text':
                             await progress({ type: 'text', agent: brain.name, delta: event.delta });
@@ -767,21 +942,27 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
-    // Agents currently executing, outermost first. Two jobs:
+    // Agents currently executing, outermost first. Three jobs now:
     //   - refuse to re-enter a running agent (self-delegation, the primary reached
     //     from inside a subagent, a ctx.run cycle). That can never produce an
     //     answer, only a stack;
-    //   - let the agentDelegate tool prove it runs at the top level, so delegation
-    //     cannot nest.
+    //   - enforce MAX_RUN_DEPTH, so "one level of delegation" is a CENTRAL rule
+    //     that a created tool holding the whole `context` cannot widen (R12);
+    //   - let the agentDelegate tool prove it runs at the top level.
     const runStack: Agent[] = [];
 
+    // Cancellation of the run that is executing RIGHT NOW (outermost runs save and
+    // restore the previous value, so a nested run inherits and returns it). This is
+    // what makes a signal reach tool contexts and delegated subagents (R10).
+    let runSignal: AbortSignal | undefined;
+
     // The one entry point every path uses: the harness call, ctx.run, and
-    // agentDelegate. The guard is here rather than in the agentDelegate tool so a
-    // cycle cannot be opened through the general tool context either.
+    // agentDelegate. The guards live here rather than in the tools so none of them
+    // can be bypassed through the general tool context.
     const runAgent = async (
         brain: Agent,
         input: string,
-        options?: HarnessRunOptions
+        signal?: AbortSignal
     ): Promise<HarnessAssistantMessage> => {
         if (runStack.includes(brain)) {
             throw new HarnessError(
@@ -789,14 +970,30 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             );
         }
 
+        // Central depth/authority rule (R12). Checked AFTER the cycle check so a
+        // cycle keeps its own, more precise message.
+        if (runStack.length >= MAX_RUN_DEPTH) {
+            throw new HarnessError(
+                `Agent "${brain.name}" cannot run: runs nest at most ${MAX_RUN_DEPTH} deep, and "${runStack[runStack.length - 1].name}" is already running.`
+            );
+        }
+
+        // An already-cancelled run must not start: check before pushing anything.
+        signal?.throwIfAborted();
+
+        const previousSignal = runSignal;
+        runSignal = signal;
         runStack.push(brain);
 
         try {
-            return await runAgentCore(brain, input, options);
+            return await runAgentCore(brain, input, signal);
         } finally {
-            // Pop in a finally so a failed or aborted run leaves the stack clean
-            // for the next call.
+            // Pop in a finally so a failed or aborted run leaves the stack and the
+            // signal binding clean for the next call. The run itself is always
+            // awaited to completion (see the abort boundary): this releases
+            // exclusivity only after the last tool has actually settled.
             runStack.pop();
+            runSignal = previousSignal;
         }
     };
 
@@ -842,6 +1039,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // createToolFrom (validation, budget, collisions, guarded compilation) and
     // agentDelegate's own execute re-checks the primary's authority.
     //
+    // R11: the arguments are resolved and VALIDATED exactly like the model path,
+    // except that the already-unwrapped direct-call form is accepted too (see
+    // core/schema-validation.ts). A manual call therefore cannot skip the schema.
+    //
     // No progress events are emitted: a manual call is not a conversation turn, so
     // there is no transcript position for a tool_call/tool_result pair. The
     // caller's request/response carries the duration (ToolCallResult).
@@ -850,16 +1051,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         // The session owns which tools exist: a harness without subagents has no
         // agentDelegate, so an operator asking for one gets an honest error here (the
-        // server maps it to 404) instead of a fabricated implementation.
+        // server maps it to 404) instead of a fabricated implementation. The same is
+        // true of toolCreate under `toolCreation: false`.
         if (!definition) {
             throw new HarnessError(`Tool "${name}" is not registered in this harness.`);
         }
 
+        const resolved = resolveToolParameters(definition.parameters, parameters, 'direct');
+
         return definition.execute({
-            parameters,
+            parameters: resolved,
             // An explicit host call acts as the session's entry agent: agentDelegate
-            // therefore stays primary-only, and ctx.run cycles are still rejected
-            // by runAgent.
+            // therefore stays primary-only, and ctx.run cycles and the depth rule are
+            // still enforced by runAgent.
             agent: primary,
             agents,
             run: (agentName: string, input: string) => {
@@ -874,7 +1078,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     // The harness is a function you call. Properties ride on it so a CLI has
     // everything in one handle without a second lookup object.
-    const run = (input: string, options?: HarnessRunOptions) => runAgent(primary, input, options);
+    const run = (input: string, options?: HarnessRunOptions) =>
+        runAgent(primary, input, options?.signal);
 
     // Every Harness field except `name` and `discoveredTools` is assigned here.
     // Those two are defineProperty'd below: `name` is a built-in function property
@@ -897,16 +1102,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // Server-facing manual execution (R8): the session-bound tool invocation
         // `POST /tools/:name` uses when a client supplies a sessionId.
         executeTool,
-        // reset() is "start over": the conversation goes back to the seeded
-        // instructions, tool discovery is forgotten with it, and the session
-        // todo list and record stores (profiles, chapters, locations) are
+        // reset() is "start over": EVERY agent's conversation goes back to its
+        // seeded instructions (R12 — a subagent used to keep its transcript, which
+        // leaked one session into the next), tool discovery is forgotten, and the
+        // session todo list and record stores (profiles, chapters, locations) are
         // cleared (ids restart at "1"), so the next run begins from the core set
-        // and empty session state. Tools created at runtime stay in the
-        // catalogue (they are registry state, not conversation state); they are
-        // simply no longer enabled until discovered again.
+        // and empty session state.
+        //
+        // Deliberately NOT reset:
+        //   - tools created at runtime stay in the catalogue (registry state, not
+        //     conversation state); they are simply no longer enabled;
+        //   - the creation BUDGET stays spent. It is a lifetime budget: restoring
+        //     it here would let a session grow the registry without bound one reset
+        //     at a time.
         reset: () => {
-            primary.reset();
+            for (const brain of Object.values(agents)) brain.reset();
             activeTools.clear();
+            discoveryOffsets.clear();
             todo.reset();
             profile.reset();
             chapter.reset();
@@ -957,6 +1169,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 // alongside each tool so a consumer can type a direct call without reaching into
 // an internal path.
 export { agent, tool, searchTools, compileToolSource, createDynamicTool, toolUi, toolUiOf } from './core';
+// R10/R11/R12 shared helpers. `boundToolResult` + MODEL_TOOL_RESULT_BUDGET_BYTES
+// are the model-facing 64 KiB cap, exported so a server can apply the SAME cap
+// when it serializes a manual `executeTool` result, and so a tool author can
+// quote the number. `resolveToolParameters` is the canonical unwrap/validate
+// helper (the manual path and the model path both use it); the schema helpers
+// let a host validate arguments before a run. DEFAULT_CREATED_TOOLS_LIMIT is the
+// lifetime toolCreate budget.
+export {
+    MODEL_TOOL_RESULT_BUDGET_BYTES,
+    boundToolResult,
+    utf8ByteLength,
+    resolveToolParameters,
+    validateSchemaValue,
+    checkToolSchemaComplexity,
+    MAX_CREATED_SCHEMA_DEPTH,
+    MAX_CREATED_SCHEMA_NODES,
+    MAX_CREATED_SCHEMA_BYTES,
+    DEFAULT_CREATED_TOOLS_LIMIT
+} from './core';
+export type { BoundedToolResult, SchemaCheck, ToolArgumentMode } from './core';
 // The session record factories are public too, so a host can build the same
 // stores the harness registers (e.g. for a server-side tool or a test). They
 // mirror the core/index.ts exports; todoManage's factory stays internal to keep
@@ -988,6 +1220,7 @@ export type {
     FileReadEntry,
     FileReadParameters,
     FileReadResult,
+    FileReadTarget,
     FileWriteEntry,
     FileWriteParameters,
     FileWriteResult,

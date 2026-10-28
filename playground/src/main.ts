@@ -240,6 +240,11 @@ type View = {
     begin: (prompt: string) => TurnHandle;
     clear: () => void;
     notice: (text: string, tone?: 'info' | 'error') => void;
+    // Session-scoped outcome line (a failed/cancelled run's detail), rendered in
+    // the transcript pane. The topbar pill is app-scoped only, so run failures are
+    // reported HERE and stay attached to the conversation they happened in
+    // (R2: details remain visible; R1: never in the global header).
+    setNotice: (text?: string, tone?: 'info' | 'error') => void;
     setTranscript: (text: string) => void;
     // Replace the whole transcript with the server's turns. Used on boot and on
     // session selection — the server record always wins over local projection.
@@ -287,8 +292,22 @@ const createView = (descriptor: HarnessDescriptor): View => {
     const transcriptBody = el('pre', 'transcript-body', '[]');
     details.append(transcriptBody);
 
+    // Session outcome line. ONE element per view (per harness/session card), so a
+    // failure from a conversation the reader left can never paint into another one:
+    // `applySnapshot` reads the session's own `lastError` into it on every
+    // authoritative answer and clears it once the session is healthy again. Hidden
+    // by default so the common (no-error) view has no empty banner.
+    const sessionNote = el('p', 'notice session-note');
+    sessionNote.hidden = true;
+    const setNotice = (text?: string, tone: 'info' | 'error' = 'error'): void => {
+        const value = text?.trim() ?? '';
+        sessionNote.textContent = value;
+        sessionNote.dataset.tone = tone;
+        sessionNote.hidden = value.length === 0;
+    };
+
     logWrap.append(log);
-    pane.append(logWrap, details);
+    pane.append(sessionNote, logWrap, details);
 
     // Only follow the stream when the reader has not scrolled away from the
     // bottom. Reading history while a run streams is a legitimate thing to do.
@@ -315,6 +334,7 @@ const createView = (descriptor: HarnessDescriptor): View => {
             board.notice(text, tone);
             stick(true);
         },
+        setNotice,
         setTranscript: (text) => {
             transcriptBody.textContent = text;
         },
@@ -343,6 +363,17 @@ const createView = (descriptor: HarnessDescriptor): View => {
             if (existing !== undefined) {
                 existing.merge(turn, model);
                 return existing;
+            }
+
+            // The record for a prompt this browser is still enqueueing (the POST
+            // answer has not arrived yet) must bind the optimistic tile instead of
+            // adding a second row for the same task (R2). The server publishes the
+            // queued `turn` upsert before the 202 body, so this is the normal path
+            // for a task submitted while another one runs.
+            const claimed = board.claim(turn.prompt);
+            if (claimed !== undefined) {
+                claimed.merge(turn, model);
+                return claimed;
             }
 
             // A turn this browser did not submit (another tab, another observer)
@@ -837,15 +868,13 @@ if (app === null) throw new Error('The harness UI needs an #app element.');
 
 const topbar = el('header', 'topbar');
 const brand = el('div', 'brand');
-brand.append(
-    el('span', 'brand-mark', '◍'),
-    el('span', 'brand-name', '@underload/harness'),
-    el('span', 'brand-sub', 'harness ui')
-);
+brand.append(el('span', 'brand-mark', '◍'), el('span', 'brand-name', 'Harness UI'));
 
-// The status pill is the app's single live region: it announces the request
-// lifecycle (connecting → session → waiting → streaming → done/error) to screen
-// readers and shows a spinner on screen. Text *and* movement carry the state, so
+// The status pill is the app's single live region, and it is APP-SCOPED: it
+// announces startup/readiness and app/config failures to screen readers and shows
+// a spinner on screen. Session and run state (queued/running/done/cancelled, a
+// failed turn) is NOT announced here: it belongs to the transcript that owns it
+// (turn tiles + the pane's session note). Text *and* movement carry the state, so
 // colour is never the only signal.
 const statusPill = el('span', 'status');
 statusPill.dataset.state = 'idle';
@@ -1377,6 +1406,13 @@ type Instance = {
     // The latest authoritative turn records for this session, keyed by id. Kept so
     // activity can be recomputed from running records without a full snapshot.
     records: Map<string, SessionTurn>;
+    // Watermark of the newest snapshot this instance has applied, tagged with the
+    // session it came from. The 202 body of POST /tasks is captured at ENQUEUE time
+    // and can resolve after newer observer frames, so its session-level fields
+    // (status, queueDepth, pending) must not override what is already on screen.
+    // Per-turn records are guarded separately by their own `updatedAt`. The tag is
+    // required because pointing the instance at another session resets the clock.
+    snapshotMark?: { sessionId: string; at: number };
 };
 
 const instances = new Map<string, Instance>();
@@ -1607,7 +1643,11 @@ const selectHarness = (name: string): void => {
     // the previous conversation's panels.
     paintPanels();
     runner.sync();
-    setStatus(current.pending ? 'running' : 'idle', current.pending ? 'session running · observing' : undefined);
+    // The topbar pill is APP-scoped: selecting a card never paints that card's run
+    // state into it (R1 — that text went stale the moment another session was
+    // opened). Work the reader selected is visible on its turn tiles, and a failure
+    // detail lives in the pane's session note.
+    setStatus('idle');
     // Re-derive controls for THIS instance: pending work belongs to its session,
     // and leaving a running conversation simply unsubscribes (work continues).
     setBusy(current.pending);
@@ -1927,9 +1967,9 @@ const patchSessionModels = async (
 
     savingAgents = true;
 
-    // Only claim the status pill while idle. During a run the pill belongs to the
-    // run, and a model edit must never look like it owns the request.
-    if (!running) setStatus('running', 'saving agent models');
+    // The pill carries the CONFIG operation (app-scoped action feedback), never the
+    // session's run state — that lives on the tiles (R1).
+    setStatus('running', 'saving agent models');
 
     try {
         const session = await updateSession(id, { agentModels: { ...models } });
@@ -1941,22 +1981,19 @@ const patchSessionModels = async (
 
         instance.sessionModels = agentModelsOf(session);
         if (typeof session.model === 'string') instance.sessionModel = session.model;
+        // The PATCH answer is the newest authoritative state for this session: it
+        // moves the watermark so a 202 body captured before the edit is recognised
+        // as stale instead of reverting the model map (R2).
+        markSnapshot(instance, session);
         upsertSession(session);
         renderSessions();
 
         if (current === instance) renderHarnessChrome();
 
-        // Only claim the pill when nothing else owns it. A streaming run keeps its
-        // own live status, and a session this tab is merely POLLING (reloaded
-        // mid-run) still reports `running` — do not downgrade that to idle.
-        if (running) {
-            // Pending work owns the pill's colour; the sentence reports the save.
-            setStatus('running', 'agent models saved · session running');
-        } else if (session.status === 'running') {
-            setStatus('running', 'agent models saved · session running');
-        } else {
-            setStatus('idle', 'agent models saved · next request');
-        }
+        // The save is a CONFIG action, so its result is app-scoped feedback. It says
+        // "next request" for a running session too: the run's own progress belongs
+        // to the tiles, never to the header (R1).
+        setStatus('idle', 'agent models saved · next request');
     } catch (error) {
         // Errors are shown even mid-run: a rejected model is something the reader
         // must see, and the streaming turn keeps its tiles either way. The row is
@@ -2327,33 +2364,112 @@ const pendingOf = (session: SessionSnapshot): boolean => {
 // transcript; `messages` is the entry agent's own view of the same run and is
 // informational. The frozen definition, when sent, becomes the displayed team.
 //
-// R4: this RECONCILES the timeline (same id → merge in place) rather than
+// R4: this RECONCILES the list (same id → merge in place) rather than
 // rebuilding it, so a reconnect/poll neither duplicates streamed text nor collapses
 // the reader's expanded turn. It also refreshes what the composer's neighbours need
 // to know: whether work is pending (Stop enabled, Reset disabled) and the activity
 // rings (only still-running records light an agent).
-const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
-    const wasPending = instance.pending;
+// Draw a snapshot into its harness view. The turns are the authoritative
+// transcript; `messages` is the entry agent's own view of the same run and is
+// informational. The frozen definition, when sent, becomes the displayed team.
+//
+// R4: this RECONCILES the list (same id → merge in place) rather than
+// rebuilding it, so a reconnect/poll neither duplicates streamed text nor collapses
+// the reader's expanded turn. It also refreshes what the composer's neighbours need
+// to know: whether work is pending (Stop enabled, Reset disabled) and the activity
+// rings (only still-running records light an agent).
+//
+// Record where a snapshot sits in its session's monotonic timeline. EVERY answer
+// that carries an authoritative `SessionSnapshot` announces itself here — the
+// stream/poll/202 hydration path (applySnapshot) and the model PATCH, which
+// applies its answer directly without a reconcile. Without the PATCH's mark a
+// delayed 202 body would look newer than the last *streamed* snapshot and revert
+// the edit it predates.
+//
+// `updatedAt` is absent from legacy fixtures: then nothing is recorded and the
+// caller never treats a snapshot as stale (graceful, no regression).
+const markSnapshot = (instance: Instance, session: SessionSnapshot): void => {
+    const stamp = session.updatedAt;
 
+    if (typeof stamp !== 'number' || !Number.isFinite(stamp)) return;
+
+    instance.snapshotMark = { sessionId: session.id, at: stamp };
+};
+
+// The server records a DELIBERATE stop as this exact sentence (server/sessions.ts:
+// `failure = session.cancelled ? 'The run was cancelled.' : messageOf(error)`).
+// The turn tile already renders the `cancelled` status, so the sentence is
+// suppressed from the pane note: a user's own Stop is not an error to report.
+const CANCELLED_MESSAGE = 'The run was cancelled.';
+
+const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     instance.sessionId = session.id;
 
-    // The frozen definition is the conversation's own team. Assign even when the
-    // server omitted it (legacy): keeping a previous session's frozen team would
-    // describe the wrong chat.
-    instance.frozen = frozenDefinitionOf(session);
+    // Snapshot watermark (R2). `session.updatedAt` is monotonic on the server, so a
+    // snapshot stamped BEFORE the newest one already applied is stale: it can only
+    // be the 202 body captured at enqueue time that resolved late. Its session-level
+    // status/queueDepth must not override the observer's newer frames (`turns` are
+    // still reconciled below — each turn carries its OWN `updatedAt` guard).
+    const stamp = session.updatedAt;
+    const mark =
+        instance.snapshotMark !== undefined && instance.snapshotMark.sessionId === session.id
+            ? instance.snapshotMark.at
+            : undefined;
+    const stale =
+        typeof stamp === 'number' && Number.isFinite(stamp) && mark !== undefined ? stamp < mark : false;
+    if (!stale) markSnapshot(instance, session);
 
-    // The session's LIVE effective per-agent models + the settings model they
-    // inherit from (R2). The frozen `harnessDefinition` above is historical; this
-    // map is not: PATCH /sessions/:id replaces it and the next request uses it.
-    instance.sessionModels = agentModelsOf(session);
-    instance.sessionModel = typeof session.model === 'string' ? session.model : undefined;
-    instance.discovered = Array.isArray(session.discoveredTools)
-        ? [...session.discoveredTools]
-        : undefined;
+    // A STALE snapshot may not rewrite anything the reader can see and act on:
+    // the frozen team, the live per-agent model map (a delayed 202 would revert a
+    // model PATCH made while it was in flight), discovery, the transcript pane and
+    // the sessions-rail cache all come from the newest snapshot only. What a stale
+    // snapshot MAY still do is reconcile turn records/tiles (each turn carries its
+    // own `updatedAt` guard) and recompute `pending` from those records.
+    if (!stale) {
+        // The frozen definition is the conversation's own team. Assign even when the
+        // server omitted it (legacy): keeping a previous session's frozen team would
+        // describe the wrong chat.
+        instance.frozen = frozenDefinitionOf(session);
+
+        // The session's LIVE effective per-agent models + the settings model they
+        // inherit from (R2). The frozen `harnessDefinition` above is historical; this
+        // map is not: PATCH /sessions/:id replaces it and the next request uses it.
+        instance.sessionModels = agentModelsOf(session);
+        instance.sessionModel = typeof session.model === 'string' ? session.model : undefined;
+        instance.discovered = Array.isArray(session.discoveredTools)
+            ? [...session.discoveredTools]
+            : undefined;
+    }
 
     // Authoritative records: latest snapshot, keyed by the server's stable id.
-    instance.records = new Map(session.turns.map((turn) => [turn.id, turn]));
-    instance.pending = pendingOf(session);
+    // MONOTONIC per id: a stale snapshot may not replace a record this instance
+    // already holds in a newer revision, otherwise `pending`/activity would flicker
+    // back to a state the observer has already moved past.
+    const records = new Map<string, SessionTurn>();
+    for (const turn of session.turns) {
+        const known = instance.records.get(turn.id);
+        const knownAt = known === undefined ? undefined : known.updatedAt;
+        records.set(
+            turn.id,
+            known !== undefined &&
+                typeof knownAt === 'number' &&
+                typeof turn.updatedAt === 'number' &&
+                knownAt > turn.updatedAt
+                ? known
+                : turn
+        );
+    }
+    instance.records = records;
+
+    // Pending: a live (running/queued) RECORD is authoritative even when the
+    // snapshot that carried it is stale. The session-level flags are only trusted
+    // from a snapshot that is not stale (a stale `status: running` would leave Stop
+    // enabled after the queue has drained).
+    const liveRecord = [...records.values()].some((turn) => {
+        const status = turn.status as string;
+        return status === 'running' || status === 'queued';
+    });
+    instance.pending = liveRecord || (!stale && (queueDepthOf(session) > 0 || session.status === 'running'));
 
     // Activity from a hydrated/polled record: ONLY a still-running turn can make
     // an agent busy. Replaying a settled turn (done/error/cancelled) lights
@@ -2361,7 +2477,7 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     // working yet, so it lights nothing either.
     instance.activity.clear();
     if (instance.pending) {
-        for (const name of activityOfTurns(session.turns)) instance.activity.add(name);
+        for (const name of activityOfTurns([...records.values()])) instance.activity.add(name);
     }
 
     // R21.3: the tool panels are DERIVED from the server's recorded turns on every
@@ -2369,13 +2485,35 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     // turn's panels are valid scratch state (they describe work that happened), but
     // they never light an agent ring: activity above only reads a RUNNING turn.
     // Recomputation also means no cross-session leakage: the board is replaced with
-    // exactly what this conversation recorded.
-    instance.panels = mediaOfTurns(session.turns);
+    // exactly what this conversation recorded. A stale snapshot is skipped: its
+    // older turn list would drop panels a newer frame already delivered.
+    if (!stale) instance.panels = mediaOfTurns(session.turns);
 
-    instance.view.reconcile(session.turns, session.model);
-    instance.view.setTranscript(JSON.stringify(session.messages, null, 2));
-    upsertSession(session);
-    renderSessions();
+    // The tile detail line follows the model the instance CURRENTLY runs, not the
+    // one the snapshot was stamped with (a stale 202 predates a model PATCH).
+    instance.view.reconcile(session.turns, stale ? instance.sessionModel : session.model);
+
+    if (!stale) {
+        instance.view.setTranscript(JSON.stringify(session.messages, null, 2));
+        upsertSession(session);
+        renderSessions();
+
+        // Session outcome detail (R1/R2). This is the ONE report of a failed run:
+        // the topbar pill is app-scoped, so a failure can neither leak into another
+        // session's header nor go stale when the reader switches away. The tile's
+        // status word still says `error`/`cancelled`; this line adds the server's
+        // message, which the record's events do not carry. A deliberate stop is
+        // suppressed: the server stores `The run was cancelled.` as `lastError`, and
+        // the tile already reports `cancelled` — repeating it here would present the
+        // user's own Stop as an error.
+        const failure =
+            session.status === 'error'
+                ? session.lastError === CANCELLED_MESSAGE
+                    ? undefined
+                    : (session.lastError ?? 'session error')
+                : undefined;
+        instance.view.setNotice(failure);
+    }
 
     if (current !== instance) return;
 
@@ -2383,33 +2521,6 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     renderHarnessChrome();
     paintPanels();
     runner.sync();
-
-    // Pill: pending work reports the queue; a transition out of pending is the
-    // completion of the task the reader was watching. Opening settled history just
-    // returns to idle (openSession may refine this for an error session).
-    if (instance.pending) {
-        const depth = queueDepthOf(session);
-        setStatus(
-            'running',
-            session.status === 'running'
-                ? depth > 0
-                    ? `session running · ${depth} queued`
-                    : 'session running'
-                : 'session queued'
-        );
-    } else if (wasPending) {
-        // The task this reader was watching has settled. A deliberate stop is
-        // reported as "cancelled" (idle tone: it is not a failure); anything else
-        // is the done line the UI has always shown.
-        const last = session.turns[session.turns.length - 1];
-        if (last?.status === 'cancelled') setStatus('idle', 'cancelled');
-        else setStatus('done', `done · ${session.model} · ${session.status}`);
-    } else if (session.status === 'error') {
-        setStatus('error', session.lastError ?? 'session error');
-    } else {
-        setStatus('idle');
-    }
-
     setBusy(instance.pending);
 };
 
@@ -2496,12 +2607,9 @@ const onStreamItem = (
         refreshActivity(instance);
 
         if (current === instance) {
-            if (instance.pending) {
-                setStatus('running', 'session running · queue updated');
-            } else {
-                // The last retained task settled; the drain snapshot refines this.
-                setStatus('done', `done · ${instance.sessionModel ?? ''}`.trim());
-            }
+            // The topbar pill is app-scoped. The last retained task settling is a
+            // session outcome: the tile says `done`/`error`/`cancelled`, so the
+            // global header is left untouched (R1).
             setBusy(instance.pending);
         }
         return;
@@ -2537,9 +2645,10 @@ const onStreamItem = (
     }
 
     // Terminal/drain frames (snapshot | failed) carry the complete session, turns
-    // included. Apply it reconciles everything the frames may have missed.
+    // included. Apply it reconciles everything the frames may have missed — and its
+    // `lastError` populates the pane's session note. The pill is NOT touched: a
+    // failed run is session-scoped (R1); its detail is in the transcript (R2).
     applySnapshot(instance, item.session);
-    if (item.type === 'failed') setStatus('error', item.error.message);
 };
 
 // Re-read the session after an observer ends, then reopen it only if work is
@@ -2601,13 +2710,11 @@ const startWatching = (instance: Instance, sessionId: string): void => {
             if (controller.signal.aborted) return;
             if (watch?.controller === controller) watch = undefined;
 
-            if (instance.sessionId === sessionId) {
-                setStatus(
-                    instance.pending ? 'running' : 'idle',
-                    instance.pending ? 'live stream lost · polling server' : 'live stream closed'
-                );
-                pollSession(instance, sessionId);
-            }
+            // Losing the live stream is not a run failure: polling continues to
+            // paint the same session, so neither the app-scoped pill nor the pane's
+            // error note is touched (R1/R3). A genuine failure of that fallback is
+            // reported by `pollSession` itself.
+            if (instance.sessionId === sessionId) pollSession(instance, sessionId);
         });
 };
 
@@ -2635,7 +2742,13 @@ const pollSession = (instance: Instance, id: string): void => {
             if (token !== pollToken) return;
 
             stopPolling();
-            setStatus('error', `polling session: ${messageOf(error)}`);
+            // A lost fallback is a real connectivity failure for THIS conversation,
+            // so it is reported in the pane (actionable, scoped) rather than in the
+            // app-scoped header (R1/R3). The session keeps its last painted state.
+            instance.view.setNotice(
+                `lost connection while following this session: ${messageOf(error)}`,
+                'error'
+            );
             return;
         }
 
@@ -2652,11 +2765,13 @@ const pollSession = (instance: Instance, id: string): void => {
             return;
         }
 
-        setStatus('running', 'session running · polling server');
-
+        // The pill is app-scoped: a session that is still being polled is visible
+        // on its tiles and Stop button, not in the global header (R1).
         if (attempts >= POLL_MAX_ATTEMPTS) {
             stopPolling();
-            setStatus('error', 'stopped polling a long-running session · reload to retry');
+            // Bounded fallback exhausted: report where the conversation is, not in
+            // the header, and say what the reader can do (R2/R3).
+            instance.view.setNotice('stopped following this session · reopen it to retry', 'info');
             return;
         }
 
@@ -2717,15 +2832,13 @@ const openSession = async (id: string): Promise<void> => {
     if (pendingOf(session)) {
         // R4: a reloaded/selected session with a live queue gets the observer, not
         // a one-way poll — queued tasks advance and stream here automatically.
-        setStatus('running', session.status === 'running' ? 'session running' : 'session queued');
+        // No header write: pending work is session state, shown on its tiles.
         startWatching(target, id);
         return;
     }
 
-    setStatus(
-        session.status === 'error' ? 'error' : 'idle',
-        session.status === 'error' ? (session.lastError ?? 'session error') : undefined
-    );
+    // A saved error session's detail is already in the pane note via
+    // `applySnapshot`; the topbar pill stays app-scoped (R1).
 };
 
 // Explicit new conversation: forget the pointer and drop the local projection.
@@ -2755,12 +2868,18 @@ const newSession = (): void => {
     // belongs to the previous session and keeps running there.
     instance.pending = false;
     instance.records.clear();
+    // The watermark belonged to the previous conversation; a new session's
+    // snapshots start a fresh clock.
+    instance.snapshotMark = undefined;
     // A new conversation has no tool output yet: clearing the instance state and
     // repainting is what drops the previous session's board and any manual panels
     // that lived only in the browser (R21.3).
     instance.panels.clear();
     clearActivity();
     instance.view.clear();
+    // The conversation (and its failure/stop detail) is gone; an empty session has
+    // no outcome to report.
+    instance.view.setNotice(undefined);
     instance.view.setTranscript('[]');
     if (instance === current) forgetRememberedSession();
     renderHarnessChrome();
@@ -2819,11 +2938,16 @@ const setBusy = (value: boolean): void => {
     paintControls();
 };
 
-// `state` drives the pill's colour and spinner; `detail` is the human sentence.
+// The topbar pill is the APP's live state (R1), and the only live region:
+//   connecting → startup/bootstrap, `idle` → ready, `error` → an app or config
+//   operation the reader must act on (offline server, unreadable session list,
+//   rejected harness/config edit).
 //
-// States map onto real phases only — no timers invent progress:
-//   connecting → opening/loading, `running` → session created / request in
-//   flight or streaming, `done` / `error` → terminal.
+// It must NEVER carry session/run outcomes: running, queued, done, cancelled and
+// failed turns are properties of ONE conversation, already rendered by its tiles
+// (status word) and its pane note (`View.setNotice`, error detail). Painting them
+// here made the header lie the moment the reader switched sessions (the cancelled
+// session's "The run was cancelled." outlived it).
 const setStatus = (state: 'idle' | 'running' | 'done' | 'error' | 'connecting', detail?: string): void => {
     statusPill.dataset.state = state;
     statusText.textContent = detail === undefined ? state : detail;
@@ -2903,7 +3027,8 @@ const run = async (): Promise<void> => {
     input.value = '';
     submitting = true;
     paintControls();
-    setStatus('connecting', 'queueing task');
+    // No header write: the optimistic tile already shows the submit lifecycle, and
+    // the topbar pill is app-scoped (R1).
 
     let sessionId: string | undefined;
 
@@ -2945,19 +3070,23 @@ const run = async (): Promise<void> => {
             instance.sessionId = undefined;
             instance.frozen = undefined;
             instance.records.clear();
+            instance.snapshotMark = undefined;
             instance.pending = false;
             instance.panels.clear();
+            // The conversation is gone from the server; any outcome detail from it
+            // would describe a session this card no longer points at.
+            instance.view.setNotice(undefined);
             if (instance === current) paintPanels();
             if (instance === current) forgetRememberedSession();
             void refreshSessions();
         }
 
         // A failed submit is the TASK's failure (rejected input, unreachable
-        // server): the tile says so and keeps its prompt. It is not a stream
-        // failure, which is reported separately and never marks a task failed.
+        // server): the tile and the transcript notice say so, and the prompt stays.
+        // It is not a stream failure, and it is NOT painted into the app-scoped
+        // header (R1): a run failure must not outlive the session it belongs to.
         turn.setState('error', message);
         instance.view.notice(`task failed: ${message}`, 'error');
-        setStatus('error', message);
         void refreshSessions();
     } finally {
         submitting = false;
@@ -2992,8 +3121,9 @@ stopButton.addEventListener('click', () => {
     // would only unsubscribe — work would keep running.
     stopWatching();
 
-    // Immediate acknowledgement: the cancel round trip has not answered yet.
-    setStatus('running', 'stopping');
+    // The cancel round trip is async; the tile keeps its last state until the
+    // server confirms. No header acknowledgement: Stop is a session action and is
+    // not an app-level state (R1).
 
     // Stopping is the user's terminal signal: no ring may keep spinning while the
     // cancellation round-trip finishes.
@@ -3027,12 +3157,15 @@ resetButton.addEventListener('click', () => {
     // stop first (unsubscribe only) or late frames would repaint wiped turns.
     stopWatching();
     instance.view.clear();
+    // The wiped conversation has no outcome left to report.
+    instance.view.setNotice(undefined);
     instance.view.setTranscript('[]');
     // Local reset clears the board immediately, before the server answers: the
     // conversation is being emptied, so its tool panels and queue state are too.
     instance.panels.clear();
     instance.pending = false;
     instance.records.clear();
+    instance.snapshotMark = undefined;
     paintPanels();
     clearActivity();
     setStatus('idle');
@@ -3053,9 +3186,11 @@ resetButton.addEventListener('click', () => {
             // stale id so the next run creates a fresh session.
             instance.sessionId = undefined;
             instance.frozen = undefined;
+            instance.view.setNotice(undefined);
             if (instance === current) forgetRememberedSession();
-            instance.view.notice(`reset failed: ${messageOf(error)}`);
-            setStatus('error', messageOf(error));
+            // The failure stays on this conversation (pane notice); the topbar pill
+            // is app-scoped and is not turned red for a session operation (R1).
+            instance.view.notice(`reset failed: ${messageOf(error)}`, 'error');
             void refreshSessions();
         }
     );

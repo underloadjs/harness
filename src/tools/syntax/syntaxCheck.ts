@@ -30,7 +30,14 @@ export type SyntaxCheckParameters = {
 
 export const syntaxCheck = tool<SyntaxCheckParameters, boolean>({
     ...PRESET_TOOLS.syntaxCheck,
-    execute: async ({ parameters }) => {
+    execute: async (context) => {
+        const parameters = context.parameters;
+
+        // context.signal is being added to ToolContext by a parallel change; read
+        // it structurally so this module works with or without that field typed.
+        // Only the Python checker consumes it — the JS check never yields.
+        const signal = (context as { signal?: AbortSignal }).signal;
+
         // The schema constrains `language`, but a direct call bypasses it. Reject
         // an unknown language as a setup error rather than returning a silent
         // "false" that would look like a syntax verdict.
@@ -45,7 +52,7 @@ export const syntaxCheck = tool<SyntaxCheckParameters, boolean>({
                 // Loaded on demand: this keeps node:child_process (and the
                 // interpreter probe) out of a JavaScript check.
                 const { checkPython } = await import('./python');
-                return checkPython(parameters.code);
+                return checkPython(parameters.code, signal);
             }
 
             default:

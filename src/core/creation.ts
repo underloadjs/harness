@@ -38,12 +38,15 @@
 // Cross-references:
 //   - ../types        — ToolCreation, ToolCreationResult, ToolContext
 //   - ./tool          — the Tool factory every created tool is built with
-//   - ../harness      — registry checks, toolCreate tool, harness.toolCreate()
+//   - ./schema-validation — the depth/size gate on a created schema (R11)
+//   - ../harness      — registry checks, toolCreate tool, harness.toolCreate(),
+//                       and the lifetime creation budget
 //   - ../util         — HarnessError, toErrorInfo
 
 import { HarnessError, toErrorInfo } from '../util';
 import type { Tool, ToolContext, ToolCreation } from '../types';
 import { tool } from './tool';
+import { checkToolSchemaComplexity } from './schema-validation';
 
 // A wire-safe tool name: one letter first, then letters/digits/_/-, at most 64
 // characters. The OpenAI function-name alphabet is the practical constraint.
@@ -55,6 +58,20 @@ const MAX_SOURCE_LENGTH = 20_000;
 const MAX_DESCRIPTION_LENGTH = 2_000;
 const MAX_TAGS = 16;
 const MAX_TAG_LENGTH = 64;
+
+// The default LIFETIME creation budget for one harness (R12). Registration is
+// cheap but not free, and an unbounded registry defeats the point of discovery.
+//
+// Semantics that matter and are easy to get wrong:
+//   - the budget is per HARNESS INSTANCE and is NOT restored by reset(): created
+//     tools stay registered after a reset (only their enabled/discovery state is
+//     cleared), so restoring the counter would let a session grow the registry
+//     without bound over its lifetime;
+//   - it is counted in successful registrations, so a rejected creation (bad
+//     name, collision, compile error) costs nothing;
+//   - a harness may raise or lower it with `maxCreatedTools`.
+export const DEFAULT_CREATED_TOOLS_LIMIT = 32;
+
 
 // `AsyncFunction` is not a global binding, so it is reached through the prototype
 // of an async function. The cast is variadic because the constructor takes the
@@ -145,6 +162,15 @@ export const createDynamicTool = (
             JSON.stringify(parameters);
         } catch {
             throw new HarnessError(`Tool "${name}" parameters must be JSON-serialisable.`);
+        }
+
+        // R11: a created schema is also validated at runtime, so bound its depth
+        // and size now. A 500-level or 10k-node schema would be a context bomb on
+        // every future request as well as a validation cost.
+        const complexity = checkToolSchemaComplexity(parameters);
+
+        if (!complexity.valid) {
+            throw new HarnessError(`Tool "${name}" parameters ${complexity.message}.`);
         }
     }
 

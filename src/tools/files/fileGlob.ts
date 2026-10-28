@@ -33,6 +33,29 @@
 //   maxResults Requested cap, clamped to 1-100. ONE global cap across every root
 //              and pattern, not a per-root budget.
 //
+// CONTENT BOUNDS (this revision)
+// ------------------------------
+// A content search used to copy each matching LINE in full, so one match on a
+// minified bundle (a single multi-megabyte line) could blow up the whole response.
+// Every match is now bounded twice:
+//
+//   - SNIPPET: at most FILE_GLOB_MATCH_TEXT_BYTES (1 KiB) of UTF-8 per match. The
+//     cut is made on a code-point boundary (`for...of` iterates code points, so a
+//     surrogate pair is never split). A cut snippet is flagged with
+//     `textTruncated: true` on that match — the omission is explicit, never silent.
+//   - AGGREGATE: at most FILE_GLOB_CONTENT_BUDGET (64 KiB) of UTF-8 match text per
+//     call, the same budget fileRead uses. When the next match would cross it the
+//     search stops and `truncated: true` is reported, because a match that exists
+//     was NOT returned. The returned matches stay a genuine prefix of the walk, so
+//     re-running with a narrower pattern is the honest way to see the rest.
+//
+// `line` is always the ORIGINAL 1-based line number, even when the snippet was cut;
+// `bytes` is the UTF-8 size of the returned snippet (not of the whole line). The
+// result reports `bytes` (charged against the budget) and `contentBudget` (the cap
+// itself) so a caller can see the policy it is subject to. Only CONTENT mode is
+// byte-bounded: filename mode returns short paths capped by maxResults, and its
+// `{ files, truncated }` shape is unchanged.
+//
 // PATTERNS ARE RELATIVE TO EACH ROOT
 // ----------------------------------
 // A pattern is matched against the path of a file RELATIVE TO THE ROOT that found
@@ -85,6 +108,14 @@ import {
     walkFiles
 } from './glob';
 
+// Maximum UTF-8 bytes of ONE matching line returned as `text`. A longer line is cut
+// on a code-point boundary and flagged with `textTruncated: true`.
+export const FILE_GLOB_MATCH_TEXT_BYTES = 1024;
+
+// Maximum UTF-8 bytes of match text across the whole call (the same 64 KiB budget
+// fileRead uses). Reaching it ends the search with `truncated: true`.
+export const FILE_GLOB_CONTENT_BUDGET = 64 * 1024;
+
 export type FileGlobParameters = {
     // Glob patterns, OR-ed. Defaults to ['**/*'] (every file).
     patterns?: string[];
@@ -100,10 +131,15 @@ export type FileGlobParameters = {
 export type FileGlobMatch = {
     // Root-prefixed path, posix-style on every platform.
     path: string;
-    // 1-based line number.
+    // 1-based line number IN THE FILE (unchanged by snippet truncation).
     line: number;
-    // The full line, without its terminator.
+    // The line, without its terminator, cut to FILE_GLOB_MATCH_TEXT_BYTES at most.
     text: string;
+    // True when the line was longer than the snippet cap, so `text` is a PREFIX and
+    // the rest of that line was not returned. Explicit, never a silent omission.
+    textTruncated: boolean;
+    // UTF-8 bytes in `text` (the snippet), charged against the aggregate budget.
+    bytes: number;
 };
 
 // Filename-mode result.
@@ -117,8 +153,13 @@ export type FileGlobFilesResult = {
 // Content-mode result.
 export type FileGlobMatchesResult = {
     matches: FileGlobMatch[];
-    // True when the cap was hit and more matches exist beyond the returned set.
+    // True when the cap OR the byte budget stopped the search and more matches
+    // exist beyond the returned set. A genuinely complete result is false.
     truncated: boolean;
+    // Total UTF-8 bytes of match text returned across `matches`.
+    bytes: number;
+    // The fixed aggregate content budget this call was subject to. Metadata only.
+    contentBudget: number;
 };
 
 // The discriminated union a caller gets back.
@@ -291,8 +332,41 @@ const listMatchingFiles = async (
     return { files: truncated ? files.slice(0, limit) : files, truncated };
 };
 
+// Cut one matching line down to the snippet cap WITHOUT splitting a code point.
+//
+// `for...of` over a string iterates code points, so a surrogate pair (an emoji, an
+// astral character) contributes its whole 4-byte sequence or nothing. Measuring in
+// UTF-8 bytes rather than UTF-16 units is what makes the cap match what the caller
+// actually receives on the wire. A line that already fits is returned untouched
+// (same string instance), so the common case allocates nothing.
+const truncateSnippet = (
+    line: string,
+    maxBytes: number
+): { text: string; bytes: number; textTruncated: boolean } => {
+    const bytes = Buffer.byteLength(line, 'utf8');
+
+    if (bytes <= maxBytes) return { text: line, bytes, textTruncated: false };
+
+    let used = 0;
+    let text = '';
+
+    for (const character of line) {
+        const size = Buffer.byteLength(character, 'utf8');
+
+        // Stop BEFORE the character that would cross the cap: the snippet is a
+        // prefix of the line, never a re-encoded fragment.
+        if (used + size > maxBytes) break;
+
+        text += character;
+        used += size;
+    }
+
+    return { text, bytes: used, textTruncated: true };
+};
+
 // Content mode: read each candidate, skip binary/oversized files, and report every
-// matching line. The cap is global across roots and patterns.
+// matching line. Both the match cap and the aggregate byte budget are global across
+// roots and patterns.
 const searchContents = async (
     roots: readonly string[],
     compiled: ReturnType<typeof compilePatterns>,
@@ -305,6 +379,7 @@ const searchContents = async (
     const matcher = createBoundedLineMatcher(source);
 
     const matches: FileGlobMatch[] = [];
+    let bytes = 0;
     let truncated = false;
 
     for await (const candidate of collect(roots, compiled)) {
@@ -329,20 +404,31 @@ const searchContents = async (
         // One bounded call per FILE (not per line): the vm boundary is crossed
         // once, and a catastrophic pattern is stopped by the cumulative deadline.
         for (const index of matcher.testLines(lines)) {
-            matches.push({ path: candidate.display, line: index + 1, text: lines[index] });
+            const snippet = truncateSnippet(lines[index], FILE_GLOB_MATCH_TEXT_BYTES);
 
-            // Collect one past the cap: that extra match is how we know the result
-            // is genuinely truncated rather than exactly full.
-            if (matches.length > limit) {
+            // The cap and the budget are checked against a match that EXISTS but
+            // cannot be returned, which is exactly what makes `truncated` truthful:
+            // there is provably more result beyond the window. An exact fit (cap or
+            // budget reached on the last match) is NOT truncation.
+            if (matches.length >= limit || bytes + snippet.bytes > FILE_GLOB_CONTENT_BUDGET) {
                 truncated = true;
                 break;
             }
+
+            matches.push({
+                path: candidate.display,
+                line: index + 1,
+                text: snippet.text,
+                textTruncated: snippet.textTruncated,
+                bytes: snippet.bytes
+            });
+            bytes += snippet.bytes;
         }
 
         if (truncated) break;
     }
 
-    return { matches: truncated ? matches.slice(0, limit) : matches, truncated };
+    return { matches, truncated, bytes, contentBudget: FILE_GLOB_CONTENT_BUDGET };
 };
 
 export const fileGlob = tool<FileGlobParameters, FileGlobResult>({

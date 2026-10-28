@@ -5,8 +5,8 @@
 // schema (the R7 five-match cap and the `remaining` count), the toolCreate
 // security statement, the todoManage actions, the record tools' schemas and
 // partial-update contract, and the agentDelegate allowlist. The server describes
-// the same tools in its catalogue from `src/core/metadata.ts` — the copy these
-// registrations use — so pinning the registered text here also pins what a
+// the same tools in its catalogue from `src/core/metadata.ts` - the copy these
+// registrations use - so pinning the registered text here also pins what a
 // descriptor advertises; `server/api.test.ts` asserts that projection end to end.
 //
 // T14: the wire names are toolRequest / toolCreate / todoManage / profileManage /
@@ -103,7 +103,8 @@ describe('core tool metadata', () => {
         const writer = solo();
 
         // The enum is the accepted action list; ./todo.ts validates against the same
-        // values and owns their order in error messages.
+        // values and owns their order in error messages. R9 adds the paging cursor
+        // and the text cap to the schema the model reads.
         expect(writer.tools.todoManage.parameters).toEqual({
             type: 'object',
             properties: {
@@ -115,7 +116,7 @@ describe('core tool metadata', () => {
                 text: {
                     type: 'string',
                     description:
-                        'Todo text for "add". Required for that action; trimmed before storage.'
+                        'Todo text for "add". Required for that action; trimmed. Maximum 4000 characters.'
                 },
                 id: {
                     type: 'string',
@@ -125,6 +126,18 @@ describe('core tool metadata', () => {
                     type: 'boolean',
                     description:
                         'For "check" only: true (default) marks complete, false unchecks. "uncheck" is the same as false.'
+                },
+                offset: {
+                    type: 'integer',
+                    minimum: 0,
+                    description:
+                        'For "list" only: 0-based index of the first item. Defaults to 0; use page.nextOffset from the previous page.'
+                },
+                limit: {
+                    type: 'integer',
+                    minimum: 1,
+                    maximum: 100,
+                    description: 'For "list" only: page size, 1-100. Defaults to 20.'
                 }
             },
             required: ['action'],
@@ -139,7 +152,7 @@ describe('core tool metadata', () => {
             'plan'
         ]);
         expect(writer.tools.todoManage.description).toBe(
-            'Manage the todo list for this harness session. Actions: "add" (requires text), "remove" (requires id), "check" (requires id; completed defaults to true, false unchecks), "uncheck" (requires id), and "list". Ids are stable strings returned by "add". The list is shared by every agent in this harness, kept across turns, and cleared by reset. Returns todos plus counts { total, completed, remaining }, and the affected todo (or removed item).'
+            'Manage the todo list for this harness session. Actions: "add" (requires text), "remove" (requires id), "check" (requires id; completed defaults to true, false unchecks), "uncheck" (requires id), and "list". Ids are stable strings returned by "add". The list is shared by every agent in this harness, kept across turns, and cleared by reset. "list" returns ONE PAGE: { todos, counts { total, completed, remaining }, page { offset, limit, hasMore, nextOffset? } } - 20 items by default, at most 100, and a 64 KiB serialized page budget, so pass page.nextOffset back as offset while page.hasMore. Every mutation returns { todo|removed, counts } with NO list, so call "list" to read it. Caps: 200 todos, 4000 characters of text each.'
         );
     });
 
@@ -161,24 +174,40 @@ describe('core tool metadata', () => {
                 },
                 name: {
                     type: 'string',
+                    maxLength: 200,
                     description:
-                        'Profile name for "add", or a replacement name for "update". Required for "add"; trimmed.'
+                        'Profile name for "add", or a replacement name for "update". Required for "add"; trimmed. Maximum 200 characters.'
                 },
                 description: {
                     type: 'string',
+                    maxLength: 4000,
                     description:
-                        'Profile description for "add", or a replacement for "update". Required for "add"; trimmed.'
+                        'Profile description for "add", or a replacement for "update". Required for "add"; trimmed. Maximum 4000 characters.'
                 },
                 traits: {
                     type: 'array',
-                    items: { type: 'string' },
+                    items: { type: 'string', maxLength: 200 },
+                    maxItems: 32,
                     description:
-                        'Optional traits for "add" or "update", e.g. ["brave", "loyal"]. Entries are trimmed and deduplicated; omitting the field leaves traits unchanged on update.'
+                        'Optional traits for "add" or "update", e.g. ["brave", "loyal"]. Entries are trimmed and deduplicated; omitting the field leaves traits unchanged on update. At most 32 traits of 200 characters each.'
                 },
                 notes: {
                     type: 'string',
+                    maxLength: 4000,
                     description:
-                        'Optional free-form notes for "add" or "update". Omitting the field leaves notes unchanged on update; an empty string clears them.'
+                        'Optional free-form notes for "add" or "update". Omitting the field leaves notes unchanged on update; an empty string clears them. Maximum 4000 characters.'
+                },
+                offset: {
+                    type: 'integer',
+                    minimum: 0,
+                    description:
+                        'For "list" only: 0-based index of the first profile. Defaults to 0; use page.nextOffset from the previous page.'
+                },
+                limit: {
+                    type: 'integer',
+                    minimum: 1,
+                    maximum: 100,
+                    description: 'For "list" only: page size, 1-100. Defaults to 20.'
                 }
             },
             required: ['action'],
@@ -193,7 +222,7 @@ describe('core tool metadata', () => {
             'people'
         ]);
         expect(writer.tools.profileManage.description).toBe(
-            'Manage character and people profiles for this harness session. Actions: "add" (requires name and description; optional traits and notes), "list", "get" (requires id), "update" (requires id and at least one of name, description, traits, notes; fields you omit are unchanged), and "remove" (requires id). Traits are trimmed and deduplicated. Ids are stable strings returned by "add". Profiles are shared by every agent in this harness, kept across turns, and cleared by reset. Every result returns the profile list, counts { total }, and the affected profile (or removed profile).'
+            'Manage character and people profiles for this harness session. Actions: "add" (requires name and description; optional traits and notes), "list", "get" (requires id), "update" (requires id and at least one of name, description, traits, notes; fields you omit are unchanged), and "remove" (requires id). Traits are trimmed and deduplicated. Ids are stable strings returned by "add". Profiles are shared by every agent in this harness, kept across turns, and cleared by reset. "list" returns ONE PAGE: { profiles, counts { total }, page { offset, limit, hasMore, nextOffset? } } - 20 by default, at most 100, 64 KiB serialized page budget. "get" returns { profile, counts }; "add"/"update" return { profile, counts } and "remove" returns { removed, counts }, with NO list. Caps: 200 profiles, 200-character names, 4000-character descriptions and notes, up to 32 traits of 200 characters each.'
         );
 
         // chapterManage: the schema states the summary/body split and the order
@@ -212,18 +241,21 @@ describe('core tool metadata', () => {
                 },
                 title: {
                     type: 'string',
+                    maxLength: 200,
                     description:
-                        'Chapter title for "add", or a replacement for "update". Required for "add"; trimmed.'
+                        'Chapter title for "add", or a replacement for "update". Required for "add"; trimmed. Maximum 200 characters.'
                 },
                 summary: {
                     type: 'string',
+                    maxLength: 4000,
                     description:
-                        'Short summary for "add", or a replacement for "update". Required for "add"; trimmed. Returned by list.'
+                        'Short summary for "add", or a replacement for "update". Required for "add"; trimmed. Returned by list. Maximum 4000 characters.'
                 },
                 content: {
                     type: 'string',
+                    maxLength: 4000,
                     description:
-                        'Chapter body for "add" or "update". Optional; trimmed. Never returned by list or mutation results - use "get" to read it.'
+                        'Chapter body for "add" or "update". Optional; trimmed. Never returned by list or mutation results - use "get" to read it. Maximum 4000 characters.'
                 },
                 status: {
                     type: 'string',
@@ -235,6 +267,18 @@ describe('core tool metadata', () => {
                     type: 'integer',
                     description:
                         'Optional sort position. Lower values list first; chapters without one follow in insertion order. Omitting it on update leaves it unchanged.'
+                },
+                offset: {
+                    type: 'integer',
+                    minimum: 0,
+                    description:
+                        'For "list" only: 0-based index of the first chapter. Defaults to 0; use page.nextOffset from the previous page.'
+                },
+                limit: {
+                    type: 'integer',
+                    minimum: 1,
+                    maximum: 100,
+                    description: 'For "list" only: page size, 1-100. Defaults to 20.'
                 }
             },
             required: ['action'],
@@ -249,7 +293,7 @@ describe('core tool metadata', () => {
             'book'
         ]);
         expect(writer.tools.chapterManage.description).toBe(
-            'Manage chapters for this harness session. Actions: "add" (requires title and summary; optional content, status and order), "list", "get" (requires id), "update" (requires id and at least one of title, summary, content, status, order; fields you omit are unchanged), and "remove" (requires id). Status is planned, draft or complete and defaults to planned. The optional integer order sorts list: ordered chapters first ascending, unordered ones after in insertion order. Ids are stable strings returned by "add". Lists and mutation results return summaries without the body; only "get" returns content. Chapters are shared by every agent in this harness, kept across turns, and cleared by reset. Every result returns chapter summaries, counts { total, planned, draft, complete }, and the affected summary (or removed summary).'
+            'Manage chapters for this harness session. Actions: "add" (requires title and summary; optional content, status and order), "list", "get" (requires id), "update" (requires id and at least one of title, summary, content, status, order; fields you omit are unchanged), and "remove" (requires id). Status is planned, draft or complete and defaults to planned. The optional integer order sorts list: ordered chapters first ascending, unordered ones after in insertion order. Ids are stable strings returned by "add". Lists and mutation results carry summaries without the body; only "get" returns content. Chapters are shared by every agent in this harness, kept across turns, and cleared by reset. "list" returns ONE PAGE: { chapters, counts { total, planned, draft, complete }, page { offset, limit, hasMore, nextOffset? } } - 20 by default, at most 100, 64 KiB serialized page budget. "get" returns { chapter, content, counts }; "add"/"update" return { chapter, counts } and "remove" returns { removed, counts }, with NO list. Caps: 200 chapters, 200-character titles, 4000-character summaries and content.'
         );
 
         // locationManage: the small record shape, no summary/body split.
@@ -267,18 +311,33 @@ describe('core tool metadata', () => {
                 },
                 name: {
                     type: 'string',
+                    maxLength: 200,
                     description:
-                        'Location name for "add", or a replacement name for "update". Required for "add"; trimmed.'
+                        'Location name for "add", or a replacement name for "update". Required for "add"; trimmed. Maximum 200 characters.'
                 },
                 description: {
                     type: 'string',
+                    maxLength: 4000,
                     description:
-                        'Location description for "add", or a replacement for "update". Required for "add"; trimmed.'
+                        'Location description for "add", or a replacement for "update". Required for "add"; trimmed. Maximum 4000 characters.'
                 },
                 notes: {
                     type: 'string',
+                    maxLength: 4000,
                     description:
-                        'Optional free-form notes for "add" or "update". Omitting the field leaves notes unchanged on update; an empty string clears them.'
+                        'Optional free-form notes for "add" or "update". Omitting the field leaves notes unchanged on update; an empty string clears them. Maximum 4000 characters.'
+                },
+                offset: {
+                    type: 'integer',
+                    minimum: 0,
+                    description:
+                        'For "list" only: 0-based index of the first location. Defaults to 0; use page.nextOffset from the previous page.'
+                },
+                limit: {
+                    type: 'integer',
+                    minimum: 1,
+                    maximum: 100,
+                    description: 'For "list" only: page size, 1-100. Defaults to 20.'
                 }
             },
             required: ['action'],
@@ -293,7 +352,7 @@ describe('core tool metadata', () => {
             'world'
         ]);
         expect(writer.tools.locationManage.description).toBe(
-            'Manage locations for this harness session. Actions: "add" (requires name and description; optional notes), "list", "get" (requires id), "update" (requires id and at least one of name, description, notes; fields you omit are unchanged), and "remove" (requires id). Ids are stable strings returned by "add". Locations are shared by every agent in this harness, kept across turns, and cleared by reset. Every result returns the location list, counts { total }, and the affected location (or removed location).'
+            'Manage locations for this harness session. Actions: "add" (requires name and description; optional notes), "list", "get" (requires id), "update" (requires id and at least one of name, description, notes; fields you omit are unchanged), and "remove" (requires id). Ids are stable strings returned by "add". Locations are shared by every agent in this harness, kept across turns, and cleared by reset. "list" returns ONE PAGE: { locations, counts { total }, page { offset, limit, hasMore, nextOffset? } } - 20 by default, at most 100, 64 KiB serialized page budget. "get" returns { location, counts }; "add"/"update" return { location, counts } and "remove" returns { removed, counts }, with NO list. Caps: 200 locations, 200-character names, 4000-character descriptions and notes.'
         );
     });
 

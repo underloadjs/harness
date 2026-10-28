@@ -1,6 +1,6 @@
 // Canonical metadata for the harness-owned CORE tools.
 //
-// R18 note: the harness also declares core tools that are NOT harness-owned — the
+// R18 note: the harness also declares core tools that are NOT harness-owned - the
 // four everyday file tools (metadata in ../tools/catalogue.ts) and configured
 // webSearch (../tools/websearch/index.ts). Their metadata lives with their real
 // implementations; this file stays the single source for the session-bound
@@ -19,11 +19,11 @@
 // A SERVER also has to *describe* those same tools without building a harness:
 // the Tools tab lists them for review and manual execution (R8), and a descriptor
 // must never advertise a name, description, tag list, or schema that the runtime
-// does not actually use. Keeping the metadata here — and having both the runtime
-// registration and the server catalogue read it — makes that drift impossible.
+// does not actually use. Keeping the metadata here - and having both the runtime
+// registration and the server catalogue read it - makes that drift impossible.
 //
-// NAMING (T14): every tool is `<namespace><action>` — toolRequest, toolCreate,
-// todoManage, profileManage, chapterManage, locationManage, agentDelegate — and
+// NAMING (T14): every tool is `<namespace><action>` - toolRequest, toolCreate,
+// todoManage, profileManage, chapterManage, locationManage, agentDelegate - and
 // the preset tools follow the same rule
 // (fileRead, fileWrite, fileEdit, fileList, fileGlob, commandRun, webSearch,
 // timeNow, textCount, diceRoll, noteSearch, textSummarize, testFlaky). The
@@ -39,11 +39,11 @@
 // cap are the same number.
 //
 // Cross-references:
-//   - ./discovery.ts     — MAX_DISCOVERY_MATCHES, the enforced cap
-//   - ../harness.ts      — registers these definitions as core tools
-//   - ./todo.ts          — builds todoManage from TODO_MANAGE_METADATA
-//   - ./profile.ts / ./chapter.ts / ./location.ts — build the session record tools
-//   - ../../harnesses/core.ts — server catalogue entries for the same names
+//   - ./discovery.ts     - MAX_DISCOVERY_MATCHES, the enforced cap
+//   - ../harness.ts      - registers these definitions as core tools
+//   - ./todo.ts          - builds todoManage from TODO_MANAGE_METADATA
+//   - ./profile.ts / ./chapter.ts / ./location.ts - build the session record tools
+//   - ../../harnesses/core.ts - server catalogue entries for the same names
 
 import type { ToolVisibility } from '../types';
 import { MAX_DISCOVERY_MATCHES } from './discovery';
@@ -71,8 +71,8 @@ export type CoreToolMetadata = {
     visibility: ToolVisibility;
 };
 
-// Discovery. The description itself carries the R7 contract — at most five
-// matches, and `remaining` as the count of further ones — because the model reads
+// Discovery. The description itself carries the R7 contract - at most five
+// matches, and `remaining` as the count of further ones - because the model reads
 // the description, not this file.
 export const TOOL_REQUEST_METADATA: CoreToolMetadata = {
     name: TOOL_REQUEST_NAME,
@@ -140,14 +140,14 @@ export const TOOL_CREATE_METADATA: CoreToolMetadata = {
 };
 
 // Session todos (R1/R2). Session state, not catalogue state, which is why it is a
-// factory closure (./todo.ts) rather than a module singleton — but its public
+// factory closure (./todo.ts) rather than a module singleton - but its public
 // description and schema are stable, so they live here with the rest. The
 // `action` enum repeats ./todo.ts's ACTIONS list (that module validates and owns
 // the order); keep the two in step when adding an action.
 export const TODO_MANAGE_METADATA: CoreToolMetadata = {
     name: TODO_MANAGE_NAME,
     description:
-        'Manage the todo list for this harness session. Actions: "add" (requires text), "remove" (requires id), "check" (requires id; completed defaults to true, false unchecks), "uncheck" (requires id), and "list". Ids are stable strings returned by "add". The list is shared by every agent in this harness, kept across turns, and cleared by reset. Returns todos plus counts { total, completed, remaining }, and the affected todo (or removed item).',
+        'Manage the todo list for this harness session. Actions: "add" (requires text), "remove" (requires id), "check" (requires id; completed defaults to true, false unchecks), "uncheck" (requires id), and "list". Ids are stable strings returned by "add". The list is shared by every agent in this harness, kept across turns, and cleared by reset. "list" returns ONE PAGE: { todos, counts { total, completed, remaining }, page { offset, limit, hasMore, nextOffset? } } - 20 items by default, at most 100, and a 64 KiB serialized page budget, so pass page.nextOffset back as offset while page.hasMore. Every mutation returns { todo|removed, counts } with NO list, so call "list" to read it. Caps: 200 todos, 4000 characters of text each.',
     tags: ['todo', 'todos', 'task', 'tasks', 'checklist', 'plan'],
     visibility: 'core',
     parameters: {
@@ -160,7 +160,8 @@ export const TODO_MANAGE_METADATA: CoreToolMetadata = {
             },
             text: {
                 type: 'string',
-                description: 'Todo text for "add". Required for that action; trimmed before storage.'
+                description:
+                    'Todo text for "add". Required for that action; trimmed. Maximum 4000 characters.'
             },
             id: {
                 type: 'string',
@@ -170,6 +171,18 @@ export const TODO_MANAGE_METADATA: CoreToolMetadata = {
                 type: 'boolean',
                 description:
                     'For "check" only: true (default) marks complete, false unchecks. "uncheck" is the same as false.'
+            },
+            offset: {
+                type: 'integer',
+                minimum: 0,
+                description:
+                    'For "list" only: 0-based index of the first item. Defaults to 0; use page.nextOffset from the previous page.'
+            },
+            limit: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 100,
+                description: 'For "list" only: page size, 1-100. Defaults to 20.'
             }
         },
         required: ['action'],
@@ -184,7 +197,7 @@ export const TODO_MANAGE_METADATA: CoreToolMetadata = {
 export const PROFILE_MANAGE_METADATA: CoreToolMetadata = {
     name: PROFILE_MANAGE_NAME,
     description:
-        'Manage character and people profiles for this harness session. Actions: "add" (requires name and description; optional traits and notes), "list", "get" (requires id), "update" (requires id and at least one of name, description, traits, notes; fields you omit are unchanged), and "remove" (requires id). Traits are trimmed and deduplicated. Ids are stable strings returned by "add". Profiles are shared by every agent in this harness, kept across turns, and cleared by reset. Every result returns the profile list, counts { total }, and the affected profile (or removed profile).',
+        'Manage character and people profiles for this harness session. Actions: "add" (requires name and description; optional traits and notes), "list", "get" (requires id), "update" (requires id and at least one of name, description, traits, notes; fields you omit are unchanged), and "remove" (requires id). Traits are trimmed and deduplicated. Ids are stable strings returned by "add". Profiles are shared by every agent in this harness, kept across turns, and cleared by reset. "list" returns ONE PAGE: { profiles, counts { total }, page { offset, limit, hasMore, nextOffset? } } - 20 by default, at most 100, 64 KiB serialized page budget. "get" returns { profile, counts }; "add"/"update" return { profile, counts } and "remove" returns { removed, counts }, with NO list. Caps: 200 profiles, 200-character names, 4000-character descriptions and notes, up to 32 traits of 200 characters each.',
     tags: ['profile', 'profiles', 'character', 'characters', 'person', 'people'],
     visibility: 'core',
     parameters: {
@@ -201,24 +214,40 @@ export const PROFILE_MANAGE_METADATA: CoreToolMetadata = {
             },
             name: {
                 type: 'string',
+                maxLength: 200,
                 description:
-                    'Profile name for "add", or a replacement name for "update". Required for "add"; trimmed.'
+                    'Profile name for "add", or a replacement name for "update". Required for "add"; trimmed. Maximum 200 characters.'
             },
             description: {
                 type: 'string',
+                maxLength: 4000,
                 description:
-                    'Profile description for "add", or a replacement for "update". Required for "add"; trimmed.'
+                    'Profile description for "add", or a replacement for "update". Required for "add"; trimmed. Maximum 4000 characters.'
             },
             traits: {
                 type: 'array',
-                items: { type: 'string' },
+                items: { type: 'string', maxLength: 200 },
+                maxItems: 32,
                 description:
-                    'Optional traits for "add" or "update", e.g. ["brave", "loyal"]. Entries are trimmed and deduplicated; omitting the field leaves traits unchanged on update.'
+                    'Optional traits for "add" or "update", e.g. ["brave", "loyal"]. Entries are trimmed and deduplicated; omitting the field leaves traits unchanged on update. At most 32 traits of 200 characters each.'
             },
             notes: {
                 type: 'string',
+                maxLength: 4000,
                 description:
-                    'Optional free-form notes for "add" or "update". Omitting the field leaves notes unchanged on update; an empty string clears them.'
+                    'Optional free-form notes for "add" or "update". Omitting the field leaves notes unchanged on update; an empty string clears them. Maximum 4000 characters.'
+            },
+            offset: {
+                type: 'integer',
+                minimum: 0,
+                description:
+                    'For "list" only: 0-based index of the first profile. Defaults to 0; use page.nextOffset from the previous page.'
+            },
+            limit: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 100,
+                description: 'For "list" only: page size, 1-100. Defaults to 20.'
             }
         },
         required: ['action'],
@@ -231,7 +260,7 @@ export const PROFILE_MANAGE_METADATA: CoreToolMetadata = {
 export const CHAPTER_MANAGE_METADATA: CoreToolMetadata = {
     name: CHAPTER_MANAGE_NAME,
     description:
-        'Manage chapters for this harness session. Actions: "add" (requires title and summary; optional content, status and order), "list", "get" (requires id), "update" (requires id and at least one of title, summary, content, status, order; fields you omit are unchanged), and "remove" (requires id). Status is planned, draft or complete and defaults to planned. The optional integer order sorts list: ordered chapters first ascending, unordered ones after in insertion order. Ids are stable strings returned by "add". Lists and mutation results return summaries without the body; only "get" returns content. Chapters are shared by every agent in this harness, kept across turns, and cleared by reset. Every result returns chapter summaries, counts { total, planned, draft, complete }, and the affected summary (or removed summary).',
+        'Manage chapters for this harness session. Actions: "add" (requires title and summary; optional content, status and order), "list", "get" (requires id), "update" (requires id and at least one of title, summary, content, status, order; fields you omit are unchanged), and "remove" (requires id). Status is planned, draft or complete and defaults to planned. The optional integer order sorts list: ordered chapters first ascending, unordered ones after in insertion order. Ids are stable strings returned by "add". Lists and mutation results carry summaries without the body; only "get" returns content. Chapters are shared by every agent in this harness, kept across turns, and cleared by reset. "list" returns ONE PAGE: { chapters, counts { total, planned, draft, complete }, page { offset, limit, hasMore, nextOffset? } } - 20 by default, at most 100, 64 KiB serialized page budget. "get" returns { chapter, content, counts }; "add"/"update" return { chapter, counts } and "remove" returns { removed, counts }, with NO list. Caps: 200 chapters, 200-character titles, 4000-character summaries and content.',
     tags: ['chapter', 'chapters', 'story', 'writing', 'outline', 'book'],
     visibility: 'core',
     parameters: {
@@ -248,18 +277,21 @@ export const CHAPTER_MANAGE_METADATA: CoreToolMetadata = {
             },
             title: {
                 type: 'string',
+                maxLength: 200,
                 description:
-                    'Chapter title for "add", or a replacement for "update". Required for "add"; trimmed.'
+                    'Chapter title for "add", or a replacement for "update". Required for "add"; trimmed. Maximum 200 characters.'
             },
             summary: {
                 type: 'string',
+                maxLength: 4000,
                 description:
-                    'Short summary for "add", or a replacement for "update". Required for "add"; trimmed. Returned by list.'
+                    'Short summary for "add", or a replacement for "update". Required for "add"; trimmed. Returned by list. Maximum 4000 characters.'
             },
             content: {
                 type: 'string',
+                maxLength: 4000,
                 description:
-                    'Chapter body for "add" or "update". Optional; trimmed. Never returned by list or mutation results - use "get" to read it.'
+                    'Chapter body for "add" or "update". Optional; trimmed. Never returned by list or mutation results - use "get" to read it. Maximum 4000 characters.'
             },
             status: {
                 type: 'string',
@@ -271,6 +303,18 @@ export const CHAPTER_MANAGE_METADATA: CoreToolMetadata = {
                 type: 'integer',
                 description:
                     'Optional sort position. Lower values list first; chapters without one follow in insertion order. Omitting it on update leaves it unchanged.'
+            },
+            offset: {
+                type: 'integer',
+                minimum: 0,
+                description:
+                    'For "list" only: 0-based index of the first chapter. Defaults to 0; use page.nextOffset from the previous page.'
+            },
+            limit: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 100,
+                description: 'For "list" only: page size, 1-100. Defaults to 20.'
             }
         },
         required: ['action'],
@@ -283,7 +327,7 @@ export const CHAPTER_MANAGE_METADATA: CoreToolMetadata = {
 export const LOCATION_MANAGE_METADATA: CoreToolMetadata = {
     name: LOCATION_MANAGE_NAME,
     description:
-        'Manage locations for this harness session. Actions: "add" (requires name and description; optional notes), "list", "get" (requires id), "update" (requires id and at least one of name, description, notes; fields you omit are unchanged), and "remove" (requires id). Ids are stable strings returned by "add". Locations are shared by every agent in this harness, kept across turns, and cleared by reset. Every result returns the location list, counts { total }, and the affected location (or removed location).',
+        'Manage locations for this harness session. Actions: "add" (requires name and description; optional notes), "list", "get" (requires id), "update" (requires id and at least one of name, description, notes; fields you omit are unchanged), and "remove" (requires id). Ids are stable strings returned by "add". Locations are shared by every agent in this harness, kept across turns, and cleared by reset. "list" returns ONE PAGE: { locations, counts { total }, page { offset, limit, hasMore, nextOffset? } } - 20 by default, at most 100, 64 KiB serialized page budget. "get" returns { location, counts }; "add"/"update" return { location, counts } and "remove" returns { removed, counts }, with NO list. Caps: 200 locations, 200-character names, 4000-character descriptions and notes.',
     tags: ['location', 'locations', 'place', 'places', 'setting', 'world'],
     visibility: 'core',
     parameters: {
@@ -300,18 +344,33 @@ export const LOCATION_MANAGE_METADATA: CoreToolMetadata = {
             },
             name: {
                 type: 'string',
+                maxLength: 200,
                 description:
-                    'Location name for "add", or a replacement name for "update". Required for "add"; trimmed.'
+                    'Location name for "add", or a replacement name for "update". Required for "add"; trimmed. Maximum 200 characters.'
             },
             description: {
                 type: 'string',
+                maxLength: 4000,
                 description:
-                    'Location description for "add", or a replacement for "update". Required for "add"; trimmed.'
+                    'Location description for "add", or a replacement for "update". Required for "add"; trimmed. Maximum 4000 characters.'
             },
             notes: {
                 type: 'string',
+                maxLength: 4000,
                 description:
-                    'Optional free-form notes for "add" or "update". Omitting the field leaves notes unchanged on update; an empty string clears them.'
+                    'Optional free-form notes for "add" or "update". Omitting the field leaves notes unchanged on update; an empty string clears them. Maximum 4000 characters.'
+            },
+            offset: {
+                type: 'integer',
+                minimum: 0,
+                description:
+                    'For "list" only: 0-based index of the first location. Defaults to 0; use page.nextOffset from the previous page.'
+            },
+            limit: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 100,
+                description: 'For "list" only: page size, 1-100. Defaults to 20.'
             }
         },
         required: ['action'],
@@ -321,9 +380,9 @@ export const LOCATION_MANAGE_METADATA: CoreToolMetadata = {
 
 // Delegation (R4). Capability-by-configuration: the harness registers agentDelegate
 // only when the allowlist is non-empty, so this metadata has two honest forms:
-//   - with subagents — the runtime declaration, whose `agent` enum is the exact
+//   - with subagents - the runtime declaration, whose `agent` enum is the exact
 //     allowlist and whose description names it;
-//   - without — a catalogue-only description (the server lists the capability and
+//   - without - a catalogue-only description (the server lists the capability and
 //     a session without subagents answers a clear 404 when it is called).
 export const agentDelegateMetadata = (subagents: readonly string[] = []): CoreToolMetadata => {
     const listed = [...subagents];
@@ -333,7 +392,7 @@ export const agentDelegateMetadata = (subagents: readonly string[] = []): CoreTo
         description:
             listed.length > 0
                 ? `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.`
-                : 'Delegate a self-contained task to a configured subagent and return its answer. Only the primary agent can delegate, subagents cannot delegate further, and a harness registers this tool only when it has subagents — a session whose harness has none answers 404.',
+                : 'Delegate a self-contained task to a configured subagent and return its answer. Only the primary agent can delegate, subagents cannot delegate further, and a harness registers this tool only when it has subagents - a session whose harness has none answers 404.',
         tags: ['agents', 'delegate', 'subagent', 'team'],
         visibility: 'core',
         parameters: {

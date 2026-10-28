@@ -25,6 +25,16 @@ import {
 } from '@underload/harness';
 import type { HarnessStream, HarnessStreamEvent } from '@underload/harness';
 
+// Mirrors FILE_READ_CONTENT_BUDGET in ./files/fileRead. Importing the constant
+// through the package would evaluate the implementation module eagerly and break
+// the lazy-loading contract (see laziness.test.ts).
+const FILE_READ_CONTENT_BUDGET = 64 * 1024;
+
+// Mirrors FILE_LIST_CONTENT_BUDGET / FILE_LIST_DEFAULT_LIMIT in ./files/fileList
+// for the same lazy-loading reason as above.
+const FILE_LIST_CONTENT_BUDGET = 64 * 1024;
+const FILE_LIST_DEFAULT_LIMIT = 200;
+
 // Repo-root Temp/, so fixtures never land in OS temp.
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../Temp', import.meta.url));
 
@@ -132,13 +142,39 @@ describe('file tools', () => {
 
         expect(written).toEqual([{ path: join(workdir, 'notes', 'hello.md'), bytes: 7 }]);
 
-        // The batched read returns [{ path, content }] in request order.
-        await expect(fileRead(['notes/hello.md'])).resolves.toEqual([
-            { path: join(workdir, 'notes', 'hello.md'), content: '# Hello' }
-        ]);
+        // The batched read returns one bounded window per path, in request order.
+        // `# Hello` is one unterminated line, so the window ended at EOF.
+        await expect(fileRead(['notes/hello.md'])).resolves.toEqual({
+            files: [
+                {
+                    path: join(workdir, 'notes', 'hello.md'),
+                    content: '# Hello',
+                    startLine: 1,
+                    endLine: 1,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 7
+                }
+            ],
+            truncated: false,
+            bytes: 7,
+            contentBudget: FILE_READ_CONTENT_BUDGET
+        });
         // Results carry the directory they came from, so one flat list can hold
         // several directories without ambiguity.
-        await expect(fileList('notes')).resolves.toEqual(['notes/hello.md']);
+        //
+        // The listing is PAGINATED (fileList.ts header): the legacy string argument
+        // still selects the directory, but the answer is one bounded page.
+        await expect(fileList('notes')).resolves.toEqual({
+            entries: ['notes/hello.md'],
+            truncated: false,
+            nextOffset: null,
+            offset: 0,
+            limit: 200,
+            bytes: 14,
+            contentBudget: FILE_LIST_CONTENT_BUDGET
+        });
     });
 
     it('reads several files in one call', async () => {
@@ -147,10 +183,33 @@ describe('file tools', () => {
             { path: 'multi-read/b.txt', content: 'b' }
         ]);
 
-        await expect(fileRead(['multi-read/b.txt', 'multi-read/a.txt'])).resolves.toEqual([
-            { path: join(workdir, 'multi-read', 'b.txt'), content: 'b' },
-            { path: join(workdir, 'multi-read', 'a.txt'), content: 'a' }
-        ]);
+        await expect(fileRead(['multi-read/b.txt', 'multi-read/a.txt'])).resolves.toEqual({
+            files: [
+                {
+                    path: join(workdir, 'multi-read', 'b.txt'),
+                    content: 'b',
+                    startLine: 1,
+                    endLine: 1,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 1
+                },
+                {
+                    path: join(workdir, 'multi-read', 'a.txt'),
+                    content: 'a',
+                    startLine: 1,
+                    endLine: 1,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 1
+                }
+            ],
+            truncated: false,
+            bytes: 2,
+            contentBudget: FILE_READ_CONTENT_BUDGET
+        });
     });
 
     it('edits several files in one call', async () => {
@@ -184,7 +243,16 @@ describe('file tools', () => {
             { path: 'tree/sub/b.txt', content: 'b' }
         ]);
 
-        await expect(fileList('tree')).resolves.toEqual(['tree/a.txt', 'tree/sub/']);
+        await expect(fileList('tree')).resolves.toEqual({
+            entries: ['tree/a.txt', 'tree/sub/'],
+            truncated: false,
+            nextOffset: null,
+            offset: 0,
+            limit: FILE_LIST_DEFAULT_LIMIT,
+            // 'tree/a.txt' (10) + 'tree/sub/' (9) UTF-8 bytes.
+            bytes: 19,
+            contentBudget: FILE_LIST_CONTENT_BUDGET
+        });
     });
 
     it('lists several directories in one call, grouped in the caller order', async () => {
@@ -193,10 +261,16 @@ describe('file tools', () => {
             { path: 'multi/task/b.ts', content: 'b' }
         ]);
 
-        await expect(fileList(['multi/task', 'multi/src'])).resolves.toEqual([
-            'multi/task/b.ts',
-            'multi/src/a.ts'
-        ]);
+        await expect(fileList(['multi/task', 'multi/src'])).resolves.toEqual({
+            entries: ['multi/task/b.ts', 'multi/src/a.ts'],
+            truncated: false,
+            nextOffset: null,
+            offset: 0,
+            limit: FILE_LIST_DEFAULT_LIMIT,
+            // 'multi/task/b.ts' (15) + 'multi/src/a.ts' (14) UTF-8 bytes.
+            bytes: 29,
+            contentBudget: FILE_LIST_CONTENT_BUDGET
+        });
     });
 
     it('defaults fileList to the working directory', async () => {
@@ -209,9 +283,19 @@ describe('file tools', () => {
         process.chdir(join(previous, 'defaults', 'empty'));
 
         try {
-            await expect(fileList(undefined)).resolves.toEqual(['marker.txt', 'sub/']);
+            // 'marker.txt' (10) + 'sub/' (4) UTF-8 bytes, no prefix (".").
+            const defaultPage = {
+                entries: ['marker.txt', 'sub/'],
+                truncated: false,
+                nextOffset: null,
+                offset: 0,
+                limit: FILE_LIST_DEFAULT_LIMIT,
+                bytes: 14,
+                contentBudget: FILE_LIST_CONTENT_BUDGET
+            };
+            await expect(fileList(undefined)).resolves.toEqual(defaultPage);
             // Omitted and explicit ["."] are the same request.
-            await expect(fileList(['.'])).resolves.toEqual(['marker.txt', 'sub/']);
+            await expect(fileList(['.'])).resolves.toEqual(defaultPage);
         } finally {
             process.chdir(previous);
         }
@@ -221,9 +305,23 @@ describe('file tools', () => {
         await fileWrite([{ path: 'over.txt', content: 'first' }]);
         await fileWrite([{ path: 'over.txt', content: 'second' }]);
 
-        await expect(fileRead(['over.txt'])).resolves.toEqual([
-            { path: join(workdir, 'over.txt'), content: 'second' }
-        ]);
+        await expect(fileRead(['over.txt'])).resolves.toEqual({
+            files: [
+                {
+                    path: join(workdir, 'over.txt'),
+                    content: 'second',
+                    startLine: 1,
+                    endLine: 1,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 6
+                }
+            ],
+            truncated: false,
+            bytes: 6,
+            contentBudget: FILE_READ_CONTENT_BUDGET
+        });
     });
 
     it('surfaces a missing file as a thrown error', async () => {
@@ -304,10 +402,24 @@ describe('presets inside a harness', () => {
             'assistant'
         ]);
         // The single-property rule unwrapped the model's {"paths":[...]} to the
-        // array, and the result serialized as the ordered array.
-        expect(JSON.parse((entry.messages[2] as { content: string }).content)).toEqual([
-            { path: join(workdir, 'harness.txt'), content: 'seeded content' }
-        ]);
+        // array, and the result serialized as the bounded batch object.
+        expect(JSON.parse((entry.messages[2] as { content: string }).content)).toEqual({
+            files: [
+                {
+                    path: join(workdir, 'harness.txt'),
+                    content: 'seeded content',
+                    startLine: 1,
+                    endLine: 1,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 14
+                }
+            ],
+            truncated: false,
+            bytes: 14,
+            contentBudget: FILE_READ_CONTENT_BUDGET
+        });
     });
 
     it('discovers syntaxCheck and hands it the whole two-property object', async () => {
