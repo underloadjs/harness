@@ -1,6 +1,6 @@
 // gitDiff — read-only unified diff of a git working tree.
 //
-// Why a dedicated tool when runCommand can already run `git diff`? Because the
+// Why a dedicated tool when commandRun can already run `git diff`? Because the
 // model should not have to compose a command line to get the one thing it needs
 // before editing, and because the argv must be fixed:
 //
@@ -20,7 +20,7 @@
 //     really is a read.
 //
 // Nothing here stages, commits, resets, or writes. A non-zero exit (not a git
-// repository, bad ref) is returned as data like runCommand does, so the model can
+// repository, bad ref) is returned as data like commandRun does, so the model can
 // read git's own message and correct itself.
 //
 // Executable on its own and registerable on a harness:

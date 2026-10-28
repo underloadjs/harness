@@ -3,7 +3,7 @@
 // Contract pinned here:
 //   - `primary` selects the entry agent; without it the first `agents` key wins;
 //   - `subagents` is an allowlist, defaulting to every agent except the primary;
-//   - the `delegate` tool is core but declared ONLY to the primary, so a subagent
+//   - the `agentDelegate` tool is core but declared ONLY to the primary, so a subagent
 //     never sees it (and a guessed call is rejected);
 //   - delegation is one level deep: only a top-level primary run may delegate, and
 //     re-entering a running agent is refused (ctx.run cycles included);
@@ -60,7 +60,7 @@ describe('primary and subagents', () => {
         expect(writer.name).toBe('researcher');
         expect(writer.agent).toBe(writer.agents.researcher);
         expect(Object.keys(writer.subagents)).toEqual(['writer']);
-        expect(writer.tools.delegate).toBeDefined();
+        expect(writer.tools.agentDelegate).toBeDefined();
     });
 
     it('keeps the first agents key as primary when none is named', () => {
@@ -81,7 +81,7 @@ describe('primary and subagents', () => {
         });
 
         expect(writer.subagents).toEqual({});
-        expect(writer.tools.delegate).toBeUndefined();
+        expect(writer.tools.agentDelegate).toBeUndefined();
     });
 
     it('uses an explicit allowlist and exposes it on the tool schema', () => {
@@ -97,7 +97,7 @@ describe('primary and subagents', () => {
 
         expect(Object.keys(writer.subagents)).toEqual(['researcher']);
         expect(
-            (writer.tools.delegate.parameters as Record<string, any>).properties.agent.enum
+            (writer.tools.agentDelegate.parameters as Record<string, any>).properties.agent.enum
         ).toEqual(['researcher']);
     });
 
@@ -118,7 +118,7 @@ describe('primary and subagents', () => {
     });
 });
 
-describe('delegate', () => {
+describe('agentDelegate', () => {
     it('declares delegate to the primary only', async () => {
         const seenWriter: HarnessStreamRequest[] = [];
         const seenResearcher: HarnessStreamRequest[] = [];
@@ -127,7 +127,7 @@ describe('delegate', () => {
         const writerAgent = brain(
             scripted(
                 [
-                    callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts"}'),
+                    callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"find facts"}'),
                     answer('final')
                 ],
                 seenWriter
@@ -137,10 +137,10 @@ describe('delegate', () => {
         const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
         await writer('go');
 
-        // The primary sees requestTools, createTool, delegate. The subagent never sees
+        // The primary sees toolRequest, toolCreate, delegate. The subagent never sees
         // the delegation control.
-        expect(declaredNames(seenWriter[0])).toEqual(['requestTools', 'createTool', 'todoTools', 'delegate']);
-        expect(declaredNames(seenResearcher[0])).toEqual(['requestTools', 'createTool', 'todoTools']);
+        expect(declaredNames(seenWriter[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate']);
+        expect(declaredNames(seenResearcher[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
     });
 
     it('runs the subagent under its own instructions and returns only its answer', async () => {
@@ -150,7 +150,7 @@ describe('delegate', () => {
 
         const writerAgent = brain(
             scripted([
-                callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts"}'),
+                callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"find facts"}'),
                 answer('final')
             ])
         );
@@ -176,7 +176,7 @@ describe('delegate', () => {
         const researcher = brain(scripted([answer('r')]));
         const editor = brain(scripted([answer('e')]));
         const writerAgent = brain(
-            scripted([callTool('c1', 'delegate', '{"agent":"editor","input":"edit"}'), answer('recovered')])
+            scripted([callTool('c1', 'agentDelegate', '{"agent":"editor","input":"edit"}'), answer('recovered')])
         );
 
         const writer = harness({
@@ -188,21 +188,21 @@ describe('delegate', () => {
         await writer('go');
 
         expect(content(writerAgent.messages[2])).toBe(
-            'Tool "delegate" failed: Agent "editor" is not a configured subagent. Allowed: researcher.'
+            'Tool "agentDelegate" failed: Agent "editor" is not a configured subagent. Allowed: researcher.'
         );
     });
 
     it('rejects a subagent that tries to delegate (guessed name)', async () => {
         const researcher = brain(
             scripted([
-                callTool('r1', 'delegate', '{"agent":"researcher","input":"again"}'),
+                callTool('r1', 'agentDelegate', '{"agent":"researcher","input":"again"}'),
                 answer('blocked')
             ])
         );
 
         const writerAgent = brain(
             scripted([
-                callTool('c1', 'delegate', '{"agent":"researcher","input":"go"}'),
+                callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"go"}'),
                 answer('final')
             ])
         );
@@ -213,7 +213,7 @@ describe('delegate', () => {
         // The subagent's call is answered with a tool result it can read; the run
         // does not crash and delegation stays one level deep.
         expect(content(researcher.messages[2])).toBe(
-            'Tool "delegate" is only available to the primary agent "writer".'
+            'Tool "agentDelegate" is only available to the primary agent "writer".'
         );
         expect(content(writerAgent.messages[2])).toBe('{"agent":"researcher","content":"blocked"}');
     });

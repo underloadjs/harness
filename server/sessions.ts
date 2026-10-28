@@ -145,7 +145,7 @@ export class SessionStore {
     // `registry` defaults to a fresh in-memory registry over the shipped presets.
     // It is injectable so tests can run scripted harnesses (including subagents and
     // failures) without reaching a provider, and so the host can share ONE registry
-    // with the API. `describe` captures host-specific availability (websearch) in
+    // with the API. `describe` captures host-specific availability (webSearch) in
     // the frozen snapshot: the store owns no catalogue, so production injects a
     // describer bound to the runtime catalogue.
     constructor(
@@ -235,7 +235,7 @@ export class SessionStore {
     // Run one REGISTERED tool inside a session's harness (R8).
     //
     // This is the server path behind `POST /tools/:name` when the caller supplies a
-    // sessionId: the core tools (requestTools/createTool/todoTools/delegate) have
+    // sessionId: the core tools (toolRequest/toolCreate/todoManage/agentDelegate) have
     // no standalone implementation, so they must execute against the harness the
     // session owns — a manual discovery or todo call then affects the very
     // conversation the user is looking at. Registered, non-core tools are also
@@ -245,7 +245,7 @@ export class SessionStore {
     // Failure mapping is the caller's job (server/api.ts):
     //   - unknown session            → SessionError 404 (require)
     //   - session busy (run/manual)  → SessionError 409 (single-flight gate)
-    //   - tool absent from the run   → SessionError 404 (delegate without subagents)
+    //   - tool absent from the run   → SessionError 404 (agentDelegate without subagents)
     //   - the tool itself throws     → whatever it throws (reported as ok:false)
     //
     // `parameters` is the value `execute` receives, i.e. already unwrapped by the
@@ -258,7 +258,7 @@ export class SessionStore {
         // run would make that run's transcript internally inconsistent, so it is
         // rejected like a second submitted task rather than queued.
         //
-        // The same holds for a SECOND manual call: an async `delegate` holds the
+        // The same holds for a SECOND manual call: an async `agentDelegate` holds the
         // session across awaits, so without this check two manual mutations (or a
         // reset) could interleave even though `status` was never `running`.
         if (session.busy) {
@@ -449,7 +449,7 @@ export class SessionStore {
     reset(id: string): SessionSnapshot {
         const session = this.require(id);
 
-        // `busy`, not `status`: a manual delegate/createTool call holds the
+        // `busy`, not `status`: a manual agentDelegate/toolCreate call holds the
         // session without a turn, and resetting its harness mid-call would clear
         // state the tool is still mutating.
         if (session.busy) {

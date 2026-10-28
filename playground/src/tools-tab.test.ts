@@ -10,7 +10,7 @@
 //   - an ordinary tool keeps its pre-R8 request body (no sessionId);
 //   - after a core call the session snapshot is re-read, so discovered tools show
 //     up without a reload;
-//   - a truncated requestTools result keeps its raw payload and adds guidance that
+//   - a truncated toolRequest result keeps its raw payload and adds guidance that
 //     names the remaining count and asks for refined tags.
 
 import type { HarnessDescriptor, SessionSnapshot, ToolDescriptor } from '../../server/protocol';
@@ -25,8 +25,8 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         description: 'A general instruction-following agent.',
         requiresEndpoint: true,
         agents: ['instruct'],
-        tools: ['readFile'],
-        coreTools: ['requestTools', 'createTool', 'todoTools'],
+        tools: ['fileRead'],
+        coreTools: ['toolRequest', 'toolCreate', 'todoManage'],
         primary: 'instruct',
         subagents: [],
         builtin: true,
@@ -44,20 +44,26 @@ const coreTool = (name: string, parameters: Record<string, unknown>): ToolDescri
     sessionBound: true
 });
 
-const readFileTool: ToolDescriptor = {
-    name: 'readFile',
+const fileReadTool: ToolDescriptor = {
+    name: 'fileRead',
     group: 'Files',
-    description: 'Read a file.',
-    tags: ['file', 'read'],
+    description: 'Read one or more files.',
+    tags: ['files', 'read'],
     visibility: 'searchable',
     parameters: {
         type: 'object',
-        properties: { path: { type: 'string', description: 'Path to read.' } },
-        required: ['path']
+        properties: {
+            paths: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Files to read, in the order the results are returned.'
+            }
+        },
+        required: ['paths']
     }
 };
 
-const requestToolsTool = coreTool('requestTools', {
+const toolRequestTool = coreTool('toolRequest', {
     type: 'object',
     properties: {
         tags: { type: 'array', items: { type: 'string' }, description: 'Capability tags.' }
@@ -89,7 +95,7 @@ type Call = { url: string; method: string | undefined; body: unknown };
 const bootstrap = (overrides: Record<string, unknown> = {}): Record<string, unknown> => ({
     rootPath: '/api',
     presets: [descriptor()],
-    tools: [requestToolsTool, readFileTool],
+    tools: [toolRequestTool, fileReadTool],
     defaults,
     sessions: [],
     agents: [],
@@ -138,12 +144,12 @@ it('lists core tools on the Tools tab, calls with the captured session and refre
                 return json({ session: snapshot() }, 201);
             }
 
-            if (url === '/api/tools/requestTools' && method === 'POST') {
+            if (url === '/api/tools/toolRequest' && method === 'POST') {
                 return json({
                     ok: true,
                     result: {
-                        enabled: ['readFile'],
-                        tools: ['readFile', 'globFiles'],
+                        enabled: ['fileRead'],
+                        tools: ['fileRead', 'fileGlob'],
                         truncated: true,
                         remaining: 2
                     },
@@ -154,10 +160,10 @@ it('lists core tools on the Tools tab, calls with the captured session and refre
             // The refresh a core call triggers. The discovery must reach the core
             // section without a reload.
             if (url === '/api/sessions/s1' && method === undefined) {
-                return json({ session: snapshot({ discoveredTools: ['readFile', 'globFiles'] }) });
+                return json({ session: snapshot({ discoveredTools: ['fileRead', 'fileGlob'] }) });
             }
 
-            if (url === '/api/tools/readFile' && method === 'POST') {
+            if (url === '/api/tools/fileRead' && method === 'POST') {
                 return json({ ok: true, result: { path: 'package.json', content: '{}' }, durationMs: 2 });
             }
 
@@ -191,14 +197,14 @@ it('lists core tools on the Tools tab, calls with the captured session and refre
     );
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-tab-button')].map((node) => node.dataset.tool)
-    ).toEqual(['requestTools', 'readFile']);
+    ).toEqual(['toolRequest', 'fileRead']);
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-tab-kind')].map((node) => node.textContent)
     ).toEqual(['core · session', 'searchable']);
 
     // The first tool opens automatically; a core tool reports its session context
     // before anything is created.
-    expect(document.querySelector('.main-title')?.textContent).toBe('requestTools');
+    expect(document.querySelector('.main-title')?.textContent).toBe('toolRequest');
     expect(byClass('.agent-slot', 'div').hidden).toBe(true);
     expect(document.querySelector('.tool-session')?.textContent).toBe(
         'Session-bound: runs inside instruct. No session yet — Call creates one for this harness.'
@@ -212,8 +218,8 @@ it('lists core tools on the Tools tab, calls with the captured session and refre
     // The session was created for the selected harness and the captured id was
     // sent with the call. Nothing else ran: a browser cannot evaluate these tools.
     expect(calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST')).toHaveLength(1);
-    expect(calls.find((call) => call.url === '/api/tools/requestTools')).toEqual({
-        url: '/api/tools/requestTools',
+    expect(calls.find((call) => call.url === '/api/tools/toolRequest')).toEqual({
+        url: '/api/tools/toolRequest',
         method: 'POST',
         body: { parameters: { tags: ['web'] }, sessionId: 's1' }
     });
@@ -237,14 +243,14 @@ it('lists core tools on the Tools tab, calls with the captured session and refre
     expect(calls.filter((call) => call.url === '/api/sessions/s1')).toHaveLength(1);
     expect(byClass('.core-discovered', 'p').hidden).toBe(false);
     expect(byClass('.core-discovered', 'p').textContent).toBe(
-        'enabled for this session: readFile, globFiles'
+        'enabled for this session: fileRead, fileGlob'
     );
 
     // An ordinary tool is unchanged: no sessionId key, no extra session traffic.
-    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="readFile"]')?.click();
+    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="fileRead"]')?.click();
     expect(document.querySelector('.tool-session')?.hidden).toBe(true);
 
-    byClass('.tool-args', 'textarea').value = '{"path":"package.json"}';
+    byClass('.tool-args', 'textarea').value = '["package.json"]';
     const getsBefore = calls.filter((call) => call.url === '/api/sessions/s1').length;
     const sessionsBefore = calls.filter((call) => call.url === '/api/sessions').length;
 
@@ -252,10 +258,10 @@ it('lists core tools on the Tools tab, calls with the captured session and refre
     await flush();
     await flush();
 
-    expect(calls.find((call) => call.url === '/api/tools/readFile')).toEqual({
-        url: '/api/tools/readFile',
+    expect(calls.find((call) => call.url === '/api/tools/fileRead')).toEqual({
+        url: '/api/tools/fileRead',
         method: 'POST',
-        body: { parameters: { path: 'package.json' } }
+        body: { parameters: ['package.json'] }
     });
     expect(calls.filter((call) => call.url === '/api/sessions/s1')).toHaveLength(getsBefore);
     expect(calls.filter((call) => call.url === '/api/sessions')).toHaveLength(sessionsBefore);
@@ -273,7 +279,7 @@ it('shows a server request failure for a core call instead of pretending it ran'
             if (url === '/api/models') return json({ models: ['m1'] });
             if (url === '/api/sessions' && init?.method === 'POST') return json({ session: snapshot() }, 201);
 
-            if (url === '/api/tools/requestTools' && init?.method === 'POST') {
+            if (url === '/api/tools/toolRequest' && init?.method === 'POST') {
                 // 409: the session is mid-run. The client reports the server's
                 // message and must NOT refresh as if the call had applied.
                 return json({ error: { message: 'Session "s1" is running; retry when it is idle.' } }, 409);

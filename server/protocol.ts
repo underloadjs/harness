@@ -73,8 +73,8 @@ export type HarnessDescriptor = {
     subagents: string[];
     agents: string[];
     tools: string[];
-    // The core tools this card's runs will declare: requestTools, createTool,
-    // todoTools for every harness, plus delegate when a subagent allowlist exists.
+    // The core tools this card's runs will declare: toolRequest, toolCreate,
+    // todoManage for every harness, plus agentDelegate when a subagent allowlist exists.
     // No preset tool is core any more (the whole catalogue is searchable).
     coreTools?: string[];
     // Per-agent model overrides (R9): agent id → model id. PRESENT ONLY WHEN a
@@ -119,7 +119,7 @@ export type UpdateHarnessRequest = {
 };
 
 // Whether the server can actually run a listed tool. Omitted means "available":
-// the field was added for credential-dependent tools (websearch), so leaving it
+// the field was added for credential-dependent tools (webSearch), so leaving it
 // off keeps every existing entry byte-identical.
 //
 // `environment` names variables only — never values — and `hint` is a non-secret
@@ -141,8 +141,8 @@ export type ToolDescriptor = {
     visibility: 'core' | 'searchable';
     parameters: Record<string, unknown>;
     availability?: ToolAvailability;
-    // True for the harness-owned core tools (requestTools, createTool, todoTools,
-    // delegate). They have no standalone implementation: a call must carry a
+    // True for the harness-owned core tools (toolRequest, toolCreate, todoManage,
+    // agentDelegate). They have no standalone implementation: a call must carry a
     // `sessionId` and executes through that session's harness. Omitted for every
     // directly callable entry, so existing descriptors keep their shape.
     sessionBound?: boolean;
@@ -173,7 +173,7 @@ export type SessionSnapshot = {
     // registry change (POST/PATCH) therefore cannot rewrite what an existing
     // session reports: the UI can always render the frozen agents/toolbox/card.
     harnessDefinition?: HarnessDescriptor;
-    // The tools requestTools had enabled when this snapshot was taken, in
+    // The tools toolRequest had enabled when this snapshot was taken, in
     // discovery order. Read-only; reset() empties it. Optional so a client can
     // still read an older server's snapshot.
     discoveredTools?: string[];
@@ -248,13 +248,13 @@ export type SubmitMessageRequest = {
 export type ToolCallRequest = {
     parameters?: unknown;
     // Which session also runs the call (R8). REQUIRED for `sessionBound` core
-    // tools (requestTools, createTool, todoTools, delegate): they execute inside
+    // tools (toolRequest, toolCreate, todoManage, agentDelegate): they execute inside
     // that session's harness so discovery, runtime creation, todos, and delegation
     // affect the conversation the user is looking at. Accepted but ignored for a
     // directly callable catalogue tool, which keeps one request shape for the UI.
     //
     // 400 when a core call omits it; 404 when the session (or the tool inside that
-    // session, e.g. delegate without subagents) does not exist; 409 when the
+    // session, e.g. agentDelegate without subagents) does not exist; 409 when the
     // session is busy (a run, a reset, or another manual call), so a manual
     // mutation cannot race an active operation.
     sessionId?: string;

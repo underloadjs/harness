@@ -1,9 +1,9 @@
-// createTool — the runtime tool-creation capability (R2b).
+// toolCreate — the runtime tool-creation capability (R2b).
 //
 // Contract pinned here:
-//   - createTool is a core tool, so every agent sees it without discovery;
+//   - toolCreate is a core tool, so every agent sees it without discovery;
 //   - a model-created tool is registered searchable, enabled at once, and appears
-//     in the very next request's declarations and in later requestTools results;
+//     in the very next request's declarations and in later toolRequest results;
 //   - registering compiles the body but NEVER executes it;
 //   - the body receives `args` after the single-property rule and the harness
 //     `context` (agent/agents/run);
@@ -71,16 +71,16 @@ const creation: ToolCreation = {
     source: 'return args.text.repeat(args.times ?? 1);'
 };
 
-describe('createTool', () => {
+describe('toolCreate', () => {
     it('is core, so the model can reach it without discovery', async () => {
         const seen: HarnessStreamRequest[] = [];
         const writer = quiet(brain(scripted([answer('hi')], seen)));
 
         await writer('go');
 
-        expect(writer.tools.createTool.visibility).toBe('core');
-        expect(writer.tools.createTool.description).toContain('Create a tool for yourself from JavaScript source.');
-        expect(declaredNames(seen[0])).toEqual(['requestTools', 'createTool', 'todoTools']);
+        expect(writer.tools.toolCreate.visibility).toBe('core');
+        expect(writer.tools.toolCreate.description).toContain('Create a tool for yourself from JavaScript source.');
+        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
     });
 
     it('registers a tool from a model call and declares it on the next turn', async () => {
@@ -88,7 +88,7 @@ describe('createTool', () => {
         const entry = brain(
             scripted(
                 [
-                    callTool('c1', 'createTool', JSON.stringify(creation)),
+                    callTool('c1', 'toolCreate', JSON.stringify(creation)),
                     callTool('c2', 'repeat', '{"text":"ab","times":2}'),
                     answer('done')
                 ],
@@ -100,15 +100,15 @@ describe('createTool', () => {
         const message = await writer('go');
 
         // Round 1: core only. Round 2: the created tool is already enabled.
-        expect(declaredNames(seen[0])).toEqual(['requestTools', 'createTool', 'todoTools']);
-        expect(declaredNames(seen[1])).toEqual(['requestTools', 'createTool', 'todoTools', 'repeat']);
+        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
+        expect(declaredNames(seen[1])).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'repeat']);
 
         // The tool is a real registry entry, searchable like any other.
         expect(writer.tools.repeat.name).toBe('repeat');
         expect(writer.tools.repeat.visibility).toBe('searchable');
         expect(writer.tools.repeat.tags).toEqual(['text', 'repeat']);
 
-        // The createTool result is metadata only — never the source.
+        // The toolCreate result is metadata only — never the source.
         expect(JSON.parse((entry.messages[2] as { content: string }).content)).toEqual({
             name: 'repeat',
             description: 'Repeat text.',
@@ -146,7 +146,7 @@ describe('createTool', () => {
             scripted([
                 callTool(
                     'c1',
-                    'createTool',
+                    'toolCreate',
                     JSON.stringify({
                         name: 'shout',
                         description: 'Uppercase text.',
@@ -168,7 +168,7 @@ describe('createTool', () => {
         expect((entry.messages[4] as { content: string }).content).toBe('HELLO');
     });
 
-    it('stays discoverable through requestTools after registration', async () => {
+    it('stays discoverable through toolRequest after registration', async () => {
         const writer = quiet(brain(scripted([answer('hi')])));
 
         writer.createTool({
@@ -178,7 +178,7 @@ describe('createTool', () => {
             source: 'return args;'
         });
 
-        expect(await writer.tools.requestTools({ tags: ['summary'] })).toEqual({
+        expect(await writer.tools.toolRequest({ tags: ['summary'] })).toEqual({
             enabled: ['digest'],
             tools: [{ name: 'digest', description: 'Summarise text.', tags: ['text', 'summary'] }],
             remaining: 0
@@ -190,12 +190,12 @@ describe('createTool', () => {
         const writer = quiet(brain(scripted([answer('hi')])), { existing });
 
         expect(() =>
-            writer.createTool({ name: 'requestTools', description: 'Mine.', tags: ['x'], source: 'return 1;' })
-        ).toThrow('Tool name "requestTools" is reserved by the harness.');
+            writer.createTool({ name: 'toolRequest', description: 'Mine.', tags: ['x'], source: 'return 1;' })
+        ).toThrow('Tool name "toolRequest" is reserved by the harness.');
 
         expect(() =>
-            writer.createTool({ name: 'delegate', description: 'Mine.', tags: ['x'], source: 'return 1;' })
-        ).toThrow('Tool name "delegate" is reserved by the harness.');
+            writer.createTool({ name: 'agentDelegate', description: 'Mine.', tags: ['x'], source: 'return 1;' })
+        ).toThrow('Tool name "agentDelegate" is reserved by the harness.');
 
         expect(() => writer.createTool({ ...creation, name: 'existing' })).toThrow(
             'Tool "existing" is already registered; choose another name.'
@@ -207,7 +207,7 @@ describe('createTool', () => {
         );
 
         // Nothing was registered by the rejected attempts.
-        expect(Object.keys(writer.tools)).toEqual(['existing', 'requestTools', 'createTool', 'todoTools']);
+        expect(Object.keys(writer.tools)).toEqual(['existing', 'toolRequest', 'toolCreate', 'todoManage']);
     });
 
     it('validates the creation shape', () => {
@@ -222,7 +222,7 @@ describe('createTool', () => {
         );
 
         expect(() => writer.createTool({ ...creation, tags: [] })).toThrow(
-            'Tool "repeat" requires at least one tag, so requestTools can find it.'
+            'Tool "repeat" requires at least one tag, so toolRequest can find it.'
         );
 
         expect(() => writer.createTool({ ...creation, source: '   ' })).toThrow(
@@ -244,7 +244,7 @@ describe('createTool', () => {
     it('turns a failed creation into a recoverable tool result for the model', async () => {
         const entry = brain(
             scripted([
-                callTool('c1', 'createTool', JSON.stringify({ ...creation, source: 'return (' })),
+                callTool('c1', 'toolCreate', JSON.stringify({ ...creation, source: 'return (' })),
                 answer('recovered')
             ])
         );
@@ -255,7 +255,7 @@ describe('createTool', () => {
         expect(message.content).toBe('recovered');
         expect(writer.tools.repeat).toBeUndefined();
         expect((entry.messages[2] as { content: string }).content).toMatch(
-            /^Tool "createTool" failed: Tool source could not be compiled: /
+            /^Tool "toolCreate" failed: Tool source could not be compiled: /
         );
     });
 

@@ -12,12 +12,19 @@
 // module: `loadPresetTool()` reaches them through `import()`, so a bundler can
 // code-split them and Node only evaluates the body when a tool is actually called.
 //
+// NAMING (T14): every wire name is `<namespace><action>` — fileRead, fileWrite,
+// fileEdit, fileList, fileGlob, commandRun, gitDiff, syntaxCheck, webSearch. The
+// namespace groups related tools for discovery; the action is what the model calls.
+// The old names (readFile, writeFile, editFile, listFiles, globFiles, searchFiles,
+// runCommand, websearch) are gone: there are no compatibility aliases, because a
+// catalogue with two names for one tool makes discovery ambiguous.
+//
 // Single source of truth
 // ----------------------
 // Each implementation spreads its entry from `PRESET_TOOLS` into `tool({...})`,
-// e.g. `files/readFile.ts`:
+// e.g. `files/fileRead.ts`:
 //
-//     tool<string, string>({ ...PRESET_TOOLS.readFile, execute: ... })
+//     tool<string[], FileReadResult>({ ...PRESET_TOOLS.fileRead, execute: ... })
 //
 // So the text a model reads and the tool that runs can never drift apart. Edit a
 // description HERE, not in the implementation file.
@@ -28,12 +35,12 @@
 //   - ../core/tool  — normalizes tags and defines the Tool contract
 //
 // Discovery: EVERY entry is `searchable` (the tool() default). Searchable means
-// the harness declares it only after requestTools matches its tags, so the
+// the harness declares it only after toolRequest matches its tags, so the
 // catalogue can grow without spending context. The only core tools are the
-// harness-owned requestTools/createTool/todoTools (plus delegate for a primary
+// harness-owned toolRequest/toolCreate/todoManage (plus agentDelegate for a primary
 // with subagents); no preset — including the file tools — is declared up front.
-// This is the latest scope decision: one discovery surface for the whole
-// catalogue, so a file tool costs the same round trip as runCommand.
+// One discovery surface for the whole catalogue, so a file tool costs the same
+// round trip as commandRun.
 
 import type { Tool, ToolVisibility } from '../types';
 
@@ -52,7 +59,7 @@ export type PresetToolMetadata = {
 // The catalogue. Key order is the order `presetTools` is built in, which is the
 // order the harness preloads — grouped syntax, files, command so the folder
 // structure and the registry read the same way. No entry is core: the whole
-// catalogue is declared only after requestTools enables it.
+// catalogue is declared only after toolRequest enables it.
 //
 // `as const` keeps literal tag tuples (so a parity test can compare them exactly)
 // while `satisfies` proves every row is complete enough to become a Tool.
@@ -79,121 +86,172 @@ export const PRESET_TOOLS = {
             additionalProperties: false
         }
     },
-    readFile: {
-        name: 'readFile',
+    // fileRead is BATCHED (T14): one property, an array of paths, so the
+    // single-property rule hands execute the array itself and the result is an
+    // ordered [{ path, content }] array. A missing file rejects the whole call.
+    fileRead: {
+        name: 'fileRead',
         description:
-            'Read a UTF-8 text file from disk and return its contents. Throws when the file does not exist or is not readable.',
+            'Read one or more UTF-8 text files and return their contents. Pass an array of paths and get an ordered array of { path, content } entries in the same order. One missing or unreadable path rejects the whole call, so a short answer never looks complete. Paths are absolute or relative to the working directory.',
         tags: ['files', 'read', 'filesystem'],
         parameters: {
             type: 'object',
             properties: {
-                path: { type: 'string', description: 'Path to the file, absolute or relative to the working directory.' }
+                paths: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description:
+                        'Files to read, absolute or relative to the working directory, in the order the results are returned.'
+                }
             },
-            required: ['path'],
+            required: ['paths'],
             additionalProperties: false
         }
     },
-    writeFile: {
-        name: 'writeFile',
+    // fileWrite is BATCHED (T14): one property, an array of { path, content }.
+    // Every entry is validated and every target path resolved (and deduplicated)
+    // before the first write; parent directories are created as needed.
+    fileWrite: {
+        name: 'fileWrite',
         description:
-            'Write UTF-8 text to a file, creating parent directories as needed and overwriting an existing file. Returns the absolute path and the number of bytes written.',
+            'Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. Every entry is validated before anything is written, and the same target path twice is rejected. A write error part-way through is reported with the paths already completed: there is no rollback.',
         tags: ['files', 'write', 'filesystem'],
         parameters: {
             type: 'object',
             properties: {
-                path: { type: 'string', description: 'Path to the file, absolute or relative to the working directory.' },
-                content: { type: 'string', description: 'Full text to write. Replaces the previous contents.' }
+                files: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            path: {
+                                type: 'string',
+                                description:
+                                    'Path to the file, absolute or relative to the working directory.'
+                            },
+                            content: {
+                                type: 'string',
+                                description: 'Full text to write. Replaces the previous contents.'
+                            }
+                        },
+                        required: ['path', 'content'],
+                        additionalProperties: false
+                    },
+                    description: 'Files to write, in the order the results are returned.'
+                }
             },
-            required: ['path', 'content'],
+            required: ['files'],
             additionalProperties: false
         }
     },
-    editFile: {
-        name: 'editFile',
+    // fileEdit is BATCHED (T14): one property, an array of
+    // { path, oldString, newString, replaceAll? }. ALL entries are read and
+    // match-checked before the first write, so a bad entry leaves every file
+    // untouched; duplicate targets are rejected.
+    fileEdit: {
+        name: 'fileEdit',
         description:
-            'Replace text in an existing file. oldString must match the file byte-for-byte and must appear exactly once unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Returns the absolute path, the replacement count, and the resulting byte size. Creates nothing: use writeFile for new files.',
+            'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match byte-for-byte and must appear exactly once unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes }. Creates nothing: use fileWrite for new files.',
         tags: ['files', 'edit', 'write', 'replace', 'filesystem'],
         parameters: {
             type: 'object',
             properties: {
-                path: { type: 'string', description: 'Path to an existing file, absolute or relative to the working directory.' },
-                oldString: { type: 'string', description: 'Exact text to replace. Must be unique unless replaceAll is true.' },
-                newString: { type: 'string', description: 'Replacement text. May be empty to delete the matched text.' },
-                replaceAll: {
-                    type: 'boolean',
-                    description: 'Replace every occurrence instead of requiring oldString to be unique. Defaults to false.'
+                edits: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            path: {
+                                type: 'string',
+                                description:
+                                    'Path to an existing file, absolute or relative to the working directory.'
+                            },
+                            oldString: {
+                                type: 'string',
+                                description:
+                                    'Exact text to replace. Must be unique unless replaceAll is true.'
+                            },
+                            newString: {
+                                type: 'string',
+                                description:
+                                    'Replacement text. May be empty to delete the matched text.'
+                            },
+                            replaceAll: {
+                                type: 'boolean',
+                                description:
+                                    'Replace every occurrence instead of requiring oldString to be unique. Defaults to false.'
+                            }
+                        },
+                        required: ['path', 'oldString', 'newString'],
+                        additionalProperties: false
+                    },
+                    description: 'Edits to apply, one per file, in the order the results are returned.'
                 }
             },
-            required: ['path', 'oldString', 'newString'],
+            required: ['edits'],
             additionalProperties: false
         }
     },
-    listFiles: {
-        name: 'listFiles',
+    // fileList is BATCHED (T14): one property, an array of directories. Every
+    // result is prefixed with its directory so a flat list stays readable.
+    // Deliberately NOT recursive — fileGlob is the walking tool.
+    fileList: {
+        name: 'fileList',
         description:
-            'List the immediate entries of a directory. Directories are returned with a trailing slash so they are distinguishable from files. Returns a sorted list of entry names, not full paths.',
+            'List the immediate entries of one or more directories, non-recursively. Every result is prefixed with the directory it came from (e.g. ["src/a.ts", "src/nested/", "task/b.ts"]), directories end with a trailing slash so they are distinguishable from files, and entries are sorted. Pass several directories to survey them in one call; the default is ["."], which returns bare entry names.',
         tags: ['files', 'list', 'filesystem'],
         parameters: {
             type: 'object',
             properties: {
-                path: {
-                    type: 'string',
-                    description: 'Directory to list, absolute or relative to the working directory. Defaults to ".".'
+                paths: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description:
+                        'Directories to list, absolute or relative to the working directory, in the order the results are grouped. Defaults to ["."].'
                 }
             },
             additionalProperties: false
         }
     },
-    searchFiles: {
-        name: 'searchFiles',
+    // fileGlob is the ONE search surface (T14): filename matching, plus an
+    // optional content regex that switches the result shape. The description must
+    // state the mode rule, because a model reads it and nothing else.
+    fileGlob: {
+        name: 'fileGlob',
         description:
-            'Search file contents with a regular expression, returning one match per line. Skips .git, node_modules, symlinks, binary files, and files larger than 1 MiB. Results are capped (100 by default) and paths are relative to the search root with 1-based line numbers. Does not read .gitignore files.',
-        tags: ['files', 'search', 'grep', 'content', 'filesystem'],
+            'Find files by glob pattern, and optionally search their contents in the same call. `patterns` (default ["**/*"]) supports *, ?, **, and [abc] classes; a pattern with no slash also matches file names at any depth. `paths` (default ["."]) lists directories to walk, in order; overlapping roots and patterns are deduplicated and results are prefixed with their root. WITHOUT `content` the result is { files, truncated }. WITH `content` (a JavaScript regular expression) every file matching the patterns is read and each matching line is returned as { matches: [{ path, line, text }], truncated }. Content mode skips .git, node_modules, symlinks, binary files, and files larger than 1 MiB. Results are capped (100 by default) across all roots. Does not read .gitignore files.',
+        tags: ['files', 'glob', 'search', 'grep', 'find', 'content', 'filesystem'],
         parameters: {
             type: 'object',
             properties: {
-                pattern: { type: 'string', description: 'JavaScript regular expression to match, e.g. "TODO|FIXME".' },
-                path: {
-                    type: 'string',
-                    description: 'Directory to search, absolute or relative to the working directory. Defaults to ".".'
+                patterns: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description:
+                        'Glob patterns, OR-ed together, e.g. ["**/*.test.ts"] or ["*.md", "*.txt"]. Defaults to ["**/*"].'
                 },
-                include: {
-                    type: 'string',
-                    description: 'Glob limiting which files are read, e.g. "*.ts" or "src/**/*.ts". Matches file names when the pattern has no slash.'
+                paths: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description:
+                        'Directories to walk, absolute or relative to the working directory, in the order they are visited. Defaults to ["."].'
                 },
-                maxResults: {
-                    type: 'number',
-                    description: 'Maximum matches to return. Defaults to 100 and is clamped to 1–100.'
-                }
-            },
-            required: ['pattern'],
-            additionalProperties: false
-        }
-    },
-    globFiles: {
-        name: 'globFiles',
-        description:
-            'Find files by glob pattern. Supports *, ?, **, and [abc] classes; a pattern with no slash also matches file names at any depth. Skips .git, node_modules, and symlinks. Paths are relative to the search root, sorted, and capped (100 by default) with a truncated flag. Does not read .gitignore files.',
-        tags: ['files', 'glob', 'search', 'find', 'filesystem'],
-        parameters: {
-            type: 'object',
-            properties: {
-                pattern: { type: 'string', description: 'Glob pattern, e.g. "**/*.test.ts" or "*.md".' },
-                path: {
+                content: {
                     type: 'string',
-                    description: 'Directory to search, absolute or relative to the working directory. Defaults to ".".'
+                    description:
+                        'JavaScript regular expression to match inside each file, e.g. "TODO|FIXME". Providing it switches the result from file paths to matching lines.'
                 },
                 maxResults: {
                     type: 'number',
-                    description: 'Maximum paths to return. Defaults to 100 and is clamped to 1–100.'
+                    description:
+                        'Maximum files or matches to return across all roots. Defaults to 100 and is clamped to 1-100.'
                 }
             },
-            required: ['pattern'],
             additionalProperties: false
         }
     },
-    runCommand: {
-        name: 'runCommand',
+    commandRun: {
+        name: 'commandRun',
         description:
             'Run a shell command and return its exit code, stdout, and stderr. The command string is passed to the platform shell, so pipes, redirects, and quoting work. A non-zero exit code is returned as data, not thrown.',
         tags: ['shell', 'command', 'process'],
@@ -258,20 +316,18 @@ export const loadPresetTool = (name: PresetToolName): Promise<Tool> => {
     switch (name) {
         case 'syntaxCheck':
             return import('./syntax/syntaxCheck').then((module) => module.syntaxCheck);
-        case 'readFile':
-            return import('./files/readFile').then((module) => module.readFile);
-        case 'writeFile':
-            return import('./files/writeFile').then((module) => module.writeFile);
-        case 'editFile':
-            return import('./files/editFile').then((module) => module.editFile);
-        case 'listFiles':
-            return import('./files/listFiles').then((module) => module.listFiles);
-        case 'searchFiles':
-            return import('./files/searchFiles').then((module) => module.searchFiles);
-        case 'globFiles':
-            return import('./files/globFiles').then((module) => module.globFiles);
-        case 'runCommand':
-            return import('./command/runCommand').then((module) => module.runCommand);
+        case 'fileRead':
+            return import('./files/fileRead').then((module) => module.fileRead);
+        case 'fileWrite':
+            return import('./files/fileWrite').then((module) => module.fileWrite);
+        case 'fileEdit':
+            return import('./files/fileEdit').then((module) => module.fileEdit);
+        case 'fileList':
+            return import('./files/fileList').then((module) => module.fileList);
+        case 'fileGlob':
+            return import('./files/fileGlob').then((module) => module.fileGlob);
+        case 'commandRun':
+            return import('./command/commandRun').then((module) => module.commandRun);
         case 'gitDiff':
             return import('./command/gitDiff').then((module) => module.gitDiff);
     }

@@ -109,7 +109,7 @@ describe('creating a harness', () => {
             subagents: ['summarizer'],
             agents: ['research', 'summarizer'],
             tools: SHARED_TOOL_NAMES,
-            environmentTools: ['websearch'],
+            environmentTools: ['webSearch'],
             builtin: false,
             editable: true
         });
@@ -119,13 +119,13 @@ describe('creating a harness', () => {
         const harness = preset.create(SETTINGS, progress);
         expect(Object.keys(harness.agents)).toEqual(['research', 'summarizer']);
         expect(Object.keys(harness.subagents)).toEqual(['summarizer']);
-        expect(harness.tools.delegate.visibility).toBe('core');
+        expect(harness.tools.agentDelegate.visibility).toBe('core');
         expect(Object.keys(harness.tools)).toEqual([
             ...SHARED_TOOL_NAMES,
-            'requestTools',
-            'createTool',
-            'todoTools',
-            'delegate'
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'agentDelegate'
         ]);
 
         // The registry lists it after the built-ins.
@@ -149,7 +149,7 @@ describe('creating a harness', () => {
         expect(preset.subagents).toEqual([]);
 
         // No subagents means the harness registers no delegate tool at all.
-        expect(preset.create(SETTINGS, progress).tools.delegate).toBeUndefined();
+        expect(preset.create(SETTINGS, progress).tools.agentDelegate).toBeUndefined();
     });
 
     it('rejects bad names, reserved aliases, duplicates and unknown agents', () => {
@@ -306,7 +306,7 @@ describe('updating a harness', () => {
         const harness = after.create(SETTINGS, progress);
         expect(Object.keys(harness.agents)).toEqual(['workspace', 'research', 'summarizer']);
         expect(Object.keys(harness.subagents)).toEqual(['research', 'summarizer']);
-        expect(harness.tools.delegate.visibility).toBe('core');
+        expect(harness.tools.agentDelegate.visibility).toBe('core');
     });
 
     it('drops the new primary from the old allowlist when subagents are not restated', () => {
@@ -318,7 +318,7 @@ describe('updating a harness', () => {
         expect(after.primary).toBe('summarizer');
         expect(after.subagents).toEqual([]);
         expect(after.agents).toEqual(['summarizer']);
-        expect(after.create(SETTINGS, progress).tools.delegate).toBeUndefined();
+        expect(after.create(SETTINGS, progress).tools.agentDelegate).toBeUndefined();
     });
 
     it('validates a patched allowlist against the effective primary', () => {

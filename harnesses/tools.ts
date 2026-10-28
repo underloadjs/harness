@@ -3,12 +3,18 @@
 // These are ordinary `tool()` definitions, now executed by the server instead of
 // being stubbed in a browser. They are deliberately dependency-free so the
 // catalogue stays useful without an endpoint, and they show the discovery flow:
-// every one is searchable, so a model must call requestTools before it can use one.
+// every one is searchable, so a model must call toolRequest before it can use one.
+//
+// NAMING (T14): `<namespace><action>` — timeNow, textCount, diceRoll, noteSearch,
+// textSummarize, testFlaky. The old names (clock, wordCount, roll, searchNotes,
+// summarize, flaky) are gone with no aliases; a second name for one tool would make
+// discovery ambiguous.
 
 import { tool } from '../src/harness';
 import type { Tool } from '../src/harness';
 
-const clock = tool<string | undefined, { timezone: string; iso: string; unix: number }>({
+// timeNow — the current time. The timezone argument is only a label for the answer.
+const timeNow = tool<string | undefined, { timezone: string; iso: string; unix: number }>({
     description:
         'Read the current time. Returns an ISO 8601 timestamp and the Unix time in seconds. The timezone argument is only a label for the answer.',
     tags: ['time', 'clock', 'date'],
@@ -31,7 +37,8 @@ const clock = tool<string | undefined, { timezone: string; iso: string; unix: nu
     }
 });
 
-const wordCount = tool<string, { words: number; characters: number }>({
+// textCount — words and characters, so a model can check a length claim.
+const textCount = tool<string, { words: number; characters: number }>({
     description: 'Count the words and characters in a text. Useful before claiming a length.',
     tags: ['text', 'words', 'count'],
     parameters: {
@@ -52,7 +59,8 @@ const wordCount = tool<string, { words: number; characters: number }>({
     }
 });
 
-const roll = tool<number | undefined, { sides: number; value: number }>({
+// diceRoll — a fair die, so the random path is exercised without a network call.
+const diceRoll = tool<number | undefined, { sides: number; value: number }>({
     description: 'Roll a fair die and return the value. Defaults to six sides.',
     tags: ['random', 'dice', 'chance'],
     parameters: {
@@ -83,7 +91,7 @@ const NOTES: readonly { title: string; body: string }[] = [
     },
     {
         title: 'Single-property rule',
-        body: 'When a tool schema declares exactly one property, execute receives that property value instead of the wrapper object. That is why readFile("package.json") and a model call carrying { "path": "package.json" } run the same code path.'
+        body: 'When a tool schema declares exactly one property, execute receives that property value instead of the wrapper object. That is why fileRead(["package.json"]) and a model call carrying { "paths": ["package.json"] } run the same code path.'
     },
     {
         title: 'Progress events',
@@ -91,7 +99,9 @@ const NOTES: readonly { title: string; body: string }[] = [
     }
 ];
 
-const searchNotes = tool<string, { title: string; excerpt: string }[]>({
+// noteSearch — the local corpus. Deliberately offline so the research preset has
+// a search that never depends on a provider key.
+const noteSearch = tool<string, { title: string; excerpt: string }[]>({
     description: 'Search a small local corpus of notes about the harness and return the matching entries.',
     tags: ['search', 'notes', 'knowledge'],
     parameters: {
@@ -129,12 +139,12 @@ const condense = (notes: string): string => {
         .join(' ');
 };
 
-// The tool-side half of a multi-agent run: `run(name, input)` is only present
-// inside a harness. Research configures a `summarizer` subagent so this tool
-// delegates to it; every other live harness shares the same tool but has no such
-// agent, so it condenses locally (see `condense` above). A direct server call has
-// neither `run` nor `agents`, and gets the same local fallback.
-const summarize = tool<string, string>({
+// textSummarize — the tool-side half of a multi-agent run: `run(name, input)` is
+// only present inside a harness. Research configures a `summarizer` subagent so
+// this tool delegates to it; every other live harness shares the same tool but has
+// no such agent, so it condenses locally (see `condense` above). A direct server
+// call has neither `run` nor `agents`, and gets the same local fallback.
+const textSummarize = tool<string, string>({
     description:
         'Summarise collected notes in at most two sentences. When the harness configures a summarizer subagent this hands the notes to it; otherwise it condenses them locally.',
     tags: ['summarize', 'text', 'agents'],
@@ -160,10 +170,11 @@ const summarize = tool<string, string>({
 
 // Deliberately unreliable: fails twice, succeeds on the third call. It exists so
 // the recoverable-failure path is visible — the harness feeds the error back as a
-// tool result and the model gets another turn.
+// tool result and the model gets another turn. The harness id stays `flaky`; only
+// the TOOL is testFlaky.
 let flakyAttempts = 0;
 
-const flaky = tool<Record<string, never>, string>({
+const testFlaky = tool<Record<string, never>, string>({
     description:
         'A deliberately unreliable tool. It throws on the first two calls of every three. Call it again after a failure; the error is returned to you as a tool result.',
     tags: ['reliability', 'retry', 'testing'],
@@ -186,10 +197,10 @@ const flaky = tool<Record<string, never>, string>({
 // The harness-level catalogue, keyed by the name the model calls. Package presets
 // live in `src/tools`; these are the extras that need no Node built-ins.
 export const harnessTools = {
-    clock,
-    wordCount,
-    roll,
-    searchNotes,
-    summarize,
-    flaky
+    timeNow,
+    textCount,
+    diceRoll,
+    noteSearch,
+    textSummarize,
+    testFlaky
 } satisfies Readonly<Record<string, Tool>>;

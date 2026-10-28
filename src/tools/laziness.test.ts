@@ -6,81 +6,98 @@
 // is imported exactly once, on first execution.
 //
 // Two tools are mocked so the callable path and the harness `execute` path are
-// each covered.
+// each covered. T14: the modules are `./files/fileRead` and `./files/fileEdit`, and
+// the batched file tools take the array their single schema property declares.
 
 import { describe, expect, it, vi } from 'vitest';
 
-const loads = vi.hoisted(() => ({ readFile: 0, editFile: 0 }));
+const loads = vi.hoisted(() => ({ fileRead: 0, fileEdit: 0 }));
 
 // A fake implementation is just the callable the proxy delegates to. Keeping it
 // minimal avoids re-implementing Tool metadata here (a function's `name` is
 // read-only, so Object.assign would throw for example).
-vi.mock('./files/readFile', () => {
-    loads.readFile += 1;
+vi.mock('./files/fileRead', () => {
+    loads.fileRead += 1;
 
-    return { readFile: async (path: string) => `mocked read:${path}` };
+    return {
+        fileRead: async (paths: string[]) => paths.map((path) => ({ path, content: `mocked read:${path}` }))
+    };
 });
 
-// editFile also needs an `execute`, because the harness calls that property
+// fileEdit also needs an `execute`, because the harness calls that property
 // directly instead of invoking the callable.
-vi.mock('./files/editFile', () => {
-    loads.editFile += 1;
+vi.mock('./files/fileEdit', () => {
+    loads.fileEdit += 1;
 
-    const editFile = async (parameters: { oldString: string }) => `mocked edit:${parameters.oldString}`;
+    const fileEdit = async (edits: { oldString: string }[]) =>
+        edits.map((edit) => ({ path: 'x', replacements: 1, bytes: edit.oldString.length }));
 
-    Object.assign(editFile, {
-        execute: async ({ parameters }: { parameters: { oldString: string } }) =>
-            `mocked execute:${parameters.oldString}`
+    Object.assign(fileEdit, {
+        execute: async ({ parameters }: { parameters: { oldString: string }[] }) =>
+            `mocked execute:${parameters[0].oldString}`
     });
 
-    return { editFile };
+    return { fileEdit };
 });
 
 describe('lazy preset tools', () => {
     it('exposes metadata without loading any implementation, then loads once on call', async () => {
         // Nothing has been imported yet: both counters start at zero.
-        expect(loads).toEqual({ readFile: 0, editFile: 0 });
+        expect(loads).toEqual({ fileRead: 0, fileEdit: 0 });
 
         const { presetTools } = await import('./index');
 
         // Full metadata is available — the description the model reads, the tags
         // discovery matches (or the visibility flag), and the schema the harness
         // declares - with no body.
-        expect(presetTools.readFile.name).toBe('readFile');
-        expect(presetTools.readFile.description).toBe('Read a UTF-8 text file from disk and return its contents. Throws when the file does not exist or is not readable.');
-        expect(presetTools.readFile.tags).toEqual(['files', 'read', 'filesystem']);
+        expect(presetTools.fileRead.name).toBe('fileRead');
+        expect(presetTools.fileRead.description).toBe(
+            'Read one or more UTF-8 text files and return their contents. Pass an array of paths and get an ordered array of { path, content } entries in the same order. One missing or unreadable path rejects the whole call, so a short answer never looks complete. Paths are absolute or relative to the working directory.'
+        );
+        expect(presetTools.fileRead.tags).toEqual(['files', 'read', 'filesystem']);
         // Searchable by catalogue metadata: discovery must enable it, but that
         // changes no laziness property.
-        expect(presetTools.readFile.visibility).toBe('searchable');
-        expect(presetTools.readFile.parameters).toEqual({
+        expect(presetTools.fileRead.visibility).toBe('searchable');
+        expect(presetTools.fileRead.parameters).toEqual({
             type: 'object',
             properties: {
-                path: { type: 'string', description: 'Path to the file, absolute or relative to the working directory.' }
+                paths: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description:
+                        'Files to read, absolute or relative to the working directory, in the order the results are returned.'
+                }
             },
-            required: ['path'],
+            required: ['paths'],
             additionalProperties: false
         });
 
         // Still no implementation import.
-        expect(loads).toEqual({ readFile: 0, editFile: 0 });
+        expect(loads).toEqual({ fileRead: 0, fileEdit: 0 });
 
-        await expect(presetTools.readFile('a.txt')).resolves.toBe('mocked read:a.txt');
-        expect(loads.readFile).toBe(1);
+        await expect(presetTools.fileRead(['a.txt'])).resolves.toEqual([
+            { path: 'a.txt', content: 'mocked read:a.txt' }
+        ]);
+        expect(loads.fileRead).toBe(1);
 
         // The module is cached: a second call does not re-import.
-        await expect(presetTools.readFile('b.txt')).resolves.toBe('mocked read:b.txt');
-        expect(loads.readFile).toBe(1);
+        await expect(presetTools.fileRead(['b.txt'])).resolves.toEqual([
+            { path: 'b.txt', content: 'mocked read:b.txt' }
+        ]);
+        expect(loads.fileRead).toBe(1);
     });
 
     it('defers the harness execute path as well', async () => {
         const { presetTools } = await import('./index');
 
-        await expect(presetTools.editFile.execute({ parameters: { oldString: 'before' } })).resolves.toBe(
-            'mocked execute:before'
-        );
-        expect(loads.editFile).toBe(1);
+        await expect(
+            presetTools.fileEdit.execute({ parameters: [{ oldString: 'before' }] })
+        ).resolves.toBe('mocked execute:before');
+        expect(loads.fileEdit).toBe(1);
 
-        await expect(presetTools.editFile({ oldString: 'after' })).resolves.toBe('mocked edit:after');
-        expect(loads.editFile).toBe(1);
+        await expect(presetTools.fileEdit([{ oldString: 'after' }])).resolves.toEqual([
+            { path: 'x', replacements: 1, bytes: 5 }
+        ]);
+        expect(loads.fileEdit).toBe(1);
     });
 });

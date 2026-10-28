@@ -1,7 +1,7 @@
 // Websearch over the real HTTP API.
 //
-// C1 fixes a specific gap: `GET /api/tools` must list websearch even on a host
-// with no provider key, `POST /api/tools/websearch` must explain that honestly,
+// C1 fixes a specific gap: `GET /api/tools` must list webSearch even on a host
+// with no provider key, `POST /api/tools/webSearch` must explain that honestly,
 // and with EXA_API_KEY in the process environment the same endpoint must execute
 // with the server-side key. Both cases run against a real server on an ephemeral
 // port; the configured case intercepts only the outbound Exa request, so no
@@ -12,7 +12,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { WEBSEARCH_ENVIRONMENT, WEBSEARCH_UNCONFIGURED_HINT } from '../harnesses';
-import { WEBSEARCH_METADATA } from '../src/harness';
+import { WEB_SEARCH_METADATA } from '../src/harness';
 import { startHarnessServer } from './index';
 import type { ToolCallResult, ToolIndex } from './protocol';
 
@@ -50,8 +50,8 @@ afterEach(() => {
     vi.unstubAllEnvs();
 });
 
-describe('websearch catalogue', () => {
-    it('lists websearch as unconfigured and refuses a direct call without a key', async () => {
+describe('webSearch catalogue', () => {
+    it('lists webSearch as unconfigured and refuses a direct call without a key', async () => {
         // The runtime catalogue must read this at server start; a module-level
         // singleton built before these stubs would have seen the host env.
         vi.stubEnv('EXA_API_KEY', '');
@@ -61,15 +61,15 @@ describe('websearch catalogue', () => {
 
         try {
             const index = await toolsIndex(server.url);
-            const descriptor = index.tools.find((tool) => tool.name === 'websearch');
+            const descriptor = index.tools.find((tool) => tool.name === 'webSearch');
 
             expect(descriptor).toEqual({
-                name: 'websearch',
+                name: 'webSearch',
                 group: 'Web search',
-                description: WEBSEARCH_METADATA.description,
+                description: WEB_SEARCH_METADATA.description,
                 tags: ['web', 'search', 'internet', 'news', 'research'],
                 visibility: 'searchable',
-                parameters: WEBSEARCH_METADATA.parameters,
+                parameters: WEB_SEARCH_METADATA.parameters,
                 availability: {
                     state: 'unconfigured',
                     environment: [...WEBSEARCH_ENVIRONMENT],
@@ -77,7 +77,7 @@ describe('websearch catalogue', () => {
                 }
             });
 
-            const result = await callTool(server.url, 'websearch', { query: 'anything' });
+            const result = await callTool(server.url, 'webSearch', { query: 'anything' });
 
             expect(withoutDuration(result)).toEqual({
                 ok: false,
@@ -132,14 +132,14 @@ describe('websearch catalogue', () => {
             expect(toolsBody).not.toContain(KEY);
 
             const index = JSON.parse(toolsBody) as ToolIndex;
-            const descriptor = index.tools.find((tool) => tool.name === 'websearch');
+            const descriptor = index.tools.find((tool) => tool.name === 'webSearch');
 
             expect(descriptor?.availability).toEqual({
                 state: 'available',
                 environment: [...WEBSEARCH_ENVIRONMENT]
             });
 
-            const result = await callTool(server.url, 'websearch', {
+            const result = await callTool(server.url, 'webSearch', {
                 query: 'harness tool discovery',
                 maxResults: 5
             });

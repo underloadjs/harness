@@ -1,11 +1,16 @@
 // The preset catalogue's static contract.
 //
-// This file pins what a UI, a docs page, or requestTools sees WITHOUT executing a
-// preset: the name order, the metadata validity rules, and the schemas of the new
-// coding tools. It never calls an implementation — that is the point of R1b.
+// This file pins what a UI, a docs page, or toolRequest sees WITHOUT executing a
+// preset: the name order, the metadata validity rules, the batched file schemas,
+// and the unified fileGlob contract. It never calls an implementation — that is
+// the point of R1b.
+//
+// T14: every wire name is `<namespace><action>`, and there are no legacy aliases.
+// A separate `searchFiles` tool no longer exists: fileGlob covers filename and
+// content search, so this file asserts its absence explicitly.
 
 import { describe, expect, it } from 'vitest';
-import { normalizeTags } from '../core/tool';
+import { toolParameterKey, normalizeTags } from '../core/tool';
 import { PRESET_TOOL_NAMES, PRESET_TOOLS } from './catalogue';
 import { presetTools } from './index';
 
@@ -13,16 +18,39 @@ describe('preset catalogue', () => {
     it('lists the presets in a stable order', () => {
         expect(PRESET_TOOL_NAMES).toEqual([
             'syntaxCheck',
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileList',
+            'fileGlob',
+            'commandRun',
+            'gitDiff'
+        ]);
+        expect(Object.keys(presetTools)).toEqual(PRESET_TOOL_NAMES);
+    });
+
+    it('publishes no legacy tool name at all', () => {
+        // The breaking part of T14: the old names are gone from the table, so a
+        // stale descriptor or a model guessing an old name cannot resolve.
+        const legacy = [
             'readFile',
             'writeFile',
             'editFile',
             'listFiles',
-            'searchFiles',
             'globFiles',
+            'searchFiles',
             'runCommand',
-            'gitDiff'
-        ]);
-        expect(Object.keys(presetTools)).toEqual(PRESET_TOOL_NAMES);
+            'websearch',
+            'requestTools',
+            'createTool',
+            'todoTools',
+            'delegate'
+        ];
+
+        for (const name of legacy) {
+            expect(PRESET_TOOLS).not.toHaveProperty(name);
+            expect(presetTools).not.toHaveProperty(name);
+        }
     });
 
     it('gives every preset a complete, normalized metadata row', () => {
@@ -32,7 +60,7 @@ describe('preset catalogue', () => {
             expect(metadata.name).toBe(name);
             expect(metadata.description.length).toBeGreaterThan(0);
             expect(metadata.tags.length).toBeGreaterThan(0);
-            // Already normalized, so the model-facing tags match what requestTools sees.
+            // Already normalized, so the model-facing tags match what toolRequest sees.
             expect(normalizeTags(metadata.tags)).toEqual([...metadata.tags]);
             expect(metadata.parameters.type).toBe('object');
             expect(deepEqual(metadata.parameters, presetTools[name].parameters)).toBe(true);
@@ -76,47 +104,155 @@ describe('preset catalogue', () => {
         expect(presetTools.syntaxCheck.visibility).toBe('searchable');
     });
 
-    it('keeps every preset searchable, including the six file tools', () => {
-        // The latest scope: the whole catalogue goes through requestTools, so no
-        // preset is declared up front. A descriptor's core list is harness-owned
-        // only (requestTools/createTool/todoTools + delegate).
+    it('keeps every preset searchable, including the five file tools', () => {
+        // The whole catalogue goes through toolRequest, so no preset is declared up
+        // front. A descriptor's core list is harness-owned only.
         for (const name of [
-            'readFile',
-            'writeFile',
-            'editFile',
-            'listFiles',
-            'searchFiles',
-            'globFiles'
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileList',
+            'fileGlob'
         ] as const) {
             expect('visibility' in PRESET_TOOLS[name]).toBe(false);
             expect(presetTools[name].visibility).toBe('searchable');
         }
 
-        expect(PRESET_TOOLS.editFile.tags).toEqual(['files', 'edit', 'write', 'replace', 'filesystem']);
-        expect(PRESET_TOOLS.editFile.parameters.required).toEqual(['path', 'oldString', 'newString']);
-
-        expect(PRESET_TOOLS.searchFiles.tags).toEqual(['files', 'search', 'grep', 'content', 'filesystem']);
-        expect(PRESET_TOOLS.searchFiles.parameters.required).toEqual(['pattern']);
-
-        expect(PRESET_TOOLS.globFiles.tags).toEqual(['files', 'glob', 'search', 'find', 'filesystem']);
-        expect(PRESET_TOOLS.globFiles.parameters.required).toEqual(['pattern']);
-
-        expect(PRESET_TOOLS.gitDiff.tags).toEqual(['git', 'diff', 'vcs', 'review', 'command']);
-        // Every gitDiff argument is optional: diffing the working tree needs none.
-        expect('required' in PRESET_TOOLS.gitDiff.parameters).toBe(false);
-
-        // syntaxCheck, runCommand and gitDiff share the same visibility default:
+        // syntaxCheck, commandRun and gitDiff share the same visibility default:
         // discovery is the only way to reach them.
-        for (const name of ['syntaxCheck', 'runCommand', 'gitDiff'] as const) {
+        for (const name of ['syntaxCheck', 'commandRun', 'gitDiff'] as const) {
             expect(presetTools[name].visibility).toBe('searchable');
         }
+    });
+
+    it('declares the three batched file tools as ONE array property each', () => {
+        // This is the schema half of the batching contract: one property means the
+        // single-property rule hands `execute` the array itself.
+        expect(toolParameterKey(PRESET_TOOLS.fileRead.parameters)).toBe('paths');
+        expect(toolParameterKey(PRESET_TOOLS.fileWrite.parameters)).toBe('files');
+        expect(toolParameterKey(PRESET_TOOLS.fileEdit.parameters)).toBe('edits');
+        expect(toolParameterKey(PRESET_TOOLS.fileList.parameters)).toBe('paths');
+
+        expect(PRESET_TOOLS.fileRead.parameters.required).toEqual(['paths']);
+        expect(PRESET_TOOLS.fileWrite.parameters.required).toEqual(['files']);
+        expect(PRESET_TOOLS.fileEdit.parameters.required).toEqual(['edits']);
+        // fileList has no `required`: the documented default is ["."].
+        expect('required' in PRESET_TOOLS.fileList.parameters).toBe(false);
+
+        expect(PRESET_TOOLS.fileRead.tags).toEqual(['files', 'read', 'filesystem']);
+        expect(PRESET_TOOLS.fileWrite.tags).toEqual(['files', 'write', 'filesystem']);
+        expect(PRESET_TOOLS.fileEdit.tags).toEqual(['files', 'edit', 'write', 'replace', 'filesystem']);
+        expect(PRESET_TOOLS.fileList.tags).toEqual(['files', 'list', 'filesystem']);
+    });
+
+    it('pins the batched entry shapes', () => {
+        expect(PRESET_TOOLS.fileWrite.parameters).toEqual({
+            type: 'object',
+            properties: {
+                files: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            path: {
+                                type: 'string',
+                                description: 'Path to the file, absolute or relative to the working directory.'
+                            },
+                            content: {
+                                type: 'string',
+                                description: 'Full text to write. Replaces the previous contents.'
+                            }
+                        },
+                        required: ['path', 'content'],
+                        additionalProperties: false
+                    },
+                    description: 'Files to write, in the order the results are returned.'
+                }
+            },
+            required: ['files'],
+            additionalProperties: false
+        });
+
+        expect(PRESET_TOOLS.fileEdit.parameters).toEqual({
+            type: 'object',
+            properties: {
+                edits: {
+                    type: 'array',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            path: {
+                                type: 'string',
+                                description:
+                                    'Path to an existing file, absolute or relative to the working directory.'
+                            },
+                            oldString: {
+                                type: 'string',
+                                description: 'Exact text to replace. Must be unique unless replaceAll is true.'
+                            },
+                            newString: {
+                                type: 'string',
+                                description: 'Replacement text. May be empty to delete the matched text.'
+                            },
+                            replaceAll: {
+                                type: 'boolean',
+                                description:
+                                    'Replace every occurrence instead of requiring oldString to be unique. Defaults to false.'
+                            }
+                        },
+                        required: ['path', 'oldString', 'newString'],
+                        additionalProperties: false
+                    },
+                    description: 'Edits to apply, one per file, in the order the results are returned.'
+                }
+            },
+            required: ['edits'],
+            additionalProperties: false
+        });
+    });
+
+    it('unifies glob and content search into one fileGlob tool', () => {
+        // One entry with FOUR properties, so the single-property rule does NOT
+        // apply and `execute` receives the whole object.
+        expect(PRESET_TOOLS.fileGlob.tags).toEqual([
+            'files',
+            'glob',
+            'search',
+            'grep',
+            'find',
+            'content',
+            'filesystem'
+        ]);
+        expect(Object.keys(PRESET_TOOLS.fileGlob.parameters.properties)).toEqual([
+            'patterns',
+            'paths',
+            'content',
+            'maxResults'
+        ]);
+        // Every argument is optional: the documented defaults are ["**/*"] and ["."].
+        expect('required' in PRESET_TOOLS.fileGlob.parameters).toBe(false);
+        expect(toolParameterKey(PRESET_TOOLS.fileGlob.parameters)).toBeUndefined();
+
+        // The description IS the contract the model reads, so the two result shapes
+        // and the mode rule have to be stated there.
+        expect(PRESET_TOOLS.fileGlob.description).toContain('{ files, truncated }');
+        expect(PRESET_TOOLS.fileGlob.description).toContain(
+            'matches: [{ path, line, text }], truncated'
+        );
+        expect(PRESET_TOOLS.fileGlob.description).toContain('Does not read .gitignore files.');
+    });
+
+    it('keeps gitDiff unchanged and every argument optional', () => {
+        expect(PRESET_TOOLS.gitDiff.tags).toEqual(['git', 'diff', 'vcs', 'review', 'command']);
+        expect('required' in PRESET_TOOLS.gitDiff.parameters).toBe(false);
+        expect(PRESET_TOOLS.commandRun.tags).toEqual(['shell', 'command', 'process']);
+        expect(PRESET_TOOLS.commandRun.parameters.required).toEqual(['command']);
     });
 
     it('does not claim a sandbox or gitignore support it does not implement', () => {
         // The descriptions are the contract the model reads; wording that implies a
         // fence must not creep in. .gitignore is explicitly documented as unread.
-        expect(PRESET_TOOLS.searchFiles.description).toContain('Does not read .gitignore files.');
-        expect(PRESET_TOOLS.globFiles.description).toContain('Does not read .gitignore files.');
+        expect(PRESET_TOOLS.fileGlob.description).toContain('Does not read .gitignore files.');
         expect(PRESET_TOOLS.gitDiff.description).toContain('Read-only');
         expect(PRESET_TOOLS.gitDiff.description).toContain('non-zero exit is data, not an error');
     });

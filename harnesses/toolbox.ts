@@ -14,28 +14,29 @@
 // built by `createToolboxHarness` below, so the registered tool set is identical
 // by construction rather than by three hand-maintained lists that can drift.
 //
-// WHAT IS IN THE SHARED TOOLBOX
-// -----------------------------
-//   - package presets  — src/tools: syntaxCheck, readFile, writeFile, editFile,
-//                        listFiles, searchFiles, globFiles, runCommand, gitDiff
+// WHAT IS IN THE SHARED TOOLBOX (T14 names)
+// -----------------------------------------
+//   - package presets  — src/tools: syntaxCheck, fileRead, fileWrite, fileEdit,
+//                        fileList, fileGlob, commandRun, gitDiff
 //                        (lazy proxies, see src/tools/lazy.ts)
-//   - harness tools    — ./tools: clock, wordCount, roll, searchNotes, summarize
-//   - websearch        — environment-backed (EXA_API_KEY / TAVILY_API_KEY); the
+//   - harness tools    — ./tools: timeNow, textCount, diceRoll, noteSearch,
+//                        textSummarize
+//   - webSearch        — environment-backed (EXA_API_KEY / TAVILY_API_KEY); the
 //                        harness factory registers it only when a key resolves,
 //                        so a keyless host is offline-safe. The global catalogue
 //                        still lists it as `unconfigured`, never fake-callable.
-//   - core tools       — harness-owned only: requestTools, createTool, todoTools,
-//                        and delegate for a preset that declares subagents. Every
-//                        package and app tool (including the file tools) is
+//   - core tools       — harness-owned only: toolRequest, toolCreate, todoManage,
+//                        and agentDelegate for a preset that declares subagents.
+//                        Every package and app tool (including the file tools) is
 //                        searchable, so a live harness declares nothing else up
 //                        front.
 //
 // DELIBERATE EXCEPTIONS
 // ---------------------
-//   - `flaky` is NOT in the shared toolbox. It fails two calls out of three on
+//   - `testFlaky` is NOT in the shared toolbox. It fails two calls out of three on
 //     purpose and carries module-level mutable state; it belongs to the
 //     "Recoverable failures" example harness, which adds it as an extra tool.
-//   - the `demo` preset stays the scripted offline fixture (clock only): it is
+//   - the `demo` preset stays the scripted offline fixture (timeNow only): it is
 //     not a live harness, so the equal-toolbox rule does not apply to it.
 //
 // LAZY, NOT EAGER
@@ -48,7 +49,7 @@
 //
 // Cross-references:
 //   - ./presets.ts      — the preset catalogue built on this factory
-//   - ./tools.ts        — the app tools (clock, …, summarize) in the shared set
+//   - ./tools.ts        — the app tools (timeNow, …, textSummarize) in the shared set
 //   - ../src/harness.ts — `presets: false` + explicit `tools` registry semantics
 //   - ../server/api.ts  — descriptors resolved from the same preset metadata
 
@@ -65,14 +66,15 @@ import type { RunnerSettings } from './types';
 export const PRESET_MAX_ITERATIONS = 1000;
 
 // The app-level tools every live harness shares, in registration order. Kept as
-// a named list (not `Object.keys(harnessTools)`) because `flaky` is deliberately
-// excluded and the order is part of the descriptor contract tests pin.
+// a named list (not `Object.keys(harnessTools)`) because `testFlaky` is
+// deliberately excluded and the order is part of the descriptor contract tests
+// pin.
 export const SHARED_APP_TOOL_NAMES = [
-    'clock',
-    'wordCount',
-    'roll',
-    'searchNotes',
-    'summarize'
+    'timeNow',
+    'textCount',
+    'diceRoll',
+    'noteSearch',
+    'textSummarize'
 ] as const;
 
 // The shared registry. Package presets come first so a duplicate name in the app
@@ -80,11 +82,11 @@ export const SHARED_APP_TOOL_NAMES = [
 // do not collide with `presetTools` today.
 export const SHARED_TOOLS: Readonly<Record<string, Tool>> = {
     ...presetTools,
-    clock: harnessTools.clock,
-    wordCount: harnessTools.wordCount,
-    roll: harnessTools.roll,
-    searchNotes: harnessTools.searchNotes,
-    summarize: harnessTools.summarize
+    timeNow: harnessTools.timeNow,
+    textCount: harnessTools.textCount,
+    diceRoll: harnessTools.diceRoll,
+    noteSearch: harnessTools.noteSearch,
+    textSummarize: harnessTools.textSummarize
 };
 
 // The exact declared names, in registry order: package tools then app tools.
@@ -94,20 +96,20 @@ export const SHARED_TOOLS: Readonly<Record<string, Tool>> = {
 // preset's advertised toolbox at runtime.
 export const SHARED_TOOL_NAMES: readonly string[] = Object.freeze(Object.keys(SHARED_TOOLS));
 
-// Harness-owned core names. `delegate` is capability-by-configuration: the
+// Harness-owned core names. agentDelegate is capability-by-configuration: the
 // harness registers it only when the harness declares subagents, so a single-agent
 // Instruct has no delegation tool while Research does. That difference is the
 // agent configuration, not a difference in the shareable toolbox.
 //
 // No preset entry is core any more: every registered package/app tool is
-// searchable, so a descriptor advertises exactly these names (plus delegate).
+// searchable, so a descriptor advertises exactly these names (plus agentDelegate).
 // `presetCore` is kept out of the signature deliberately — there is no second
 // source of core tools that could disagree with this list.
-export const CORE_TOOL_NAMES = ['requestTools', 'createTool', 'todoTools'] as const;
+export const CORE_TOOL_NAMES = ['toolRequest', 'toolCreate', 'todoManage'] as const;
 
 export const coreToolNames = (subagents: readonly string[] = []): string[] => [
     ...CORE_TOOL_NAMES,
-    ...(subagents.length > 0 ? ['delegate'] : [])
+    ...(subagents.length > 0 ? ['agentDelegate'] : [])
 ];
 
 // Provider settings are never used by construction; they only feed `agent(...)`.
@@ -181,9 +183,9 @@ export const createProfiledHarness =
 export type ToolboxHarnessConfiguration = {
     agents: Record<string, Agent>;
     primary: string;
-    // Omitted/empty means a single-agent harness (no delegate tool).
+    // Omitted/empty means a single-agent harness (no agentDelegate tool).
     subagents?: readonly string[];
-    // Example-only extras (the recoverable-failure preset adds `flaky`). Never
+    // Example-only extras (the recoverable-failure preset adds `testFlaky`). Never
     // used by Instruct/Research/Workspace, so the shared set stays exact.
     extraTools?: Readonly<Record<string, Tool>>;
 };
@@ -209,7 +211,8 @@ export const createToolboxHarness = (
         maxIterations: PRESET_MAX_ITERATIONS,
         // Environment-backed search; no key means the factory returns undefined
         // and the harness is unchanged. Keys are resolved at construction, after
-        // `.env` is loaded by the CLI/server.
+        // `.env` is loaded by the CLI/server. The CONFIGURATION field keeps its
+        // name (`websearch`); the tool it registers is webSearch.
         websearch: true,
         report: { progress }
     });

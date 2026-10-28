@@ -31,8 +31,8 @@
 // model) therefore never rewrites a conversation that is already on screen.
 //
 // Execution is server-only. A catalogue tool is a direct call; a core tool
-// (`sessionBound`) is sent with the selected session's id so requestTools,
-// createTool, todoTools and delegate change THAT conversation — and the snapshot is
+// (`sessionBound`) is sent with the selected session's id so toolRequest,
+// toolCreate, todoManage and agentDelegate change THAT conversation — and the snapshot is
 // re-read afterwards so discoveries/todos show up. The browser never evaluates a
 // tool.
 //
@@ -227,7 +227,7 @@ const createView = (descriptor: HarnessDescriptor): View => {
         el(
             'p',
             'empty-hint',
-            'Tools are discovered inside the chat with requestTools; the catalogue never assigns them.'
+            'Tools are discovered inside the chat with toolRequest; the catalogue never assigns them.'
         )
     );
 
@@ -302,18 +302,26 @@ const EXAMPLES: Readonly<Record<string, unknown>> = {
     // Two properties, so the runner sends the whole object (no single-property
     // unwrapping): the language is part of the input, not a separate mode.
     syntaxCheck: { code: 'const answer = 42;\nconsole.log(answer);', language: 'javascript' },
-    readFile: 'package.json',
-    writeFile: { path: 'notes/hello.txt', content: 'hello from the harness UI\n' },
-    listFiles: '.',
-    runCommand: { command: 'git status --short' },
-    clock: 'UTC',
-    wordCount: 'The harness finds tools by tag before it uses them.',
-    roll: 6,
-    searchNotes: 'tool loop',
-    summarize: 'The harness runs tools until the model answers with text.',
+    // The batched file tools each declare ONE array property, so the textarea holds
+    // the array itself, not a wrapper object (T14).
+    fileRead: ['package.json'],
+    fileWrite: [{ path: 'notes/hello.txt', content: 'hello from the harness UI\n' }],
+    fileEdit: [{ path: 'notes/hello.txt', oldString: 'hello', newString: 'hi' }],
+    // "." works from whatever directory the server runs in.
+    fileList: ['.'],
+    // fileGlob declares four properties, so it takes the whole object. `content`
+    // is present here to show the content-search mode; delete it for a filename
+    // listing.
+    fileGlob: { patterns: ['**/*.ts'], paths: ['.'], content: 'harness', maxResults: 20 },
+    commandRun: { command: 'git status --short' },
+    timeNow: 'UTC',
+    textCount: 'The harness finds tools by tag before it uses them.',
+    diceRoll: 6,
+    noteSearch: 'tool loop',
+    textSummarize: 'The harness runs tools until the model answers with text.',
     // The server owns the provider key; the runner only needs a valid query. The
     // exact key is never part of this value.
-    websearch: { query: 'harness tool discovery', maxResults: 5 }
+    webSearch: { query: 'harness tool discovery', maxResults: 5 }
 };
 
 // The single-property rule, mirrored for the UI: a one-property schema means the
@@ -365,7 +373,7 @@ const templateFor = (parameters: Record<string, unknown> | undefined): string =>
 //
 // `context` is read at show time and before every call; `ensureSession` creates
 // the SELECTED harness's session when none exists yet; `refreshSession` re-reads
-// the server snapshot after a call so requestTools discoveries and todo state are
+// the server snapshot after a call so toolRequest discoveries and todo state are
 // on screen immediately. None of these live in this module: the runner must not
 // own the selection, and it must not guess a session id.
 export type ToolRunnerOptions = {
@@ -382,15 +390,15 @@ type ToolRunner = {
     sync: () => void;
 };
 
-// The cap the server applies to `requestTools` (5). Kept here only to explain
+// The cap the server applies to `toolRequest` (5). Kept here only to explain
 // truncation: the UI never slices the result itself.
 const REQUEST_TOOLS_LIMIT = 5;
 
-// Turn a requestTools result into one actionable sentence. The structured result
+// Turn a toolRequest result into one actionable sentence. The structured result
 // is still rendered verbatim above; this line exists because a truncated list is
 // useless unless it says how much is missing and what to do next.
 const resultHintFor = (name: string, result: unknown): string | undefined => {
-    if (name !== 'requestTools' || typeof result !== 'object' || result === null) return undefined;
+    if (name !== 'toolRequest' || typeof result !== 'object' || result === null) return undefined;
 
     const value = result as { truncated?: unknown; remaining?: unknown; enabled?: unknown };
 
@@ -462,7 +470,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     const outputBody = el('pre', 'card-body', '');
     output.append(outputHead, outputBody);
 
-    // Guidance for a truncated requestTools answer. Separate from the raw result:
+    // Guidance for a truncated toolRequest answer. Separate from the raw result:
     // the structured payload is never rewritten.
     const resultHint = el('p', 'field-hint tool-hint', '');
     resultHint.hidden = true;
@@ -588,7 +596,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
             setOutput(rendered, false);
             outputHead.textContent = `result · ${response.durationMs}ms`;
 
-            // requestTools caps its answer (5 tools). The raw payload stays; the
+            // toolRequest caps its answer (5 tools). The raw payload stays; the
             // hint names the remaining count and the next move.
             const hint = resultHintFor(entry.name, response.result);
             resultHint.hidden = hint === undefined;
@@ -1054,10 +1062,10 @@ const coreBody = el('div', 'core-body');
 const coreHint = el(
     'p',
     'field-hint',
-    'Always available in chat. requestTools enables more tools for this session; discovered tools stay enabled for it.'
+    'Always available in chat. toolRequest enables more tools for this session; discovered tools stay enabled for it.'
 );
 const coreList = el('div', 'core-list');
-// Tools requestTools enabled for the selected session, from the server snapshot
+// Tools toolRequest enabled for the selected session, from the server snapshot
 // (`discoveredTools`). Kept separate from the core list: these are session state,
 // not the harness-owned set, and a core-tool call refreshes the snapshot so this
 // line updates without a reload.
@@ -1075,7 +1083,7 @@ catalogueHead.append(catalogueHeading, catalogueCount);
 const catalogueHint = el(
     'p',
     'field-hint',
-    'Every tool the server can call, core tools included. Nothing is assigned here: chat discovers tools with requestTools by tag.'
+    'Every tool the server can call, core tools included. Nothing is assigned here: chat discovers tools with toolRequest by tag.'
 );
 const toolList = el('div', 'tool-list');
 catalogueSection.append(catalogueHead, catalogueHint, toolList);
@@ -1122,7 +1130,7 @@ type Instance = {
     // The session's settings model: the value the per-agent "inherit" choice names
     // for a frozen chat, and the fallback when a member is absent from the map.
     sessionModel?: string;
-    // Tools requestTools enabled for this session (SessionSnapshot.discoveredTools),
+    // Tools toolRequest enabled for this session (SessionSnapshot.discoveredTools),
     // shown under the core dropdown. Refreshed by the snapshot a core call triggers.
     discovered?: readonly string[];
     // Per-instance live activity set for the tile rings. Never a module global:
@@ -1538,7 +1546,7 @@ const removeAgent = async (name: string): Promise<void> => {
 };
 
 // Core tools live ONLY in this collapsible dropdown (R3): the harness-owned set,
-// where delegate appears exactly when there is somewhere to delegate. The Tools tab
+// where agentDelegate appears exactly when there is somewhere to delegate. The Tools tab
 // and the right-rail catalogue list every tool including these; this dropdown stays
 // as the informational view of what a session always has.
 const renderCoreTools = (
@@ -1564,7 +1572,7 @@ const renderCoreTools = (
         coreList.append(row);
     }
 
-    // Discovered tools are session state: a manual requestTools (Tools tab) or a
+    // Discovered tools are session state: a manual toolRequest (Tools tab) or a
     // chat discovery refreshes the snapshot, and this line follows it.
     const enabled = discovered ?? [];
     coreDiscovered.hidden = enabled.length === 0;
@@ -1578,7 +1586,7 @@ const renderCoreTools = (
 // Two listings of the SAME server data, on purpose:
 //   - the right rail is the compact catalogue that stays visible while chatting;
 //   - the Tools tab is the full-width, keyed list the user asked for, and it
-//     includes the core tools (requestTools/createTool/todoTools/delegate) even
+//     includes the core tools (toolRequest/toolCreate/todoManage/agentDelegate) even
 //     though the harness also shows them informationally in its core dropdown.
 // Selecting either listing opens the same runner, and a core entry runs inside the
 // selected harness's session (api.ts `callTool(name, parameters, sessionId)`).
@@ -1764,7 +1772,7 @@ const buildTools = (entries: readonly ToolDescriptor[]): void => {
         button.setAttribute('aria-pressed', 'false');
         button.disabled = running;
 
-        // The rail has to answer "is websearch available here?" before a click.
+        // The rail has to answer "is webSearch available here?" before a click.
         // The kind text is the existing visibility, with an explicit unconfigured
         // suffix and a data attribute for styling; a configured tool is unchanged.
         const unavailable = entry.availability?.state === 'unconfigured';

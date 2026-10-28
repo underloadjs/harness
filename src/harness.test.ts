@@ -4,11 +4,11 @@
 //   - the harness is callable: `await writer('...')` runs the entry agent;
 //   - the first `agents` key is the entry point (unless `primary` names another),
 //     and its name is the harness name;
-//   - the ONLY core tools are the harness-owned requestTools, createTool, and
-//     todoTools (delegate only when subagents exist); the entire preset catalogue
-//     — file tools included — is searchable and requestTools enables the matches
+//   - the ONLY core tools are the harness-owned toolRequest, toolCreate, and
+//     todoManage (delegate only when subagents exist); the entire preset catalogue
+//     — file tools included — is searchable and toolRequest enables the matches
 //     for the next turn, until then they are invisible and uncallable;
-//   - createTool and todoTools are always core, and delegate is core only when
+//   - toolCreate and todoManage are always core, and delegate is core only when
 //     subagents exist;
 //   - tools run, their results are fed back, and the loop repeats until the model
 //     answers with text;
@@ -18,7 +18,7 @@
 //   - transport failure or a runaway loop truncates history and throws.
 
 import { describe, expect, it } from 'vitest';
-import { agent, harness, readFile, runCommand, syntaxCheck, tool } from '@underload/harness';
+import { agent, harness, fileRead, commandRun, syntaxCheck, tool } from '@underload/harness';
 import type { HarnessEvent, HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '@underload/harness';
 
 // A transport that replays a scripted list of turns, one per request. Each entry
@@ -83,20 +83,20 @@ describe('harness', () => {
         expect(writer.agents.researcher.model()).toBe('merge/ds4-flash');
     });
 
-    it('registers tools under their config key and always adds requestTools', async () => {
-        const websearch = tool({ description: 'Search the web.', tags: ['search'], execute: () => 'results' });
+    it('registers tools under their config key and always adds toolRequest', async () => {
+        const webSearch = tool({ description: 'Search the web.', tags: ['search'], execute: () => 'results' });
 
         const writer = harness({
             agents: { writer: brain(scripted([answer('done')])) },
-            tools: { websearch }
+            tools: { webSearch }
         });
 
-        expect(writer.tools.websearch).toBe(websearch);
-        expect(websearch.name).toBe('websearch');
-        expect(writer.tools.requestTools.visibility).toBe('core');
+        expect(writer.tools.webSearch).toBe(webSearch);
+        expect(webSearch.name).toBe('webSearch');
+        expect(writer.tools.toolRequest.visibility).toBe('core');
     });
 
-    it('declares core tools only, leaving the rest to requestTools', async () => {
+    it('declares core tools only, leaving the rest to toolRequest', async () => {
         const seen: HarnessStreamRequest[] = [];
         const searchable = tool({ description: 'Search.', tags: ['search'], execute: () => 'found' });
         const core = tool({ description: 'Always on.', tags: ['core'], visibility: 'core', execute: () => 'ok' });
@@ -113,9 +113,9 @@ describe('harness', () => {
         expect(writer.tools.searchable).toBe(searchable);
         expect(declaredNames(seen[0])).toEqual([
             'core',
-            'requestTools',
-            'createTool',
-            'todoTools'
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
         ]);
     });
 
@@ -126,20 +126,20 @@ describe('harness', () => {
         await writer('go');
 
         // Registered, so they can be discovered without any import...
-        expect(writer.tools.readFile).toBe(readFile);
-        expect(writer.tools.runCommand).toBe(runCommand);
+        expect(writer.tools.fileRead).toBe(fileRead);
+        expect(writer.tools.commandRun).toBe(commandRun);
         expect(writer.tools.syntaxCheck).toBe(syntaxCheck);
-        expect(writer.tools.readFile.visibility).toBe('searchable');
-        expect(writer.tools.runCommand.visibility).toBe('searchable');
+        expect(writer.tools.fileRead.visibility).toBe('searchable');
+        expect(writer.tools.commandRun.visibility).toBe('searchable');
         // ...and nothing is declared but the harness-owned core set.
-        expect(declaredNames(seen[0])).toEqual(['requestTools', 'createTool', 'todoTools']);
+        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
     });
 
     it('discovers the file tools along with syntaxCheck', async () => {
         const entry = brain(
             scripted([
-                callTool('c1', 'requestTools', '{"tags":["files"]}'),
-                callTool('c2', 'requestTools', '{"tags":["javascript"]}'),
+                callTool('c1', 'toolRequest', '{"tags":["files"]}'),
+                callTool('c2', 'toolRequest', '{"tags":["javascript"]}'),
                 answer('done')
             ])
         );
@@ -148,52 +148,67 @@ describe('harness', () => {
         await writer('look around');
 
         // Every file tool is searchable now and each carries the exact tag
-        // "files", so all six tie on the best single-tag score (4). A name or
+        // "files", so all five tie on the best single-tag score (4). A name or
         // description hit is the 1-point rung of that ladder, not a bonus on top
         // of a tag hit, so it cannot reorder them; hits and then name decide.
-        // The sixth match (writeFile) is counted, not named, because discovery
-        // returns at most five (R7).
+        // T14 folded glob+content search into one fileGlob tool, so the whole
+        // family now fits inside the five-match cap.
         const fileSearch = JSON.parse((entry.messages[2] as { content: string }).content);
         expect(fileSearch.enabled).toEqual([
-            'editFile',
-            'globFiles',
-            'listFiles',
-            'readFile',
-            'searchFiles'
+            'fileEdit',
+            'fileGlob',
+            'fileList',
+            'fileRead',
+            'fileWrite'
         ]);
         expect(fileSearch.tools.map((tool: { name: string }) => tool.name)).toEqual([
-            'editFile',
-            'globFiles',
-            'listFiles',
-            'readFile',
-            'searchFiles'
+            'fileEdit',
+            'fileGlob',
+            'fileList',
+            'fileRead',
+            'fileWrite'
         ]);
-        expect(fileSearch.remaining).toBe(1);
-        expect(fileSearch.truncated).toBe(true);
+        expect(fileSearch.remaining).toBe(0);
+        expect(fileSearch.truncated).toBeUndefined();
 
-        // ...while the searchable syntaxCheck is found and enabled. It is a single
-        // exact match, so nothing is left over.
+        // ...while the searchable syntaxCheck is found and enabled. The same
+        // "javascript" query also reaches fileGlob weakly (its description mentions
+        // a "JavaScript regular expression"), which is the documented 1-point rung,
+        // so the exact tag hit ranks first and both are declared.
         const syntaxSearch = JSON.parse((entry.messages[4] as { content: string }).content);
-        expect(syntaxSearch.enabled).toEqual(['syntaxCheck']);
+        expect(syntaxSearch.enabled).toEqual(['syntaxCheck', 'fileGlob']);
         expect(syntaxSearch.tools).toEqual([
             {
                 name: 'syntaxCheck',
                 description: expect.stringContaining('Check whether a code snippet parses'),
                 tags: ['code', 'syntax', 'javascript', 'python', 'validation']
+            },
+            {
+                name: 'fileGlob',
+                description: expect.stringContaining('Find files by glob pattern'),
+                tags: [
+                    'files',
+                    'glob',
+                    'search',
+                    'grep',
+                    'find',
+                    'content',
+                    'filesystem'
+                ]
             }
         ]);
         expect(syntaxSearch.remaining).toBe(0);
         expect(syntaxSearch.truncated).toBeUndefined();
 
-        expect(writer.tools.readFile.visibility).toBe('searchable');
+        expect(writer.tools.fileRead.visibility).toBe('searchable');
         expect(writer.tools.syntaxCheck.visibility).toBe('searchable');
     });
 
     it('refines a broad query to reach the match the cap left out', async () => {
         const entry = brain(
             scripted([
-                callTool('c1', 'requestTools', '{"tags":["files"]}'),
-                callTool('c2', 'requestTools', '{"tags":["files","write"]}'),
+                callTool('c1', 'toolRequest', '{"tags":["files"]}'),
+                callTool('c2', 'toolRequest', '{"tags":["files","write"]}'),
                 answer('done')
             ])
         );
@@ -201,33 +216,33 @@ describe('harness', () => {
 
         await writer('change a file');
 
-        // "files" alone leaves writeFile out (sixth by name among a six-way tie
-        // on the exact "files" tag); adding the second tag gives editFile and
-        // writeFile a second matching query tag, which is the documented tie
-        // break, so writeFile enters the shortlist. That is the R7 workflow.
+        // "files" alone already lists every file tool (the whole family fits in
+        // the cap now that glob+content search is one tool). Adding the second tag
+        // gives fileEdit and fileWrite a second matching query tag, which is the
+        // documented tie break, so they move to the front — that is the R7
+        // refinement workflow: same shortlist, better order.
         expect(JSON.parse((entry.messages[2] as { content: string }).content).enabled).toEqual([
-            'editFile',
-            'globFiles',
-            'listFiles',
-            'readFile',
-            'searchFiles'
+            'fileEdit',
+            'fileGlob',
+            'fileList',
+            'fileRead',
+            'fileWrite'
         ]);
         expect(JSON.parse((entry.messages[4] as { content: string }).content).enabled).toEqual([
-            'editFile',
-            'writeFile',
-            'globFiles',
-            'listFiles',
-            'readFile'
+            'fileEdit',
+            'fileWrite',
+            'fileGlob',
+            'fileList',
+            'fileRead'
         ]);
-        // Discovery order is first-enabled-first: the five from the broad query,
-        // then writeFile, which only the refined query reached.
+        // Discovery order is first-enabled-first: the broad query enabled all five,
+        // so the refined query adds nothing new and the order is unchanged.
         expect(writer.discoveredTools).toEqual([
-            'editFile',
-            'globFiles',
-            'listFiles',
-            'readFile',
-            'searchFiles',
-            'writeFile'
+            'fileEdit',
+            'fileGlob',
+            'fileList',
+            'fileRead',
+            'fileWrite'
         ]);
     });
 
@@ -237,8 +252,8 @@ describe('harness', () => {
             presets: false
         });
 
-        expect(writer.tools.readFile).toBeUndefined();
-        expect(Object.keys(writer.tools)).toEqual(['requestTools', 'createTool', 'todoTools']);
+        expect(writer.tools.fileRead).toBeUndefined();
+        expect(Object.keys(writer.tools)).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
     });
 
     it('lets the model discover and run a preloaded preset', async () => {
@@ -246,7 +261,7 @@ describe('harness', () => {
         const entry = brain(
             scripted(
                 [
-                    callTool('c1', 'requestTools', '{"tags":["javascript"]}'),
+                    callTool('c1', 'toolRequest', '{"tags":["javascript"]}'),
                     callTool(
                         'c2',
                         'syntaxCheck',
@@ -262,24 +277,29 @@ describe('harness', () => {
         const writer = harness({ agents: { writer: entry } });
         const message = await writer('check this snippet');
 
+        // A "javascript" query hits syntaxCheck on its exact tag (4) and fileGlob
+        // weakly through its description ("a JavaScript regular expression", 1).
+        // Both are enabled; the ranking puts the exact tag hit first, so the
+        // declaration order is syntaxCheck then fileGlob.
         expect(declaredNames(seen[1])).toEqual([
-            'requestTools',
-            'createTool',
-            'todoTools',
-            'syntaxCheck'
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'syntaxCheck',
+            'fileGlob'
         ]);
         expect((entry.messages[4] as { content: string }).content).toBe('true');
         expect(message.content).toBe('valid');
     });
 
-    it('enables the closest matches through requestTools for the next turn', async () => {
+    it('enables the closest matches through toolRequest for the next turn', async () => {
         const seen: HarnessStreamRequest[] = [];
-        const readFile = tool({
+        const fileRead = tool({
             description: 'Read a text file.',
             tags: ['files', 'read'],
             execute: () => 'file contents'
         });
-        const runCommand = tool({
+        const commandRun = tool({
             description: 'Run a shell command.',
             tags: ['shell', 'command'],
             execute: () => 'output'
@@ -288,27 +308,27 @@ describe('harness', () => {
         const entry = brain(
             scripted(
                 [
-                    callTool('c1', 'requestTools', '{"tags":["files"]}'),
-                    callTool('c2', 'readFile', '{"path":"a.txt"}'),
+                    callTool('c1', 'toolRequest', '{"tags":["files"]}'),
+                    callTool('c2', 'fileRead', '{"path":"a.txt"}'),
                     answer('read it')
                 ],
                 seen
             )
         );
 
-        const writer = harness({ agents: { writer: entry }, tools: { readFile, runCommand }, presets: false });
+        const writer = harness({ agents: { writer: entry }, tools: { fileRead, commandRun }, presets: false });
         const message = await writer('read a.txt');
 
         // Round one: core only. Round two: the discovered tool joined the
         // declarations, and the unrelated tool stayed out.
-        expect(declaredNames(seen[0])).toEqual(['requestTools', 'createTool', 'todoTools']);
-        expect(declaredNames(seen[1])).toEqual(['requestTools', 'createTool', 'todoTools', 'readFile']);
+        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
+        expect(declaredNames(seen[1])).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'fileRead']);
 
         // The discovery result is what the model sees: names plus metadata.
         const discovery = JSON.parse((entry.messages[2] as { content: string }).content);
-        expect(discovery.enabled).toEqual(['readFile']);
+        expect(discovery.enabled).toEqual(['fileRead']);
         expect(discovery.tools).toEqual([
-            { name: 'readFile', description: 'Read a text file.', tags: ['files', 'read'] }
+            { name: 'fileRead', description: 'Read a text file.', tags: ['files', 'read'] }
         ]);
 
         expect(message.content).toBe('read it');
@@ -334,13 +354,13 @@ describe('harness', () => {
         expect(executed).toBe(false);
         expect(message.content).toBe('recovered');
         expect((entry.messages[2] as { content: string }).content).toBe(
-            'Tool "hidden" is registered but not enabled yet. Call requestTools with tags like "files", "read" to enable it.'
+            'Tool "hidden" is registered but not enabled yet. Call toolRequest with tags like "files", "read" to enable it.'
         );
     });
 
     it('runs a tool, feeds the result back, and loops until the model answers', async () => {
         const received: unknown[] = [];
-        const websearch = tool({
+        const webSearch = tool({
             description: 'Search the web.',
             tags: ['search', 'web'],
             visibility: 'core',
@@ -352,14 +372,14 @@ describe('harness', () => {
         });
 
         const entry = brain(
-            scripted([callTool('call_1', 'websearch', '{"q":"new year"}'), answer('New year is fireworks.')])
+            scripted([callTool('call_1', 'webSearch', '{"q":"new year"}'), answer('New year is fireworks.')])
         );
 
-        const writer = harness({ agents: { writer: entry }, tools: { websearch } });
+        const writer = harness({ agents: { writer: entry }, tools: { webSearch } });
         const message = await writer('tell me about new year');
 
         // Single-property schema: the implementation gets the value, not the
-        // wrapper object. Same thing a direct `websearch('new year')` receives.
+        // wrapper object. Same thing a direct `webSearch('new year')` receives.
         expect(received).toEqual(['new year']);
         expect(message.content).toBe('New year is fireworks.');
 
@@ -370,22 +390,22 @@ describe('harness', () => {
             role: 'tool',
             content: '{"hits":["fireworks","countdown"]}',
             toolCallId: 'call_1',
-            name: 'websearch'
+            name: 'webSearch'
         });
     });
 
     it('reports every step through report.progress, in order', async () => {
         const events: HarnessEvent[] = [];
 
-        const websearch = tool({
+        const webSearch = tool({
             description: 'Search.',
             tags: ['search'],
             visibility: 'core',
             execute: () => 'found'
         });
         const writer = harness({
-            agents: { writer: brain(scripted([callTool('c1', 'websearch', '{}'), answer('done')])) },
-            tools: { websearch },
+            agents: { writer: brain(scripted([callTool('c1', 'webSearch', '{}'), answer('done')])) },
+            tools: { webSearch },
             report: {
                 progress: async (event) => {
                     events.push(event);
@@ -400,14 +420,14 @@ describe('harness', () => {
         expect(events[1]).toEqual({
             type: 'tool_call',
             agent: 'writer',
-            call: { id: 'c1', name: 'websearch', arguments: '{}' }
+            call: { id: 'c1', name: 'webSearch', arguments: '{}' }
         });
         // The call id lets a UI pair a result with its exact call even when two
         // calls in one turn share a name.
         expect(events[2]).toEqual({
             type: 'tool_result',
             agent: 'writer',
-            name: 'websearch',
+            name: 'webSearch',
             callId: 'c1',
             content: 'found',
             isError: false
@@ -444,15 +464,15 @@ describe('harness', () => {
             role: 'tool',
             name: 'nope',
             // Only the harness-owned core tools are declared, so the recovery hint
-            // lists exactly those and points at requestTools for the catalogue.
+            // lists exactly those and points at toolRequest for the catalogue.
             content:
-                'Tool "nope" is not registered. Available tools: requestTools, createTool, todoTools. Call requestTools with capability tags to search the catalogue.'
+                'Tool "nope" is not registered. Available tools: toolRequest, toolCreate, todoManage. Call toolRequest with capability tags to search the catalogue.'
         });
     });
 
     it('turns malformed arguments into a recoverable tool result', async () => {
         let executed = false;
-        const websearch = tool({
+        const webSearch = tool({
             description: 'Search.',
             tags: ['search'],
             visibility: 'core',
@@ -462,8 +482,8 @@ describe('harness', () => {
             }
         });
 
-        const entry = brain(scripted([callTool('c1', 'websearch', '{"q":'), answer('recovered')]));
-        const writer = harness({ agents: { writer: entry }, tools: { websearch } });
+        const entry = brain(scripted([callTool('c1', 'webSearch', '{"q":'), answer('recovered')]));
+        const writer = harness({ agents: { writer: entry }, tools: { webSearch } });
 
         await writer('go');
 
@@ -473,7 +493,7 @@ describe('harness', () => {
     });
 
     it('turns a throwing tool into a recoverable tool result', async () => {
-        const websearch = tool({
+        const webSearch = tool({
             description: 'Search.',
             tags: ['search'],
             visibility: 'core',
@@ -482,13 +502,13 @@ describe('harness', () => {
             }
         });
 
-        const entry = brain(scripted([callTool('c1', 'websearch', '{}'), answer('recovered')]));
-        const writer = harness({ agents: { writer: entry }, tools: { websearch } });
+        const entry = brain(scripted([callTool('c1', 'webSearch', '{}'), answer('recovered')]));
+        const writer = harness({ agents: { writer: entry }, tools: { webSearch } });
 
         const message = await writer('go');
 
         expect(message.content).toBe('recovered');
-        expect((entry.messages[2] as { content: string }).content).toBe('Tool "websearch" failed: rate limited');
+        expect((entry.messages[2] as { content: string }).content).toBe('Tool "webSearch" failed: rate limited');
     });
 
     it('gives a tool access to sibling agents through ctx.run', async () => {
@@ -723,10 +743,10 @@ describe('harness', () => {
     });
 
     it('reset() clears the entry agent conversation and keeps the tools', async () => {
-        const websearch = tool({ description: 'Search.', tags: ['search'], execute: () => 'ok' });
+        const webSearch = tool({ description: 'Search.', tags: ['search'], execute: () => 'ok' });
         const writer = harness({
             agents: { writer: brain(scripted([answer('hi')]), { instruction: 'You are a writer.' }) },
-            tools: { websearch }
+            tools: { webSearch }
         });
 
         await writer('one');
@@ -735,17 +755,17 @@ describe('harness', () => {
         writer.reset();
 
         expect(writer.agent.messages).toEqual([{ role: 'system', content: 'You are a writer.' }]);
-        expect(writer.tools.websearch).toBe(websearch);
+        expect(writer.tools.webSearch).toBe(webSearch);
     });
 
-    it('reset() forgets the tools requestTools enabled', async () => {
+    it('reset() forgets the tools toolRequest enabled', async () => {
         const seen: HarnessStreamRequest[] = [];
         const hidden = tool({ description: 'Hidden.', tags: ['files'], execute: () => 'ok' });
 
         const entry = brain(
             scripted(
                 [
-                    callTool('c1', 'requestTools', '{"tags":["files"]}'),
+                    callTool('c1', 'toolRequest', '{"tags":["files"]}'),
                     answer('done'),
                     answer('done again')
                 ],
@@ -756,7 +776,7 @@ describe('harness', () => {
         const writer = harness({ agents: { writer: entry }, tools: { hidden }, presets: false });
 
         await writer('go');
-        expect(declaredNames(seen[1])).toEqual(['requestTools', 'createTool', 'todoTools', 'hidden']);
+        expect(declaredNames(seen[1])).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'hidden']);
         expect(writer.discoveredTools).toEqual(['hidden']);
 
         writer.reset();
@@ -765,7 +785,7 @@ describe('harness', () => {
         await writer('go again');
 
         // Back to the core set: discovery is part of "start over".
-        expect(declaredNames(seen[2])).toEqual(['requestTools', 'createTool', 'todoTools']);
+        expect(declaredNames(seen[2])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
     });
 
     it('keeps discovery across separate calls on the same harness', async () => {
@@ -779,7 +799,7 @@ describe('harness', () => {
         const entry = brain(
             scripted(
                 [
-                    callTool('c1', 'requestTools', '{"tags":["read"]}'),
+                    callTool('c1', 'toolRequest', '{"tags":["read"]}'),
                     callTool('c2', 'reader', '{"path":"a.txt"}'),
                     answer('first done'),
                     answer('second done')
@@ -795,14 +815,14 @@ describe('harness', () => {
         });
 
         await writer('first');
-        expect(declaredNames(seen[1])).toEqual(['requestTools', 'createTool', 'todoTools', 'reader']);
+        expect(declaredNames(seen[1])).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'reader']);
         expect(writer.discoveredTools).toEqual(['reader']);
 
-        // A second call starts a NEW turn but not a new catalogue: requestTools
+        // A second call starts a NEW turn but not a new catalogue: toolRequest
         // enabled `reader` for the harness, so the next request still declares it
         // without another discovery round.
         await writer('second');
-        expect(declaredNames(seen[3])).toEqual(['requestTools', 'createTool', 'todoTools', 'reader']);
+        expect(declaredNames(seen[3])).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'reader']);
         expect(writer.discoveredTools).toEqual(['reader']);
     });
 
@@ -822,15 +842,15 @@ describe('harness', () => {
         ).toThrow('Tool "bad" is not a tool: create it with tool({...}).');
     });
 
-    it('reserves the requestTools name', () => {
+    it('reserves the toolRequest name', () => {
         const custom = tool({ description: 'Mine.', tags: ['discovery'], execute: () => 'ok' });
 
         expect(() =>
             harness({
                 agents: { writer: brain(scripted([answer('hi')])) },
-                tools: { requestTools: custom }
+                tools: { toolRequest: custom }
             })
-        ).toThrow('Tool "requestTools" is reserved by the harness.');
+        ).toThrow('Tool "toolRequest" is reserved by the harness.');
     });
 
     it('applies plugins, which can add agents and tools', async () => {
@@ -894,7 +914,7 @@ describe('harness', () => {
 //
 // The same registered implementation runs, with this harness's context. Discovery
 // gates the MODEL only — an explicit operator call may run a searchable tool that
-// was never enabled — while every other policy (reserved names, the createTool
+// was never enabled — while every other policy (reserved names, the toolCreate
 // budget/validation, primary-only delegation) still applies.
 describe('executeTool', () => {
     it('runs a registered searchable tool without enabling it for the model', async () => {
@@ -909,7 +929,7 @@ describe('executeTool', () => {
         // Nothing was enabled and the model still sees only the core declarations.
         expect(writer.discoveredTools).toEqual([]);
         await writer('go');
-        expect(declaredNames(seen[0])).toEqual(['requestTools', 'createTool', 'todoTools']);
+        expect(declaredNames(seen[0])).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
     });
 
     it('runs a core tool against this harness and rejects an unregistered name', async () => {
@@ -917,7 +937,7 @@ describe('executeTool', () => {
 
         // A core tool is NOT searchable, so asking for its tag matches nothing: the
         // manual path runs the real implementation, not a shortcut.
-        expect(await writer.executeTool('requestTools', { tags: ['todo'] })).toMatchObject({
+        expect(await writer.executeTool('toolRequest', { tags: ['todo'] })).toMatchObject({
             enabled: [],
             tools: [],
             remaining: 0,
@@ -929,9 +949,9 @@ describe('executeTool', () => {
             'Tool "nope" is not registered in this harness.'
         );
 
-        // No subagents means no delegate tool at all — never a fabricated one.
-        await expect(writer.executeTool('delegate', { agent: 'helper', input: 'go' })).rejects.toThrow(
-            'Tool "delegate" is not registered in this harness.'
+        // No subagents means no agentDelegate tool at all — never a fabricated one.
+        await expect(writer.executeTool('agentDelegate', { agent: 'helper', input: 'go' })).rejects.toThrow(
+            'Tool "agentDelegate" is not registered in this harness.'
         );
     });
 
@@ -939,7 +959,7 @@ describe('executeTool', () => {
         const writer = harness({ agents: { writer: brain(scripted([answer('hi')])) } });
 
         expect(
-            await writer.executeTool('createTool', {
+            await writer.executeTool('toolCreate', {
                 name: 'upper',
                 description: 'Uppercase text.',
                 tags: ['text', 'upper'],
@@ -957,7 +977,7 @@ describe('executeTool', () => {
         expect(writer.discoveredTools).toEqual(['upper']);
         expect(writer.tools.upper.visibility).toBe('searchable');
         await expect(
-            writer.executeTool('createTool', {
+            writer.executeTool('toolCreate', {
                 name: 'upper',
                 description: 'Again.',
                 tags: ['text'],
@@ -980,7 +1000,7 @@ describe('executeTool', () => {
         // A manual delegate call runs a REAL turn on the subagent, so its answer is
         // the same one the model would receive. No user message is appended to the
         // primary's conversation: this was not a turn.
-        expect(await writer.executeTool('delegate', { agent: 'helper', input: 'find it' })).toEqual({
+        expect(await writer.executeTool('agentDelegate', { agent: 'helper', input: 'find it' })).toEqual({
             agent: 'helper',
             content: 'helper answer'
         });
@@ -988,7 +1008,7 @@ describe('executeTool', () => {
         expect(writer.agents.helper.messages.map((message) => message.role)).toEqual(['user', 'assistant']);
 
         // The allowlist is still enforced on the manual path.
-        await expect(writer.executeTool('delegate', { agent: 'lead', input: 'go' })).rejects.toThrow(
+        await expect(writer.executeTool('agentDelegate', { agent: 'lead', input: 'go' })).rejects.toThrow(
             'Agent "lead" is not a configured subagent. Allowed: helper.'
         );
     });

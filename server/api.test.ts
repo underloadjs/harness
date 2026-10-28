@@ -9,11 +9,14 @@
 // suite; this file pins the HTTP contract — routing, bootstrap, statuses, origin
 // gate, body policy/bounds, and frame passthrough.
 //
-// No network is touched: `settings`/`defaults` are injected, websearch keys are
+// No network is touched: `settings`/`defaults` are injected, webSearch keys are
 // stubbed empty, and only the scripted demo preset runs.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createToolCatalogue, createWebsearchCatalogueEntry, WEBSEARCH_UNCONFIGURED_HINT } from '../harnesses';
+import { mkdir, mkdtemp, rm, writeFile as writeTextFile } from 'node:fs/promises';
+import { join, sep } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createToolCatalogue, createWebSearchCatalogueEntry, WEBSEARCH_UNCONFIGURED_HINT } from '../harnesses';
 import { MAX_API_BODY_BYTES } from './api';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
@@ -37,34 +40,41 @@ const DEFAULTS = {
 // The harness-owned core tools lead the catalogue (R8): GET /tools, its
 // /tools/bootstrap alias, and the bootstrap document all list them so a client can
 // review and manually execute them against a session.
-const CORE_TOOL_NAMES = ['requestTools', 'createTool', 'todoTools', 'delegate'];
+const CORE_TOOL_NAMES = ['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate'];
 
 // The exact catalogue order after the core set: nine package presets, six harness
-// tools, websearch.
+// tools, webSearch.
 const CATALOGUE_TOOL_NAMES = [
     'syntaxCheck',
-    'readFile',
-    'writeFile',
-    'editFile',
-    'listFiles',
-    'searchFiles',
-    'globFiles',
-    'runCommand',
+    'fileRead',
+    'fileWrite',
+    'fileEdit',
+    'fileList',
+    'fileGlob',
+    'commandRun',
     'gitDiff',
-    'clock',
-    'wordCount',
-    'roll',
-    'searchNotes',
-    'summarize',
-    'flaky',
-    'websearch'
+    'timeNow',
+    'textCount',
+    'diceRoll',
+    'noteSearch',
+    'textSummarize',
+    'testFlaky',
+    'webSearch'
 ];
 
 const TOOL_NAMES = [...CORE_TOOL_NAMES, ...CATALOGUE_TOOL_NAMES];
 
 const PRESET_NAMES = ['instruct', 'research', 'workspace', 'demo', 'flaky'];
 
-// Stub search keys so `websearch` is deterministically listed as unconfigured
+// Repo-root Temp/ for filesystem fixtures (never OS temp): server/ -> harness ->
+// underload -> packages -> repo root, matching server/environment.test.ts.
+const TEMP_LIST_ROOT = fileURLToPath(new URL('../../../../Temp', import.meta.url));
+
+// fileList reports posix separators on every platform, so an absolute Windows
+// fixture path has to be compared in that same form.
+const posix = (value: string): string => value.split(sep).join('/');
+
+// Stub search keys so `webSearch` is deterministically listed as unconfigured
 // regardless of the machine/.env running the suite.
 const stubEmptySearchKeys = (): void => {
     vi.stubEnv('EXA_API_KEY', '');
@@ -187,28 +197,27 @@ describe('canonical bootstrap document', () => {
             name: 'instruct',
             title: 'Instruct',
             description:
-                'A general instruction-following agent with the full shared toolbox. Every capability is searchable: call requestTools with capability tags to enable the file, command, git, time, text, notes, or web-search tools the task needs. The live presets differ only in their agents, not their tools.',
+                'A general instruction-following agent with the full shared toolbox. Every capability is searchable: call toolRequest with capability tags to enable the file, command, git, time, text, notes, or web-search tools the task needs. The live presets differ only in their agents, not their tools.',
             requiresEndpoint: true,
             primary: 'instruct',
             subagents: [],
             agents: ['instruct'],
             tools: [
                 'syntaxCheck',
-                'readFile',
-                'writeFile',
-                'editFile',
-                'listFiles',
-                'searchFiles',
-                'globFiles',
-                'runCommand',
+                'fileRead',
+                'fileWrite',
+                'fileEdit',
+                'fileList',
+                'fileGlob',
+                'commandRun',
                 'gitDiff',
-                'clock',
-                'wordCount',
-                'roll',
-                'searchNotes',
-                'summarize'
+                'timeNow',
+                'textCount',
+                'diceRoll',
+                'noteSearch',
+                'textSummarize'
             ],
-            coreTools: ['requestTools', 'createTool', 'todoTools'],
+            coreTools: ['toolRequest', 'toolCreate', 'todoManage'],
             builtin: true,
             editable: true
         });
@@ -221,13 +230,13 @@ describe('canonical bootstrap document', () => {
             name: 'demo',
             title: 'Scripted demo',
             description:
-                'Runs a scripted transport: a reasoning stream, a requestTools discovery round, one tool call, and a final answer. No endpoint needed, so this is the fixture to try first. It is deliberately not a live harness: the toolbox rule applies to Instruct, Research, and Workspace.',
+                'Runs a scripted transport: a reasoning stream, a toolRequest discovery round, one tool call, and a final answer. No endpoint needed, so this is the fixture to try first. It is deliberately not a live harness: the toolbox rule applies to Instruct, Research, and Workspace.',
             requiresEndpoint: false,
             primary: 'demo',
             subagents: [],
             agents: ['demo'],
-            tools: ['clock'],
-            coreTools: ['requestTools', 'createTool', 'todoTools'],
+            tools: ['timeNow'],
+            coreTools: ['toolRequest', 'toolCreate', 'todoManage'],
             builtin: true,
             editable: false
         });
@@ -262,13 +271,13 @@ describe('canonical bootstrap document', () => {
     });
 });
 
-// Preset descriptors and the environment-backed `websearch` tool.
+// Preset descriptors and the environment-backed `webSearch` tool.
 //
 // The declarative half (`environmentTools` in harnesses/presets.ts) says WHICH
-// preset can run websearch; the runtime catalogue says WHETHER this host has it.
+// preset can run webSearch; the runtime catalogue says WHETHER this host has it.
 // These tests pin the resolver in api.ts: configured hosts advertise the tool on
 // every live preset (instruct/research/workspace), keyless hosts advertise the
-// same shared toolbox minus websearch. The configured catalogue is injected with
+// same shared toolbox minus webSearch. The configured catalogue is injected with
 // an explicit `env`, so the test never reads or mutates the real process
 // environment.
 describe('preset descriptor tool metadata', () => {
@@ -276,28 +285,27 @@ describe('preset descriptor tool metadata', () => {
     // then five app tools. No live card gets a subset any more.
     const TOOLBOX = [
         'syntaxCheck',
-        'readFile',
-        'writeFile',
-        'editFile',
-        'listFiles',
-        'searchFiles',
-        'globFiles',
-        'runCommand',
+        'fileRead',
+        'fileWrite',
+        'fileEdit',
+        'fileList',
+        'fileGlob',
+        'commandRun',
         'gitDiff',
-        'clock',
-        'wordCount',
-        'roll',
-        'searchNotes',
-        'summarize'
+        'timeNow',
+        'textCount',
+        'diceRoll',
+        'noteSearch',
+        'textSummarize'
     ];
 
     const CONFIGURED_PRESET_TOOLS = {
-        instruct: [...TOOLBOX, 'websearch'],
-        research: [...TOOLBOX, 'websearch'],
-        workspace: [...TOOLBOX, 'websearch'],
-        demo: ['clock'],
-        // The example adds its own failure tool; websearch is not part of it.
-        flaky: [...TOOLBOX, 'flaky']
+        instruct: [...TOOLBOX, 'webSearch'],
+        research: [...TOOLBOX, 'webSearch'],
+        workspace: [...TOOLBOX, 'webSearch'],
+        demo: ['timeNow'],
+        // The example adds its own failure tool; webSearch is not part of it.
+        flaky: [...TOOLBOX, 'testFlaky']
     };
 
     // Only the harness-owned names are core now. The whole shared toolbox —
@@ -305,17 +313,17 @@ describe('preset descriptor tool metadata', () => {
     // Agent configuration: only Research declares a subagent, so only Research
     // gets the delegate tool.
     const CORE_TOOLS = {
-        instruct: ['requestTools', 'createTool', 'todoTools'],
-        research: ['requestTools', 'createTool', 'todoTools', 'delegate'],
-        workspace: ['requestTools', 'createTool', 'todoTools'],
-        demo: ['requestTools', 'createTool', 'todoTools'],
-        flaky: ['requestTools', 'createTool', 'todoTools']
+        instruct: ['toolRequest', 'toolCreate', 'todoManage'],
+        research: ['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate'],
+        workspace: ['toolRequest', 'toolCreate', 'todoManage'],
+        demo: ['toolRequest', 'toolCreate', 'todoManage'],
+        flaky: ['toolRequest', 'toolCreate', 'todoManage']
     };
 
     const configuredRuntime = (): HarnessRuntime => {
         // Explicit env: this catalogue is configured regardless of the machine.
         const catalogue = createToolCatalogue({
-            websearch: createWebsearchCatalogueEntry({
+            websearch: createWebSearchCatalogueEntry({
                 configuration: { env: { EXA_API_KEY: 'configured-exa-key' } }
             })
         });
@@ -334,7 +342,7 @@ describe('preset descriptor tool metadata', () => {
     const coreLists = (presets: HarnessDescriptor[]): Record<string, string[] | undefined> =>
         Object.fromEntries(presets.map((preset) => [preset.name, preset.coreTools]));
 
-    it('appends websearch to every live preset when configured', async () => {
+    it('appends webSearch to every live preset when configured', async () => {
         const runtime = configuredRuntime();
         const bootstrap = await jsonBody<{ presets: HarnessDescriptor[] }>(
             await callHandler(runtime, 'GET', '/v1/harness')
@@ -351,7 +359,7 @@ describe('preset descriptor tool metadata', () => {
 
         // The direct-call catalogue agrees: the same key makes the tool callable.
         const tools = await jsonBody<ToolIndex>(await callHandler(runtime, 'GET', '/v1/harness/tools'));
-        expect(tools.body.tools.find((tool) => tool.name === 'websearch')?.availability).toEqual({
+        expect(tools.body.tools.find((tool) => tool.name === 'webSearch')?.availability).toEqual({
             state: 'available',
             environment: ['EXA_API_KEY', 'TAVILY_API_KEY']
         });
@@ -374,14 +382,14 @@ describe('preset descriptor tool metadata', () => {
             instruct: TOOLBOX,
             research: TOOLBOX,
             workspace: TOOLBOX,
-            demo: ['clock'],
-            flaky: [...TOOLBOX, 'flaky']
+            demo: ['timeNow'],
+            flaky: [...TOOLBOX, 'testFlaky']
         });
 
-        // Keyless stays honest: the global catalogue still lists websearch, but as
+        // Keyless stays honest: the global catalogue still lists webSearch, but as
         // unconfigured, and no preset card advertises a tool it cannot call.
         const tools = await jsonBody<ToolIndex>(await callHandler(runtime, 'GET', '/v1/harness/tools'));
-        expect(tools.body.tools.find((tool) => tool.name === 'websearch')?.availability).toEqual({
+        expect(tools.body.tools.find((tool) => tool.name === 'webSearch')?.availability).toEqual({
             state: 'unconfigured',
             environment: ['EXA_API_KEY', 'TAVILY_API_KEY'],
             hint: WEBSEARCH_UNCONFIGURED_HINT
@@ -636,7 +644,7 @@ describe('canonical sessions', () => {
         const runtime = createRuntime();
 
         const clock = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/clock', { body: { parameters: 'UTC' } })
+            await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', { body: { parameters: 'UTC' } })
         );
         expect(clock.status).toBe(200);
         expect(clock.body.ok).toBe(true);
@@ -650,6 +658,74 @@ describe('canonical sessions', () => {
         expect(
             await jsonBody(await callHandler(runtime, 'POST', '/v1/harness/tools/nope', { body: {} }))
         ).toEqual({ status: 404, body: { error: { message: 'Unknown tool "nope".' } } });
+    });
+
+    // T12: fileList takes a directory array. The server declares the schema it
+    // reads from the catalogue and applies the single-property rule to the body,
+    // so `parameters` IS the `paths` array — exactly what a direct call passes.
+    it('declares and runs fileList with a directory array', async () => {
+        const runtime = createRuntime();
+
+        const index = await jsonBody<ToolIndex>(await callHandler(runtime, 'GET', '/v1/harness/tools'));
+        const fileListEntry = index.body.tools.find((tool) => tool.name === 'fileList');
+        expect(fileListEntry?.parameters).toEqual({
+            type: 'object',
+            properties: {
+                paths: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description:
+                        'Directories to list, absolute or relative to the working directory, in the order the results are grouped. Defaults to ["."].'
+                }
+            },
+            additionalProperties: false
+        });
+        // No `required`: the documented default is ["."], so an argument-less call
+        // is legal for both a model and a client.
+        expect(fileListEntry !== undefined && 'required' in fileListEntry.parameters).toBe(false);
+
+        // Real fixture directories under the repo-root Temp/ (never OS temp).
+        const fixture = await mkdtemp(join(TEMP_LIST_ROOT, 'harness-list-api-'));
+        try {
+            await mkdir(join(fixture, 'src', 'nested'), { recursive: true });
+            await mkdir(join(fixture, 'task'), { recursive: true });
+            await writeTextFile(join(fixture, 'src', 'a.ts'), 'a\n', 'utf8');
+            await writeTextFile(join(fixture, 'task', 'b.ts'), 'b\n', 'utf8');
+
+            // The direct runner applies the same single-property rule as the
+            // harness: `parameters` IS the value of "paths", not a wrapper object
+            // (server/api.ts callToolRoute). This is the exact body the playground
+            // runner sends for a fileList example.
+            const result = await jsonBody<ToolCallResult>(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/fileList', {
+                    body: { parameters: [join(fixture, 'src'), join(fixture, 'task')] }
+                })
+            );
+
+            // Absolute inputs keep their absolute prefix, posix-normalized, and the
+            // directory order is the caller's: src (with its child) then task.
+            expect(result.body).toEqual({
+                ok: true,
+                result: [
+                    `${posix(fixture)}/src/a.ts`,
+                    `${posix(fixture)}/src/nested/`,
+                    `${posix(fixture)}/task/b.ts`
+                ],
+                durationMs: expect.any(Number)
+            });
+
+            // A missing directory is a tool failure reported as data (200 + ok:false),
+            // not a partial list and not a request error.
+            const missing = await jsonBody<ToolCallResult>(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/fileList', {
+                    body: { parameters: [join(fixture, 'src'), join(fixture, 'nope')] }
+                })
+            );
+            expect(missing.status).toBe(200);
+            expect(missing.body.ok).toBe(false);
+        } finally {
+            await rm(fixture, { recursive: true, force: true });
+        }
     });
 });
 
@@ -674,10 +750,10 @@ describe('all-tools manual execution', () => {
         const core = body.tools.slice(0, 4);
         expect(core.map((tool) => tool.name)).toEqual(CORE_TOOL_NAMES);
 
-        // requestTools is exact: its schema is the R7 advertisement (five max,
+        // toolRequest is exact: its schema is the R7 advertisement (five max,
         // `limit` cap, remaining count in the description).
         expect(core[0]).toEqual({
-            name: 'requestTools',
+            name: 'toolRequest',
             group: 'Core tools',
             description:
                 'Find tools by capability tag and enable them. The whole catalogue is searchable (including the file and command tools). Pass the tags you need (for example ["files", "read"] or ["shell"] or ["git", "diff"]) and up to 5 of the closest matches become available on your next turn. The result\'s "remaining" field counts any further tools that matched but were not listed, so add a more specific tag to drill into the rest. Call this before concluding that something cannot be done.',
@@ -708,7 +784,7 @@ describe('all-tools manual execution', () => {
 
         // The rest are core-marked, session-bound, and carry a real schema.
         expect(core.slice(1)).toEqual(
-            ['createTool', 'todoTools', 'delegate'].map((name) => ({
+            ['toolCreate', 'todoManage', 'agentDelegate'].map((name) => ({
                 name,
                 group: 'Core tools',
                 description: expect.any(String),
@@ -747,12 +823,12 @@ describe('all-tools manual execution', () => {
         });
     });
 
-    it('runs requestTools inside the session so the match is enabled there', async () => {
+    it('runs toolRequest inside the session so the match is enabled there', async () => {
         const runtime = createRuntime();
         const session = await createDemo(runtime);
 
         const result = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/requestTools', {
+            await callHandler(runtime, 'POST', '/v1/harness/tools/toolRequest', {
                 body: { sessionId: session.id, parameters: { tags: ['time'] } }
             })
         );
@@ -761,10 +837,10 @@ describe('all-tools manual execution', () => {
         expect(result.body).toEqual({
             ok: true,
             result: {
-                enabled: ['clock'],
+                enabled: ['timeNow'],
                 tools: [
                     {
-                        name: 'clock',
+                        name: 'timeNow',
                         description:
                             'Read the current time. Returns an ISO 8601 timestamp and the Unix time in seconds. The timezone argument is only a label for the answer.',
                         tags: ['time', 'clock', 'date']
@@ -776,16 +852,16 @@ describe('all-tools manual execution', () => {
         });
 
         // The SESSION changed, not a detached catalogue: its snapshot now reports
-        // the discovery, exactly as a model-driven requestTools would.
-        expect(runtime.store.get(session.id).discoveredTools).toEqual(['clock']);
+        // the discovery, exactly as a model-driven toolRequest would.
+        expect(runtime.store.get(session.id).discoveredTools).toEqual(['timeNow']);
     });
 
-    it('runs createTool inside the session with the guarded registration policy', async () => {
+    it('runs toolCreate inside the session with the guarded registration policy', async () => {
         const runtime = createRuntime();
         const session = await createDemo(runtime);
 
         const created = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/createTool', {
+            await callHandler(runtime, 'POST', '/v1/harness/tools/toolCreate', {
                 body: {
                     sessionId: session.id,
                     parameters: {
@@ -814,7 +890,7 @@ describe('all-tools manual execution', () => {
         // The policy is still enforced: the same name is now registered, so a
         // second manual creation fails as data (ok: false) instead of overwriting.
         const collided = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/createTool', {
+            await callHandler(runtime, 'POST', '/v1/harness/tools/toolCreate', {
                 body: {
                     sessionId: session.id,
                     parameters: {
@@ -837,11 +913,11 @@ describe('all-tools manual execution', () => {
 
         // A reserved name is refused by the same path, never by a bypass.
         const reserved = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/createTool', {
+            await callHandler(runtime, 'POST', '/v1/harness/tools/toolCreate', {
                 body: {
                     sessionId: session.id,
                     parameters: {
-                        name: 'todoTools',
+                        name: 'todoManage',
                         description: 'Mine.',
                         tags: ['text'],
                         source: 'return 1;'
@@ -851,16 +927,16 @@ describe('all-tools manual execution', () => {
         );
         expect(reserved.body.ok).toBe(false);
         if (!reserved.body.ok) {
-            expect(reserved.body.error.message).toBe('Tool name "todoTools" is reserved by the harness.');
+            expect(reserved.body.error.message).toBe('Tool name "todoManage" is reserved by the harness.');
         }
     });
 
-    it('runs todoTools against the session list', async () => {
+    it('runs todoManage against the session list', async () => {
         const runtime = createRuntime();
         const session = await createDemo(runtime);
 
         const added = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/todoTools', {
+            await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
                 body: { sessionId: session.id, parameters: { action: 'add', text: '  check bounds ' } }
             })
         );
@@ -877,7 +953,7 @@ describe('all-tools manual execution', () => {
 
         // A second call sees the SAME list: the tool lives in the session harness.
         const listed = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/todoTools', {
+            await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
                 body: { sessionId: session.id, parameters: { action: 'list' } }
             })
         );
@@ -898,7 +974,7 @@ describe('all-tools manual execution', () => {
 
         expect(
             await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/todoTools', {
+                await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
                     body: { parameters: { action: 'list' } }
                 })
             )
@@ -906,7 +982,7 @@ describe('all-tools manual execution', () => {
             status: 400,
             body: {
                 error: {
-                    message: 'Tool "todoTools" runs inside a session; send a "sessionId" with the call.'
+                    message: 'Tool "todoManage" runs inside a session; send a "sessionId" with the call.'
                 }
             }
         });
@@ -914,7 +990,7 @@ describe('all-tools manual execution', () => {
         // An empty id is "no session" for this purpose, not a lookup.
         expect(
             await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/todoTools', {
+                await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
                     body: { sessionId: '', parameters: { action: 'list' } }
                 })
             )
@@ -922,7 +998,7 @@ describe('all-tools manual execution', () => {
             status: 400,
             body: {
                 error: {
-                    message: 'Tool "todoTools" runs inside a session; send a "sessionId" with the call.'
+                    message: 'Tool "todoManage" runs inside a session; send a "sessionId" with the call.'
                 }
             }
         });
@@ -930,7 +1006,7 @@ describe('all-tools manual execution', () => {
         // A present-but-unusable type is a 400, never coerced into a 404 lookup.
         expect(
             await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/todoTools', {
+                await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
                     body: { sessionId: 7, parameters: { action: 'list' } }
                 })
             )
@@ -943,7 +1019,7 @@ describe('all-tools manual execution', () => {
         // answers 404 before the body is read.
         expect(
             await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/todoTools', {
+                await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
                     body: { sessionId: session.id }
                 })
             )
@@ -971,7 +1047,7 @@ describe('all-tools manual execution', () => {
 
         expect(
             await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/todoTools', {
+                await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
                     body: { sessionId: 'missing', parameters: { action: 'list' } }
                 })
             )
@@ -982,13 +1058,13 @@ describe('all-tools manual execution', () => {
         const session = await createDemo(runtime);
         expect(
             await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/delegate', {
+                await callHandler(runtime, 'POST', '/v1/harness/tools/agentDelegate', {
                     body: { sessionId: session.id, parameters: { agent: 'helper', input: 'go' } }
                 })
             )
         ).toEqual({
             status: 404,
-            body: { error: { message: 'Tool "delegate" is not available in this session.' } }
+            body: { error: { message: 'Tool "agentDelegate" is not available in this session.' } }
         });
     });
 
@@ -1029,7 +1105,7 @@ describe('all-tools manual execution', () => {
         // todos all write harness state the running transcript depends on.
         expect(
             await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/requestTools', {
+                await callHandler(runtime, 'POST', '/v1/harness/tools/toolRequest', {
                     body: { sessionId: session.id, parameters: { tags: ['time'] } }
                 })
             )
@@ -1048,7 +1124,7 @@ describe('all-tools manual execution', () => {
         const session = await createDemo(runtime);
 
         const alias = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/todoTools/call', {
+            await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage/call', {
                 body: { sessionId: session.id, parameters: { action: 'list' } }
             })
         );
@@ -1060,7 +1136,7 @@ describe('all-tools manual execution', () => {
         });
 
         expect(
-            await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/tools/todoTools/call'))
+            await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/tools/todoManage/call'))
         ).toEqual({
             status: 405,
             body: { error: { message: 'Use POST for /v1/harness/tools/:name/call.' } }
@@ -1075,7 +1151,7 @@ describe('all-tools manual execution', () => {
         // a catalogue tool it is accepted and ignored — the direct runner is
         // unchanged, with no session state involved.
         const clock = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/clock', {
+            await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', {
                 body: { sessionId: session.id, parameters: 'UTC' }
             })
         );
@@ -1103,7 +1179,7 @@ describe('body policy and bounds', () => {
             { method: 'POST', pathname: '/v1/harness/models', body: 7 },
             { method: 'POST', pathname: '/v1/harness/sessions', body: [] },
             { method: 'POST', pathname: `/v1/harness/sessions/${session.id}/messages`, body: 'hello' },
-            { method: 'POST', pathname: '/v1/harness/tools/clock', body: 7 }
+            { method: 'POST', pathname: '/v1/harness/tools/timeNow', body: 7 }
         ];
 
         for (const entry of cases) {
@@ -1128,7 +1204,7 @@ describe('body policy and bounds', () => {
         // fails, so it must never reach a tool as "no arguments". `clock` would
         // happily answer with its default timezone if it did.
         expect(
-            await jsonBody(await callHandler(runtime, 'POST', '/v1/harness/tools/clock', { body: {} }))
+            await jsonBody(await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', { body: {} }))
         ).toEqual({
             status: 400,
             body: {
@@ -1144,7 +1220,7 @@ describe('body policy and bounds', () => {
         // single-property rule hands `execute` the wrapper object as the value;
         // that is the tool contract, not an HTTP concern, and it stays `ok: true`.
         const clock = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/clock', { body: { parameters: {} } })
+            await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', { body: { parameters: {} } })
         );
         expect(clock.status).toBe(200);
         expect(clock.body.ok).toBe(true);
@@ -1289,11 +1365,11 @@ describe('standalone /api compatibility', () => {
 // sessions only, which the frozen-definition assertions below pin directly.
 describe('harness registry over HTTP', () => {
     const INSTRUCT_GUIDELINES = [
-        'The whole catalogue is searchable. Call requestTools with capability tags before concluding that a capability is missing; discovery enables the matches for your next turn.',
-        'Tags are broad: "files"/"read" to read a file, "files"/"write" and "files"/"edit" to change one, "files"/"list", "files"/"search", and "files"/"glob" to inspect a tree, "shell" to run a command, "git"/"diff" to review the working tree, "javascript" or "python" to check syntax with syntaxCheck, and "time", "text", "random", "notes", and "web"/"search" for the internet when the host configured a search key.',
+        'The whole catalogue is searchable. Call toolRequest with capability tags before concluding that a capability is missing; discovery enables the matches for your next turn.',
+        'Tags are broad: "files"/"read" to read one or more files, "files"/"write" and "files"/"edit" to change them, "files"/"list" and "files"/"glob" to inspect a tree or grep contents, "shell" to run a command, "git"/"diff" to review the working tree, "javascript" or "python" to check syntax with syntaxCheck, and "time", "text", "random", "notes", and "web"/"search" for the internet when the host configured a search key.',
         'Prefer a tool over memory when it can answer more accurately, and say which tool you used.',
         'File and command tools execute on the server host with the server process permissions and are not sandboxed, so inspect before you change anything.',
-        'If a small capability is missing, createTool can add one for this session.',
+        'If a small capability is missing, toolCreate can add one for this session.',
         'Be concise.'
     ];
 
@@ -1365,25 +1441,24 @@ describe('harness registry over HTTP', () => {
             primary: 'research',
             subagents: ['summarizer'],
             agents: ['research', 'summarizer'],
-            // The keyless runtime catalogue has no callable websearch, so the
+            // The keyless runtime catalogue has no callable webSearch, so the
             // descriptor advertises exactly the registered static toolbox.
             tools: [
                 'syntaxCheck',
-                'readFile',
-                'writeFile',
-                'editFile',
-                'listFiles',
-                'searchFiles',
-                'globFiles',
-                'runCommand',
+                'fileRead',
+                'fileWrite',
+                'fileEdit',
+                'fileList',
+                'fileGlob',
+                'commandRun',
                 'gitDiff',
-                'clock',
-                'wordCount',
-                'roll',
-                'searchNotes',
-                'summarize'
+                'timeNow',
+                'textCount',
+                'diceRoll',
+                'noteSearch',
+                'textSummarize'
             ],
-            coreTools: ['requestTools', 'createTool', 'todoTools', 'delegate'],
+            coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate'],
             builtin: false,
             editable: true
         });
@@ -1615,7 +1690,7 @@ describe('harness registry over HTTP', () => {
         });
 
         expect(
-            await post({ name: 'tools', primary: 'instruct', tools: ['runCommand'] })
+            await post({ name: 'tools', primary: 'instruct', tools: ['commandRun'] })
         ).toEqual({
             status: 400,
             body: { error: { message: 'Unknown field "tools". Allowed fields: name, title, description, primary, subagents, agentModels.' } }
@@ -1655,7 +1730,7 @@ describe('harness registry over HTTP', () => {
             primary: 'workspace',
             subagents: ['research'],
             agents: ['workspace', 'research'],
-            coreTools: ['requestTools', 'createTool', 'todoTools', 'delegate'],
+            coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate'],
             builtin: true,
             editable: true
         });
@@ -1755,12 +1830,12 @@ describe('recorded run timing', () => {
         expect(times.every((value, index) => index === 0 || value >= times[index - 1])).toBe(true);
 
         // Discovery is part of the recorded snapshot: the scripted demo enabled
-        // `clock` through requestTools, so a reload can show it.
-        expect(terminal.session.discoveredTools).toEqual(['clock']);
+        // `clock` through toolRequest, so a reload can show it.
+        expect(terminal.session.discoveredTools).toEqual(['timeNow']);
 
         // And the record survives the reload path unchanged.
         expect(runtime.store.get(session.id).turns).toEqual(terminal.session.turns);
-        expect(runtime.store.get(session.id).discoveredTools).toEqual(['clock']);
+        expect(runtime.store.get(session.id).discoveredTools).toEqual(['timeNow']);
     });
 });
 

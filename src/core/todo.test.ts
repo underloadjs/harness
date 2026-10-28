@@ -1,4 +1,4 @@
-// todoTools — the per-harness session todo list (core/todo.ts).
+// todoManage — the per-harness session todo list (core/todo.ts).
 //
 // These are unit tests for the factory: exact result envelopes, defaults,
 // validation errors, defensive copies, and reset/isolation. The harness
@@ -24,7 +24,7 @@ describe('createTodoTool', () => {
     it('exposes the exact wire name, core visibility, and todo tags', () => {
         const { tool } = createTodoTool();
 
-        expect(tool.name).toBe('todoTools');
+        expect(tool.name).toBe('todoManage');
         expect(tool.visibility).toBe('core');
         expect(tool.tags).toEqual(['todo', 'todos', 'task', 'tasks', 'checklist', 'plan']);
         expect(tool.parameters).toEqual({
@@ -122,16 +122,16 @@ describe('createTodoTool', () => {
         const { tool } = createTodoTool();
 
         await expect(tool(null as never)).rejects.toThrow(
-            'todoTools expects an object with an "action" (add, remove, check, uncheck, list).'
+            'todoManage expects an object with an "action" (add, remove, check, uncheck, list).'
         );
         await expect(tool([] as never)).rejects.toThrow(
-            'todoTools expects an object with an "action" (add, remove, check, uncheck, list).'
+            'todoManage expects an object with an "action" (add, remove, check, uncheck, list).'
         );
     });
 
     it('rejects a missing, unknown, or non-string action', async () => {
         const { tool } = createTodoTool();
-        const message = 'todoTools requires "action" to be one of: add, remove, check, uncheck, list.';
+        const message = 'todoManage requires "action" to be one of: add, remove, check, uncheck, list.';
 
         await expect(tool({} as never)).rejects.toThrow(message);
         await expect(tool({ action: 'archive' } as never)).rejects.toThrow(message);
@@ -140,12 +140,12 @@ describe('createTodoTool', () => {
 
     it('rejects a missing, blank, or non-string add text without mutating', async () => {
         const { tool } = createTodoTool();
-        const message = 'todoTools "add" requires a non-empty "text" string.';
+        const message = 'todoManage "add" requires a non-empty "text" string.';
 
         await expect(tool({ action: 'add' })).rejects.toThrow(message);
         await expect(tool({ action: 'add', text: '   ' })).rejects.toThrow(message);
         await expect(tool({ action: 'add', text: 7 } as never)).rejects.toThrow(
-            'todoTools "text" must be a string when provided.'
+            'todoManage "text" must be a string when provided.'
         );
 
         expect(await tool({ action: 'list' })).toEqual(empty);
@@ -156,13 +156,13 @@ describe('createTodoTool', () => {
         await tool({ action: 'add', text: 'One' });
 
         await expect(tool({ action: 'remove' })).rejects.toThrow(
-            'todoTools "remove" requires a non-empty "id" string.'
+            'todoManage "remove" requires a non-empty "id" string.'
         );
         await expect(tool({ action: 'check', id: '  ' })).rejects.toThrow(
-            'todoTools "check" requires a non-empty "id" string.'
+            'todoManage "check" requires a non-empty "id" string.'
         );
         await expect(tool({ action: 'uncheck' })).rejects.toThrow(
-            'todoTools "uncheck" requires a non-empty "id" string.'
+            'todoManage "uncheck" requires a non-empty "id" string.'
         );
 
         expect(await tool({ action: 'list' })).toEqual({
@@ -176,13 +176,13 @@ describe('createTodoTool', () => {
         await tool({ action: 'add', text: 'One' });
 
         await expect(tool({ action: 'check', id: '99' })).rejects.toThrow(
-            'todoTools has no todo with id "99".'
+            'todoManage has no todo with id "99".'
         );
         await expect(tool({ action: 'remove', id: '99' })).rejects.toThrow(
-            'todoTools has no todo with id "99".'
+            'todoManage has no todo with id "99".'
         );
         await expect(tool({ action: 'uncheck', id: '99' })).rejects.toThrow(
-            'todoTools has no todo with id "99".'
+            'todoManage has no todo with id "99".'
         );
 
         expect(await tool({ action: 'list' })).toEqual({
@@ -195,13 +195,13 @@ describe('createTodoTool', () => {
         const { tool } = createTodoTool();
 
         await expect(tool({ action: 'list', completed: 'yes' } as never)).rejects.toThrow(
-            'todoTools "completed" must be a boolean when provided.'
+            'todoManage "completed" must be a boolean when provided.'
         );
         await expect(tool({ action: 'remove', id: 1 } as never)).rejects.toThrow(
-            'todoTools "id" must be a string when provided.'
+            'todoManage "id" must be a string when provided.'
         );
         await expect(tool({ action: 'add', text: 'One', id: 1 } as never)).rejects.toThrow(
-            'todoTools "id" must be a string when provided.'
+            'todoManage "id" must be a string when provided.'
         );
 
         expect(await tool({ action: 'list' })).toEqual(empty);

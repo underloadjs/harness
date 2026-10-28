@@ -91,10 +91,10 @@ describe('harness server', () => {
         const index = await json<ToolIndex>(response);
         const names = index.tools.map((tool) => tool.name);
 
-        expect(names).toContain('clock');
-        expect(names).toContain('readFile');
-        expect(names).toContain('runCommand');
-        expect(index.tools.find((tool) => tool.name === 'clock')?.group).toBe('Harness tools');
+        expect(names).toContain('timeNow');
+        expect(names).toContain('fileRead');
+        expect(names).toContain('commandRun');
+        expect(index.tools.find((tool) => tool.name === 'timeNow')?.group).toBe('Harness tools');
     });
 
     it('streams a task, persists the session, and accepts another task', async () => {
@@ -137,7 +137,7 @@ describe('harness server', () => {
     });
 
     it('calls a tool directly with no harness and no model', async () => {
-        const response = await fetch(`${base}/api/tools/clock`, {
+        const response = await fetch(`${base}/api/tools/timeNow`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Harness-Client': 'ui' },
             body: JSON.stringify({ parameters: 'UTC' })
@@ -153,7 +153,7 @@ describe('harness server', () => {
     });
 
     it('reports tool failures as data, not as a broken server', async () => {
-        const response = await fetch(`${base}/api/tools/readFile`, {
+        const response = await fetch(`${base}/api/tools/fileRead`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Harness-Client': 'ui' },
             body: JSON.stringify({ parameters: 'does/not/exist.txt' })

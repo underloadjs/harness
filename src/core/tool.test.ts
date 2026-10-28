@@ -5,7 +5,7 @@
 //     harness runs, with no agent and no registry;
 //   - the single-property rule: a schema with exactly one property delivers that
 //     property's value to `execute`, so a direct call and a model call agree;
-//   - tags and visibility: every tool is tagged (that is how requestTools finds it)
+//   - tags and visibility: every tool is tagged (that is how toolRequest finds it)
 //     and searchable by default (that is what keeps a big catalogue out of the
 //     context window).
 
@@ -16,18 +16,18 @@ describe('tool', () => {
     it('carries name, description, parameters, and tags', () => {
         const parameters = { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] };
 
-        const websearch = tool({
-            name: 'websearch',
+        const webSearch = tool({
+            name: 'webSearch',
             description: 'Search the web.',
             tags: ['search', 'web'],
             parameters,
             execute: ({ parameters: args }) => `results for ${args.q}`
         });
 
-        expect(websearch.name).toBe('websearch');
-        expect(websearch.description).toBe('Search the web.');
-        expect(websearch.parameters).toBe(parameters);
-        expect(websearch.tags).toEqual(['search', 'web']);
+        expect(webSearch.name).toBe('webSearch');
+        expect(webSearch.description).toBe('Search the web.');
+        expect(webSearch.parameters).toBe(parameters);
+        expect(webSearch.tags).toEqual(['search', 'web']);
     });
 
     it('normalizes tags so discovery can compare them directly', () => {
@@ -54,8 +54,8 @@ describe('tool', () => {
     });
 
     it('defaults the name when none is given (a harness sets it from the key)', () => {
-        const websearch = tool({ description: 'Search.', tags: ['search'], execute: () => 'ok' });
-        expect(websearch.name).toBe('tool');
+        const webSearch = tool({ description: 'Search.', tags: ['search'], execute: () => 'ok' });
+        expect(webSearch.name).toBe('tool');
     });
 
     it('is callable directly, without a harness', async () => {
@@ -86,7 +86,7 @@ describe('tool', () => {
     });
 
     it('passes multi-property parameters through as the object', async () => {
-        const writeFile = tool<{ path: string; content: string }, string>({
+        const fileWrite = tool<{ path: string; content: string }, string>({
             description: 'Write a file.',
             tags: ['files', 'write'],
             parameters: {
@@ -97,7 +97,7 @@ describe('tool', () => {
             execute: ({ parameters }) => `${parameters.path}:${parameters.content}`
         });
 
-        await expect(writeFile({ path: 'a.txt', content: 'hi' })).resolves.toBe('a.txt:hi');
+        await expect(fileWrite({ path: 'a.txt', content: 'hi' })).resolves.toBe('a.txt:hi');
     });
 
     it('always resolves execute as a promise, even for sync implementations', async () => {
@@ -127,9 +127,9 @@ describe('tool', () => {
     it('can be renamed, so a harness can key it by registry name', () => {
         const search = tool({ description: 'Search.', tags: ['search'], execute: () => 'ok' });
 
-        search.name = 'websearch';
+        search.name = 'webSearch';
 
-        expect(search.name).toBe('websearch');
+        expect(search.name).toBe('webSearch');
     });
 
     it('requires a description', () => {

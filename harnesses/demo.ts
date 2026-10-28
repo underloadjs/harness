@@ -1,9 +1,12 @@
 // The offline demo transport.
 //
-// It scripts the shape of a real run — reasoning deltas, a requestTools discovery
+// It scripts the shape of a real run — reasoning deltas, a toolRequest discovery
 // round, one tool call, then a final answer — so the app is fully interactive
 // without an endpoint or an API key. The harness cannot tell this apart from a
 // provider: it only sees `HarnessStreamEvent`s.
+//
+// NAMING (T14): the scripted tool calls use the CURRENT wire names — toolRequest
+// and timeNow. The harness id and the preset id stay `demo`.
 
 import type { HarnessStream, HarnessStreamEvent } from '../src/harness';
 
@@ -44,27 +47,27 @@ async function* speak(
 
 const DEMO_REASONING =
     'No endpoint is attached to this preset, so the transport is scripted. ' +
-    'Only requestTools is declared, so I have to discover the clock before I can read the time.';
+    'Only toolRequest is declared, so I have to discover timeNow before I can read the time.';
 
-const DEMO_DISCOVERY = 'Asking the catalogue for time-related tools first, since only requestTools is visible.';
+const DEMO_DISCOVERY = 'Asking the catalogue for time-related tools first, since only toolRequest is visible.';
 
-const DEMO_PREAMBLE = 'Found it. Calling the clock tool now.';
+const DEMO_PREAMBLE = 'Found it. Calling timeNow now.';
 
 // The scripted transport reads the request to decide which round it is in. The
 // harness appends a `tool` message before re-requesting, and that message's
 // `name` says which round just finished:
 //
-//   1. user prompt        -> requestTools(["time"])   (the only declared tool)
-//   2. requestTools result    -> clock                (now declared, so callable)
-//   3. clock result       -> the answer
+//   1. user prompt          -> toolRequest(["time"])   (the only declared tool)
+//   2. toolRequest result   -> timeNow                 (now declared, so callable)
+//   3. timeNow result       -> the answer
 export const scriptedDemo = (): HarnessStream =>
     async function* (request): AsyncGenerator<HarnessStreamEvent> {
         const last = request.messages[request.messages.length - 1];
         const afterTool = last !== undefined && last.role === 'tool' ? last : undefined;
 
-        if (afterTool !== undefined && afterTool.name === 'clock') {
+        if (afterTool !== undefined && afterTool.name === 'timeNow') {
             const text =
-                `The clock tool returned ${afterTool.content}. ` +
+                `timeNow returned ${afterTool.content}. ` +
                 'That is the whole loop: the harness ran the tool, appended its result, and re-requested ' +
                 'until the model answered with text. Switch to a live preset and set an endpoint to try ' +
                 'this against a real model.';
@@ -79,12 +82,12 @@ export const scriptedDemo = (): HarnessStream =>
             return;
         }
 
-        if (afterTool !== undefined && afterTool.name === 'requestTools') {
+        if (afterTool !== undefined && afterTool.name === 'toolRequest') {
             yield* speak(DEMO_PREAMBLE, 'reasoning', request.signal);
             yield {
                 type: 'done',
                 stopReason: 'tool_calls',
-                toolCalls: [{ id: 'call_clock_1', name: 'clock', arguments: '{"timezone":"UTC"}' }],
+                toolCalls: [{ id: 'call_time_now_1', name: 'timeNow', arguments: '{"timezone":"UTC"}' }],
                 usage: { input: 96, output: 22, total: 118 }
             };
             return;
@@ -95,7 +98,7 @@ export const scriptedDemo = (): HarnessStream =>
         yield {
             type: 'done',
             stopReason: 'tool_calls',
-            toolCalls: [{ id: 'call_get_tools_1', name: 'requestTools', arguments: '{"tags":["time"]}' }],
+            toolCalls: [{ id: 'call_tool_request_1', name: 'toolRequest', arguments: '{"tags":["time"]}' }],
             usage: { input: 48, output: 18, total: 66 }
         };
     };

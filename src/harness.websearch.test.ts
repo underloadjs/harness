@@ -1,4 +1,4 @@
-// websearch inside a harness: conditional registration, discovery, credentials.
+// webSearch inside a harness: conditional registration, discovery, credentials.
 //
 // The factory's wire behaviour is covered in tools/websearch/websearch.test.ts.
 // These tests pin the harness-level contract instead: whether the tool exists,
@@ -8,7 +8,7 @@
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
-import type { HarnessStream, HarnessStreamEvent, WebsearchResult } from '@underload/harness';
+import type { HarnessStream, HarnessStreamEvent, WebSearchResult } from '@underload/harness';
 
 const scripted = (turns: HarnessStreamEvent[][]): HarnessStream => {
     let index = 0;
@@ -35,8 +35,8 @@ const answer = (text: string): HarnessStreamEvent[] => [
 const idle = () => agent({ model: 'm', stream: scripted([answer('idle')]) });
 
 const discoveryAndSearch = (): HarnessStreamEvent[][] => [
-    callTool('c0', 'requestTools', '{"tags":["web","search"]}'),
-    callTool('c1', 'websearch', '{"query":"harness","maxResults":2}'),
+    callTool('c0', 'toolRequest', '{"tags":["web","search"]}'),
+    callTool('c1', 'webSearch', '{"query":"harness","maxResults":2}'),
     answer('found it')
 ];
 
@@ -73,7 +73,7 @@ describe('registration', () => {
     it('is off when the configuration does not opt in', () => {
         const writer = harness({ agents: { writer: idle() } });
 
-        expect(writer.tools.websearch).toBeUndefined();
+        expect(writer.tools.webSearch).toBeUndefined();
     });
 
     it('is off when explicitly false', () => {
@@ -82,7 +82,7 @@ describe('registration', () => {
             websearch: false
         });
 
-        expect(writer.tools.websearch).toBeUndefined();
+        expect(writer.tools.webSearch).toBeUndefined();
     });
 
     it('is not registered when opted in but no key is available', () => {
@@ -94,7 +94,7 @@ describe('registration', () => {
             websearch: true
         });
 
-        expect(writer.tools.websearch).toBeUndefined();
+        expect(writer.tools.webSearch).toBeUndefined();
     });
 
     it('registers a searchable tool from process.env when opted in with true', () => {
@@ -108,9 +108,9 @@ describe('registration', () => {
 
         // Searchable, not core: the model still has to discover it, so an opt-in
         // harness does not grow the always-declared context.
-        expect(writer.tools.websearch).toBeDefined();
-        expect(writer.tools.websearch.visibility).toBe('searchable');
-        expect(writer.tools.websearch.tags).toEqual(['web', 'search', 'internet', 'news', 'research']);
+        expect(writer.tools.webSearch).toBeDefined();
+        expect(writer.tools.webSearch.visibility).toBe('searchable');
+        expect(writer.tools.webSearch.tags).toEqual(['web', 'search', 'internet', 'news', 'research']);
     });
 
     it('does not touch the network at construction', () => {
@@ -130,10 +130,10 @@ describe('registration', () => {
                 agents: { writer: idle() },
                 websearch: { exa: { apiKey: 42 as never } }
             })
-        ).toThrow('Websearch provider "exa" apiKey must be a string or a function returning one.');
+        ).toThrow('webSearch provider "exa" apiKey must be a string or a function returning one.');
     });
 
-    it('lets a configured tool named websearch win', () => {
+    it('lets a configured tool named webSearch win', () => {
         const custom = tool<{ query: string }, string>({
             description: 'A caller-provided search tool.',
             tags: ['web', 'search'],
@@ -148,16 +148,16 @@ describe('registration', () => {
 
         const writer = harness({
             agents: { writer: idle() },
-            tools: { websearch: custom },
+            tools: { webSearch: custom },
             websearch: { env: { EXA_API_KEY: 'exa-secret-key' } }
         });
 
-        expect(writer.tools.websearch).toBe(custom);
+        expect(writer.tools.webSearch).toBe(custom);
     });
 });
 
 describe('discovery and execution', () => {
-    it('is enabled by requestTools and returns the normalized result', async () => {
+    it('is enabled by toolRequest and returns the normalized result', async () => {
         const fetchMock = stubFetch();
         const events: string[] = [];
 
@@ -194,11 +194,11 @@ describe('discovery and execution', () => {
             contents: { highlights: true }
         });
 
-        // user -> requestTools call -> result -> websearch call -> result -> answer
+        // user -> toolRequest call -> result -> webSearch call -> result -> answer
         const resultMessage = entry.messages[4] as { role: string; content: string };
         expect(resultMessage.role).toBe('tool');
 
-        const expected: WebsearchResult = {
+        const expected: WebSearchResult = {
             provider: 'exa',
             query: 'harness',
             maxResults: 2,
@@ -215,7 +215,7 @@ describe('discovery and execution', () => {
         expect(JSON.parse(resultMessage.content)).toEqual(expected);
 
         // Nothing secret in the transcript or the progress stream. The tool is
-        // declared (requestTools enabled it), so the declaration text is in history.
+        // declared (toolRequest enabled it), so the declaration text is in history.
         const transcript = JSON.stringify(entry.messages);
         expect(transcript).not.toContain('exa-secret-key');
         expect(transcript).not.toContain('EXA_API_KEY');
@@ -250,8 +250,8 @@ describe('discovery and execution', () => {
         });
 
         // Neither harness advertises the other's provider.
-        expect(JSON.stringify(first.tools.websearch.parameters)).not.toContain('tavily');
-        expect(JSON.stringify(second.tools.websearch.parameters)).not.toContain('exa');
+        expect(JSON.stringify(first.tools.webSearch.parameters)).not.toContain('tavily');
+        expect(JSON.stringify(second.tools.webSearch.parameters)).not.toContain('exa');
     });
 
     it('routes a model call to the custom override, not the network', async () => {
@@ -272,15 +272,15 @@ describe('discovery and execution', () => {
         const entry = agent({
             model: 'm',
             stream: scripted([
-                callTool('c0', 'requestTools', '{"tags":["web","search"]}'),
-                callTool('c1', 'websearch', '{"query":"harness"}'),
+                callTool('c0', 'toolRequest', '{"tags":["web","search"]}'),
+                callTool('c1', 'webSearch', '{"query":"harness"}'),
                 answer('done')
             ])
         });
 
         const writer = harness({
             agents: { writer: entry },
-            tools: { websearch: custom },
+            tools: { webSearch: custom },
             presets: false,
             websearch: { env: { EXA_API_KEY: 'exa-secret-key' } }
         });

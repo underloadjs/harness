@@ -11,14 +11,14 @@
 // What is deferred until the model or a caller invokes the tool:
 //   the implementation module, and therefore every `node:` built-in it imports
 //
-// Shape compatibility (do not regress this — T3's createTool registration and the
+// Shape compatibility (do not regress this — T3's toolCreate registration and the
 // server's direct-call path depend on it):
-//   - the proxy is callable: `readFile('a.txt')` runs the real tool's direct path;
+//   - the proxy is callable: `fileRead(['a.txt'])` runs the real tool's direct path;
 //   - `execute(context)` exists and runs the real tool's execute path, because
 //     harness.ts calls `definition.execute(...)` directly;
 //   - `name` is a writable, enumerable own property, so `definition.name = key`
 //     during registration does not throw in strict mode;
-//   - tags are normalized exactly like tool() normalizes them, so requestTools ranks
+//   - tags are normalized exactly like tool() normalizes them, so toolRequest ranks
 //     a lazy preset identically to an eager one.
 //
 // Failure behaviour: a failed import clears the cache so a later call retries
@@ -38,7 +38,7 @@ import type { PresetToolMetadata, PresetToolName } from './catalogue';
 // Build the callable proxy for one catalogue entry.
 //
 // The explicit generics let each named export keep its parameter/result types
-// (`lazyTool<string, string>('readFile')`) even though the loader is untyped: the
+// (`lazyTool<string[], FileReadResult>('fileRead')`) even though the loader is untyped: the
 // metadata table is schema plumbing, not the public type surface.
 export const lazyTool = <TParameters = any, TResult = any>(
     name: PresetToolName

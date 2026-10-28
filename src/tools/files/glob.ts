@@ -1,7 +1,7 @@
 // @underload/harness tools/files/glob — dependency-free glob matching and walking.
 //
-// Shared by searchFiles and globFiles. Kept in one file so both tools agree on
-// what "include" means and on which directories a walk never enters.
+// Shared by fileGlob (filename mode and content mode). Kept in one file so the
+// matcher, the skip list, and the caps have exactly one definition.
 //
 // Matching rules (documented in the tool descriptions so the model and a caller
 // see the same contract):
@@ -31,12 +31,12 @@ import { join, relative, resolve, sep } from 'node:path';
 // Matched by entry name at any depth, deliberately case-sensitive.
 export const SKIPPED_DIRECTORIES: readonly string[] = ['.git', 'node_modules'];
 
-// A file larger than this is not read by searchFiles. Generated bundles and data
-// dumps would otherwise turn one grep into a multi-second read.
+// A file larger than this is not read by fileGlob's content mode. Generated
+// bundles and data dumps would otherwise turn one grep into a multi-second read.
 export const MAX_SEARCH_FILE_BYTES = 1024 * 1024;
 
-// Default and hard cap for both tools. Discovery already caps what a model sees;
-// the same reasoning applies to a search result that would flood a tool response.
+// Default and hard cap for fileGlob. Discovery already caps what a model sees; the
+// same reasoning applies to a search result that would flood a tool response.
 export const DEFAULT_MAX_RESULTS = 100;
 export const MAX_RESULTS_LIMIT = 100;
 
@@ -186,8 +186,9 @@ export async function* walkFiles(root: string): AsyncGenerator<string> {
     yield* walk(absoluteRoot);
 }
 
-// Whether a file is small enough for searchFiles to read. A stat failure is
-// treated as "skip" for the same reason unreadable directories are skipped.
+// Whether a file is small enough for fileGlob's content mode to read. A stat
+// failure is treated as "skip" for the same reason unreadable directories are
+// skipped.
 export const isSearchableFileSize = async (path: string): Promise<boolean> => {
     try {
         const info = await stat(path);

@@ -34,11 +34,11 @@
 //
 // TOOL EXECUTION (R8): every tool runs on the server. GET /tools (and
 // /tools/bootstrap, and the bootstrap document) lists the whole catalogue PLUS the
-// harness-owned core tools — requestTools, createTool, todoTools, delegate — marked
+// harness-owned core tools — toolRequest, toolCreate, todoManage, agentDelegate — marked
 // `visibility: 'core'` and `sessionBound: true`. A sessionBound entry has no
 // standalone implementation: POST /tools/:name requires `sessionId`, rejects 400
 // without one, 404 for an unknown session or a core tool that session's harness
-// does not register (delegate without subagents), and 409 while the session is
+// does not register (agentDelegate without subagents), and 409 while the session is
 // busy (a streaming run, a reset, or another manual call) so a manual mutation
 // cannot race an active operation. A directly callable catalogue tool keeps its
 // old session-less runner and simply ignores `sessionId`.
@@ -397,7 +397,7 @@ export const createHarnessApi = ({
     //
     // Two execution paths, because there are two kinds of entry:
     //
-    //   core (sessionBound) — requestTools, createTool, todoTools, delegate. These
+    //   core (sessionBound) — toolRequest, toolCreate, todoManage, agentDelegate. These
     //     have no standalone implementation by design; they run inside a session's
     //     harness so a manual call changes THAT conversation (enabled tools,
     //     registered tools, todos, a delegated subagent turn). A call must carry
@@ -457,7 +457,7 @@ export const createHarnessApi = ({
             } catch (error) {
                 // Unknown session (404), a busy session (409, run or another
                 // manual call), and a core tool the session's harness does not
-                // register (delegate without subagents, 404) are REQUEST failures:
+                // register (agentDelegate without subagents, 404) are REQUEST failures:
                 // the client must be able to distinguish "did not run" from "ran
                 // and failed".
                 if (error instanceof SessionError) throw error;

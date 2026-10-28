@@ -238,8 +238,8 @@ describe('searchTools', () => {
         // The harness renames tools to their registry key; discovery ranks what
         // the model will actually call.
         const definition = make('tool', ['unrelated'], { description: 'Unrelated capability.' });
-        definition.name = 'readFile';
+        definition.name = 'fileRead';
 
-        expect(searchTools([definition], ['readfile']).enabled).toEqual(['readFile']);
+        expect(searchTools([definition], ['fileread']).enabled).toEqual(['fileRead']);
     });
 });

@@ -6,7 +6,7 @@
 //
 // RUNTIME, NOT MODULE STATE
 // -------------------------
-// The direct-call catalogue now includes `websearch`, which depends on a provider
+// The direct-call catalogue now includes `webSearch`, which depends on a provider
 // key. Keys arrive from `.env`, and the server/CLI load that file *after* their
 // imports are evaluated. A module-level catalogue would therefore capture whatever
 // the environment happened to contain at import time (usually nothing). So the
@@ -16,7 +16,7 @@
 //
 // Call it after `loadEnvironmentFile()` — `server/index.ts` does exactly that —
 // and pass the result into `createHarnessHandler`. Live sessions are unaffected:
-// presets opt into `websearch: true` and read the same environment when the
+// presets opt into `websearch: true` (the configuration field keeps its name) and read the same environment when the
 // harness is constructed, which already happens after the load.
 //
 // Cross-references:
@@ -32,8 +32,8 @@ import { presets, PRESET_MAX_ITERATIONS } from './presets';
 // Value import for the local findPreset() below. The barrel also re-exports the
 // constant so callers keep importing it from here.
 import { PRESET_ALIASES } from './registry';
-import { createWebsearchCatalogueEntry } from './websearch';
-import type { WebsearchCatalogueEntry } from './websearch';
+import { createWebSearchCatalogueEntry } from './websearch';
+import type { WebSearchCatalogueEntry } from './websearch';
 import type { CatalogueEntry, HarnessPreset, ToolGroup } from './types';
 
 export { presets, harnessTools, PRESET_MAX_ITERATIONS };
@@ -60,8 +60,8 @@ export {
     createCoreToolEntries
 } from './core';
 export { scriptedDemo } from './demo';
-export { createWebsearchCatalogueEntry, WEBSEARCH_ENVIRONMENT, WEBSEARCH_UNCONFIGURED_HINT } from './websearch';
-export type { WebsearchCatalogueEntry, WebsearchCatalogueOptions } from './websearch';
+export { createWebSearchCatalogueEntry, WEBSEARCH_ENVIRONMENT, WEBSEARCH_UNCONFIGURED_HINT } from './websearch';
+export type { WebSearchCatalogueEntry, WebSearchCatalogueOptions } from './websearch';
 export type { CatalogueEntry, HarnessPreset, RunnerSettings, ToolAvailability, ToolGroup } from './types';
 
 // The trusted agent registry is re-exported through the app barrel because the
@@ -90,7 +90,7 @@ export type ToolCatalogueOptions = {
     // Inject the credential-dependent entry. Defaults to a fresh entry built from
     // the current process environment — at call time, never at import time.
     // Tests pass an explicitly configured or keyless entry.
-    websearch?: WebsearchCatalogueEntry;
+    websearch?: WebSearchCatalogueEntry;
 };
 
 // Copy a Tool into a catalogue entry. The metadata is snapshotted so a disabled
@@ -108,7 +108,7 @@ const entryOf = (name: string, tool: Tool, group: ToolGroup): CatalogueEntry => 
 
 export const createToolCatalogue = (options: ToolCatalogueOptions = {}): ToolCatalogue => {
     // Built here, after the caller has had a chance to load `.env`.
-    const websearch = options.websearch ?? createWebsearchCatalogueEntry();
+    const websearch = options.websearch ?? createWebSearchCatalogueEntry();
 
     const entries: CatalogueEntry[] = [];
     const tools: Record<string, Tool> = {};

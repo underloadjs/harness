@@ -4,15 +4,15 @@
 // researcher tool subsets:
 //   - every LIVE preset (instruct, research, workspace) registers the exact same
 //     tool keys, configured and keyless — package coding tools, the app tools,
-//     websearch when a key resolves, then the harness core tools;
-//   - `delegate` is the one conditional core tool, and it exists only for a preset
+//     webSearch when a key resolves, then the harness core tools;
+//   - `agentDelegate` is the one conditional core tool, and it exists only for a preset
 //     that declares subagents (Research), which is an agent-configuration
 //     difference;
 //   - the instructions really are distinct and the routing is explicit;
-//   - `flaky` is not part of the shared set (it is an example-only extra);
+//   - `testFlaky` is not part of the shared set (it is an example-only extra);
 //   - the scripted demo is a documented fixture exception;
 //   - the legacy preset ids still resolve as aliases;
-//   - `summarize` works in every live preset: it delegates only when a summarizer
+//   - `textSummarize` works in every live preset: it delegates only when a summarizer
 //     agent exists and condenses locally otherwise.
 //
 // No network: constructing a preset never calls the provider (the transport is
@@ -54,22 +54,21 @@ const instructionOf = (presetName: string, agentName: string): string => {
     return message.content;
 };
 
-// The exact shared registry order: nine package tools, then five app tools.
+// The exact shared registry order: eight package tools, then five app tools.
 const TOOLBOX = [
     'syntaxCheck',
-    'readFile',
-    'writeFile',
-    'editFile',
-    'listFiles',
-    'searchFiles',
-    'globFiles',
-    'runCommand',
+    'fileRead',
+    'fileWrite',
+    'fileEdit',
+    'fileList',
+    'fileGlob',
+    'commandRun',
     'gitDiff',
-    'clock',
-    'wordCount',
-    'roll',
-    'searchNotes',
-    'summarize'
+    'timeNow',
+    'textCount',
+    'diceRoll',
+    'noteSearch',
+    'textSummarize'
 ];
 
 afterEach(() => {
@@ -113,7 +112,7 @@ describe('preset catalogue', () => {
                 subagents: [],
                 agents: ['instruct'],
                 tools: TOOLBOX,
-                environmentTools: ['websearch']
+                environmentTools: ['webSearch']
             },
             {
                 name: 'research',
@@ -121,7 +120,7 @@ describe('preset catalogue', () => {
                 subagents: ['summarizer'],
                 agents: ['research', 'summarizer'],
                 tools: TOOLBOX,
-                environmentTools: ['websearch']
+                environmentTools: ['webSearch']
             },
             {
                 name: 'workspace',
@@ -129,14 +128,14 @@ describe('preset catalogue', () => {
                 subagents: [],
                 agents: ['workspace'],
                 tools: TOOLBOX,
-                environmentTools: ['websearch']
+                environmentTools: ['webSearch']
             },
             {
                 name: 'demo',
                 primary: 'demo',
                 subagents: [],
                 agents: ['demo'],
-                tools: ['clock'],
+                tools: ['timeNow'],
                 environmentTools: undefined
             },
             {
@@ -144,7 +143,7 @@ describe('preset catalogue', () => {
                 primary: 'flaky',
                 subagents: [],
                 agents: ['flaky'],
-                tools: [...TOOLBOX, 'flaky'],
+                tools: [...TOOLBOX, 'testFlaky'],
                 environmentTools: undefined
             }
         ]);
@@ -176,69 +175,69 @@ describe('one toolbox, different agents', () => {
         // core difference is delegate (Research declares a subagent).
         expect(registeredTools('instruct')).toEqual([
             ...TOOLBOX,
-            'websearch',
-            'requestTools',
-            'createTool',
-            'todoTools'
+            'webSearch',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
         ]);
         expect(registeredTools('research')).toEqual([
             ...TOOLBOX,
-            'websearch',
-            'requestTools',
-            'createTool',
-            'todoTools',
-            'delegate'
+            'webSearch',
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'agentDelegate'
         ]);
         expect(registeredTools('workspace')).toEqual([
             ...TOOLBOX,
-            'websearch',
-            'requestTools',
-            'createTool',
-            'todoTools'
+            'webSearch',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
         ]);
 
         // The example gets the same shared set plus its own failure tool.
         expect(registeredTools('flaky')).toEqual([
             ...TOOLBOX,
-            'flaky',
-            'websearch',
-            'requestTools',
-            'createTool',
-            'todoTools'
+            'testFlaky',
+            'webSearch',
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
         ]);
 
         // The scripted offline fixture is a documented exception.
-        expect(registeredTools('demo')).toEqual(['clock', 'requestTools', 'createTool', 'todoTools']);
+        expect(registeredTools('demo')).toEqual(['timeNow', 'toolRequest', 'toolCreate', 'todoManage']);
     });
 
     it('registers the identical toolbox on every live preset when the host is keyless', () => {
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
 
-        expect(registeredTools('instruct')).toEqual([...TOOLBOX, 'requestTools', 'createTool', 'todoTools']);
+        expect(registeredTools('instruct')).toEqual([...TOOLBOX, 'toolRequest', 'toolCreate', 'todoManage']);
         expect(registeredTools('research')).toEqual([
             ...TOOLBOX,
-            'requestTools',
-            'createTool',
-            'todoTools',
-            'delegate'
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'agentDelegate'
         ]);
-        expect(registeredTools('workspace')).toEqual([...TOOLBOX, 'requestTools', 'createTool', 'todoTools']);
+        expect(registeredTools('workspace')).toEqual([...TOOLBOX, 'toolRequest', 'toolCreate', 'todoManage']);
 
-        // No key means the factory registers no websearch at all; the global
+        // No key means the factory registers no webSearch at all; the global
         // catalogue is where a keyless host learns it exists but is unconfigured.
-        expect(registeredTools('instruct')).not.toContain('websearch');
+        expect(registeredTools('instruct')).not.toContain('webSearch');
     });
 
-    it('excludes flaky from the shared toolbox and the three live harnesses', () => {
+    it('excludes testFlaky from the shared toolbox and the three live harnesses', () => {
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
 
-        expect(SHARED_TOOL_NAMES).not.toContain('flaky');
-        expect(registeredTools('instruct')).not.toContain('flaky');
-        expect(registeredTools('research')).not.toContain('flaky');
-        expect(registeredTools('workspace')).not.toContain('flaky');
-        expect(registeredTools('flaky')).toContain('flaky');
+        expect(SHARED_TOOL_NAMES).not.toContain('testFlaky');
+        expect(registeredTools('instruct')).not.toContain('testFlaky');
+        expect(registeredTools('research')).not.toContain('testFlaky');
+        expect(registeredTools('workspace')).not.toContain('testFlaky');
+        expect(registeredTools('flaky')).toContain('testFlaky');
     });
 
     it('keeps every shared tool searchable, file tools included', () => {
@@ -249,51 +248,49 @@ describe('one toolbox, different agents', () => {
 
         // The latest scope: discovery is the only way to reach a catalogue tool,
         // so no preset entry is declared up front. Only the harness-owned core
-        // tools bypass requestTools.
+        // tools bypass toolRequest.
         expect(
             Object.fromEntries(
                 [
-                    'readFile',
-                    'writeFile',
-                    'editFile',
-                    'listFiles',
-                    'searchFiles',
-                    'globFiles',
+                    'fileRead',
+                    'fileWrite',
+                    'fileEdit',
+                    'fileList',
+                    'fileGlob',
                     'syntaxCheck',
-                    'runCommand',
+                    'commandRun',
                     'gitDiff',
-                    'clock',
-                    'wordCount',
-                    'roll',
-                    'searchNotes',
-                    'summarize'
+                    'timeNow',
+                    'textCount',
+                    'diceRoll',
+                    'noteSearch',
+                    'textSummarize'
                 ].map((name) => [name, harness.tools[name].visibility])
             )
         ).toEqual({
-            readFile: 'searchable',
-            writeFile: 'searchable',
-            editFile: 'searchable',
-            listFiles: 'searchable',
-            searchFiles: 'searchable',
-            globFiles: 'searchable',
+            fileRead: 'searchable',
+            fileWrite: 'searchable',
+            fileEdit: 'searchable',
+            fileList: 'searchable',
+            fileGlob: 'searchable',
             syntaxCheck: 'searchable',
-            runCommand: 'searchable',
+            commandRun: 'searchable',
             gitDiff: 'searchable',
-            clock: 'searchable',
-            wordCount: 'searchable',
-            roll: 'searchable',
-            searchNotes: 'searchable',
-            summarize: 'searchable'
+            timeNow: 'searchable',
+            textCount: 'searchable',
+            diceRoll: 'searchable',
+            noteSearch: 'searchable',
+            textSummarize: 'searchable'
         });
 
         // Names and metadata are registered without eager implementation loading
         // (the package entries are lazy proxies, see src/tools/lazy.ts).
-        expect(harness.tools.readFile.tags).toEqual(['files', 'read', 'filesystem']);
-        expect(harness.tools.requestTools.visibility).toBe('core');
-        expect(harness.tools.createTool.visibility).toBe('core');
-        expect(harness.tools.todoTools.visibility).toBe('core');
-        expect(harness.tools.delegate).toBeUndefined();
-        expect(presetOf('research').create(SETTINGS, progress).tools.delegate.visibility).toBe('core');
+        expect(harness.tools.fileRead.tags).toEqual(['files', 'read', 'filesystem']);
+        expect(harness.tools.toolRequest.visibility).toBe('core');
+        expect(harness.tools.toolCreate.visibility).toBe('core');
+        expect(harness.tools.todoManage.visibility).toBe('core');
+        expect(harness.tools.agentDelegate).toBeUndefined();
+        expect(presetOf('research').create(SETTINGS, progress).tools.agentDelegate.visibility).toBe('core');
     });
 
     it('gives each live preset distinct instructions and the right subagents', () => {
@@ -349,9 +346,9 @@ describe('one toolbox, different agents', () => {
             role: 'system',
             content: 'You are the Research agent. Investigate before you answer, and separate what you found from what you inferred.'
         });
-        // The delegate guideline is what makes the subagent reachable in words.
+        // The agentDelegate guideline is what makes the subagent reachable in words.
         expect((research.agents.research.messages[1] as { content: string }).content).toContain(
-            'You may call delegate with agent "summarizer" for a self-contained brief'
+            'You may call agentDelegate with agent "summarizer" for a self-contained brief'
         );
     });
 
@@ -379,11 +376,11 @@ describe('summarize under one shared toolbox', () => {
         const harness = presetOf('instruct').create(SETTINGS, progress);
 
         // Direct tool call: the same path a model call takes after discovery.
-        expect(await harness.tools.summarize('First sentence. Second sentence. Third sentence.')).toBe(
+        expect(await harness.tools.textSummarize('First sentence. Second sentence. Third sentence.')).toBe(
             'First sentence. Second sentence.'
         );
-        expect(await harness.tools.summarize('  one   line\n\nsecond line  ')).toBe('one line second line');
-        expect(await harness.tools.summarize('   ')).toBe('');
+        expect(await harness.tools.textSummarize('  one   line\n\nsecond line  ')).toBe('one line second line');
+        expect(await harness.tools.textSummarize('   ')).toBe('');
     });
 
     it('has a summarizer to delegate to only in Research', () => {

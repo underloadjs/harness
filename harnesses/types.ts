@@ -27,13 +27,13 @@ export type HarnessPreset = {
     primary: string;
     // The delegation allowlist. Empty for a single-agent harness; Research names
     // `summarizer`. This is exposed so a descriptor can report the actual core
-    // tool set (delegate exists only when there is somewhere to delegate).
+    // tool set (agentDelegate exists only when there is somewhere to delegate).
     subagents: readonly string[];
     // Declared for display only — the harness registry is the source of truth.
     agents: readonly string[];
     tools: readonly string[];
     // Declared tools that only exist when the host configured their credential
-    // (today: `websearch`, backed by EXA_API_KEY / TAVILY_API_KEY).
+    // (today: `webSearch`, backed by EXA_API_KEY / TAVILY_API_KEY).
     //
     // Deliberately declarative: a descriptor must be computable without building
     // the harness (and therefore without constructing a live agent or a session),
@@ -41,7 +41,7 @@ export type HarnessPreset = {
     // appends only the ones with an executable definition. A keyless host adds
     // nothing, which keeps "listed" == "callable" — the preset factory itself
     // already skips registration when the key is absent (see src/harness.ts).
-    // Every live preset declares `websearch`; the scripted demo and the
+    // Every live preset declares `webSearch`; the scripted demo and the
     // recoverable-failure example do not.
     environmentTools?: readonly string[];
     // Per-agent model overrides (R9): agent id → model id. A member that is absent
@@ -65,9 +65,9 @@ export type HarnessPreset = {
 };
 
 // How a tool is grouped in the direct-call catalogue. 'Web search' is separate
-// from the presets because websearch is credential-dependent and opt-in: a host
+// from the presets because webSearch is credential-dependent and opt-in: a host
 // must see at a glance whether this deployment can run it. 'Core tools' holds the
-// harness-owned set (requestTools, createTool, todoTools, delegate), which are
+// harness-owned set (toolRequest, toolCreate, todoManage, agentDelegate), which are
 // listed for review and manual execution but only ever run inside a session.
 export type ToolGroup = 'Package presets' | 'Harness tools' | 'Web search' | 'Core tools';
 

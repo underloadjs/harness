@@ -3,28 +3,37 @@
 // Each one is exercised twice, because that is the contract: standalone (called
 // directly) and registered on a harness (called by the model). File tools run
 // inside a temporary directory so they never touch the repository.
+//
+// T14: the four file tools are BATCHED (one array argument each) and fileGlob is
+// the single search surface (filename mode, or content mode when `content` is
+// supplied). Names follow `<namespace><action>`.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { mkdir, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
     agent,
     harness,
-    listFiles,
-    readFile,
-    runCommand,
-    syntaxCheck,
-    writeFile
+    commandRun,
+    fileEdit,
+    fileList,
+    fileRead,
+    fileWrite,
+    syntaxCheck
 } from '@underload/harness';
 import type { HarnessStream, HarnessStreamEvent } from '@underload/harness';
+
+// Repo-root Temp/, so fixtures never land in OS temp.
+const TEMP_ROOT = fileURLToPath(new URL('../../../../../Temp', import.meta.url));
 
 let workdir: string;
 let previousCwd: string;
 
 beforeAll(async () => {
     previousCwd = process.cwd();
-    workdir = await mkdtemp(join(tmpdir(), 'underload-harness-'));
+    await mkdir(TEMP_ROOT, { recursive: true });
+    workdir = await mkdtemp(join(TEMP_ROOT, 'harness-presets-'));
     process.chdir(workdir);
 });
 
@@ -93,16 +102,14 @@ describe('syntaxCheck', () => {
             })
         ).resolves.toBe(true);
 
-        await expect(readFile('executed.txt')).rejects.toThrow();
-        await expect(readFile('executed-js.txt')).rejects.toThrow();
+        await expect(fileRead(['executed.txt'])).rejects.toThrow();
+        await expect(fileRead(['executed-js.txt'])).rejects.toThrow();
     });
 
     it('rejects an unsupported language instead of guessing', async () => {
         // The schema's enum catches a model call; a direct call bypasses the
         // schema, so the implementation refuses rather than returning a verdict.
-        await expect(
-            syntaxCheck({ code: 'puts 1', language: 'ruby' as never })
-        ).rejects.toThrow(
+        await expect(syntaxCheck({ code: 'puts 1', language: 'ruby' as never })).rejects.toThrow(
             'syntaxCheck requires language to be "javascript" or "python"; received "ruby".'
         );
     });
@@ -119,44 +126,113 @@ describe('syntaxCheck', () => {
 });
 
 describe('file tools', () => {
-    it('writes, reads, and lists', async () => {
-        const written = await writeFile({ path: 'notes/hello.md', content: '# Hello' });
+    it('writes, reads, and lists with the batched arguments', async () => {
+        const written = await fileWrite([{ path: 'notes/hello.md', content: '# Hello' }]);
 
-        expect(written.bytes).toBe(7);
-        expect(written.path.endsWith(join('notes', 'hello.md'))).toBe(true);
+        expect(written).toEqual([{ path: join(workdir, 'notes', 'hello.md'), bytes: 7 }]);
 
-        await expect(readFile('notes/hello.md')).resolves.toBe('# Hello');
-        await expect(listFiles('notes')).resolves.toEqual(['hello.md']);
+        // The batched read returns [{ path, content }] in request order.
+        await expect(fileRead(['notes/hello.md'])).resolves.toEqual([
+            { path: join(workdir, 'notes', 'hello.md'), content: '# Hello' }
+        ]);
+        // Results carry the directory they came from, so one flat list can hold
+        // several directories without ambiguity.
+        await expect(fileList('notes')).resolves.toEqual(['notes/hello.md']);
+    });
+
+    it('reads several files in one call', async () => {
+        await fileWrite([
+            { path: 'multi-read/a.txt', content: 'a' },
+            { path: 'multi-read/b.txt', content: 'b' }
+        ]);
+
+        await expect(fileRead(['multi-read/b.txt', 'multi-read/a.txt'])).resolves.toEqual([
+            { path: join(workdir, 'multi-read', 'b.txt'), content: 'b' },
+            { path: join(workdir, 'multi-read', 'a.txt'), content: 'a' }
+        ]);
+    });
+
+    it('edits several files in one call', async () => {
+        await fileWrite([
+            { path: 'multi-edit/a.txt', content: 'alpha\n' },
+            { path: 'multi-edit/b.txt', content: 'beta\n' }
+        ]);
+
+        await expect(
+            fileEdit([
+                { path: 'multi-edit/a.txt', oldString: 'alpha', newString: 'ALPHA' },
+                { path: 'multi-edit/b.txt', oldString: 'beta', newString: 'BETA' }
+            ])
+        ).resolves.toEqual([
+            {
+                path: join(workdir, 'multi-edit', 'a.txt'),
+                replacements: 1,
+                bytes: Buffer.byteLength('ALPHA\n', 'utf8')
+            },
+            {
+                path: join(workdir, 'multi-edit', 'b.txt'),
+                replacements: 1,
+                bytes: Buffer.byteLength('BETA\n', 'utf8')
+            }
+        ]);
     });
 
     it('lists directories with a trailing slash so they are distinguishable', async () => {
-        await writeFile({ path: 'tree/a.txt', content: 'a' });
-        await writeFile({ path: 'tree/sub/b.txt', content: 'b' });
+        await fileWrite([
+            { path: 'tree/a.txt', content: 'a' },
+            { path: 'tree/sub/b.txt', content: 'b' }
+        ]);
 
-        await expect(listFiles('tree')).resolves.toEqual(['a.txt', 'sub/']);
+        await expect(fileList('tree')).resolves.toEqual(['tree/a.txt', 'tree/sub/']);
     });
 
-    it('defaults listFiles to the working directory', async () => {
-        await writeFile({ path: 'root.txt', content: 'r' });
-        const entries = await listFiles(undefined);
-        expect(entries).toContain('root.txt');
+    it('lists several directories in one call, grouped in the caller order', async () => {
+        await fileWrite([
+            { path: 'multi/src/a.ts', content: 'a' },
+            { path: 'multi/task/b.ts', content: 'b' }
+        ]);
+
+        await expect(fileList(['multi/task', 'multi/src'])).resolves.toEqual([
+            'multi/task/b.ts',
+            'multi/src/a.ts'
+        ]);
+    });
+
+    it('defaults fileList to the working directory', async () => {
+        // A fresh, otherwise-empty directory makes the default listing exact: no
+        // other test's fixtures leak in, so "." must produce exactly these names
+        // with no prefix at all.
+        const previous = process.cwd();
+        await mkdir('defaults/empty/sub', { recursive: true });
+        await fileWrite([{ path: 'defaults/empty/marker.txt', content: 'm' }]);
+        process.chdir(join(previous, 'defaults', 'empty'));
+
+        try {
+            await expect(fileList(undefined)).resolves.toEqual(['marker.txt', 'sub/']);
+            // Omitted and explicit ["."] are the same request.
+            await expect(fileList(['.'])).resolves.toEqual(['marker.txt', 'sub/']);
+        } finally {
+            process.chdir(previous);
+        }
     });
 
     it('overwrites an existing file', async () => {
-        await writeFile({ path: 'over.txt', content: 'first' });
-        await writeFile({ path: 'over.txt', content: 'second' });
+        await fileWrite([{ path: 'over.txt', content: 'first' }]);
+        await fileWrite([{ path: 'over.txt', content: 'second' }]);
 
-        await expect(readFile('over.txt')).resolves.toBe('second');
+        await expect(fileRead(['over.txt'])).resolves.toEqual([
+            { path: join(workdir, 'over.txt'), content: 'second' }
+        ]);
     });
 
     it('surfaces a missing file as a thrown error', async () => {
-        await expect(readFile('nope/missing.txt')).rejects.toThrow();
+        await expect(fileRead(['nope/missing.txt'])).rejects.toThrow();
     });
 });
 
-describe('runCommand', () => {
+describe('commandRun', () => {
     it('returns exit code, stdout, and stderr', async () => {
-        const result = await runCommand({ command: 'node -e "console.log(42)"' });
+        const result = await commandRun({ command: 'node -e "console.log(42)"' });
 
         expect(result.exitCode).toBe(0);
         expect(result.stdout.trim()).toBe('42');
@@ -164,14 +240,17 @@ describe('runCommand', () => {
     });
 
     it('returns a non-zero exit as data instead of throwing', async () => {
-        const result = await runCommand({ command: 'node -e "process.exit(3)"' });
+        const result = await commandRun({ command: 'node -e "process.exit(3)"' });
 
         expect(result.exitCode).toBe(3);
     });
 
     it('honours cwd', async () => {
-        await writeFile({ path: 'cwd-test/marker.txt', content: 'x' });
-        const result = await runCommand({ command: 'node -e "console.log(process.cwd())"', cwd: 'cwd-test' });
+        await fileWrite([{ path: 'cwd-test/marker.txt', content: 'x' }]);
+        const result = await commandRun({
+            command: 'node -e "console.log(process.cwd())"',
+            cwd: 'cwd-test'
+        });
 
         expect(result.stdout.trim().endsWith('cwd-test')).toBe(true);
     });
@@ -179,7 +258,7 @@ describe('runCommand', () => {
 
 describe('presets inside a harness', () => {
     it('ships every preset searchable, file tools included', () => {
-        expect(readFile.tags).toEqual(['files', 'read', 'filesystem']);
+        expect(fileRead.tags).toEqual(['files', 'read', 'filesystem']);
         expect(syntaxCheck.tags).toEqual([
             'code',
             'syntax',
@@ -187,8 +266,8 @@ describe('presets inside a harness', () => {
             'python',
             'validation'
         ]);
-        expect(readFile.visibility).toBe('searchable');
-        expect(runCommand.visibility).toBe('searchable');
+        expect(fileRead.visibility).toBe('searchable');
+        expect(commandRun.visibility).toBe('searchable');
         expect(syntaxCheck.visibility).toBe('searchable');
     });
 
@@ -196,32 +275,38 @@ describe('presets inside a harness', () => {
         const entry = agent({
             model: 'm',
             stream: scripted([
-                callTool('c0', 'requestTools', '{"tags":["read"]}'),
-                callTool('c1', 'readFile', '{"path":"harness.txt"}'),
+                callTool('c0', 'toolRequest', '{"tags":["read"]}'),
+                callTool('c1', 'fileRead', '{"paths":["harness.txt"]}'),
                 answer('read it')
             ])
         });
 
-        const writer = harness({ agents: { writer: entry }, tools: { readFile, writeFile } });
+        const writer = harness({ agents: { writer: entry }, tools: { fileRead, fileWrite } });
 
-        await writeFile({ path: 'harness.txt', content: 'seeded content' });
+        await fileWrite([{ path: 'harness.txt', content: 'seeded content' }]);
 
-        // The registry key renames the tool, so the model calls `readFile`.
-        expect(writer.tools.readFile.name).toBe('readFile');
+        // The registry key renames the tool, so the model calls `fileRead`.
+        expect(writer.tools.fileRead.name).toBe('fileRead');
 
         const message = await writer('read the file');
 
         expect(message.content).toBe('read it');
-        // user -> requestTools -> readFile call -> result -> answer. Discovery is
-        // OR-ranked, so description mentions of "read" ("Read-only", "Does not
-        // read .gitignore files.") also enable those tools as weak matches.
+        // user -> toolRequest -> fileRead call -> result -> answer. Discovery is
+        // OR-ranked, so a description mention of "read" ("Read one or more…",
+        // "Read-only", "read and match-checked") also enables those tools as weak
+        // matches, which is why the array is longer than the exact tag hit.
         expect(JSON.parse((entry.messages[2] as { content: string }).content).enabled).toEqual([
-            'readFile',
-            'gitDiff',
-            'globFiles',
-            'searchFiles'
+            'fileRead',
+            'fileEdit',
+            'fileGlob',
+            'fileWrite',
+            'gitDiff'
         ]);
-        expect((entry.messages[4] as { content: string }).content).toBe('seeded content');
+        // The single-property rule unwrapped the model's {"paths":[...]} to the
+        // array, and the result serialized as the ordered array.
+        expect(JSON.parse((entry.messages[4] as { content: string }).content)).toEqual([
+            { path: join(workdir, 'harness.txt'), content: 'seeded content' }
+        ]);
     });
 
     it('discovers syntaxCheck and hands it the whole two-property object', async () => {
@@ -231,7 +316,7 @@ describe('presets inside a harness', () => {
         const entry = agent({
             model: 'm',
             stream: scripted([
-                callTool('c0', 'requestTools', '{"tags":["python"]}'),
+                callTool('c0', 'toolRequest', '{"tags":["python"]}'),
                 callTool(
                     'c1',
                     'syntaxCheck',

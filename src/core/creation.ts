@@ -1,8 +1,8 @@
 // Tool creation — compile a tool from source at runtime.
 //
 // This is the small, explicit "the agent writes a tool" capability behind the
-// harness's model-facing `createTool` tool and the host-side
-// `harness.createTool()` method.
+// harness's model-facing `toolCreate` tool and the host-side
+// `harness.toolCreate()` method.
 //
 // Two-phase on purpose:
 //   1. register(): validate the shape, then COMPILE the source. Nothing runs.
@@ -15,7 +15,7 @@
 // -----------
 // Compilation uses the host realm's Function constructor (`new AsyncFunction`).
 // A created tool therefore has the full permissions of the process: filesystem,
-// network, child processes. That is the same trust model as `runCommand` in
+// network, child processes. That is the same trust model as `commandRun` in
 // src/tools — this package has no sandbox and no isolation, and nothing here
 // should ever be described as sandboxing. What this module DOES guarantee:
 //   - a bounded name/description/tag/source shape,
@@ -38,7 +38,7 @@
 // Cross-references:
 //   - ../types        — ToolCreation, ToolCreationResult, ToolContext
 //   - ./tool          — the Tool factory every created tool is built with
-//   - ../harness      — registry checks, createTool tool, harness.createTool()
+//   - ../harness      — registry checks, toolCreate tool, harness.toolCreate()
 //   - ../util         — HarnessError, toErrorInfo
 
 import { HarnessError, toErrorInfo } from '../util';
@@ -49,7 +49,7 @@ import { tool } from './tool';
 // characters. The OpenAI function-name alphabet is the practical constraint.
 const NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 
-// Bounds on one creation. They keep a single createTool round from dumping an
+// Bounds on one creation. They keep a single toolCreate round from dumping an
 // unbounded schema, description, or program into the registry/context window.
 const MAX_SOURCE_LENGTH = 20_000;
 const MAX_DESCRIPTION_LENGTH = 2_000;
@@ -87,7 +87,7 @@ export const compileToolSource = (source: string): ToolBody => {
 // anything a model can get wrong, so the harness can surface the text as a tool
 // result instead of crashing the run.
 //
-// `options.reserved` is the registry's own name list (requestTools/createTool/delegate
+// `options.reserved` is the registry's own name list (toolRequest/toolCreate/agentDelegate
 // in the harness). Comparison is case-insensitive so a near-collision cannot make
 // the catalogue ambiguous.
 export const createDynamicTool = (
@@ -119,7 +119,7 @@ export const createDynamicTool = (
     }
 
     if (!Array.isArray(tags) || tags.length === 0) {
-        throw new HarnessError(`Tool "${name}" requires at least one tag, so requestTools can find it.`);
+        throw new HarnessError(`Tool "${name}" requires at least one tag, so toolRequest can find it.`);
     }
 
     if (tags.length > MAX_TAGS) {

@@ -11,7 +11,7 @@
 // session and the frozen definition inside that session can never disagree.
 //
 // `catalogue` is optional. It says WHICH environment-backed tools this host can
-// actually run (websearch today). The session store does not own a catalogue, so
+// actually run (webSearch today). The session store does not own a catalogue, so
 // the host injects a bound describer (server/index.ts, server/runtime.ts); a
 // describer without one is honest about only the statically declared tools.
 //
@@ -55,8 +55,8 @@ export const describeAgents = (profiles: readonly AgentProfile[]): AgentDescript
 // keyless host therefore advertises exactly what it can call and never claims a
 // search tool that would answer `ok: false`.
 //
-// `coreTools` comes from the harness-owned list only: requestTools,
-// createTool, todoTools, plus delegate when there is a subagent allowlist. No
+// `coreTools` comes from the harness-owned list only: toolRequest,
+// toolCreate, todoManage, plus agentDelegate when there is a subagent allowlist. No
 // preset entry is core any more (the whole catalogue is searchable), so the
 // descriptor cannot advertise a declared file tool that is not actually declared.
 //

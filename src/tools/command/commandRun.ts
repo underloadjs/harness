@@ -1,4 +1,4 @@
-// runCommand — execute a shell command and collect its output.
+// commandRun — execute a shell command and collect its output.
 //
 // The escape hatch every CLI harness ships, and the most powerful tool here: it
 // runs with the permissions of the host process and has NO sandbox, no allowlist,
@@ -8,13 +8,16 @@
 //
 // Executable on its own and registerable on a harness:
 //
-//     const { exitCode, stdout } = await runCommand({ command: 'git status' });
+//     const { exitCode, stdout } = await commandRun({ command: 'git status' });
+//
+// Metadata (name, description, tags, schema) lives in ../catalogue so the preset
+// can be enumerated without importing this module — and so text can't drift.
 
 import { spawn } from 'node:child_process';
 import { tool } from '../../core';
 import { PRESET_TOOLS } from '../catalogue';
 
-export type RunCommandResult = {
+export type CommandRunResult = {
     // Process exit code, or -1 when the process was terminated by a signal.
     exitCode: number;
     stdout: string;
@@ -23,10 +26,10 @@ export type RunCommandResult = {
 
 // Metadata (name, description, tags, schema) lives in ../catalogue so the preset
 // can be enumerated without importing this module — and so text can't drift.
-export const runCommand = tool<{ command: string; cwd?: string }, RunCommandResult>({
-    ...PRESET_TOOLS.runCommand,
+export const commandRun = tool<{ command: string; cwd?: string }, CommandRunResult>({
+    ...PRESET_TOOLS.commandRun,
     execute: ({ parameters: { command, cwd } }) =>
-        new Promise<RunCommandResult>((resolve, reject) => {
+        new Promise<CommandRunResult>((resolve, reject) => {
             // shell: true is deliberate — it is what makes a single string
             // behave like a command line instead of an argv array.
             const child = spawn(command, { cwd, shell: true });

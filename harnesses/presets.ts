@@ -9,10 +9,10 @@
 //   live  — instruct, research, workspace (and the flaky example). All built from
 //           TRUSTED agent profiles in src/agents through `createProfiledHarness`
 //           (./toolbox.ts), so they register the SAME toolbox: package coding
-//           tools, the app tools, environment-backed websearch, and the harness
+//           tools, the app tools, environment-backed webSearch, and the harness
 //           core tools. Only the agents differ: names, instructions, guidelines,
 //           primary, and subagents.
-//   fixture — demo is a scripted offline run with clock only. It is retained so
+//   fixture — demo is a scripted offline run with timeNow only. It is retained so
 //           the UI (and the service tests) can exercise the whole loop without a
 //           provider; it is deliberately not a live harness, is `editable: false`,
 //           and is listed after the live presets.
@@ -32,6 +32,8 @@
 // and `researcher` is an alias of `research` (see ./index.ts `findPreset` and
 // ./registry.ts). They resolve to the canonical preset, so an old CLI invocation
 // or bookmarked session request still runs; they are not listed a second time.
+// The harness ids themselves are unchanged by the T14 tool rename — only TOOL
+// names changed.
 //
 // Cross-references:
 //   - ../src/agents     — AgentProfile registry (instruction + guidelines)
@@ -68,24 +70,24 @@ const instruct: HarnessPreset = {
     name: 'instruct',
     title: 'Instruct',
     description:
-        'A general instruction-following agent with the full shared toolbox. Every capability is searchable: call requestTools with capability tags to enable the file, command, git, time, text, notes, or web-search tools the task needs. The live presets differ only in their agents, not their tools.',
+        'A general instruction-following agent with the full shared toolbox. Every capability is searchable: call toolRequest with capability tags to enable the file, command, git, time, text, notes, or web-search tools the task needs. The live presets differ only in their agents, not their tools.',
     requiresEndpoint: true,
     primary: 'instruct',
     subagents: [],
     agents: ['instruct'],
     tools: SHARED_TOOL_NAMES,
     // Same environment-backed declaration as every live preset: a keyless host
-    // simply does not append websearch to the descriptor (it stays listed as
+    // simply does not append webSearch to the descriptor (it stays listed as
     // unconfigured in the global tool catalogue).
-    environmentTools: ['websearch'],
+    environmentTools: ['webSearch'],
     builtin: true,
     editable: true,
     create: createProfiledHarness('instruct', [])
 };
 
 // Research: the one live preset with a subagent. The shared toolbox is identical
-// to Instruct's; the difference is the selected agents, which makes `delegate`
-// (and the delegated half of `summarize`) available.
+// to Instruct's; the difference is the selected agents, which makes agentDelegate
+// (and the delegated half of textSummarize) available.
 const research: HarnessPreset = {
     name: 'research',
     title: 'Research',
@@ -96,7 +98,7 @@ const research: HarnessPreset = {
     subagents: ['summarizer'],
     agents: ['research', 'summarizer'],
     tools: SHARED_TOOL_NAMES,
-    environmentTools: ['websearch'],
+    environmentTools: ['webSearch'],
     builtin: true,
     editable: true,
     create: createProfiledHarness('research', ['summarizer'])
@@ -109,13 +111,13 @@ const workspace: HarnessPreset = {
     name: 'workspace',
     title: 'Workspace (coding)',
     description:
-        'A coding agent with the full shared toolbox: discover and use read/write/edit files, search contents and globs, check syntax, diff the working tree, run commands, and web search when a key is configured. It has the same registered tools as every live harness and differs only in its agent profile and routing. Everything runs on the server host; discovery gates each tool.',
+        'A coding agent with the full shared toolbox: discover and use file read/write/edit/list/glob, check syntax, diff the working tree, run commands, and web search when a key is configured. It has the same registered tools as every live harness and differs only in its agent profile and routing. Everything runs on the server host; discovery gates each tool.',
     requiresEndpoint: true,
     primary: 'workspace',
     subagents: [],
     agents: ['workspace'],
     tools: SHARED_TOOL_NAMES,
-    environmentTools: ['websearch'],
+    environmentTools: ['webSearch'],
     builtin: true,
     editable: true,
     create: createProfiledHarness('workspace', [])
@@ -126,20 +128,20 @@ const workspace: HarnessPreset = {
 // ---------------------------------------------------------------------------
 
 // The offline demo is a scripted transport, not a live harness: it demonstrates
-// the loop (reasoning, requestTools discovery, one tool call, answer) with no
-// endpoint. Its clock-only registry is intentional and pinned by its script, so
+// the loop (reasoning, toolRequest discovery, one tool call, answer) with no
+// endpoint. Its timeNow-only registry is intentional and pinned by its script, so
 // it is exempt from the shared-toolbox rule. `editable: false`: overriding its
 // metadata would let the fixture claim a configuration its script does not run.
 const demo: HarnessPreset = {
     name: 'demo',
     title: 'Scripted demo',
     description:
-        'Runs a scripted transport: a reasoning stream, a requestTools discovery round, one tool call, and a final answer. No endpoint needed, so this is the fixture to try first. It is deliberately not a live harness: the toolbox rule applies to Instruct, Research, and Workspace.',
+        'Runs a scripted transport: a reasoning stream, a toolRequest discovery round, one tool call, and a final answer. No endpoint needed, so this is the fixture to try first. It is deliberately not a live harness: the toolbox rule applies to Instruct, Research, and Workspace.',
     requiresEndpoint: false,
     primary: 'demo',
     subagents: [],
     agents: ['demo'],
-    tools: ['clock'],
+    tools: ['timeNow'],
     builtin: true,
     editable: false,
     create: (settings, progress) =>
@@ -155,7 +157,7 @@ const demo: HarnessPreset = {
                     stream: scriptedDemo()
                 })
             },
-            tools: { clock: harnessTools.clock },
+            tools: { timeNow: harnessTools.timeNow },
             presets: false,
             // Explicit entry point, even with one agent: the documented style,
             // and it keeps the harness name independent of key order.
@@ -165,10 +167,11 @@ const demo: HarnessPreset = {
 };
 
 // Recoverable failures is a live example, so it gets the shared toolbox too and
-// adds `flaky` as an extra. `flaky` stays out of the shared table on purpose: it
-// throws two calls out of three and keeps module-level attempt state, which must
-// never be part of what Instruct/Research/Workspace can call. Not editable: the
-// example's point is its fixed failure behaviour.
+// adds `testFlaky` as an extra. `testFlaky` stays out of the shared table on
+// purpose: it throws two calls out of three and keeps module-level attempt state,
+// which must never be part of what Instruct/Research/Workspace can call. Not
+// editable: the example's point is its fixed failure behaviour. The harness id
+// stays `flaky` (only the TOOL is testFlaky).
 const failure: HarnessPreset = {
     name: 'flaky',
     title: 'Recoverable failures (example)',
@@ -178,7 +181,7 @@ const failure: HarnessPreset = {
     primary: 'flaky',
     subagents: [],
     agents: ['flaky'],
-    tools: [...SHARED_TOOL_NAMES, 'flaky'],
+    tools: [...SHARED_TOOL_NAMES, 'testFlaky'],
     builtin: true,
     editable: false,
     create: (settings: RunnerSettings, progress) =>
@@ -188,7 +191,7 @@ const failure: HarnessPreset = {
                 primary: 'flaky',
                 subagents: [],
                 // The one preset-specific tool; excluded from the shared set.
-                extraTools: { flaky: harnessTools.flaky }
+                extraTools: { testFlaky: harnessTools.testFlaky }
             },
             settings,
             progress

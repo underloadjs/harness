@@ -19,12 +19,12 @@ const reasoning = (agent: string): HarnessEvent => ({ type: 'reasoning', agent, 
 const toolCall = (agent: string): HarnessEvent => ({
     type: 'tool_call',
     agent,
-    call: { id: 'c1', name: 'readFile', arguments: '{}' }
+    call: { id: 'c1', name: 'fileRead', arguments: '{}' }
 });
 const toolResult = (agent: string): HarnessEvent => ({
     type: 'tool_result',
     agent,
-    name: 'readFile',
+    name: 'fileRead',
     content: 'ok',
     isError: false
 });

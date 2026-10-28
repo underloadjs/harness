@@ -4,10 +4,14 @@
 // what ships out of the box:
 //
 //   syntax/   syntaxCheck (javascript or python, named by the caller)
-//   files/    readFile, writeFile, editFile, listFiles, searchFiles, globFiles
-//   command/  runCommand, gitDiff
-//   websearch/ websearch — opt-in, per-harness (NOT in `presetTools`: it needs a
-//             provider key, which belongs to one harness; see createWebsearchTool)
+//   files/    fileRead, fileWrite, fileEdit, fileList, fileGlob
+//   command/  commandRun, gitDiff
+//   websearch/ webSearch — opt-in, per-harness (NOT in `presetTools`: it needs a
+//             provider key, which belongs to one harness; see createWebSearchTool)
+//
+// NAMING (T14): every wire name is `<namespace><action>`. The four file tools and
+// commandRun/webSearch were renamed; there are no aliases, because two names for
+// one tool makes discovery ambiguous.
 //
 // Lazy, not eager (R1b)
 // --------------------
@@ -19,14 +23,15 @@
 // contract the registry relies on:
 //
 //     await syntaxCheck({ code: 'print(1)', language: 'python' }); // true
-//     await readFile('package.json');                              // the file, as text
-//     harness({ tools: { syntaxCheck, readFile } });                // the model calls them
+//     await fileRead(['package.json']);                            // [{ path, content }]
+//     await fileWrite([{ path: 'a.txt', content: 'hi' }]);         // [{ path, bytes }]
+//     harness({ tools: { syntaxCheck, fileRead } });                // the model calls them
 //
 // Every proxy has writable `name`, `description`, `tags`, `visibility`, `parameters`
 // and a deferred `execute`, so harness registration/rename and the server's direct
 // calls behave exactly as they did with eager tools. See ./lazy.
 //
-// Every preset is **searchable**, so the model asks requestTools for `files`,
+// Every preset is **searchable**, so the model asks toolRequest for `files`,
 // `read`, `shell`, `git`, … and discovery enables the matches; nothing in this
 // catalogue is declared up front. A harness preloads `presetTools` unless it is
 // created with `presets: false`.
@@ -41,15 +46,15 @@
 // hoist the Node built-in imports back into the entry and defeat the split.
 import { lazyTool } from './lazy';
 import type {
-    EditFileParameters,
-    EditFileResult,
-    GlobFilesParameters,
-    GlobFilesResult,
-    SearchFilesParameters,
-    SearchFilesResult,
-    WriteFileResult
+    FileEditParameters,
+    FileEditResult,
+    FileGlobParameters,
+    FileGlobResult,
+    FileListParameters,
+    FileReadResult,
+    FileWriteResult
 } from './files';
-import type { GitDiffParameters, GitDiffResult, RunCommandResult } from './command';
+import type { CommandRunResult, GitDiffParameters, GitDiffResult } from './command';
 import type { SyntaxCheckParameters } from './syntax';
 import type { Tool } from '../types';
 
@@ -57,42 +62,55 @@ import type { Tool } from '../types';
 // precise signature even though the implementation is loaded lazily.
 export const syntaxCheck = lazyTool<SyntaxCheckParameters, boolean>('syntaxCheck');
 
-export const readFile = lazyTool<string, string>('readFile');
-export const writeFile = lazyTool<{ path: string; content: string }, WriteFileResult>('writeFile');
-export const editFile = lazyTool<EditFileParameters, EditFileResult>('editFile');
-export const listFiles = lazyTool<string | undefined, string[]>('listFiles');
-export const searchFiles = lazyTool<SearchFilesParameters, SearchFilesResult>('searchFiles');
-export const globFiles = lazyTool<GlobFilesParameters, GlobFilesResult>('globFiles');
+// The four file tools are BATCHED: each takes the array its single schema property
+// declares, so a direct call and a model call reach `execute` identically.
+export const fileRead = lazyTool<string[], FileReadResult>('fileRead');
+export const fileWrite = lazyTool<{ path: string; content: string }[], FileWriteResult>('fileWrite');
+export const fileEdit = lazyTool<FileEditParameters, FileEditResult>('fileEdit');
+export const fileList = lazyTool<FileListParameters, string[]>('fileList');
+// fileGlob declares four properties, so it receives the whole object and its
+// result shape depends on whether `content` was supplied.
+export const fileGlob = lazyTool<FileGlobParameters, FileGlobResult>('fileGlob');
 
-export const runCommand = lazyTool<{ command: string; cwd?: string }, RunCommandResult>('runCommand');
+export const commandRun = lazyTool<{ command: string; cwd?: string }, CommandRunResult>('commandRun');
 export const gitDiff = lazyTool<GitDiffParameters, GitDiffResult>('gitDiff');
 
 export type { SyntaxCheckLanguage, SyntaxCheckParameters } from './syntax';
-export type { WriteFileResult } from './files';
 export type {
-    EditFileParameters,
-    EditFileResult,
-    GlobFilesParameters,
-    GlobFilesResult,
-    SearchFilesMatch,
-    SearchFilesParameters,
-    SearchFilesResult
+    FileEditEntry,
+    FileEditParameters,
+    FileEditResult,
+    FileEditResultEntry,
+    FileGlobFilesResult,
+    FileGlobMatch,
+    FileGlobMatchesResult,
+    FileGlobParameters,
+    FileGlobResult,
+    FileListParameters,
+    FileReadEntry,
+    FileReadParameters,
+    FileReadResult,
+    FileWriteEntry,
+    FileWriteParameters,
+    FileWriteResult,
+    FileWriteResultEntry
 } from './files';
-export type { GitDiffParameters, GitDiffResult, RunCommandResult } from './command';
+export type { CommandRunResult, GitDiffParameters, GitDiffResult } from './command';
 
 // Web search is intentionally outside `presetTools`: a preset is shared by every
 // harness, while a search tool closes over that harness's key. harness.ts calls
-// this factory only when `websearch` is configured, and the factory returns
+// this factory only when `websearch` is configured (the configuration property
+// keeps its name; only the TOOL is called webSearch), and the factory returns
 // undefined when no provider key is available.
-export { createWebsearchTool, WEBSEARCH_METADATA, WEBSEARCH_TOOL_NAME } from './websearch';
-export type { WebsearchMetadata } from './websearch';
+export { createWebSearchTool, WEB_SEARCH_METADATA, WEB_SEARCH_TOOL_NAME } from './websearch';
+export type { WebSearchMetadata } from './websearch';
 export type {
     WebsearchConfiguration,
-    WebsearchMatch,
-    WebsearchParameters,
+    WebSearchMatch,
+    WebSearchParameters,
     WebsearchProvider,
     WebsearchProviderConfiguration,
-    WebsearchResult
+    WebSearchResult
 } from '../types';
 
 // The preload catalogue, keyed by the name the model calls. `harness()` spreads
@@ -101,12 +119,11 @@ export type {
 // this object costs no implementation imports.
 export const presetTools = {
     syntaxCheck,
-    readFile,
-    writeFile,
-    editFile,
-    listFiles,
-    searchFiles,
-    globFiles,
-    runCommand,
+    fileRead,
+    fileWrite,
+    fileEdit,
+    fileList,
+    fileGlob,
+    commandRun,
     gitDiff
 } satisfies Record<string, Tool>;

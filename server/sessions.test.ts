@@ -99,7 +99,7 @@ const singlePreset = (): HarnessPreset =>
         })
     );
 
-// Primary + subagent. The primary asks for `delegate` on its first request and,
+// Primary + subagent. The primary asks for `agentDelegate` on its first request and,
 // after the harness appends the delegate result as a tool message, answers with
 // text. The helper answers on its own stream. This exercises the fact that the
 // session records subagent progress in the primary turn.
@@ -115,7 +115,7 @@ const teamPreset = (): HarnessPreset =>
                         stream: async function* (request): AsyncGenerator<HarnessStreamEvent> {
                             const last = request.messages[request.messages.length - 1];
 
-                            if (last !== undefined && last.role === 'tool' && last.name === 'delegate') {
+                            if (last !== undefined && last.role === 'tool' && last.name === 'agentDelegate') {
                                 yield { type: 'text', delta: 'done by helper' };
                                 yield { type: 'done', stopReason: 'stop', toolCalls: [] };
                                 return;
@@ -127,7 +127,7 @@ const teamPreset = (): HarnessPreset =>
                                 toolCalls: [
                                     {
                                         id: 'call_1',
-                                        name: 'delegate',
+                                        name: 'agentDelegate',
                                         arguments: '{"agent":"helper","input":"find it"}'
                                     }
                                 ]
@@ -272,7 +272,7 @@ describe('SessionStore turns', () => {
                 agent: 'lead',
                 call: {
                     id: 'call_1',
-                    name: 'delegate',
+                    name: 'agentDelegate',
                     arguments: '{"agent":"helper","input":"find it"}'
                 }
             },
@@ -294,7 +294,7 @@ describe('SessionStore turns', () => {
             {
                 type: 'tool_result',
                 agent: 'lead',
-                name: 'delegate',
+                name: 'agentDelegate',
                 callId: 'call_1',
                 content: '{"agent":"helper","content":"helper answer"}',
                 isError: false
@@ -714,7 +714,7 @@ describe('SessionStore turns', () => {
                 subagents: [],
                 agents: ['single'],
                 tools: [],
-                coreTools: ['requestTools', 'createTool', 'todoTools'],
+                coreTools: ['toolRequest', 'toolCreate', 'todoManage'],
                 builtin: true,
                 editable: true
             },
@@ -792,7 +792,7 @@ describe('SessionStore and the harness registry', () => {
                         model: settings.model,
                         instruction: 'Discover, then read.',
                         stream: scriptedStream([
-                            [{ type: 'done', stopReason: 'tool_calls', toolCalls: [{ id: 'c1', name: 'requestTools', arguments: '{"tags":["read"]}' }] }],
+                            [{ type: 'done', stopReason: 'tool_calls', toolCalls: [{ id: 'c1', name: 'toolRequest', arguments: '{"tags":["read"]}' }] }],
                             [{ type: 'done', stopReason: 'tool_calls', toolCalls: [{ id: 'c2', name: 'reader', arguments: '{"path":"a.txt"}' }] }],
                             [{ type: 'text', delta: 'first' }, { type: 'done', stopReason: 'stop', toolCalls: [] }],
                             [{ type: 'text', delta: 'second' }, { type: 'done', stopReason: 'stop', toolCalls: [] }]
@@ -814,7 +814,7 @@ describe('SessionStore and the harness registry', () => {
         expect(store.get(created.id).discoveredTools).toEqual(['reader']);
 
         // The second turn starts from the harness's existing enabled set: no new
-        // requestTools round, and the tool is still declared/callable.
+        // toolRequest round, and the tool is still declared/callable.
         setClock(3_000);
         const items: SessionStreamItem[] = [];
         await store.run(created.id, 'second', async (item) => {
@@ -871,7 +871,7 @@ describe('SessionStore manual tool calls', () => {
         const mine = store.create('single');
         const other = store.create('single');
 
-        expect(await store.callTool(mine.id, 'todoTools', { action: 'add', text: '  only mine ' })).toEqual({
+        expect(await store.callTool(mine.id, 'todoManage', { action: 'add', text: '  only mine ' })).toEqual({
             todos: [{ id: '1', text: 'only mine', completed: false }],
             todo: { id: '1', text: 'only mine', completed: false },
             counts: { total: 1, completed: 0, remaining: 1 }
@@ -879,11 +879,11 @@ describe('SessionStore manual tool calls', () => {
 
         // The state lives in the session's harness: the same session sees the item,
         // a sibling session does not.
-        expect(await store.callTool(mine.id, 'todoTools', { action: 'list' })).toEqual({
+        expect(await store.callTool(mine.id, 'todoManage', { action: 'list' })).toEqual({
             todos: [{ id: '1', text: 'only mine', completed: false }],
             counts: { total: 1, completed: 0, remaining: 1 }
         });
-        expect(await store.callTool(other.id, 'todoTools', { action: 'list' })).toEqual({
+        expect(await store.callTool(other.id, 'todoManage', { action: 'list' })).toEqual({
             todos: [],
             counts: { total: 0, completed: 0, remaining: 0 }
         });
@@ -894,13 +894,13 @@ describe('SessionStore manual tool calls', () => {
         const session = store.create('toolbox');
 
         // Discovery gates the MODEL. An explicit operator call may run any
-        // registered tool even before requestTools enabled it.
+        // registered tool even before toolRequest enabled it.
         expect(store.get(session.id).discoveredTools).toEqual([]);
         expect(await store.callTool(session.id, 'digest', 'anything')).toBe('digested');
 
-        // requestTools through the same path enables it for the model, and the
+        // toolRequest through the same path enables it for the model, and the
         // snapshot reports the change (the session really was mutated).
-        expect(await store.callTool(session.id, 'requestTools', { tags: ['text'] })).toEqual({
+        expect(await store.callTool(session.id, 'toolRequest', { tags: ['text'] })).toEqual({
             enabled: ['digest'],
             tools: [{ name: 'digest', description: 'Summarise text.', tags: ['text', 'summary'] }],
             remaining: 0
@@ -912,21 +912,21 @@ describe('SessionStore manual tool calls', () => {
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
         const session = store.create('single');
 
-        await expect(store.callTool('missing', 'todoTools', { action: 'list' })).rejects.toMatchObject({
+        await expect(store.callTool('missing', 'todoManage', { action: 'list' })).rejects.toMatchObject({
             status: 404,
             message: 'Unknown session "missing".'
         });
 
         // singlePreset has no subagents, so its harness registers no delegate.
-        await expect(store.callTool(session.id, 'delegate', { agent: 'x', input: 'go' })).rejects.toMatchObject({
+        await expect(store.callTool(session.id, 'agentDelegate', { agent: 'x', input: 'go' })).rejects.toMatchObject({
             status: 404,
-            message: 'Tool "delegate" is not available in this session.'
+            message: 'Tool "agentDelegate" is not available in this session.'
         });
 
         // A tool that throws keeps its own message: the API layer reports it as
         // ok:false, exactly like a throwing catalogue tool.
-        await expect(store.callTool(session.id, 'todoTools', { action: 'add' })).rejects.toThrow(
-            'todoTools "add" requires a non-empty "text" string.'
+        await expect(store.callTool(session.id, 'todoManage', { action: 'add' })).rejects.toThrow(
+            'todoManage "add" requires a non-empty "text" string.'
         );
     });
 
@@ -1010,7 +1010,7 @@ describe('SessionStore manual tool calls', () => {
         // held promise is never reported as an unhandled rejection.
         const settled = pending.catch((error: unknown) => error);
 
-        await expect(store.callTool(session.id, 'todoTools', { action: 'list' })).rejects.toMatchObject({
+        await expect(store.callTool(session.id, 'todoManage', { action: 'list' })).rejects.toMatchObject({
             status: 409
         });
 
@@ -1057,7 +1057,7 @@ describe('SessionStore manual tool calls', () => {
 
         // A manual mutation cannot interleave with a live turn: the running
         // transcript depends on the state it would change.
-        await expect(store.callTool(session.id, 'todoTools', { action: 'list' })).rejects.toMatchObject({
+        await expect(store.callTool(session.id, 'todoManage', { action: 'list' })).rejects.toMatchObject({
             status: 409,
             message: 'A task is running in this session; try again when it finishes.'
         });
@@ -1066,7 +1066,7 @@ describe('SessionStore manual tool calls', () => {
         await running;
 
         // Once the turn is done, the same call works.
-        expect(await store.callTool(session.id, 'todoTools', { action: 'list' })).toEqual({
+        expect(await store.callTool(session.id, 'todoManage', { action: 'list' })).toEqual({
             todos: [],
             counts: { total: 0, completed: 0, remaining: 0 }
         });

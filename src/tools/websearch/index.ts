@@ -1,14 +1,18 @@
-// websearch — one model-facing search tool over Exa or Tavily.
+// webSearch — one model-facing search tool over Exa or Tavily.
 //
 // WHY A FACTORY, NOT A PRESET
 // ---------------------------
-// A search tool is not like readFile: it needs a provider credential, and a
+// A search tool is not like fileRead: it needs a provider credential, and a
 // credential belongs to one harness (one process/session/tenant). Registering a
 // module singleton would mean the first key ever read is the key every harness
 // uses forever, and a preset catalogue that always advertises a network tool the
-// host cannot authenticate. `createWebsearchTool()` therefore resolves keys once,
+// host cannot authenticate. `createWebSearchTool()` therefore resolves keys once,
 // at construction — never per call — and returns either a configured tool or
 // `undefined`.
+//
+// NAMING (T14): the TOOL is `webSearch`. The harness CONFIGURATION property stays
+// `websearch` (see HarnessConfiguration), because it names the feature, not the
+// tool; renaming it would break every host's configuration for no API gain.
 //
 // Key resolution (S2)
 // -------------------
@@ -41,7 +45,7 @@
 // -------------
 // This module imports only `tool`, the types, HarnessError, and the small shared
 // request helpers. The Exa/Tavily adapters are `import()`ed inside `execute`, so
-// constructing a harness, listing tools, or calling requestTools never loads them.
+// constructing a harness, listing tools, or calling toolRequest never loads them.
 // There is no SDK dependency: both adapters use `fetch` and plain JSON.
 //
 // Cross-references:
@@ -49,17 +53,17 @@
 //   - ./exa       — Exa wire body + result mapping
 //   - ./tavily    — Tavily wire body + result mapping
 //   - ../../harness.ts — registers this tool when `websearch` is configured
-//   - ../../types      — WebsearchConfiguration / WebsearchResult
+//   - ../../types      — WebsearchConfiguration / WebSearchResult
 
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
 import type {
     Tool,
     WebsearchConfiguration,
-    WebsearchMatch,
-    WebsearchParameters,
+    WebSearchMatch,
+    WebSearchParameters,
     WebsearchProvider,
-    WebsearchResult
+    WebSearchResult
 } from '../../types';
 import {
     createRedactor,
@@ -70,7 +74,7 @@ import type { ProviderSearch } from './request';
 
 // The wire name. A harness registry key would also name it, but a configured tool
 // of this name wins (see harness.ts), so the two must agree.
-const TOOL_NAME = 'websearch';
+const TOOL_NAME = 'webSearch';
 
 // Preference order, used both for the default provider and for the description.
 // Exa is index 0, so it is chosen when both keys exist (design decision: Exa is
@@ -87,14 +91,14 @@ const ENVIRONMENT_KEYS: Record<WebsearchProvider, string> = {
 // value: these are constants, not credentials).
 const LABELS: Record<WebsearchProvider, string> = { exa: 'Exa', tavily: 'Tavily' };
 
-// The capability tags. Shared by the executable tool and by WEBSEARCH_METADATA so
+// The capability tags. Shared by the executable tool and by WEB_SEARCH_METADATA so
 // a catalogue's disabled entry advertises exactly the tags discovery would match.
 const TAGS: readonly string[] = ['web', 'search', 'internet', 'news', 'research'];
 
 // Everything a host can show about the tool without a provider key: no execute,
 // no credential, no adapter. `visibility` is always the tool() default because a
 // configured search tool is searchable, never core.
-export type WebsearchMetadata = {
+export type WebSearchMetadata = {
     name: string;
     description: string;
     tags: readonly string[];
@@ -130,7 +134,7 @@ const explicitKey = (provider: WebsearchProvider, configuration: WebsearchConfig
             value = credential();
         } catch {
             // Deliberately no cause: a getter's error may print the secret store.
-            throw new HarnessError(`Websearch provider "${provider}" apiKey getter failed.`);
+            throw new HarnessError(`webSearch provider "${provider}" apiKey getter failed.`);
         }
     } else {
         value = credential;
@@ -140,7 +144,7 @@ const explicitKey = (provider: WebsearchProvider, configuration: WebsearchConfig
 
     if (typeof value !== 'string') {
         throw new HarnessError(
-            `Websearch provider "${provider}" apiKey must be a string or a function returning one.`
+            `webSearch provider "${provider}" apiKey must be a string or a function returning one.`
         );
     }
 
@@ -182,7 +186,7 @@ const readMaxResults = (value: unknown): number => {
 
     if (typeof value !== 'number' || !Number.isFinite(value)) {
         throw new HarnessError(
-            `websearch maxResults must be a number between 1 and ${MAX_RESULTS_LIMIT}.`
+            `webSearch maxResults must be a number between 1 and ${MAX_RESULTS_LIMIT}.`
         );
     }
 
@@ -200,7 +204,7 @@ const readProvider = (
 
     if (typeof value !== 'string' || !configured.includes(value as WebsearchProvider)) {
         throw new HarnessError(
-            `websearch provider "${String(value)}" is not configured. Configured: ${configured.join(', ')}.`
+            `webSearch provider "${String(value)}" is not configured. Configured: ${configured.join(', ')}.`
         );
     }
 
@@ -208,19 +212,19 @@ const readProvider = (
 };
 
 const readInvocation = (
-    parameters: WebsearchParameters | string | undefined,
+    parameters: WebSearchParameters | string | undefined,
     configured: readonly WebsearchProvider[],
     fallback: WebsearchProvider
 ): Invocation => {
-    // Direct callers may pass the bare query (`websearch('cats')`), mirroring how
-    // readFile accepts the path string itself. A model always passes an object,
+    // Direct callers may pass the bare query (`webSearch('cats')`), mirroring how
+    // fileRead accepts the paths array itself. A model always passes an object,
     // because the schema has more than one property.
     const input = typeof parameters === 'string' ? { query: parameters } : parameters;
 
     const query = typeof input?.query === 'string' ? input.query.trim() : '';
 
     if (query.length === 0) {
-        throw new HarnessError('websearch requires a non-empty query string.');
+        throw new HarnessError('webSearch requires a non-empty query string.');
     }
 
     return {
@@ -233,7 +237,7 @@ const readInvocation = (
 // Resolve adapter on execute. A failed import is reported as a plain tool error
 // (never a stack or module path), and it is not cached, so a later call can retry
 // after a deployment that actually ships the chunk.
-const loadSearch = async (provider: WebsearchProvider): Promise<((search: ProviderSearch) => Promise<WebsearchMatch[]>)> =>
+const loadSearch = async (provider: WebsearchProvider): Promise<((search: ProviderSearch) => Promise<WebSearchMatch[]>)> =>
     provider === 'exa'
         ? (await import('./exa')).searchExa
         : (await import('./tavily')).searchTavily;
@@ -245,7 +249,7 @@ const loadSearch = async (provider: WebsearchProvider): Promise<((search: Provid
 // With no configured provider the description still names both providers (what a
 // host could enable), but the `provider` property is absent: offering a choice
 // with no legal value would be a lie.
-const metadataFor = (configured: readonly WebsearchProvider[]): WebsearchMetadata => {
+const metadataFor = (configured: readonly WebsearchProvider[]): WebSearchMetadata => {
     const offered = configured.length > 0 ? configured : PROVIDERS;
     const labels = offered.map((provider) => LABELS[provider]).join(' or ');
     const fallback = configured[0] ?? PROVIDERS[0];
@@ -286,18 +290,18 @@ const metadataFor = (configured: readonly WebsearchProvider[]): WebsearchMetadat
     };
 };
 
-// Static metadata for hosts that must advertise websearch before any provider
-// key exists (the harness app's Tools catalogue). It reads no environment, holds
-// no credential, and imports no adapter: listing it is as cheap and as safe as
+// Static metadata for hosts that must advertise webSearch before any provider key
+// exists (the harness app's Tools catalogue). It reads no environment, holds no
+// credential, and imports no adapter: listing it is as cheap and as safe as
 // listing any preset. A host pairs it with created tools only when configured.
-export const WEBSEARCH_METADATA: WebsearchMetadata = metadataFor([]);
+export const WEB_SEARCH_METADATA: WebSearchMetadata = metadataFor([]);
 
 // Build the tool for one configuration. Returns undefined when no provider has a
 // usable key: "opted in but unusable" is the same as "off", which is what keeps a
 // default harness and a keyless deployment honest.
-export const createWebsearchTool = (
+export const createWebSearchTool = (
     configuration: WebsearchConfiguration = {}
-): Tool<WebsearchParameters, WebsearchResult> | undefined => {
+): Tool<WebSearchParameters, WebSearchResult> | undefined => {
     const environment = configuration.env ?? processEnvironment();
 
     const keys: Record<WebsearchProvider, string | undefined> = {
@@ -315,7 +319,7 @@ export const createWebsearchTool = (
     // a page it quotes) could repeat the other key if the caller mixed up stores.
     const redact = createRedactor(configured.map((provider) => keys[provider] as string));
 
-    const definition = tool<WebsearchParameters, WebsearchResult>({
+    const definition = tool<WebSearchParameters, WebSearchResult>({
         ...metadataFor(configured),
         // tool() normalizes into its own array; the readonly metadata tuple is
         // copied rather than shared so a caller mutating tags cannot edit the
@@ -328,10 +332,10 @@ export const createWebsearchTool = (
             // Unreachable through readProvider, but the closure's invariant is
             // worth enforcing where the key is used rather than trusting a cast.
             if (apiKey === undefined) {
-                throw new HarnessError(`websearch provider "${invocation.provider}" is not configured.`);
+                throw new HarnessError(`webSearch provider "${invocation.provider}" is not configured.`);
             }
 
-            let results: WebsearchResult['results'];
+            let results: WebSearchResult['results'];
 
             try {
                 const search = await loadSearch(invocation.provider);
@@ -349,7 +353,7 @@ export const createWebsearchTool = (
                 throw new HarnessError(`${LABELS[invocation.provider]} search failed.`);
             }
 
-            const result: WebsearchResult = {
+            const result: WebSearchResult = {
                 provider: invocation.provider,
                 query: invocation.query,
                 maxResults: invocation.maxResults,
@@ -365,12 +369,12 @@ export const createWebsearchTool = (
 
 // The tool's wire name, exported so the harness can reserve/skip consistently
 // without duplicating a literal.
-export const WEBSEARCH_TOOL_NAME = TOOL_NAME;
+export const WEB_SEARCH_TOOL_NAME = TOOL_NAME;
 
 export type {
     WebsearchConfiguration,
-    WebsearchMatch,
-    WebsearchParameters,
+    WebSearchMatch,
+    WebSearchParameters,
     WebsearchProvider,
-    WebsearchResult
+    WebSearchResult
 } from '../../types';

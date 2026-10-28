@@ -3,11 +3,11 @@
 // WHY THIS IS SEPARATE FROM createToolCatalogue()
 // ----------------------------------------------
 // `createToolCatalogue()` (./index.ts) lists tools a host can call DIRECTLY: no
-// harness, no model, no session. The core tools are the opposite — requestTools,
-// createTool, todoTools, and delegate only mean something inside one session's
-// harness, because they mutate that harness's enabled set, registry, todo list, or
-// agent team. Adding them there would make the CLI promise a callable tool it
-// cannot run.
+// harness, no model, no session. The core tools are the opposite — toolRequest,
+// toolCreate, todoManage, and agentDelegate only mean something inside one
+// session's harness, because they mutate that harness's enabled set, registry, todo
+// list, or agent team. Adding them there would make the CLI promise a callable tool
+// it cannot run.
 //
 // The server, however, must LIST them: the UI's Tools tab shows every tool
 // (core included) for review and manual execution, and all execution happens
@@ -29,7 +29,7 @@
 //   - ../server/api.ts      — compose + session-bound call routing
 //   - ../server/sessions.ts — SessionStore.callTool → harness.executeTool
 
-import { coreToolMetadata, delegateMetadata } from '../src/core/metadata';
+import { agentDelegateMetadata, coreToolMetadata } from '../src/core/metadata';
 import type { CatalogueEntry } from './types';
 
 // The display group for the core set. A distinct group (rather than 'Harness
@@ -39,17 +39,17 @@ export const CORE_TOOL_GROUP = 'Core tools' as const;
 
 // The hint a client can print verbatim. It states the one thing that is different
 // about these entries — they need a session — without promising availability in a
-// particular session (delegate, for example, exists only where the harness allows
-// subagents).
+// particular session (agentDelegate, for example, exists only where the harness
+// allows subagents).
 export const CORE_TOOL_SESSION_HINT =
     'Runs inside a session harness: send a sessionId with the call.';
 
-// Build the four core entries. `delegate` is always listed, with generic metadata:
-// the catalogue is host-wide, while whether delegate is registered is a property
-// of the selected session's harness. A session without subagents answers a clear
-// 404 rather than inventing a subagent.
+// Build the four core entries. `agentDelegate` is always listed, with generic
+// metadata: the catalogue is host-wide, while whether agentDelegate is registered
+// is a property of the selected session's harness. A session without subagents
+// answers a clear 404 rather than inventing a subagent.
 export const createCoreToolEntries = (): CatalogueEntry[] =>
-    [...coreToolMetadata(), delegateMetadata()].map((metadata) => ({
+    [...coreToolMetadata(), agentDelegateMetadata()].map((metadata) => ({
         name: metadata.name,
         group: CORE_TOOL_GROUP,
         // No `tool`: the session's harness owns the implementation (see header).

@@ -386,28 +386,28 @@ describe('tool calls', () => {
         const module = await import('./api');
 
         // A catalogue tool keeps the pre-R8 body: no sessionId key at all.
-        expect(await module.callTool('readFile', { path: 'a.txt' })).toEqual({
+        expect(await module.callTool('fileRead', { path: 'a.txt' })).toEqual({
             ok: true,
             result: { enabled: [] },
             durationMs: 3
         });
-        await module.callTool('requestTools', { tags: ['web'] }, 'session-1');
+        await module.callTool('toolRequest', { tags: ['web'] }, 'session-1');
         // An empty id is "no session" for this purpose, not a session lookup.
-        await module.callTool('requestTools', { tags: ['web'] }, '');
+        await module.callTool('toolRequest', { tags: ['web'] }, '');
 
         expect(calls).toEqual([
             {
-                url: '/api/tools/readFile',
+                url: '/api/tools/fileRead',
                 method: 'POST',
                 body: { parameters: { path: 'a.txt' } }
             },
             {
-                url: '/api/tools/requestTools',
+                url: '/api/tools/toolRequest',
                 method: 'POST',
                 body: { parameters: { tags: ['web'] }, sessionId: 'session-1' }
             },
             {
-                url: '/api/tools/requestTools',
+                url: '/api/tools/toolRequest',
                 method: 'POST',
                 body: { parameters: { tags: ['web'] } }
             }

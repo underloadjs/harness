@@ -12,14 +12,14 @@ afterEach(() => {
 
 describe('createToolCallCard', () => {
     it('starts collapsed and reports a running state in text', () => {
-        const card = createToolCallCard('readFile', '{"path":"package.json"}');
+        const card = createToolCallCard('fileRead', '{"paths":["package.json"]}');
 
         expect(card.element.tagName).toBe('DETAILS');
         expect(card.element.open).toBe(false);
         expect(card.element.getAttribute('data-state')).toBe('running');
         expect(card.element.querySelector('.tool-state')?.textContent).toBe('running');
-        expect(card.element.querySelector('.tool-name')?.textContent).toBe('readFile');
-        expect(card.element.querySelector('.tool-peek')?.textContent).toBe('{"path":"package.json"}');
+        expect(card.element.querySelector('.tool-name')?.textContent).toBe('fileRead');
+        expect(card.element.querySelector('.tool-peek')?.textContent).toBe('{"paths":["package.json"]}');
         expect(card.element.querySelector('.tool-label')?.textContent).toBe('arguments');
         expect(card.element.querySelectorAll('.tool-label')[1]?.textContent).toBe('result · pending');
         expect(card.element.querySelector('.tool-pending')?.textContent).toBe(
@@ -29,14 +29,14 @@ describe('createToolCallCard', () => {
     });
 
     it('resolves a successful result, highlighting JSON and summarising the size', () => {
-        const card = createToolCallCard('readFile', '{"path":"package.json"}');
+        const card = createToolCallCard('fileRead', '{"paths":["package.json"]}');
         card.resolve('{"ok":true}', false);
 
         expect(card.state()).toBe('ok');
         expect(card.element.getAttribute('data-state')).toBe('ok');
         expect(card.element.querySelector('.tool-state')?.textContent).toBe('ok');
         expect(card.element.querySelector('.tool-peek')?.textContent).toBe(
-            '{"path":"package.json"} · 11 chars'
+            '{"paths":["package.json"]} · 11 chars'
         );
         expect(card.element.querySelectorAll('.tool-label')[1]?.textContent).toBe('result');
         expect(card.element.querySelector('.tool-result code')?.innerHTML).toBe(
@@ -45,7 +45,7 @@ describe('createToolCallCard', () => {
     });
 
     it('marks failures and never overwrites a settled card', () => {
-        const card = createToolCallCard('runCommand', '{"command":"false"}');
+        const card = createToolCallCard('commandRun', '{"command":"false"}');
         card.resolve('exit code 1', true);
 
         expect(card.state()).toBe('error');
@@ -63,7 +63,7 @@ describe('createToolCallCard', () => {
     });
 
     it('shows a placeholder for an empty result', () => {
-        const card = createToolCallCard('clock', '');
+        const card = createToolCallCard('timeNow', '');
         card.resolve('', false);
 
         expect(card.element.querySelector('.tool-peek')?.textContent).toBe(
@@ -77,7 +77,7 @@ describe('createToolCallCard', () => {
         vi.useFakeTimers();
         vi.setSystemTime(new Date(T));
 
-        const card = createToolCallCard('runCommand', '{"command":"slow"}', { startedAt: T });
+        const card = createToolCallCard('commandRun', '{"command":"slow"}', { startedAt: T });
         const label = card.element.querySelector<HTMLElement>('.tool-duration');
 
         expect(label?.hidden).toBe(false);
@@ -98,7 +98,7 @@ describe('createToolCallCard', () => {
     });
 
     it('uses an authoritative recorded duration when one is supplied', () => {
-        const card = createToolCallCard('readFile', '{}');
+        const card = createToolCallCard('fileRead', '{}');
         expect(card.element.querySelector<HTMLElement>('.tool-duration')?.hidden).toBe(true);
 
         card.resolve('ok', false, 1500);
@@ -112,7 +112,7 @@ describe('createToolCallCard', () => {
         vi.useFakeTimers();
         vi.setSystemTime(new Date(T));
 
-        const card = createToolCallCard('clock', '', { startedAt: T });
+        const card = createToolCallCard('timeNow', '', { startedAt: T });
         vi.advanceTimersByTime(1000);
         expect(card.element.querySelector('.tool-duration')?.textContent).toBe('1.0s');
 

@@ -1,6 +1,6 @@
-// Tool-catalogue rendering for the credential-dependent websearch entry.
+// Tool-catalogue rendering for the credential-dependent webSearch entry.
 //
-// C1 is a visibility fix: the right-rail catalogue must show websearch even when
+// C1 is a visibility fix: the right-rail catalogue must show webSearch even when
 // the server has no key, the button must say so before a click, and the runner
 // must offer the example arguments while refusing to call it. With a key, the
 // same entry is a normal callable tool. `main.ts` is imported with a stubbed
@@ -50,7 +50,7 @@ const stubFetch = (availability: unknown): void => {
                     presets: [descriptor],
                     tools: [
                         {
-                            name: 'websearch',
+                            name: 'webSearch',
                             group: 'Web search',
                             description: 'Search the web with Exa or Tavily.',
                             tags: ['web', 'search', 'internet', 'news', 'research'],
@@ -101,7 +101,7 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-it('lists an unconfigured websearch, explains it, and disables the call', async () => {
+it('lists an unconfigured webSearch, explains it, and disables the call', async () => {
     const hint =
         'Web search is not configured on this server. Set EXA_API_KEY or TAVILY_API_KEY in packages/underload/harness/.env (or the process environment) and restart the harness server.';
 
@@ -120,7 +120,7 @@ it('lists an unconfigured websearch, explains it, and disables the call', async 
     selectWebsearch();
 
     // The tool opens in the centre; the header describes it without badge clutter.
-    expect(document.querySelector('.main-title')?.textContent).toBe('websearch');
+    expect(document.querySelector('.main-title')?.textContent).toBe('webSearch');
     expect(document.querySelector('.harness-id')?.textContent).toBe('Web search');
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         'searchable · tags: web, search, internet, news, research · unconfigured'
@@ -159,7 +159,7 @@ it('enables the same entry when the server reports it configured', async () => {
 
     selectWebsearch();
 
-    expect(document.querySelector('.main-title')?.textContent).toBe('websearch');
+    expect(document.querySelector('.main-title')?.textContent).toBe('webSearch');
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         'searchable · tags: web, search, internet, news, research'
     );

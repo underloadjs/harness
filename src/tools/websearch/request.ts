@@ -1,4 +1,4 @@
-// Shared HTTP plumbing for the websearch adapters.
+// Shared HTTP plumbing for the webSearch adapters.
 //
 // WHY THIS FILE EXISTS
 // --------------------
@@ -34,7 +34,7 @@
 //   - ../../util   — HarnessError (the message the model ends up reading)
 
 import { HarnessError } from '../../util';
-import type { WebsearchMatch } from '../../types';
+import type { WebSearchMatch } from '../../types';
 
 // Default result count when the model (or a direct caller) does not ask.
 export const DEFAULT_MAX_RESULTS = 5;
@@ -88,7 +88,7 @@ export type MatchFields = {
 };
 
 // The result of reading a provider row. `read` returns untrusted raw fields; the
-// shared normalization below is what makes a WebsearchMatch safe to emit.
+// shared normalization below is what makes a WebSearchMatch safe to emit.
 export type MatchReader = (row: Record<string, unknown>) => MatchFields;
 
 // Build a redactor over every configured key. The returned function is applied to
@@ -167,8 +167,8 @@ export const normalizeMatches = (
     maxResults: number,
     redact: (text: string) => string,
     read: MatchReader
-): WebsearchMatch[] => {
-    const matches: WebsearchMatch[] = [];
+): WebSearchMatch[] => {
+    const matches: WebSearchMatch[] = [];
 
     for (const row of rows.slice(0, maxResults)) {
         if (!row || typeof row !== 'object' || Array.isArray(row)) continue;
@@ -177,7 +177,7 @@ export const normalizeMatches = (
         const url = validUrl(fields.url);
         if (url === undefined) continue;
 
-        const match: WebsearchMatch = {
+        const match: WebSearchMatch = {
             // Fall back to the URL so a result never has an empty title.
             title: redact(text(fields.title, MAX_TITLE_CHARS) || url),
             url: redact(url),

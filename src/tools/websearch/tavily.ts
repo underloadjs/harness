@@ -1,6 +1,6 @@
 // Tavily adapter.
 //
-// Loaded by `import()` from ./index on the first `websearch` call, so constructing
+// Loaded by `import()` from ./index on the first `webSearch` call, so constructing
 // a harness or listing tools never touches this module or the network.
 //
 // Wire contract (https://docs.tavily.com/documentation/api-reference/endpoint/search):
@@ -19,7 +19,7 @@
 //   - ./request   — requestSearch, normalizeMatches, the shared bounds/errors
 //   - ./index     — dispatch + key resolution
 
-import type { WebsearchMatch } from '../../types';
+import type { WebSearchMatch } from '../../types';
 import {
     excerpt,
     date,
@@ -32,7 +32,7 @@ import type { MatchFields, ProviderSearch } from './request';
 const ENDPOINT = 'https://api.tavily.com/search';
 const LABEL = 'Tavily';
 
-export const searchTavily = async (search: ProviderSearch): Promise<WebsearchMatch[]> => {
+export const searchTavily = async (search: ProviderSearch): Promise<WebSearchMatch[]> => {
     const payload = await requestSearch({
         label: LABEL,
         endpoint: ENDPOINT,

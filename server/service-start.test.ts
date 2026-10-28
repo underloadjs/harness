@@ -90,26 +90,25 @@ const PRESET_NAMES = ['instruct', 'research', 'workspace', 'demo', 'flaky'];
 // Core tools lead the catalogue (R8) in every listing surface, including the
 // bootstrap document the service loader serves at GET /v1/harness.
 const TOOL_NAMES = [
-    'requestTools',
-    'createTool',
-    'todoTools',
-    'delegate',
+    'toolRequest',
+    'toolCreate',
+    'todoManage',
+    'agentDelegate',
     'syntaxCheck',
-    'readFile',
-    'writeFile',
-    'editFile',
-    'listFiles',
-    'searchFiles',
-    'globFiles',
-    'runCommand',
+    'fileRead',
+    'fileWrite',
+    'fileEdit',
+    'fileList',
+    'fileGlob',
+    'commandRun',
     'gitDiff',
-    'clock',
-    'wordCount',
-    'roll',
-    'searchNotes',
-    'summarize',
-    'flaky',
-    'websearch'
+    'timeNow',
+    'textCount',
+    'diceRoll',
+    'noteSearch',
+    'textSummarize',
+    'testFlaky',
+    'webSearch'
 ];
 
 const parseSse = (text: string): SessionStreamItem[] => {
@@ -300,7 +299,7 @@ describeService('service endpoint discovery and canonical API', () => {
         expect(first.turn.status).toBe('running');
 
         const events = items.flatMap((item) => (item.type === 'event' ? [item.event] : []));
-        // The scripted demo always runs: requestTools, clock, answer. Asserting the
+        // The scripted demo always runs: toolRequest, clock, answer. Asserting the
         // non-delta sequence pins the frame passthrough without depending on
         // whitespace chunking.
         expect(
@@ -341,7 +340,7 @@ describeService('service endpoint discovery and canonical API', () => {
     });
 
     it('calls a tool directly and maps errors to exact statuses', async () => {
-        const clock = await fetch(`${base}/v1/harness/tools/clock`, {
+        const clock = await fetch(`${base}/v1/harness/tools/timeNow`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ parameters: 'UTC' })
@@ -404,7 +403,7 @@ describeService('service endpoint discovery and canonical API', () => {
         // `parameters` property is what keeps `clock` from running with its
         // default timezone on a request that never asked for a call.
         for (const raw of ['{', '{}']) {
-            const response = await fetch(`${base}/v1/harness/tools/clock`, {
+            const response = await fetch(`${base}/v1/harness/tools/timeNow`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: raw
@@ -422,7 +421,7 @@ describeService('service endpoint discovery and canonical API', () => {
         // An explicit empty wrapper is still a valid call. `clock` has one
         // property, so the wrapper object is the value `execute` receives — the
         // call is accepted, which is what this asserts.
-        const empty = await fetch(`${base}/v1/harness/tools/clock`, {
+        const empty = await fetch(`${base}/v1/harness/tools/timeNow`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({ parameters: {} })

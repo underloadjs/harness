@@ -70,7 +70,7 @@ describe('createTurnBoard', () => {
         turn.apply({
             type: 'tool_call',
             agent: 'writer',
-            call: { id: 'c1', name: 'readFile', arguments: '{"path":"package.json"}' }
+            call: { id: 'c1', name: 'fileRead', arguments: '{"path":"package.json"}' }
         });
 
         const tool = turn.element.querySelector('details.tool');
@@ -80,7 +80,7 @@ describe('createTurnBoard', () => {
         turn.apply({
             type: 'tool_result',
             agent: 'writer',
-            name: 'readFile',
+            name: 'fileRead',
             content: '{"ok":true}',
             isError: false
         });
@@ -92,10 +92,10 @@ describe('createTurnBoard', () => {
 
     it('labels a delegated agent as a subagent and keeps the tile open until the stream ends', () => {
         const { board } = mount();
-        const turn = board.begin('delegate');
+        const turn = board.begin('agentDelegate');
 
         turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
-        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'd1', name: 'delegate', arguments: '{}' } });
+        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'd1', name: 'agentDelegate', arguments: '{}' } });
         turn.apply({ type: 'start', agent: 'helper', model: 'm2' });
         turn.apply({ type: 'text', agent: 'helper', delta: 'done' });
 
@@ -224,8 +224,8 @@ describe('server turns', () => {
             serverTurn({
                 events: [
                     { type: 'start', agent: 'writer', model: 'm1' },
-                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'readFile', arguments: '{}' } },
-                    { type: 'tool_result', agent: 'writer', name: 'readFile', content: '{"ok":true}', isError: false },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'fileRead', arguments: '{}' } },
+                    { type: 'tool_result', agent: 'writer', name: 'fileRead', content: '{"ok":true}', isError: false },
                     { type: 'text', agent: 'writer', delta: 'recorded **prose**' },
                     { type: 'done', agent: 'writer', message: doneMessage('writer') }
                 ]
@@ -324,11 +324,11 @@ describe('server turns', () => {
             serverTurn({
                 events: [
                     { type: 'start', agent: 'writer', model: 'm1' },
-                    { type: 'tool_call', agent: 'writer', call: { id: 'd1', name: 'delegate', arguments: '{}' } },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'd1', name: 'agentDelegate', arguments: '{}' } },
                     { type: 'start', agent: 'helper', model: 'm2' },
                     { type: 'text', agent: 'helper', delta: 'delegated' },
                     { type: 'done', agent: 'helper', message: doneMessage('helper') },
-                    { type: 'tool_result', agent: 'writer', name: 'delegate', content: 'done', isError: false }
+                    { type: 'tool_result', agent: 'writer', name: 'agentDelegate', content: 'done', isError: false }
                 ]
             })
         ]);
@@ -431,11 +431,11 @@ describe('elapsed timing', () => {
                 updatedAt: T + 2200,
                 events: [
                     { type: 'start', agent: 'writer', model: 'm1' },
-                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'readFile', arguments: '{"path":"a"}' } },
-                    { type: 'tool_call', agent: 'writer', call: { id: 'c2', name: 'readFile', arguments: '{"path":"b"}' } },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'fileRead', arguments: '{"path":"a"}' } },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c2', name: 'fileRead', arguments: '{"path":"b"}' } },
                     // Results arrive out of call order; the call id is the match.
-                    { type: 'tool_result', agent: 'writer', name: 'readFile', content: 'b', isError: false, callId: 'c2' },
-                    { type: 'tool_result', agent: 'writer', name: 'readFile', content: 'a', isError: false, callId: 'c1' },
+                    { type: 'tool_result', agent: 'writer', name: 'fileRead', content: 'b', isError: false, callId: 'c2' },
+                    { type: 'tool_result', agent: 'writer', name: 'fileRead', content: 'a', isError: false, callId: 'c1' },
                     { type: 'done', agent: 'writer', message: doneMessage('writer') }
                 ],
                 eventTimes: [T, T + 100, T + 500, T + 900, T + 1500, T + 2200]
@@ -455,8 +455,8 @@ describe('elapsed timing', () => {
                 updatedAt: T + 1000,
                 events: [
                     { type: 'start', agent: 'writer', model: 'm1' },
-                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'readFile', arguments: '{}' } },
-                    { type: 'tool_result', agent: 'writer', name: 'readFile', content: 'ok', isError: false }
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'fileRead', arguments: '{}' } },
+                    { type: 'tool_result', agent: 'writer', name: 'fileRead', content: 'ok', isError: false }
                 ]
             })
         ]);
@@ -473,11 +473,11 @@ describe('elapsed timing', () => {
 
         turn.apply({ type: 'start', agent: 'writer', model: 'm1' }, T);
         turn.apply(
-            { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'readFile', arguments: '{}' } },
+            { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'fileRead', arguments: '{}' } },
             T
         );
         turn.apply(
-            { type: 'tool_result', agent: 'writer', name: 'readFile', content: 'ok', isError: false },
+            { type: 'tool_result', agent: 'writer', name: 'fileRead', content: 'ok', isError: false },
             T + 750
         );
 

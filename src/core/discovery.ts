@@ -1,9 +1,9 @@
-// Tool discovery — the ranking behind the harness's requestTools tool.
+// Tool discovery — the ranking behind the harness's toolRequest tool.
 //
 // A harness may register thousands of tools. Declaring all of them on every
 // request would spend the model's context on schemas it will never call, so only
 // core tools are declared up front and everything else waits in the catalogue.
-// requestTools is how the model asks "what do you have for X?"; this module answers
+// toolRequest is how the model asks "what do you have for X?"; this module answers
 // with the closest tag matches.
 //
 // Matching is deliberately fuzzy but ordered, because a model's tag guess is
@@ -39,7 +39,7 @@
 // Cross-references:
 //   - ../types       — ToolSearchResult, ToolMatch, ToolVisibility
 //   - ./tool         — where tags are normalized
-//   - ../harness     — requestTools, which enables the matches for the next turn
+//   - ../harness     — toolRequest, which enables the matches for the next turn
 
 import type { Tool, ToolSearchResult } from '../types';
 import { normalizeTags } from './tool';
@@ -51,12 +51,12 @@ import { normalizeTags } from './tool';
 // matches more reports the excess as the `remaining` COUNT, and the model refines
 // its tags to drill deeper — there is no pagination and no list of omitted names.
 //
-// Exported because requestTools' schema and the server's core descriptor both
+// Exported because toolRequest's schema and the server's core descriptor both
 // advertise this number; one constant keeps the promise and the behaviour equal.
 export const MAX_DISCOVERY_MATCHES = 5;
 
 // The cap and the default are the same number on purpose: a caller (or the model,
-// through requestTools' `limit`) may ask for FEWER matches, never more.
+// through toolRequest's `limit`) may ask for FEWER matches, never more.
 const MAX_MATCHES = MAX_DISCOVERY_MATCHES;
 const DEFAULT_MAX_MATCHES = MAX_DISCOVERY_MATCHES;
 
@@ -83,7 +83,7 @@ const scoreTag = (tag: string, needle: string): number => {
 // This is a MAX, not a sum. Summing made breadth additive: a tool with
 // ['files', 'file', 'filesystem'] scored 4+3+2 = 9 on the query "files" and
 // outranked the tool whose only tag was an exact ['files'] (4). The documented
-// contract (README "Ranking" row, knowledge.md requestTools section, and the
+// contract (README "Ranking" row, knowledge.md toolRequest section, and the
 // header above) is OR-style best-match — a tool's rank is its strongest single
 // tag — with breadth only breaking ties in searchTools. A name/description hit
 // is the 1-point rung of the same ladder, so it can lift a tool that has no tag
@@ -115,7 +115,7 @@ const vocabulary = (tools: readonly Tool[]): string[] => {
 };
 
 // Clamp the requested cap into [0, MAX_MATCHES]. A missing or non-finite limit
-// falls back to the documented default, so requestTools can pass whatever the model
+// falls back to the documented default, so toolRequest can pass whatever the model
 // sent without trusting it.
 const resolveLimit = (limit: number | undefined): number => {
     if (limit === undefined || !Number.isFinite(limit)) return DEFAULT_MAX_MATCHES;
@@ -128,7 +128,7 @@ const resolveLimit = (limit: number | undefined): number => {
 // catalogue themselves without building a harness. `enabled` doubles as the
 // ranking order.
 //
-// `limit` narrows the shortlist below the 5-match cap (requestTools' optional
+// `limit` narrows the shortlist below the 5-match cap (toolRequest's optional
 // `limit` argument). It can never raise it: the cap is a context guard, so a host
 // calling searchTools directly gets the same semantics as the model.
 export const searchTools = (

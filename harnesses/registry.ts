@@ -368,7 +368,7 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
             // whole catalogue is searchable and the harness core tools are
             // harness-owned.
             tools: SHARED_TOOL_NAMES,
-            environmentTools: ['websearch'],
+            environmentTools: ['webSearch'],
             // Absent vs `{}` are the same thing: no overrides. Stored as a plain
             // object so update() has one shape to reason about.
             agentModels,

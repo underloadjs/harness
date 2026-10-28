@@ -3,27 +3,34 @@
 // WHY THIS FILE EXISTS (single source of truth)
 // ---------------------------------------------
 // The core tools are built in two very different places:
-//   - src/harness.ts registers requestTools, createTool, and (when the harness has
-//     subagents) delegate on the live harness;
-//   - src/core/todo.ts builds todoTools from its factory closure.
+//   - src/harness.ts registers toolRequest, toolCreate, and (when the harness has
+//     subagents) agentDelegate on the live harness;
+//   - src/core/todo.ts builds todoManage from its factory closure.
 // A SERVER also has to *describe* those same tools without building a harness:
 // the Tools tab lists them for review and manual execution (R8), and a descriptor
 // must never advertise a name, description, tag list, or schema that the runtime
 // does not actually use. Keeping the metadata here — and having both the runtime
 // registration and the server catalogue read it — makes that drift impossible.
 //
+// NAMING (T14): every tool is `<namespace><action>` — toolRequest, toolCreate,
+// todoManage, agentDelegate — and the preset tools follow the same rule
+// (fileRead, fileWrite, fileEdit, fileList, fileGlob, commandRun, webSearch,
+// timeNow, textCount, diceRoll, noteSearch, textSummarize, testFlaky). The
+// namespace is what groups related tools in discovery; the action is what the
+// model calls. There are no compatibility aliases: the old names are gone.
+//
 // This module is deliberately data + one function: no agent, no transport, no
 // harness, so the server can import it cheaply and a descriptor stays purely
 // declarative.
 //
 // The DISCOVERY cap (R7) lives in core/discovery.ts as MAX_DISCOVERY_MATCHES; the
-// requestTools schema below imports it so the advertised maximum and the enforced
+// toolRequest schema below imports it so the advertised maximum and the enforced
 // cap are the same number.
 //
 // Cross-references:
 //   - ./discovery.ts     — MAX_DISCOVERY_MATCHES, the enforced cap
 //   - ../harness.ts      — registers these definitions as core tools
-//   - ./todo.ts          — builds todoTools from TODO_TOOLS_METADATA
+//   - ./todo.ts          — builds todoManage from TODO_MANAGE_METADATA
 //   - ../../harnesses/core.ts — server catalogue entries for the same names
 
 import type { ToolVisibility } from '../types';
@@ -32,10 +39,10 @@ import { MAX_DISCOVERY_MATCHES } from './discovery';
 // Wire names. They are part of the harness contract: a model (and an operator)
 // calls these exact strings, and the harness reserves them against every other
 // tool source.
-export const REQUEST_TOOLS_NAME = 'requestTools';
-export const CREATE_TOOL_NAME = 'createTool';
-export const TODO_TOOLS_NAME = 'todoTools';
-export const DELEGATE_TOOL_NAME = 'delegate';
+export const TOOL_REQUEST_NAME = 'toolRequest';
+export const TOOL_CREATE_NAME = 'toolCreate';
+export const TODO_MANAGE_NAME = 'todoManage';
+export const AGENT_DELEGATE_NAME = 'agentDelegate';
 
 // One core tool's declarative half: everything a request declaration or a server
 // catalogue needs, and nothing that could execute.
@@ -52,8 +59,8 @@ export type CoreToolMetadata = {
 // Discovery. The description itself carries the R7 contract — at most five
 // matches, and `remaining` as the count of further ones — because the model reads
 // the description, not this file.
-export const REQUEST_TOOLS_METADATA: CoreToolMetadata = {
-    name: REQUEST_TOOLS_NAME,
+export const TOOL_REQUEST_METADATA: CoreToolMetadata = {
+    name: TOOL_REQUEST_NAME,
     description:
         `Find tools by capability tag and enable them. The whole catalogue is searchable (including the file and command tools). Pass the tags you need (for example ["files", "read"] or ["shell"] or ["git", "diff"]) and up to ${MAX_DISCOVERY_MATCHES} of the closest matches become available on your next turn. The result's "remaining" field counts any further tools that matched but were not listed, so add a more specific tag to drill into the rest. Call this before concluding that something cannot be done.`,
     tags: ['discovery', 'tools', 'catalogue'],
@@ -80,8 +87,8 @@ export const REQUEST_TOOLS_METADATA: CoreToolMetadata = {
 
 // Runtime creation (R2b). The text is the security statement the model is given:
 // a created tool runs with the process's permissions and there is no sandbox.
-export const CREATE_TOOL_METADATA: CoreToolMetadata = {
-    name: CREATE_TOOL_NAME,
+export const TOOL_CREATE_METADATA: CoreToolMetadata = {
+    name: TOOL_CREATE_NAME,
     description:
         "Create a tool for yourself from JavaScript source. `source` is the BODY of an async function, for example `return args.toUpperCase();`: it receives `args` (the call arguments; a one-property schema passes the value itself) and `context` (agent, agents, run). Registering validates and compiles the source and enables the tool for your next turn, without running it. The body runs with this process's full permissions - there is no sandbox - so only create tools you are willing to run, and keep them small.",
     tags: ['tools', 'create', 'extension', 'dynamic'],
@@ -96,12 +103,12 @@ export const CREATE_TOOL_METADATA: CoreToolMetadata = {
             },
             description: {
                 type: 'string',
-                description: 'What the tool does, shown to requestTools and the model.'
+                description: 'What the tool does, shown to toolRequest and the model.'
             },
             tags: {
                 type: 'array',
                 items: { type: 'string' },
-                description: 'Capability tags, e.g. ["text", "upper"]. Required so requestTools can find it.'
+                description: 'Capability tags, e.g. ["text", "upper"]. Required so toolRequest can find it.'
             },
             parameters: {
                 type: 'object',
@@ -122,8 +129,8 @@ export const CREATE_TOOL_METADATA: CoreToolMetadata = {
 // description and schema are stable, so they live here with the rest. The
 // `action` enum repeats ./todo.ts's ACTIONS list (that module validates and owns
 // the order); keep the two in step when adding an action.
-export const TODO_TOOLS_METADATA: CoreToolMetadata = {
-    name: TODO_TOOLS_NAME,
+export const TODO_MANAGE_METADATA: CoreToolMetadata = {
+    name: TODO_MANAGE_NAME,
     description:
         'Manage the todo list for this harness session. Actions: "add" (requires text), "remove" (requires id), "check" (requires id; completed defaults to true, false unchecks), "uncheck" (requires id), and "list". Ids are stable strings returned by "add". The list is shared by every agent in this harness, kept across turns, and cleared by reset. Returns todos plus counts { total, completed, remaining }, and the affected todo (or removed item).',
     tags: ['todo', 'todos', 'task', 'tasks', 'checklist', 'plan'],
@@ -155,17 +162,17 @@ export const TODO_TOOLS_METADATA: CoreToolMetadata = {
     }
 };
 
-// Delegation (R4). Capability-by-configuration: the harness registers delegate
+// Delegation (R4). Capability-by-configuration: the harness registers agentDelegate
 // only when the allowlist is non-empty, so this metadata has two honest forms:
 //   - with subagents — the runtime declaration, whose `agent` enum is the exact
 //     allowlist and whose description names it;
 //   - without — a catalogue-only description (the server lists the capability and
 //     a session without subagents answers a clear 404 when it is called).
-export const delegateMetadata = (subagents: readonly string[] = []): CoreToolMetadata => {
+export const agentDelegateMetadata = (subagents: readonly string[] = []): CoreToolMetadata => {
     const listed = [...subagents];
 
     return {
-        name: DELEGATE_TOOL_NAME,
+        name: AGENT_DELEGATE_NAME,
         description:
             listed.length > 0
                 ? `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.`
@@ -196,7 +203,7 @@ export const delegateMetadata = (subagents: readonly string[] = []): CoreToolMet
 
 // The core set a harness without subagents registers: discovery, creation, todos.
 export const coreToolMetadata = (): CoreToolMetadata[] => [
-    REQUEST_TOOLS_METADATA,
-    CREATE_TOOL_METADATA,
-    TODO_TOOLS_METADATA
+    TOOL_REQUEST_METADATA,
+    TOOL_CREATE_METADATA,
+    TODO_MANAGE_METADATA
 ];

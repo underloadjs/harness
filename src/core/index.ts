@@ -2,17 +2,17 @@
 //
 //   agent()      — the brain. One turn at a time (`stream` / `turn`).
 //   tool()       — an action the model can request, and that you can call directly.
-//   searchTools() — rank a tool catalogue against capability tags (what requestTools
+//   searchTools() — rank a tool catalogue against capability tags (what toolRequest
 //                  uses). Pure, so tooling and UIs can reuse the ranking.
 //   createDynamicTool() — validate + compile a tool from an async function body.
-//                  The primitive behind the harness's createTool tool.
-//   createTodoTool() — the harness's per-session todoTools state, as a factory.
+//                  The primitive behind the harness's toolCreate tool.
+//   createTodoTool() — the harness's per-session todoManage state, as a factory.
 //                  State stays in the closure so a harness (and nothing global)
 //                  owns it. See ../core/todo.ts.
-//   coreToolMetadata()/delegateMetadata() — the CORE tools' declarative half
+//   coreToolMetadata()/agentDelegateMetadata() — the CORE tools' declarative half
 //                  (name, description, tags, schema). The runtime registration in
 //                  ../harness.ts and the server catalogue both read this copy.
-//   MAX_DISCOVERY_MATCHES — the discovery cap (R7) the requestTools schema
+//   MAX_DISCOVERY_MATCHES — the discovery cap (R7) the toolRequest schema
 //                  advertises and searchTools enforces.
 //
 // Both factories are usable on their own. An agent on its own means writing the
@@ -29,14 +29,14 @@ export { MAX_DISCOVERY_MATCHES, searchTools } from './discovery';
 export { compileToolSource, createDynamicTool } from './creation';
 export { createTodoTool } from './todo';
 export {
-    CREATE_TOOL_METADATA,
-    CREATE_TOOL_NAME,
-    DELEGATE_TOOL_NAME,
-    REQUEST_TOOLS_METADATA,
-    REQUEST_TOOLS_NAME,
-    TODO_TOOLS_METADATA,
-    TODO_TOOLS_NAME,
-    coreToolMetadata,
-    delegateMetadata
+    TOOL_CREATE_METADATA,
+    TOOL_CREATE_NAME,
+    AGENT_DELEGATE_NAME,
+    TOOL_REQUEST_METADATA,
+    TOOL_REQUEST_NAME,
+    TODO_MANAGE_METADATA,
+    TODO_MANAGE_NAME,
+    agentDelegateMetadata,
+    coreToolMetadata
 } from './metadata';
 export type { CoreToolMetadata } from './metadata';

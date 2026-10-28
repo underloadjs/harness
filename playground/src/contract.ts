@@ -24,19 +24,19 @@ import type {
 } from '../../server/protocol';
 
 // The harness core tools, in display order. R3 is explicit that this dropdown is
-// *only* the harness core set: `requestTools`/`createTool`/`todoTools` always,
-// `delegate` when the harness has a second agent to delegate to. Other tools are
-// catalogue entries, not core tools.
-export const HARNESS_CORE_TOOL_NAMES = ['requestTools', 'createTool', 'todoTools'] as const;
+// *only* the harness core set: `toolRequest`/`toolCreate`/`todoManage` always,
+// `agentDelegate` when the harness has a second agent to delegate to. Other tools
+// are catalogue entries, not core tools.
+export const HARNESS_CORE_TOOL_NAMES = ['toolRequest', 'toolCreate', 'todoManage'] as const;
 
 // One-line explanations for the core dropdown. They describe behaviour the
 // harness owns (src/harness.ts) rather than which capability exists, because the
 // catalogue below already lists every tool.
 export const HARNESS_CORE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
-    requestTools: 'Find tools by capability tag and enable them for this chat.',
-    createTool: 'Add a small session-local tool when the catalogue cannot help.',
-    todoTools: 'Keep a task list for the current work.',
-    delegate: 'Hand a self-contained task to one of this harness’s agents.'
+    toolRequest: 'Find tools by capability tag and enable them for this chat.',
+    toolCreate: 'Add a small session-local tool when the catalogue cannot help.',
+    todoManage: 'Keep a task list for the current work.',
+    agentDelegate: 'Hand a self-contained task to one of this harness’s agents.'
 };
 
 const descriptorsOf = (descriptor: HarnessDescriptor): readonly string[] =>
@@ -92,14 +92,15 @@ export const editableOf = (descriptor: HarnessDescriptor): boolean => descriptor
 
 export const builtinOf = (descriptor: HarnessDescriptor): boolean => descriptor.builtin === true;
 
-// Core tools for the dropdown, limited to the harness-owned set. `delegate` is
-// shown when the team has a second member or when the server already declares it.
+// Core tools for the dropdown, limited to the harness-owned set. `agentDelegate`
+// is shown when the team has a second member or when the server already declares
+// it.
 export const coreToolsOf = (descriptor: HarnessDescriptor, memberCount: number): string[] => {
     const declared = Array.isArray(descriptor.coreTools) ? descriptor.coreTools : undefined;
 
     return [
         ...HARNESS_CORE_TOOL_NAMES,
-        ...(memberCount > 1 || declared?.includes('delegate') === true ? ['delegate'] : [])
+        ...(memberCount > 1 || declared?.includes('agentDelegate') === true ? ['agentDelegate'] : [])
     ];
 };
 

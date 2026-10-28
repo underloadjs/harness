@@ -40,8 +40,8 @@ const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor 
         description: 'A general instruction-following agent.',
         requiresEndpoint: true,
         agents: ['instruct'],
-        tools: ['readFile'],
-        coreTools: ['requestTools', 'createTool', 'todoTools', 'readFile'],
+        tools: ['fileRead'],
+        coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'fileRead'],
         primary: 'instruct',
         subagents: [],
         builtin: true,
@@ -196,12 +196,12 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     const call = {
         type: 'tool_call' as const,
         agent: 'instruct',
-        call: { id: 'c1', name: 'readFile', arguments: '{"path":"package.json"}' }
+        call: { id: 'c1', name: 'fileRead', arguments: '{"path":"package.json"}' }
     };
     const result = {
         type: 'tool_result' as const,
         agent: 'instruct',
-        name: 'readFile',
+        name: 'fileRead',
         content: '{"ok":true}',
         isError: false,
         callId: 'c1'
@@ -275,7 +275,7 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     const core = byClass('.core-tools', 'details');
     expect(core.open).toBe(false);
     expect(document.querySelector('.core-summary')?.textContent).toBe('Core tools · 3');
-    expect(coreToolNames()).toEqual(['requestTools', 'createTool', 'todoTools']);
+    expect(coreToolNames()).toEqual(['toolRequest', 'toolCreate', 'todoManage']);
     // No badge wall in the header any more.
     expect(document.querySelector('.badges')).toBeNull();
 
@@ -313,7 +313,7 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
 
     // R4: the server's startedAt/updatedAt and eventTimes decide the labels.
     expect(tile.querySelector('.tile-elapsed')?.textContent).toBe('3.6s');
-    expect(tile.querySelector('.tool-name')?.textContent).toBe('readFile');
+    expect(tile.querySelector('.tool-name')?.textContent).toBe('fileRead');
     expect(tile.querySelector('.tool-duration')?.textContent).toBe('800ms');
     expect(tile.classList.contains('is-expanded')).toBe(true);
 
@@ -352,12 +352,12 @@ it('restores a remembered session with its frozen team and server timings', asyn
             {
                 type: 'tool_call',
                 agent: 'instruct',
-                call: { id: 'c1', name: 'readFile', arguments: '{"path":"package.json"}' }
+                call: { id: 'c1', name: 'fileRead', arguments: '{"path":"package.json"}' }
             },
             {
                 type: 'tool_result',
                 agent: 'instruct',
-                name: 'readFile',
+                name: 'fileRead',
                 content: '{"ok":true}',
                 isError: false,
                 callId: 'c1'
@@ -379,7 +379,7 @@ it('restores a remembered session with its frozen team and server timings', asyn
         updatedAt: T + 5000,
         events: [
             { type: 'start', agent: 'instruct', model: 'm1' },
-            { type: 'tool_call', agent: 'instruct', call: { id: 'c2', name: 'clock', arguments: '{}' } },
+            { type: 'tool_call', agent: 'instruct', call: { id: 'c2', name: 'timeNow', arguments: '{}' } },
             { type: 'error', agent: 'instruct', error: { message: 'provider exploded' } }
         ]
     };
@@ -426,7 +426,7 @@ it('restores a remembered session with its frozen team and server timings', asyn
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         'Viewing a saved session · agent team frozen'
     );
-    expect(coreToolNames()).toEqual(['requestTools', 'createTool', 'todoTools', 'delegate']);
+    expect(coreToolNames()).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate']);
     for (const button of document.querySelectorAll<HTMLButtonElement>('.agent-main')) {
         expect(button.disabled).toBe(true);
     }
@@ -520,7 +520,7 @@ it('creates a harness from preset agents with an initial primary', async () => {
     expect(document.querySelector('.main-title')?.textContent).toBe('Release captain');
     expect(agentNames()).toEqual(['workspace', 'summarizer']);
     expect(agentRoles()).toEqual(['primary', 'secondary']);
-    expect(coreToolNames()).toEqual(['requestTools', 'createTool', 'todoTools', 'delegate']);
+    expect(coreToolNames()).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate']);
 });
 
 it('adds a picker agent, promotes it to primary and never duplicates a member', async () => {
@@ -573,7 +573,7 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
     expect(picker.hidden).toBe(true);
     expect(agentNames()).toEqual(['instruct', 'summarizer']);
     expect(agentRoles()).toEqual(['primary', 'secondary']);
-    expect(coreToolNames()).toContain('delegate');
+    expect(coreToolNames()).toContain('agentDelegate');
 
     // Selecting a secondary demotes the old primary; the request lists it once.
     document.querySelectorAll<HTMLButtonElement>('.agent-main')[1].click();

@@ -7,8 +7,8 @@
 // exactly where silent drift is expensive.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createWebsearchTool } from '@underload/harness';
-import type { Tool, WebsearchConfiguration, WebsearchParameters, WebsearchResult } from '@underload/harness';
+import { createWebSearchTool } from '@underload/harness';
+import type { Tool, WebsearchConfiguration, WebSearchParameters, WebSearchResult } from '@underload/harness';
 import {
     MAX_RESPONSE_CHARS,
     MAX_RESULTS_LIMIT,
@@ -22,10 +22,10 @@ import {
 const configured = (
     env: Record<string, string | undefined>,
     toolConfiguration: Omit<WebsearchConfiguration, 'env'> = {}
-): Tool<WebsearchParameters, WebsearchResult> => {
-    const definition = createWebsearchTool({ env, ...toolConfiguration });
+): Tool<WebSearchParameters, WebSearchResult> => {
+    const definition = createWebSearchTool({ env, ...toolConfiguration });
 
-    if (!definition) throw new Error('Expected a configured websearch tool.');
+    if (!definition) throw new Error('Expected a configured webSearch tool.');
 
     return definition;
 };
@@ -52,14 +52,14 @@ afterEach(() => {
 
 describe('key resolution', () => {
     it('registers nothing without a key', () => {
-        expect(createWebsearchTool({ env: {} })).toBeUndefined();
-        expect(createWebsearchTool({ env: { EXA_API_KEY: '   ', TAVILY_API_KEY: '' } })).toBeUndefined();
+        expect(createWebSearchTool({ env: {} })).toBeUndefined();
+        expect(createWebSearchTool({ env: { EXA_API_KEY: '   ', TAVILY_API_KEY: '' } })).toBeUndefined();
     });
 
     it('offers only the provider that has a key', () => {
         const exa = configured({ EXA_API_KEY: 'exa-secret-key' });
 
-        expect(exa.name).toBe('websearch');
+        expect(exa.name).toBe('webSearch');
         expect(exa.visibility).toBe('searchable');
         expect(exa.tags).toEqual(['web', 'search', 'internet', 'news', 'research']);
 
@@ -94,7 +94,7 @@ describe('key resolution', () => {
     });
 
     it('treats an explicit blank key as "off", not as a fallback to env', () => {
-        expect(createWebsearchTool({ env: { EXA_API_KEY: 'env-exa-key' }, exa: { apiKey: '' } })).toBeUndefined();
+        expect(createWebSearchTool({ env: { EXA_API_KEY: 'env-exa-key' }, exa: { apiKey: '' } })).toBeUndefined();
     });
 
     it('calls a key getter once, at construction', async () => {
@@ -117,21 +117,21 @@ describe('key resolution', () => {
     });
 
     it('rejects an explicit value that is not a string or getter', () => {
-        expect(() => createWebsearchTool({ exa: { apiKey: 42 as never } })).toThrow(
-            'Websearch provider "exa" apiKey must be a string or a function returning one.'
+        expect(() => createWebSearchTool({ exa: { apiKey: 42 as never } })).toThrow(
+            'webSearch provider "exa" apiKey must be a string or a function returning one.'
         );
     });
 
     it('rejects a throwing getter without echoing its error', () => {
         expect(() =>
-            createWebsearchTool({
+            createWebSearchTool({
                 exa: {
                     apiKey: () => {
                         throw new Error('vault unavailable: sk-live-should-not-leak');
                     }
                 }
             })
-        ).toThrow('Websearch provider "exa" apiKey getter failed.');
+        ).toThrow('webSearch provider "exa" apiKey getter failed.');
     });
 
     it('keeps keys out of the schema, description, and tags', () => {
@@ -408,15 +408,15 @@ describe('validation', () => {
     it('rejects a blank or non-string query', async () => {
         const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
 
-        await expect(tool({ query: '   ' })).rejects.toThrow('websearch requires a non-empty query string.');
-        await expect(tool({ query: 42 as never })).rejects.toThrow('websearch requires a non-empty query string.');
+        await expect(tool({ query: '   ' })).rejects.toThrow('webSearch requires a non-empty query string.');
+        await expect(tool({ query: 42 as never })).rejects.toThrow('webSearch requires a non-empty query string.');
     });
 
     it('accepts a bare query string from a direct caller', async () => {
         const fetchMock = stubFetch(json({ results: [] }));
         const tool = configured({ EXA_API_KEY: 'exa-secret-key' }) as unknown as (
             parameters: string
-        ) => Promise<WebsearchResult>;
+        ) => Promise<WebSearchResult>;
 
         await tool('bare');
 
@@ -427,7 +427,7 @@ describe('validation', () => {
         const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
 
         await expect(tool({ query: 'q', maxResults: 'ten' as never })).rejects.toThrow(
-            'websearch maxResults must be a number between 1 and 20.'
+            'webSearch maxResults must be a number between 1 and 20.'
         );
     });
 
@@ -435,7 +435,7 @@ describe('validation', () => {
         const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
 
         await expect(tool({ query: 'q', provider: 'tavily' })).rejects.toThrow(
-            'websearch provider "tavily" is not configured. Configured: exa.'
+            'webSearch provider "tavily" is not configured. Configured: exa.'
         );
     });
 });

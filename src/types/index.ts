@@ -234,10 +234,10 @@ export type Agent = {
 // A large catalogue cannot be declared on every request — thousands of tools
 // would flood the context window before the first prompt. So a request declares:
 //   - every 'core' tool (keep that list tiny), and
-//   - every 'searchable' tool that requestTools has already enabled.
+//   - every 'searchable' tool that toolRequest has already enabled.
 export type ToolVisibility = 'core' | 'searchable';
 
-// One entry in a requestTools result: enough for the model to decide whether to call
+// One entry in a toolRequest result: enough for the model to decide whether to call
 // it, without shipping the whole schema again.
 export type ToolMatch = {
     name: string;
@@ -245,7 +245,7 @@ export type ToolMatch = {
     tags: string[];
 };
 
-// The result of a requestTools call, and the return value of the pure
+// The result of a toolRequest call, and the return value of the pure
 // `searchTools()` helper. Shaped as data because it travels back to the model as
 // a tool result.
 //
@@ -275,8 +275,8 @@ export type ToolSearchResult = {
     truncated?: boolean;
 };
 
-// A request to create a tool at runtime, either from the model-facing createTool
-// tool or from the host through `harness.createTool()`.
+// A request to create a tool at runtime, either from the model-facing toolCreate
+// tool or from the host through `harness.toolCreate()`.
 //
 // `source` is the BODY of an async function, compiled once at registration and
 // executed only when the model (or host) calls the tool — registering a tool
@@ -285,7 +285,7 @@ export type ToolSearchResult = {
 // ToolContext, including agent/agents/run inside a harness).
 //
 // SECURITY: compilation uses the host realm's Function constructor. A created tool
-// has exactly the permissions of the process — the same trust model as `runCommand`
+// has exactly the permissions of the process — the same trust model as `commandRun`
 // in src/tools. There is NO sandbox and NO isolation; the only guarantees are
 // bounded input validation, a bounded number of tools, and a compile error if the
 // source does not parse.
@@ -293,7 +293,7 @@ export type ToolCreation = {
     // Wire name the model calls. Must match the registry-safe pattern in
     // src/core/creation.ts and must not collide with a registered name.
     name: string;
-    // Shown to the model and used by requestTools matching.
+    // Shown to the model and used by toolRequest matching.
     description: string;
     // Capability tags. Required: an untagged creation could never be discovered.
     tags: readonly string[];
@@ -303,7 +303,7 @@ export type ToolCreation = {
     source: string;
 };
 
-// What a successful createTool call hands back to the model. Metadata only: the
+// What a successful toolCreate call hands back to the model. Metadata only: the
 // source is never echoed, so a creation round costs one short result.
 export type ToolCreationResult = {
     name: string;
@@ -311,7 +311,7 @@ export type ToolCreationResult = {
     tags: string[];
     parameters?: Record<string, unknown>;
     // A created tool is registered `searchable` and enabled at once, so the very
-    // next turn can call it without a second requestTools round.
+    // next turn can call it without a second toolRequest round.
     enabled: true;
 };
 
@@ -323,7 +323,7 @@ export type HarnessDelegationResult = {
 };
 
 // ---------------------------------------------------------------------------
-// todoTools (per-harness session todos)
+// todoManage (per-harness session todos)
 // ---------------------------------------------------------------------------
 //
 // A harness-specific incremental todo API. It is intentionally NOT OpenCode's
@@ -359,7 +359,7 @@ export type TodoCounts = {
     remaining: number;
 };
 
-// Every todoTools result is a snapshot: `todos` is always a copy of the current
+// Every todoManage result is a snapshot: `todos` is always a copy of the current
 // list, plus the affected item and/or counts. `todo` is present for add/check/
 // uncheck, `removed` for remove.
 export type TodoResult = {
@@ -380,7 +380,7 @@ export type TodoToolset = {
 // What a tool implementation is handed when the model calls it.
 //
 // The harness fields are optional because a tool can also be executed on its
-// own: `readFile('package.json')` runs the same implementation with no agent, no
+// own: `fileRead(['package.json'])` runs the same implementation with no agent, no
 // registry, and no run(). A tool that needs them must check, and the presets in
 // src/tools deliberately do not.
 export type ToolContext<TParameters = any> = {
@@ -398,17 +398,17 @@ export type ToolContext<TParameters = any> = {
 };
 
 // A tool definition. `name` is optional: inside a harness the registry key names
-// the tool, so `websearch: tool({...})` is enough.
+// the tool, so `webSearch: tool({...})` is enough.
 export type ToolConfiguration<TParameters = any, TResult = any> = {
     name?: string;
     // Shown to the model. Required — an undescribed tool is an unusable tool.
     description: string;
     // Capability tags, used by tool discovery to find close matches. Required:
-    // an untagged tool is invisible to requestTools, so it could never be found.
+    // an untagged tool is invisible to toolRequest, so it could never be found.
     // Stored trimmed, lowercased, and deduplicated.
     tags: readonly string[];
     // 'core' tools are declared on every request; 'searchable' ones (the
-    // default) stay hidden until requestTools enables them.
+    // default) stay hidden until toolRequest enables them.
     visibility?: ToolVisibility;
     // JSON Schema for the arguments. A TypeBox schema works as-is: TypeBox
     // output is plain JSON Schema.
@@ -421,9 +421,9 @@ export type ToolConfiguration<TParameters = any, TResult = any> = {
 // A tool is an executable object: it can be called directly, or registered on a
 // harness and called by the model. Both paths run the same implementation.
 //
-//     const readFile = tool<string, string>({...});
-//     await readFile('package.json');         // direct, no harness
-//     harness({ tools: { readFile } });       // the model calls it
+//     const fileRead = tool<string[], FileReadResult>({...});
+//     await fileRead(['package.json']);        // direct, no harness
+//     harness({ tools: { fileRead } });        // the model calls it
 export type Tool<TParameters = any, TResult = any> = {
     // Execute directly. The argument is the parameter value, exactly as
     // `execute` receives it.
@@ -444,12 +444,12 @@ export type Tool<TParameters = any, TResult = any> = {
 // Web search (opt-in)
 // ---------------------------------------------------------------------------
 //
-// One model-facing tool, `websearch`, backed by a hosted search API. The keys are
+// One model-facing tool, `webSearch`, backed by a hosted search API. The keys are
 // provider credentials, so they are resolved once at harness construction and
 // never appear in a tool schema, argument, result, or progress event (W3).
 //
 // Cross-references:
-//   - tools/websearch/index.ts  — createWebsearchTool, the per-harness factory
+//   - tools/websearch/index.ts  — createWebSearchTool, the per-harness factory
 //   - harness.ts                — `websearch` configuration field wiring
 export type WebsearchProvider = 'exa' | 'tavily';
 
@@ -479,7 +479,7 @@ export type WebsearchConfiguration = {
 // The model-facing argument shape. `query` is the only required property; having
 // more than one property keeps the object wrapper intact (see the single-property
 // rule in core/tool.ts), and both optional fields are validated in execute.
-export type WebsearchParameters = {
+export type WebSearchParameters = {
     query: string;
     // Requested result count. Defaults to 5 and is clamped to 1–20.
     maxResults?: number;
@@ -491,7 +491,7 @@ export type WebsearchParameters = {
 // One normalized result. Every field is present (possibly empty) so the model
 // sees a stable shape regardless of provider. `snippet` is the provider's
 // highlight/content excerpt, truncated and treated as untrusted data.
-export type WebsearchMatch = {
+export type WebSearchMatch = {
     title: string;
     url: string;
     snippet: string;
@@ -499,12 +499,12 @@ export type WebsearchMatch = {
     published?: string;
 };
 
-export type WebsearchResult = {
+export type WebSearchResult = {
     provider: WebsearchProvider;
     query: string;
     // The count actually requested from the provider, after clamping.
     maxResults: number;
-    results: WebsearchMatch[];
+    results: WebSearchMatch[];
 };
 
 // ---------------------------------------------------------------------------
@@ -543,14 +543,14 @@ export type HarnessConfiguration = {
     // Every brain the harness can run, keyed by name. The FIRST entry is the
     // entry point unless `primary` names another one: `writer(...)` runs that
     // agent, and the rest are reachable from tools through `ctx.run(name, input)`
-    // or the `delegate` tool the primary agent gets.
+    // or the `agentDelegate` tool the primary agent gets.
     agents: Record<string, Agent>;
     // Which agent the callable runs. Defaults to the first entry of `agents`, so
     // a single-agent config needs nothing. Must name a registered agent.
     primary?: string;
     // Agents the primary agent may delegate to. Defaults to every agent except
     // the primary. When the list is empty there is no delegation at all and the
-    // `delegate` tool is not registered. Subagents never receive `delegate`, so
+    // `agentDelegate` tool is not registered. Subagents never receive it, so
     // delegation is one level deep by construction.
     subagents?: readonly string[];
 
@@ -566,7 +566,7 @@ export type HarnessConfiguration = {
 
     // Every tool the harness can run. Keyed by the name the model calls. Only
     // `visibility: 'core'` tools are declared up front; the rest are found
-    // through the built-in requestTools tool and enabled for the next turn.
+    // through the built-in toolRequest tool and enabled for the next turn.
     tools?: Record<string, Tool>;
     // Preload the bundled preset catalogue (src/tools/) into the registry. True by
     // default: discovery exists so a large catalogue costs nothing until it is
@@ -574,12 +574,12 @@ export type HarnessConfiguration = {
     // a name collision.
     presets?: boolean;
     // Opt-in web search. `true` reads EXA_API_KEY / TAVILY_API_KEY from this
-    // process's environment and registers one searchable `websearch` tool; an
+    // process's environment and registers one searchable `webSearch` tool; an
     // object does the same with an injected env or explicit key overrides. Off
     // when absent or false, and absent when neither key is present — so a
     // default harness never carries a network tool it cannot use. Secrets stay in
     // the constructed tool closure: no schema value, argument, result, or event
-    // carries them. A configured tool named `websearch` wins over this field.
+    // carries them. A configured tool named `webSearch` wins over this field.
     websearch?: boolean | WebsearchConfiguration;
     // Reporting hooks. `progress` is awaited for every step, so a slow UI can
     // pace the run, and a `console.log` can just print.
@@ -604,14 +604,14 @@ export type Harness = {
     // not configured.
     readonly subagents: Readonly<Record<string, Agent>>;
     // The registered tools, keyed by the names the model calls. Includes the
-    // built-in requestTools, createTool, and todoTools entries, plus delegate when
+    // built-in toolRequest, toolCreate, and todoManage entries, plus agentDelegate when
     // there is at least one subagent.
     readonly tools: Readonly<Record<string, Tool>>;
     // Register a tool from source at runtime. This is the host-side path the
-    // model-facing createTool tool uses: same validation, same registry, same
+    // model-facing toolCreate tool uses: same validation, same registry, same
     // "searchable and enabled at once" behaviour. Throws HarnessError on invalid
     // or colliding input, so a host sees creation failures as exceptions.
-    createTool: (configuration: ToolCreation) => Tool;
+    toolCreate: (configuration: ToolCreation) => Tool;
     // Execute one registered tool by name, outside the model's discovery gate
     // (R8). This is the server/host path for an EXPLICIT user action — the CLI or
     // the UI's Tools tab — and it runs the SAME session-bound implementation the
@@ -619,16 +619,16 @@ export type Harness = {
     // mutate this harness exactly as they would during a run.
     //
     // `parameters` is the value `execute` receives, i.e. already unwrapped by the
-    // single-property rule: `executeTool('readFile', 'package.json')`, never
-    // `{ path: 'package.json' }` for a one-property schema. Same convention as the
+    // single-property rule: `executeTool('fileRead', ['package.json'])`, never
+    // `{ paths: ['package.json'] }` for a one-property schema. Same convention as the
     // tool's direct callable.
     //
     // GATING: discovery gates the MODEL, not its operator. A searchable tool that
-    // requestTools has not enabled is still runnable here; the model remains
-    // unable to call it. Reserved policy is NOT bypassed: `createTool` here goes
+    // toolRequest has not enabled is still runnable here; the model remains
+    // unable to call it. Reserved policy is NOT bypassed: `toolCreate` here goes
     // through the same validated registration path (budget, name rules,
-    // collisions, compilation), and `delegate` still requires a harness that
-    // actually registered it (no subagents means no delegate tool).
+    // collisions, compilation), and `agentDelegate` still requires a harness that
+    // actually registered it (no subagents means no agentDelegate tool).
     //
     // Throws HarnessError when the name is not registered in this harness, or
     // whatever the implementation throws; unlike the model path there is no
@@ -636,12 +636,12 @@ export type Harness = {
     executeTool: (name: string, parameters: unknown) => Promise<unknown>;
     // Names of the applied plugins, in order.
     readonly plugins: readonly string[];
-    // Names of the tools requestTools has enabled so far, in discovery order.
+    // Names of the tools toolRequest has enabled so far, in discovery order.
     // Persists for the harness's lifetime (not just one call), which is what lets a
     // later turn call a tool discovered earlier. Copied on read; `reset()` empties
     // it.
     readonly discoveredTools: string[];
-    // Reset the entry agent's conversation, forget which tools requestTools had
+    // Reset the entry agent's conversation, forget which tools toolRequest had
     // enabled, and clear the session todo list, so the next run starts from the
     // core set again. Created tools stay registered (they are part of the
     // catalogue), just not enabled.

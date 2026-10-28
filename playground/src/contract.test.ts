@@ -84,20 +84,20 @@ describe('descriptor extensions', () => {
     });
 
     it('shows only the harness core set, adding delegate when applicable', () => {
-        expect(coreToolsOf(descriptor({ coreTools: ['requestTools', 'readFile', 'createTool'] }), 1)).toEqual([
-            'requestTools',
-            'createTool',
-            'todoTools'
+        expect(coreToolsOf(descriptor({ coreTools: ['toolRequest', 'fileRead', 'toolCreate'] }), 1)).toEqual([
+            'toolRequest',
+            'toolCreate',
+            'todoManage'
         ]);
         expect(coreToolsOf(descriptor(), 2)).toEqual([
-            'requestTools',
-            'createTool',
-            'todoTools',
-            'delegate'
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'agentDelegate'
         ]);
         expect(
-            coreToolsOf(descriptor({ coreTools: ['requestTools', 'createTool', 'todoTools', 'delegate'] }), 1)
-        ).toEqual(['requestTools', 'createTool', 'todoTools', 'delegate']);
+            coreToolsOf(descriptor({ coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate'] }), 1)
+        ).toEqual(['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate']);
     });
 });
 
@@ -143,14 +143,14 @@ describe('session timings', () => {
             callIdOf({
                 type: 'tool_result',
                 agent: 'a',
-                name: 'readFile',
+                name: 'fileRead',
                 content: 'x',
                 isError: false,
                 callId: 'c1'
             } as HarnessEvent)
         ).toBe('c1');
         expect(
-            callIdOf({ type: 'tool_result', agent: 'a', name: 'readFile', content: 'x', isError: false })
+            callIdOf({ type: 'tool_result', agent: 'a', name: 'fileRead', content: 'x', isError: false })
         ).toBeUndefined();
         expect(callIdOf({ type: 'text', agent: 'a', delta: 'x' })).toBeUndefined();
     });
