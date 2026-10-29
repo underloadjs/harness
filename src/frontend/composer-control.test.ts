@@ -8,7 +8,8 @@
 //   empty + idle                    -> nothing at all
 //
 // Reset is gone; this file proves no `.run` / `.stop` / `.reset` control survives
-// outside the in-field action, and that Enter / Shift+Enter / clicking keep the
+// outside the in-field action, and that Enter (native newline) / Ctrl+Cmd+Enter
+// (send) / Shift+Alt+Enter (newline) / IME Enter (ignored) / clicking keep the
 // exact submission semantics the old buttons had.
 //
 // The field's growth math is unit-tested in ui/composer.test.ts; here the textarea's
@@ -175,10 +176,13 @@ it('paints the single in-field action for every state and never renders old cont
     const input = byClass('.composer-input', 'textarea');
     const action = byClass('.composer-action', 'button');
 
-    // R9: ONE row by default (autoGrow owns the inline height from here on), with a
-    // real accessible name rather than relying on the placeholder.
+    // R9/R2: ONE row by default (autoGrow owns the inline height from here on), with
+    // a real accessible name rather than relying on the placeholder. The compact UI
+    // deliberately carries NO placeholder: it is not a label, it disappears on the
+    // first keystroke, and its keyboard hints were guidance the composer does not need.
     expect(input.rows).toBe(1);
     expect(input.getAttribute('aria-label')).toBe('Task message');
+    expect(input.getAttribute('placeholder')).toBeNull();
 
     // R10: the action is a child of the field wrapper, which is the composer's only
     // content — no sibling action column, no Run/Stop/Reset trio.
@@ -213,7 +217,8 @@ it('paints the single in-field action for every state and never renders old cont
     expect(action.disabled).toBe(false);
     expect(action.textContent).toBe('▶');
     expect(action.getAttribute('aria-label')).toBe('Send task');
-    expect(action.title).toBe('Send (Enter)');
+    // R1: the title advertises the real shortcut — plain Enter is a newline now.
+    expect(action.title).toBe('Send (Ctrl/Cmd+Enter)');
 
     // Submit -> the field clears and the SAME control becomes STOP while pending.
     composer.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
@@ -259,7 +264,7 @@ it('paints the single in-field action for every state and never renders old cont
     expect(action.dataset.action).toBe('none');
 });
 
-it('submits on Enter and click, keeps Shift+Enter a newline, and queues while running', async () => {
+it('sends only on Ctrl/Cmd+Enter and the button, keeping Enter, Shift+Alt+Enter and IME Enter native', async () => {
     const server = stubServer();
     await mount();
 
@@ -267,8 +272,9 @@ it('submits on Enter and click, keeps Shift+Enter a newline, and queues while ru
     const input = byClass('.composer-input', 'textarea');
     const action = byClass('.composer-action', 'button');
 
-    // Enter (no shift) submits exactly like the old Run button.
-    input.value = 'first';
+    // R1: a bare Enter is a NEWLINE. Nothing is prevented (the browser inserts the
+    // line break) and nothing is POSTed; the typed text stays in the field.
+    input.value = 'first line';
     input.dispatchEvent(new Event('input', { bubbles: true }));
     const enter = new KeyboardEvent('keydown', {
         key: 'Enter',
@@ -277,16 +283,13 @@ it('submits on Enter and click, keeps Shift+Enter a newline, and queues while ru
     });
     input.dispatchEvent(enter);
     await flush();
-    await flush();
 
-    expect(enter.defaultPrevented).toBe(true);
-    expect(server.tasks).toBe(1);
-    expect(input.value).toBe('');
-    expect(action.dataset.action).toBe('stop');
+    expect(enter.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(0);
+    expect(input.value).toBe('first line');
+    expect(action.dataset.action).toBe('submit');
 
-    // Shift+Enter is a newline: nothing is prevented and nothing is submitted.
-    input.value = 'second line';
-    input.dispatchEvent(new Event('input', { bubbles: true }));
+    // Shift+Enter stays a newline: not prevented, not submitted.
     const shiftEnter = new KeyboardEvent('keydown', {
         key: 'Enter',
         shiftKey: true,
@@ -297,25 +300,108 @@ it('submits on Enter and click, keeps Shift+Enter a newline, and queues while ru
     await flush();
 
     expect(shiftEnter.defaultPrevented).toBe(false);
-    expect(server.tasks).toBe(1);
-    expect(input.value).toBe('second line');
+    expect(server.tasks).toBe(0);
+    expect(input.value).toBe('first line');
 
-    // The submit icon is live while the first task runs (R4): clicking it queues the
-    // second task through the form's own submit path.
+    // Alt+Enter is a newline too: Alt is a content modifier, not a send modifier.
+    const altEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        altKey: true,
+        bubbles: true,
+        cancelable: true
+    });
+    input.dispatchEvent(altEnter);
+    await flush();
+
+    expect(altEnter.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(0);
+    expect(input.value).toBe('first line');
+
+    // Ctrl+Enter is the explicit send shortcut: exactly one POST, field cleared, and
+    // the same control turns into stop while the first task runs.
+    const ctrlEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true
+    });
+    input.dispatchEvent(ctrlEnter);
+    await flush();
+    await flush();
+
+    expect(ctrlEnter.defaultPrevented).toBe(true);
+    expect(server.tasks).toBe(1);
+    expect(input.value).toBe('');
+    expect(action.dataset.action).toBe('stop');
+    expect(action.hidden).toBe(false);
+
+    // An IME confirmation Enter must do nothing: not prevented (the input method
+    // owns the event) and not submitted, with the half-typed text preserved.
+    input.value = 'ime text';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    const imeEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        ctrlKey: true,
+        isComposing: true,
+        bubbles: true,
+        cancelable: true
+    });
+    input.dispatchEvent(imeEnter);
+    await flush();
+
+    expect(imeEnter.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(1);
+    expect(input.value).toBe('ime text');
+
+    // Older engines only report the legacy composition marker (keyCode 229): the same
+    // guard applies, so this Enter is ignored as well.
+    const legacyImeEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        bubbles: true,
+        cancelable: true
+    });
+    Object.defineProperty(legacyImeEnter, 'keyCode', { value: 229 });
+    input.dispatchEvent(legacyImeEnter);
+    await flush();
+
+    expect(legacyImeEnter.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(1);
+    expect(input.value).toBe('ime text');
+
+    // Cmd+Enter (macOS) is the same shortcut: one more POST while the first runs, so
+    // the task queues instead of replacing (R4).
+    const metaEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        metaKey: true,
+        bubbles: true,
+        cancelable: true
+    });
+    input.dispatchEvent(metaEnter);
+    await flush();
+    await flush();
+
+    expect(metaEnter.defaultPrevented).toBe(true);
+    expect(server.tasks).toBe(2);
+    expect(input.value).toBe('');
+
+    // The submit icon is live while tasks run (R4): clicking it queues another task
+    // through the form's own submit path.
+    input.value = 'third';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
     expect(action.dataset.action).toBe('submit');
     expect(action.disabled).toBe(false);
     action.click();
     await flush();
     await flush();
 
-    expect(server.tasks).toBe(2);
+    expect(server.tasks).toBe(3);
     expect(input.value).toBe('');
     // Empty + still pending: the action is the stop X again.
     expect(action.dataset.action).toBe('stop');
     expect(action.hidden).toBe(false);
 });
 
-it('grows with its content up to the cap and shrinks back to one row after sending', async () => {
+it('caps growth at 3 text lines on a phone and 5 on desktop, scrolling past the cap', async () => {
     stubServer();
     await mount();
 
@@ -323,39 +409,75 @@ it('grows with its content up to the cap and shrinks back to one row after sendi
     const input = byClass('.composer-input', 'textarea');
 
     // jsdom has no layout: `scrollHeight` is the one metric the field reads, so the
-    // test supplies it. The cap is the same declaration the stylesheet ships.
+    // test supplies it. The cap math reads the same computed metrics a browser would,
+    // so they are pinned inline here (the .composer-input box: 20px line, 10px top +
+    // bottom padding, 1px border each side => 2px of vertical border).
     let measured = 40;
     Object.defineProperty(input, 'scrollHeight', {
         configurable: true,
         get: () => measured
     });
-    input.style.maxHeight = '200px';
+    input.style.lineHeight = '20px';
+    input.style.fontSize = '13.5px';
+    input.style.paddingTop = '10px';
+    input.style.paddingBottom = '10px';
+    input.style.borderTopWidth = '1px';
+    input.style.borderBottomWidth = '1px';
 
     // No inline height before the first keystroke: the CSS one-row default applies.
+    expect(window.innerWidth).toBe(1024);
     expect(input.style.height).toBe('');
 
     // One row -> three rows: the height follows the content exactly.
     input.value = 'one';
     input.dispatchEvent(new Event('input', { bubbles: true }));
-    expect(input.style.height).toBe('40px');
+    expect(input.style.height).toBe('42px');
 
-    measured = 120;
+    measured = 100;
     input.value = 'one\ntwo\nthree';
     input.dispatchEvent(new Event('input', { bubbles: true }));
-    expect(input.style.height).toBe('120px');
+    expect(input.style.height).toBe('102px');
+
+    // Desktop cap (R5): 5 lines * 20px + 20px padding + 2px border = 122px.
+    measured = 122;
+    input.value = 'one\ntwo\nthree\nfour\nfive';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(input.style.height).toBe('122px');
 
     // Past the cap: it clamps and the stylesheet's overflow-y takes over.
     measured = 400;
     input.value = 'one\ntwo\nthree\nfour\nfive\nsix\nseven\neight';
     input.dispatchEvent(new Event('input', { bubbles: true }));
-    expect(input.style.height).toBe('200px');
+    expect(input.style.height).toBe('122px');
+
+    // Phone (R5): the 860px breakpoint shrinks the budget to 3 lines => 3 * 20px +
+    // 20px padding + 2px border = 82px, re-measured by the same resize listener the
+    // browser fires when the viewport crosses the breakpoint.
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 600 });
+    window.dispatchEvent(new Event('resize'));
+    expect(input.style.height).toBe('82px');
+
+    measured = 60;
+    input.value = 'one\ntwo';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(input.style.height).toBe('62px');
+
+    // Back to desktop: the cap widens again without a keystroke.
+    Object.defineProperty(window, 'innerWidth', { configurable: true, value: 1440 });
+    window.dispatchEvent(new Event('resize'));
+    expect(input.style.height).toBe('62px');
+
+    measured = 400;
+    input.value = 'one\ntwo\nthree\nfour\nfive\nsix';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(input.style.height).toBe('122px');
 
     // Sending clears the text and remeasures immediately (back to one row), so the
     // empty field never keeps the tall height of the submitted draft.
     measured = 40;
     composer.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
     expect(input.value).toBe('');
-    expect(input.style.height).toBe('40px');
+    expect(input.style.height).toBe('42px');
     await flush();
     await flush();
     expect(byClass('.composer-action', 'button').dataset.action).toBe('stop');

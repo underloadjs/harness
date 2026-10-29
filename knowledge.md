@@ -163,7 +163,11 @@ src/server/
 src/frontend/
   index.ts              client barrel -> @underload/harness/frontend (no CSS, no shell)
   main.ts               app shell: imports styles.css, mounts the DOM (NOT exported)
-  vite.config.ts        Vite dev/build/preview; /api proxy to the service on :5000
+  vite.config.ts        Vite dev/build/preview; dev binds the dual-stack wildcard
+                        (localhost + LAN), /api proxy
+                        to the service on :5000; proxy stamps target origin so the
+                        service gate accepts LAN-browser traffic without CORS changes
+  vite-proxy.ts         /api route map: target, changeOrigin, target-origin header, rewrite
   api.ts                root resolution (query/injected/build/api) + fetch + SSE parser
   contract.ts           wire validation/presentation helpers
   ui/turns.ts           linear turn timeline: completed grey, active green, queued neutral;
@@ -1477,6 +1481,11 @@ as their own entries.
   `watch()`. `static.ts` serves `src/frontend/dist`; `dev.ts` is the separate
   standalone API launcher (`yarn dev:server`, static serving disabled), while
   `yarn dev:frontend` is Vite only and proxies `/api` to the service on :5000.
+  It binds the IPv6 wildcard `::` (`DEV_SERVER_HOST` in
+  `src/frontend/vite-proxy.ts`), which Node opens dual-stack, so the one listener
+  serves `localhost` (`::1`), `127.0.0.1` and the LAN IPv4 address; an IPv4-only
+  bind made Vite's printed `Local` URL false because `localhost` resolves to `::1`
+  first. Preview stays pinned to `localhost` (loopback, IPv6-only on Windows).
   Set `HARNESS_DEV_API=http://127.0.0.1:5181/api` to point that same proxy at the
   standalone launcher instead. There is no CORS in the standalone Node mode: the
   UI is same-origin in production and proxied (or service-hosted) in development.
@@ -1901,12 +1910,12 @@ yarn cli "task"           # one-shot as the live default preset (instruct)
 yarn cli --preset demo    # explicit offline scripted fixture
 yarn cli                  # interactive Instruct session
 yarn cli --serve          # explicit standalone API + built UI on :5181 (CLI opt-in)
-yarn dev:frontend         # Vite UI on :5180; /api proxies to the service on :5000
+yarn dev:frontend         # Vite UI on :5180, dual-stack wildcard (localhost + LAN); /api proxies to the service on :5000
 yarn dev:server           # separate standalone API on :5181 (no Vite/UI)
 yarn preview:frontend     # built UI on :5180, proxies /api to the service on :5000
 yarn test                 # library + server + shared tests
 yarn test:frontend        # jsdom client tests
-yarn start-service        # repo root: @underload/service host, /v1/harness on :5000
+yarn start-service        # repo root: builds UI for /harness/, serves it + /v1/harness on :5000
 ```
 
 `dev:frontend` and `dev:server` are independent launches: the first is Vite only
@@ -1916,7 +1925,13 @@ starts no UI. `HARNESS_DEV_API` (default
 be pointed at the standalone `/api` mount when that is the server being run.
 There is no generic `start`/`serve`/`server` script: normal hosting is owned by
 `@underload/service` (`yarn start-service`), and `startHarnessServer()` is an
-explicit API. `src/server/server.test.ts` drives the real HTTP server with the
+explicit API. The root launcher builds the UI with `PLAYGROUND_BASE=/harness/`
+and `VITE_HARNESS_API=/v1/harness`, then imports the service entry from the
+repository-root cwd after setting `UNDERLOAD_HARNESS_UI=1`; the service entry is
+API-only without that opt-in, so `yarn workspace @underload/service start` needs
+no UI build. The opted-in gateway serves the page at `/harness/` as well as
+`/v1/harness`, so a device on the same LAN can open `http://<LAN-IP>:5000/harness/`
+(no auth, trusted LAN only). `src/server/server.test.ts` drives the real HTTP server with the
 scripted demo: create a session, stream a task, continue it, reset it, call a tool
 directly, and check the error statuses. `src/server/service-start.test.ts` runs an
 actual `vite-node` service gateway that discovers

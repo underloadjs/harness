@@ -133,12 +133,11 @@ const panelIds = (slot: 'scratch' | 'center' | 'left'): (string | undefined)[] =
 const panelText = (slot: 'scratch' | 'center' | 'left'): (string | null)[] =>
     [...host(slot).querySelectorAll<HTMLElement>('.panel-text')].map((node) => node.textContent);
 
-const tab = (name: 'Chat' | 'Tools'): HTMLButtonElement => {
-    const found = [...document.querySelectorAll<HTMLButtonElement>('.tab')].find(
-        (candidate) => candidate.textContent === name
-    );
-    if (found === undefined) throw new Error(`missing ${name} tab`);
-    return found;
+// R3: the tools view is opened from the global topbar toggle (no tab strip).
+const openTools = (): void => {
+    const found = document.querySelector<HTMLButtonElement>('.tools-toggle');
+    if (found === null) throw new Error('missing global Tools toggle');
+    if (found.getAttribute('aria-pressed') !== 'true') found.click();
 };
 
 const ui = (panel: unknown): unknown[] => [panel];
@@ -562,10 +561,10 @@ it('routes a manual tool result to the owner captured before the call', async ()
     await flush();
     await flush();
 
-    tab('Tools').click();
+    openTools();
     await flush();
 
-    // The Tools tab still lists every tool while the scratch board is visible.
+    // The tools view still lists every tool while the scratch board is visible.
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-tab-button')].map((node) => node.dataset.tool)
     ).toEqual(['publish']);

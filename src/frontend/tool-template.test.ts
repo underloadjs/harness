@@ -216,11 +216,10 @@ const toolMounted = async (): Promise<void> => {
     await flush();
     await flush();
 
-    const toolsTab = [...document.querySelectorAll<HTMLButtonElement>('.tab')].find(
-        (candidate) => candidate.textContent === 'Tools'
-    );
-    if (toolsTab === undefined) throw new Error('missing Tools tab');
-    toolsTab.click();
+    // R3: the global topbar toggle opens the tools view; there is no tab strip.
+    const toolsToggle = document.querySelector<HTMLButtonElement>('.tools-toggle');
+    if (toolsToggle === null) throw new Error('missing global Tools toggle');
+    toolsToggle.click();
     await flush();
 };
 

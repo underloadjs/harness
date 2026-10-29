@@ -7,9 +7,25 @@
 //     duplicated slug + title pair, and no role badge. Role is conveyed by the
 //     name colour (primary green, secondary neutral, styles.css) plus the
 //     `aria-pressed` state below, so the control stays compact;
-//   - selecting any member's tile makes it primary — the row never shows two
-//     primaries, and the caller sends the complete `subagents` list with the new
-//     `primary` so a demotion cannot leave a stale duplicate behind;
+//   - the tiles form an OVERLAPPING CARD DECK: `[primary] ] ] ]`. One card is
+//     "front" (fully visible, leftmost in the fan) and every other card shows only
+//     its right-hand `--agent-deck-peek` strip, which is a dedicated
+//     `.agent-handle` button carrying the agent's name vertically. CSS does the
+//     geometry (`order: -1` + a negative left margin on the non-front tiles,
+//     styles.css `.agent-tile`), so DOM order — and therefore the listitem order
+//     `membersOf` returns — is untouched;
+//   - the FRONT card only controls what is VIEWED. Clicking an exposed
+//     strip fronts that card; it does NOT promote it and never sends a team
+//     PATCH (the caller's `onFront` is local UI state only). The front choice is
+//     seeded from `front` and reported back so a rebuild (activity frame, model
+//     PATCH) keeps the same card in front; a remembered name that is no longer a
+//     member falls back to the primary. Fronting stays available while the team is
+//     locked, because viewing a frozen agent's model is exactly when it is needed;
+//   - PROMOTION is still the tile's own `.agent-main` button: the row never shows
+//     two primaries, and the caller sends the complete `subagents` list with the
+//     new `primary` so a demotion cannot leave a stale duplicate behind. A hidden
+//     card's promotion button is out of the tab order and covered by the deck, so
+//     promoting is deliberately two steps: front the card, then press its name;
 //   - the trailing `+` opens a picker of agents the SERVER advertises. Harness
 //     creation here means choosing existing presets, never typing instructions:
 //     the instruction and guidelines are shown read-only;
@@ -32,9 +48,12 @@
 // independent of this component. The former `.agent-lock` block, `lockReason` and
 // `onNewSession` options are gone, so no caller can reintroduce the notice.
 //
-// The component is intentionally stateless: `main.ts` re-renders it from the
-// descriptor after every server-confirmed change. Only the picker's open state is
-// local, and it closes as soon as a preset is chosen.
+// The component is intentionally stateless about the TEAM: `main.ts` re-renders it
+// from the descriptor after every server-confirmed change. Only the picker's open
+// state, the R1 phone summary's open state (seeded from `expanded`, reported back
+// through `onToggle`) and the deck's FRONT card (seeded from `front`, reported back
+// through `onFront`) are local, and the two remembered states are owned by the
+// caller so a rebuild cannot reset them mid-interaction.
 //
 // Cross-references:
 //   - src/frontend/contract.ts — primary/subagents accessors
@@ -63,6 +82,22 @@ export type AgentRowOptions = {
     // Agent names whose tile should show the rotating activity ring. Read from the
     // live per-instance set, so a rebuild never loses a running agent.
     activity?: readonly string[];
+    // R1 mobile disclosure: whether the card strip starts open inside the phone
+    // summary. Omitted means collapsed, which is the phone default; the value is
+    // re-applied on every rebuild the caller triggers.
+    expanded?: boolean;
+    // R1 mobile disclosure: reports the new open state so the caller can remember it
+    // across rebuilds (main.ts keeps it in `agentsExpanded`). Optional for callers
+    // that do not re-render.
+    onToggle?: (open: boolean) => void;
+    // The member whose card is FRONT (fully visible). Omitted means the primary.
+    // This is view-only state: it never changes `primary` and never sends a PATCH.
+    // The caller re-applies it on every rebuild (main.ts `agentFront`) so an
+    // activity repaint or a model PATCH cannot yank a viewed card back.
+    front?: string;
+    // Reports the newly fronted member so the caller can remember it. Fronting a
+    // card always fires it, even while the team is locked (`editable: false`).
+    onFront?: (name: string) => void;
     onSelectPrimary: (name: string) => void;
     onAdd: (name: string) => void;
     onRemove: (name: string) => void;
@@ -240,6 +275,52 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
 
     const pickerId = `agent-picker-${++nextId}`;
 
+    // R1: one-line summary that owns the phone disclosure. The card strip is tall
+    // (name row + model select per agent) and scrolls horizontally, which costs a
+    // large slice of a 375px screen; on a phone it therefore starts behind this
+    // summary. The control is display:none outside the 860px block (styles.css), so
+    // desktop/tablet keep the always-visible cards and the add tile.
+    //
+    // The summary is a real button: its text ("Instruct · 2 agents") is the
+    // accessible name, `aria-expanded` reports the state, and `aria-controls` points
+    // at the card row it reveals.
+    const teamId = `agent-team-${++nextId}`;
+    row.id = teamId;
+
+    const teamLabel = detailsOf(options.agents, options.primary).title;
+    const summary = el('button', 'agent-summary');
+    summary.type = 'button';
+    summary.setAttribute('aria-controls', teamId);
+    summary.setAttribute('aria-expanded', options.expanded === true ? 'true' : 'false');
+    const summaryChevron = el('span', 'agent-summary-icon', '▾');
+    summaryChevron.setAttribute('aria-hidden', 'true');
+    summary.append(
+        el('span', 'agent-summary-label', teamLabel),
+        el(
+            'span',
+            'agent-summary-meta',
+            `${options.members.length} agent${options.members.length === 1 ? '' : 's'}`
+        ),
+        summaryChevron
+    );
+
+    // The wrapper carries `data-open` only while expanded; the phone stylesheet hides
+    // `.agent-row` without it. Deleting the attribute (rather than writing 'false')
+    // keeps the collapsed default free of a styleable state.
+    let expanded = options.expanded === true;
+    const paintExpanded = (): void => {
+        if (expanded) wrapper.dataset.open = 'true';
+        else delete wrapper.dataset.open;
+        summary.setAttribute('aria-expanded', expanded ? 'true' : 'false');
+    };
+    paintExpanded();
+
+    summary.addEventListener('click', () => {
+        expanded = !expanded;
+        paintExpanded();
+        options.onToggle?.(expanded);
+    });
+
     const picker = el('div', 'agent-picker');
     picker.id = pickerId;
     picker.hidden = true;
@@ -310,6 +391,110 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
     // button are siblings inside the top row.
     const active = new Set(options.activity ?? []);
 
+    // Everything the front paint needs per tile, collected while building so the
+    // paint never has to query the DOM again.
+    type DeckEntry = {
+        name: string;
+        tile: HTMLElement;
+        main: HTMLButtonElement;
+        remove: HTMLButtonElement;
+        select: HTMLSelectElement | null;
+        handle: HTMLButtonElement;
+    };
+    const deck: DeckEntry[] = [];
+
+    // -----------------------------------------------------------------------
+    // Deck front card (declared before the loop so the handle handlers close over
+    // already-initialised bindings)
+    // -----------------------------------------------------------------------
+    // Conservative resolution: an omitted (or remembered-but-removed) name falls
+    // back to the primary, so the deck always has exactly one fully visible card.
+    // This is the graceful fallback for R2's "selected member was removed" case;
+    // the caller's stale name is simply ignored and can never blank the deck.
+    let frontName =
+        options.front !== undefined && options.members.includes(options.front)
+            ? options.front
+            : options.primary;
+
+    // Paint the whole deck from `frontName`. CSS does the geometry purely from
+    // `data-front` (styles.css `.agent-tile[data-front='true']` gets `order: -1`
+    // plus the top z-index, the others get the negative left margin), which keeps
+    // DOM order — and therefore the listitem order membersOf returns — unchanged.
+    //
+    // `focusCard` is used after a handle press: that handle becomes hidden, so
+    // focus is moved INSIDE the newly fronted card instead of being dropped to
+    // <body> (which would restart the Tab sequence at the top of the page). The
+    // target has to be focusable, and not every card has an enabled control: a
+    // frozen session keeps models live but disables promotion, and a run in flight
+    // disables every card control. See the focus branch at the end for the order.
+    const paintFront = (focusCard = false): void => {
+        // Visual order = the front card first, then the rest in list order (this is
+        // exactly what `order: -1` gives the browser). Each card must paint ABOVE
+        // the card to its right, because that neighbour's body overlaps the strip
+        // this card exposes; without the rank, a later sibling would cover an
+        // earlier card's strip and clicks there would land on the neighbour's
+        // promotion button. `--agent-deck-z` carries that rank into styles.css (the
+        // only dynamic value the component styles inline).
+        const visual = [frontName, ...deck.map((entry) => entry.name).filter((name) => name !== frontName)];
+        const rank = new Map(visual.map((name, index) => [name, deck.length - index]));
+
+        for (const entry of deck) {
+            const isFront = entry.name === frontName;
+            if (isFront) entry.tile.dataset.front = 'true';
+            else delete entry.tile.dataset.front;
+            // The tile only ever carries a tabindex while it serves as the
+            // programmatic-only focus target of the front card (run in flight). Once
+            // another card is front, drop the marker so no stale focusable tile is
+            // left behind in the deck.
+            if (!isFront) entry.tile.removeAttribute('tabindex');
+            entry.tile.style.setProperty('--agent-deck-z', String(rank.get(entry.name) ?? 1));
+
+            // A card in front offers no handle (it is fully visible, so there is
+            // nothing to reveal) and owns the only tabbable controls. A hidden
+            // card keeps its controls in the DOM so promotion/removal handlers are
+            // unchanged, but takes them out of the tab order: they are covered by
+            // the front card and its strip. They are deliberately NOT
+            // `aria-hidden`: hiding them would also remove the only description of
+            // a member's model/remove control from a screen reader, and the strips
+            // already give AT a way to bring that card forward.
+            entry.handle.hidden = isFront;
+            for (const control of [entry.main, entry.remove, entry.select]) {
+                if (control === null) continue;
+                if (isFront) control.removeAttribute('tabindex');
+                else control.tabIndex = -1;
+            }
+        }
+
+        // Focus hand-over after fronting, in preference order, always landing INSIDE
+        // the fronted card and never on <body>:
+        //   1. the promotion button — the normal case (editable team); it is the
+        //      card's primary control, so Enter/Space works from there;
+        //   2. else the model select, when it is live — a frozen session disables the
+        //      team controls but NOT the model map (R2), so the card still has a real
+        //      enabled control to receive focus;
+        //   3. else the tile itself at tabindex=-1 — a run in flight disables every
+        //      card control. -1 is programmatic focus only, so it adds NO tab stop
+        //      (R3) and the tab order of the row is unchanged.
+        if (focusCard) {
+            const front = deck.find((entry) => entry.name === frontName);
+            if (front !== undefined) {
+                const liveSelect =
+                    front.select !== null && !front.select.disabled ? front.select : null;
+
+                if (!front.main.disabled) {
+                    front.tile.removeAttribute('tabindex');
+                    front.main.focus();
+                } else if (liveSelect !== null) {
+                    front.tile.removeAttribute('tabindex');
+                    liveSelect.focus();
+                } else {
+                    front.tile.tabIndex = -1;
+                    front.tile.focus();
+                }
+            }
+        }
+    };
+
     for (const name of options.members) {
         const agent = detailsOf(options.agents, name);
         const isPrimary = name === options.primary;
@@ -374,12 +559,48 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
             }
         );
 
-        tile.append(top, model);
+        // The deck's exposed right edge: the ONLY interactive part of a hidden
+        // card, so it is a dedicated button. It deliberately contains neither the
+        // remove control nor the model select (a mis-click must not delete an agent
+        // or open a native select), and it is never disabled by the team lock
+        // because viewing a frozen agent's model is exactly when it is needed (R2).
+        // styles.css positions it over the card's right `--agent-deck-peek` strip.
+        const handle = el('button', 'agent-handle');
+        handle.type = 'button';
+        handle.dataset.agent = name;
+        handle.setAttribute('aria-label', `View ${label}`);
+        handle.title = `View ${label}`;
+        handle.append(el('span', 'agent-handle-name', label));
+        handle.addEventListener('click', () => {
+            if (frontName === name) return;
+            frontName = name;
+            paintFront(true);
+            // Local UI state only: the caller remembers it for the next rebuild and
+            // must NOT turn this into a team PATCH (R2).
+            options.onFront?.(name);
+        });
+
+        tile.append(top, model, handle);
         row.append(tile);
+
+        deck.push({
+            name,
+            tile,
+            main,
+            remove,
+            // The select is the only control whose tab stop matters inside the model
+            // row; the wrapper carries no focusable element.
+            select: model.querySelector<HTMLSelectElement>('select'),
+            handle
+        });
     }
 
+    // Initial paint: the primary is front unless the caller remembered another
+    // card, and no focus is stolen on page paint.
+    paintFront();
+
     row.append(addButton);
-    wrapper.append(row, picker);
+    wrapper.append(summary, row, picker);
 
     // R7: no lock notice and no "New session" link here. A frozen team is only
     // visible through its disabled controls; the rail's own New session button

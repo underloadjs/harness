@@ -46,14 +46,12 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(selector: string, tag: K
     return found;
 };
 
-const tab = (name: 'Chat' | 'Tools'): HTMLButtonElement => {
-    const found = [...document.querySelectorAll<HTMLButtonElement>('.tab')].find(
-        (candidate) => candidate.textContent === name
-    );
-    if (found === undefined) throw new Error(`missing ${name} tab`);
-    return found;
+// R3: the tools view is opened from the global topbar toggle (no tab strip).
+const openTools = (): void => {
+    const found = document.querySelector<HTMLButtonElement>('.tools-toggle');
+    if (found === null) throw new Error('missing global Tools toggle');
+    if (found.getAttribute('aria-pressed') !== 'true') found.click();
 };
-
 const calls: Call[] = [];
 
 beforeEach(() => {
@@ -121,7 +119,7 @@ it('offers the paths array as the example and sends it unwrapped', async () => {
     await flush();
     await flush();
 
-    tab('Tools').click();
+    openTools();
     await flush();
 
     document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="fileList"]')?.click();

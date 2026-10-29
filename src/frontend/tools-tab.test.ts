@@ -1,13 +1,19 @@
-// Tools tab: every bootstrap tool (core included) is listed and callable, and a
-// core call runs on the server inside the selected session.
+// Tools view (global): every bootstrap tool (core included) is listed and callable,
+// and a core call runs on the server inside the selected session.
 //
-// R21.2 acceptance this file also pins: the Tools tab is the ONLY tool listing —
+// R21.2 acceptance this file also pins: the tools view is the ONLY tool listing —
 // the right rail no longer drops a catalogue or core-tools disclosure — and the
 // enabled-for-session status lives here (`.tools-session-note`).
 //
+// R3 acceptance this file pins:
+//   - there is NO tab strip: no `.tabs`, no tablist/tab/tabpanel and no
+//     `aria-labelledby` pointing at a removed tab;
+//   - the topbar's icon-only Tools toggle is the single global control that opens
+//     the same catalogue + runner view, and it reports its state with
+//     `aria-pressed` while `aria-controls` names the centre region;
+//
 // R8 acceptance this file pins:
-//   - the Tools tab exists as an accessible tablist and lists core tools as well
-//     as catalogue tools;
+//   - the tools view lists core tools as well as catalogue tools;
 //   - a session-bound core call sends the captured sessionId and no browser eval
 //     is involved — the only effects are fetch requests;
 //   - the session is created for the selected harness when none exists;
@@ -112,12 +118,17 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(selector: string, tag: K
     return found;
 };
 
-const tab = (name: 'Chat' | 'Tools'): HTMLButtonElement => {
-    const found = [...document.querySelectorAll<HTMLButtonElement>('.tab')].find(
-        (candidate) => candidate.textContent === name
-    );
-    if (found === undefined) throw new Error(`missing ${name} tab`);
+// R3: the centre has no tab strip. Tools is a GLOBAL icon-only toggle in the topbar
+// that opens the same catalogue + runner view; these helpers drive it by its
+// accessible name rather than by a tab role.
+const toolsToggle = (): HTMLButtonElement => {
+    const found = document.querySelector<HTMLButtonElement>('.tools-toggle');
+    if (found === null) throw new Error('missing global Tools toggle');
     return found;
+};
+
+const openTools = (): void => {
+    if (toolsToggle().getAttribute('aria-pressed') !== 'true') toolsToggle().click();
 };
 
 beforeEach(() => {
@@ -130,7 +141,7 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-it('lists core tools on the Tools tab, calls with the captured session and refreshes the snapshot', async () => {
+it('lists core tools in the global tools view, calls with the captured session and refreshes the snapshot', async () => {
     const calls: Call[] = [];
 
     vi.stubGlobal(
@@ -179,23 +190,32 @@ it('lists core tools on the Tools tab, calls with the captured session and refre
     await flush();
     await flush();
 
-    // A real tablist, and the only tool listing (R21.2).
-    const tabs = byClass('.tabs', 'div');
+    // No tab strip at all (R3), and the only tool listing (R21.2).
     expect(document.querySelector('.rail-right .tool-list')).toBeNull();
     expect(document.querySelector('.rail-right .core-tools')).toBeNull();
-    expect(tabs.getAttribute('role')).toBe('tablist');
-    expect([...document.querySelectorAll<HTMLElement>('.tab')].map((node) => node.textContent)).toEqual([
-        'Chat',
-        'Tools'
-    ]);
-    expect(tab('Chat').getAttribute('aria-selected')).toBe('true');
+    expect(document.querySelector('.tabs')).toBeNull();
+    expect(document.querySelector('[role="tablist"]')).toBeNull();
+    expect(document.querySelector('[role="tab"]')).toBeNull();
+    expect(document.querySelector('[role="tabpanel"]')).toBeNull();
+    expect(document.querySelector('[aria-labelledby^="harness-tab"]')).toBeNull();
 
-    tab('Tools').click();
+    // The global control is an icon-only toggle with an accessible name: no visible
+    // text, one decorative glyph, `aria-pressed` reporting the closed view, and
+    // `aria-controls` naming the centre region it replaces.
+    const toggle = toolsToggle();
+    expect(toggle.type).toBe('button');
+    expect(toggle.getAttribute('aria-label')).toBe('Tools');
+    expect(toggle.textContent).toBe('⚒');
+    expect(toggle.querySelector('[aria-hidden="true"]')?.textContent).toBe('⚒');
+    expect(toggle.getAttribute('aria-controls')).toBe('harness-stage');
+    expect(toggle.getAttribute('aria-pressed')).toBe('false');
+    expect(byClass('.stage', 'div').id).toBe('harness-stage');
+
+    openTools();
     await flush();
 
-    expect(tab('Chat').getAttribute('aria-selected')).toBe('false');
-    expect(tab('Tools').getAttribute('aria-selected')).toBe('true');
-    expect(byClass('.stage', 'div').getAttribute('aria-labelledby')).toBe('harness-tab-tools');
+    expect(toggle.getAttribute('aria-pressed')).toBe('true');
+    expect(byClass('.stage', 'div').querySelector('.tools-pane')).not.toBeNull();
 
     // EVERY bootstrap tool is listed, core tools included, in server group order.
     expect([...document.querySelectorAll<HTMLElement>('.tool-tab-group')].map((node) => node.textContent)).toEqual(
@@ -244,8 +264,8 @@ it('lists core tools on the Tools tab, calls with the captured session and refre
         '1 tool enabled; 2 more tools match. Refine the tags to see them.'
     );
 
-    // The post-call snapshot refresh surfaced the discovery on the Tools tab, while
-    // the Tools tab still owns the centre (R21.2: this replaced the removed
+    // The post-call snapshot refresh surfaced the discovery in the tools view, while
+    // the tools view still owns the centre (R21.2: this replaced the removed
     // right-rail core dropdown).
     expect(calls.filter((call) => call.url === '/api/sessions/s1')).toHaveLength(1);
     expect(byClass('.tools-session-note', 'p').textContent).toBe(
@@ -299,7 +319,7 @@ it('shows a server request failure for a core call instead of pretending it ran'
     await flush();
     await flush();
 
-    tab('Tools').click();
+    openTools();
     await flush();
 
     byClass('.tool-args', 'textarea').value = '{"tags":["web"]}';
@@ -355,7 +375,7 @@ it('fills the delegation example from the selected team, not a hard-coded agent'
     await flush();
     await flush();
 
-    tab('Tools').click();
+    openTools();
     await flush();
     document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="agentDelegate"]')?.click();
 
@@ -394,7 +414,7 @@ it('reports delegation as unavailable when the selected harness has no subagents
     await flush();
     await flush();
 
-    tab('Tools').click();
+    openTools();
     await flush();
 
     // The catalogue is host-wide, but the tab says when the tool is actually

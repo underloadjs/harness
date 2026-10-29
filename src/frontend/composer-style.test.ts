@@ -98,6 +98,11 @@ it('makes the chat field one row by default, auto-grown and scrolling at the cap
     // The script measures the content; a manual handle would fight it.
     expect(field).toContain('resize: none');
     expect(field).not.toContain('resize: vertical');
+    // R5: the cap is a LINE budget owned by the script (3 lines phone / 5 desktop,
+    // computed from the live line-height). A fixed stylesheet box here would clip the
+    // fifth line at large fonts or zoom, so the chat field must not re-impose one.
+    expect(field).toContain('max-height: none');
+    expect(field).not.toContain('max-height: 200px');
     // Past the cap the field scrolls instead of growing without bound.
     expect(field).toContain('overflow-y: auto');
 });

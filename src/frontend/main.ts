@@ -18,16 +18,17 @@
 //   - left rail  — harnesses (built-ins and user-created) plus the create form,
 //                  the `left` tool-panel host, and a collapsed endpoint/model
 //                  panel at the bottom;
-//   - centre     — a Chat/Tools tablist. Chat shows the selected harness title,
-//                  its agent row (with a per-agent model dropdown), the `center`
-//                  tool-panel host, the transcript and the composer. Tools is the
-//                  full-width list of EVERY server tool — core entries included —
-//                  plus the manual runner; the tool list lives ONLY there;
+//   - centre     — the selected harness title, its agent row (with a per-agent
+//                  model dropdown), the `center` tool-panel host, the transcript
+//                  and the composer. The GLOBAL tools view (the full-width list of
+//                  EVERY server tool — core entries included — plus the manual
+//                  runner) replaces this column when the topbar's icon-only Tools
+//                  toggle is pressed; there is no tab strip (R3);
 //   - right rail — the tool-contributed SCRATCH BOARD (primary panel host) and,
 //                  below it, the sessions for the selected harness only.
 //
 // R21.2 removed the right rail's core-tools dropdown and tool catalogue. They
-// duplicated the Tools tab, which is now the single place to review and call
+// duplicated the tools view, which is now the single place to review and call
 // tools; enabled-for-session status moved next to that list (`.tools-session-note`)
 // instead of floating on the board.
 //
@@ -115,7 +116,7 @@ import {
 } from './contract';
 import { createCreateHarnessPanel } from './ui/create-harness';
 import { createAgentRow } from './ui/agents';
-import { composerActionOf, composerFieldHeight } from './ui/composer';
+import { composerActionOf, composerFieldHeight, composerMaxHeight } from './ui/composer';
 import { applyActivity, activityOfTurns, paintActivity } from './ui/activity';
 import { highlightCode, looksLikeJson, prettyJson } from './ui/markdown';
 import { applyPanels, createPanelHost, mediaOfTurns } from './ui/panels';
@@ -973,30 +974,72 @@ statusDot.setAttribute('aria-hidden', 'true');
 const statusText = el('span', 'status-text', 'idle');
 statusPill.append(statusDot, statusText);
 
-// Mobile rail toggles (R1). Below 860px both rails are collapsed by default, so the
-// topbar carries one independent disclosure per rail. On every wider layout the
+// R3: Tools is a GLOBAL icon-only toggle in the top-right corner, not a centre tab.
+// It opens the same full-width catalogue + manual runner in `stage`; the harness
+// head, agent strip and composer are hidden while it is open (`setToolsView`).
+//
+// The glyph is decoration (`aria-hidden`), the accessible name is `aria-label`, and
+// `aria-pressed` reports whether the tools view is showing, so the button is a real
+// toggle for assistive tech rather than an unexplained icon.
+const toolsToggle = el('button', 'tools-toggle');
+toolsToggle.type = 'button';
+toolsToggle.id = 'tools-toggle';
+toolsToggle.setAttribute('aria-label', 'Tools');
+toolsToggle.setAttribute('aria-controls', 'harness-stage');
+toolsToggle.setAttribute('aria-pressed', 'false');
+toolsToggle.title = 'Show or hide the tool catalogue';
+// There is no catalogue to show until boot answers, and opening the view would
+// replace the startup pane with "no tools". `paintControls` enables it once boot
+// has reached a selected harness (the same pass that enables the rail actions).
+toolsToggle.disabled = true;
+const toolsGlyph = el('span', 'tools-toggle-icon', '⚒');
+toolsGlyph.setAttribute('aria-hidden', 'true');
+toolsToggle.append(toolsGlyph);
+
+// The right cluster keeps the live status pill and the Tools toggle together at the
+// top-right on every width. `.rail-toggles` keeps `margin-left: auto`, so on a phone
+// the two rail icons sit immediately left of this cluster instead of between it and
+// the brand.
+const topbarRight = el('div', 'topbar-right');
+topbarRight.append(statusPill, toolsToggle);
+
+// Mobile rail toggles (R1/R4). Below 860px both rails are collapsed by default, so
+// the topbar carries one independent disclosure per rail. On every wider layout the
 // rails are permanently visible and `.rail-toggles` is `display:none` (styles.css),
 // which is why the state below is inert there — it only drives the phone layout.
+//
+// R4: both are ICON-ONLY. The glyph is decorative (`aria-hidden`); the accessible
+// name is the `aria-label` below, so a screen reader still announces which rail the
+// button opens and the `title` explains the action on hover.
 //
 // One rail at a time: the two toggles are siblings, not a segmented control, but
 // `setRailOpen` closes the other side because two open rails would leave no room
 // for the chat on a phone.
 const railToggles = el('div', 'rail-toggles');
-const leftRailToggle = el('button', 'button small rail-toggle rail-toggle-left', 'Harnesses');
+
+const railIcon = (glyph: string): HTMLSpanElement => {
+    const icon = el('span', 'rail-toggle-icon', glyph);
+    icon.setAttribute('aria-hidden', 'true');
+    return icon;
+};
+
+const leftRailToggle = el('button', 'button small rail-toggle rail-toggle-left');
 leftRailToggle.type = 'button';
 leftRailToggle.setAttribute('aria-controls', 'rail-left');
 leftRailToggle.setAttribute('aria-expanded', 'false');
 leftRailToggle.setAttribute('aria-label', 'Harnesses panel');
 leftRailToggle.title = 'Show or hide the harnesses rail';
-const rightRailToggle = el('button', 'button small rail-toggle rail-toggle-right', 'Sessions');
+leftRailToggle.append(railIcon('☰'));
+const rightRailToggle = el('button', 'button small rail-toggle rail-toggle-right');
 rightRailToggle.type = 'button';
 rightRailToggle.setAttribute('aria-controls', 'rail-right');
 rightRailToggle.setAttribute('aria-expanded', 'false');
 rightRailToggle.setAttribute('aria-label', 'Scratch board and sessions panel');
 rightRailToggle.title = 'Show or hide the scratch board and sessions rail';
+rightRailToggle.append(railIcon('▤'));
 railToggles.append(leftRailToggle, rightRailToggle);
 
-topbar.append(brand, railToggles, statusPill);
+topbar.append(brand, railToggles, topbarRight);
 
 const shell = el('div', 'shell');
 
@@ -1280,56 +1323,61 @@ endpoint.append(endpointBody);
 // answers, so the dropdown must show it rather than an empty control.
 renderModelOptions();
 
-// --- centre: view tabs, harness head, agent row, transcript, composer ------
+// --- centre: harness head, agent row, transcript, composer ------------------
 const center = el('main', 'center');
 
-// Chat / Tools are real tabs (role="tablist"), not a mode switch hidden in the
-// catalogue: the user asked for an obvious Tools tab, and it has to be reachable
-// without discovering the right rail. One panel (`stage`) is shared because both
-// views replace the same centre column; `aria-labelledby` names whichever tab is
-// selected.
-const tabs = el('div', 'tabs');
-tabs.setAttribute('role', 'tablist');
-tabs.setAttribute('aria-label', 'Harness views');
-
-const chatTab = el('button', 'tab', 'Chat');
-chatTab.type = 'button';
-chatTab.id = 'harness-tab-chat';
-chatTab.setAttribute('role', 'tab');
-chatTab.setAttribute('aria-selected', 'true');
-chatTab.setAttribute('aria-controls', 'harness-tabpanel');
-chatTab.tabIndex = 0;
-
-const toolsTab = el('button', 'tab', 'Tools');
-toolsTab.type = 'button';
-toolsTab.id = 'harness-tab-tools';
-toolsTab.setAttribute('role', 'tab');
-toolsTab.setAttribute('aria-selected', 'false');
-toolsTab.setAttribute('aria-controls', 'harness-tabpanel');
-toolsTab.tabIndex = -1;
-
-tabs.append(chatTab, toolsTab);
-
+// R1: the harness head is a single title line; its detail note lives behind this
+// small disclosure. The button is `display:none` above the 860px breakpoint
+// (styles.css), where the note is always visible, so the desktop header keeps its
+// exact previous shape.
+//
+// F3: the SAME header band also shows the selected tool's name/group/meta while the
+// tools view is open, so the accessible name must not claim "harness": "Details"
+// describes either content, and the title says what the press does.
+//
+// The open state lives on the header element (`data-expanded`) rather than in a
+// module variable: the header is built once and `renderHarnessChrome` only rewrites
+// the text inside it, so there is no rebuild that could lose it.
 const mainHead = el('header', 'harness-head');
 const titleRow = el('div', 'harness-title-row');
 const headTitle = el('h1', 'main-title', '');
 const headName = el('span', 'harness-id', '');
-titleRow.append(headTitle, headName);
 const headNote = el('p', 'harness-note', '');
+headNote.id = 'harness-note';
+
+const headDisclosure = el('button', 'harness-disclosure');
+headDisclosure.type = 'button';
+headDisclosure.setAttribute('aria-controls', 'harness-note');
+headDisclosure.setAttribute('aria-expanded', 'false');
+headDisclosure.setAttribute('aria-label', 'Details');
+headDisclosure.title = 'Show or hide details';
+const headChevron = el('span', 'harness-disclosure-icon', '▾');
+headChevron.setAttribute('aria-hidden', 'true');
+headDisclosure.append(headChevron);
+headDisclosure.addEventListener('click', () => {
+    const open = mainHead.dataset.expanded !== 'true';
+    mainHead.dataset.expanded = open ? 'true' : 'false';
+    headDisclosure.setAttribute('aria-expanded', open ? 'true' : 'false');
+});
+
+titleRow.append(headTitle, headName, headDisclosure);
 mainHead.append(titleRow, headNote);
 
 const agentSlot = el('div', 'agent-slot');
 
+// `stage` is the single centre surface: the transcript, the global tools view or a
+// status pane. It is NOT a tab panel (R3): the topbar Tools toggle points at it with
+// `aria-controls`, and nothing claims a tab/tabpanel relationship.
 const stage = el('div', 'stage');
-stage.id = 'harness-tabpanel';
-stage.setAttribute('role', 'tabpanel');
-stage.setAttribute('aria-labelledby', 'harness-tab-chat');
+stage.id = 'harness-stage';
 
-// Composer (R9/R10): ONE input field with ONE action inside it.
+// Composer (R9/R10 + R5): ONE input field with ONE action inside it.
 //
 //   - The textarea starts at a single row (`rows = 1`) and grows with its content
-//     up to the stylesheet cap, then scrolls. `autoGrow` below is the only writer
-//     of its inline height; the cap comes from `.composer-field .composer-input`.
+//     up to a line cap, then scrolls: 3 text lines on a phone viewport (<=860px) and
+//     5 on desktop. `autoGrow` below is the only writer of its inline height and
+//     derives the cap from the live computed line-height/padding/borders, so the cap
+//     is measured in readable lines rather than a fixed pixel box.
 //   - The action button is positioned inside the box, bottom-right, and keeps that
 //     spot in every state (styles.css `.composer-action`). Its meaning follows the
 //     state matrix in `ui/composer.ts`:
@@ -1339,17 +1387,20 @@ stage.setAttribute('aria-labelledby', 'harness-tab-chat');
 //         empty + idle           -> no control at all
 //   - Reset is gone (R10). Starting over is the Sessions rail's New session; the
 //     server still owns POST /sessions/:id/reset for other clients (untouched).
+//   - Keyboard (R1): Enter inserts a newline like any textarea; Ctrl/Cmd+Enter is
+//     the shortcut that sends, and the in-field button stays the primary send path.
+//     See the `keydown` listener below the submit wiring for the full matrix.
 const composer = el('form', 'composer');
 // The field is the positioning context for the action, so the button travels with
 // the box as it grows instead of sitting in a separate column.
 const composerField = el('div', 'composer-field');
 const input = el('textarea', 'input composer-input');
 input.rows = 1;
-// R9 accessibility: the field has a real accessible name, not just a placeholder
-// (placeholders disappear on input and are not a label). The action button's name is
-// painted per state in `paintComposer`.
+// R9/R2 accessibility: the field has a real accessible name. There is deliberately
+// NO placeholder: it is not a label, it vanishes as soon as the reader types, and
+// its keyboard hints were guidance the compact composer does not need. The empty
+// field still starts at one row and `autoGrow` keeps the multiline behaviour.
 input.setAttribute('aria-label', 'Task message');
-input.placeholder = 'Ask the harness something…  (Enter to run, Shift+Enter for a newline)';
 input.spellcheck = false;
 
 // One button, switched by state — never two visible controls. It starts hidden
@@ -1361,10 +1412,11 @@ actionButton.hidden = true;
 composerField.append(input, actionButton);
 composer.append(composerField);
 
-// R9: grow/shrink the field with its content. The inline height is cleared FIRST so
-// a deleted line measures the smaller content honestly; `composerFieldHeight` adds
-// the border back (border-box) and clamps to the CSS cap. jsdom has no layout
-// (scrollHeight === 0), so the stylesheet's one-row height is left in place there.
+// R9/R5: grow/shrink the field with its content. The inline height is cleared FIRST
+// so a deleted line measures the smaller content honestly; `composerFieldHeight` adds
+// the border back (border-box) and clamps to the LINE cap computed here (3 text lines
+// on a phone viewport, 5 on desktop), not to a fixed stylesheet box. jsdom has no
+// layout (scrollHeight === 0), so the stylesheet's one-row height is left in place.
 const autoGrow = (): void => {
     input.style.height = 'auto';
 
@@ -1372,11 +1424,18 @@ const autoGrow = (): void => {
     const borders =
         (Number.parseFloat(styles.borderTopWidth) || 0) +
         (Number.parseFloat(styles.borderBottomWidth) || 0);
-    const height = composerFieldHeight(
-        input.scrollHeight,
-        borders,
-        Number.parseFloat(styles.maxHeight)
-    );
+    // R5: read the cap from the LIVE computed metrics every time, so a resize across
+    // the 860px breakpoint, a zoom change or a restyled font is honoured without a
+    // keystroke. `window.innerWidth` is the same viewport width CSS media queries use.
+    const maxHeight = composerMaxHeight({
+        viewportWidth: window.innerWidth,
+        lineHeight: styles.lineHeight,
+        fontSize: styles.fontSize,
+        paddingTop: styles.paddingTop,
+        paddingBottom: styles.paddingBottom,
+        borders
+    });
+    const height = composerFieldHeight(input.scrollHeight, borders, maxHeight);
 
     input.style.height = height > 0 ? `${height}px` : '';
 };
@@ -1386,9 +1445,9 @@ const autoGrow = (): void => {
 //
 // Labels/titles are the accessible names (the glyph is decorative): the button is a
 // real <button>, so both pointer and keyboard activate it. In submit mode it is the
-// form's submit button, which keeps Enter and click on the exact same path as before
-// this change (R10: queuing behavior untouched). In stop mode it is a plain button
-// wired to `stopRun`.
+// form's submit button, so clicking it and pressing Ctrl/Cmd+Enter share one path
+// (R10: queuing behavior untouched); a bare Enter stays a native newline (see the
+// keydown contract below). In stop mode it is a plain button wired to `stopRun`.
 const paintComposer = (): void => {
     const pending = running || current?.pending === true;
     const action = composerActionOf(input.value, pending);
@@ -1409,7 +1468,9 @@ const paintComposer = (): void => {
 
     actionButton.textContent = '▶';
     actionButton.setAttribute('aria-label', 'Send task');
-    actionButton.title = 'Send (Enter)';
+    // The title must state the real shortcut (R1): Enter is a newline now, so the
+    // only keyboard send is Ctrl+Enter (Cmd+Enter on macOS).
+    actionButton.title = 'Send (Ctrl/Cmd+Enter)';
 };
 
 // Typing is the only thing that changes the action outside a paintControls pass:
@@ -1419,8 +1480,9 @@ input.addEventListener('input', () => {
     paintComposer();
 });
 
-// R9 responsive: a layout reflow (phone rail opening, window resize, rotation) changes
-// the wrap width without a keystroke, so the last inline height would clip the text.
+// R9/R5 responsive: a layout reflow (phone rail opening, window resize, rotation)
+// changes the wrap width — and possibly the cap itself when the 860px breakpoint is
+// crossed — without a keystroke, so the last inline height would clip the text.
 // Re-measure; the browser resizes the element before this listener runs.
 window.addEventListener('resize', () => {
     autoGrow();
@@ -1437,7 +1499,7 @@ const centerPanels = createPanelHost('center');
 // The left host is appended with the create-harness panel below (harness list →
 // panels → endpoint), which is the requested "below harnesses, above endpoint".
 const leftPanels = createPanelHost('left');
-center.append(tabs, mainHead, agentSlot, centerPanels.element, stage, composer);
+center.append(mainHead, agentSlot, centerPanels.element, stage, composer);
 
 // --- right rail: scratch board (primary panel host), then sessions ----------
 const rightRail = el('aside', 'rail rail-right');
@@ -1556,7 +1618,7 @@ type Instance = {
     // choice and the tile label a saved chat shows (R18 never renders "inherit").
     sessionModel?: string;
     // Tools toolRequest enabled for this session (SessionSnapshot.discoveredTools),
-    // shown on the Tools tab's session note (R21.2 — there is no core dropdown any
+    // shown on the tools view's session note (R21.2 — there is no core dropdown any
     // more). Refreshed by the snapshot a core call triggers.
     discovered?: readonly string[];
     // Per-instance live activity set for the tile rings. Never a module global:
@@ -1592,12 +1654,26 @@ let presetDescriptors: readonly HarnessDescriptor[] = [];
 let agentLibrary: readonly AgentDescriptor[] = [];
 let sessions: SessionSnapshot[] = [];
 let currentTool: ToolDescriptor | undefined;
-// The complete server catalogue (core entries included) for the Tools tab — the
-// ONLY tool listing after R21.2. Boot replaces it from the bootstrap document.
+// The complete server catalogue (core entries included) for the global tools view —
+// the ONLY tool listing after R21.2. Boot replaces it from the bootstrap document.
 let toolEntries: readonly ToolDescriptor[] = [];
-// Which centre view is showing. The Tools tab is not the catalogue: it is a
-// full-width, keyed list of every tool plus the manual runner.
-let activeTab: 'chat' | 'tools' = 'chat';
+// Which centre view is showing: the chat (transcript + composer) or the GLOBAL tools
+// view (catalogue + manual runner). There is no tab strip (R3); the topbar's
+// icon-only Tools toggle drives this through `setToolsView`.
+let showingTools = false;
+// R1 mobile disclosure state for the agent strip. `renderAgents` rebuilds the DOM on
+// every paint (activity frames, model PATCHes, busy changes), so the open/closed
+// choice has to live out here or it would reset mid-interaction. It is CSS-inert on
+// desktop/tablet, where the card row is always visible.
+let agentsExpanded = false;
+// Which agent tile is FRONT (fully visible) in the overlapping card deck (R2). Same
+// reason as `agentsExpanded`: the row is rebuilt constantly, so the viewed card has
+// to be remembered here or an activity frame would flip the deck back. This is
+// VIEW state only — it is deliberately not `selectedName`/`primaryOf`, never sent to
+// the server, and fronting a card never PATCHes the team. `undefined` means "front
+// the primary"; a name that is no longer a member is dropped on the next render so
+// removing the viewed agent falls back to the primary instead of blanking the deck.
+let agentFront: string | undefined;
 
 // Single-flight submit state (R4). `running` means the selected session has work
 // the server has not finished; it drives the composer's stop state and the harness
@@ -1735,16 +1811,15 @@ const replaceDescriptor = (updated: HarnessDescriptor): void => {
 
 const harnessButtons = new Map<string, HTMLButtonElement>();
 
-// Tab visuals only. Content switching lives in `setTab` (declared with the tool
-// runner, because it needs `toolEntries`), so this is safe to call from selection
-// and busy-state code without re-entering the runner.
-const paintTabs = (): void => {
-    const chat = activeTab === 'chat';
-    chatTab.setAttribute('aria-selected', chat ? 'true' : 'false');
-    toolsTab.setAttribute('aria-selected', chat ? 'false' : 'true');
-    chatTab.tabIndex = chat ? 0 : -1;
-    toolsTab.tabIndex = chat ? -1 : 0;
-    stage.setAttribute('aria-labelledby', chat ? 'harness-tab-chat' : 'harness-tab-tools');
+// Toggle visuals only. Content switching lives in `setToolsView` (declared with the
+// tool runner, because it needs `toolEntries`), so this is safe to call from
+// selection and busy-state code without re-entering the runner.
+//
+// R3: there is no tab/tablist anywhere. The only visible state is the topbar
+// toggle's pressed flag; the stage is a plain region and its accessible name comes
+// from the heading inside it (the harness title or the selected tool's name).
+const paintToolsToggle = (): void => {
+    toolsToggle.setAttribute('aria-pressed', showingTools ? 'true' : 'false');
 };
 
 // Remove every activity ring. Called on terminal frames, cancel, delete, new
@@ -1799,10 +1874,16 @@ const selectHarness = (name: string): void => {
     stopWatching();
     stopPolling();
 
-    // Switching harness leaves the Tools tab and drops every ring: the activity
-    // belonged to the view being left.
-    activeTab = 'chat';
-    paintTabs();
+    // Switching harness closes the global tools view and drops every ring: the
+    // activity belonged to the view being left. The mobile agent disclosure also
+    // starts collapsed for the new team (R1 default).
+    showingTools = false;
+    paintToolsToggle();
+    agentsExpanded = false;
+    // The deck's front card belonged to the team being left; the new team starts
+    // with its own primary in front (the deck's own fallback does the same, this
+    // just keeps the remembered state honest).
+    agentFront = undefined;
     clearActivity();
 
     selectedName = descriptor.name;
@@ -1877,13 +1958,13 @@ const renderHarnessChrome = (): void => {
 
     const display = instance.frozen ?? instance.descriptor;
 
-    // The Tools tab's session line always describes the SELECTED harness (R21.2):
-    // the tab is where tools are reviewed and called, and a snapshot refreshed by a
+    // The tools view's session line always describes the SELECTED harness (R21.2):
+    // the view is where tools are reviewed and called, and a snapshot refreshed by a
     // manual core call must update "enabled for this session" there. The right rail
     // no longer renders any tool list.
     renderToolsSession(display, instance.sessionId, instance.discovered);
 
-    // The manual runner lives on the Tools tab and shows an agentDelegate example
+    // The manual runner lives on the tools view and shows an agentDelegate example
     // built from the selected team (see createToolRunner.paintDelegate). A team edit
     // lands here, so re-sync it: the example becomes callable the moment a subagent
     // exists, and stops being offered when the last one is removed. The runner
@@ -1970,6 +2051,12 @@ const renderAgents = (instance: Instance): HTMLElement => {
           '')
         : defaultSessionModel();
 
+    // R2 deck: prune the remembered front card against the CURRENT team before it
+    // is handed down. Removing (or promoting away) the viewed agent therefore falls
+    // back to the primary on this render, and a name that later reappears is not a
+    // ghost selection. `members` order is the server's, primary first.
+    if (agentFront !== undefined && !members.includes(agentFront)) agentFront = undefined;
+
     return createAgentRow({
         members,
         primary: primaryOf(display),
@@ -1991,6 +2078,21 @@ const renderAgents = (instance: Instance): HTMLElement => {
             onChange: (name, model) => void setAgentModel(name, model)
         },
         activity: [...instance.activity],
+        // R1: the phone disclosure state is owned here (module-level) because this
+        // row is rebuilt on every paint; the callback writes the reader's choice
+        // back so a rebuild (an activity frame, a model PATCH) keeps the cards open.
+        expanded: agentsExpanded,
+        onToggle: (open) => {
+            agentsExpanded = open;
+        },
+        // R2: the front card is remembered here for the same reason. It is pruned
+        // against the CURRENT team first, so removing the viewed agent drops the
+        // name on this very render and the deck falls back to the primary instead
+        // of keeping a stale module value. Fronting never PATCHes.
+        ...(agentFront !== undefined ? { front: agentFront } : {}),
+        onFront: (name) => {
+            agentFront = name;
+        },
         onSelectPrimary: (name) => void selectPrimary(name),
         onAdd: (name) => void addAgent(name),
         onRemove: (name) => void removeAgent(name)
@@ -2219,10 +2321,10 @@ const removeAgent = async (name: string): Promise<void> => {
     await patchAgents(nextPrimary, remaining);
 };
 
-// R21.2: the tool catalogue is the Tools tab and nothing else. This line is the
-// tab's informational session status (the one piece the removed right-rail core
-// dropdown actually carried that is still worth showing): which harness/session a
-// session-bound call will mutate, and which tools toolRequest enabled there.
+// R21.2: the tool catalogue is the global tools view and nothing else. This line is
+// that view's informational session status (the one piece the removed right-rail
+// core dropdown actually carried that is still worth showing): which harness/session
+// a session-bound call will mutate, and which tools toolRequest enabled there.
 //
 // It is updated from the SELECTED instance on every chrome rebuild, so a manual
 // core call's snapshot refresh keeps it truthful without a reload.
@@ -2244,7 +2346,7 @@ const renderToolsSession = (
 };
 
 // ---------------------------------------------------------------------------
-// Tools tab: the complete catalogue and the manual runner (centre)
+// Tools view: the complete catalogue and the manual runner (centre column)
 // ---------------------------------------------------------------------------
 //
 // R21.2: this is the ONLY tool listing. The right rail used to duplicate it (a
@@ -2275,10 +2377,10 @@ const selectTool = (entry: ToolDescriptor): void => {
     stopPolling();
 
     currentTool = entry;
-    // Selecting a tool switches to the Tools tab: that is the only tool listing
-    // now (R21.2), so the full catalogue and the runner are always in view together.
-    activeTab = 'tools';
-    paintTabs();
+    // Selecting a tool opens the GLOBAL tools view: that is the only tool listing
+    // (R21.2), so the full catalogue and the runner are always in view together.
+    showingTools = true;
+    paintToolsToggle();
 
     for (const [name, button] of toolTabButtons) {
         button.setAttribute('aria-pressed', name === entry.name ? 'true' : 'false');
@@ -2308,15 +2410,17 @@ const selectTool = (entry: ToolDescriptor): void => {
     setStatus('idle');
 };
 
-// Switch between the chat and the Tools tab. The panel (`stage`) is shared; the
-// rest of the centre chrome (head, agent row, composer) is shown or hidden to
-// match. A run in flight keeps the tabs locked, exactly like harness switching.
-const setTab = (tab: 'chat' | 'tools'): void => {
-    if (running || activeTab === tab) return;
+// Open or close the GLOBAL tools view (R3). One function for both directions: the
+// topbar icon toggle calls it, selecting a tool opens it, and harness selection
+// closes it. The panel (`stage`) is shared; the rest of the centre chrome (head,
+// agent row, composer) is shown or hidden to match. A run in flight keeps the view
+// locked, exactly as the removed tabs were.
+const setToolsView = (open: boolean): void => {
+    if (running || showingTools === open) return;
 
-    if (tab === 'chat') {
-        activeTab = 'chat';
-        paintTabs();
+    if (!open) {
+        showingTools = false;
+        paintToolsToggle();
 
         currentTool = undefined;
         for (const button of toolTabButtons.values()) button.setAttribute('aria-pressed', 'false');
@@ -2334,13 +2438,13 @@ const setTab = (tab: 'chat' | 'tools'): void => {
         return;
     }
 
-    // Tools tab with nothing chosen yet: open the first entry (core tools are
-    // listed first by the server) so the tab is never an empty shell. An empty
+    // Tools view with nothing chosen yet: open the first entry (core tools are
+    // listed first by the server) so the view is never an empty shell. An empty
     // catalogue explains itself instead.
     const entry = currentTool ?? toolEntries[0];
     if (entry === undefined) {
-        activeTab = 'tools';
-        paintTabs();
+        showingTools = true;
+        paintToolsToggle();
         currentTool = undefined;
         agentSlot.hidden = true;
         composer.hidden = true;
@@ -2360,10 +2464,14 @@ const setTab = (tab: 'chat' | 'tools'): void => {
     selectTool(entry);
 };
 
-chatTab.addEventListener('click', () => setTab('chat'));
-toolsTab.addEventListener('click', () => setTab('tools'));
+// The topbar icon is a real toggle: pressing it while the tools view is showing
+// closes it and returns to the selected chat. It is disabled while a run is pending
+// (paintControls), so this handler never has to fight a streaming queue.
+toolsToggle.addEventListener('click', () => {
+    setToolsView(!showingTools);
+});
 
-// Full-width Tools tab listing: the single catalogue (R21.2). Every entry is a
+// Full-width tools view listing: the single catalogue (R21.2). Every entry is a
 // keyed button with enough room to show what it is and whether a session is needed.
 // Group headings come from the server order, core entries included.
 const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
@@ -2409,9 +2517,9 @@ const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
     }
 };
 
-// Boot entry for the catalogue. R21.2: the Tools tab is the sole listing, so this
-// only caches the entries (for `setTab`) and rebuilds that list — no right-rail
-// duplicate to keep in sync any more.
+// Boot entry for the catalogue. R21.2: the tools view is the sole listing, so this
+// only caches the entries (for `setToolsView`) and rebuilds that list — no
+// right-rail duplicate to keep in sync any more.
 const buildTools = (entries: readonly ToolDescriptor[]): void => {
     toolEntries = entries;
     buildToolsTab(entries);
@@ -3329,8 +3437,8 @@ const newSession = (): void => {
 //   - The composer switches to its STOP action whenever work is pending, including
 //     a session observed after a reload (Stop then cancels ALL explicitly via
 //     cancelSession(id, true)).
-//   - New session/harness switching/tabs stay locked while pending, because they
-//     would tear down the view of a queue that is still running. Reset is gone
+//   - New session/harness switching/the tools view stay locked while pending, because
+//     they would tear down the view of a queue that is still running. Reset is gone
 //     (R10), so there is no third composer control to paint.
 const paintControls = (): void => {
     const pending = running || current?.pending === true;
@@ -3347,8 +3455,10 @@ const paintControls = (): void => {
     // simply unsubscribed and reopened when the reader returns.
     for (const button of harnessButtons.values()) button.disabled = submitting || !booted;
     for (const button of toolTabButtons.values()) button.disabled = submitting || pending;
-    chatTab.disabled = submitting || pending;
-    toolsTab.disabled = submitting || pending;
+    // R3: the global tools toggle is locked while a run is pending, like the tabs it
+    // replaced; leaving the transcript of a streaming queue is not offered. It is also
+    // locked before boot has a catalogue (`booted`) and after `showOffline` disables it.
+    toolsToggle.disabled = submitting || pending || !booted;
     for (const row of sessionList.querySelectorAll<HTMLButtonElement>('.session')) {
         row.disabled = submitting;
     }
@@ -3545,13 +3655,32 @@ composer.addEventListener('submit', (event) => {
     void run();
 });
 
+// Keyboard contract (R1). The send button is the primary path; the keyboard only
+// mirrors it:
+//   Enter              -> native newline. NEVER prevented and NEVER submits, so the
+//                         textarea behaves like any other multiline field.
+//   Shift+Enter        -> native newline (unchanged).
+//   Alt+Enter          -> native newline (also unchanged: Alt is a content modifier).
+//   Ctrl+Enter, Cmd+Enter -> explicit send shortcut. The ONLY keyboard submit path.
+//   IME composition    -> ignored entirely: the Enter that confirms a candidate
+//                         belongs to the input method, so it must not submit and must
+//                         not be prevented (`isComposing`, plus keyCode 229 for older
+//                         engines that only report the legacy marker).
+// Both the shortcut and the button run through the form's own `submit` path, so
+// queueing while a run is in flight (R4) stays identical.
 input.addEventListener('keydown', (event) => {
-    // Enter submits, Shift+Enter inserts a newline. `isComposing` keeps an IME's
-    // confirmation Enter from submitting half-typed text (it is not typing yet).
-    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
-        event.preventDefault();
-        void run();
-    }
+    if (event.key !== 'Enter') return;
+
+    // IME guard first: no composition Enter may reach the send logic at all.
+    if (event.isComposing || event.keyCode === 229) return;
+
+    // Send only on Ctrl/Cmd. Shift or Alt alongside it is still a newline request
+    // (content modifiers win), and a bare Enter is left to the browser.
+    const sending = (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey;
+    if (!sending) return;
+
+    event.preventDefault();
+    void run();
 });
 
 // Stop is explicit and TOTAL (R4): `{ all: true }` makes the server abort the
@@ -3587,10 +3716,10 @@ const stopRun = (): void => {
         });
 };
 
-// R10: one action, two roles. Submit mode is the form's own submit button (Enter and
-// pointer take the existing run() path, queueing included); only stop mode needs a
-// direct listener. The state check makes a late click after the queue drained a
-// no-op instead of a stale cancel.
+// R10: one action, two roles. Submit mode is the form's own submit button (pointer and
+// the Ctrl/Cmd+Enter shortcut take the existing run() path, queueing included); only
+// stop mode needs a direct listener. The state check makes a late click after the
+// queue drained a no-op instead of a stale cancel.
 actionButton.addEventListener('click', (event) => {
     if (actionButton.dataset.action !== 'stop') return;
 
@@ -3730,9 +3859,8 @@ const showOffline = (message: string): void => {
     pane.append(wrap);
     stage.replaceChildren(pane);
 
-    // No catalogue, no tab switch: the only useful action is Retry.
-    chatTab.disabled = true;
-    toolsTab.disabled = true;
+    // No catalogue, no tools view: the only useful action is Retry.
+    toolsToggle.disabled = true;
 
     if (presetDescriptors.length === 0) {
         harnessList.replaceChildren(el('p', 'field-hint', 'No server connection.'));

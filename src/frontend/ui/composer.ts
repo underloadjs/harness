@@ -6,8 +6,12 @@
 //   - which SINGLE in-field action exists: submit, stop, or none at all;
 //   - how tall the auto-grown field is: one row minimum, capped, scroll past the cap.
 //
-// The cap is read from styles.css `.composer-field .composer-input` (max-height) at
-// call time, so the two files cannot drift into different limits.
+// R5 moves the cap from a fixed stylesheet pixel box to a TEXT-LINE budget: 3 lines
+// on a phone viewport and 5 on desktop. It is derived from the field's live computed
+// line-height/padding/borders at call time (main.ts autoGrow), so a zoomed or
+// restyled field still caps at the same number of readable lines. styles.css
+// `.composer-field .composer-input` therefore sets `max-height: none`: the script is
+// the only cap writer and a stale pixel box must not clip the last line.
 
 // The three states of the single action button. There is deliberately no fourth
 // state: Reset is gone (R10) and Run/Stop are never both visible.
@@ -54,4 +58,78 @@ export const composerFieldHeight = (
     const wanted = scrollHeight + (borders > 0 ? borders : 0);
 
     return maxHeight > 0 ? Math.min(wanted, maxHeight) : wanted;
+};
+
+// Phone/desktop split for the line cap. 860px is the SAME breakpoint the shell's
+// layout media query uses (styles.css `@media (max-width: 860px)`), so the composer
+// switches cap and layout together instead of at a second, drifting threshold.
+export const COMPOSER_MOBILE_WIDTH = 860;
+
+// `window.innerWidth` is what CSS media queries match against (viewport width), so
+// this stays consistent with COMPOSER_MOBILE_WIDTH. A non-finite width (detached
+// node, exotic embed) falls back to the roomier desktop cap rather than a 3-line
+// phone cap that would clip a desktop draft.
+export const composerMaxLines = (viewportWidth: number): number =>
+    Number.isFinite(viewportWidth) && viewportWidth <= COMPOSER_MOBILE_WIDTH ? 3 : 5;
+
+// Values from `.composer-input` in styles.css, used ONLY when the browser reports
+// something unparseable (no layout yet, `line-height: normal`, detached node).
+// jsdom reports exactly those (`normal` / `medium`), so tests that do not stub the
+// metrics still get a stable, intentional cap instead of NaN.
+export const COMPOSER_FONT_SIZE_FALLBACK = 13.5;
+export const COMPOSER_LINE_HEIGHT_RATIO = 1.45;
+
+// Normalize one computed-style metric (`"10px"`, `"normal"`, `"medium"`, number).
+// Anything non-finite or negative reads as 0, the same convention composerFieldHeight
+// uses for an unreadable border width.
+const composerMetric = (value: string | number): number => {
+    const parsed = typeof value === 'number' ? value : Number.parseFloat(value);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
+};
+
+// Resolve one LINE BOX height in px. A unitless `line-height` is already resolved to
+// px by getComputedStyle in a real browser; `"normal"` is not, so it falls back to the
+// stylesheet's own font-size * 1.45 (13.5px * 1.45 = 19.575px) rather than inventing a
+// new ratio. Numeric inputs are accepted so callers/tests can pass raw metrics.
+export const composerLineHeight = (
+    lineHeight: string | number,
+    fontSize: string | number
+): number => {
+    const explicit = composerMetric(lineHeight);
+    if (explicit > 0) return explicit;
+
+    const size = composerMetric(fontSize);
+
+    return (size > 0 ? size : COMPOSER_FONT_SIZE_FALLBACK) * COMPOSER_LINE_HEIGHT_RATIO;
+};
+
+// The metrics autoGrow reads off the live element before asking for the cap.
+export type ComposerHeightMetrics = {
+    // Viewport width in CSS px (window.innerWidth); selects 3 vs 5 lines.
+    viewportWidth: number;
+    // `getComputedStyle(input).lineHeight` / `.fontSize`.
+    lineHeight: string | number;
+    fontSize: string | number;
+    // `getComputedStyle(input).paddingTop` / `.paddingBottom` (border-box padding).
+    paddingTop: string | number;
+    paddingBottom: string | number;
+    // Vertical border widths ALREADY summed by the caller (same value it hands to
+    // composerFieldHeight), so the border is counted exactly once overall.
+    borders: number;
+};
+
+// Cap in px for a line budget: the text lines themselves PLUS the field's real
+// padding and borders, i.e. the outer height of N readable lines in a border-box
+// textarea. `Math.ceil` keeps a fractional line-height (19.575px) from clipping the
+// bottom pixel row of the last line; it can reveal at most 1px of the next line but
+// never cuts text. `overflow-y: auto` in styles.css turns anything past it into a
+// scroll, which is the requested "grow until the cap, then scroll".
+export const composerMaxHeight = (metrics: ComposerHeightMetrics): number => {
+    const content = composerMaxLines(metrics.viewportWidth) * composerLineHeight(
+        metrics.lineHeight,
+        metrics.fontSize
+    );
+    const padding = composerMetric(metrics.paddingTop) + composerMetric(metrics.paddingBottom);
+
+    return Math.ceil(content + padding + composerMetric(metrics.borders));
 };

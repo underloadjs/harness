@@ -96,6 +96,70 @@ button {
     font-size: 14px;
 }
 
+/* Right cluster: the app status pill plus the GLOBAL Tools toggle (R3). It is the
+   last topbar child, so the tools icon always sits at the top-right corner. */
+.topbar-right {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    /* F1: the cluster must be able to GIVE room back. With `flex: 0 0 auto` the pill's
+       percentage max-width resolved against this shrink-to-fit wrapper, so the pill
+       kept its own min-content width, the wrapper kept its full width, and the topbar
+       scrolled sideways at 320/375px with a long error status (and clipped "idle" on
+       desktop). `min-width: 0` lets the pill itself be the thing that shrinks. */
+    flex: 0 1 auto;
+    min-width: 0;
+}
+
+/* The global Tools toggle (R3). Scoped to its own class on purpose: the create-harness
+   form's close button already owns `.icon-button` (see `.create-head` rules below with
+   `border: 0; padding: 0 6px; font-size: 16px`), and a generic rule here would both
+   lose the cascade for this button and silently restyle that close control. */
+.tools-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.tools-toggle:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+/* `aria-pressed` is the only selection signal; border + background + colour carry it
+   so the open view is visible without relying on colour alone. */
+.tools-toggle[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--bg-elevated);
+    color: var(--text);
+}
+
+.tools-toggle:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.tools-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.tools-toggle-icon {
+    font-size: 15px;
+    line-height: 1;
+}
+
 /* The pill is the app's request-lifecycle indicator. Colour is never the only
    signal: the text states the phase, and a pulsing dot (motion, then also text)
    marks work in flight. */
@@ -114,6 +178,15 @@ button {
     white-space: nowrap;
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+/* F1: no percentage cap inside the topbar cluster. A percentage here resolves against
+   `.topbar-right`, whose width is shrink-to-fit, which kept the pill at its content
+   width and pushed the topbar past the viewport when the server reported a long error
+   (e.g. "session list: HTTP 404 Not Found"). The pill now sizes to its content and is
+   the flex item that shrinks; `.status-text` (below) ellipsizes. */
+.topbar-right .status {
+    max-width: none;
 }
 
 .status-dot {
@@ -180,8 +253,22 @@ button {
 }
 
 .rail-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    padding: 0;
     font-family: var(--mono);
-    font-size: 11px;
+    font-size: 14px;
+    line-height: 1;
+}
+
+/* R4: the phone rail toggles are icon-only, so the glyph carries the whole visual
+   footprint. It is decorative; the button's aria-label names the rail. */
+.rail-toggle-icon {
+    font-size: 14px;
+    line-height: 1;
 }
 
 /* Dismiss layer for an expanded phone rail. Never rendered above the phone
@@ -500,49 +587,11 @@ button {
     min-height: 0;
 }
 
-/* Chat / Tools tabs. Accessible role="tablist"; the selected tab is also the
-   panel's aria-labelledby. Text and border carry selection, not colour alone. */
-.tabs {
-    display: flex;
-    flex: 0 0 auto;
-    gap: 4px;
-    padding: 6px 14px 0;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg-bar);
-}
-
-.tab {
-    padding: 6px 14px;
-    border: 1px solid transparent;
-    border-bottom: 0;
-    border-radius: 8px 8px 0 0;
-    background: transparent;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 11.5px;
-    letter-spacing: 0.04em;
-    cursor: pointer;
-}
-
-.tab:hover:not(:disabled) {
-    color: var(--text);
-}
-
-.tab[aria-selected='true'] {
-    border-color: var(--border-strong);
-    background: var(--bg-elevated);
-    color: var(--text);
-}
-
-.tab:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-}
-
-/* Tools tab ------------------------------------------------------------- */
+/* Global tools view ---------------------------------------------------- */
 /* Full-width, keyed list of every server tool (core entries included) above the
    manual runner. After R21.2 this is the ONLY catalogue: the right rail no longer
-   duplicates it, and a call always executes on the server. */
+   duplicates it, and a call always executes on the server. The view replaces the
+   centre column when the topbar's icon-only Tools toggle is pressed (R3). */
 
 .tools-pane {
     gap: 12px;
@@ -694,6 +743,45 @@ button {
     font-size: 12px;
 }
 
+/* R1: phone-only harness-head disclosure. It is hidden outside the 860px block,
+   where the note is always visible and the header keeps its desktop shape. */
+.harness-disclosure {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    margin-left: auto;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 10px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.harness-disclosure:hover {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+.harness-disclosure:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* The chevron turns over when the note is open (attribute set in main.ts). */
+.harness-disclosure-icon {
+    transition: transform 120ms ease;
+}
+
+.harness-head[data-expanded='true'] .harness-disclosure-icon {
+    transform: rotate(180deg);
+}
+
 /* Agent row ------------------------------------------------------------ */
 
 .agent-slot {
@@ -710,10 +798,80 @@ button {
     margin: 0 auto;
 }
 
+/* R1: phone-only summary that owns the agent-strip disclosure. Hidden outside the
+   860px block, so desktop/tablet show the cards exactly as before. Its label is the
+   primary's title and its state is `aria-expanded` (ui/agents.ts). */
+.agent-summary {
+    display: none;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+    padding: 5px 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-elevated);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.agent-summary:hover {
+    border-color: var(--accent);
+}
+
+.agent-summary:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.agent-summary-label {
+    overflow: hidden;
+    color: var(--text);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.agent-summary-meta {
+    flex: 0 0 auto;
+    margin-left: auto;
+    font-size: 10.5px;
+}
+
+.agent-summary-icon {
+    flex: 0 0 auto;
+    font-size: 10px;
+    line-height: 1;
+    transition: transform 120ms ease;
+}
+
+.agent-row-wrap[data-open='true'] .agent-summary-icon {
+    transform: rotate(180deg);
+}
+
+/* Agent deck (R2) ---------------------------------------------------------- */
+/* The team is an overlapping card deck: ONE fully visible front card at the left
+   and every other card showing only its right-hand strip, i.e. `[primary] ] ] ]`.
+
+   The geometry is purely CSS:
+     - `--agent-deck-width` fixes each card so the exposed strip is predictable;
+     - the front card gets `order: -1` so it is VISUALLY first without touching DOM
+       order (the listitem order, and every querySelector order tests rely on, stays
+       the server's);
+     - each non-front card is pulled left by `width - peek + gap`, so exactly
+       `--agent-deck-peek` of its right edge stays visible and each strip sits on
+       top of the previous card's body (`.agent-handle` occupies that strip).
+
+   Ordinary teams are therefore `200px + peek` per extra agent instead of a full
+   card each; `overflow-x: auto` stays as the fallback for extreme team sizes. */
 .agent-row {
+    --agent-deck-width: 200px;
+    --agent-deck-peek: 52px;
+    --agent-deck-gap: 6px;
     display: flex;
     align-items: stretch;
-    gap: 6px;
+    gap: var(--agent-deck-gap);
     padding-bottom: 2px;
     overflow-x: auto;
 }
@@ -725,9 +883,12 @@ button {
     position: relative;
     display: flex;
     flex-direction: column;
-    flex: 0 0 auto;
-    min-width: 128px;
-    max-width: 200px;
+    flex: 0 0 var(--agent-deck-width);
+    width: var(--agent-deck-width);
+    /* Deck rank, written per tile by ui/agents.ts paintFront: the leftmost card must
+       paint above the card to its right, whose body overlaps its exposed strip. The
+       fallback keeps a tile rendered without the component's paint usable. */
+    z-index: var(--agent-deck-z, 1);
     /* The tile's own border is the dim track the activity ring sweeps around
        (see .agent-tile[data-activity='active']::before). */
     border: 1px solid var(--border);
@@ -736,11 +897,33 @@ button {
     transition: border-color 120ms ease, background 120ms ease;
 }
 
+/* Deck geometry, part 1: the front card comes first visually. Its rank
+   (`--agent-deck-z`, written by ui/agents.ts) is the highest, so its name/remove/
+   model controls stay clickable above the cards it covers. */
+.agent-tile[data-front='true'] {
+    order: -1;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.28);
+}
+
+/* Deck geometry, part 2: every hidden card is pulled under its neighbours and
+   exposes exactly `--agent-deck-peek` of its own right edge. The negative margin
+   also accounts for the flex `gap`, otherwise the strip would drift by 6px per
+   card and the handle would stop lining up with the visible edge. */
+.agent-tile:not([data-front='true']) {
+    margin-left: calc(var(--agent-deck-peek) - var(--agent-deck-width) - var(--agent-deck-gap));
+    box-shadow: none;
+}
+
 /* Primary reads green end to end; secondary stays neutral. The name colour
    below is the primary/secondary signal, so no role badge is needed. */
 .agent-tile[data-role='primary'] {
     border-color: rgba(74, 222, 128, 0.5);
-    background: rgba(74, 222, 128, 0.1);
+    /* Deck: the card surface must stay OPAQUE or the cards it covers would show
+       through the front card. Layering the same 10% green gradient over the solid
+       elevated surface keeps the identical tint (a bare rgba background did not). */
+    background:
+        linear-gradient(rgba(74, 222, 128, 0.1), rgba(74, 222, 128, 0.1)),
+        var(--bg-elevated);
 }
 
 /* Top row: promotion button + remove button. The model dropdown is a sibling
@@ -808,6 +991,81 @@ button {
 .agent-remove:disabled {
     opacity: 0.35;
     cursor: not-allowed;
+}
+
+/* The exposed right strip of a hidden card (ui/agents.ts `.agent-handle`): the
+   ONLY interactive part of that card, so it is a dedicated button that never
+   contains the remove control or the model select. It is absolutely positioned
+   over the card's right `--agent-deck-peek` and above the card's own controls, so
+   a click on the strip can only ever FRONT the card — never delete the agent or
+   open a native select. The front card hides its own handle entirely
+   (`.agent-handle[hidden]` below beats the `display: flex` here).
+
+   The name is set vertically (book-spine style, reading bottom-to-top) because the
+   strip is far narrower than a name. It ellipsizes when a name is longer than the
+   card is tall; `title`/`aria-label` still carry the full name, so identity is
+   never lost. No animation, so reduced motion needs nothing extra. */
+.agent-handle {
+    position: absolute;
+    top: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 3;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--agent-deck-peek);
+    padding: 5px 0;
+    overflow: hidden;
+    border: 0;
+    border-left: 1px solid var(--border);
+    border-radius: 0 9px 9px 0;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+}
+
+.agent-handle:hover {
+    background: rgba(255, 255, 255, 0.05);
+    color: var(--text);
+}
+
+.agent-handle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -3px;
+}
+
+/* A front card has nothing to reveal. Declared after `display: flex` above so the
+   UA `[hidden]` rule is not overridden by it. */
+.agent-handle[hidden] {
+    display: none;
+}
+
+.agent-handle-name {
+    max-height: 100%;
+    overflow: hidden;
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.02em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    writing-mode: vertical-rl;
+    /* vertical-rl reads top-to-bottom with the glyphs rotated clockwise; flipping
+       the box gives the usual bottom-to-top spine without a second glyph rotation. */
+    transform: rotate(180deg);
+}
+
+/* Keep the primary identifiable even while its card is hidden: the same green used
+   by the primary name/role colour, applied to the strip label. */
+.agent-tile[data-role='primary'] .agent-handle-name {
+    color: var(--ok);
+}
+
+/* Activity on a hidden card is otherwise invisible under the deck; tint its strip
+   label so a busy agent is still identifiable from the fan. The ring itself
+   (`.agent-tile[data-activity='active']::before`) is untouched. */
+.agent-tile[data-activity='active'] .agent-handle-name {
+    color: var(--accent);
 }
 
 /* Agent activity ring --------------------------------------------------- */
@@ -2576,14 +2834,19 @@ button {
     line-height: 1.45;
 }
 
-/* R9: the CHAT field is one row by default and grows by script (main.ts autoGrow)
-   up to the same max-height, then scrolls. `min-height: 0` lets `rows = 1` decide
-   the empty height instead of the base 54px; `resize` is off because the drag
-   handle would fight the measured height. The right padding reserves the action's
-   footprint so text never runs underneath it (R10). */
+/* R9/R5: the CHAT field is one row by default and grows by script (main.ts autoGrow)
+   up to a LINE cap — 3 text lines on a phone viewport (<=860px), 5 on desktop — then
+   scrolls. `min-height: 0` lets `rows = 1` decide the empty height instead of the
+   base 54px; `resize` is off because the drag handle would fight the measured height.
+   `max-height: none` is deliberate: the script computes the cap from the field's live
+   line-height/padding/borders, so the base 200px box (still used by the tool-runner
+   arguments textarea) must not clip the fifth line at large fonts or zoom. The
+   right padding reserves the action's footprint so text never runs underneath it
+   (R10). */
 .composer-field .composer-input {
     width: 100%;
     min-height: 0;
+    max-height: none;
     padding: 10px 52px 10px 12px;
     resize: none;
     overflow-y: auto;
@@ -2685,8 +2948,8 @@ button {
 }
 
 /* Core tools dropdown (right rail) — REMOVED in R21.2 ------------------ */
-/* The right rail no longer lists tools at all: the Tools tab is the single
-   catalogue (core entries included). Only the tab's session-status line and the
+/* The right rail no longer lists tools at all: the global tools view is the single
+   catalogue (core entries included). Only the view's session-status line and the
    panel hosts remain styled below. */
 
 /* Tool scratch board + panel hosts (R21.3) ----------------------------- */
@@ -2815,9 +3078,9 @@ button {
     overflow-wrap: anywhere;
 }
 
-/* Tools tab session status (R21.2) ------------------------------------- */
+/* Tools view session status (R21.2) ------------------------------------ */
 /* Informational session binding + tools toolRequest enabled for it. This replaced
-   the removed right-rail core-tools dropdown; the tab itself is styled above. */
+   the removed right-rail core-tools dropdown; the view itself is styled above. */
 .tools-session-note {
     margin: 0;
     color: var(--accent);
@@ -3306,16 +3569,58 @@ button {
         font-size: 11.5px;
     }
 
+    /* R3/R4: the topbar carries two icon rail toggles plus the icon-only Tools button,
+       so the pill must be able to shrink and ellipsize instead of pushing the icons
+       off the line. The width cap itself lives on `.topbar-right .status` (F1); a
+       percentage here would resolve against the shrink-to-fit cluster. */
     .status {
-        max-width: 50%;
+        min-width: 0;
     }
 
+    /* Compact topbar on a phone: brand + rail icons + tools icon + pill on one line. */
+    .topbar {
+        gap: 8px;
+        padding: 8px 12px;
+    }
+
+    .brand-name {
+        font-size: 13px;
+    }
+
+    /* R1: the compact disclosure row needs less breathing room than the card strip
+       did; the expanded cards keep their own padding. */
     .agent-slot {
-        padding: 10px 14px;
+        padding: 6px 14px;
+    }
+
+    /* R1: the card strip is collapsed behind the summary by default. `data-open` is
+       written by ui/agents.ts; without it the row (cards + add tile) is not shown,
+       so a 375px screen spends one line on the team instead of a full card row. */
+    .agent-summary {
+        display: flex;
+    }
+
+    .agent-row-wrap:not([data-open='true']) .agent-row {
+        display: none;
     }
 
     .harness-head {
-        padding: 10px 14px 8px;
+        padding: 8px 14px;
+    }
+
+    /* R1: the header is a single title line on a phone. The disclosure button reveals
+       the detail note (it is `display:none` above this breakpoint, where the note is
+       always visible). */
+    .harness-disclosure {
+        display: inline-flex;
+    }
+
+    .harness-head .harness-note {
+        display: none;
+    }
+
+    .harness-head[data-expanded='true'] .harness-note {
+        display: block;
     }
 }
 

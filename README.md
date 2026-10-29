@@ -1244,14 +1244,21 @@ content and state survive opening and closing, and every wider layout ignores th
 toggle state and shows both rails permanently.
 
 ```bash
-yarn build:frontend       # UI -> src/frontend/dist
+yarn build:frontend       # UI -> src/frontend/dist (base /, standalone/static hosts)
 
-yarn start-service        # repo root: @underload/service gateway, /v1/harness on :5000
-yarn dev:frontend         # Vite on :5180; /api proxies to the running service
-yarn preview:frontend     # built UI on :5180; same /api proxy
+yarn start-service        # repo root: builds UI for /harness/, serves UI + /v1/harness on :5000
+yarn dev:frontend         # Vite on all interfaces, dual-stack (localhost + LAN); /api proxies to the running service
+yarn preview:frontend     # built UI on :5180 (loopback only); same /api proxy
 
 yarn dev:server           # optional standalone API on :5181 (no Vite, no UI)
 ```
+
+`yarn start-service` (root `package.json`) builds the UI first with
+`PLAYGROUND_BASE=/harness/` and `VITE_HARNESS_API=/v1/harness`, then imports the
+service entry without changing the repository-root cwd. That build is the one the
+gateway mounts; use the root `yarn build:harness-ui` script to rebuild it without
+starting the gateway. A default `yarn build:frontend` build (base `/`) is for the
+standalone server or a static host, not the gateway.
 
 `yarn dev:frontend` starts **only Vite**. It never imports or calls
 `startHarnessServer`; its `server.proxy` (and `preview.proxy`) maps the client's
@@ -1259,6 +1266,57 @@ default `/api` root onto the service mount at `http://127.0.0.1:5000/v1/harness`
 Start the service first (see [Service host](#service-host-v1harness)), or override
 the root with `?apiRoot=` / `VITE_HARNESS_API` (see “Connecting the UI to the
 service” below).
+
+**LAN development (R7/R8/R11).** The dev server binds the IPv6 wildcard (`::`), which
+Node opens dual-stack, so **one** listener answers `http://localhost:5180/`,
+`http://127.0.0.1:5180/` and the LAN Network URL — the same machine can use either
+loopback form while a phone or another trusted machine uses the LAN one. Restart the
+backend and Vite after pulling this change:
+
+```bash
+yarn start-service       # terminal 1: gateway + /v1/harness on :5000
+yarn dev:frontend        # terminal 2: Vite on all interfaces (dual-stack)
+```
+
+Then open the **Network** URL Vite prints, e.g.
+`http://192.168.1.20:5180/`, from the other device. If :5180 is already busy, Vite
+starts on the next free port (usually :5181) — use the port in the printed
+`Network:` line, not the `Local:` one. The backend must be running first: Vite
+serves only the UI and proxies `/api`, so a stopped service gives a proxy error,
+not a UI-only page. Keep `HARNESS_DEV_API` unset for the normal gateway; when you
+do set it, Vite proxies to that mount and stamps its origin on the outgoing
+request, so a custom target must still be reachable from the machine running
+Vite.
+
+**If `Network` works but `Local` (`http://localhost:5180/`) does not**, another
+process owns `::1:5180` and answers with its own page or 404. `localhost`
+resolves to `::1` first on Windows, and Windows lets one process keep
+`0.0.0.0:5180` while another keeps `::1:5180` — a specific address keeps winning
+over a later wildcard bind — so Vite neither errors nor falls forward. List the
+owners and stop the stale one (a leftover `yarn dev:frontend`,
+`yarn preview:frontend` or another project's Vite):
+
+```powershell
+Get-NetTCPConnection -LocalPort 5180 | Where-Object State -eq Listen |
+    Select-Object LocalAddress, OwningProcess
+```
+
+Only the harness dev server should be listening; anything else on `::1:5180`
+takes `localhost` away from it. The fix is a restart with only one owner — no
+hosts-file, firewall or DNS change is needed.
+
+The proxy rewrites the outgoing `Origin` to the target's own origin (for the
+default target, `http://127.0.0.1:5000`) while `changeOrigin` makes `Host`
+match. That keeps the existing service Origin gate intact for a LAN browser (its
+`http://<LAN-IP>:5181` origin is never forwarded as-is) without widening the
+service's CORS or loopback allowlist. This is Vite-only: `preview:frontend`
+stays loopback-bound.
+
+There is **no authentication**. A LAN device that can reach the Vite port can use
+the UI and therefore drive the unsandboxed harness tools through the proxy; the
+gateway on :5000 is equally trusted. Only do this on a network you trust, allow
+the Vite port through the firewall for that network (the OS may prompt when Vite
+first binds the wildcard address), and close the terminal when finished.
 
 `yarn dev:server` is the separate, explicit standalone API launcher
 (`src/server/dev.ts`): it binds the Node server on `127.0.0.1:5181` with static
@@ -1600,7 +1658,10 @@ CORS layer, which is what keeps a same-origin UI simple. It is still a process w
 the server's permissions: `workspace`, `commandRun`, `fileWrite`, and direct tool
 calls can change the host. Do not expose it to a network you do not trust. The
 service host is stricter in transport but not in trust: `0.0.0.0` plus permissive
-CORS, with only the loopback Origin gate described above.
+CORS, with only the loopback/same-host Origin gate described above. Serving the
+UI at `/harness/` on that LAN bind does not add authentication: anyone who can
+reach the port can use the page and its API, so keep it on a trusted LAN and
+allow the port through the firewall only there.
 
 `src/frontend/vite.config.ts` no longer aliases `@underload/harness` or stubs
 `node:`: the browser bundle never reaches the package. `yarn dev:frontend` starts
@@ -1629,16 +1690,32 @@ share the service's port. The route modules only describe a URL and a handler �
 first request, and every route shares that one store, so a session created through
 one route is visible through the other.
 
-Start it from the repository root with `yarn start-service` (which runs
-`yarn workspace @underload/service start`); that entry scans the repository root,
-so the two modules above are discovered. The frontend dev launch expects this
-service (its `/api` proxy targets `http://127.0.0.1:5000/v1/harness`). This package
-ships no generic `start`/`serve` script: the gateway owns the normal listener, and
-nothing starts a harness server implicitly. `startHarnessServer()` remains an
-explicit API; the separate `yarn dev:server` entry runs it API-only on
-`127.0.0.1:5181` when a standalone process is wanted, and an embedder can still
-serve `src/frontend/dist` through `startHarnessServer({ staticRoot })`. The service
-gateway is `http://localhost:5000`.
+Start it from the repository root with `yarn start-service`. The root launcher
+first builds the UI for the gateway prefixes (`/harness/` page base,
+`/v1/harness` API root) and then imports the service entry without changing the
+repository-root cwd, so harness tools keep resolving the repository as their
+project root. That entry scans the repository root, so the two modules above are
+discovered. The frontend dev launch expects this service (its `/api` proxy
+targets `http://127.0.0.1:5000/v1/harness`). This package ships no generic
+`start`/`serve` script: the gateway owns the normal listener, and nothing starts
+a harness server implicitly. `startHarnessServer()` remains an explicit API; the
+separate `yarn dev:server` entry runs it API-only on `127.0.0.1:5181` when a
+standalone process is wanted, and an embedder can still serve
+`src/frontend/dist` through `startHarnessServer({ staticRoot })`.
+
+The gateway serves both the API and the UI on one listener: the API at
+`/v1/harness` and the built page at `/harness/`. The service entry itself stays
+API-only by default (the unchanged `yarn workspace @underload/service start`
+needs no UI build); the root launcher sets `UNDERLOAD_HARNESS_UI=1` after
+building, which opts into the validated `/harness` mount. Locally open
+`http://localhost:5000/harness/`. The service still binds `0.0.0.0` and logs its
+LAN addresses, so another device on the same router can open
+`http://<LAN-IP>:5000/harness/`; allow TCP port 5000 through the host firewall
+first. The page's API calls are same-origin, so the existing Origin gate applies
+unchanged — a browser origin that is neither the same host nor loopback still
+gets a 403; this feature does not broaden the service's Origin/CORS policy.
+There is **no authentication**: anyone who can reach port 5000 on the LAN can
+create sessions and drive tools, so use this only on a trusted network.
 
 `GET /v1/harness` is the canonical bootstrap document:
 
@@ -1787,8 +1864,13 @@ http://localhost:5180/?apiRoot=http://localhost:5000/v1/harness
 
 `yarn dev:frontend` (Vite) and `yarn preview:frontend` (built UI) serve on `:5180`
 and proxy `/api` to the service gateway on `:5000`, so the explicit `?apiRoot=`
-above is only needed when bypassing that proxy. The Vite origin is a loopback
-origin, which the Origin gate allows. The UI never sees the API key — it posts only the base URL and model,
+above is only needed when bypassing that proxy. A loopback Vite origin is allowed
+by the Origin gate directly; a LAN browser's non-loopback origin is not, so the
+dev proxy stamps the target's origin on its server-to-server request (the gate
+still rejects a foreign origin that reaches the service without that proxy).
+For a LAN browser keep the default relative `/api` root; an absolute
+`?apiRoot=http://<LAN-IP>:5000/...` is a different page origin and the runtime
+gate ignores it. The UI never sees the API key — it posts only the base URL and model,
 and `defaults.hasApiKey` is a boolean.
 
 A **runtime** absolute root (`?apiRoot=` or injected `__HARNESS_CONFIG__`/meta)
@@ -1848,11 +1930,12 @@ yarn test              # vitest run (library + server + shared)
 yarn test:frontend     # vitest run --config src/frontend/vitest.config.ts (UI, jsdom)
 yarn typecheck         # tsc --noEmit
 yarn build             # library + server + client entries -> dist/
-yarn build:frontend    # the UI application -> src/frontend/dist
+yarn build:frontend    # the UI application -> src/frontend/dist (standalone/deploy base)
 yarn cli --list        # CLI preset catalogue
-yarn dev:frontend      # Vite UI on :5180, /api -> the service on :5000
+yarn dev:frontend      # Vite UI on all interfaces, dual-stack (LAN + localhost), /api -> the service on :5000
 yarn dev:server        # optional standalone API on :5181 (no Vite/UI)
-yarn start-service     # repo root: @underload/service host, /v1/harness on :5000
+yarn start-service     # repo root: builds UI for /harness/, serves it + /v1/harness on :5000
+yarn build:harness-ui  # repo root: rebuild just the gateway UI (/harness/ base)
 ```
 
 ## npm Publishing

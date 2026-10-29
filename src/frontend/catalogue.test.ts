@@ -82,14 +82,13 @@ const boot = async (): Promise<void> => {
     await flush();
 };
 
-// R21.2: the Tools tab is the only catalogue. Selecting a tool means clicking its
-// keyed button there, so the tab is opened first.
+// R21.2/R3: the tools view is the only catalogue. Selecting a tool means clicking
+// its keyed button there, so the global topbar toggle is pressed first (there is no
+// tab strip any more).
 const openToolsTab = (): void => {
-    const found = [...document.querySelectorAll<HTMLButtonElement>('.tab')].find(
-        (candidate) => candidate.textContent === 'Tools'
-    );
-    if (found === undefined) throw new Error('the Tools tab did not render');
-    found.click();
+    const found = document.querySelector<HTMLButtonElement>('.tools-toggle');
+    if (found === null) throw new Error('the global Tools toggle did not render');
+    if (found.getAttribute('aria-pressed') !== 'true') found.click();
 };
 
 const toolButtons = (): HTMLButtonElement[] => [

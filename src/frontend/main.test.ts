@@ -204,6 +204,9 @@ const agentRoles = (): (string | undefined)[] =>
     [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.dataset.role);
 const agentNames = (): (string | null)[] =>
     [...document.querySelectorAll<HTMLElement>('.agent-tile-name')].map((node) => node.textContent);
+// R2 deck: the FRONT card per tile, in DOM order (`undefined` = hidden card).
+const agentFronts = (): (string | undefined)[] =>
+    [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.dataset.front);
 const harnessNames = (): (string | null)[] =>
     [...document.querySelectorAll<HTMLElement>('.harness-item .harness-name')].map((node) => node.textContent);
 // The core list is gone from the UI (R21.2); this helper stays only so a test can
@@ -731,8 +734,8 @@ it('restores a remembered session with its frozen team and server timings', asyn
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         'Viewing a saved session · agent team frozen'
     );
-    // R21.2: the enabled-for-session status now lives on the Tools tab (its tab
-    // pane is detached while Chat owns the stage — tools-tab.test.ts pins the
+    // R21.2: the enabled-for-session status now lives in the global tools view (its
+    // pane is detached while the chat owns the stage — tools-tab.test.ts pins the
     // text). What matters here is that no right-rail core dropdown came back.
     expect(document.querySelector('.core-tools')).toBeNull();
     for (const button of document.querySelectorAll<HTMLButtonElement>('.agent-main')) {
@@ -853,8 +856,8 @@ it('creates a harness from preset agents with an initial primary', async () => {
     expect(document.querySelector('.main-title')?.textContent).toBe('Release captain');
     expect(agentNames()).toEqual(['Workspace', 'Summarizer']);
     expect(agentRoles()).toEqual(['primary', 'secondary']);
-    // R21.2: no right-rail core list follows the new harness; the Tools tab
-    // (detached while Chat is showing) carries that status instead.
+    // R21.2: no right-rail core list follows the new harness; the global tools view
+    // (detached while the chat is showing) carries that status instead.
     expect(document.querySelector('.core-tools')).toBeNull();
     expect(document.querySelector('.rail-right .tool-list')).toBeNull();
 });
@@ -920,8 +923,8 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
     expect(picker.hidden).toBe(true);
     expect(agentNames()).toEqual(['Instruct', 'Summarizer']);
     expect(agentRoles()).toEqual(['primary', 'secondary']);
-    // R21.2: the core set is no longer rendered anywhere; the Tools tab lists every
-    // tool (core entries included) from the server catalogue instead.
+    // R21.2: the core set is no longer rendered anywhere; the global tools view lists
+    // every tool (core entries included) from the server catalogue instead.
     expect(document.querySelector('.core-tool-name')).toBeNull();
 
     // Selecting a secondary demotes the old primary; the request lists it once.
@@ -945,6 +948,212 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
     });
     expect(agentNames()).toEqual(['Summarizer']);
     expect(byClass('.agent-remove', 'button').disabled).toBe(true);
+});
+
+it('fronts an agent card for viewing without promoting it or PATCHing the team', async () => {
+    const base = descriptor({
+        agents: ['instruct', 'summarizer'],
+        primary: 'instruct',
+        subagents: ['summarizer']
+    });
+    let current = base;
+    const calls = stubFetch((url, method, body) => {
+        if (url === '/api') return json(bootstrap({ presets: [base] }));
+        if (url === '/api/models') return json({ models: ['m1', 'm2'] });
+
+        if (url === '/api/harnesses/instruct' && method === 'PATCH') {
+            const request = body as {
+                primary: string;
+                subagents: string[];
+                agentModels?: Record<string, string>;
+            };
+            current = descriptor({
+                agents: [request.primary, ...request.subagents],
+                primary: request.primary,
+                subagents: request.subagents,
+                agentModels: request.agentModels
+            });
+            return json({ harness: current });
+        }
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // R2 deck: the primary is the front card; the secondary is a named strip.
+    expect(agentFronts()).toEqual(['true', undefined]);
+    expect(
+        [...document.querySelectorAll<HTMLButtonElement>('.agent-handle')].map((handle) => [
+            handle.dataset.agent,
+            handle.hidden
+        ])
+    ).toEqual([
+        ['instruct', true],
+        ['summarizer', false]
+    ]);
+
+    // Viewing the secondary sends NOTHING: fronting is local UI state, not a team
+    // edit. The primary and its aria-pressed state are untouched.
+    document.querySelector<HTMLButtonElement>('.agent-handle[data-agent="summarizer"]')?.click();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
+    expect(agentFronts()).toEqual([undefined, 'true']);
+    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(document.querySelectorAll<HTMLButtonElement>('.agent-main')[0].getAttribute('aria-pressed')).toBe(
+        'true'
+    );
+
+    // The fronted card owns the usable controls: its model select is a tab stop,
+    // the covered primary's is not. Editing that secondary's model is what the
+    // front state is for, and the team PATCH keeps the primary unchanged.
+    const selects = [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
+    expect(selects.map((select) => select.getAttribute('tabindex'))).toEqual(['-1', null]);
+    selects[1].value = 'm2';
+    selects[1].dispatchEvent(new Event('change', { bubbles: true }));
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')[0]?.body).toEqual({
+        primary: 'instruct',
+        subagents: ['summarizer'],
+        agentModels: { summarizer: 'm2' }
+    });
+    // The rebuild the PATCH triggers re-seeds the remembered front card, so the
+    // card being viewed is not yanked away mid-edit (R2).
+    expect(agentFronts()).toEqual([undefined, 'true']);
+    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(
+        [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')].map((select) => select.value)
+    ).toEqual(['', 'm2']);
+});
+
+it('falls back to the primary when the viewed card is removed', async () => {
+    const base = descriptor({
+        agents: ['instruct', 'summarizer'],
+        primary: 'instruct',
+        subagents: ['summarizer']
+    });
+    let current = base;
+    const calls = stubFetch((url, method, body) => {
+        if (url === '/api') return json(bootstrap({ presets: [base] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+
+        if (url === '/api/harnesses/instruct' && method === 'PATCH') {
+            const request = body as { primary: string; subagents: string[] };
+            current = descriptor({
+                agents: [request.primary, ...request.subagents],
+                primary: request.primary,
+                subagents: request.subagents
+            });
+            return json({ harness: current });
+        }
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // View the secondary, then remove it from its own (now front) card.
+    document.querySelector<HTMLButtonElement>('.agent-handle[data-agent="summarizer"]')?.click();
+    await flush();
+    expect(agentFronts()).toEqual([undefined, 'true']);
+
+    document.querySelectorAll<HTMLButtonElement>('.agent-remove')[1].click();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'PATCH')[0]?.body).toEqual({
+        primary: 'instruct',
+        subagents: []
+    });
+    // The remembered front name is pruned against the new team, so the surviving
+    // primary becomes front instead of an empty/ghost deck (R2 fallback).
+    expect(agentNames()).toEqual(['Instruct']);
+    expect(agentFronts()).toEqual(['true']);
+    expect(
+        [...document.querySelectorAll<HTMLButtonElement>('.agent-handle')].map((handle) => handle.hidden)
+    ).toEqual([true]);
+    expect(byClass('.agent-remove', 'button').disabled).toBe(true);
+    expect(byClass('.agent-main', 'button').disabled).toBe(false);
+});
+
+it('fronts a card of a frozen team and keeps that card across the live model PATCH', async () => {
+    const frozen = descriptor({
+        agents: ['instruct', 'summarizer'],
+        primary: 'instruct',
+        subagents: ['summarizer'],
+        coreTools: [
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'agentDelegate'
+        ]
+    });
+    const restored = snapshot({ harnessDefinition: frozen } as Partial<SessionSnapshot>);
+    localStorage.setItem(SESSION_KEY, 's1');
+
+    const patches: unknown[] = [];
+    stubFetch((url, method, body) => {
+        if (url === '/api') return json(bootstrap({ presets: [descriptor()], sessions: [restored] }));
+        if (url === '/api/models') return json({ models: ['m1', 'm2'] });
+        if (url === '/api/sessions/s1' && method === undefined) return json({ session: restored });
+        if (url === '/api/sessions' && method === undefined) return json({ sessions: [restored] });
+
+        if (url === '/api/sessions/s1' && method === 'PATCH') {
+            patches.push(body);
+            return json({
+                session: snapshot({
+                    harnessDefinition: frozen,
+                    agentModels: { summarizer: 'm2' },
+                    updatedAt: 3
+                } as Partial<SessionSnapshot>)
+            });
+        }
+
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // R2/R3: the team is frozen, but VIEWING is not a team edit, so the strip works.
+    document.querySelector<HTMLButtonElement>('.agent-handle[data-agent="summarizer"]')?.click();
+    await flush();
+
+    expect(agentFronts()).toEqual([undefined, 'true']);
+    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    // No team change was attempted; promotion stays disabled while frozen.
+    expect(patches).toEqual([]);
+    expect(document.querySelectorAll<HTMLButtonElement>('.agent-main').length).toBe(2);
+    for (const button of document.querySelectorAll<HTMLButtonElement>('.agent-main')) {
+        expect(button.disabled).toBe(true);
+    }
+
+    // The fronted (still secondary) agent's model is live: the session PATCH is what
+    // a saved chat edits, and it does not touch primary/subagents at all.
+    const selects = [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
+    expect(selects.map((select) => select.disabled)).toEqual([false, false]);
+    expect(selects.map((select) => select.value)).toEqual(['', '']);
+    selects[1].value = 'm2';
+    selects[1].dispatchEvent(new Event('change', { bubbles: true }));
+    await flush();
+
+    expect(patches).toEqual([{ agentModels: { summarizer: 'm2' } }]);
+    // The PATCH rebuild keeps the viewed card in front and shows the new model.
+    expect(agentFronts()).toEqual([undefined, 'true']);
+    expect(agentRoles()).toEqual(['primary', 'secondary']);
+    expect(
+        [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')].map((select) => select.value)
+    ).toEqual(['', 'm2']);
 });
 
 it('filters the sessions rail to the selected harness and opens within it', async () => {
@@ -2058,13 +2267,10 @@ const expectOfflinePane = (message: string): void => {
     expect(statusText()).toBe('server offline');
     expect(document.querySelector<HTMLElement>('.status')?.dataset.state).toBe('error');
 
-    // No catalogue, no rows and no tab switch while offline.
+    // No catalogue, no rows and no tools view while offline (R3).
     expect(document.querySelectorAll('.harness-item')).toHaveLength(0);
     expect(document.querySelector('.harness-list .field-hint')?.textContent).toBe('No server connection.');
-    expect([...document.querySelectorAll<HTMLButtonElement>('.tab')].map((tab) => tab.disabled)).toEqual([
-        true,
-        true
-    ]);
+    expect(byClass('.tools-toggle', 'button').disabled).toBe(true);
 };
 
 it('renders the connecting pane before the first request settles', async () => {

@@ -1,8 +1,8 @@
-// R1: phone rails start collapsed and are opened from the topbar.
+// R1/R4: phone rails start collapsed and are opened from the topbar.
 //
 // Two contracts, both pinned here:
-//   - DOM/state: two independent toggles exist in the topbar, both rails start
-//     collapsed, one rail opens at a time, the toggle they own reports
+//   - DOM/state: two independent ICON-ONLY toggles exist in the topbar, both rails
+//     start collapsed, one rail opens at a time, the toggle they own reports
 //     `aria-expanded`, and Escape or the backdrop collapses without removing the
 //     rails from the DOM;
 //   - CSS: the collapse only exists inside the <=860px media query, so the desktop
@@ -107,6 +107,14 @@ it('starts both phone rails collapsed and toggles them one at a time', async () 
         'Harnesses panel',
         'Scratch board and sessions panel'
     ]);
+    // R4: icon-only. Each toggle's entire content is ONE decorative glyph; the
+    // accessible name above is the only human-readable label, so the phone topbar
+    // keeps its room for the brand, the tools icon and the status pill.
+    expect(toggles().map((button) => button.textContent)).toEqual(['☰', '▤']);
+    expect(toggles().map((button) => button.children.length)).toEqual([1, 1]);
+    expect(
+        toggles().map((button) => button.firstElementChild?.getAttribute('aria-hidden'))
+    ).toEqual(['true', 'true']);
     // Collapsed by default: no data state, both `aria-expanded` false.
     expect(shell.dataset.railOpen).toBeUndefined();
     expect(expanded()).toEqual(['false', 'false']);

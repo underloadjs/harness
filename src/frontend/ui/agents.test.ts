@@ -146,8 +146,10 @@ describe('createAgentRow', () => {
         expect(element.querySelector<HTMLButtonElement>('.agent-add')?.title).toBe(
             'The agent team is locked.'
         );
-        // The wrapper holds exactly the row and the picker: no third lock block.
+        // The wrapper holds the phone summary, the row and the picker: no third lock
+        // block. The summary is R1's mobile disclosure (hidden by CSS above 860px).
         expect([...element.children].map((child) => child.className)).toEqual([
+            'agent-summary',
             'agent-row',
             'agent-picker'
         ]);
@@ -159,6 +161,67 @@ describe('createAgentRow', () => {
         const tile = element.querySelector<HTMLElement>('.agent-tile[data-agent="legacy-helper"]');
         expect(tile?.querySelector('.agent-tile-name')?.textContent).toBe('legacy-helper');
         expect(element.querySelectorAll('.agent-option')).toHaveLength(agents.length);
+    });
+});
+
+// R1 (phone): the summary is a real disclosure control. Its DOM/state is pinned
+// here; the stylesheet half — hidden above 860px, cards hidden until `data-open` —
+// is pinned in compact-ui.test.ts.
+describe('phone team summary', () => {
+    it('summarises the primary and starts collapsed', () => {
+        const { element } = mount({ members: ['instruct', 'summarizer'] });
+
+        const summary = element.querySelector<HTMLButtonElement>('.agent-summary');
+        const row = element.querySelector<HTMLElement>('.agent-row');
+        if (summary === null || row === null) throw new Error('missing summary or row');
+
+        expect(summary.type).toBe('button');
+        expect(summary.getAttribute('aria-expanded')).toBe('false');
+        // The summary controls the card row it reveals (unique ids per mount).
+        expect(summary.getAttribute('aria-controls')).toBe(row.id);
+        expect(summary.querySelector('.agent-summary-label')?.textContent).toBe('Instruct');
+        expect(summary.querySelector('.agent-summary-meta')?.textContent).toBe('2 agents');
+        const icon = summary.querySelector('.agent-summary-icon');
+        expect(icon?.textContent).toBe('▾');
+        expect(icon?.getAttribute('aria-hidden')).toBe('true');
+        // Collapsed is the ABSENCE of a data state, so nothing styles an open row.
+        expect(element.dataset.open).toBeUndefined();
+
+        // The cards and the add control stay in the DOM: CSS hides them, so expanding
+        // never has to rebuild the team.
+        expect(element.querySelectorAll('.agent-tile')).toHaveLength(2);
+        expect(element.querySelector('.agent-add')).not.toBeNull();
+    });
+
+    it('uses the singular count for a one-agent team', () => {
+        const { element } = mount();
+        expect(element.querySelector('.agent-summary-label')?.textContent).toBe('Instruct');
+        expect(element.querySelector('.agent-summary-meta')?.textContent).toBe('1 agent');
+    });
+
+    it('reports the open state to the caller and keeps a seeded state open', () => {
+        const onToggle = vi.fn();
+        const { element } = mount({ members: ['instruct', 'summarizer'], onToggle });
+        const summary = element.querySelector<HTMLButtonElement>('.agent-summary');
+        if (summary === null) throw new Error('missing summary');
+
+        summary.click();
+        expect(summary.getAttribute('aria-expanded')).toBe('true');
+        expect(element.dataset.open).toBe('true');
+        expect(onToggle).toHaveBeenLastCalledWith(true);
+
+        summary.click();
+        expect(summary.getAttribute('aria-expanded')).toBe('false');
+        expect(element.dataset.open).toBeUndefined();
+        expect(onToggle).toHaveBeenLastCalledWith(false);
+
+        // A rebuild seeded from the remembered state (main.ts `agentsExpanded`) paints
+        // the same open row, so a repaint cannot collapse an open team.
+        const reopened = mount({ members: ['instruct', 'summarizer'], expanded: true }).element;
+        expect(
+            reopened.querySelector<HTMLButtonElement>('.agent-summary')?.getAttribute('aria-expanded')
+        ).toBe('true');
+        expect(reopened.dataset.open).toBe('true');
     });
 });
 
@@ -348,5 +411,276 @@ describe('per-agent model dropdown', () => {
         expect([...select!.options].map((option) => option.textContent)).toEqual([
             'model not specified'
         ]);
+    });
+});
+
+// R2: the overlapping card deck. ONE card is front (fully visible); every other
+// card exposes only its right strip as a `.agent-handle` button. The strip VIEWS
+// the card — it never promotes and never reaches the server — while promotion and
+// removal stay on the card's own controls. The geometry is CSS (styles.css), the
+// front-state precedence and the tab order are pinned here.
+describe('agent card deck', () => {
+    const tileList = (element: HTMLElement): HTMLElement[] => [
+        ...element.querySelectorAll<HTMLElement>('.agent-tile')
+    ];
+    const handleList = (element: HTMLElement): HTMLButtonElement[] => [
+        ...element.querySelectorAll<HTMLButtonElement>('.agent-handle')
+    ];
+    // The FRONT flag in DOM order; `undefined` means "hidden card".
+    const fronts = (element: HTMLElement): (string | undefined)[] =>
+        tileList(element).map((tile) => tile.dataset.front);
+    const tabStops = (tile: HTMLElement): (string | null)[] =>
+        [
+            tile.querySelector<HTMLElement>('.agent-main'),
+            tile.querySelector<HTMLElement>('.agent-remove'),
+            tile.querySelector<HTMLElement>('.agent-model-select')
+        ].map((node) => node?.getAttribute('tabindex') ?? null);
+
+    it('starts with the primary in front and every other edge a named button', () => {
+        const { element } = mount({
+            members: ['instruct', 'summarizer', 'workspace'],
+            primary: 'instruct'
+        });
+
+        // Exactly one front card, the primary, and it is the leftmost visually
+        // (CSS `order: -1`) without reordering the list itself.
+        expect(fronts(element)).toEqual(['true', undefined, undefined]);
+        expect(tileList(element).map((tile) => tile.dataset.agent)).toEqual([
+            'instruct',
+            'summarizer',
+            'workspace'
+        ]);
+
+        // The strips are real buttons carrying the agent's human name, so an edge
+        // identifies its agent. The front card offers no strip (nothing to reveal).
+        // `workspace` is not in this file's preset fixture, so its fallback title is
+        // the slug (detailsOf), exactly like a member from an older session.
+        expect(
+            handleList(element).map((handle) => [handle.dataset.agent, handle.hidden, handle.textContent, handle.getAttribute('aria-label')])
+        ).toEqual([
+            ['instruct', true, 'Instruct', 'View Instruct'],
+            ['summarizer', false, 'Summarizer', 'View Summarizer'],
+            ['workspace', false, 'workspace', 'View workspace']
+        ]);
+        expect(handleList(element).map((handle) => handle.type)).toEqual(['button', 'button', 'button']);
+        expect(handleList(element).map((handle) => handle.title)).toEqual([
+            'View Instruct',
+            'View Summarizer',
+            'View workspace'
+        ]);
+        // A strip is a pure view control: it contains neither the remove button nor
+        // the native model select, so a mis-click cannot delete or open one.
+        expect(
+            handleList(element).some(
+                (handle) => handle.querySelector('.agent-remove, select') !== null
+            )
+        ).toBe(false);
+    });
+
+    it('fronts a card from its strip without promoting it or touching the list', () => {        const onFront = vi.fn();
+        const { element, options } = mount({
+            members: ['instruct', 'summarizer', 'workspace'],
+            primary: 'instruct',
+            onFront
+        });
+
+        handleList(element)[2].click();
+
+        expect(fronts(element)).toEqual([undefined, undefined, 'true']);
+        expect(onFront).toHaveBeenCalledWith('workspace');
+        // R2: viewing is not promotion. The team callbacks are untouched...
+        expect(options.onSelectPrimary).not.toHaveBeenCalled();
+        expect(options.onRemove).not.toHaveBeenCalled();
+        expect(options.onAdd).not.toHaveBeenCalled();
+        // ...and the DOM/list semantics are the server's order with one primary.
+        expect(tileList(element).map((tile) => tile.dataset.agent)).toEqual([
+            'instruct',
+            'summarizer',
+            'workspace'
+        ]);
+        expect(tileList(element).map((tile) => tile.dataset.role)).toEqual([
+            'primary',
+            'secondary',
+            'secondary'
+        ]);
+        expect(mainButtons(element).map((button) => button.getAttribute('aria-pressed'))).toEqual([
+            'true',
+            'false',
+            'false'
+        ]);
+    });
+
+    it('hands focus to the newly fronted card and keeps hidden controls out of the tab order', () => {
+        const { element } = mount({ members: ['instruct', 'summarizer'], primary: 'instruct' });
+
+        // Initial state: the primary's controls are the only tab stops; the secondary
+        // card is covered by the deck, so its controls are skipped.
+        expect(tabStops(tileList(element)[0])).toEqual([null, null, null]);
+        expect(tabStops(tileList(element)[1])).toEqual(['-1', '-1', '-1']);
+
+        handleList(element)[1].click();
+
+        // The pressed strip is now hidden (its tile is front), so focus is moved to
+        // that card's promotion button rather than being dropped to <body>.
+        expect(handleList(element)[1].hidden).toBe(true);
+        expect(handleList(element)[0].hidden).toBe(false);
+        expect(document.activeElement).toBe(tileList(element)[1].querySelector('.agent-main'));
+        expect(tabStops(tileList(element)[1])).toEqual([null, null, null]);
+        expect(tabStops(tileList(element)[0])).toEqual(['-1', '-1', '-1']);
+    });
+
+    it('focuses the live model select when the locked card has no enabled promotion', () => {
+        // Frozen session: `editable: false` disables promotion/removal but the model
+        // map stays live (R2), so that is the card's real focusable control. Focusing
+        // the disabled `.agent-main` would leave activeElement on <body>.
+        const { element } = mount({
+            members: ['instruct', 'summarizer'],
+            editable: false,
+            models: {
+                models: {},
+                catalogue: ['m1'],
+                fallbackModel: 'm1',
+                editable: true,
+                onChange: vi.fn()
+            }
+        });
+        const front = tileList(element)[1];
+        const select = front.querySelector<HTMLSelectElement>('.agent-model-select');
+
+        handleList(element)[1].click();
+
+        expect(front.dataset.front).toBe('true');
+        expect(select?.disabled).toBe(false);
+        expect(document.activeElement).toBe(select);
+        // The tile is not a focus target in this case, so it gains no tabindex.
+        expect(front.hasAttribute('tabindex')).toBe(false);
+        expect(tabStops(front)).toEqual([null, null, null]);
+    });
+
+    it('focuses the tile itself when every card control is disabled, adding no tab stop', () => {
+        // Run in flight: the team AND its models are locked, so the card has nothing
+        // focusable. Focus must still land inside the fronted card, and only as a
+        // programmatic target (tabindex=-1), never as a new Tab stop (R3).
+        const { element } = mount({
+            members: ['instruct', 'summarizer'],
+            editable: false,
+            models: {
+                models: {},
+                catalogue: ['m1'],
+                fallbackModel: 'm1',
+                editable: false,
+                onChange: vi.fn()
+            }
+        });
+
+        handleList(element)[1].click();
+
+        const front = tileList(element)[1];
+        expect(front.dataset.front).toBe('true');
+        expect(document.activeElement).toBe(front);
+        expect(front.getAttribute('tabindex')).toBe('-1');
+        // No control on that card became reachable: promotion/removal/model stay
+        // disabled and the hidden controls stay at -1.
+        expect(tabStops(front)).toEqual([null, null, null]);
+        expect(front.querySelector<HTMLButtonElement>('.agent-main')?.disabled).toBe(true);
+        expect(front.querySelector<HTMLButtonElement>('.agent-remove')?.disabled).toBe(true);
+        expect(front.querySelector<HTMLSelectElement>('.agent-model-select')?.disabled).toBe(true);
+
+        // Fronting the other card moves the focus target (and its tabindex marker)
+        // with it, so no stale focusable tile is left in the deck.
+        handleList(element)[0].click();
+        expect(document.activeElement).toBe(tileList(element)[0]);
+        expect(tileList(element)[0].getAttribute('tabindex')).toBe('-1');
+        expect(tileList(element)[1].hasAttribute('tabindex')).toBe(false);
+    });
+
+    it('ignores a repeat activation of the already-front card', () => {
+        const onFront = vi.fn();
+        const { element } = mount({ members: ['instruct', 'summarizer'], onFront });
+
+        // A hidden handle cannot be clicked by a pointer, but a stale programmatic
+        // activation must not re-report or reset the deck.
+        handleList(element)[1].click();
+        handleList(element)[1].click();
+
+        expect(onFront).toHaveBeenCalledTimes(1);
+        expect(onFront).toHaveBeenCalledWith('summarizer');
+        expect(fronts(element)).toEqual([undefined, 'true']);
+    });
+
+    it('ranks every card above the neighbour whose body covers its strip', () => {
+        // The strip of a card is overlapped by the card to its RIGHT, so the leftmost
+        // card must paint highest. Without this rank a mid-list front card would cover
+        // an earlier card's strip, and a click there would hit promotion.
+        const { element } = mount({
+            members: ['instruct', 'summarizer', 'workspace'],
+            primary: 'instruct'
+        });
+        const ranks = (): string[] =>
+            tileList(element).map((tile) => tile.style.getPropertyValue('--agent-deck-z'));
+
+        // Front first, then the rest in list order: 3, 2, 1 by DOM index.
+        expect(ranks()).toEqual(['3', '2', '1']);
+
+        // Fronting the LAST member moves it visually to the left, so the ranks follow
+        // the visual order: workspace 3, instruct 2, summarizer 1.
+        handleList(element)[2].click();
+        expect(ranks()).toEqual(['2', '1', '3']);
+
+        // The same rank is applied when the front card is seeded by the caller.
+        const seeded = mount({
+            members: ['instruct', 'summarizer', 'workspace'],
+            front: 'workspace'
+        }).element;
+        expect(tileList(seeded).map((tile) => tile.style.getPropertyValue('--agent-deck-z'))).toEqual([
+            '2',
+            '1',
+            '3'
+        ]);
+    });
+
+    it('re-applies a remembered front card and falls back to the primary for an unknown one', () => {
+        // main.ts remembers the viewed card (agentFront) and re-seeds it on every
+        // rebuild, so an activity frame or a model PATCH cannot yank it back.
+        const remembered = mount({ members: ['instruct', 'summarizer'], front: 'summarizer' }).element;
+        expect(fronts(remembered)).toEqual([undefined, 'true']);
+
+        // A remembered name that is no longer a member (the agent was removed) must
+        // never blank the deck: the primary becomes front again.
+        const stale = mount({ members: ['instruct', 'summarizer'], front: 'ghost' }).element;
+        expect(fronts(stale)).toEqual(['true', undefined]);
+        expect(handleList(stale)[0].hidden).toBe(true);
+    });
+
+    it('fronts while the team is locked and leaves the model selects as the lock applies', () => {
+        const onFront = vi.fn();
+        const { element } = mount({
+            members: ['instruct', 'summarizer'],
+            editable: false,
+            onFront
+        });
+
+        // Promotion/removal stay disabled; the strip is not part of the team edit, so
+        // viewing a frozen agent is still offered (R2/R3).
+        expect(handleList(element).map((handle) => handle.disabled)).toEqual([false, false]);
+        handleList(element)[1].click();
+
+        expect(fronts(element)).toEqual([undefined, 'true']);
+        expect(onFront).toHaveBeenCalledWith('summarizer');
+        expect(mainButtons(element).map((button) => button.disabled)).toEqual([true, true]);
+        expect(removeButtons(element).map((button) => button.disabled)).toEqual([true, true]);
+        expect(tabStops(tileList(element)[1])).toEqual([null, null, null]);
+    });
+
+    it('keeps promotion and removal working on a hidden card when driven directly', () => {
+        // The deck only covers these controls visually; their handlers are unchanged,
+        // so the existing single-PATCH promotion/removal paths still report.
+        const { element, options } = mount({ members: ['instruct', 'summarizer'] });
+
+        mainButtons(element)[1].click();
+        expect(options.onSelectPrimary).toHaveBeenCalledWith('summarizer');
+
+        removeButtons(element)[1].click();
+        expect(options.onRemove).toHaveBeenCalledWith('summarizer');
     });
 });
