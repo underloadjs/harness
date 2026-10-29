@@ -297,10 +297,6 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions/s1' && method === undefined) return json({ session: first });
         if (url === '/api/sessions/s2' && method === undefined) return json({ session: second });
-        // Reset answers with a full snapshot whose turn list is empty.
-        if (url === '/api/sessions/s1/reset' && method === 'POST') {
-            return json({ session: snapshot({ id: 's1', turns: [] }) });
-        }
         return undefined;
     });
 
@@ -381,15 +377,14 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
     expect(host('center').hidden).toBe(true);
     expect(host('left').hidden).toBe(true);
 
-    // Reset empties the conversation AND its board (the server's empty snapshot is
-    // drawn, not assumed): no panel survives a reset.
-    byClass('.reset', 'button').click();
-    await flush();
-    await flush();
-
-    expect(panelIds('scratch')).toEqual([]);
-    expect(host('scratch').hidden).toBe(true);
-    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    // R10 removed the composer's Reset control: there is no in-place conversation
+    // wipe in the UI any more. The board is cleared by New session (proven above) or
+    // by an authoritative snapshot, so a plain selection change keeps it intact and
+    // no reset control exists anywhere in the composer.
+    expect(document.querySelector('.composer .reset')).toBeNull();
+    expect(panelIds('scratch')).toEqual(['status']);
+    expect(host('scratch').hidden).toBe(false);
+    expect(document.querySelectorAll('.tile')).toHaveLength(1);
 });
 
 it('renders live tool_result.ui panels and keeps them across the terminal snapshot', async () => {

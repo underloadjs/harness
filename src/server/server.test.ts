@@ -153,10 +153,13 @@ describe('harness server', () => {
     });
 
     it('reports tool failures as data, not as a broken server', async () => {
+        // A missing path is a per-entry result now (fileRead R1), so this uses a
+        // genuinely invalid request (the documented "at least one path" rule) to
+        // keep the point: an execute rejection is returned as ok:false data.
         const response = await fetch(`${base}/api/tools/fileRead`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Harness-Client': 'ui' },
-            body: JSON.stringify({ parameters: 'does/not/exist.txt' })
+            body: JSON.stringify({ parameters: [] })
         });
 
         expect(response.status).toBe(200);

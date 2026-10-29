@@ -287,7 +287,10 @@ it('clears every ring as soon as Stop is pressed', async () => {
     await flush();
     expect(tileActivity()).toEqual(['active', 'active']);
 
-    byClass('.stop', 'button').click();
+    // R10: the running session exposes the stop action as the composer's only button.
+    const composerAction = byClass('.composer-action', 'button');
+    expect(composerAction.dataset.action).toBe('stop');
+    composerAction.click();
     await flush();
     expect(tileActivity()).toEqual([undefined, undefined]);
 

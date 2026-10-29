@@ -28,7 +28,7 @@
 // fileList uses: "." contributes no prefix). Fixtures live under the repo-root
 // `Temp/`, one unique directory per run, removed afterwards.
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { mkdir, mkdtemp, rm, symlink, writeFile as writeTextFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -389,13 +389,31 @@ describe('fileGlob — content mode', () => {
     it('stops a catastrophic pattern instead of hanging, with a clear error', async () => {
         // T16 regression: `(a+)+$` against 31 "a"s and a "b" used to block the whole
         // process for seconds. It now runs inside a vm with the documented cumulative
-        // budget, so the call fails instead of freezing the harness. Restricted to
-        // the one file, so no other fixture is scanned before the stop.
-        await expect(
-            fileGlob({ patterns: ['line.txt'], content: '(a+)+$' })
-        ).rejects.toThrow(
-            'fileGlob content pattern did not finish within its 2000ms matching budget and was stopped. Simplify the pattern: nested quantifiers such as "(a+)+" can backtrack exponentially.'
-        );
+        // 30-second budget, so the call fails instead of freezing the harness.
+        //
+        // Waiting out the real default would exceed vitest's 15s per-test timeout, so
+        // the clock is mocked to jump 30001ms per read: the matcher takes its deadline
+        // from the first read, the second read is past it, and an exhausted deadline is
+        // refused BEFORE any matching. That proves fileGlob passes the DEFAULT budget
+        // (30000ms), which is what the message names. Restricted to the one file, so no
+        // other fixture is scanned before the stop.
+        const now = vi.spyOn(Date, 'now');
+        let tick = 0;
+
+        try {
+            now.mockImplementation(() => {
+                tick += 1;
+                return 1_000_000 + tick * 30_001;
+            });
+
+            await expect(
+                fileGlob({ patterns: ['line.txt'], content: '(a+)+$' })
+            ).rejects.toThrow(
+                'fileGlob content pattern did not finish within its 30000ms matching budget and was stopped. Simplify the pattern: nested quantifiers such as "(a+)+" can backtrack exponentially.'
+            );
+        } finally {
+            now.mockRestore();
+        }
     });
 
     it('keeps ordinary content searches unaffected by the budget', async () => {

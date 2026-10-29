@@ -647,6 +647,150 @@ describe('invocation thread entries', () => {
         const agents = [...turn.element.querySelectorAll<HTMLElement>('.agent')];
         expect(agents.map((agent) => agent.dataset.agent)).toEqual(['writer', 'helper']);
         expect(agents.map((agent) => agent.dataset.role)).toEqual(['primary', 'subagent']);
+        // R3: no visible role badge on a flat section either.
+        expect(turn.element.querySelectorAll('.agent-role, .thread-role')).toHaveLength(0);
         expect(agents[1].querySelector('.agent-text')?.textContent).toBe('legacy answer\n');
+    });
+
+    // R3: identity is colour, and the colour is the SAME on the main block and on
+    // every nested block of that agent — including two invocations of one agent,
+    // and the neutral fallback for an agent the stream cannot name. The name/section
+    // spells out WHO, the nesting WHERE, and nothing is labelled "subagent".
+    it('paints one stable agent colour on main and nested blocks, with an unknown fallback', () => {
+        const board = mount();
+        const turn = board.begin('colour identity');
+
+        turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+        turn.apply(delegateCall('helper', 'first task', 'd1'));
+        turn.apply(
+            withThread({ type: 'start', agent: 'helper', model: 'h1' }, { id: 't1', callId: 'd1', input: 'first task' })
+        );
+        turn.apply(delegateCall('helper', 'second task', 'd2'));
+        turn.apply(
+            withThread({ type: 'start', agent: 'helper', model: 'h1' }, { id: 't2', callId: 'd2', input: 'second task' })
+        );
+        // An empty agent id: the server never named this invocation.
+        turn.apply(withThread({ type: 'start', agent: '', model: 'u1' }, { id: 't3', input: 'anon' }));
+        turn.flush();
+
+        // Main block: the primary agent's tone (`writer` is a hashed, non-profile id
+        // → violet, slot 2).
+        expect(turn.element.dataset.agent).toBe('writer');
+        expect(turn.element.style.getPropertyValue('--agent-color')).toBe('#a78bfa');
+        expect(turn.element.style.getPropertyValue('--agent-line')).toBe('rgba(167, 139, 250, 0.6)');
+
+        // Nested blocks: each tile is painted; the same agent is the same tone, twice.
+        // `helper` hashes to teal (slot 5).
+        const tiles = [...turn.element.nextElementSibling!.querySelectorAll<HTMLElement>('.thread-tile')];
+        expect(tiles.map((tile) => tile.dataset.agent)).toEqual(['helper', 'helper', undefined]);
+        expect(tiles.map((tile) => tile.style.getPropertyValue('--agent-line'))).toEqual([
+            'rgba(45, 212, 191, 0.6)',
+            'rgba(45, 212, 191, 0.6)',
+            // Unknown/unnamed agent keeps the neutral fallback, and `data-agent` is
+            // absent (cleared) rather than an empty identity.
+            'rgba(139, 148, 167, 0.55)'
+        ]);
+        expect(tiles.map((tile) => tile.style.getPropertyValue('--agent-color'))).toEqual([
+            '#2dd4bf',
+            '#2dd4bf',
+            '#8b94a7'
+        ]);
+        expect(tiles[2].hasAttribute('data-agent')).toBe(false);
+        // The ROW uses the same neutral semantics (no `data-agent=""` raw value).
+        expect(tiles[2].parentElement?.hasAttribute('data-agent')).toBe(false);
+
+        // No role label anywhere in the transcript, and hierarchy is only indentation
+        // (the host nests, nothing else changes the block).
+        expect(turn.element.querySelectorAll('.thread-role, .agent-role')).toHaveLength(0);
+        expect(turn.element.nextElementSibling!.querySelectorAll('.thread-role')).toHaveLength(0);
+    });
+
+    // R3 parity: the nested tile MIRRORS its row's state and expansion, which is what
+    // lets styles.css style main and nested blocks with one grouped selector
+    // (`:is(.tile, .thread-tile)`). The CSS itself is pinned in thread-style.test.ts;
+    // this pins the DOM half so a mirrored property cannot silently stop updating.
+    it('mirrors the nested row state and expansion onto the block surface', () => {
+        const board = mount();
+        const turn = board.begin('mirror');
+
+        turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+        turn.apply(delegateCall('helper', 'task', 'd1'));
+        turn.apply(
+            withThread({ type: 'start', agent: 'helper', model: 'h1' }, { id: 't1', callId: 'd1', input: 'task' })
+        );
+
+        const row = threadRows(turn)[0];
+        const tile = row.querySelector<HTMLElement>('.thread-tile');
+        expect(row.dataset.state).toBe('streaming');
+        expect(tile?.dataset.state).toBe('streaming');
+        expect(tile?.classList.contains('is-expanded')).toBe(false);
+
+        const button = row.querySelector<HTMLButtonElement>('.thread-select');
+        button?.click();
+        expect(row.classList.contains('is-expanded')).toBe(true);
+        // The tile carries the same marker, so `:is(.tile, .thread-tile).is-expanded`
+        // paints the nested entry's expanded frame exactly like the main tile's.
+        expect(tile?.classList.contains('is-expanded')).toBe(true);
+
+        turn.apply(withThread({ type: 'done', agent: 'helper', message: doneMessage('helper') }, { id: 't1' }));
+        expect(row.dataset.state).toBe('done');
+        expect(tile?.dataset.state).toBe('done');
+    });
+
+    // R3: a FLAT legacy section (a second agent the stream cannot attribute to an
+    // invocation) is still an agent-owned block: it must be a direct child of
+    // `.tile-flow` with `data-role="subagent"`, the only shape styles.css outlines.
+    // The primary section is the tile's own content and is deliberately excluded.
+    it('marks a flat legacy subagent section so it can carry its own outline', () => {
+        const board = mount();
+        const turn = board.begin('legacy ctx.run');
+
+        turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+        turn.apply({ type: 'start', agent: 'helper', model: 'h2' });
+
+        const flow = turn.element.querySelector('.tile-flow');
+        const flat = [...(flow?.children ?? [])].filter((child) => child.classList.contains('agent'));
+
+        expect(flat.map((node) => node.getAttribute('data-role'))).toEqual(['primary', 'subagent']);
+        expect(flat[0].matches(".tile-flow > .agent[data-role='subagent']")).toBe(false);
+        expect(flat[1].matches(".tile-flow > .agent[data-role='subagent']")).toBe(true);
+        // It keeps the agent's own colour, which the outline reads.
+        expect((flat[1] as HTMLElement).style.getPropertyValue('--agent-line')).toBe(
+            'rgba(45, 212, 191, 0.6)'
+        );
+    });
+
+    // R4: a collapsed entry is ONE row — the header button holds a single row that
+    // contains the name, the ellipsised preview and the status. The old layout put
+    // the preview on a second line.
+    it('renders a collapsed entry as a single header row', () => {
+        const board = mount();
+        const turn = board.begin('one line');
+        turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+        turn.apply(delegateCall('helper', 'a very long delegated task description', 'd1'));
+
+        const row = threadRows(turn)[0];
+        const select = row.querySelector<HTMLElement>('.thread-select');
+        const top = select?.querySelector<HTMLElement>('.thread-top');
+
+        // One child element in the button, and every item lives inside that row.
+        expect([...(select?.children ?? [])].map((child) => child.className)).toEqual(['thread-top']);
+        expect([...(top?.children ?? [])].map((child) => child.className)).toEqual([
+            'thread-name',
+            'thread-preview',
+            'thread-status'
+        ]);
+        expect(top?.querySelector('.thread-preview')?.textContent).toBe(
+            'a very long delegated task description'
+        );
+        expect(top?.querySelector('.thread-status')?.textContent).toBe('queued');
+
+        // Expansion is unchanged: the body opens and the header row stays a row
+        // (the preview is replaced by the full Markdown task in the body).
+        const button = select as HTMLButtonElement;
+        button.click();
+        expect(row.classList.contains('is-expanded')).toBe(true);
+        expect(button.getAttribute('aria-expanded')).toBe('true');
+        expect(row.querySelector('.thread-body')?.contains(row.querySelector('.thread-prompt'))).toBe(true);
     });
 });

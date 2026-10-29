@@ -113,8 +113,45 @@ describe('syntaxCheck', () => {
             })
         ).resolves.toBe(true);
 
-        await expect(fileRead(['executed.txt'])).rejects.toThrow();
-        await expect(fileRead(['executed-js.txt'])).rejects.toThrow();
+        // A missing path is now a not-found ENTRY (R1), so "the code did not run" is
+        // proven by the ENOENT error on that entry instead of a thrown call.
+        await expect(fileRead(['executed.txt', 'executed-js.txt'])).resolves.toEqual({
+            files: [
+                {
+                    path: join(workdir, 'executed.txt'),
+                    content: '',
+                    startLine: 1,
+                    endLine: 0,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 0,
+                    error: {
+                        code: 'ENOENT',
+                        message:
+                            'fileRead could not find "executed.txt": no such file or directory (ENOENT).'
+                    }
+                },
+                {
+                    path: join(workdir, 'executed-js.txt'),
+                    content: '',
+                    startLine: 1,
+                    endLine: 0,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 0,
+                    error: {
+                        code: 'ENOENT',
+                        message:
+                            'fileRead could not find "executed-js.txt": no such file or directory (ENOENT).'
+                    }
+                }
+            ],
+            truncated: false,
+            bytes: 0,
+            contentBudget: FILE_READ_CONTENT_BUDGET
+        });
     });
 
     it('rejects an unsupported language instead of guessing', async () => {
@@ -324,8 +361,31 @@ describe('file tools', () => {
         });
     });
 
-    it('surfaces a missing file as a thrown error', async () => {
-        await expect(fileRead(['nope/missing.txt'])).rejects.toThrow();
+    it('reports a missing file as an ordered not-found entry', async () => {
+        // R1: a missing path is data now, not a thrown error. The entry keeps the
+        // absolute resolved path, empty content, 0 bytes, and the ENOENT error.
+        await expect(fileRead(['nope/missing.txt'])).resolves.toEqual({
+            files: [
+                {
+                    path: join(workdir, 'nope/missing.txt'),
+                    content: '',
+                    startLine: 1,
+                    endLine: 0,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 0,
+                    error: {
+                        code: 'ENOENT',
+                        message:
+                            'fileRead could not find "nope/missing.txt": no such file or directory (ENOENT).'
+                    }
+                }
+            ],
+            truncated: false,
+            bytes: 0,
+            contentBudget: FILE_READ_CONTENT_BUDGET
+        });
     });
 });
 

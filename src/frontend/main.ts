@@ -38,8 +38,10 @@
 // permission.
 //
 // Agent TEAM editing is deliberately scoped to *new* sessions. A saved session
-// carries a frozen `harnessDefinition` for its member list and promotion order; the
-// row renders those and explains why the team is locked, with a New session action.
+// carries a frozen `harnessDefinition` for its member list and promotion order;
+// the row renders those with its controls disabled. R7: there is no lock notice
+// and no in-row "New session" link — the Sessions rail's own New session button
+// is the independent way to start an editable conversation.
 //
 // Agent MODELS are live (R2): `SessionSnapshot.agentModels` is the session's current
 // effective map, so a tile dropdown edits the conversation on screen through
@@ -56,12 +58,12 @@
 //
 // Activity: every `HarnessEvent` names an agent, and the live set per instance
 // draws a rotating ring on that agent's tile (ui/activity.ts, styles.css). Start
-// activates, done/error removes only that agent, and terminal/cancel/reset/switch/
+// activates, done/error removes only that agent, and terminal/cancel/switch/
 // pagehide clear everything. A hydrated or polled RUNNING turn derives activity
 // from its own events; settled history never lights a tile.
 //
-// Run/cancel is single-flight and instance-scoped: the stop button uses the
-// instance that started the run (never "whatever is selected now"), and harness
+// Run/cancel is single-flight and instance-scoped: the composer's stop action uses
+// the instance that started the run (never "whatever is selected now"), and harness
 // switching and TEAM editing is disabled while a run is in flight. Model edits are
 // not a team edit: PATCH /sessions/:id applies to the next request without
 // cancelling the stream (R2).
@@ -86,13 +88,13 @@ import {
     cancelSession,
     createHarness,
     createSession,
+    deleteSession,
     enqueueTask,
     getSession,
     listProviderModels,
     listSessions,
     loadBootstrap,
     observeSession,
-    resetSession,
     updateHarness,
     updateSession
 } from './api';
@@ -113,6 +115,7 @@ import {
 } from './contract';
 import { createCreateHarnessPanel } from './ui/create-harness';
 import { createAgentRow } from './ui/agents';
+import { composerActionOf, composerFieldHeight } from './ui/composer';
 import { applyActivity, activityOfTurns, paintActivity } from './ui/activity';
 import { highlightCode, looksLikeJson, prettyJson } from './ui/markdown';
 import { applyPanels, createPanelHost, mediaOfTurns } from './ui/panels';
@@ -1322,23 +1325,107 @@ stage.id = 'harness-tabpanel';
 stage.setAttribute('role', 'tabpanel');
 stage.setAttribute('aria-labelledby', 'harness-tab-chat');
 
+// Composer (R9/R10): ONE input field with ONE action inside it.
+//
+//   - The textarea starts at a single row (`rows = 1`) and grows with its content
+//     up to the stylesheet cap, then scrolls. `autoGrow` below is the only writer
+//     of its inline height; the cap comes from `.composer-field .composer-input`.
+//   - The action button is positioned inside the box, bottom-right, and keeps that
+//     spot in every state (styles.css `.composer-action`). Its meaning follows the
+//     state matrix in `ui/composer.ts`:
+//         text present           -> submit (chevron/play); while a run is in flight
+//                                   the same control queues the task (R4 preserved)
+//         empty + pending work   -> stop (X)
+//         empty + idle           -> no control at all
+//   - Reset is gone (R10). Starting over is the Sessions rail's New session; the
+//     server still owns POST /sessions/:id/reset for other clients (untouched).
 const composer = el('form', 'composer');
+// The field is the positioning context for the action, so the button travels with
+// the box as it grows instead of sitting in a separate column.
+const composerField = el('div', 'composer-field');
 const input = el('textarea', 'input composer-input');
-input.rows = 3;
+input.rows = 1;
+// R9 accessibility: the field has a real accessible name, not just a placeholder
+// (placeholders disappear on input and are not a label). The action button's name is
+// painted per state in `paintComposer`.
+input.setAttribute('aria-label', 'Task message');
 input.placeholder = 'Ask the harness something…  (Enter to run, Shift+Enter for a newline)';
 input.spellcheck = false;
 
-const actions = el('div', 'composer-actions');
-const runButton = el('button', 'button primary run', 'Run');
-runButton.type = 'submit';
-runButton.disabled = true;
-const stopButton = el('button', 'button stop', 'Stop');
-stopButton.type = 'button';
-stopButton.disabled = true;
-const resetButton = el('button', 'button reset', 'Reset');
-resetButton.type = 'button';
-actions.append(runButton, stopButton, resetButton);
-composer.append(input, actions);
+// One button, switched by state — never two visible controls. It starts hidden
+// (idle + empty) and type=submit so a future paint cannot submit a blank field
+// by accident; `paintComposer` keeps type and label in sync with the matrix.
+const actionButton = el('button', 'composer-action');
+actionButton.type = 'submit';
+actionButton.hidden = true;
+composerField.append(input, actionButton);
+composer.append(composerField);
+
+// R9: grow/shrink the field with its content. The inline height is cleared FIRST so
+// a deleted line measures the smaller content honestly; `composerFieldHeight` adds
+// the border back (border-box) and clamps to the CSS cap. jsdom has no layout
+// (scrollHeight === 0), so the stylesheet's one-row height is left in place there.
+const autoGrow = (): void => {
+    input.style.height = 'auto';
+
+    const styles = getComputedStyle(input);
+    const borders =
+        (Number.parseFloat(styles.borderTopWidth) || 0) +
+        (Number.parseFloat(styles.borderBottomWidth) || 0);
+    const height = composerFieldHeight(
+        input.scrollHeight,
+        borders,
+        Number.parseFloat(styles.maxHeight)
+    );
+
+    input.style.height = height > 0 ? `${height}px` : '';
+};
+
+// Paint the single action from the same `pending` value `paintControls` uses: the
+// local run flag OR the selected session's server-owned queue.
+//
+// Labels/titles are the accessible names (the glyph is decorative): the button is a
+// real <button>, so both pointer and keyboard activate it. In submit mode it is the
+// form's submit button, which keeps Enter and click on the exact same path as before
+// this change (R10: queuing behavior untouched). In stop mode it is a plain button
+// wired to `stopRun`.
+const paintComposer = (): void => {
+    const pending = running || current?.pending === true;
+    const action = composerActionOf(input.value, pending);
+
+    actionButton.dataset.action = action;
+    actionButton.hidden = action === 'none';
+    // Submit follows the old Run guard exactly (the short enqueue window + boot);
+    // stop is always live in its state because that state requires pending work.
+    actionButton.disabled = action === 'submit' ? submitting || !booted : false;
+    actionButton.type = action === 'stop' ? 'button' : 'submit';
+
+    if (action === 'stop') {
+        actionButton.textContent = '×';
+        actionButton.setAttribute('aria-label', 'Stop the running task');
+        actionButton.title = 'Stop';
+        return;
+    }
+
+    actionButton.textContent = '▶';
+    actionButton.setAttribute('aria-label', 'Send task');
+    actionButton.title = 'Send (Enter)';
+};
+
+// Typing is the only thing that changes the action outside a paintControls pass:
+// measure the new height and re-derive the icon as text appears or disappears.
+input.addEventListener('input', () => {
+    autoGrow();
+    paintComposer();
+});
+
+// R9 responsive: a layout reflow (phone rail opening, window resize, rotation) changes
+// the wrap width without a keystroke, so the last inline height would clip the text.
+// Re-measure; the browser resizes the element before this listener runs.
+window.addEventListener('resize', () => {
+    autoGrow();
+});
+
 
 // Tool-panel hosts (R21.3). Three named locations, one renderer:
 //   - `center` sits above the turn grid, inside the chat column;
@@ -1477,13 +1564,13 @@ type Instance = {
     activity: Set<string>;
     // Tool-contributed panels for THIS instance/session (R21.3), keyed by
     // tool+panel id. Recomputed from the server's turns on every applySnapshot
-    // (reload, poll, session open, reset) and upserted live from
+    // (reload, poll, session open, enqueue answer) and upserted live from
     // `tool_result.ui` and from manual tool results. Never shared across
     // instances: switching harness can neither show nor leak another chat's board.
     panels: Map<string, PanelMedia>;
     // Work the server has not finished for this instance's session (R4): a
-    // running task, a retained queued task, or a non-zero queueDepth. Drives Stop
-    // (enabled), Reset (disabled) and the topbar pill. The composer is NOT gated
+    // running task, a retained queued task, or a non-zero queueDepth. Drives the
+    // composer's stop state (R10) and the topbar pill. The composer is NOT gated
     // by it: submitting another task is how a queue is built.
     pending: boolean;
     // The latest authoritative turn records for this session, keyed by id. Kept so
@@ -1513,11 +1600,11 @@ let toolEntries: readonly ToolDescriptor[] = [];
 let activeTab: 'chat' | 'tools' = 'chat';
 
 // Single-flight submit state (R4). `running` means the selected session has work
-// the server has not finished; it drives Stop/Reset/harness locks but NOT the
-// composer, because submitting another task while one runs is exactly how the
-// queue is built. `submitting` covers only the short window between pressing Run
-// and the POST /tasks answer, so a double submit cannot create two sessions or
-// two copies of the same task.
+// the server has not finished; it drives the composer's stop state and the harness
+// locks, but NOT submission, because submitting another task while one runs is
+// exactly how the queue is built. `submitting` covers only the short window between
+// pressing the submit action and the POST /tasks answer, so a double submit cannot
+// create two sessions or two copies of the same task.
 let running = false;
 let submitting = false;
 let booted = false;
@@ -1660,7 +1747,7 @@ const paintTabs = (): void => {
     stage.setAttribute('aria-labelledby', chat ? 'harness-tab-chat' : 'harness-tab-tools');
 };
 
-// Remove every activity ring. Called on terminal frames, cancel, reset, new
+// Remove every activity ring. Called on terminal frames, cancel, delete, new
 // session, harness switch and pagehide: after those there is no in-flight agent
 // in view, and a leftover ring would claim work that is not happening.
 const clearActivity = (): void => {
@@ -1833,14 +1920,6 @@ const renderAgents = (instance: Instance): HTMLElement => {
     // session locks the row.
     const editable = !locked && !running && !submitting;
 
-    const lockReason = locked
-        ? instance.frozen !== undefined
-            ? 'This saved session keeps the agent team it started with.'
-            : 'This saved session cannot change its agent team here.'
-        : running
-          ? 'Stop the run before changing the agent team.'
-          : undefined;
-
     // Effective model per member.
     //
     // Saved session (locked): `SessionSnapshot.agentModels` is the session's LIVE
@@ -1896,7 +1975,6 @@ const renderAgents = (instance: Instance): HTMLElement => {
         primary: primaryOf(display),
         agents: agentLibrary,
         editable,
-        ...(lockReason === undefined ? {} : { lockReason }),
         models: {
             models,
             catalogue: modelIds,
@@ -1913,7 +1991,6 @@ const renderAgents = (instance: Instance): HTMLElement => {
             onChange: (name, model) => void setAgentModel(name, model)
         },
         activity: [...instance.activity],
-        onNewSession: () => newSession(),
         onSelectPrimary: (name) => void selectPrimary(name),
         onAdd: (name) => void addAgent(name),
         onRemove: (name) => void removeAgent(name)
@@ -2345,6 +2422,10 @@ const buildTools = (entries: readonly ToolDescriptor[]): void => {
 // ---------------------------------------------------------------------------
 
 const upsertSession = (session: SessionSnapshot): void => {
+    // R8: a deleted conversation is never re-entered into the directory cache by a
+    // late answer (see `deletedSessions` and `forgetDeletedSession`).
+    if (deletedSessions.has(session.id)) return;
+
     const index = sessions.findIndex((candidate) => candidate.id === session.id);
     if (index >= 0) sessions[index] = session;
     else sessions.push(session);
@@ -2356,17 +2437,202 @@ const shortId = (id: string): string => (id.length <= 8 ? id : id.slice(0, 8));
 // Sessions belong to one canonical harness. The rail shows only the selected one,
 // which is the "locked to selected harness" rule in R3 — opening a row can never
 // silently move the reader to another harness, because no other row is offered.
+//
+// R8 defense in depth: a tombstoned id (`deletedSessions`) is never rendered, even
+// if some other path assigned it into the cache. The authoritative filter is at the
+// assignment sites (`refreshSessions`, `upsertSession`), but the RENDER projection
+// is the last line of defence, so a deleted conversation cannot reappear as a row.
 const visibleSessions = (): SessionSnapshot[] => {
     if (selectedName === undefined) return [];
 
     return sessions.filter(
-        (session) => canonicalHarnessName(session.harness, presetDescriptors) === selectedName
+        (session) =>
+            !deletedSessions.has(session.id) &&
+            canonicalHarnessName(session.harness, presetDescriptors) === selectedName
     );
+};
+
+// ---------------------------------------------------------------------------
+// Deleting a session (R8)
+// ---------------------------------------------------------------------------
+//
+// Delete is PERMANENT. The server (src/server/api.ts DELETE /sessions/:id ->
+// SessionStore.remove, src/server/sessions.ts) aborts an active run, discards the
+// retained queue, closes /events watchers, and rewrites state.json without the
+// record before answering. The UI therefore never offers it as a one-click icon:
+// `.session-delete` only OPENS the inline `.session-confirm`, cancel sends no
+// request at all, and only a confirm sends exactly one DELETE.
+//
+// Local state is deliberately module-scoped, not per row: `renderSessions` may
+// rebuild the rail at any time (a refresh, a snapshot, a new submit) and the open
+// confirmation must not vanish or be duplicated by that rebuild.
+
+// Session ids with a DELETE currently in flight. Doubles as the dedupe guard: a
+// second confirm click (or a double pointer event) is a no-op.
+const removingSessions = new Set<string>();
+
+// Tombstones for ids this page has deleted. Every asynchronous path that can
+// deliver an authoritative session (the 202 body of POST /tasks, a GET /events
+// frame, the GET /sessions/:id polling fallback, an openSession/enqueue/model PATCH
+// answer) checks this before applying anything: the server record is gone, so a
+// late answer must not re-point a card at it or re-add its row (R8). Ids are
+// UUIDs, so a tombstone can never hide a different, later session.
+const deletedSessions = new Set<string>();
+
+// The one session whose inline confirmation is open, if any. Opening a second
+// row replaces it, so two confirms can never be open at once.
+let confirmingDelete: string | undefined;
+
+// A delete must not race an operation that owns the same conversation:
+//   - `submitting` is the POST /tasks window (the run() flow),
+//   - `savingAgents` is a harness/team PATCH or a session-model PATCH,
+//   - a pending session creation (creatingSessions) would make "which session is
+//     current" ambiguous mid-flight,
+//   - and nothing may be deleted before the catalogue has booted.
+// Runs themselves are NOT a reason to block: the server stops the run as part of
+// the delete, which is exactly what the confirmation warns about.
+const deletionBlocked = (): boolean =>
+    !booted || submitting || savingAgents || creatingSessions > 0;
+
+// First step: open (or close) the inline confirmation. No request is sent here.
+const requestDeleteConfirmation = (id: string): void => {
+    if (deletionBlocked() || removingSessions.has(id)) return;
+
+    confirmingDelete = confirmingDelete === id ? undefined : id;
+    renderSessions();
+};
+
+// Second step's escape hatch: close the confirmation without any request.
+const cancelDelete = (): void => {
+    if (confirmingDelete === undefined) return;
+
+    confirmingDelete = undefined;
+    renderSessions();
+};
+
+// Drop every local trace of a session the server no longer holds. Used after a
+// successful DELETE, and after a 404 (the record is already gone — the desired
+// end state). It NEVER creates a replacement session: the card becomes an empty
+// harness view, exactly like `newSession`, and the frozen team is unlocked only
+// because no conversation is selected any more.
+const forgetDeletedSession = (id: string): void => {
+    // The tombstone is what keeps a late stream/poll/POST answer from resurrecting
+    // the conversation after its row is gone (see `deletedSessions`).
+    deletedSessions.add(id);
+
+    // The directory cache is what every later render (and `refreshSessions`) reads,
+    // so the row disappears from here first.
+    sessions = sessions.filter((session) => session.id !== id);
+
+    let wasCurrent = false;
+
+    for (const instance of instances.values()) {
+        // Sessions are one-to-one with their canonical harness, so this normally
+        // matches a single instance; the loop keeps a second stale pointer from
+        // ever outliving the record.
+        if (instance.sessionId !== id) continue;
+
+        // Stop observing the conversation on screen BEFORE clearing its id. The
+        // observer/poll guards key off `instance.sessionId`, so clearing first
+        // would also work — but aborting first means no frame can paint while this
+        // function runs.
+        if (instance === current) {
+            stopWatching();
+            stopPolling();
+            wasCurrent = true;
+        }
+
+        // Same state `newSession` clears, plus the frozen/live model maps: the
+        // deleted conversation must not leak its team, models or discovery into
+        // the empty view (R8).
+        instance.sessionId = undefined;
+        instance.frozen = undefined;
+        instance.sessionModels = undefined;
+        instance.sessionModel = undefined;
+        instance.discovered = undefined;
+        instance.pending = false;
+        instance.records.clear();
+        // The watermark belonged to the deleted conversation's clock.
+        instance.snapshotMark = undefined;
+        instance.panels.clear();
+        instance.view.clear();
+        // The conversation (and its outcome detail) is gone; nothing is left to
+        // report, and an empty view must not carry its transcript.
+        instance.view.setNotice(undefined);
+        instance.view.setTranscript('[]');
+    }
+
+    // The remembered pointer must not resurrect a deleted id on the next reload.
+    if (wasCurrent && loadRememberedSession() === id) forgetRememberedSession();
+
+    renderSessions();
+
+    if (!wasCurrent) return;
+
+    // No replacement is created. Clear the rings tied to the removed session,
+    // repaint the (now empty) card, and release the lock: `setBusy(false)` also
+    // re-enables the agent team and New session, since the server stopped whatever
+    // was running in the deleted conversation.
+    clearActivity();
+    renderHarnessChrome();
+    paintPanels();
+    runner.sync();
+    setBusy(false);
+};
+
+// Send the DELETE. Exactly one request per confirmed action: the row is marked
+// busy before the round trip, and every entry point re-checks the guards.
+const deleteSessionRow = async (id: string): Promise<void> => {
+    if (deletionBlocked() || removingSessions.has(id)) return;
+
+    confirmingDelete = undefined;
+    removingSessions.add(id);
+    // Paint the in-flight state (confirmation closed, control disabled).
+    renderSessions();
+
+    let removed = false;
+    let alreadyGone = false;
+
+    try {
+        await deleteSession(id);
+        removed = true;
+    } catch (error) {
+        // A 404 means the server holds no such session (deleted from another
+        // browser, or a stale id after a server restart). The end state the user
+        // asked for already holds, so the row is dropped without claiming our
+        // DELETE achieved it. `api.ts` keeps the wire contract unchanged; the
+        // message check is the same one `run()` uses for an unknown session.
+        if (messageOf(error).includes('Unknown session')) alreadyGone = true;
+        else {
+            // The row STAYS: nothing was removed. Rail operations report in the
+            // app-scoped pill (like a failed `refreshSessions`); a conversation
+            // pane note would describe whichever chat happens to be on screen.
+            setStatus('error', `delete session: ${messageOf(error)}`);
+        }
+    } finally {
+        removingSessions.delete(id);
+    }
+
+    if (!removed && !alreadyGone) {
+        // Failure: row visible again (enabled), confirmation closed, error shown.
+        renderSessions();
+        return;
+    }
+
+    forgetDeletedSession(id);
+    setStatus('idle', removed ? `session ${shortId(id)} deleted` : `session ${shortId(id)} was already gone`);
 };
 
 // Rows are buttons: keyboard reachable and self-explanatory with a status text
 // and turn count. The active row is marked for styling only — selection is state
 // in `current.sessionId`, not in this DOM.
+//
+// R8: every row is a `.session-row` WRAPPER around the select button and a
+// SIBLING `.session-delete` control. Buttons can never nest, so deletion is a
+// second button beside the row, and confirming it is an inline two-step action
+// (`.session-confirm`) rather than a browser dialog or a one-click delete.
+// The select button keeps its own `data-session-id`/`data-status`/`data-active`
+// as well, so the existing `.session[...]` styles and row queries keep working.
 const renderSessions = (): void => {
     sessionList.replaceChildren();
 
@@ -2393,6 +2659,11 @@ const renderSessions = (): void => {
     const activeId = current?.sessionId;
 
     for (const session of visible) {
+        const rowWrap = el('div', 'session-row');
+        rowWrap.dataset.sessionId = session.id;
+        rowWrap.dataset.status = session.status;
+        if (session.id === activeId) rowWrap.dataset.active = 'true';
+
         const row = el('button', 'session');
         row.type = 'button';
         row.dataset.sessionId = session.id;
@@ -2423,17 +2694,70 @@ const renderSessions = (): void => {
             void openSession(session.id);
         });
 
-        sessionList.append(row);
+        // Delete control. Disabled while a write owns the conversation, or while
+        // this row's own DELETE is in flight (see `deletionBlocked`).
+        const remove = el('button', 'session-delete');
+        remove.type = 'button';
+        remove.dataset.sessionId = session.id;
+        // A compact glyph with an explicit accessible name: the rail has no room
+        // for a word, and the inline confirmation carries the full warning.
+        remove.textContent = '×';
+        remove.setAttribute('aria-label', `Delete session ${shortId(session.id)}`);
+        remove.title = 'Delete this session permanently';
+        remove.disabled = deletionBlocked() || removingSessions.has(session.id);
+        remove.addEventListener('click', () => requestDeleteConfirmation(session.id));
+
+        rowWrap.append(row, remove);
+
+        // Inline confirmation for THIS row only. It states the two consequences
+        // the server guarantee implies: the record is gone for good, and any
+        // running/queued work in it is stopped.
+        if (confirmingDelete === session.id) {
+            const confirm = el('div', 'session-confirm');
+            confirm.dataset.sessionId = session.id;
+            confirm.setAttribute('role', 'group');
+            confirm.setAttribute('aria-label', `Confirm deleting session ${shortId(session.id)}`);
+            confirm.append(
+                el(
+                    'p',
+                    'session-confirm-text',
+                    'Delete this session permanently. Running or queued work in it stops.'
+                )
+            );
+
+            const yes = el('button', 'session-confirm-delete', 'Delete session');
+            yes.type = 'button';
+            yes.disabled = removingSessions.has(session.id);
+            yes.addEventListener('click', () => void deleteSessionRow(session.id));
+
+            const no = el('button', 'session-confirm-cancel', 'Cancel');
+            no.type = 'button';
+            // Cancel is a pure view change: it sends NO request.
+            no.addEventListener('click', () => cancelDelete());
+
+            confirm.append(yes, no);
+            rowWrap.append(confirm);
+        }
+
+        sessionList.append(rowWrap);
     }
 };
 
 // Re-read the directory. A failure is reported in the status pill; the list on
 // screen stays usable (it is the last answer the server gave).
+//
+// R8: a list read that STARTED before a DELETE can resolve after it. The server
+// answer is a snapshot of the moment it was produced, so assigning it raw would
+// rebuild the deleted row in the rail (the confirmed race: press Refresh, delete a
+// session, then release the older list). Every answer is therefore filtered
+// through the `deletedSessions` tombstones before it becomes the cache — the
+// delete is permanent locally too, not just until the next directory read.
 const refreshSessions = async (): Promise<void> => {
     refreshSessionsButton.disabled = true;
 
     try {
-        sessions = await listSessions();
+        const listed = await listSessions();
+        sessions = listed.filter((session) => !deletedSessions.has(session.id));
         renderSessions();
     } catch (error) {
         setStatus('error', `session list: ${messageOf(error)}`);
@@ -2444,7 +2768,8 @@ const refreshSessions = async (): Promise<void> => {
 
 // Does this snapshot still hold work? A running session status, an explicit
 // `queueDepth` (new server), or any running/queued turn record (authoritative even
-// when an older server omits queueDepth). Used for Stop/Reset and the pill.
+// when an older server omits queueDepth). Drives the composer's stop action and the
+// topbar pill.
 const queueDepthOf = (session: SessionSnapshot): number => {
     const depth = (session as { queueDepth?: unknown }).queueDepth;
     return typeof depth === 'number' && Number.isFinite(depth) && depth > 0 ? depth : 0;
@@ -2466,17 +2791,8 @@ const pendingOf = (session: SessionSnapshot): boolean => {
 //
 // R4: this RECONCILES the list (same id → merge in place) rather than
 // rebuilding it, so a reconnect/poll neither duplicates streamed text nor collapses
-// the reader's expanded turn. It also refreshes what the composer's neighbours need
-// to know: whether work is pending (Stop enabled, Reset disabled) and the activity
-// rings (only still-running records light an agent).
-// Draw a snapshot into its harness view. The turns are the authoritative
-// transcript; `messages` is the entry agent's own view of the same run and is
-// informational. The frozen definition, when sent, becomes the displayed team.
-//
-// R4: this RECONCILES the list (same id → merge in place) rather than
-// rebuilding it, so a reconnect/poll neither duplicates streamed text nor collapses
-// the reader's expanded turn. It also refreshes what the composer's neighbours need
-// to know: whether work is pending (Stop enabled, Reset disabled) and the activity
+// the reader's expanded turn. It also refreshes what the composer needs to know —
+// whether work is pending, which decides stop vs submit (R10) — and the activity
 // rings (only still-running records light an agent).
 //
 // Record where a snapshot sits in its session's monotonic timeline. EVERY answer
@@ -2503,6 +2819,11 @@ const markSnapshot = (instance: Instance, session: SessionSnapshot): void => {
 const CANCELLED_MESSAGE = 'The run was cancelled.';
 
 const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
+    // R8: a snapshot for a session this page deleted must never re-point the card
+    // at it. The tombstone covers the observer/poll/resync/openSession/enqueue
+    // continuations that were already in flight when the DELETE succeeded.
+    if (deletedSessions.has(session.id)) return;
+
     instance.sessionId = session.id;
 
     // Snapshot watermark (R2). `session.updatedAt` is monotonic on the server, so a
@@ -2581,7 +2902,7 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     }
 
     // R21.3: the tool panels are DERIVED from the server's recorded turns on every
-    // snapshot — reload, poll, session open, reset, terminal frame. A completed
+    // snapshot - reload, poll, session open, enqueue answer, terminal frame. A completed
     // turn's panels are valid scratch state (they describe work that happened), but
     // they never light an agent ring: activity above only reads a RUNNING turn.
     // Recomputation also means no cross-session leakage: the board is replaced with
@@ -2905,6 +3226,11 @@ const openSession = async (id: string): Promise<void> => {
         return;
     }
 
+    // R8: this read may have been in flight when the row was deleted (a DELETE is
+    // allowed while a session is being opened). The record is gone server-side, so
+    // a pre-delete answer must not reopen it or restore the remembered pointer.
+    if (deletedSessions.has(id)) return;
+
     // Opening a session keeps its canonical harness (including a legacy alias):
     // the row's harness is what is selected, so the chat never lands in another
     // harness's transcript.
@@ -2997,18 +3323,22 @@ const newSession = (): void => {
 // (b) whether a submit is in its short enqueue window.
 //
 // R4 keys:
-//   - Run stays ENABLED while a task runs: submitting another task is how the
-//     queue grows. Only `submitting` (the POST /tasks round trip) locks it.
-//   - Stop is enabled whenever work is pending, including a session observed after
-//     a reload (Stop then cancels ALL explicitly via cancelSession(id, true)).
-//   - Reset/New session/harness switching/tabs stay locked while pending, because
-//     they would tear down the view of a queue that is still running.
+//   - The composer's SUBMIT action stays ENABLED while a task runs: submitting
+//     another task is how the queue grows. Only `submitting` (the POST /tasks round
+//     trip) locks it — see `paintComposer`.
+//   - The composer switches to its STOP action whenever work is pending, including
+//     a session observed after a reload (Stop then cancels ALL explicitly via
+//     cancelSession(id, true)).
+//   - New session/harness switching/tabs stay locked while pending, because they
+//     would tear down the view of a queue that is still running. Reset is gone
+//     (R10), so there is no third composer control to paint.
 const paintControls = (): void => {
     const pending = running || current?.pending === true;
 
-    runButton.disabled = submitting || !booted;
-    stopButton.disabled = !pending;
-    resetButton.disabled = submitting || pending;
+    // R9/R10: the composer's single action is painted from the same state as every
+    // other control. It is the only submit/stop control in the shell.
+    paintComposer();
+
     newSessionButton.disabled = submitting || pending || !booted;
     createHarnessButton.disabled = submitting || pending || !booted;
 
@@ -3021,6 +3351,15 @@ const paintControls = (): void => {
     toolsTab.disabled = submitting || pending;
     for (const row of sessionList.querySelectorAll<HTMLButtonElement>('.session')) {
         row.disabled = submitting;
+    }
+
+    // R8: deletion is a write, so it is disabled for the same conflicting windows
+    // that lock submits/saves (and for a row whose own DELETE is in flight). The
+    // click handler re-checks `deletionBlocked`, so this is only the visible state.
+    const deletionsBlocked = deletionBlocked();
+    for (const button of sessionList.querySelectorAll<HTMLButtonElement>('.session-delete')) {
+        const id = button.dataset.sessionId;
+        button.disabled = deletionsBlocked || (id !== undefined && removingSessions.has(id));
     }
 
     // The agent row follows the pending lock for TEAM edits; models remain live
@@ -3125,6 +3464,9 @@ const run = async (): Promise<void> => {
     // `queued` and neutral: no ring, no clock.
     const turn = instance.view.begin(prompt);
     input.value = '';
+    // R9: the field shrinks back to one row immediately; the inline height from the
+    // filled state would otherwise leave a tall empty box until the next keystroke.
+    autoGrow();
     submitting = true;
     paintControls();
     // No header write: the optimistic tile already shows the submit lifecycle, and
@@ -3204,21 +3546,23 @@ composer.addEventListener('submit', (event) => {
 });
 
 input.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && !event.shiftKey) {
+    // Enter submits, Shift+Enter inserts a newline. `isComposing` keeps an IME's
+    // confirmation Enter from submitting half-typed text (it is not typing yet).
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
         event.preventDefault();
         void run();
     }
 });
 
-stopButton.addEventListener('click', () => {
+// Stop is explicit and TOTAL (R4): `{ all: true }` makes the server abort the
+// active task AND cancel every retained queued record, so the queue drains instead
+// of immediately starting the next task. Merely aborting the observer would only
+// unsubscribe — work would keep running.
+const stopRun = (): void => {
     const instance = current;
     const sessionId = instance?.sessionId;
     if (instance === undefined || sessionId === undefined || !instance.pending) return;
 
-    // Stop is explicit and TOTAL (R4): `{ all: true }` makes the server abort the
-    // active task AND cancel every retained queued record, so the queue drains
-    // instead of immediately starting the next task. Merely aborting the observer
-    // would only unsubscribe — work would keep running.
     stopWatching();
 
     // The cancel round trip is async; the tile keeps its last state until the
@@ -3241,59 +3585,17 @@ stopButton.addEventListener('click', () => {
             void resyncSession(instance, sessionId);
             void refreshSessions();
         });
-});
+};
 
-resetButton.addEventListener('click', () => {
-    const instance = current;
-    if (instance === undefined) return;
+// R10: one action, two roles. Submit mode is the form's own submit button (Enter and
+// pointer take the existing run() path, queueing included); only stop mode needs a
+// direct listener. The state check makes a late click after the queue drained a
+// no-op instead of a stale cancel.
+actionButton.addEventListener('click', (event) => {
+    if (actionButton.dataset.action !== 'stop') return;
 
-    if (running) {
-        instance.view.notice('cancel the running task before resetting');
-        return;
-    }
-
-    const sessionId = instance.sessionId;
-    // Reset is a server-side conversation wipe; the observer for its queue must
-    // stop first (unsubscribe only) or late frames would repaint wiped turns.
-    stopWatching();
-    instance.view.clear();
-    // The wiped conversation has no outcome left to report.
-    instance.view.setNotice(undefined);
-    instance.view.setTranscript('[]');
-    // Local reset clears the board immediately, before the server answers: the
-    // conversation is being emptied, so its tool panels and queue state are too.
-    instance.panels.clear();
-    instance.pending = false;
-    instance.records.clear();
-    instance.snapshotMark = undefined;
-    paintPanels();
-    clearActivity();
-    setStatus('idle');
-    setBusy(false);
-
-    if (sessionId === undefined) return;
-
-    void resetSession(sessionId).then(
-        (session) => {
-            // The reset answer is a full snapshot with an empty turn list; draw
-            // it rather than guessing that clearing locally was equivalent.
-            applySnapshot(instance, session);
-            upsertSession(session);
-            renderSessions();
-        },
-        (error: unknown) => {
-            // The server may have restarted since this card was opened. Forget the
-            // stale id so the next run creates a fresh session.
-            instance.sessionId = undefined;
-            instance.frozen = undefined;
-            instance.view.setNotice(undefined);
-            if (instance === current) forgetRememberedSession();
-            // The failure stays on this conversation (pane notice); the topbar pill
-            // is app-scoped and is not turned red for a session operation (R1).
-            instance.view.notice(`reset failed: ${messageOf(error)}`, 'error');
-            void refreshSessions();
-        }
-    );
+    event.preventDefault();
+    stopRun();
 });
 
 // ---------------------------------------------------------------------------
@@ -3487,7 +3789,9 @@ const boot = async (): Promise<void> => {
         }
 
         booted = true;
-        runButton.disabled = false;
+        // R9/R10: paint the single composer action now that submitting is allowed
+        // (it stays hidden while the field is empty and nothing is pending).
+        paintComposer();
         selectHarness(presetDescriptors[0].name);
 
         // Resume the last conversation this browser looked at, but only if this

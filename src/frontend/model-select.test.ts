@@ -365,18 +365,20 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     await flush();
     await flush();
 
-    // The TEAM is still frozen: promotion, add and remove are disabled, and the
-    // existing explanation plus New session affordance stay on screen.
+    // The TEAM is still frozen: promotion, add and remove are disabled. R7: there
+    // is no lock notice and no in-row "New session" link; the Sessions rail keeps
+    // its own independent New session action, which stays usable.
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         'Viewing a saved session · agent team frozen'
     );
     expect(byClass('.agent-main', 'button').disabled).toBe(true);
     expect(byClass('.agent-add', 'button').disabled).toBe(true);
     expect(byClass('.agent-remove', 'button').disabled).toBe(true);
-    expect(document.querySelector('.agent-lock-text')?.textContent).toBe(
-        'This saved session keeps the agent team it started with.'
-    );
-    expect(document.querySelector('.agent-lock .link-button')?.textContent).toBe('New session');
+    expect(document.querySelector('.agent-lock')).toBeNull();
+    expect(document.querySelector('.agent-row-wrap .link-button')).toBeNull();
+    const railNewSession = byClass('.new-session', 'button');
+    expect(railNewSession.textContent).toBe('New session');
+    expect(railNewSession.disabled).toBe(false);
 
     const selects = modelSelects();
     // Effective live values (not the live descriptor's map, which only has
@@ -492,11 +494,13 @@ it('changes a RUNNING session’s model without cancelling the stream', async ()
             body: { agentModels: { instruct: 'm3', summarizer: 'm1' } }
         }
     ]);
-    // Nothing cancels or restarts the run: no cancel route. Stop is AVAILABLE
-    // because this session has pending work (R4: a reloaded running session can be
-    // stopped, and Stop cancels all); it does not own an observation either way.
+    // Nothing cancels or restarts the run: no cancel route. The composer's stop
+    // action is AVAILABLE because this session has pending work (R4/R10: a reloaded
+    // running session can be stopped, and Stop cancels all); it does not own an
+    // observation either way.
     expect(calls.some((call) => call.url.endsWith('/cancel'))).toBe(false);
-    expect(byClass('.stop', 'button').disabled).toBe(false);
+    expect(byClass('.composer-action', 'button').dataset.action).toBe('stop');
+    expect(byClass('.composer-action', 'button').disabled).toBe(false);
 
     expect(modelSelects().map((select) => select.value)).toEqual(['m3', '']);
     // The save is config feedback; the session's run state stays on its tile, so the

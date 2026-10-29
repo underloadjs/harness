@@ -90,7 +90,7 @@ describe('createTurnBoard', () => {
         expect(turn.element.querySelector('.tool-state')?.textContent).toBe('ok');
     });
 
-    it('labels a delegated agent as a subagent and keeps the tile open until the stream ends', () => {
+    it('colours a delegated agent block and keeps the tile open until the stream ends', () => {
         const { board } = mount();
         const turn = board.begin('agentDelegate');
 
@@ -99,10 +99,22 @@ describe('createTurnBoard', () => {
         turn.apply({ type: 'start', agent: 'helper', model: 'm2' });
         turn.apply({ type: 'text', agent: 'helper', delta: 'done' });
 
+        // R3: a delegated agent is NOT labelled; it is an agent section like any
+        // other, told apart by nesting and its own colour (see the assertion below).
         const agents = [...turn.element.querySelectorAll('.agent')];
         expect(agents.map((agent) => agent.getAttribute('data-agent'))).toEqual(['writer', 'helper']);
         expect(agents.map((agent) => agent.getAttribute('data-role'))).toEqual(['primary', 'subagent']);
-        expect(agents[1]?.querySelector('.agent-role')?.textContent).toBe('subagent');
+        // R3: no visible role badge — the nesting plus the agent colour say who
+        // owns the block. `data-role` above is the structural attribute only.
+        expect(agents[1]?.querySelector('.agent-role')).toBeNull();
+        expect(turn.element.querySelectorAll('.agent-role, .thread-role')).toHaveLength(0);
+        // Each section carries its own agent colour (name colour + outline var).
+        // `writer`/`helper` are not built-in profile ids, so they use the palette
+        // hash: writer → violet (slot 2), helper → teal (slot 5).
+        expect(agents.map((agent) => agent.style.getPropertyValue('--agent-color'))).toEqual([
+            '#a78bfa',
+            '#2dd4bf'
+        ]);
 
         // `done` closes the agent turn, not the user turn: the primary still has
         // to return from its tool call.
@@ -115,6 +127,52 @@ describe('createTurnBoard', () => {
         expect(turn.element.dataset.state).toBe('done');
         expect(turn.element.querySelector('.tile-status-text')?.textContent).toBe('done');
         expect(turn.element.querySelector('.tile-meta')?.textContent).toBe('2 agents · 1 tool call · m1 · idle');
+    });
+
+    it('paints the main block with its agent colour and keeps an unnamed tile neutral', () => {
+        const { board } = mount();
+        const turn = board.begin('colour identity');
+
+        // Before any event names an agent the tile is NOT painted: the `:root`
+        // fallback in styles.css supplies the neutral tone, so the tile cannot
+        // borrow palette slot 0 and imply an identity it does not know yet.
+        expect(turn.element.hasAttribute('data-agent')).toBe(false);
+        expect(turn.element.style.getPropertyValue('--agent-color')).toBe('');
+
+        turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+        // R3: the main block is agent-owned exactly like a nested block. `writer` is
+        // not a built-in profile id, so it takes the palette hash (violet, slot 2).
+        expect(turn.element.dataset.agent).toBe('writer');
+        expect(turn.element.style.getPropertyValue('--agent-color')).toBe('#a78bfa');
+        expect(turn.element.style.getPropertyValue('--agent-line')).toBe('rgba(167, 139, 250, 0.6)');
+
+        // A different primary agent gets a different, deterministic tone.
+        const other = board.begin('second');
+        other.apply({ type: 'start', agent: 'researcher', model: 'm1' });
+        expect(other.element.dataset.agent).toBe('researcher');
+        expect(other.element.style.getPropertyValue('--agent-line')).toBe('rgba(244, 114, 182, 0.6)');
+    });
+
+    it('keeps an unattributable placeholder agent neutral on both the tile and its section', () => {
+        const { board } = mount();
+        const turn = board.begin('orphan result');
+
+        // A result-only legacy frame with no start and no tool_call: the UI cannot
+        // name an agent, so it renders the `unknown` placeholder section. The tile and
+        // that section must agree on the SAME neutral tone (before the correction the
+        // section hashed the literal 'unknown' to cyan while the tile stayed neutral).
+        turn.apply({ type: 'tool_result', agent: 'ghost', name: 'fileRead', content: 'ok', isError: false });
+
+        const agent = turn.element.querySelector<HTMLElement>('.agent');
+        expect(agent?.dataset.agent).toBeUndefined();
+        expect(agent?.dataset.role).toBe('primary');
+        expect(agent?.style.getPropertyValue('--agent-color')).toBe('#8b94a7');
+        expect(agent?.style.getPropertyValue('--agent-line')).toBe('rgba(139, 148, 167, 0.55)');
+
+        // The tile: same neutral tone, and no `data-agent` identity at all.
+        expect(turn.element.style.getPropertyValue('--agent-color')).toBe('#8b94a7');
+        expect(turn.element.style.getPropertyValue('--agent-line')).toBe('rgba(139, 148, 167, 0.55)');
+        expect(turn.element.hasAttribute('data-agent')).toBe(false);
     });
 
     it('keeps exactly one tile expanded and lets the user reopen an older one', () => {

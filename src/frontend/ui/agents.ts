@@ -26,13 +26,19 @@
 //   - an active agent's tile carries `data-activity='active'` / `aria-busy` for the
 //     rotating ring (ui/activity.ts, styles.css).
 //
+// R7: a locked team renders NO explanation and NO "New session" link. The frozen
+// team is expressed by the disabled controls alone; starting a new conversation
+// is the Sessions rail's own New session button (main.ts `newSession`), which is
+// independent of this component. The former `.agent-lock` block, `lockReason` and
+// `onNewSession` options are gone, so no caller can reintroduce the notice.
+//
 // The component is intentionally stateless: `main.ts` re-renders it from the
 // descriptor after every server-confirmed change. Only the picker's open state is
 // local, and it closes as soon as a preset is chosen.
 //
 // Cross-references:
 //   - src/frontend/contract.ts — primary/subagents accessors
-//   - src/frontend/main.ts — PATCH handling and the lock explanation
+//   - src/frontend/main.ts — PATCH handling and the session lock (renderAgents)
 //   - src/frontend/styles.css — `.agent-row`, `.agent-tile`, `.agent-picker`
 
 import type { AgentDescriptor } from '../../server/protocol';
@@ -47,12 +53,9 @@ export type AgentRowOptions = {
     // Trusted preset library from GET /agents (or the boot fallback).
     agents: readonly AgentDescriptor[];
     // False while a run is in flight or while a saved session's frozen team is on
-    // screen. The reason is printed verbatim next to the row.
+    // screen. The reason is conveyed by the disabled controls only: R7 removed the
+    // visible lock notice and its New session link (the rail owns that action).
     editable: boolean;
-    lockReason?: string;
-    // The affordance offered with the lock explanation: start a new conversation
-    // so the edited team applies.
-    onNewSession?: () => void;
     // Per-agent model dropdowns (R9). Every tile gets one, labelled for its own
     // agent and kept OUTSIDE the promotion button so choosing a model can never
     // also change the primary. Omitted only by callers that do not know models.
@@ -83,7 +86,8 @@ export type AgentModelSelect = {
     // honestly instead of inventing an id.
     fallbackModel?: string;
     // False when the team is locked: the select shows the effective frozen model
-    // and cannot change it. The caller explains the lock and offers New session.
+    // and cannot change it. R7: the lock is not explained in this component; the
+    // Sessions rail's New session is the only route to an editable team.
     editable: boolean;
     // R2: true when this dropdown edits a SAVED session's live model map. It only
     // changes the tooltip's promise ("next request in this session" instead of
@@ -256,7 +260,7 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
     addButton.setAttribute('aria-label', 'Add an agent');
     addButton.setAttribute('aria-expanded', 'false');
     addButton.setAttribute('aria-controls', pickerId);
-    addButton.title = options.editable ? 'Add an agent' : (options.lockReason ?? 'The agent team is locked.');
+    addButton.title = options.editable ? 'Add an agent' : 'The agent team is locked.';
     addButton.disabled = !options.editable;
 
     const setPickerOpen = (open: boolean): void => {
@@ -377,27 +381,8 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
     row.append(addButton);
     wrapper.append(row, picker);
 
-    // Lock explanation and the affordance that makes the rule actionable: a
-    // saved session keeps its frozen team, so the way to edit is a new session.
-    if (!options.editable) {
-        const lock = el('p', 'agent-lock');
-        lock.append(
-            el(
-                'span',
-                'agent-lock-text',
-                options.lockReason ?? 'The agent team cannot be changed here.'
-            )
-        );
-
-        if (options.onNewSession !== undefined) {
-            const action = el('button', 'link-button', 'New session');
-            action.type = 'button';
-            action.addEventListener('click', () => options.onNewSession?.());
-            lock.append(action);
-        }
-
-        wrapper.append(lock);
-    }
-
+    // R7: no lock notice and no "New session" link here. A frozen team is only
+    // visible through its disabled controls; the rail's own New session button
+    // (independent of this row) is what starts an editable conversation.
     return wrapper;
 };

@@ -667,7 +667,7 @@ searchable remainder (`fileList`, `syntaxCheck`, `commandRun`, `gitDiff`) waits 
 | Export | Call | Result |
 |---|---|---|
 | `syntaxCheck` | `({ code, language: 'javascript' \| 'python' })` | `boolean` |
-| `fileRead` | `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` — non-empty | `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes }], truncated, bytes, contentBudget }`; one bad/binary path rejects the call |
+| `fileRead` | `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` — non-empty | `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }`; a missing path keeps its entry with `error: { code: 'ENOENT', message }` (empty content, 0 bytes); a malformed request, directory, binary, or other I/O error rejects the call |
 | `fileWrite` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`; all validated first, duplicate targets rejected |
 | `fileEdit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes }[]`; all preflighted before the first write |
 | `fileList` | `(paths?)` legacy string/string[] or `({ paths?, offset?, limit? })`; defaults to `["."]` | `{ entries: string[], truncated, nextOffset, offset, limit, bytes, contentBudget }` — ONE page of `dir/entry`, directories end with `/`; non-recursive |
@@ -703,6 +703,13 @@ Implementation notes worth keeping:
   in the chunks DECODED WHILE STREAMING rejects the call as binary; this is not
   whole-file validation, since bytes after the last read chunk are never inspected.
   A call accepts at most 100 paths so metadata cannot grow without bound either.
+  A path that does not exist is DATA, not a failed call: it keeps its ordered slot as
+  an entry with empty `content`, `endLine = startLine - 1`, `bytes: 0`, and
+  `error: { code: 'ENOENT', message }`, and it consumes no content budget (the split
+  is computed across files that actually exist, see `execute`'s two phases), so the
+  readable files are still returned in full. Every other failure — a malformed
+  request or range, a directory, binary content, any other I/O error — still rejects
+  the whole call.
   Ranges/continuations rescan from byte 0 to count lines: bounded memory, but a deep
   offset costs time proportional to the skipped prefix. `contentBudget` labels the
   cap honestly: content bytes, not the JSON envelope.
@@ -750,11 +757,13 @@ Implementation notes worth keeping:
 - **Content matching is time-bounded.** `content` is a JavaScript regex, and
   JavaScript regexes backtrack: `(a+)+$` blocks the process for seconds on a 31-byte
   line. `tools/files/bounded-regex.ts` therefore runs the match loop inside
-  `node:vm` with a cumulative 2-second budget across the whole search (one context
+  `node:vm` with a cumulative 30-second budget across the whole search (one context
   and one precompiled script per search, one call per FILE, so ordinary greps cost
-  the same as before). Exhausting the budget throws a `HarnessError` that names the
-  budget and the likely cause. It is a timeout, not a sandbox; an invalid pattern
-  still fails in the host realm so the caller gets the parser's own `SyntaxError`.
+  the same as before). That is the only time bound on matching; there is no
+  additional overall request timeout. Exhausting the budget throws a `HarnessError`
+  that names the budget and the likely cause. It is a timeout, not a sandbox; an
+  invalid pattern still fails in the host realm so the caller gets the parser's own
+  `SyntaxError`.
 - **`gitDiff` is the read-only git path.** A fixed argv with no shell, no colour,
   no external diff drivers, no textconv; `ref` may not start with `-`, and paths
   go after `--`. Non-zero exit is data, like `commandRun`.

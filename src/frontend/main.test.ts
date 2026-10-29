@@ -5,7 +5,8 @@
 //   - R1: the harness rail lists the server catalogue and offers a create action;
 //   - R2: a horizontal agent row labels primary/secondary, the trailing + opens a
 //     trusted preset picker, selecting a member promotes it, and a saved session
-//     freezes its team (editing is locked with a New session affordance);
+//     freezes its team (editing is locked; R7 removed the in-row notice/link, so
+//     the Sessions rail's own New session is the way to an editable team);
 //   - R3 (as amended by R21.2): sessions are filtered/locked to the selected
 //     harness and the right rail is the scratch board then sessions — no tool list;
 //   - R4: turn and tool-call durations come from the server on reload;
@@ -211,6 +212,10 @@ const coreToolNames = (): (string | null)[] =>
     [...document.querySelectorAll<HTMLElement>('.core-tool-name')].map((node) => node.textContent);
 const sessionIds = (): (string | undefined)[] =>
     [...document.querySelectorAll<HTMLElement>('.session')].map((node) => node.dataset.sessionId);
+// R8: the row WRAPPER (select button + sibling delete control) carries the
+// row-level data attributes and the session id.
+const rowIds = (): (string | undefined)[] =>
+    [...document.querySelectorAll<HTMLElement>('.session-row')].map((node) => node.dataset.sessionId);
 
 const byClass = <K extends keyof HTMLElementTagNameMap>(
     selector: string,
@@ -360,7 +365,11 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
 
     const input = byClass('.composer-input', 'textarea');
     const form = byClass('.composer', 'form');
-    const runButton = byClass('.run', 'button');
+    // R10: the only composer action starts hidden (idle + empty field) and is the
+    // single in-field control in every other state.
+    const composerAction = byClass('.composer-action', 'button');
+    expect(composerAction.hidden).toBe(true);
+    expect(composerAction.dataset.action).toBe('none');
 
     input.value = 'say hi';
     form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
@@ -399,12 +408,16 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
 
     // The header is app-scoped: a settled run is reported by the tile, not here.
     expect(statusText()).toBe('idle');
-    expect(runButton.disabled).toBe(false);
-    // A session exists now, so the TEAM is frozen: editing needs a New session.
+    // Empty field, no pending work: the action is gone again (R10).
+    expect(composerAction.hidden).toBe(true);
+    expect(composerAction.dataset.action).toBe('none');
+    // A session exists now, so the TEAM is frozen: editing needs the rail's own
+    // New session. R7 removed the in-row lock notice and its link.
     expect(byClass('.agent-main', 'button').disabled).toBe(true);
-    expect(document.querySelector('.agent-lock-text')?.textContent).toBe(
-        'This saved session keeps the agent team it started with.'
-    );
+    expect(document.querySelector('.agent-lock')).toBeNull();
+    expect(document.querySelector('.agent-row-wrap .link-button')).toBeNull();
+    expect(document.querySelector('.new-session')?.textContent).toBe('New session');
+    expect(byClass('.new-session', 'button').disabled).toBe(false);
     // ...but the MODELS are live (R2): the tile dropdown still edits this session.
     const modelSelect = byClass('.agent-model-select', 'select');
     expect(modelSelect.disabled).toBe(false);
@@ -726,9 +739,14 @@ it('restores a remembered session with its frozen team and server timings', asyn
         expect(button.disabled).toBe(true);
     }
     expect(byClass('.agent-add', 'button').disabled).toBe(true);
-    expect(document.querySelector('.agent-lock-text')?.textContent).toBe(
-        'This saved session keeps the agent team it started with.'
-    );
+    // R7: the frozen team is visible through its disabled controls only. Neither
+    // the removed notice nor its New session link may come back; the rail keeps
+    // its own independent New session action.
+    expect(document.querySelector('.agent-lock')).toBeNull();
+    expect(document.querySelector('.agent-lock-text')).toBeNull();
+    expect(document.querySelector('.agent-row-wrap .link-button')).toBeNull();
+    expect(byClass('.new-session', 'button').textContent).toBe('New session');
+    expect(byClass('.new-session', 'button').disabled).toBe(false);
     // R2: models are not part of the frozen team, so their controls stay usable on a
     // saved session and promise the next request in THIS chat.
     const modelSelects = [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
@@ -738,8 +756,10 @@ it('restores a remembered session with its frozen team and server timings', asyn
         'Model for Summarizer. Applies to the next request in this session.'
     ]);
 
-    // The lock's affordance starts a new conversation, which unlocks editing.
-    byClass('.agent-lock .link-button', 'button').click();
+    // The rail's New session action starts a new conversation, which unlocks
+    // editing. It is the ONLY New session affordance on the page (R7).
+    expect(document.querySelectorAll('.new-session')).toHaveLength(1);
+    byClass('.new-session', 'button').click();
     await flush();
 
     expect(document.querySelectorAll('.tile')).toHaveLength(0);
@@ -1190,7 +1210,12 @@ it('stops every task in the originating session while a run is in flight', async
         'Model for Instruct. Applies to the next request in this session.'
     );
 
-    byClass('.stop', 'button').click();
+    // R10: the running session, with an empty field, exposes the stop action in the
+    // composer's one button slot.
+    const composerAction = byClass('.composer-action', 'button');
+    expect(composerAction.dataset.action).toBe('stop');
+    expect(composerAction.hidden).toBe(false);
+    composerAction.click();
     await flush();
     await flush();
     await flush();
@@ -1205,7 +1230,9 @@ it('stops every task in the originating session while a run is in flight', async
     expect(statusText()).toBe('idle');
     expect(document.querySelector('.session-note')?.hasAttribute('hidden')).toBe(true);
     expect(byClass('.harness-item[data-harness="workspace"]', 'button').disabled).toBe(false);
-    expect(byClass('.stop', 'button').disabled).toBe(true);
+    // The queue drained: no text, no pending work, no action (R10).
+    expect(composerAction.hidden).toBe(true);
+    expect(composerAction.dataset.action).toBe('none');
 });
 
 it('stops polling a running session when another harness is selected', async () => {
@@ -1406,8 +1433,14 @@ it('queues a second task behind the active one and advances it automatically', a
 
     expect(tasks).toBe(1);
     expect(tileStates()).toEqual(['streaming']);
-    // The composer stays usable while A runs (R4).
-    expect(byClass('.run', 'button').disabled).toBe(false);
+    // R4/R10: with A running and the field empty the one action is STOP; typing
+    // turns that same control into an ENABLED submit, which is still queueing.
+    const composerAction = byClass('.composer-action', 'button');
+    expect(composerAction.dataset.action).toBe('stop');
+    input.value = 'queued while running';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(composerAction.dataset.action).toBe('submit');
+    expect(composerAction.disabled).toBe(false);
 
     // Task B is submitted BEHIND A and is visibly queued, neutral.
     input.value = 'second task';
@@ -1418,10 +1451,12 @@ it('queues a second task behind the active one and advances it automatically', a
     expect(tasks).toBe(2);
     expect(tileStates()).toEqual(['streaming', 'queued']);
     expect(document.querySelectorAll('.turn-row')[1]?.getAttribute('data-state')).toBe('queued');
-    // Queued B has no clock, and Stop is available for the whole queue.
+    // Queued B has no clock, and the stop action covers the whole queue. Reset is
+    // gone (R10): no third composer control exists while work is pending.
     expect(tileElapsed()[1]).toBe('');
-    expect(byClass('.stop', 'button').disabled).toBe(false);
-    expect(byClass('.reset', 'button').disabled).toBe(true);
+    expect(composerAction.dataset.action).toBe('stop');
+    expect(composerAction.disabled).toBe(false);
+    expect(document.querySelector('.composer .reset')).toBeNull();
     // R2: models stay editable while a queue runs.
     expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
 
@@ -1447,8 +1482,9 @@ it('queues a second task behind the active one and advances it automatically', a
     // No duplicated events: A's single text block appears exactly once.
     expect(document.querySelectorAll('.tile')[0].querySelectorAll('.agent-text')).toHaveLength(1);
     expect(document.querySelector('.tile-elapsed')?.textContent).toBe('100ms');
-    expect(byClass('.run', 'button').disabled).toBe(false);
-    expect(byClass('.stop', 'button').disabled).toBe(true);
+    // Queue drained + empty field: no action at all (R10).
+    expect(composerAction.hidden).toBe(true);
+    expect(composerAction.dataset.action).toBe('none');
 });
 
 // R2 regression: a delayed 202 answer must not revert a model edit.
@@ -1883,19 +1919,23 @@ it('hydrates a queued session on reload and stops the whole queue explicitly', a
     await flush();
     await flush();
 
-    // Reload shows the server-owned queue: active A, neutral B behind it.
+    // Reload shows the server-owned queue: active A, neutral B behind it. Empty
+    // field + pending work means the ONE composer action is stop (R10).
     expect(tileStates()).toEqual(['streaming', 'queued']);
-    expect(byClass('.stop', 'button').disabled).toBe(false);
-    expect(byClass('.reset', 'button').disabled).toBe(true);
+    const composerAction = byClass('.composer-action', 'button');
+    expect(composerAction.dataset.action).toBe('stop');
+    expect(composerAction.disabled).toBe(false);
+    expect(document.querySelector('.composer .reset')).toBeNull();
 
-    byClass('.stop', 'button').click();
+    composerAction.click();
     await flush();
     await flush();
 
     // Stop is explicit and total: active + retained queue.
     expect(cancelBody).toEqual({ all: true });
     expect(tileStates()).toEqual(['cancelled', 'cancelled']);
-    expect(byClass('.stop', 'button').disabled).toBe(true);
+    expect(composerAction.hidden).toBe(true);
+    expect(composerAction.dataset.action).toBe('none');
 
     observer?.close();
 });
@@ -2088,4 +2128,446 @@ it('shows the offline pane when a proxy answers 200 with HTML instead of JSON', 
     // loadBootstrap discards the root attempt; /harnesses is the first fallback
     // route to reject with the API abstraction's actionable non-JSON message.
     expectOfflinePane('The harness server returned a non-JSON response for /harnesses (HTTP 200).');
+});
+
+// ---------------------------------------------------------------------------
+// R8: permanent session deletion
+// ---------------------------------------------------------------------------
+//
+// The row is a `.session-row` wrapper with the select button and a SIBLING
+// `.session-delete` control. Deleting is two-step and inline: the first click
+// only opens `.session-confirm`, cancel sends nothing, and confirm sends exactly
+// one DELETE /sessions/:id and then removes the row. No replacement session is
+// created for the current conversation, and a late observer frame must not
+// resurrect a deleted one.
+
+it('confirms an inactive session delete once, and cancel sends no request', async () => {
+    const doneTurn: SessionTurn = {
+        id: 't1',
+        index: 0,
+        prompt: 'hello',
+        status: 'done',
+        startedAt: T,
+        updatedAt: T + 10,
+        events: [{ type: 'start', agent: 'instruct', model: 'm1' }]
+    };
+    const current = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn] });
+    const other = snapshot({ id: 's2', harnessDefinition: descriptor() });
+
+    localStorage.setItem(SESSION_KEY, 's1');
+
+    const calls = stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap({ sessions: [current, other] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/s1') return json({ session: current });
+        if (url === '/api/sessions/s2' && method === 'DELETE') return json({ deleted: true });
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // Both rows of the selected harness are present; only s1 is active.
+    expect(rowIds()).toEqual(['s1', 's2']);
+    const wrappers = [...document.querySelectorAll<HTMLElement>('.session-row')];
+    expect(wrappers.map((node) => [...node.children].map((child) => child.className))).toEqual([
+        ['session', 'session-delete'],
+        ['session', 'session-delete']
+    ]);
+    expect(wrappers.map((node) => node.dataset.status)).toEqual(['idle', 'idle']);
+    expect(wrappers.map((node) => node.dataset.active)).toEqual(['true', undefined]);
+
+    const del = byClass('.session-row[data-session-id="s2"] .session-delete', 'button');
+    expect(del.textContent).toBe('×');
+    expect(del.getAttribute('aria-label')).toBe('Delete session s2');
+    expect(del.title).toBe('Delete this session permanently');
+    expect(del.disabled).toBe(false);
+
+    // First step: the confirmation opens and NOTHING is sent.
+    del.click();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([]);
+    expect(document.querySelectorAll('.session-confirm')).toHaveLength(1);
+    const confirm = byClass('.session-confirm', 'div');
+    expect(confirm.dataset.sessionId).toBe('s2');
+    expect(confirm.getAttribute('role')).toBe('group');
+    expect(confirm.getAttribute('aria-label')).toBe('Confirm deleting session s2');
+    expect(confirm.querySelector('.session-confirm-text')?.textContent).toBe(
+        'Delete this session permanently. Running or queued work in it stops.'
+    );
+    expect(confirm.querySelector('.session-confirm-delete')?.textContent).toBe('Delete session');
+    expect(confirm.querySelector<HTMLButtonElement>('.session-confirm-delete')?.disabled).toBe(false);
+    expect(confirm.querySelector('.session-confirm-cancel')?.textContent).toBe('Cancel');
+
+    // Cancel is a pure view change: the row and the pointer survive, no request.
+    byClass('.session-confirm-cancel', 'button').click();
+    await flush();
+
+    expect(document.querySelector('.session-confirm')).toBeNull();
+    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([]);
+    expect(rowIds()).toEqual(['s1', 's2']);
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
+
+    // Two-step, then exactly one DELETE and the row disappears.
+    byClass('.session-row[data-session-id="s2"] .session-delete', 'button').click();
+    await flush();
+    byClass('.session-confirm-delete', 'button').click();
+    await flush();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
+        { url: '/api/sessions/s2', method: 'DELETE', body: undefined }
+    ]);
+    expect(rowIds()).toEqual(['s1']);
+    expect(sessionIds()).toEqual(['s1']);
+    expect(byClass('.session-row[data-session-id="s1"]', 'div').dataset.active).toBe('true');
+    // The current conversation is untouched: its tile, pointer, frozen team and
+    // status note all stay exactly as they were.
+    expect(document.querySelectorAll('.tile')).toHaveLength(1);
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
+    expect(document.querySelector('.session-note')?.hasAttribute('hidden')).toBe(true);
+    expect(document.querySelector('.harness-note')?.textContent).toBe(
+        'Viewing a saved session · agent team frozen'
+    );
+    expect(byClass('.agent-main', 'button').disabled).toBe(true);
+    // No session was created: a delete is not a submit.
+    expect(calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST')).toEqual([]);
+    expect(statusText()).toBe('session s2 deleted');
+    expect(byClass('.status', 'span').dataset.state).toBe('idle');
+});
+
+it('deletes the running current session, stops watching and creates no replacement', async () => {
+    const runningTurn: SessionTurn = {
+        id: 't1',
+        index: 0,
+        prompt: 'long one',
+        status: 'running',
+        startedAt: T,
+        updatedAt: T,
+        events: [{ type: 'start', agent: 'instruct', model: 'm1' }]
+    };
+    const running = snapshot({
+        harnessDefinition: descriptor(),
+        status: 'running',
+        turns: [runningTurn]
+    });
+
+    localStorage.setItem(SESSION_KEY, 's1');
+
+    const calls: Call[] = [];
+    let observerAborted = false;
+    let release: (() => void) | undefined;
+
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            calls.push({
+                url,
+                method: init?.method,
+                body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
+            });
+
+            if (url === '/api') return json(bootstrap({ sessions: [running] }));
+            if (url === '/api/models') return json({ models: ['m1'] });
+            if (url === '/api/sessions/s1' && init?.method === undefined) {
+                return json({ session: running });
+            }
+            if (url === '/api/sessions/s1' && init?.method === 'DELETE') {
+                return json({ deleted: true });
+            }
+
+            if (url === '/api/sessions/s1/events') {
+                init?.signal?.addEventListener('abort', () => {
+                    observerAborted = true;
+                });
+                // One turn frame now, the terminal snapshot later: the test decides
+                // when it lands, so it can prove a LATE frame cannot resurrect the
+                // session after the delete.
+                const stream = splitSse(
+                    [{ type: 'turn', turn: runningTurn }],
+                    [{ type: 'snapshot', session: running }]
+                );
+                release = stream.release;
+                return stream.response;
+            }
+
+            throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
+        })
+    );
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // A running session is being observed: its tile is on screen (a running server
+    // turn renders as `streaming`) and the composer's stop action is live.
+    expect(tileStates()).toEqual(['streaming']);
+    expect(byClass('.composer-action', 'button').dataset.action).toBe('stop');
+    expect(byClass('.composer-action', 'button').disabled).toBe(false);
+    expect(document.querySelector('.session-row[data-session-id="s1"]')?.getAttribute('data-status')).toBe(
+        'running'
+    );
+
+    // Deleting the CURRENT session is allowed while it runs: the confirmation
+    // says the running/queued work stops.
+    byClass('.session-row[data-session-id="s1"] .session-delete', 'button').click();
+    await flush();
+    expect(byClass('.session-confirm-delete', 'button').disabled).toBe(false);
+    byClass('.session-confirm-delete', 'button').click();
+    await flush();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
+        { url: '/api/sessions/s1', method: 'DELETE', body: undefined }
+    ]);
+    // The observer is unsubscribed (abort only, never a cancel round trip).
+    expect(observerAborted).toBe(true);
+    expect(calls.filter((call) => call.url.endsWith('/cancel'))).toEqual([]);
+
+    // The row, the transcript, the pointer and every view field are gone; no
+    // replacement session was created and the frozen team is editable again.
+    expect(rowIds()).toEqual([]);
+    expect(document.querySelector('.session-list .field-hint')?.textContent).toBe(
+        'No sessions for this harness yet. Send a task to create one.'
+    );
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    expect(document.querySelector('.agent-text')).toBeNull();
+    expect(localStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
+    expect(byClass('.agent-main', 'button').disabled).toBe(false);
+    expect(byClass('.agent-add', 'button').disabled).toBe(false);
+    // The deleted conversation took its pending work with it: empty field + idle
+    // means no action, and there is no Reset control to fall back on (R10).
+    expect(byClass('.composer-action', 'button').hidden).toBe(true);
+    expect(byClass('.composer-action', 'button').dataset.action).toBe('none');
+    expect(document.querySelector('.reset')).toBeNull();
+    expect(byClass('.new-session', 'button').disabled).toBe(false);
+    expect(calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST')).toEqual([]);
+    expect(statusText()).toBe('session s1 deleted');
+    expect(byClass('.status', 'span').dataset.state).toBe('idle');
+
+    // A frame that arrives AFTER the delete is dropped by the session-id guards:
+    // nothing repaints and the pointer is not restored.
+    release?.();
+    await flush();
+    await flush();
+
+    expect(rowIds()).toEqual([]);
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    expect(localStorage.getItem(SESSION_KEY)).toBeNull();
+});
+
+it('keeps the row and reports the error when a delete is rejected', async () => {
+    const current = snapshot({ harnessDefinition: descriptor() });
+    localStorage.setItem(SESSION_KEY, 's1');
+
+    const calls = stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap({ sessions: [current] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/s1' && method === undefined) return json({ session: current });
+        if (url === '/api/sessions/s1' && method === 'DELETE') {
+            return json({ error: { message: 'The database is read-only.' } }, 500);
+        }
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    byClass('.session-delete', 'button').click();
+    await flush();
+    byClass('.session-confirm-delete', 'button').click();
+    await flush();
+    await flush();
+
+    // One attempt, row still there, confirmation closed, error reported through
+    // the app-scoped pill (the same place a failed session-list read reports).
+    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
+        { url: '/api/sessions/s1', method: 'DELETE', body: undefined }
+    ]);
+    expect(rowIds()).toEqual(['s1']);
+    expect(sessionIds()).toEqual(['s1']);
+    expect(document.querySelector('.session-confirm')).toBeNull();
+    expect(byClass('.status', 'span').dataset.state).toBe('error');
+    expect(statusText()).toBe('delete session: The database is read-only.');
+    expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
+    // The control is usable again, so a transient failure can be retried.
+    expect(byClass('.session-delete', 'button').disabled).toBe(false);
+});
+
+it('drops the row when the server answers 404 for an already-deleted session', async () => {
+    const current = snapshot({ harnessDefinition: descriptor() });
+    localStorage.setItem(SESSION_KEY, 's1');
+
+    const calls = stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap({ sessions: [current] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/s1' && method === undefined) return json({ session: current });
+        if (url === '/api/sessions/s1' && method === 'DELETE') {
+            return json({ error: { message: 'Unknown session "s1".' } }, 404);
+        }
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    byClass('.session-delete', 'button').click();
+    await flush();
+    byClass('.session-confirm-delete', 'button').click();
+    await flush();
+    await flush();
+
+    // The desired end state already holds: the local record is dropped, without
+    // claiming our request deleted it and without an error state.
+    expect(calls.filter((call) => call.method === 'DELETE')).toHaveLength(1);
+    expect(rowIds()).toEqual([]);
+    expect(localStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    expect(byClass('.status', 'span').dataset.state).toBe('idle');
+    expect(statusText()).toBe('session s1 was already gone');
+});
+
+it('dedupes a double-confirmed delete and disables the row while it is in flight', async () => {
+    const current = snapshot({ harnessDefinition: descriptor() });
+    localStorage.setItem(SESSION_KEY, 's1');
+
+    let deletes = 0;
+    let settleDelete: ((response: Response) => void) | undefined;
+    const pendingDelete = new Promise<Response>((resolve) => {
+        settleDelete = resolve;
+    });
+
+    stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap({ sessions: [current] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/s1' && method === undefined) return json({ session: current });
+        if (url === '/api/sessions/s1' && method === 'DELETE') {
+            deletes += 1;
+            return pendingDelete as unknown as Response;
+        }
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    byClass('.session-delete', 'button').click();
+    await flush();
+
+    // Hold the node: the in-flight repaint replaces the DOM, so this click proves
+    // the guard (not the disabled attribute) is what blocks a duplicate.
+    const confirm = byClass('.session-confirm-delete', 'button');
+    confirm.click();
+    await flush();
+    confirm.click();
+    await flush();
+
+    expect(deletes).toBe(1);
+    expect(byClass('.session-delete', 'button').disabled).toBe(true);
+    expect(document.querySelector('.session-confirm')).toBeNull();
+
+    settleDelete?.(json({ deleted: true }));
+    await flush();
+    await flush();
+
+    expect(rowIds()).toEqual([]);
+    expect(statusText()).toBe('session s1 deleted');
+});
+
+// R8 regression (reviewer-reproduced race): a directory read that STARTED before a
+// delete can resolve after it. The raw list answer still contains the deleted id,
+// so assigning it unfiltered rebuilt the row. A tombstoned id must stay gone while
+// the survivor in the same answer still renders.
+it('never resurrects a deleted session from a stale session-list answer', async () => {
+    const deleted = snapshot({
+        harnessDefinition: descriptor(),
+        turns: [
+            {
+                id: 't1',
+                index: 0,
+                prompt: 'delete me',
+                status: 'done',
+                startedAt: T,
+                updatedAt: T + 10,
+                events: [{ type: 'start', agent: 'instruct', model: 'm1' }]
+            }
+        ]
+    });
+    const survivor = snapshot({ id: 's2', harnessDefinition: descriptor() });
+
+    localStorage.setItem(SESSION_KEY, 's1');
+
+    let listRequests = 0;
+    let settleList: ((response: Response) => void) | undefined;
+    // The list answer is held until the test releases it, so its content is
+    // provably OLDER than the delete that lands while it is in flight.
+    const pendingList = new Promise<Response>((resolve) => {
+        settleList = resolve;
+    });
+
+    const calls = stubFetch((url, method) => {
+        if (url === '/api') return json(bootstrap({ sessions: [deleted, survivor] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/s1' && method === undefined) return json({ session: deleted });
+        if (url === '/api/sessions/s1' && method === 'DELETE') return json({ deleted: true });
+        if (url === '/api/sessions' && method === undefined) {
+            listRequests += 1;
+            return pendingList as unknown as Response;
+        }
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    expect(rowIds()).toEqual(['s1', 's2']);
+    expect(document.querySelectorAll('.tile')).toHaveLength(1);
+
+    // Start the directory read and leave it un-answered.
+    const refresh = byClass('.sessions-actions button:nth-of-type(2)', 'button');
+    expect(refresh.textContent).toBe('Refresh');
+    refresh.click();
+    await flush();
+    expect(listRequests).toBe(1);
+    expect(refresh.disabled).toBe(true);
+
+    // Delete the CURRENT session while that older read is still in flight.
+    byClass('.session-row[data-session-id="s1"] .session-delete', 'button').click();
+    await flush();
+    byClass('.session-confirm-delete', 'button').click();
+    await flush();
+    await flush();
+
+    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
+        { url: '/api/sessions/s1', method: 'DELETE', body: undefined }
+    ]);
+    expect(rowIds()).toEqual(['s2']);
+    expect(localStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+
+    // Release the pre-delete list: it still names s1. The tombstone filter must keep
+    // the deleted row gone and leave the surviving session visible.
+    settleList?.(json({ sessions: [deleted, survivor] }));
+    await flush();
+    await flush();
+
+    expect(listRequests).toBe(1);
+    expect(rowIds()).toEqual(['s2']);
+    expect(sessionIds()).toEqual(['s2']);
+    expect(document.querySelector('.session-row[data-session-id="s1"]')).toBeNull();
+    expect(byClass('.session-row[data-session-id="s2"]', 'div').dataset.status).toBe('idle');
+    expect(byClass('.session-row[data-session-id="s2"]', 'div').dataset.active).toBeUndefined();
+    expect(localStorage.getItem(SESSION_KEY)).toBeNull();
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
+    expect(byClass('.agent-main', 'button').disabled).toBe(false);
+    expect(refresh.disabled).toBe(false);
 });

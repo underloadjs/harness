@@ -392,6 +392,12 @@ export const resetSession = async (id: string): Promise<SessionSnapshot> => {
     return body.session;
 };
 
+// DELETE /sessions/:id — PERMANENT removal (R8). The server aborts an active run,
+// discards retained queue records, closes /events watchers and rewrites state.json
+// before answering `{ deleted: true }` (src/server/api.ts -> SessionStore.remove).
+// An unknown id is a 404 that `request` surfaces as an Error whose message contains
+// `Unknown session`; main.ts treats that as "already gone" (the desired end state)
+// rather than a failed delete, so the wire contract stays exactly this method/path.
 export const deleteSession = async (id: string): Promise<void> => {
     await request<{ deleted: boolean }>(`/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
 };

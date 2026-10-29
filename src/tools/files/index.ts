@@ -9,8 +9,11 @@
 // BATCHING (T14): fileRead, fileWrite, fileEdit, and fileList each declare ONE
 // array property (`paths` / `files` / `edits`), so the single-property rule hands
 // `execute` the array itself and one call covers several targets. fileWrite and
-// fileEdit validate everything before the first write; fileRead and fileList reject
-// the whole call on one bad entry, so a partial answer never looks complete.
+// fileEdit validate everything before the first write; fileRead keeps the ordered
+// entry of a MISSING path (empty content + `error: { code: 'ENOENT' }`, see
+// ./fileRead) but still rejects the whole call for a malformed request, a directory,
+// binary content, or any other I/O error. fileList rejects the whole call on one bad
+// directory, so a partial answer never looks complete.
 //
 // fileGlob is the one search surface: filename matching, plus an optional `content`
 // regex that switches the result to matching lines. It uses ./glob's walker, so

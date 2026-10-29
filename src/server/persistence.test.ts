@@ -1007,4 +1007,69 @@ describe('R3b durable harness database', () => {
         expect(raw).not.toContain('server-secret-key');
         expect(raw).not.toContain('apiKey');
     });
+
+    // R8: deleting a session is a FULL removal, not a hidden row. The whole
+    // document is rewritten without the record, so transcript, turns, core
+    // records (todos), the live model map and settings all disappear with it —
+    // and a fresh runtime over the same root cannot see it either.
+    it('removes a deleted session from state.json and from a same-root reload', async () => {
+        const root = tempRoot('delete');
+        const keepPreset = liveScriptedPreset('one', 'kept answer');
+        const doomedPreset = liveScriptedPreset('two', 'deleted answer');
+
+        const first = runtimeOf(root, [keepPreset, doomedPreset]);
+        const keep = first.store.create('one');
+        const doomed = first.store.create('two');
+
+        // Both sessions get real content: deleting one must leave the other's
+        // transcript/turns untouched.
+        await first.store.run(keep.id, 'keep this', async () => {});
+        await first.store.run(doomed.id, 'delete this transcript', async () => {});
+
+        // Durable session state on the doomed record: a todo (core snapshot), a
+        // live per-agent model map and its own settings model.
+        expect(await first.store.callTool(doomed.id, 'todoManage', { action: 'add', text: 'delete me too' })).toEqual({
+            todo: { id: '1', text: 'delete me too', completed: false },
+            counts: { total: 1, completed: 0, remaining: 1 }
+        });
+        expect(first.store.setAgentModels(doomed.id, { two: 'next/model' }).agentModels).toEqual({
+            two: 'next/model'
+        });
+
+        const keptBefore = first.store.get(keep.id);
+        const doomedBefore = first.store.get(doomed.id);
+
+        const before = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
+            sessions: { id: string }[];
+        };
+        // Insertion order: the surviving session comes first.
+        expect(before.sessions.map((session) => session.id)).toEqual([keep.id, doomed.id]);
+
+        // The delete itself persists before returning.
+        expect(first.store.remove(doomed.id)).toBe(true);
+        expect(first.store.remove(doomed.id)).toBe(false);
+        expect(first.store.list().map((session) => session.id)).toEqual([keep.id]);
+
+        const raw = fs.readFileSync(stateFile(root), 'utf8');
+        // Nothing from the removed record may survive: not the id, not the prompt,
+        // the recorded answer, the todo text, or the live model id.
+        expect(raw).not.toContain(doomed.id);
+        expect(raw).not.toContain('delete this transcript');
+        expect(raw).not.toContain('deleted answer');
+        expect(raw).not.toContain('delete me too');
+        expect(raw).not.toContain('next/model');
+        // ...while the surviving session is still whole.
+        expect(raw).toContain(keep.id);
+        expect(raw).toContain('keep this');
+
+        first.store.dispose();
+
+        // A fresh runtime over the SAME root (a process restart) has no trace of
+        // the deleted session, and the surviving one restores unchanged.
+        const second = runtimeOf(root, [keepPreset, doomedPreset]);
+        expect(second.store.list().map((session) => session.id)).toEqual([keep.id]);
+        expect(() => second.store.get(doomed.id)).toThrow(`Unknown session "${doomed.id}".`);
+        expect(second.store.get(keep.id)).toEqual(keptBefore);
+        expect(doomedBefore.id).toBe(doomed.id);
+    });
 });

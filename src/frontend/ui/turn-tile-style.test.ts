@@ -28,6 +28,10 @@ if (stylesheet === undefined) throw new Error('styles.css not found');
 
 const css = readFileSync(stylesheet, 'utf8');
 
+// Comments deliberately name removed rules, so "this rule is gone" assertions run
+// against the stylesheet with comments stripped (see thread-style.test.ts).
+const rules = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
 // CSS selectors contain `{`/`}` inside pseudo-class arguments? No — the tile
 // selectors here are plain attribute/pseudo-class lists, so the first `{` after
 // the selector opens the rule and the first `}` closes it.
@@ -75,22 +79,29 @@ it('clips the compact status word and colour-codes the rows', () => {
     // reader while the tile itself shows colour instead.
     expect(statusText).not.toContain('display: none');
 
-    // R4: completed is GREY; green is reserved for the one active task.
-    expect(blockOf(".tile:not(.is-expanded)[data-state='done'] {")).toContain('border-color: var(--border)');
-    expect(blockOf(".tile:not(.is-expanded)[data-state='streaming'] {")).toContain(
+    // R4: completed is GREY; green is reserved for the one active task. R3: the
+    // surface rules are grouped with `.thread-tile` so a nested block gets the SAME
+    // treatment (no second copy can drift).
+    expect(blockOf(":is(.tile, .thread-tile):not(.is-expanded)[data-state='done'] {")).toContain(
+        'border-color: var(--border)'
+    );
+    expect(blockOf(":is(.tile, .thread-tile):not(.is-expanded)[data-state='streaming'] {")).toContain(
         'border-color: rgba(74, 222, 128, 0.5)'
     );
-    expect(blockOf(".tile:not(.is-expanded)[data-state='error'] {")).toContain(
+    expect(blockOf(":is(.tile, .thread-tile):not(.is-expanded)[data-state='error'] {")).toContain(
         'border-color: rgba(248, 113, 113, 0.5)'
     );
     // Completed status text is muted too: no green glow on finished work.
     expect(blockOf(".tile[data-state='done'] .tile-status {")).toContain('color: var(--muted)');
-    // Cancelled stays neutral: no green, no red.
-    expect(css).not.toContain(".tile:not(.is-expanded)[data-state='cancelled'] {");
+    // Cancelled stays neutral: no green, no red. (No surface rule is written for it
+    // on either block owner.)
+    expect(rules).not.toContain(":is(.tile, .thread-tile):not(.is-expanded)[data-state='cancelled']");
 });
 
-it('sweeps the agent activity ring around the active tile only', () => {
-    const ring = blockOf(".tile:not(.is-expanded)[data-state='streaming']::before {");
+it('sweeps the agent activity ring around the active block, main or nested', () => {
+    const ring = blockOf(
+        ":is(.tile, .thread-tile):not(.is-expanded)[data-state='waiting']::before,"
+    );
 
     expect(ring).toContain('from var(--agent-ring-angle, 0deg)');
     expect(ring).toContain('var(--accent) 330deg');
@@ -100,6 +111,14 @@ it('sweeps the agent activity ring around the active tile only', () => {
     expect(ring).toContain('pointer-events: none');
     expect(ring).toContain('animation: agent-ring-spin 900ms linear infinite');
 
+    // R3: the SAME rule list covers `.thread-tile`, so a working child entry shows
+    // the ring the working main tile shows (the markup half of that parity is the
+    // mirrored `data-state` in ui/turns.ts). `blockOf` returns declarations only, so
+    // the selector list itself is asserted on the stylesheet text.
+    expect(css).toContain(
+        ":is(.tile, .thread-tile):not(.is-expanded)[data-state='streaming']::before {"
+    );
+
     // The shared keyframes and registered property are the consistency contract
     // with `.agent-tile[data-activity='active']::before`.
     expect(css).toContain('@keyframes agent-ring-spin');
@@ -108,7 +127,7 @@ it('sweeps the agent activity ring around the active tile only', () => {
     // R4: a queued task is NOT spinning; only waiting/streaming animate, and a
     // settled tile never does.
     const ringSelectors = css.slice(
-        css.indexOf("/* Compact tile activity ring"),
+        css.indexOf('/* Compact tile activity ring'),
         css.indexOf("content: ''", css.indexOf('/* Compact tile activity ring'))
     );
     expect(ringSelectors).not.toContain("[data-state='queued']");
@@ -138,15 +157,39 @@ it('lays the turns out as one plain full-width list with no timeline decoration'
     expect(blockOf(".tile[data-state='queued'] .tile-status {")).toContain('color: var(--muted)');
 });
 
+it('outlines the main tile in its agent colour and defaults to the neutral tone', () => {
+    // R3: identity is drawn as an OUTLINE so it survives the state border. The tile
+    // is the root invocation's block, exactly like `.thread-tile` is a child's.
+    const tile = blockOf('.tile {');
+    expect(tile).toContain('outline: 1px solid var(--agent-line)');
+    expect(tile).toContain('outline-offset: -2px');
+
+    // The documented unknown-agent fallback (ui/agent-color.ts UNKNOWN_AGENT_COLOR).
+    const root = blockOf(':root {');
+    expect(root).toContain('--agent-color: #8b94a7');
+    expect(root).toContain('--agent-line: rgba(139, 148, 167, 0.55)');
+
+    // The agent name in an agent section reads the same painted property.
+    expect(blockOf('.agent-name {')).toContain('color: var(--agent-color)');
+    // No role badge survives anywhere (R3).
+    expect(rules).not.toContain('.agent-role');
+});
+
 it('freezes the tile ring for reduced motion and outlines it under forced colors', () => {
     expect(css).toMatch(
         /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.tile\[data-state='streaming'\]::before[\s\S]*?animation: none !important;/
     );
-
+    // R3: the nested ring freezes with it (same reduced-motion list).
     expect(css).toMatch(
-        /@media \(forced-colors: active\)[\s\S]*?\.tile:not\(\.is-expanded\)\[data-state='streaming'\] \{[\s\S]*?outline: 2px solid CanvasText;/
+        /@media \(prefers-reduced-motion: reduce\)[\s\S]*?\.thread-tile\[data-state='streaming'\]::before[\s\S]*?animation: none !important;/
+    );
+
+    // Forced colors: the grouped selector means a working CHILD gets the same
+    // system outline as a working main tile, and its ring is removed too.
+    expect(css).toMatch(
+        /@media \(forced-colors: active\)[\s\S]*?:is\(\.tile, \.thread-tile\):not\(\.is-expanded\)\[data-state='streaming'\] \{[\s\S]*?outline: 2px solid CanvasText;/
     );
     expect(css).toMatch(
-        /@media \(forced-colors: active\)[\s\S]*?\.tile:not\(\.is-expanded\)\[data-state='streaming'\]::before \{[\s\S]*?display: none;/
+        /@media \(forced-colors: active\)[\s\S]*?:is\(\.tile, \.thread-tile\):not\(\.is-expanded\)\[data-state='streaming'\]::before \{[\s\S]*?display: none;/
     );
 });

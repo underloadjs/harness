@@ -29,8 +29,19 @@
 //     keep their DOM, only visibility changes, so a user reading turn 3 is not
 //     pulled away by deltas arriving for turn 7.
 //
-// Delegation — one agent calling another — shows up as extra agents inside the
-// same turn (each event names its agent) and is labelled as a subagent.
+// Delegation — one agent calling another — shows up as its own nested block inside
+// the same turn (each event names its agent). R3: a nested block is the SAME
+// surface as a main block (radius, header, state treatment) and differs ONLY by
+// indentation; there is no "subagent" label and no role badge. Agent identity is
+// carried by colour instead: every agent-owned surface is painted with the
+// deterministic tone from ui/agent-color.ts (name colour + block outline), so the
+// same agent keeps one colour across the whole transcript.
+//
+// Collapsed blocks (R4): the main tile and EVERY nested entry are exactly one
+// compact row (`.tile:not(.is-expanded)`, `.thread-row:not(.is-expanded)`).
+// Whatever does not fit — prompt/task preview, status, meta — is ellipsised (or
+// clipped into the accessible subtree for the meta line), never wrapped onto a
+// second line. Expansion still shows everything in full.
 //
 // Invocation threads (R1/R2/R3). A delegated agent is its own ENTRY, not just an
 // extra flat agent section: the spawned invocation gets a `.thread-row` appended
@@ -92,6 +103,11 @@ import {
     wakeupOf
 } from '../contract';
 import type { HarnessPendingTool, HarnessThreadInfo } from '../contract';
+// Deterministic agent identity colour (R3): shared by the turn tile, every nested
+// invocation tile and every agent section (see ui/agent-color.ts). The placeholder
+// constant keeps the "cannot attribute this stream" sentinel in ONE place, so the
+// tile and its section resolve to the same neutral tone.
+import { UNNAMED_AGENT_PLACEHOLDER, paintAgentColor } from './agent-color';
 import { markdownFragment, plainPreview } from './markdown';
 import { elapsedBetween, formatDuration } from './time';
 import { formatTokens } from './tokens';
@@ -303,7 +319,6 @@ type AgentSection = {
     root: HTMLElement;
     flow: HTMLElement;
     meta: HTMLElement;
-    role: HTMLElement;
     text: TextBlock | undefined;
     reasoning: { details: HTMLDetailsElement; summary: HTMLElement; body: HTMLElement; buffer: string } | undefined;
     tools: ToolCallCard[];
@@ -360,6 +375,10 @@ type ThreadEntry = {
     section: AgentSection;
     // DOM (undefined for the root/inline sections, which live in the tile flow).
     row: HTMLElement | undefined;
+    // The nested block surface. It mirrors `data-state` and `is-expanded` from its
+    // row so styles.css can style main (`.tile`) and nested (`.thread-tile`) blocks
+    // with ONE grouped selector instead of two copies that drift (R3).
+    tile: HTMLElement | undefined;
     body: HTMLElement | undefined;
     select: HTMLButtonElement | undefined;
     status: HTMLElement | undefined;
@@ -754,25 +773,26 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         // metadata (and no inferable delegate call) keep the old flat section so a
         // saved transcript stays readable instead of inventing ancestry.
 
-        // Build one agent content section inside `container`. The role is decided by
-        // the caller: the root invocation is `primary`, every delegated entry is
-        // `subagent` (the row header is what spells out the invocation).
+        // Build one agent content section inside `container`. `role` is a
+        // STRUCTURAL signal only (kept on `data-role` for CSS/tests/assistive
+        // context): R3 removed the visible role badge, because a nested block is
+        // the same surface as a main block and is told apart by indentation plus
+        // its agent colour, not by the word "subagent".
         const createSection = (
             container: HTMLElement,
             agentName: string,
             role: 'primary' | 'subagent'
         ): AgentSection => {
             const root = el('section', 'agent');
-            root.dataset.agent = agentName;
             root.dataset.role = role;
+            // Paint the section: `.agent-name` reads `--agent-color`, so a flat/legacy
+            // section inside the tile flow is coloured like every other agent-owned
+            // surface. The helper also mirrors the name on `data-agent` (cleared for an
+            // unnamed stream, so it never claims an identity).
+            paintAgentColor(root, agentName);
 
             const head = el('header', 'agent-head');
             head.append(el('span', 'agent-name', agentName));
-            const roleLabel = el('span', 'agent-role', role);
-            // A single-agent turn needs no role badge; it is added to the DOM
-            // anyway so a later delegation can label an existing section without
-            // rebuilding it.
-            head.append(roleLabel);
 
             const sectionFlow = el('div', 'agent-flow');
             const agentMeta = el('div', 'agent-meta');
@@ -784,7 +804,6 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 root,
                 flow: sectionFlow,
                 meta: agentMeta,
-                role: roleLabel,
                 text: undefined,
                 reasoning: undefined,
                 tools: [],
@@ -796,12 +815,15 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
         // Collapse/expand one entry. Independent of the board's single expanded
         // TURN: a reader can open a child while the parent tile is collapsed, and
-        // opening one child never closes another.
+        // opening one child never closes another. The class is mirrored onto the
+        // nested tile as well, so the shared `:is(.tile, .thread-tile)` CSS can key
+        // the expanded frame off one selector for both block owners (R3).
         const setThreadExpanded = (entry: ThreadEntry, expanded: boolean): void => {
             if (entry.row === undefined) return;
 
             entry.expanded = expanded;
             entry.row.classList.toggle('is-expanded', expanded);
+            entry.tile?.classList.toggle('is-expanded', expanded);
             entry.select?.setAttribute('aria-expanded', String(expanded));
         };
 
@@ -879,6 +901,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             if (entry.row === undefined) return;
 
             entry.row.dataset.state = state;
+            // The tile mirrors the state for the shared block-surface rules
+            // (`:is(.tile, .thread-tile)[data-state=…]`, styles.css R3).
+            if (entry.tile !== undefined) entry.tile.dataset.state = state;
             if (entry.status !== undefined) entry.status.textContent = STATE_TEXT[state];
         };
 
@@ -952,10 +977,20 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             const threadRow = el('div', 'thread-row');
             threadRow.dataset.depth = String(place.depth);
             threadRow.dataset.threadId = options.key;
-            threadRow.dataset.agent = options.agent;
+            // Same painting rule as the tile: an unnamed/placeholder agent writes NO
+            // `data-agent` (not `data-agent=""`) so every block shares one neutral
+            // semantics and `[data-agent]` only matches a real identity.
+            paintAgentColor(threadRow, options.agent);
             threadRow.dataset.state = options.state;
 
             const tile = el('article', 'thread-tile');
+            // R3: the nested surface is painted with the SAME helper the main tile
+            // uses, so a delegated invocation is visually the same block (plus the
+            // indentation its host provides) and keeps one stable colour per agent.
+            paintAgentColor(tile, options.agent);
+            // The tile mirrors its row's state so styles.css styles main and nested
+            // blocks with one grouped selector (`:is(.tile, .thread-tile)`).
+            tile.dataset.state = options.state;
 
             // A real <button> owns collapse/expand: Enter/Space work natively and
             // `aria-expanded`/`aria-controls` describe the controlled body.
@@ -964,12 +999,13 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             select.setAttribute('aria-expanded', 'false');
             select.setAttribute('aria-controls', bodyId);
 
+            // R4: the whole collapsed entry is ONE row — `name · preview · status`,
+            // exactly like a compact turn tile's `prompt · metadata` row. The
+            // preview therefore lives INSIDE `.thread-top` (between the name and the
+            // status) instead of on a second line; CSS ellipsises it.
             const top = el('span', 'thread-top');
             const name = el('span', 'thread-name', options.agent);
-            const roleLabel = el('span', 'thread-role', 'subagent');
             const status = el('span', 'thread-status', STATE_TEXT[options.state]);
-            top.append(name, roleLabel, status);
-
             const preview = el(
                 'span',
                 'thread-preview',
@@ -977,7 +1013,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     ? 'delegated task'
                     : plainPreview(options.input, 160)
             );
-            select.append(top, preview);
+            top.append(name, preview, status);
+            select.append(top);
 
             const body = el('div', 'thread-body');
             body.id = bodyId;
@@ -1009,6 +1046,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 state: options.state,
                 section: createSection(threadFlow, options.agent, 'subagent'),
                 row: threadRow,
+                tile,
                 body,
                 select,
                 status,
@@ -1040,6 +1078,15 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             // primary), and only when the data actually says so.
             if (primaryAgent === undefined) primaryAgent = agentName;
 
+            // R3: the MAIN block is agent-owned too, so the tile itself carries the
+            // agent's outline/name colour (identical treatment to `.thread-tile`).
+            // The helper treats the `unknown` placeholder as unnamed, so a tile whose
+            // section came from the unattributable-stream fallback
+            // (`resolveTool` → `inlineSection(UNNAMED_AGENT_PLACEHOLDER)`) stays
+            // neutral instead of minting a palette identity for data we cannot
+            // attribute.
+            paintAgentColor(card, agentName);
+
             const section = createSection(flow, agentName, 'primary');
             threads.set(ROOT_KEY, {
                 key: ROOT_KEY,
@@ -1053,6 +1100,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 state: 'streaming',
                 section,
                 row: undefined,
+                tile: undefined,
                 body: undefined,
                 select: undefined,
                 status: undefined,
@@ -1095,6 +1143,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 state: 'streaming',
                 section,
                 row: undefined,
+                tile: undefined,
                 body: undefined,
                 select: undefined,
                 status: undefined,
@@ -1534,7 +1583,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             // reports results without calls, or a missed tool_call): show it rather
             // than dropping information. It belongs to the root invocation when one
             // emitted, otherwise to a truthful flat section for that agent name.
-            const section = threads.get(ROOT_KEY)?.section ?? inlineSection(primaryAgent ?? 'unknown');
+            const section = threads.get(ROOT_KEY)?.section ?? inlineSection(primaryAgent ?? UNNAMED_AGENT_PLACEHOLDER);
             const card = createToolCallCard(name, '');
             card.resolve(content, isError);
             toolGroupOf(section).append(card.element);
@@ -1615,10 +1664,11 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                         break;
                     }
 
-                    // A second agent in the same turn is a delegation; relabel
-                    // rather than guess up front.
+                    // A second agent in the same turn is a delegation. R3: only the
+                    // STRUCTURAL role attribute is updated — there is no visible
+                    // role badge to relabel, the nesting and the agent colour carry
+                    // the hierarchy.
                     section.root.dataset.role = event.agent === primaryAgent ? 'primary' : 'subagent';
-                    section.role.textContent = event.agent === primaryAgent ? 'primary' : 'subagent';
                     break;
                 }
 

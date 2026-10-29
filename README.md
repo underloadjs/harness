@@ -469,7 +469,7 @@ groups related tools for discovery; the action is what the model calls.
 | `createTool` (tool) | `toolCreate` | core; the host method is `harness.createTool()` |
 | `todoTools` | `todoManage` | core; always declared |
 | `delegate` | `agentDelegate` | core; primary only, when subagents exist |
-| `readFile` | `fileRead` | **batched and bounded**: `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` → `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes }], truncated, bytes, contentBudget }` |
+| `readFile` | `fileRead` | **batched and bounded**: `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` → `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }` |
 | `writeFile` | `fileWrite` | **batched**: `({ path, content }[])` → `{ path, bytes }[]` |
 | `editFile` | `fileEdit` | **batched**: `({ path, oldString, newString, replaceAll? }[])` → `{ path, replacements, bytes }[]` |
 | `listFiles` | `fileList` | **paged**: `(paths?)` or `({ paths?, offset?, limit? })` → `{ entries, truncated, nextOffset, offset, limit, bytes, contentBudget }` |
@@ -574,6 +574,15 @@ reports what the response consumed. Because line numbers require counting from t
 beginning, a deep `startLine`/`startColumn` rescan the file from byte 0 each time:
 memory stays bounded, but the skipped prefix costs time.
 
+A path that does **not exist** is a per-entry result, not a failed call: it keeps its
+ordered position with empty `content`, `bytes` 0, the empty-window range
+(`endLine = startLine - 1`), and `error: { code: 'ENOENT', message }`, while every
+other requested file is still read. A missing entry consumes **no** content budget,
+so it cannot shrink the window of a file that does exist. Everything else — a
+malformed request, a range error, a directory, binary bytes in a chunk that was
+read, or any other filesystem error — rejects the whole call, so a partial answer
+can never look complete.
+
 `fileWrite` and `fileEdit` validate **every** entry (shape, non-empty strings, no
 NUL, unique target file) before the first write, and `fileEdit` also reads and
 match-checks every file first, so one bad entry leaves every file untouched.
@@ -586,7 +595,7 @@ with the paths already completed: there is **no transaction and no rollback**.
 | Tool | Signatures | Result |
 |---|---|---|
 | `syntaxCheck` | `({ code, language: 'javascript' \| 'python' })` | `true` when the snippet parses; JavaScript is a classic script (no `import`/`export` or top-level await) |
-| `fileRead` | `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` — non-empty | `{ files, truncated, bytes, contentBudget }`; one window per path, ordered; one missing/unreadable/binary path rejects the whole call |
+| `fileRead` | `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` — non-empty | `{ files, truncated, bytes, contentBudget }`; one window per path, ordered; a missing path is an entry with `error: { code: 'ENOENT', message }` (empty content, 0 bytes), while a malformed request, directory, binary, or other I/O error rejects the whole call |
 | `fileWrite` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`, creating parent directories; duplicate target files rejected |
 | `fileEdit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes }[]`; `oldString` must be unique unless `replaceAll`; all edits preflighted |
 | `fileList` | `(paths?)` — string or string[]; defaults to `["."]` | `string[]` of `dir/entry`, directories end with `/`; non-recursive |
@@ -617,10 +626,11 @@ content mode, and `.gitignore` is **not** read.
 
 Content matching is **time-bounded**: a JavaScript regex can backtrack
 exponentially (`(a+)+$` needs seconds on a 31-byte line), so the match loop runs in
-`node:vm` with a cumulative 2-second budget and a pattern that exceeds it fails with
-a clear error instead of hanging the call. It is a timeout, not a sandbox, and an
-ordinary grep over a large tree is unaffected (the context is reused per search and
-the boundary is crossed once per file, not once per line).
+`node:vm` with a cumulative 30-second budget and a pattern that exceeds it fails with
+a clear error instead of hanging the call. That budget is the only time bound on the
+match; no separate overall request timeout is added. It is a timeout, not a sandbox,
+and an ordinary grep over a large tree is unaffected (the context is reused per
+search and the boundary is crossed once per file, not once per line).
 `gitDiff` runs a fixed `git diff` argv with no shell, colour, external diff
 drivers, or textconv, and never stages or commits.
 

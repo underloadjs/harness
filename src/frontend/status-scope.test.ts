@@ -369,8 +369,9 @@ it('reports an active task failure on its tile and note, never in the app header
     expect(noteText()).toBe(FAILURE);
     expect(statusState()).toBe('idle');
     expect(statusText()).toBe('idle');
-    // A failed submit is not a pending queue: Stop is released.
-    expect(byClass('.stop', 'button').disabled).toBe(true);
+    // A failed submit is not a pending queue: with an empty field the action is gone.
+    expect(byClass('.composer-action', 'button').hidden).toBe(true);
+    expect(byClass('.composer-action', 'button').dataset.action).toBe('none');
 });
 
 it('keeps a failure local while the rest of the queue keeps running', async () => {
@@ -439,11 +440,11 @@ it('keeps a failure local while the rest of the queue keeps running', async () =
     await flush();
 
     // The failed task is visible in the transcript; the queued one is still waiting
-    // and the queue is live (Stop enabled).
+    // and the queue is live (the composer's stop action is available).
     expect(tileStates()).toEqual(['error', 'queued']);
     expect(noteText()).toBe(FAILURE);
     expect(statusText()).toBe('idle');
-    expect(byClass('.stop', 'button').disabled).toBe(false);
+    expect(byClass('.composer-action', 'button').dataset.action).toBe('stop');
 
     // The queue advances: the second task runs and finishes. Only the session state
     // moves; the app header never becomes a run display.
@@ -457,7 +458,8 @@ it('keeps a failure local while the rest of the queue keeps running', async () =
     // The drained snapshot is healthy again, and the failed tile still reports
     // `error`, so the session-wide note is cleared instead of going stale.
     expect(noteHidden()).toBe(true);
-    expect(byClass('.stop', 'button').disabled).toBe(true);
+    expect(byClass('.composer-action', 'button').hidden).toBe(true);
+    expect(byClass('.composer-action', 'button').dataset.action).toBe('none');
 });
 
 it('still surfaces a bootstrap failure in the app header and the offline pane', async () => {
@@ -479,6 +481,9 @@ it('still surfaces a bootstrap failure in the app header and the offline pane', 
     expect(document.querySelector('.empty-text')?.textContent).toBe(
         'The harness server is unreachable: connect ECONNREFUSED 127.0.0.1:5181'
     );
-    // Nothing can be submitted without the catalogue.
-    expect(byClass('.run', 'button').disabled).toBe(true);
+    // Nothing can be submitted without the catalogue: the composer's single action
+    // stays hidden, and there are no separate Run/Reset controls (R10).
+    expect(byClass('.composer-action', 'button').hidden).toBe(true);
+    expect(document.querySelector('.composer .run')).toBeNull();
+    expect(document.querySelector('.composer .reset')).toBeNull();
 });

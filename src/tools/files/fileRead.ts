@@ -45,7 +45,7 @@
 // ------------
 //     {
 //       files: [{ path, content, startLine, endLine, truncated,
-//                 nextLine, nextColumn, bytes }],
+//                 nextLine, nextColumn, bytes, error? }],
 //       truncated: boolean,          // any file truncated
 //       bytes: number,               // total content bytes returned
 //       contentBudget: number        // fixed aggregate content cap (64 KiB)
@@ -56,6 +56,12 @@
 // prefixes inside the copied text. `endLine` is the last line represented (it may
 // equal startLine for a partial line, and is startLine - 1 when nothing was
 // returned).
+//
+// `error` is present ONLY on a per-entry not-found result (see below): it carries
+// `{ code: 'ENOENT', message }` and the entry's metadata is the same empty-window
+// shape an empty file would produce (startLine as requested, endLine = startLine -
+// 1, bytes 0). Every other entry has no `error` property at all, so an existing
+// caller that compares whole entries is unaffected.
 //
 // CONTINUATION
 // ------------
@@ -69,12 +75,18 @@
 // When false, `nextLine` and `nextColumn` are null and the window reached the end
 // of the file.
 //
-// FAILURE SEMANTICS (all-or-nothing)
-// ----------------------------------
-// A blank/NUL/non-string path, an invalid range value, a directory, a missing
-// file, or binary bytes ENCOUNTERED WHILE READING rejects the WHOLE call. There is
-// no partial array: a short answer that looks complete would let a model conclude a
-// file it never received is empty. Every filesystem error names the requested path.
+// FAILURE SEMANTICS (per-entry not-found; everything else is all-or-nothing)
+// ---------------------------------------------------------------------------
+// A missing file (ENOENT) does NOT fail the call: every requested path keeps its
+// ordered position, the missing one becomes an entry with empty `content`, `bytes`
+// 0 and a structured `error` { code: 'ENOENT', message }, and the remaining files
+// are still read. A missing entry consumes no content budget, so the existing files
+// in the same call keep their full fair share.
+//
+// Every OTHER failure still rejects the WHOLE call, because a partial array would
+// look complete: a blank/NUL/non-string path, an invalid range value, a directory,
+// binary bytes ENCOUNTERED WHILE READING, or any other filesystem error. Every
+// filesystem error names the requested path.
 //
 // COST OF RANGES / CONTINUATIONS
 // ------------------------------
@@ -131,6 +143,15 @@ export type FileReadTarget =
           maxLines?: number;
       };
 
+// A per-entry failure that is REPORTED, not thrown: only a path that does not
+// exist, because the caller asked for several files and one absent file is a
+// lookup result, not a broken request. `code` is the literal ENOENT so a caller can
+// branch on it; `message` is the human-readable sentence, naming the requested path.
+export type FileReadEntryError = {
+    code: 'ENOENT';
+    message: string;
+};
+
 // One file's bounded window, in request order.
 export type FileReadEntry = {
     // The absolute path that was read.
@@ -151,6 +172,11 @@ export type FileReadEntry = {
     nextColumn: number | null;
     // UTF-8 bytes in `content`, the amount charged against the aggregate budget.
     bytes: number;
+    // Present ONLY when the requested path did not exist (ENOENT). The entry then
+    // carries empty content, bytes 0, and an empty-window range; the call itself
+    // succeeds and the other entries are unaffected. Absent for every readable file
+    // so existing result comparisons keep working.
+    error?: FileReadEntryError;
 };
 
 // The ordered batch result. `files` has exactly one entry per requested path.
@@ -174,6 +200,55 @@ type NormalizedTarget = {
     startLine: number;
     startColumn: number;
     maxLines: number;
+};
+
+// A target after the existence preflight: an open handle awaiting its window, or
+// the not-found entry standing in for a path that does not exist. Keeping this
+// ordered list is what makes the result mirror the request even when some paths are
+// missing (see the two-phase note in `execute`).
+type PreparedTarget =
+    | { request: NormalizedTarget; handle: FileHandle }
+    | { request: NormalizedTarget; entry: FileReadEntry };
+
+// ENOENT is the one filesystem outcome that is DATA (the requested file is absent),
+// not a failed request. Anything else — EISDIR, EPERM, EACCES, ENOTDIR — still
+// rejects the whole batch.
+const isNotFound = (error: unknown): boolean =>
+    typeof error === 'object' &&
+    error !== null &&
+    (error as { code?: unknown }).code === 'ENOENT';
+
+// The ordered entry a missing path produces. It is shaped exactly like an empty
+// window (empty content, endLine = startLine - 1, no continuation, zero bytes), so
+// a caller's range arithmetic still holds, plus a structured `error` naming the
+// requested path. `bytes: 0` is what keeps a missing entry out of the content
+// budget.
+const missingEntry = (request: NormalizedTarget): FileReadEntry => ({
+    path: resolve(request.path),
+    content: '',
+    startLine: request.startLine,
+    endLine: request.startLine - 1,
+    truncated: false,
+    nextLine: null,
+    nextColumn: null,
+    bytes: 0,
+    error: {
+        code: 'ENOENT',
+        message: `fileRead could not find "${request.path}": no such file or directory (ENOENT).`
+    }
+});
+
+// Close best-effort, ignoring a handle that is already closed. Used on the failure
+// paths so a rejected batch never leaks an open descriptor.
+const closeQuietly = async (handles: Iterable<FileHandle>): Promise<void> => {
+    for (const handle of handles) {
+        try {
+            await handle.close();
+        } catch {
+            // Nothing actionable: the call is already failing or the handle was
+            // closed by the scanner's own finally block.
+        }
+    }
 };
 
 // The binary rejection shared by the NUL and invalid-UTF-8 paths so the message
@@ -455,40 +530,83 @@ export const fileRead = tool<FileReadParameters, FileReadResult>({
     execute: async ({ parameters: paths }) => {
         const requested = normalizeTargets(paths);
 
-        // Sequential and ordered on purpose: the result mirrors the request, and a
-        // later failure rejects the whole call rather than returning a prefix.
+        // PHASE 1 — open every existing path and replace every ENOENT with a
+        // not-found entry, preserving the caller's order. Opening first is what
+        // lets PHASE 2 split the content budget only across files that actually
+        // exist: a missing path never reserves a share it cannot use, so the
+        // readable files in the same call keep their full fair share.
+        const prepared: PreparedTarget[] = [];
+        const openHandles = new Set<FileHandle>();
+
+        try {
+            for (const request of requested) {
+                try {
+                    const handle = await open(request.path, 'r');
+                    openHandles.add(handle);
+                    prepared.push({ request, handle });
+                } catch (error) {
+                    // Only a missing file is reported in place. A directory, a
+                    // permission error, or any other I/O failure still rejects the
+                    // whole call (no partial array that looks complete).
+                    if (isNotFound(error)) {
+                        prepared.push({ request, entry: missingEntry(request) });
+                        continue;
+                    }
+
+                    throw fileError(request.path, error);
+                }
+            }
+        } catch (error) {
+            // Do not leak handles opened before the failing target.
+            await closeQuietly(openHandles);
+            throw error;
+        }
+
         const files: FileReadEntry[] = [];
         let remainingBudget = FILE_READ_CONTENT_BUDGET;
 
-        for (let index = 0; index < requested.length; index += 1) {
-            // Fair share of what is left: one file may use the whole budget, two
-            // files split it, and so on. A file that returns fewer bytes leaves the
-            // remainder for the files after it.
-            const remainingFiles = requested.length - index;
-            const allowance = Math.floor(remainingBudget / remainingFiles);
+        // Only files that exist take part in the fair split (see PHASE 1).
+        let remainingReadable = prepared.filter((item) => 'handle' in item).length;
 
-            // `open` is also what surfaces ENOENT/EISDIR/EPERM for the whole batch.
-            let handle: FileHandle;
-            try {
-                handle = await open(requested[index].path, 'r');
-            } catch (error) {
-                throw fileError(requested[index].path, error);
+        try {
+            // PHASE 2 — scan in request order. A not-found entry is pushed as-is and
+            // consumes no budget; a real window subtracts exactly its content bytes.
+            for (const item of prepared) {
+                if ('entry' in item) {
+                    files.push(item.entry);
+                    continue;
+                }
+
+                // Fair share of what is left: one file may use the whole budget, two
+                // files split it, and so on. A file that returns fewer bytes leaves
+                // the remainder for the files after it.
+                const allowance =
+                    remainingReadable > 0
+                        ? Math.floor(remainingBudget / remainingReadable)
+                        : remainingBudget;
+
+                let entry: FileReadEntry;
+                try {
+                    entry = await scanFile(item.handle, item.request, allowance);
+                } catch (error) {
+                    // Binary errors are already HarnessError with the path; only wrap
+                    // raw filesystem/decoder failures.
+                    if (error instanceof HarnessError) throw error;
+                    throw fileError(item.request.path, error);
+                } finally {
+                    openHandles.delete(item.handle);
+                    await closeQuietly([item.handle]);
+                }
+
+                remainingReadable -= 1;
+                remainingBudget -= entry.bytes;
+                files.push(entry);
             }
-
-            let entry: FileReadEntry;
-            try {
-                entry = await scanFile(handle, requested[index], allowance);
-            } catch (error) {
-                // Binary errors are already HarnessError with the path; only wrap
-                // raw filesystem/decoder failures.
-                if (error instanceof HarnessError) throw error;
-                throw fileError(requested[index].path, error);
-            } finally {
-                await handle.close();
-            }
-
-            remainingBudget -= entry.bytes;
-            files.push(entry);
+        } catch (error) {
+            // A failed scan (binary content, decoder failure) rejects the batch:
+            // close whatever handle is still open so nothing is leaked.
+            await closeQuietly(openHandles);
+            throw error;
         }
 
         return {

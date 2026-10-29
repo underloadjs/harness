@@ -127,25 +127,30 @@ describe('createAgentRow', () => {
         expect(options.onRemove).toHaveBeenCalledWith('instruct');
     });
 
-    it('locks editing with a visible reason and a New session affordance', () => {
-        const onNewSession = vi.fn();
-        const { element, options } = mount({
+    it('locks the team without a notice or an in-row New session link (R7)', () => {
+        const { element } = mount({
             members: ['instruct', 'summarizer'],
-            editable: false,
-            lockReason: 'This saved session keeps the agent team it started with.',
-            onNewSession
+            editable: false
         });
 
         expect(mainButtons(element).every((button) => button.disabled)).toBe(true);
         expect(removeButtons(element).every((button) => button.disabled)).toBe(true);
         expect(element.querySelector<HTMLButtonElement>('.agent-add')?.disabled).toBe(true);
-        expect(element.querySelector('.agent-lock-text')?.textContent).toBe(
-            'This saved session keeps the agent team it started with.'
+        // R7: a frozen team is expressed by the disabled controls alone. The old
+        // explanation and its link must not come back (the rail owns New session).
+        expect(element.querySelector('.agent-lock')).toBeNull();
+        expect(element.querySelector('.agent-lock-text')).toBeNull();
+        expect(element.querySelector('.link-button')).toBeNull();
+        // The add control's tooltip states only the fact, never a caller-supplied
+        // reason that could smuggle the removed sentence back in.
+        expect(element.querySelector<HTMLButtonElement>('.agent-add')?.title).toBe(
+            'The agent team is locked.'
         );
-
-        element.querySelector<HTMLButtonElement>('.agent-lock .link-button')?.click();
-        expect(onNewSession).toHaveBeenCalledTimes(1);
-        expect(options.onSelectPrimary).not.toHaveBeenCalled();
+        // The wrapper holds exactly the row and the picker: no third lock block.
+        expect([...element.children].map((child) => child.className)).toEqual([
+            'agent-row',
+            'agent-picker'
+        ]);
     });
 
     it('renders a fallback title for a member the preset library does not know', () => {
@@ -293,7 +298,6 @@ describe('per-agent model dropdown', () => {
         const { element } = mount({
             members: ['instruct', 'summarizer'],
             editable: false,
-            lockReason: 'This saved session keeps the agent team it started with.',
             models: models({
                 editable: false,
                 fallbackModel: 'm1',

@@ -7,9 +7,11 @@
 // harness. The fix runs the match loop inside `node:vm` with a real timeout.
 //
 // These tests are deliberately NOT "run the evil pattern and wait": the budget is a
-// parameter, so the bound is proven with a short deadline. The one assertion that
-// takes real time (the default 2-second budget through fileGlob) lives in
-// fileGlob.test.ts.
+// parameter, so the bound is proven with a short deadline. Waiting out the 30-second
+// production budget would also exceed vitest's 15-second per-test timeout, so the
+// DEFAULT is pinned as a number and enforced through a mocked clock in
+// fileGlob.test.ts; the catastrophic-pattern stop itself is proven with an injected
+// short budget here.
 //
 // What is pinned:
 //   - ordinary matching is unchanged: 0-based indices, ascending, one per matching
@@ -21,7 +23,7 @@
 //   - an exhausted budget is refused before any work, and the failure does not
 //     poison a later search.
 
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { HarnessError } from '../../util';
 import {
     budgetError,
@@ -68,19 +70,33 @@ describe('createBoundedLineMatcher', () => {
         expect(() => createBoundedLineMatcher('(a')).toThrow(/Unterminated group/);
     });
 
-    it('stops a catastrophic pattern at the 2-second default budget', () => {
-        // The production budget, so the number in the error is the documented one.
-        // This is the slow test of the file (~2s) and the reason the budget below is
-        // injectable everywhere else.
-        expect(MAX_CONTENT_MATCH_MILLIS).toBe(2000);
+    it('publishes a 30-second default matching budget', () => {
+        // The production budget fileGlob uses when nothing is injected. 30s is the
+        // ONLY matching bound: generous for a legitimate deep grep, still finite for
+        // a catastrophic pattern.
+        expect(MAX_CONTENT_MATCH_MILLIS).toBe(30_000);
+    });
 
-        const matcher = createBoundedLineMatcher(EVIL_SOURCE);
-        const started = Date.now();
+    it('enforces the default budget instead of running the pattern to completion', () => {
+        // Waiting out the real 30s default would exceed vitest's 15s test timeout, so
+        // the clock is mocked: the deadline starts at the first `testLines` call, and
+        // the second clock read is already past the default budget. An exhausted
+        // budget is refused BEFORE matching, so this proves the default is actually
+        // wired in and that the error names it, without burning 30s.
+        const now = vi.spyOn(Date, 'now');
 
-        // Bounded proof: it must throw, not return, and it must return control soon
-        // after the budget rather than minutes later.
-        expect(() => matcher.testLines([EVIL_LINE])).toThrow(budgetError(MAX_CONTENT_MATCH_MILLIS));
-        expect(Date.now() - started).toBeLessThan(30_000);
+        try {
+            now.mockReturnValueOnce(1_000_000);
+            now.mockReturnValue(1_000_000 + MAX_CONTENT_MATCH_MILLIS);
+
+            const matcher = createBoundedLineMatcher(EVIL_SOURCE);
+
+            expect(() => matcher.testLines([EVIL_LINE])).toThrow(
+                budgetError(MAX_CONTENT_MATCH_MILLIS)
+            );
+        } finally {
+            now.mockRestore();
+        }
     });
 
     it('reports the budget and the likely cause, not a partial answer', () => {

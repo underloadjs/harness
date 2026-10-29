@@ -52,11 +52,12 @@
 import { createContext, Script } from 'node:vm';
 import { HarnessError } from '../../util';
 
-// Total matching time one content search may spend, in milliseconds. Sized so a
-// legitimate grep of a large tree still fits (100,000 lines of ordinary text take
-// ~50ms, so 2s is millions of lines) while a catastrophic pattern is stopped long
-// before it can look like a hang.
-export const MAX_CONTENT_MATCH_MILLIS = 2000;
+// Total matching time one content search may spend, in milliseconds. A generous
+// 30s ceiling keeps a legitimate grep of a very large tree from failing (100,000
+// lines of ordinary text take ~50ms) while a catastrophic pattern is still stopped
+// before it can look like a hang. This is the ONLY time bound on content matching:
+// there is deliberately no second, overall request timeout.
+export const MAX_CONTENT_MATCH_MILLIS = 30_000;
 
 // The body of the in-context loop. Compiled ONCE at module load; `source` and
 // `lines` are read from the context on every run, so there is no per-line or

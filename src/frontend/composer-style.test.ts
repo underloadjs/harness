@@ -1,0 +1,117 @@
+// R9/R10 composer CSS contract.
+//
+// The behavior is owned by main.ts and pinned in composer-control.test.ts. This file
+// pins the CSS half, so a future style edit cannot silently:
+//   - give the chat field a taller default / a manual resize handle (R9 wants ONE
+//     row by default, auto-grown by script, scrolling at the cap);
+//   - move the single action out of the input box or let text run underneath it
+//     (R10 wants the same spot inside the field in every state);
+//   - re-introduce the old footer action row for the composer.
+//
+// It holds no import of main.ts so it stays runnable while behavior changes.
+
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { expect, it } from 'vitest';
+
+// Same resolution as the other CSS-source tests: package root (`npm test`) or the
+// frontend root (vitest.config.ts `root`).
+const stylesheet = ['src/frontend/styles.css', 'src/styles.css']
+    .map((candidate) => resolve(process.cwd(), candidate))
+    .find((candidate) => existsSync(candidate));
+if (stylesheet === undefined) throw new Error('styles.css not found');
+
+const css = readFileSync(stylesheet, 'utf8');
+
+// Comments NAME the old selectors, so "must be gone" assertions read the stripped
+// stylesheet (see session-control-style.test.ts).
+const rules = css.replace(/\/\*[\s\S]*?\*\//g, '');
+
+// Brace-matched slice, so a nested `@media` body is never cut at the first `}`.
+const blockOf = (selector: string): string => {
+    const start = rules.indexOf(selector);
+    if (start < 0) throw new Error(`missing selector ${selector}`);
+
+    const open = rules.indexOf('{', start);
+    if (open < 0) throw new Error(`missing body for ${selector}`);
+
+    let depth = 0;
+    for (let index = open; index < rules.length; index += 1) {
+        if (rules[index] === '{') depth += 1;
+        if (rules[index] === '}') {
+            depth -= 1;
+            if (depth === 0) return rules.slice(open + 1, index);
+        }
+    }
+
+    throw new Error(`unbalanced block for ${selector}`);
+};
+
+it('lays the action inside a positioned field wrapper', () => {
+    // R10: the wrapper is the positioning context; without `position: relative`
+    // the action would fly to the viewport corner and duplicate the old footer.
+    const field = blockOf('.composer-field {');
+    expect(field).toContain('position: relative');
+    expect(field).toContain('display: flex');
+    expect(field).toContain('flex: 1');
+    expect(field).toContain('min-width: 0');
+
+    // The action is anchored bottom-right INSIDE that wrapper in every state.
+    const action = blockOf('.composer-action {');
+    expect(action).toContain('position: absolute');
+    expect(action).toContain('right: 8px');
+    expect(action).toContain('bottom: 8px');
+    expect(action).toContain('display: inline-flex');
+    expect(action).toContain('width: 28px');
+    expect(action).toContain('height: 28px');
+    expect(action).toContain('border-radius: 999px');
+
+    // Hidden is a real removal (idle + empty has NO action), not just opacity.
+    const hidden = blockOf('.composer-action[hidden] {');
+    expect(hidden).toContain('display: none');
+
+    // Stop shares the spot but reads as outlined, not as the primary submit.
+    const stop = blockOf(".composer-action[data-action='stop'] {");
+    expect(stop).toContain('background: transparent');
+    expect(stop).toContain('border-color: var(--border-strong)');
+
+    // Keyboard users get a visible focus ring on the dark input.
+    const focus = blockOf('.composer-action:focus-visible {');
+    expect(focus).toContain('outline: 2px solid var(--accent)');
+    expect(focus).toContain('outline-offset: 2px');
+});
+
+it('makes the chat field one row by default, auto-grown and scrolling at the cap', () => {
+    // The base rule keeps the tool-runner arguments box usable (it shares the class
+    // and keeps `resize: vertical`); the chat field overrides it below.
+    const base = blockOf('.composer-input {');
+    expect(base).toContain('max-height: 200px');
+
+    // R9: rows=1 + min-height 0 decide the empty height, script growth owns the rest.
+    const field = blockOf('.composer-field .composer-input {');
+    expect(field).toContain('width: 100%');
+    expect(field).toContain('min-height: 0');
+    expect(field).not.toContain('min-height: 54px');
+    // R10: the right gutter reserves the 28px action + margins, so text never
+    // runs under the icon; the other sides keep the normal field padding.
+    expect(field).toContain('padding: 10px 52px 10px 12px');
+    // The script measures the content; a manual handle would fight it.
+    expect(field).toContain('resize: none');
+    expect(field).not.toContain('resize: vertical');
+    // Past the cap the field scrolls instead of growing without bound.
+    expect(field).toContain('overflow-y: auto');
+});
+
+it('does not keep a footer action row for the composer', () => {
+    // R10: the composer itself has one child (the field). `.composer-actions` is
+    // still legitimately used by the offline Retry pane and the manual tool runner,
+    // so the assertion is scoped to the composer element, not the class.
+    const composer = blockOf('.composer {');
+    expect(composer).toContain('display: flex');
+    expect(composer).not.toContain('flex-direction: column');
+
+    // The removed controls have no rules to style them back into existence.
+    expect(rules).not.toContain('.button.run');
+    expect(rules).not.toContain('.button.reset');
+    expect(rules).not.toContain('.composer-actions .run');
+});

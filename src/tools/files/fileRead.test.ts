@@ -15,8 +15,10 @@
 //     through with `startColumn`;
 //   - UTF-8 bytes (not UTF-16 code units) are counted, and CRLF/empty files keep
 //     their exact text;
-//   - a missing/unreadable path, a directory, an invalid range, or binary content
-//     (NUL bytes or invalid UTF-8) rejects the WHOLE call.
+//   - a path that does not exist keeps its ordered slot as an entry with empty
+//     content, 0 bytes, and a structured `error` (code ENOENT) — while a directory,
+//     an invalid range, or binary content (NUL bytes or invalid UTF-8) still rejects
+//     the WHOLE call.
 //
 // Fixtures are real files under the repo-root `Temp/` (never OS temp), one unique
 // directory per run, removed afterwards. Module-relative so the location does not
@@ -593,12 +595,141 @@ describe('fileRead', () => {
         ).rejects.toThrow(/binary data/);
     });
 
-    it('rejects the whole call when a later path is missing', async () => {
-        // No partial array: the first file exists, but a truncated answer that
-        // looks complete would be worse than an error.
-        await expect(fileRead([join(workdir, 'a.txt'), join(workdir, 'missing.txt')])).rejects.toThrow(
-            /ENOENT/
+    it('keeps an ordered not-found entry for a missing path and reads the rest', async () => {
+        // R1: a missing file is a RESULT, not a failed call. It keeps its ordered
+        // slot with empty content, the empty-window range, 0 bytes, and a structured
+        // ENOENT error, while both readable files are still returned in full.
+        const missing = join(workdir, 'missing.txt');
+
+        await expect(
+            fileRead([join(workdir, 'a.txt'), missing, join(workdir, 'b.txt')])
+        ).resolves.toEqual({
+            files: [
+                {
+                    path: join(workdir, 'a.txt'),
+                    content: 'alpha\n',
+                    startLine: 1,
+                    endLine: 1,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 6
+                },
+                {
+                    path: missing,
+                    content: '',
+                    startLine: 1,
+                    endLine: 0,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 0,
+                    error: {
+                        code: 'ENOENT',
+                        message: `fileRead could not find "${missing}": no such file or directory (ENOENT).`
+                    }
+                },
+                {
+                    path: join(workdir, 'b.txt'),
+                    content: 'beta\n',
+                    startLine: 1,
+                    endLine: 1,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 5
+                }
+            ],
+            truncated: false,
+            bytes: 11,
+            contentBudget: FILE_READ_CONTENT_BUDGET
+        });
+    });
+
+    it('reports every missing path, keeping the requested range as empty metadata', async () => {
+        // An all-missing batch still succeeds: one entry per path, in order, each
+        // with zero bytes, no continuation, and the requested startLine preserved so
+        // `endLine` is the usual "nothing returned" value.
+        const first = join(workdir, 'absent-1.txt');
+        const second = join(workdir, 'absent-2.txt');
+
+        await expect(fileRead([first, { path: second, startLine: 5, maxLines: 2 }])).resolves.toEqual(
+            {
+                files: [
+                    {
+                        path: first,
+                        content: '',
+                        startLine: 1,
+                        endLine: 0,
+                        truncated: false,
+                        nextLine: null,
+                        nextColumn: null,
+                        bytes: 0,
+                        error: {
+                            code: 'ENOENT',
+                            message: `fileRead could not find "${first}": no such file or directory (ENOENT).`
+                        }
+                    },
+                    {
+                        path: second,
+                        content: '',
+                        startLine: 5,
+                        endLine: 4,
+                        truncated: false,
+                        nextLine: null,
+                        nextColumn: null,
+                        bytes: 0,
+                        error: {
+                            code: 'ENOENT',
+                            message: `fileRead could not find "${second}": no such file or directory (ENOENT).`
+                        }
+                    }
+                ],
+                truncated: false,
+                bytes: 0,
+                contentBudget: FILE_READ_CONTENT_BUDGET
+            }
         );
+    });
+
+    it('charges no content budget to a missing entry', async () => {
+        // R1 budget rule: the 40 KB file used to split the 64 KiB cap with the
+        // missing path (32 KB each), even though the missing entry can never spend
+        // its share. The split now covers files that exist, so the whole file is
+        // returned and the caller sees the same window as a one-file call.
+        await expect(
+            fileRead([join(workdir, 'many', '0.txt'), join(workdir, 'missing.txt')])
+        ).resolves.toEqual({
+            files: [
+                {
+                    path: join(workdir, 'many', '0.txt'),
+                    content: 'a'.repeat(40000),
+                    startLine: 1,
+                    endLine: 1,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 40000
+                },
+                {
+                    path: join(workdir, 'missing.txt'),
+                    content: '',
+                    startLine: 1,
+                    endLine: 0,
+                    truncated: false,
+                    nextLine: null,
+                    nextColumn: null,
+                    bytes: 0,
+                    error: {
+                        code: 'ENOENT',
+                        message: `fileRead could not find "${join(workdir, 'missing.txt')}": no such file or directory (ENOENT).`
+                    }
+                }
+            ],
+            truncated: false,
+            bytes: 40000,
+            contentBudget: FILE_READ_CONTENT_BUDGET
+        });
     });
 
     it('rejects a directory path with the path in the message', async () => {

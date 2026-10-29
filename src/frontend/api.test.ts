@@ -669,3 +669,51 @@ describe('session model updates', () => {
         );
     });
 });
+
+// R8: permanent session removal. The wire contract is fixed — one DELETE on
+// `/sessions/:id`, no body — and a 404 keeps surfacing the server's own message so
+// main.ts can recognise "Unknown session" as already-gone rather than inventing a
+// second route or swallowing the error.
+describe('session deletion', () => {
+    it('sends DELETE /sessions/:id with no body and resolves on { deleted: true }', async () => {
+        const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+                calls.push({
+                    url: String(input),
+                    method: init?.method,
+                    body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
+                });
+                return json({ deleted: true });
+            })
+        );
+
+        const module = await import('./api');
+
+        // `void` on purpose: the UI only needs the acknowledgement, and the record
+        // is gone once this resolves.
+        await expect(module.deleteSession('a/b')).resolves.toBeUndefined();
+        expect(calls).toEqual([
+            { url: '/api/sessions/a%2Fb', method: 'DELETE', body: undefined }
+        ]);
+    });
+
+    it('surfaces the server 404 message for an unknown session', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+                if (String(input) === '/api/sessions/s1' && init?.method === 'DELETE') {
+                    return json({ error: { message: 'Unknown session "s1".' } }, 404);
+                }
+
+                throw new Error(`unexpected request: ${String(input)}`);
+            })
+        );
+
+        const module = await import('./api');
+
+        await expect(module.deleteSession('s1')).rejects.toThrow('Unknown session "s1".');
+    });
+});
