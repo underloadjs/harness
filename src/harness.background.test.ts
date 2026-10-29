@@ -456,7 +456,8 @@ describe('background tool calls', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
 
         // R4: the pause is reported as a done with the pending list, and the wake

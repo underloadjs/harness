@@ -244,3 +244,91 @@ describe('paintActivity', () => {
         ).toBeUndefined();
     });
 });
+
+describe('N3 interaction and branch frames', () => {
+    const request = {
+        requestId: 'req-1',
+        question: 'Which file?',
+        recommended: 'a',
+        options: [{ id: 'a', label: 'Alpha' }],
+        allowCustom: true as const
+    };
+    const actionRequest = (agent: string): HarnessEvent => ({
+        type: 'action_request',
+        agent,
+        callId: 'call-1',
+        request
+    });
+    const actionAnswer = (agent: string): HarnessEvent => ({
+        type: 'action_answer',
+        agent,
+        requestId: 'req-1',
+        answer: {
+            requestId: 'req-1',
+            choice: { kind: 'option', optionId: 'a' },
+            source: 'auto'
+        }
+    });
+    const branch = (branchId: string, kind: 'fork' | 'autoanswer', agent: string) => ({
+        branchId,
+        kind,
+        agent,
+        role: 'subagent' as const,
+        forkDepth: 1,
+        model: 'm1',
+        tools: []
+    });
+    const branchStart = (branchId: string, kind: 'fork' | 'autoanswer', agent: string): HarnessEvent => ({
+        type: 'branch_start',
+        agent,
+        branch: branch(branchId, kind, agent)
+    });
+    const branchEnd = (branchId: string, agent: string): HarnessEvent => ({
+        type: 'branch_end',
+        agent,
+        branchId,
+        status: 'completed'
+    });
+
+    it('keeps the asking agent active while a question is pending and after it is answered', () => {
+        expect(reduce([start('instruct'), actionRequest('instruct')])).toEqual(['instruct']);
+        expect(reduce([start('instruct'), actionRequest('instruct'), actionAnswer('instruct')])).toEqual([
+            'instruct'
+        ]);
+    });
+
+    it('lights the branch agent on branch_start and leaves the requester ring alone on branch_end', () => {
+        expect(reduce([start('instruct'), branchStart('b1', 'fork', 'helper')])).toEqual([
+            'instruct',
+            'helper'
+        ]);
+
+        // `branch_end` names the REQUESTER (the source of the fork), not the branch
+        // agent; it must not unfinish the source's still-running ring. The branch's
+        // own done settles the branch agent.
+        const ended = reduce([
+            start('instruct'),
+            branchStart('b1', 'fork', 'helper'),
+            branchEnd('b1', 'instruct')
+        ]);
+        expect(ended).toEqual(['instruct', 'helper']);
+        expect([...ended].sort()).toEqual(['helper', 'instruct']);
+
+        expect(
+            reduce([
+                start('instruct'),
+                branchStart('b1', 'fork', 'helper'),
+                branchEnd('b1', 'instruct'),
+                done('helper')
+            ])
+        ).toEqual(['instruct']);
+    });
+
+    it('contributes no activity for a settled replay even with N3 frames', () => {
+        const settled = turn({
+            status: 'done',
+            events: [start('instruct'), actionRequest('instruct'), branchStart('b1', 'fork', 'helper')]
+        });
+        expect([...activityOfTurn(settled)]).toEqual([]);
+    });
+});

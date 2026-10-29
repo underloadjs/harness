@@ -6,6 +6,10 @@
 //   - which SINGLE in-field action exists: submit, stop, or none at all;
 //   - how tall the auto-grown field is: one row minimum, capped, scroll past the cap.
 //
+// Attachment markers/counters are a separate concern (ui/attachments.ts); this
+// module only learns whether a READY attachment exists, so an attachment-only turn
+// paints the same submit action as typed text.
+//
 // R5 moves the cap from a fixed stylesheet pixel box to a TEXT-LINE budget: 3 lines
 // on a phone viewport and 5 on desktop. It is derived from the field's live computed
 // line-height/padding/borders at call time (main.ts autoGrow), so a zoomed or
@@ -17,20 +21,30 @@
 // state: Reset is gone (R10) and Run/Stop are never both visible.
 export type ComposerActionKind = 'submit' | 'stop' | 'none';
 
-// Derive the action from the field's text and whether work is pending.
+// Derive the action from the field's text/attachments and whether work is pending.
 //
 // R10 matrix:
-//   text present, idle      -> submit
-//   text present, running   -> submit (submitting queues the task)
-//   empty, running/pending  -> stop
-//   empty, idle             -> none (no control at all)
+//   text or ready attachments present, idle      -> submit
+//   text or ready attachments present, running   -> submit (submitting queues)
+//   empty, running/pending                       -> stop
+//   empty, idle                                  -> none (no control at all)
 //
-// Whitespace-only input is treated as empty: run() trims and refuses it, so painting
-// a submit icon over spaces would promise an action that cannot happen. Text ALWAYS
-// wins over pending: while a task runs the same control submits the next task, which
-// is how the existing queue behavior is preserved.
-export const composerActionOf = (value: string, pending: boolean): ComposerActionKind => {
-    if (value.trim().length > 0) return 'submit';
+// Text ALWAYS wins over pending: while a task runs the same control submits the
+// next task, which is how the existing queue behavior is preserved.
+//
+// Whitespace-only text is treated as empty: run() trims and refuses it, so painting
+// a submit icon over spaces alone would promise an action that cannot happen.
+//
+// ATTACHMENTS (clip/attach): the server accepts an attachment-only turn, so a
+// draft with a READY file (its marker inserted, bytes encoded) is submittable even
+// with an empty prompt. Pending reads are excluded by the caller: until every file
+// has encoded, the draft is not ready and this must not promise a send.
+export const composerActionOf = (
+    value: string,
+    pending: boolean,
+    attachments = 0
+): ComposerActionKind => {
+    if (value.trim().length > 0 || attachments > 0) return 'submit';
 
     return pending ? 'stop' : 'none';
 };

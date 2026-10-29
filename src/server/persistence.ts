@@ -51,6 +51,7 @@ import type {
     HarnessSnapshot
 } from '../harness';
 import type { HarnessDescriptor, SessionStatus, SessionTurn } from './protocol';
+import { validateAttachments } from '../shared/attachments';
 
 // Bumped only when the on-disk document becomes incompatible. The core snapshot
 // carries its own version (HARNESS_SNAPSHOT_VERSION); this one gates the
@@ -332,10 +333,31 @@ const readTurn = (value: unknown, label: string): SessionTurn => {
                   };
               })();
 
+    // Composer attachments (T3) are OPTIONAL. Re-run the shared validator on load
+    // for the same reason the core re-validates persisted user messages: a
+    // corrupted/foreign document must fail loudly instead of restoring bytes whose
+    // size/MIME/signature no longer holds. `undefined` means a pre-attachment
+    // record and is preserved as an absent key (exact old shape).
+    const attachments =
+        record.attachments === undefined
+            ? undefined
+            : (() => {
+                  try {
+                      // The validator detaches copies, so the restored record never
+                      // aliases the parsed document.
+                      return validateAttachments(record.attachments);
+                  } catch (error) {
+                      throw new TypeError(
+                          `${label}.attachments is invalid: ${error instanceof Error ? error.message : String(error)}`
+                      );
+                  }
+              })();
+
     return {
         id: requireString(record.id, `${label}.id`),
         index: requireNumber(record.index, `${label}.index`),
         prompt: requireString(record.prompt, `${label}.prompt`),
+        ...(attachments === undefined ? {} : { attachments }),
         status: status as SessionTurn['status'],
         ...(record.startedAt === undefined
             ? {}

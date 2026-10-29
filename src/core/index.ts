@@ -29,6 +29,15 @@
 //                  (R11). Shared with the harness's manual tool path so both
 //                  resolve arguments identically.
 //   DEFAULT_CREATED_TOOLS_LIMIT — the lifetime toolCreate budget (R12).
+//   validateActionRequestParameters()/validateActionChoice() — strict
+//                  actionRequest parsing shared by the harness runtime, server
+//                  route, and frontend card (N3). See ./action.ts.
+//   agentBranchOf()/forkAgent()/materializeBranchHistory()/
+//   incorporateBranchHistory()/pruneBranchRecords() — the private branch
+//                  foundation: identity, fork creation, strict tool-id
+//                  materialization, owner/child incorporation, and record
+//                  bounds (N3). See ./branch.ts. `agentBranchOf` is the internal
+//                  accessor that keeps branchId out of the public Agent type.
 //
 // These factories are usable on their own. An agent on its own means writing the
 // loop by hand: send a message, read `message.toolCalls`, run the tools, append
@@ -92,6 +101,10 @@ export {
     TOOL_CREATE_METADATA,
     TOOL_CREATE_NAME,
     AGENT_DELEGATE_NAME,
+    ACTION_REQUEST_METADATA,
+    ACTION_REQUEST_NAME,
+    THREAD_FORK_METADATA,
+    THREAD_FORK_NAME,
     TOOL_CANCEL_METADATA,
     TOOL_CANCEL_NAME,
     TOOL_REQUEST_METADATA,
@@ -108,3 +121,45 @@ export {
     coreToolMetadata
 } from './metadata';
 export type { CoreToolMetadata } from './metadata';
+// N3 actionRequest parsing. The server route, the frontend card, and the harness
+// runtime all call these two functions so model output and owner answers are
+// validated by one implementation.
+export {
+    ACTION_REQUEST_LIMITS,
+    validateActionChoice,
+    validateActionRequestParameters
+} from './action';
+// N3 branch foundation. `agentBranchOf` is the INTERNAL accessor that keeps a
+// branch id out of the public Agent type; the rest are the runtime's contracts
+// for creating branches, materializing/incorporating history and enforcing the
+// frozen bounds. None of these are re-exported from the package root.
+export {
+    BRANCH_PENDING_PLACEHOLDER,
+    MAX_BRANCH_RECORDS,
+    MAX_FORK_CONCURRENT,
+    MAX_FORK_DEPTH,
+    MAX_FORK_HISTORY_BYTES,
+    agentBranchOf,
+    assertBranchConcurrency,
+    assertForkDepth,
+    branchBoundaryEnd,
+    branchBoundaryStart,
+    createBranchId,
+    forkAgent,
+    incorporateBranchHistory,
+    isTerminalBranchStatus,
+    materializeBranchHistory,
+    normalizeBranchLabel,
+    normalizeForkAgentOptions,
+    pruneBranchRecords,
+    quotedBranchSystemInstruction
+} from './branch';
+export type {
+    AgentBranchKind,
+    AgentBranchMetadata,
+    BranchPendingReason,
+    ForkAgentOptions,
+    IncorporateBranchHistoryOptions,
+    MaterializedBranchHistory,
+    NormalizedForkAgentOptions
+} from './branch';

@@ -34,6 +34,18 @@ describe('composerActionOf', () => {
     ] as const)('returns %s', (_label, value, pending, expected) => {
         expect(composerActionOf(value, pending)).toBe(expected);
     });
+
+    // T5: a READY attachment makes an empty prompt submittable (the server accepts
+    // an attachment-only turn). A pending read is excluded by the caller, which
+    // passes the count of ENCODED files only.
+    it('treats a ready attachment as submittable content', () => {
+        expect(composerActionOf('', false, 1)).toBe('submit');
+        expect(composerActionOf('', true, 1)).toBe('submit');
+        expect(composerActionOf('   ', true, 2)).toBe('submit');
+        // No text and no ready attachment keeps the old empty-field matrix.
+        expect(composerActionOf('', true, 0)).toBe('stop');
+        expect(composerActionOf('', false, 0)).toBe('none');
+    });
 });
 
 describe('composerFieldHeight', () => {

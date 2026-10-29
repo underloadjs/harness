@@ -23,12 +23,25 @@ import type { HarnessPreset, RunnerSettings } from '../harnesses/types';
 import { loadConfiguration } from '../config';
 import { loadEnvironmentFile } from '../environment';
 import { startHarnessServer } from '../index';
-import type { Harness } from '../../harness';
+import type { Harness, HarnessInteractionConfiguration } from '../../harness';
 import { createRenderer } from './render';
 import type { Renderer } from './render';
 import { DEFAULT_CLI_PRESET, parseCliOptions } from './options';
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+// N4 owner interaction for the CLI. There is no prompt UI here, so the model may
+// still ASK (the tool is declared) but every root question is answered with a
+// readable error instead of silently accepting the recommendation. The runtime's
+// child/fork path keeps its own auto-answer behaviour, which is why
+// `autoAnswer` is left at its default. No answer is ever fabricated.
+const CLI_INTERACTION: HarnessInteractionConfiguration = {
+    actionRequest: async () => {
+        throw new Error(
+            'The CLI has no owner UI to answer an actionRequest. Decide safely from the available context instead; the recommended option is never selected automatically.'
+        );
+    }
+};
 
 const printUsage = (): void => {
     console.log(`@underload/harness — CLI agent harness
@@ -165,7 +178,7 @@ const interactive = async (
     renderer: Renderer,
     json: boolean
 ): Promise<void> => {
-    const harness = preset.create(settings, renderer);
+    const harness = preset.create(settings, renderer, { interaction: CLI_INTERACTION });
     const output = json ? process.stderr : process.stdout;
 
     output.write(`\n${preset.title} (${preset.name})\n`);
@@ -279,7 +292,7 @@ const oneShot = async (
     input: string,
     json: boolean
 ): Promise<void> => {
-    const harness = preset.create(settings, renderer);
+    const harness = preset.create(settings, renderer, { interaction: CLI_INTERACTION });
     const controller = new AbortController();
 
     process.once('SIGINT', () => controller.abort());

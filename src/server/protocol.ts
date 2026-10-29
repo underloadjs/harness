@@ -4,11 +4,27 @@
 // a runtime dependency that a browser cannot load. The server and CLI import the
 // values they need from their own modules.
 
-import type { HarnessErrorInfo, HarnessEvent, HarnessMessage, HarnessUsage, ToolUiPanel } from '../harness';
+import type {
+    HarnessActionAnswer,
+    HarnessActionChoice,
+    HarnessActionOption,
+    HarnessActionRequest,
+    HarnessAttachment,
+    HarnessErrorInfo,
+    HarnessEvent,
+    HarnessMessage,
+    HarnessUsage,
+    ToolUiPanel
+} from '../harness';
 import type { RunnerSettings } from './harnesses/types';
 
 export type {
+    HarnessActionAnswer,
+    HarnessActionChoice,
+    HarnessActionOption,
+    HarnessActionRequest,
     HarnessAssistantMessage,
+    HarnessAttachment,
     HarnessErrorInfo,
     HarnessEvent,
     HarnessMessage,
@@ -48,6 +64,12 @@ export type SessionTurn = {
     index: number;
     // The trimmed task text the harness received, not the raw request body.
     prompt: string;
+    // Composer attachments the user submitted with this turn (T3). Omitted for a
+    // text-only turn, so every pre-attachment record and response keeps its exact
+    // old shape. The server validates and deep-copies them before the turn exists,
+    // persists them with the turn, and hands the same bytes to the harness call
+    // (`HarnessRunOptions.attachments`). `data` is raw canonical base64.
+    attachments?: HarnessAttachment[];
     status: SessionTurnStatus;
     // Absent while 'queued' (execution has not begun); always set once the turn
     // is 'running' or terminal. Optional so a queued record is a valid turn.
@@ -305,8 +327,16 @@ export type UpdateSessionRequest = {
     agentModels: Record<string, string>;
 };
 
+// Body of both submit routes. `input` is the user text (trimmed by the server);
+// `attachments` are the composer clips referenced by their markers inside the
+// text. The key is OMITTED by a text-only client, which keeps the legacy body
+// byte-identical. Empty/whitespace input is accepted only when at least one
+// attachment is present. The server re-validates every field (shared
+// validateAttachments) BEFORE creating a turn, so malformed, oversized, or
+// mismatched media answers 400/413/415 with nothing mutated.
 export type SubmitMessageRequest = {
     input: string;
+    attachments?: HarnessAttachment[];
 };
 
 // Body of POST /api/sessions/:id/tasks — the server-queued submit (R4).
@@ -317,6 +347,29 @@ export type SubmitMessageRequest = {
 // `{ session, turn }` immediately and the server pump runs the task even if the
 // browser is gone. Task text is trimmed and bounded exactly like /messages.
 export type SubmitTaskRequest = SubmitMessageRequest;
+
+// Body of POST /api/sessions/:id/actions/:requestId/answer (N4).
+//
+// The client answers ONE pending owner question with exactly one of the frozen
+// `HarnessActionChoice` shapes: `{ kind: 'option', optionId }` naming an option
+// the model offered, or `{ kind: 'custom', text }` free text. The server validates
+// the choice against the recorded request (unknown option ids and malformed bodies
+// are 400), resolves that pending promise exactly once, and answers `{ ok: true }`.
+// The runtime then emits `action_answer` before the tool result, so every client
+// can clear its question card from events alone.
+//
+// Status contract: 400 malformed/unknown-option, 404 unknown session or request id,
+// 409 already answered or expired (including every request restored from disk).
+// Answering is ALLOWED while the session is busy — the run is awaiting this answer.
+export type AnswerActionRequest = {
+    choice: HarnessActionChoice;
+};
+
+// Successful answer response. Deliberately minimal: the authoritative record is the
+// persisted `action_answer` event, not a second copy of the choice on this route.
+export type AnswerActionResult = {
+    ok: true;
+};
 
 // Body of POST /api/sessions/:id/cancel. Absent/`{}` keeps the legacy behaviour:
 // cancel the ACTIVE run only, leaving queued tasks untouched. `all: true` is the

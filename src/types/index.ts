@@ -23,6 +23,35 @@
 
 export type HarnessRole = 'system' | 'user' | 'assistant' | 'tool';
 
+// One composer attachment carried with a user message (T3 clip/attach feature).
+//
+// `data` is RAW canonical base64 of the file bytes — never a `data:` URL, a
+// filesystem path, or an HTTP URL. `size` is the DECODED byte length and must
+// agree with `data`. `marker` is the exact text label the composer inserted into
+// the prompt (e.g. "[Image 1]"); the transport uses it to place the media part at
+// the position the user referenced. Validation and limits live in
+// shared/attachments.ts (validateAttachments); this type is the single shape
+// owner for server, frontend, snapshot, and transport.
+export type HarnessAttachment = {
+    // Stable, opaque, unique within one turn (used by the client to update a
+    // preview in place and by snapshots to round-trip).
+    id: string;
+    // What the attachment IS. `file` is representable but not transportable:
+    // the transport refuses it with an explicit unsupported error rather than
+    // stringifying binary data.
+    kind: 'image' | 'video' | 'audio' | 'pdf' | 'file';
+    // The text marker as it appears in the user prompt: "[Image 1]".
+    marker: string;
+    // Plain file name only (used as the provider's file filename). No paths/URLs.
+    name: string;
+    // Lowercase MIME type without parameters, e.g. "image/png" or "application/pdf".
+    mime: string;
+    // Decoded byte length of `data`.
+    size: number;
+    // Raw canonical base64 bytes (no prefix, no whitespace).
+    data: string;
+};
+
 // A tool invocation requested by the model. `arguments` stays a raw JSON string
 // because that is what the wire protocol delivers, and because malformed JSON is
 // the harness's problem to report back to the model rather than a parse crash.
@@ -41,7 +70,18 @@ export type HarnessToolCall = {
 // transport maps these onto the provider's wire format (see transport.ts).
 export type HarnessMessage =
     | { role: 'system'; content: string }
-    | { role: 'user'; content: string }
+    | {
+          role: 'user';
+          content: string;
+          // Composer attachments referenced by `marker` inside `content`. Optional
+          // and omitted for a text-only user message, so every pre-attachment
+          // transcript (and snapshot) keeps its exact old shape.
+          //
+          // Validated and deep-copied before any append (core/agent.ts,
+          // harness.ts, core/snapshot.ts) and mapped to provider parts by the
+          // transport (transport/openai.ts).
+          attachments?: HarnessAttachment[];
+      }
     | {
           role: 'assistant';
           content: string;
@@ -205,6 +245,13 @@ export type AgentModelAccessor = {
 
 export type AgentStreamOptions = {
     signal?: AbortSignal;
+    // Attachments for the user message that stream(input, options) appends.
+    // `turn()` ignores them: it never appends a user message. Validated before
+    // the append (core/agent.ts), so malformed bytes never mutate history.
+    //
+    // The harness validates the root run's attachments once in harness.ts and
+    // passes them through here; nested subagent runs never inherit them.
+    attachments?: HarnessAttachment[];
     // Tool declarations forwarded with the request. Standalone callers pass these
     // and write the execution loop themselves; the harness supplies its whole
     // registry automatically.
@@ -259,7 +306,9 @@ export type Agent = {
     model: AgentModelAccessor;
     // Append a message and return the agent for chaining.
     system: (content: string) => Agent;
-    user: (content: string) => Agent;
+    // Append a user message. The optional attachments are validated and copied
+    // before the append; omit them for the historical text-only call.
+    user: (content: string, attachments?: HarnessAttachment[]) => Agent;
     assistant: (content: string, toolCalls?: HarnessToolCall[]) => Agent;
     // Append the input, then run one turn. Commits the turn atomically: on
     // failure history is truncated back to where it was.
@@ -268,7 +317,18 @@ export type Agent = {
     // message. This is the primitive the harness loop re-requests with after a
     // tool result. Throws on failure.
     turn: (options?: AgentStreamOptions) => AsyncIterable<AgentStreamEvent>;
-    // Restore history to the seeded instructions and reset the model.
+    // N3: create a PRIVATE branch that owns a detached copy of this agent's
+    // entire committed history, model value, instructions and reset baseline.
+    // It shares the transport (and therefore provider credentials / external
+    // tool side effects), never a sandbox. Tool-call ids are remapped
+    // deterministically and pending calls are paired with explicit non-success
+    // placeholders; this agent's own transcript is never touched. `label` is
+    // display metadata only. Branch identity/depth is available through the
+    // internal `agentBranchOf` accessor (core/index), not on this public type.
+    fork: (options?: { label?: string }) => Agent;
+    // Restore history to the seeded instructions and reset the model. For a
+    // fork this restores the branch's DETACHED baseline (its cloned history at
+    // fork time), never the live source history.
     reset: () => void;
 };
 
@@ -404,6 +464,165 @@ export type ToolCreationPolicy = 'all' | 'primary' | false;
 export type HarnessDelegationResult = {
     agent: string;
     content: string;
+};
+
+// ---------------------------------------------------------------------------
+// actionRequest / threadFork / branches (N3)
+// ---------------------------------------------------------------------------
+//
+// actionRequest lets a model stop and ask its OWNER a bounded question when the
+// request is genuinely ambiguous. The model always supplies alternatives plus a
+// recommended option; it can never force the owner to accept the recommendation
+// (there is no silent fallback), and the owner may always answer with free text
+// because `allowCustom` is a type-level `true`, not a model-controlled argument.
+//
+// threadFork copies an agent's ENTIRE committed history into a private branch so
+// another thread can read that history independently and return one summary. A
+// branch is not a sandbox: it shares the source agent's transport and the host's
+// external tool side effects. It owns a detached transcript and reset baseline.
+//
+// Cross-references:
+//   - ../core/action.ts   — strict runtime parsing for both wire shapes
+//   - ../core/branch.ts   — fork identity, tool-id materializer, branch bounds
+//   - ../core/agent.ts    — Agent.fork()
+//   - ../core/metadata.ts — actionRequest / threadFork schemas
+//   - ../harness.ts       — runtime that creates/records branches (later worker)
+
+// One choice the model offers the owner. `id` is the stable value a reply names;
+// `label` is what a UI shows. `description` is optional supporting detail.
+export type HarnessActionOption = {
+    id: string;
+    label: string;
+    description?: string;
+};
+
+// The model-facing request. `recommended` MUST be one of the option ids: the
+// parser rejects an unknown id rather than silently falling back to options[0],
+// so a UI can always highlight a real recommendation.
+export type HarnessActionRequest = {
+    // Generated by the runtime, never by the model.
+    requestId: string;
+    question: string;
+    recommended: string;
+    options: HarnessActionOption[];
+    // Always true. Custom free-text answers are part of the contract, not a
+    // switch the model may disable.
+    allowCustom: true;
+};
+
+// The answer itself, as chosen by an owner (human/host) or the automatic owner
+// fork. Either an option id or free text; never both.
+export type HarnessActionChoice =
+    | { kind: 'option'; optionId: string }
+    | { kind: 'custom'; text: string };
+
+// Recorded answer envelope. `source` says who answered; `branchId` is present
+// only when an automatic owner fork answered.
+export type HarnessActionAnswer = {
+    requestId: string;
+    choice: HarnessActionChoice;
+    source: 'owner' | 'auto';
+    branchId?: string;
+};
+
+// The tool result handed back to the requesting model. Option choices carry the
+// resolved label/description so the model sees the human-visible wording even
+// though it only sent an id.
+export type HarnessActionResult = {
+    requestId: string;
+    answeredBy: 'owner' | 'auto';
+    choice:
+        | { kind: 'option'; optionId: string; label: string; description?: string }
+        | { kind: 'custom'; text: string };
+};
+
+// What a host action handler sees. `agent`/`branchId`/`threadId`/`callId`
+// identify the requester precisely; `request` is already parsed and validated.
+export type HarnessActionRequestContext = {
+    requestId: string;
+    agent: string;
+    branchId?: string;
+    threadId?: string;
+    callId: string;
+    request: HarnessActionRequest;
+};
+
+// A host-supplied answerer. The signal aborts with the run; a handler that
+// rejects fails the actionRequest call (the model receives the error).
+export type HarnessActionHandler = (
+    context: HarnessActionRequestContext,
+    signal: AbortSignal
+) => Promise<HarnessActionChoice>;
+
+// What threadFork returns to the requesting thread: an identity plus the final
+// summary content. The full transcript stays in `harness.branch(branchId)`.
+export type HarnessForkResult = {
+    branchId: string;
+    threadId: string;
+    content: string;
+};
+
+// The public, bounded description of one branch. `role` is the source agent's
+// role in the harness, `tools` the wire names that branch could call. `forkDepth`
+// counts ordinary forks (1 = a fork of a root); autoanswer branches inherit their
+// source depth because they do not consume a general nesting level.
+export type HarnessBranchSummary = {
+    branchId: string;
+    kind: 'fork' | 'autoanswer';
+    agent: string;
+    role: 'primary' | 'subagent';
+    sourceBranchId?: string;
+    sourceThreadId?: string;
+    callId?: string;
+    requestId?: string;
+    forkDepth: number;
+    model: string;
+    tools: string[];
+};
+
+// Lifecycle of one branch record. `running` is the only non-terminal state.
+export type HarnessBranchStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+
+// The terminal statuses a `branch_end` event may report.
+export type HarnessBranchTerminalStatus = Exclude<HarnessBranchStatus, 'running'>;
+
+// A branch record is a SUMMARY plus the branch's own committed transcript and
+// the deterministic origin→branch tool-id mapping the materializer produced.
+// It is runtime/session state, deliberately NOT part of snapshot v1.
+export type HarnessBranchRecord = HarnessBranchSummary & {
+    status: HarnessBranchStatus;
+    // Deterministic provider-safe remap for every tool call in `messages`.
+    // `origin` is the id in the source transcript; `branch` is the id this
+    // branch uses. Empty for a branch with no tool calls.
+    toolCallIds: Array<{ origin: string; branch: string }>;
+    // The branch's entire committed transcript (cloned, remapped and with
+    // pending calls paired by an explicit non-success placeholder). Never a
+    // reference to the owner's live array.
+    messages: HarnessMessage[];
+    // Present when the branch finished normally.
+    result?: { content: string; stopReason: HarnessStopReason };
+    // Present when the branch failed or was cancelled.
+    error?: HarnessErrorInfo;
+};
+
+// Fork/branch bounds. Every field is optional; the defaults are the frozen
+// values in ../core/branch.ts (maxDepth 2, maxConcurrent 4, maxHistoryBytes
+// 8 MiB, maxBranchRecords 64).
+export type HarnessForkConfiguration = {
+    enabled?: boolean;
+    maxDepth?: number;
+    maxConcurrent?: number;
+    maxHistoryBytes?: number;
+    maxBranchRecords?: number;
+};
+
+// Owner interaction. `actionRequest` installs the host answerer; `autoAnswer`
+// lets an owner fork answer tool-free when no handler is available. Neither
+// enables the tool by itself: the harness registers `actionRequest` only when
+// interaction is configured.
+export type HarnessInteractionConfiguration = {
+    actionRequest?: HarnessActionHandler;
+    autoAnswer?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -862,6 +1081,18 @@ export type HarnessThread = {
     parentId?: string;
     callId?: string;
     input?: string;
+    // N3: what spawned this NON-ROOT invocation.
+    //   - 'delegation' — an ordinary agentDelegate / ctx.run child;
+    //   - 'fork'       — a threadFork branch that reads the owner history;
+    //   - 'autoanswer' — a tool-free owner fork answering an actionRequest.
+    // Omitted for historical recorded turns (they predate this field) and may be
+    // omitted by a hand-written reporter, so readers must not require it.
+    kind?: 'delegation' | 'fork' | 'autoanswer';
+    // Branch identity for a fork/autoanswer thread. Absent for a delegation
+    // thread and for every pre-branch recorded event. This is the SAME id the
+    // branch events and `harness.branch(id)` use; a thread does not invent a
+    // second naming scheme.
+    branchId?: string;
 };
 
 // Every event variant carries the SAME optional field (spelled out per variant so
@@ -945,6 +1176,43 @@ export type HarnessEvent =
           pending: HarnessPendingTool[];
           thread?: HarnessThread;
       }
+    // N3: the model asked its owner a bounded question. `callId` is the
+    // actionRequest tool call; `request` is already parsed and bounds-checked.
+    | {
+          type: 'action_request';
+          agent: string;
+          callId: string;
+          request: HarnessActionRequest;
+          thread?: HarnessThread;
+      }
+    // N3: an answer was recorded (owner or automatic). Emitted for every
+    // accepted answer, including a custom one, so a client can resolve the
+    // pending card without polling.
+    | {
+          type: 'action_answer';
+          agent: string;
+          requestId: string;
+          answer: HarnessActionAnswer;
+          thread?: HarnessThread;
+      }
+    // N3: a fork/autoanswer branch started. `branch` is the summary a client can
+    // use before the branch transcript exists.
+    | {
+          type: 'branch_start';
+          agent: string;
+          branch: HarnessBranchSummary;
+          thread?: HarnessThread;
+      }
+    // N3: a branch reached a terminal state. `error` is present for a failed or
+    // cancelled branch, and absent for a completed one.
+    | {
+          type: 'branch_end';
+          agent: string;
+          branchId: string;
+          status: HarnessBranchTerminalStatus;
+          error?: HarnessErrorInfo;
+          thread?: HarnessThread;
+      }
     | { type: 'error'; agent: string; error: HarnessErrorInfo; thread?: HarnessThread };
 
 export type HarnessProgress = (event: HarnessEvent) => void | Promise<void>;
@@ -985,6 +1253,9 @@ export type HarnessStateChangeEvent = {
     agent?: string;
     // The tool whose execution/create caused the change, when applicable.
     tool?: string;
+    // N3: the branch whose transcript changed, when the change belongs to a
+    // fork/autoanswer branch rather than to a root agent.
+    branchId?: string;
 };
 
 export type HarnessRunOptions = {
@@ -1000,6 +1271,14 @@ export type HarnessRunOptions = {
     // history is truncated back to where its call started, and the error
     // propagates.
     signal?: AbortSignal;
+    // Attachments for the ROOT user prompt of this run (T3 composer). Validated
+    // before any history mutation; malformed input rejects the run untouched.
+    //
+    // Only the root prompt receives them: delegated children and ctx.run start
+    // from their own text prompt, so a root's bytes are never re-sent with an
+    // unrelated subagent request. The user message keeps `marker` labels inside
+    // `content`; the transport maps them to multimodal parts.
+    attachments?: HarnessAttachment[];
 };
 
 // ---------------------------------------------------------------------------
@@ -1151,6 +1430,12 @@ export type HarnessConfiguration = {
     // the constructed tool closure: no schema value, argument, result, or event
     // carries them. A configured tool named `webSearch` wins over this field.
     websearch?: boolean | WebsearchConfiguration;
+    // N3 fork/branch bounds and the threadFork capability. Omitted = threadFork
+    // is not registered and no branch may be created. Values are validated at
+    // construction against the frozen defaults in core/branch.ts.
+    forks?: HarnessForkConfiguration;
+    // N3 owner interaction. Omitted = actionRequest is not registered.
+    interaction?: HarnessInteractionConfiguration;
     // Reporting hooks. `progress` is awaited for every step, so a slow UI can
     // pace the run, and a `console.log` can just print.
     report?: {
@@ -1241,6 +1526,14 @@ export type Harness = {
     // later turn call a tool discovered earlier. Copied on read; `reset()` empties
     // it.
     readonly discoveredTools: string[];
+    // N3: every branch record this harness knows, newest last. Includes running
+    // branches and the bounded newest terminal records (see
+    // MAX_BRANCH_RECORDS / core/branch.ts). The returned array is a detached
+    // copy: mutating it never changes harness state.
+    branches: () => HarnessBranchRecord[];
+    // N3: one branch record by id, or undefined. The returned record is a
+    // detached copy, like `branches()`.
+    branch: (id: string) => HarnessBranchRecord | undefined;
     // Reset to "start over": EVERY agent's conversation goes back to its seeded
     // instructions (R12 — a subagent kept its old transcript before this), tool
     // discovery is forgotten, and the session todo list and record stores are

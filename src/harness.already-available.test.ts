@@ -216,6 +216,7 @@ describe('toolRequest already-available core tools', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'threadFork',
             'tool-00',
             'tool-01',
             'tool-02',

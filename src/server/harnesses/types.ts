@@ -7,6 +7,7 @@
 
 import type {
     Harness,
+    HarnessInteractionConfiguration,
     HarnessProgress,
     HarnessStateChangeEvent,
     Tool,
@@ -28,6 +29,14 @@ export type RunnerSettings = {
 // exceptions (a persistence failure must not change a run's outcome).
 export type HarnessPresetReport = {
     stateChange?: (event: HarnessStateChangeEvent) => void;
+    // N4 owner interaction, forwarded verbatim into HarnessConfiguration.interaction
+    // by the shared toolbox factory. It lives beside `stateChange` because both are
+    // server/host hooks supplied at construction, and keeping it on this one
+    // optional third argument is what lets every existing factory signature and
+    // caller stay unchanged. A factory that ignores it (the scripted demo before
+    // its N4 update, or a custom preset) simply produces a harness with no owner
+    // questions rather than failing.
+    interaction?: HarnessInteractionConfiguration;
 };
 
 // One named harness in the catalogue.

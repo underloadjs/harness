@@ -120,3 +120,29 @@ it('does not keep a footer action row for the composer', () => {
     expect(rules).not.toContain('.button.reset');
     expect(rules).not.toContain('.composer-actions .run');
 });
+
+it('styles the attachment accessory additively without touching the field contract', () => {
+    // T5: chips/error sit in a column ABOVE the existing `.composer-field`, so the
+    // action's absolute position inside the field is untouched.
+    const body = blockOf('.composer-body {');
+    expect(body).toContain('display: flex');
+    expect(body).toContain('flex-direction: column');
+    expect(body).toContain('flex: 1');
+    expect(body).toContain('min-width: 0');
+
+    // An empty draft truly removes the strip; the native file input never paints.
+    expect(blockOf('.composer-attachments[hidden] {')).toContain('display: none');
+    expect(blockOf('.composer-file {')).toContain('display: none');
+
+    // The chooser is a real focusable button with the same hit area as the action.
+    const attach = blockOf('.composer-attach {');
+    expect(attach).toContain('width: 34px');
+    expect(attach).toContain('height: 34px');
+    expect(attach).toContain('cursor: pointer');
+    expect(blockOf('.composer-attach:focus-visible {')).toContain('outline: 2px solid var(--accent)');
+
+    // Chips clip a long filename instead of growing the composer off-screen, and
+    // the replay strip is hidden for text-only turns.
+    expect(blockOf('.attachment-name {')).toContain('text-overflow: ellipsis');
+    expect(blockOf('.turn-attachments[hidden] {')).toContain('display: none');
+});

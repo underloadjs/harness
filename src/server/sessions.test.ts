@@ -1210,7 +1210,8 @@ describe('SessionStore turns', () => {
                     'todoManage',
                     'profileManage',
                     'chapterManage',
-                    'locationManage'
+                    'locationManage',
+                    'threadFork'
                 ],
                 builtin: true,
                 editable: true

@@ -31,6 +31,7 @@
 // cannot be changed by a URL the user is tricked into opening.
 
 import { isTrustedRuntimeOrigin } from '../shared/origin';
+import type { HarnessActionChoice, HarnessAttachment } from '../types';
 import type {
     AgentDescriptor,
     CreateHarnessRequest,
@@ -416,6 +417,37 @@ export const cancelSession = async (id: string, all = false): Promise<boolean> =
     return body.cancelled;
 };
 
+// POST /sessions/:id/actions/:requestId/answer (N3).
+//
+// Answers ONE pending actionRequest with either an option id or custom text. This
+// is NOT a task submission: it resolves a question the running turn is paused on,
+// so the composer/queue must not enqueue anything and the request is allowed while
+// the session is busy. Both ids are URL-encoded (a request id is server-generated
+// but still data), and the body is exactly `{ choice }` per the frozen contract.
+// The server answers `{ ok: true }`; anything else is surfaced by `request` as an
+// Error with the server's message, which the card shows without losing the user's
+// selection.
+export const answerAction = async (
+    sessionId: string,
+    requestId: string,
+    choice: HarnessActionChoice
+): Promise<boolean> => {
+    const body = await request<{ ok: boolean }>(
+        `/sessions/${encodeURIComponent(sessionId)}/actions/${encodeURIComponent(requestId)}/answer`,
+        {
+            method: 'POST',
+            body: JSON.stringify({ choice })
+        }
+    );
+
+    // The contract's only success body is `{ ok: true }`. A 200 that says
+    // otherwise is a refusal the card must present as a recoverable error, not a
+    // silent "answered" state.
+    if (body.ok !== true) throw new Error('The harness server did not accept the answer.');
+
+    return true;
+};
+
 // POST /sessions/:id/tasks (R4 queue).
 //
 // The server records the task, puts it behind whatever is already running, and
@@ -428,10 +460,20 @@ export type EnqueueTaskResult = {
     turn: SessionTurn;
 };
 
-export const enqueueTask = async (id: string, input: string): Promise<EnqueueTaskResult> => {
+// Body of POST /sessions/:id/tasks. `attachments` is OPTIONAL and omitted when the
+// draft has none, so a text-only submit stays byte-identical to the pre-attachment
+// contract. The server validates the same array with shared/attachments.ts; this
+// client passes records the composer already built through that validator.
+export const enqueueTask = async (
+    id: string,
+    input: string,
+    attachments?: readonly HarnessAttachment[]
+): Promise<EnqueueTaskResult> => {
     return request<EnqueueTaskResult>(`/sessions/${encodeURIComponent(id)}/tasks`, {
         method: 'POST',
-        body: JSON.stringify({ input })
+        body: JSON.stringify(
+            attachments === undefined || attachments.length === 0 ? { input } : { input, attachments }
+        )
     });
 };
 

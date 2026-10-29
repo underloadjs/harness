@@ -64,6 +64,11 @@ const CORE_ORDER = [
     'locationManage'
 ];
 
+// N6: threadFork is core for every agent; agentDelegate stays primary-only and is
+// declared BEFORE threadFork (registration order).
+const CORE_ORDER_PRIMARY = [...CORE_ORDER, 'agentDelegate', 'threadFork'];
+const CORE_ORDER_SUBAGENT = [...CORE_ORDER, 'threadFork'];
+
 // R9 bounded shapes (src/core/{profile,chapter,location}.ts):
 //   list  -> { <kind>s, counts, page }  (default 20, max 100, 64 KiB page budget)
 //   write -> { <kind>|removed, counts } (no list)
@@ -107,7 +112,7 @@ describe('session record tools', () => {
         await writer('remember Elena');
 
         // toolRequest is never called, yet the record tools were declared.
-        expect(declaredNames(seen[0])).toEqual(CORE_ORDER);
+        expect(declaredNames(seen[0])).toEqual(CORE_ORDER_SUBAGENT);
         expect((entry.messages[2] as { content: string }).content).toBe(
             `{"profile":${JSON.stringify(ELENA)},"counts":{"total":1}}`
         );
@@ -164,9 +169,9 @@ describe('session record tools', () => {
         });
 
         // Configured tools precede the harness-owned set; agentDelegate is
-        // primary-only and last.
-        expect(declaredNames(writerSeen[0])).toEqual(['peek', ...CORE_ORDER, 'agentDelegate']);
-        expect(declaredNames(researcherSeen[0])).toEqual(['peek', ...CORE_ORDER]);
+        // primary-only, and threadFork follows it in registration order.
+        expect(declaredNames(writerSeen[0])).toEqual(['peek', ...CORE_ORDER_PRIMARY]);
+        expect(declaredNames(researcherSeen[0])).toEqual(['peek', ...CORE_ORDER_SUBAGENT]);
     });
 
     it('keeps records across calls, isolates harnesses, and clears on reset', async () => {
@@ -297,7 +302,7 @@ describe('session record tools', () => {
 
         // The quiet registry is exactly the core set, in order.
         const writer = quiet(brain(scripted([answer('hi')])));
-        expect(Object.keys(writer.tools)).toEqual(CORE_ORDER);
+        expect(Object.keys(writer.tools)).toEqual(CORE_ORDER_SUBAGENT);
     });
 
     it('turns invalid record input into recoverable tool results', async () => {

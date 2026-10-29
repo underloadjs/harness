@@ -250,14 +250,26 @@ describe('one toolbox, different agents', () => {
         // preset declares subagents (so agentDelegate exists on all five), and the
         // only other difference is the example's testFlaky.
         for (const name of REAL) {
-            expect(registeredTools(name)).toEqual([...TOOLBOX, 'webSearch', ...CORE, 'agentDelegate']);
+            expect(registeredTools(name)).toEqual([
+                ...TOOLBOX,
+                'webSearch',
+                ...CORE,
+                'agentDelegate',
+                'threadFork'
+            ]);
         }
 
         // The example gets the same shared set plus its own failure tool.
-        expect(registeredTools('flaky')).toEqual([...TOOLBOX, 'testFlaky', 'webSearch', ...CORE]);
+        expect(registeredTools('flaky')).toEqual([
+            ...TOOLBOX,
+            'testFlaky',
+            'webSearch',
+            ...CORE,
+            'threadFork'
+        ]);
 
         // The scripted offline fixture is a documented exception.
-        expect(registeredTools('demo')).toEqual(['timeNow', ...CORE]);
+        expect(registeredTools('demo')).toEqual(['timeNow', ...CORE, 'threadFork']);
     });
 
     it('registers the identical toolbox on every real preset when the host is keyless', () => {
@@ -265,7 +277,7 @@ describe('one toolbox, different agents', () => {
         vi.stubEnv('TAVILY_API_KEY', '');
 
         for (const name of REAL) {
-            expect(registeredTools(name)).toEqual([...TOOLBOX, ...CORE, 'agentDelegate']);
+            expect(registeredTools(name)).toEqual([...TOOLBOX, ...CORE, 'agentDelegate', 'threadFork']);
         }
 
         // No key means the factory registers no webSearch at all; the global
@@ -373,7 +385,8 @@ describe('one toolbox, different agents', () => {
             'fileGlob',
             'webSearch',
             ...CORE,
-            'agentDelegate'
+            'agentDelegate',
+            'threadFork'
         ]);
     });
 

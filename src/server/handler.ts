@@ -17,6 +17,7 @@ import type { SessionStreamItem } from './protocol';
 import type { HarnessIndex } from './protocol';
 import { SessionStore } from './sessions';
 import {
+    bodyLimitFor,
     createHarnessApi,
     HttpError,
     MAX_API_BODY_BYTES,
@@ -65,7 +66,11 @@ const sendJson = (response: ServerResponse, status: number, body: unknown): void
     response.end(JSON.stringify(body));
 };
 
-const readJson = <T>(request: IncomingMessage): Promise<T> =>
+// Read a JSON body while STREAMING, so an over-sized request is rejected before
+// the whole payload is buffered. `limitBytes` comes from api.ts bodyLimitFor: the
+// submit routes carry base64 media and get 16 MiB, every other route keeps the
+// 1 MB legacy cap. The same helper feeds service.ts, so the two mounts agree.
+const readJson = <T>(request: IncomingMessage, limitBytes = MAX_API_BODY_BYTES): Promise<T> =>
     new Promise<T>((resolve, reject) => {
         let size = 0;
         const chunks: Buffer[] = [];
@@ -75,9 +80,9 @@ const readJson = <T>(request: IncomingMessage): Promise<T> =>
             if (settled) return;
 
             size += chunk.length;
-            if (size > MAX_API_BODY_BYTES) {
+            if (size > limitBytes) {
                 settled = true;
-                reject(new HttpError(413, `A request body cannot exceed ${MAX_API_BODY_BYTES} bytes.`));
+                reject(new HttpError(413, `A request body cannot exceed ${limitBytes} bytes.`));
                 return;
             }
 
@@ -199,7 +204,13 @@ export const createHarnessHandler = ({
                 method: request.method ?? 'GET',
                 pathname: url.pathname,
                 mount: STANDALONE_MOUNT,
-                readBody: () => readJson(request)
+                // Route-aware cap resolved BEFORE reading: only POST submit routes
+                // may stream a base64 body up to MAX_SUBMIT_BODY_BYTES.
+                readBody: () =>
+                    readJson(
+                        request,
+                        bodyLimitFor(request.method ?? 'GET', url.pathname, STANDALONE_MOUNT)
+                    )
             });
 
             if (result.kind === 'json') {

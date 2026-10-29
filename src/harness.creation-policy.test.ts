@@ -89,7 +89,8 @@ describe('toolCreation policy', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
 
         // ... and a guessed call is answered, not executed.

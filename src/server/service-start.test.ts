@@ -105,6 +105,9 @@ const TOOL_NAMES = [
     'chapterManage',
     'locationManage',
     'agentDelegate',
+    // N4: conditional harness-owned tools, appended to the global catalogue.
+    'actionRequest',
+    'threadFork',
     'syntaxCheck',
     'fileRead',
     'fileWrite',

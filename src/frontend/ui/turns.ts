@@ -99,6 +99,7 @@
 //
 // Cross-references:
 //   - tool cards: src/frontend/ui/tools.ts
+//   - attachment chips (composer + replay): src/frontend/ui/attachments.ts
 //   - lifecycle status (topbar pill): src/frontend/main.ts (`setLifecycle`)
 //   - elapsed formatting: src/frontend/ui/time.ts
 //   - styles: src/frontend/styles.css (`.turns`, `.turn-row`, `.tile`, `.agent`)
@@ -107,7 +108,19 @@
 //     describe a turn whose optimistic tile is still unbound (`claim`).
 
 import type { HarnessEvent, HarnessUsage, SessionTurn, SessionTurnStatus } from '../../server/protocol';
+import type {
+    HarnessActionAnswer,
+    HarnessActionChoice,
+    HarnessActionRequest,
+    HarnessAttachment,
+    HarnessBranchSummary
+} from '../../types';
+import { attachmentChipElement, attachmentThumbnailUrl } from './attachments';
 import {
+    actionAnswerEventOf,
+    actionRequestEventOf,
+    branchEndEventOf,
+    branchStartEventOf,
     callIdOf,
     eventTimesOf,
     finiteOf,
@@ -118,6 +131,8 @@ import {
     wakeupOf
 } from '../contract';
 import type { HarnessPendingTool, HarnessThreadInfo } from '../contract';
+import { createActionRequestCard } from './action-request';
+import type { ActionRequestCard } from './action-request';
 // Deterministic agent identity colour (R3): shared by the turn tile, every nested
 // invocation tile and every agent section (see ui/agent-color.ts). The placeholder
 // constant keeps the "cannot attribute this stream" sentinel in ONE place, so the
@@ -156,6 +171,35 @@ const stateOf = (status: SessionTurnStatus | 'queued'): TurnState =>
 // queued record may never replace a running one, nor a running one a terminal one.
 const rankOf = (status: SessionTurnStatus | 'queued'): number =>
     status === 'queued' ? 0 : status === 'running' ? 1 : 2;
+
+// Attachments on a recorded turn (T5 clip/attach, additive).
+//
+// The protocol's `SessionTurn.attachments` is optional: a text-only turn (and every
+// pre-attachment snapshot) simply omits it. It is read STRUCTURALLY here rather
+// than relying on the protocol declaration being updated in the same change, so
+// history replay renders chips as soon as the server starts sending them and keeps
+// rendering the same tiles when it does not. Malformed values are ignored for
+// RENDERING only (the server validates before it stores); a bad entry must never
+// break the transcript.
+export type SessionTurnWithAttachments = SessionTurn & { attachments?: HarnessAttachment[] };
+
+export const turnAttachmentsOf = (source: SessionTurn): HarnessAttachment[] => {
+    const value = (source as SessionTurnWithAttachments).attachments;
+    if (!Array.isArray(value)) return [];
+
+    return value.filter(
+        (entry) =>
+            typeof entry === 'object' &&
+            entry !== null &&
+            typeof entry.marker === 'string' &&
+            typeof entry.name === 'string' &&
+            (entry.kind === 'image' ||
+                entry.kind === 'video' ||
+                entry.kind === 'audio' ||
+                entry.kind === 'pdf' ||
+                entry.kind === 'file')
+    );
+};
 
 export type TurnHandle = {
     element: HTMLElement;
@@ -212,6 +256,14 @@ export type TurnHandle = {
     // Number of agent sections, tool cards and the primary agent name. Exposed
     // for tests and for the tile's meta line.
     summary: () => { agents: number; tools: number; primary?: string };
+    // Attachments recorded for this turn (empty for a text-only turn). A tile
+    // created by `begin` carries the draft's attachments until the server record
+    // replaces them, so the optimistic and replayed renderings agree.
+    attachments: () => readonly HarnessAttachment[];
+    // Replace the chips under the prompt. Called by `merge` with the server's
+    // record; never renders the base64 payload as text (filename/marker only, plus
+    // a safe raster-image thumbnail).
+    setAttachments: (attachments: readonly HarnessAttachment[]) => void;
     // Stop every timer the tile owns (elapsed tick, tool timers, pending text
     // frame). Called when the board clears or the page is hidden.
     destroy: () => void;
@@ -230,9 +282,34 @@ export type HydrateOptions = {
     keep?: string;
 };
 
+// N3 answer routing. The board resolves the CLICK to a request+choice; it must not
+// know how a session is selected. `sessionId` is captured when the card is created
+// (see bindSession), so an answer can only ever target the conversation the
+// question was rendered from — a session switch expires the card and main.ts
+// rejects a stale binding defensively.
+export type AnswerActionInput = {
+    requestId: string;
+    choice: HarnessActionChoice;
+    sessionId?: string;
+};
+
+export type TurnBoardOptions = {
+    empty?: HTMLElement;
+    // Sends one human answer to the harness server. Omitted in standalone tests and
+    // on a page with no wiring; the card then reports a recoverable local error.
+    answerAction?: (input: AnswerActionInput) => Promise<void>;
+};
+
 export type TurnBoard = {
     element: HTMLElement;
-    begin: (prompt: string) => TurnHandle;
+    // Bind the board to the session whose turns it renders. Called before every
+    // reconcile/hydrate and when a session is opened/cleared. Cards created under a
+    // DIFFERENT session expire instead of silently answering the new one.
+    bindSession: (sessionId: string | undefined) => void;
+    // `attachments` is the optional draft payload already validated by the
+    // composer. It is rendered immediately (optimistic tile) and replaced by the
+    // server record on `merge`; omitting it keeps the text-only path identical.
+    begin: (prompt: string, attachments?: readonly HarnessAttachment[]) => TurnHandle;
     notice: (text: string, tone?: 'info' | 'error') => HTMLElement;
     clear: () => void;
     expand: (turn: TurnHandle) => void;
@@ -652,6 +729,14 @@ type ThreadEntry = {
     // Runtime-provided id once a `thread` record named this invocation. Used to
     // distinguish a synthesized placeholder from an explicitly identified entry.
     explicitId: string | undefined;
+    // N3: what spawned this non-root invocation. Undefined for the root and for
+    // every pre-branch record (a delegation placeholder starts undefined too).
+    // Fork/autoanswer rows also carry their branch identity for branch_end.
+    kind: 'delegation' | 'fork' | 'autoanswer' | undefined;
+    branchId: string | undefined;
+    // Tiny header tag (`fork` / `auto`), created only for a branch kind. It is a
+    // narrow label, not the removed oversized role badge (R3).
+    kindTag: HTMLElement | undefined;
     started: boolean;
     state: ThreadState;
     section: AgentSection;
@@ -702,11 +787,27 @@ type PendingTool = {
     startedAt: number | undefined;
 };
 
-export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoard => {
+export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const element = el('div', 'turns');
 
     const turns: TurnHandle[] = [];
     let expandedTurn: TurnHandle | undefined;
+    // N3 session binding for answer routing. Cards capture this value when created
+    // (see create/action handler), never read it at click time, so a switch cannot
+    // retarget an answer that was rendered for another conversation.
+    let boundSession: string | undefined;
+    // Live cards across every tile, with the session they were rendered under. Used
+    // by `bindSession` to expire a question the reader has navigated away from
+    // instead of letting a stale answer reach the next conversation. `undefined`
+    // means the card predates a binding (it is adopted by the first bind).
+    const answerCards = new Map<string, { card: ActionRequestCard; session: string | undefined }>();
+
+    const rememberAnswerCard = (card: ActionRequestCard): void => {
+        answerCards.set(card.requestId, { card, session: boundSession });
+    };
+    const forgetAnswerCard = (requestId: string): void => {
+        answerCards.delete(requestId);
+    };
 
     // The empty state lives inside the grid so it inherits the same width and
     // padding; it is removed when the first turn starts and restored on clear.
@@ -736,13 +837,14 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         expandedTurn = undefined;
     };
 
-    const begin = (prompt: string): TurnHandle => create(prompt);
+    const begin = (prompt: string, attachments: readonly HarnessAttachment[] = []): TurnHandle =>
+        create(prompt, attachments);
 
     // One tile, shared by the optimistic `begin` path and server adoption. R3: the
     // tile no longer paints a `#position` ordinal; the server's `index` still binds
     // (protocol/ordering) but is never displayed. The agent identity in the header
     // is the compact per-turn label (`RH1`), not a raw agent id.
-    const create = (prompt: string): TurnHandle => {
+    const create = (prompt: string, initialAttachments: readonly HarnessAttachment[] = []): TurnHandle => {
         empty?.remove();
 
         const id = `turn-${++nextId}`;
@@ -805,8 +907,40 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         // and lists into the composer, and the tile should read like the answer.
         const promptBlock = el('div', 'turn-prompt markdown');
         promptBlock.append(markdownFragment(prompt));
+
+        // Attachments (T5, additive): the chip strip sits directly under the prompt
+        // and is hidden for a text-only turn, so every pre-attachment tile keeps its
+        // exact layout. Chips are built by ui/attachments.ts (filename via
+        // textContent, decorative raster thumbnail only; the base64 payload is never
+        // rendered as text). History is read-only: no remove control here.
+        const attachmentHost = el('div', 'turn-attachments');
+        attachmentHost.setAttribute('role', 'list');
+        attachmentHost.hidden = true;
+
+        let attachmentRecords: HarnessAttachment[] = [];
+
+        const setAttachments = (attachments: readonly HarnessAttachment[]): void => {
+            attachmentRecords = [...attachments];
+
+            const chips = attachments.map((attachment) => {
+                const preview = attachmentThumbnailUrl(attachment);
+                return attachmentChipElement({
+                    kind: attachment.kind,
+                    marker: attachment.marker,
+                    name: attachment.name,
+                    mime: attachment.mime,
+                    ...(preview === undefined ? {} : { previewUrl: preview })
+                });
+            });
+
+            attachmentHost.replaceChildren(...chips);
+            attachmentHost.hidden = chips.length === 0;
+        };
+
+        setAttachments(initialAttachments);
+
         const flow = el('div', 'tile-flow');
-        body.append(promptBlock, flow);
+        body.append(promptBlock, attachmentHost, flow);
 
         card.append(select, body);
 
@@ -896,6 +1030,15 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         // add a second card or overwrite the first answer. Cleared with the
         // projection.
         const settledCalls = new Set<string>();
+        // N3 action cards rendered by THIS tile, keyed by requestId. A rebuilt
+        // projection destroys them so a replayed action_request cannot leave a
+        // stale, clickable card behind.
+        const actionCards = new Map<string, ActionRequestCard>();
+        // Authoritative answers seen on this tile, keyed by requestId. A recorded
+        // replay normally orders request before answer, but a duplicate/out-of-order
+        // frame must not leave a question looking pending: a late request consumes
+        // the stored answer instead of rendering actionable controls.
+        const actionAnswers = new Map<string, HarnessActionAnswer>();
 
         const updateMeta = (): void => {
             const live = isLive(state);
@@ -978,6 +1121,27 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     // its block clock at the local observation (R1). A recorded child
                     // keeps its last painted span.
                     if (entry.meta !== undefined) entry.meta.finish(undefined, entry.meta.recorded());
+                }
+
+                // N3: an unresolved question cannot outlive its turn. Done/error/
+                // cancelled all mean the server will not accept an answer any more,
+                // so every still-pending card becomes visibly expired. A card that
+                // already has an authoritative answer is never downgraded. This is
+                // the replay guard too: a settled historical turn ends up here.
+                //
+                // A `done` with non-empty `pending` (a scheduler pause) never
+                // reaches this branch: the tile state stays `streaming`, so the
+                // question remains answerable while the run is paused on work.
+                const expiry =
+                    next === 'cancelled'
+                        ? 'This question expired when the turn was cancelled.'
+                        : next === 'error'
+                          ? 'This question expired when the turn failed.'
+                          : 'This question expired when the turn ended.';
+                for (const card of actionCards.values()) {
+                    const cardState = card.state();
+                    if (cardState === 'answered' || cardState === 'expired') continue;
+                    card.setExpired(expiry);
                 }
             } else {
                 // A non-terminal transition: clear a local end and tick while the task
@@ -1150,6 +1314,45 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             if (entry.statusText !== undefined) entry.statusText.textContent = STATE_TEXT[state];
         };
 
+        // N3: stamp what spawned this invocation and (for fork/autoanswer) its
+        // branch identity. The header tag is created lazily so a delegation row is
+        // exactly the pre-N3 row (no badge, no extra width). A root/flat entry has
+        // no row to tag, so the metadata is kept but nothing is painted.
+        const setThreadKind = (
+            entry: ThreadEntry,
+            kind: 'delegation' | 'fork' | 'autoanswer' | undefined,
+            branchId: string | undefined
+        ): void => {
+            entry.kind = kind;
+            entry.branchId = branchId;
+
+            if (entry.row === undefined) return;
+            if (branchId !== undefined) entry.row.dataset.branchId = branchId;
+            else delete entry.row.dataset.branchId;
+
+            if (kind !== 'fork' && kind !== 'autoanswer') {
+                entry.kindTag?.remove();
+                entry.kindTag = undefined;
+                delete entry.row.dataset.kind;
+                return;
+            }
+
+            if (entry.kindTag === undefined) {
+                const tag = el('span', 'thread-kind', kind === 'fork' ? 'fork' : 'auto');
+                tag.dataset.kind = kind;
+                tag.title = kind === 'fork' ? 'Fork of this thread' : 'Automatic owner answer';
+                // Insert directly after the agent code so the row reads
+                // `code · kind · preview`; CSS `order` keeps it in that slot even
+                // though the preview was appended later.
+                entry.select?.insertBefore(tag, entry.preview ?? null);
+                entry.kindTag = tag;
+            }
+
+            entry.kindTag.textContent = kind === 'fork' ? 'fork' : 'auto';
+            entry.kindTag.dataset.kind = kind;
+            entry.row.dataset.kind = kind;
+        };
+
         // Outcome line for one invocation. FIRST outcome wins: a replay can deliver
         // the same parent result twice, and a root-terminal interruption already
         // told the reader why the child stopped. Text only — the result is
@@ -1240,6 +1443,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             explicitId: string | undefined;
             started: boolean;
             state: ThreadState;
+            kind?: 'delegation' | 'fork' | 'autoanswer';
+            branchId?: string;
         }): ThreadEntry => {
             const existing = threads.get(options.key);
             if (existing !== undefined) return existing;
@@ -1281,6 +1486,14 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             // block shows its own duration and usage when its events report them.
             const label = labels.next(options.agent);
             const name = el('span', 'thread-name', label);
+            const kindTag =
+                options.kind === 'fork' || options.kind === 'autoanswer'
+                    ? el('span', 'thread-kind', options.kind === 'fork' ? 'fork' : 'auto')
+                    : undefined;
+            if (kindTag !== undefined) {
+                kindTag.dataset.kind = options.kind ?? '';
+                kindTag.title = options.kind === 'fork' ? 'Fork of this thread' : 'Automatic owner answer';
+            }
             const blockMeta = createBlockMeta({ elapsed: 'thread-elapsed', tokens: 'thread-tokens' });
             // Status stays TEXT: the word is clipped (not removed) on a compact row,
             // exactly like `.tile-status-text`, and colour only reinforces it.
@@ -1298,7 +1511,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     ? 'delegated task'
                     : plainPreview(options.input, 160)
             );
-            select.append(name, preview, top);
+            select.append(name, ...(kindTag === undefined ? [] : [kindTag]), preview, top);
 
             const body = el('div', 'thread-body');
             body.id = bodyId;
@@ -1327,6 +1540,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 parentKey: options.parentKey,
                 depth: place.depth,
                 explicitId: options.explicitId,
+                kind: options.kind,
+                branchId: options.branchId,
+                kindTag,
                 started: options.started,
                 state: options.state,
                 section: createSection(threadFlow, options.agent, 'subagent', label),
@@ -1396,6 +1612,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 parentKey: undefined,
                 depth: 0,
                 explicitId: undefined,
+                kind: undefined,
+                branchId: undefined,
+                kindTag: undefined,
                 started: true,
                 state: 'streaming',
                 section,
@@ -1446,6 +1665,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 parentKey: undefined,
                 depth: 0,
                 explicitId: undefined,
+                kind: undefined,
+                branchId: undefined,
+                kindTag: undefined,
                 started: true,
                 state: 'streaming',
                 section,
@@ -1505,6 +1727,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
             if (meta.callId !== undefined) entry.callId = meta.callId;
             setThreadInput(entry, meta.input);
+            setThreadKind(entry, meta.kind, meta.branchId);
             if (meta.parentId !== entry.parentKey) reparentThread(entry, meta.parentId);
 
             entry.started = true;
@@ -1539,7 +1762,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 parentKey: meta.parentId,
                 explicitId: meta.id,
                 started: true,
-                state: 'streaming'
+                state: 'streaming',
+                ...(meta.kind === undefined ? {} : { kind: meta.kind }),
+                ...(meta.branchId === undefined ? {} : { branchId: meta.branchId })
             });
         };
 
@@ -1706,6 +1931,127 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 )
             );
             section.flow.append(node);
+        };
+
+        // --- N3 action cards and branch rows ---------------------------------
+        //
+        // A card belongs to the invocation that emitted the request: inside the
+        // root tile flow for the owner's question, inside a child entry's flow for
+        // an automatic fork's question. `entry.key === ROOT_KEY` is the ONE
+        // interactive case; every thread (delegation, fork or autoanswer) is
+        // answered by its immediate owner and renders read-only.
+        const isSettledTurn = (): boolean => state === 'done' || state === 'error' || state === 'cancelled';
+
+        // Create/register one card. `request` is already parsed by the contract
+        // guard, so the card never sees a partially-malformed payload.
+        const mountActionCard = (entry: ThreadEntry, request: HarnessActionRequest): ActionRequestCard => {
+            const existing = actionCards.get(request.requestId);
+            if (existing !== undefined) return existing;
+
+            const interactive = entry.key === ROOT_KEY && !isSettledTurn();
+            const stored = actionAnswers.get(request.requestId);
+            const card = createActionRequestCard({
+                request,
+                interactive,
+                ...(stored === undefined ? {} : { answer: stored }),
+                ...(interactive
+                    ? {
+                          onAnswer: async (choice: HarnessActionChoice): Promise<void> => {
+                              if (options.answerAction === undefined) {
+                                  throw new Error('answering is not wired on this page');
+                              }
+                              // `boundSession` is read at click time. `bindSession`
+                              // expires a card created under another session, so
+                              // this can only name the conversation on screen.
+                              await options.answerAction({
+                                  requestId: request.requestId,
+                                  choice,
+                                  ...(boundSession === undefined ? {} : { sessionId: boundSession })
+                              });
+                          }
+                      }
+                    : {}),
+                // A settled historical turn is not a live question: the card is
+                // shown for the record but its controls are already expired.
+                ...(isSettledTurn()
+                    ? {
+                          expired:
+                              state === 'cancelled'
+                                  ? 'This question expired when the turn was cancelled.'
+                                  : state === 'error'
+                                    ? 'This question expired when the turn failed.'
+                                    : 'This question expired when the turn ended.'
+                      }
+                    : {})
+            });
+
+            entry.section.flow.append(card.element);
+            if (entry.section.pending !== undefined) entry.section.flow.append(entry.section.pending);
+            actionCards.set(request.requestId, card);
+            rememberAnswerCard(card);
+            return card;
+        };
+
+        // Authoritative answer frame. A card that is not on this tile is ignored:
+        // a replay/duplicate must not fabricate a question row.
+        const applyActionAnswer = (answer: HarnessActionAnswer): void => {
+            actionAnswers.set(answer.requestId, answer);
+            actionCards.get(answer.requestId)?.setAnswer(answer);
+        };
+
+        const findBranchEntry = (branchId: string): ThreadEntry | undefined => {
+            for (const entry of threads.values()) {
+                if (entry.row !== undefined && entry.branchId === branchId) return entry;
+            }
+
+            return undefined;
+        };
+
+        // Paint a branch summary onto its thread entry. The row keeps the same
+        // block anatomy as every other invocation (R3) and adds only a tiny kind
+        // tag; no raw agent id or branch id is written as text.
+        const applyBranchStart = (entry: ThreadEntry, branch: HarnessBranchSummary): void => {
+            entry.started = true;
+            setThreadKind(entry, branch.kind, branch.branchId);
+            if (!isTerminalThread(entry.state)) setThreadState(entry, 'streaming');
+
+            entry.section.root.dataset.model = branch.model;
+            entry.section.root.dataset.branchKind = branch.kind;
+
+            // A branch has no prompt of its own; describe what it is doing instead
+            // of leaving a generic "delegated task" preview. A real input (when the
+            // runtime supplied one) still wins.
+            if (entry.preview !== undefined && (entry.input === undefined || entry.input.length === 0)) {
+                entry.preview.textContent =
+                    branch.kind === 'fork' ? 'fork of this thread' : 'automatic owner answer';
+            }
+
+            updateMeta();
+        };
+
+        // Terminal branch report. The branch's own `done`/`error` may already have
+        // settled the entry; `completeThread` keeps the first terminal state and
+        // still allows an outcome line. The mapped state uses the same vocabulary
+        // as every invocation row, so nothing new is introduced visually.
+        const applyBranchEnd = (
+            entry: ThreadEntry,
+            status: 'completed' | 'failed' | 'cancelled',
+            error: { message: string } | undefined,
+            at: number | undefined,
+            origin: ApplyOrigin
+        ): void => {
+            const mapped: ThreadState =
+                status === 'completed' ? 'done' : status === 'failed' ? 'error' : 'cancelled';
+            const outcome =
+                status === 'completed'
+                    ? 'outcome · branch completed.'
+                    : status === 'failed'
+                      ? `error · ${error?.message ?? 'branch failed.'}`
+                      : 'outcome · branch cancelled.';
+
+            completeThread(entry, mapped, outcome);
+            settleInvocation(entry, at, origin);
+            updateMeta();
         };
 
         const appendText = (section: AgentSection, delta: string): void => {
@@ -1924,6 +2270,15 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             threads.clear();
             pendingTools.length = 0;
             settledCalls.clear();
+            // Cards from the discarded projection must not survive: they would be
+            // detached DOM plus a stale clickable request. The rebuilt pass creates
+            // fresh cards from the record.
+            for (const [requestId, card] of actionCards) {
+                card.destroy();
+                forgetAnswerCard(requestId);
+            }
+            actionCards.clear();
+            actionAnswers.clear();
             flow.replaceChildren();
             // Invocation rows live OUTSIDE the tile flow, so clearing the flow alone
             // would leave orphan entries after a superseding record arrives.
@@ -2181,6 +2536,86 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     break;
                 }
 
+                // N3: the owner was asked a bounded question. The card is mounted on
+                // the emitting invocation: interactive ONLY for the turn root; a
+                // non-root (delegation/fork/autoanswer) request is read-only because
+                // its immediate owner answers it automatically.
+                case 'action_request': {
+                    const frame = actionRequestEventOf(event);
+                    if (frame === undefined) break;
+
+                    const entry = route();
+                    mountActionCard(entry, frame.request);
+                    break;
+                }
+
+                // N3: the authoritative answer. Resolves the pending card without
+                // any polling; `source` distinguishes a human answer from the
+                // automatic owner fork.
+                case 'action_answer': {
+                    const frame = actionAnswerEventOf(event);
+                    if (frame === undefined) break;
+
+                    applyActionAnswer(frame.answer);
+                    break;
+                }
+
+                // N3: a fork/autoanswer branch started. Render it as the same
+                // nested invocation block as a delegation (R3): depth comes from
+                // the thread metadata, the only addition is a tiny kind tag.
+                case 'branch_start': {
+                    const frame = branchStartEventOf(event);
+                    if (frame === undefined) break;
+
+                    const branch = frame.branch;
+                    // IMPORTANT: the frame is emitted by the REQUESTING run, so its
+                    // optional `thread` describes the SOURCE invocation, not the
+                    // branch. The branch's own thread id is its branchId (runtime
+                    // contract, harness.ts `withThread`), so the row key/anchor is
+                    // derived from the summary and never from `event.thread`.
+                    let entry = threads.get(branch.branchId) ?? findBranchEntry(branch.branchId);
+
+                    if (entry === undefined) {
+                        entry = createThread({
+                            key: branch.branchId,
+                            agent: branch.agent,
+                            input: undefined,
+                            callId: branch.callId,
+                            // Nest under the source invocation when the summary names
+                            // one; a root-level fork has neither and sits at the turn
+                            // root exactly like a root-level delegation.
+                            parentKey: branch.sourceThreadId ?? branch.sourceBranchId,
+                            explicitId: branch.branchId,
+                            started: true,
+                            state: 'streaming',
+                            kind: branch.kind,
+                            branchId: branch.branchId
+                        });
+                    }
+
+                    observeInvocation(entry, at, origin);
+                    applyBranchStart(entry, branch);
+                    break;
+                }
+
+                // N3: the branch reached a terminal state. Its thread row settles
+                // with the same vocabulary as any invocation; a branch id is NOT
+                // rendered as text.
+                case 'branch_end': {
+                    const frame = branchEndEventOf(event);
+                    if (frame === undefined) break;
+
+                    // As with branch_start, `event.thread` is the REQUESTER's
+                    // context. The branch row is keyed by its branchId (its thread
+                    // id), so look it up by that identity only.
+                    const entry = threads.get(frame.branchId) ?? findBranchEntry(frame.branchId);
+                    if (entry === undefined) break;
+
+                    observeInvocation(entry, at, origin);
+                    applyBranchEnd(entry, frame.status, frame.error, at, origin);
+                    break;
+                }
+
                 // A wakeup `wakeupOf` rejected (no usable `pending` list) lands
                 // here on purpose: the event is recorded for prefix matching, but
                 // nothing is rendered and the pending snapshot is left untouched.
@@ -2267,6 +2702,11 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             // The server owns the tally (see setUsage).
             setUsage(usageOf(source.usage));
 
+            // Attachments are additive history: the record's chips replace the
+            // optimistic draft chips. A text-only record clears them (the draft was
+            // only ever a projection of what this turn carries).
+            setAttachments(turnAttachmentsOf(source));
+
             setState(stateOf(source.status), model !== undefined && model.length > 0 ? model : undefined);
             flush();
         };
@@ -2293,6 +2733,12 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 // page must not keep it running.
                 entry.meta?.stop();
             }
+
+            for (const [requestId, card] of actionCards) {
+                card.destroy();
+                forgetAnswerCard(requestId);
+            }
+            actionCards.clear();
         };
 
         const turn: TurnHandle = {
@@ -2311,6 +2757,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             tokens: () => blockMeta.tokens.textContent ?? '',
             setUsage,
             summary: () => ({ agents: threads.size, tools: toolCount, primary: primaryAgent }),
+            attachments: () => attachmentRecords,
+            setAttachments,
             destroy
         };
 
@@ -2388,7 +2836,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
     const adopt = (source: SessionTurn, model?: string): TurnHandle => {
         // R3: the server `index` is not rendered, so adoption only needs the prompt;
         // the record's position is the list order (`reconcile` re-orders by record).
-        const handle = create(source.prompt);
+        // Attachments are passed to the optimistic render, then `merge` applies the
+        // same record's list — one code path, no duplicated DOM.
+        const handle = create(source.prompt, turnAttachmentsOf(source));
         // One code path with `merge` keeps a freshly adopted tile and a reconciled
         // live tile identical: timing, events, tally and status all come from the
         // record, and `appliedCount` starts at zero for a new tile.
@@ -2514,8 +2964,33 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         for (const turn of turns) turn.destroy();
     };
 
+    // N3: bind the board to one session. A card rendered for a different session
+    // can no longer be answered once the reader moves on: the controls are
+    // expired locally (the server would reject a stale request anyway, but the UI
+    // must not even offer it). A card created before the first bind (undefined)
+    // is adopted, because it was rendered by this very conversation before the id
+    // arrived. Re-binding the same id is a no-op, so every snapshot is safe.
+    const bindSession = (sessionId: string | undefined): void => {
+        if (boundSession === sessionId) return;
+
+        for (const record of answerCards.values()) {
+            if (record.session === undefined) {
+                record.session = sessionId;
+                continue;
+            }
+            if (sessionId !== undefined && record.session === sessionId) continue;
+
+            const cardState = record.card.state();
+            if (cardState === 'answered' || cardState === 'expired') continue;
+            record.card.setExpired('This question belongs to another session.');
+        }
+
+        boundSession = sessionId;
+    };
+
     return {
         element,
+        bindSession,
         begin,
         notice,
         clear,

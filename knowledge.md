@@ -2,9 +2,10 @@
 
 Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harness` is the loop.
 
-> **Last verified:** 2026-10-29 (documentation review of the server task queue,
-> watcher stream, and transcript presentation (R4/R5); the test suite was not
-> re-run in this pass — an independent verifier owns that run)
+> **Last verified:** 2026-10-30 (documentation review of owner interaction and
+> private history branches (N3/N4); this was a source-level documentation pass —
+> runtime behaviour was not re-verified and the test suite was not re-run, so an
+> independent verifier still owns both)
 > **Package name:** `@underload/harness`
 > **Dependencies:** none (Node 18+ — default transport uses global `fetch`)
 > **Workspace consumers:** none yet
@@ -16,10 +17,11 @@ Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harn
 1. Read `src/harness.ts` for the public barrel and the loop
 2. Check `src/core/agent.ts`, `src/core/tool.ts`, `src/core/discovery.ts`,
    `src/core/creation.ts`, `src/core/todo.ts`, `src/core/profile.ts`,
-   `src/core/chapter.ts`, `src/core/location.ts`, and `src/transport/openai.ts` +
-   `src/transport/models.ts`
+   `src/core/chapter.ts`, `src/core/location.ts`, `src/core/action.ts`,
+   `src/core/branch.ts`, and `src/transport/openai.ts` + `src/transport/models.ts`
 3. Check `src/tools/catalogue.ts` / `src/tools/lazy.ts` when touching presets
-4. Check `src/server/`, `src/frontend/`, and `src/shared/` for the app contract
+4. Check `src/server/`, `src/frontend/` (including `ui/action-request.ts`), and
+   `src/shared/` for the app contract
 5. Update the "Last verified" date
 6. Keep the "Not built yet" list honest — it is the roadmap
 
@@ -42,7 +44,10 @@ src/
   harness.metadata.test.ts    core tool metadata (R7 cap, schemas) as registered
   harness.websearch.test.ts   opt-in webSearch registration/core declaration/secrets
   core/
-    index.ts            barrel: agent, tool, searchTools, compileToolSource, createDynamicTool, createTodoTool, createProfileTool, createChapterTool, createLocationTool
+    index.ts            barrel: agent, tool, searchTools, compileToolSource, createDynamicTool,
+                        createTodoTool, createProfileTool, createChapterTool, createLocationTool,
+                        action/branch internals (validateActionRequestParameters,
+                        validateActionChoice, agentBranchOf, forkAgent, materialize/incorporate)
     agent.ts            the brain
     agent.test.ts
     tool.ts             an action the model can request, or you can call
@@ -60,6 +65,8 @@ src/
     chapter.test.ts
     location.ts         per-harness locations/places (name, description, notes)
     location.test.ts
+    action.ts           strict actionRequest parameters/choice parsing + limits (N3)
+    branch.ts           fork identity, tool-id materialization, incorporation, bounds (N3)
   agents/
     index.ts            trusted AgentProfile registry + agentInstruction()
     types.ts            AgentProfile (name, title, description, instruction, guidelines)
@@ -134,7 +141,8 @@ src/server/
   runtime.ts            lazy shared store/catalogue for the service routes, keyed by root
   persistence.ts        durable database: versioned JSON DTO, atomic write, validation
   sessions.ts           authoritative turns + FIFO queue, watchers, single-flight gate,
-                        core-snapshot write-through and restart recovery
+                        owner-action registry (answerAction/expiry), core-snapshot
+                        write-through and restart recovery
   dev.ts                explicit standalone API launcher (no Vite/UI)
   environment.ts        package-root .env loader (Node entry points only)
   config.ts             provider defaults + mergeSettings credential rule
@@ -174,6 +182,7 @@ src/frontend/
                         one independently expandable entry per delegated invocation,
                         nested depth-first outside every collapsible body
   ui/markdown.ts        safe GFM (marked + DOMPurify) + highlight.js fenced code (R5)
+  ui/action-request.ts  interactive owner-question card; read-only non-root card (N3)
 ```
 
 **Transcript threads.** One `.turn-row` per server turn: a `.tile` (compact header,
@@ -186,8 +195,10 @@ outside the parent body, neither tile collapse nor entry collapse can hide them.
 Every entry is tracked by invocation id (runtime `thread.id`, or a synthesized
 `call:<callId>` for legacy records), and only the parent's `tool_result` for the
 spawning `callId` — or the root turn's terminal status — closes it for good;
-`done.pending` is a pause, not a finish. The layout is pure DOM/CSS, so the
-`main.ts` stream/snapshot routing needs no per-agent case.
+`done.pending` is a pause, not a finish. A `threadFork`/autoanswer branch reuses
+this same nested row shape (`thread.kind` plus `branchId`) rather than inventing a
+second presentation; only the small kind tag differs. The layout is pure DOM/CSS,
+so the `main.ts` stream/snapshot routing needs no per-agent case.
 
 `src/server` and `src/server/cli` import `src/harness.ts` relatively (they are
 inside the package) and re-use the public harness surface. `src/frontend` imports
@@ -280,6 +291,8 @@ reach into `src/`.
 - [Session records](#session-records) — Core profileManage/chapterManage/locationManage stores
 - [toolCreate](#createtool) — Runtime tool creation from an async function body
 - [Delegation](#delegation) — Explicit primary/subagents, one level deep
+- [Owner questions and history forks](#owner-questions-and-history-forks) —
+  Conditional `actionRequest`/`threadFork`, autoanswer owner forks, ephemeral branches
 
 ### Preset Tools
 - [Preset tools](#preset-tools) - the eight lazy presets, executable on their own
@@ -345,6 +358,17 @@ const brain = agent({ model, instruction, provider });   // name optional
 - `messages` is the live array (not a copy).
 - `model()` reads, `model('x')` writes. `system`/`user`/`assistant` append and
   chain. `reset()` restores instructions + seed messages.
+- `fork({ label? })` returns a private branch of this agent's entire committed
+  history, current model, and instruction snapshot. `core/branch.ts` materializes
+  a detached copy: every tool call gets a deterministic provider-safe id and every
+  still-pending call gets an explicit non-success placeholder. The source
+  transcript is never mutated. The branch shares the transport (credentials and
+  external side effects), never a sandbox. `label` is display metadata, trimmed,
+  ≤120 characters, whitespace-only treated as absent.
+- A fork's `reset()` restores its fork-time baseline (the cloned history), not the
+  live source history. Fork identity lives in a private `WeakMap`
+  (`agentBranchOf` from `core/index`, not the package root), so the public `Agent`
+  shape carries no nullable branch field.
 
 Construction throws on: missing model, and missing transport (neither `stream`
 nor `provider.baseURL`).
@@ -412,6 +436,8 @@ Every tool — core and preset — is named `<namespace><action>`:
 | `chapter*` | `chapterManage` (session chapters, summaries + ordered list) |
 | `location*` | `locationManage` (session locations/places) |
 | `agent*` | `agentDelegate` (bounded delegation) |
+| `action*` | `actionRequest` (conditional owner question; `interaction` configured) |
+| `thread*` | `threadFork` (conditional private history fork; forks enabled) |
 | `file*` | `fileRead`, `fileWrite`, `fileEdit`, `fileList`, `fileGlob` |
 | `command*` | `commandRun` |
 | `text*` | `textCount`, `textSummarize` |
@@ -463,7 +489,10 @@ request and need no discovery. `fileList`, `syntaxCheck`, `commandRun`, and
 `files`/`list`. A configured tool replaces a preloaded preset of the same name.
 The harness-owned toolRequest/toolCreate/todoManage/profileManage/chapterManage/
 locationManage (plus delegate for a primary with subagents) are core too, and a
-configured `webSearch` is core as well.
+configured `webSearch` is core as well. `actionRequest` is core only when
+`interaction` is configured; `threadFork` is core when `forks.enabled` (the
+default). Both are registered as standalone definitions whose `execute` refuses a
+direct call, because the runtime handles them with the owning run.
 
 **Core is not session-bound.** The four core file tools and `webSearch` have real
 implementations, so the server's direct-call path runs them without a `sessionId`.
@@ -476,7 +505,8 @@ it closes over the live registry and the harness's active set. It is registered
 after the declarative tools and before plugins, is always core, and its name is
 reserved (`harness()` throws if the config or a preset already has `toolRequest`).
 `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, and
-(when subagents exist) `agentDelegate` are reserved the same way.
+(when subagents exist) `agentDelegate` are reserved the same way, as are
+`actionRequest` and `threadFork` when their configuration registers them.
 
 - Signature: `toolRequest({ tags: string[], limit?: number })` — two properties, so
   the single-property rule hands `execute` the parsed object. A bare array or a
@@ -1022,6 +1052,195 @@ with.
 
 ---
 
+## Owner questions and history forks
+
+Two conditional harness-owned core tools (N3/N4). Their parsers, defaults, and
+bounds live in `core/action.ts` and `core/branch.ts`; the runtime handling is in
+`src/harness.ts`; the server broker is `SessionStore` (`src/server/sessions.ts`);
+the card is `src/frontend/ui/action-request.ts`.
+
+### Registration and configuration
+
+```ts
+const writer = harness({
+    agents: { writer: agent({ ... }) },
+    interaction: {
+        actionRequest: async (context, signal) => ({ kind: 'option', optionId: 'safe' }),
+        autoAnswer: true                       // default
+    },
+    forks: {
+        enabled: true,                         // default
+        maxDepth: 2,
+        maxConcurrent: 4,
+        maxHistoryBytes: 8 * 1024 * 1024,
+        maxBranchRecords: 64
+    }
+});
+```
+
+- `actionRequest` is registered only when `configuration.interaction` is present.
+  Its `execute` is a deliberate refusal: the runtime handles it, so a direct
+  `executeTool()` call cannot fabricate an owner.
+- `threadFork` is registered when `forks.enabled` is true (default). Set
+  `forks: { enabled: false }` for a harness that must not branch.
+- `resolveForks` reads defaults from `core/branch.ts`. Every numeric bound must be
+  a positive safe integer; a typo throws at construction instead of silently
+  clamping. `maxConcurrent` counts autoanswer branches too.
+- The server always passes an `interaction.actionRequest` handler into every
+  preset (fresh and restored) and leaves `autoAnswer` unset. The CLI passes a
+  handler that rejects with a readable "no owner UI" message, so a root question
+  is declared and can be attempted, but the recommendation is never accepted on
+  the user's behalf. A plain library harness without `interaction` has no
+  `actionRequest` tool at all.
+
+### actionRequest
+
+Model arguments and the parsed request:
+
+```ts
+type HarnessActionOption = { id: string; label: string; description?: string };
+type HarnessActionRequest = {
+    requestId: string;              // runtime-generated, never model-supplied
+    question: string;
+    recommended: string;            // MUST be one of options[].id
+    options: HarnessActionOption[];
+    allowCustom: true;              // type-level constant, not an argument
+};
+```
+
+- Strict parser (`validateActionRequestParameters`): plain object only; exactly
+  `question`/`recommended`/`options`; no `allowCustom` argument (unknown properties
+  are rejected). Bounds: question 1..4000, options 2..8, id 1..32 matching
+  `^[A-Za-z0-9_-]+$`, unique ids, label 1..120, description trimmed and ≤500
+  (blank is omitted). Ids/labels/question are trimmed by the parser. An unknown
+  `recommended` id is an error, never a fallback to `options[0]`.
+- `allowCustom` is always true: an owner can always answer
+  `{ kind: 'custom', text }` (trimmed, 1..4000). `validateActionChoice` accepts
+  exactly `{ kind: 'option', optionId }` or `{ kind: 'custom', text }`; an option
+  id the model did not offer is an error, and a custom choice has no request-side
+  switch to check.
+- `HarnessActionHandler = (context, signal) => Promise<HarnessActionChoice>`.
+  `context` is `{ requestId, agent, branchId?, threadId?, callId, request }`.
+  `branchId` is the REQUESTER's branch, absent for a root. `signal` aborts with
+  the run. A rejecting/throwing handler fails the tool call with a readable tool
+  result (`actionRequest owner handler failed: …`).
+- The model-visible result is `HarnessActionResult`
+  `{ requestId, answeredBy: 'owner' | 'auto', choice }`. An option choice is
+  widened with the resolved `label`/`description`; a custom choice is verbatim.
+- The runtime request id is `request-<n>` (process-local monotonic).
+- Pending limit: at most 4 unresolved requests per harness (`src/harness.ts`) and
+  per session (`MAX_PENDING_ACTIONS` in `src/server/sessions.ts`). A fifth is
+  rejected for the model, never auto-answered.
+- Root runs: only the host handler can answer. If it is absent, the tool result is
+  a readable "no interaction.actionRequest handler" failure; the recommendation is
+  never selected automatically.
+- Child/fork runs: the immediate owner is cloned at request instant, synchronously,
+  over the owner's FULL history plus the requester's FULL history
+  (`incorporateBranchHistory`; child system messages are demoted to quoted user
+  data). The autoanswer branch is tool-free and gets exactly one turn, so it cannot
+  recursively fork or ask again. It must
+  reply `option:<id>` or `custom:<text>` on one line; blank, prose, an unknown id,
+  or any tool call is an explicit failure. `forks.enabled` must be true and
+  `autoAnswer !== false`. The answer is delivered only to the requester's
+  `actionRequest` tool result; the owner transcript is unchanged. The autoanswer
+  branch inherits the owner's role and records `tools: []`.
+
+### threadFork
+
+```ts
+threadFork({ input: string; label?: string })
+// -> HarnessForkResult { branchId, threadId, content }
+```
+
+- `input` is required and non-empty. `label` is display-only, trimmed, ≤120.
+  `threadFork` is a normal tool call: the requester stays in flight and the branch
+  runs as a separate actor.
+- At request instant the runtime calls `forkAgent(run.agent, …)`; the branch gets
+  this agent's ENTIRE committed transcript (never a slice), current model, and
+  instruction snapshot. `materializeBranchHistory` deep-copies and validates every
+  message, remaps every tool-call id to `call_<branchToken>_<n>`, rewrites every
+  tool result to the remapped id, and pairs outstanding calls with the
+  `threadFork` non-success placeholder. Duplicate/orphan results and repeated ids
+  are rejected. The origin transcript is never mutated.
+- Branches inherit the source `role`, so `declared(branch)` resolves the same
+  role-aware core set: a fork of the primary keeps `agentDelegate`/`toolCreate`
+  under their policies; a fork of a subagent does not gain them. A fork can fork
+  again until `maxDepth`.
+- Bounds (`core/branch.ts`): `MAX_FORK_DEPTH = 2` (ordinary forks; autoanswer
+  inherits the source depth), `MAX_FORK_CONCURRENT = 4` live branches,
+  `MAX_FORK_HISTORY_BYTES = 8 MiB` of serialized history,
+  `MAX_BRANCH_RECORDS = 64` retained records. Over-cap history is an EXPLICIT
+  error — a fork never truncates history. The serialized cap includes attachment
+  payloads, so a legal media-heavy turn can exceed 8 MiB; raise
+  `forks.maxHistoryBytes` for those histories.
+- The only value returned to the origin is `{ branchId, threadId, content }`, where
+  `threadId === branchId`. `content` is the branch's final assistant text, trimmed
+  and required non-empty (`threadFork branch "…" produced no substantive answer.`
+  otherwise). There is no separate summarizer pass and no transcript merge; the
+  full branch transcript stays in the audit record.
+- Runtime identity is private: `actorKeyOf(branch)` is `branch:<branchId>`, never
+  the display name, so a fork cannot deadlock behind a same-name source run.
+  `actorRoles` inherits the source role; `agentBranchOf` reads the `WeakMap`.
+- `harness.branches()` returns detached `HarnessBranchRecord` copies; `branch(id)`
+  returns one or `undefined`. A record is `HarnessBranchSummary` plus `status`
+  (`running|completed|failed|cancelled`), `toolCallIds` (origin→branch remap),
+  `messages`, and optional `result`/`error`. Active records are never evicted;
+  the newest terminal records fill the remaining `maxBranchRecords` capacity.
+- Branch state is ephemeral: `branchRecords`/`activeBranches`/pending request ids
+  are runtime/session state, deliberately NOT in `HarnessSnapshot` v1. `reset()`
+  does not clear branch records (nor does restore bring them back); they are
+  pruned only by the retention bound.
+- `src/harness.ts` refuses `executeTool('threadFork' | 'actionRequest', …)` with
+  "requires the harness run that owns the conversation", so neither can be
+  invoked through the manual server tool route.
+
+### Events and threads
+
+- `action_request`: `{ agent, callId, request, thread? }`, emitted by the
+  requester before the handler/owner fork is invoked, so a client can render the
+  pending card.
+- `action_answer`: `{ agent, requestId, answer, thread? }`, emitted for every
+  accepted answer before the tool result. `answer` is
+  `{ requestId, choice, source: 'owner'|'auto', branchId? }`.
+- `branch_start`: `{ agent, branch: HarnessBranchSummary, thread? }`; for an
+  autoanswer it is emitted before `action_request`.
+- `branch_end`: `{ agent, branchId, status, error?, thread? }`; `error` is present
+  for `failed`/`cancelled` and absent for `completed`.
+- `HarnessThread` = `{ id, parentId?, callId?, input?, kind?, branchId? }`. `kind`
+  is `'delegation' | 'fork' | 'autoanswer'`; a branch's `id` IS its `branchId`, and
+  the branch's own frames carry that same `thread`, so `branch_start`/`branch_end`,
+  the branch frames, `harness.branch(id)`, and the transcript's nested entry use
+  one naming scheme. `input` is the branch/child task.
+
+### Server broker and UI
+
+- Route: `POST /sessions/:id/actions/:requestId/answer` (standalone `/api`, service
+  `/v1/harness`) with body `{ choice }` and response `{ ok: true }`.
+  `SessionStore.answerAction` validates against the recorded request and settles
+  the handler promise exactly once. Status mapping: 400 malformed body/unknown
+  option/out-of-bounds text, 404 unknown session or request id, 409 already
+  answered or expired. It is deliberately allowed while the session is busy — the
+  active run is awaiting it — and it never enqueues a turn.
+- Pending entries keep the run's abort listener. `cancel()`, session end,
+  `remove()`/`dispose()`, and an abort settle them with readable rejection text;
+  `MAX_COMPLETED_ACTIONS = 64` request ids are remembered so a stale card is 409,
+  never 404.
+- Restore marks every recorded `action_request` id as expired (the awaiting
+  runtime is gone) and starts no run, so a restarted session cannot resume a
+  question.
+- UI: one card per event. A root request is interactive: recommended option first,
+  alternatives after, **always** a free-text custom path, explicit **Answer**
+  (nothing auto-submits); submit disables controls, keeps the choice on failure,
+  and treats `setAnswer` from `action_answer` as authoritative. A non-root card is
+  read-only ("Auto-answered by the owner fork.") because its owner answers
+  automatically. Cards capture the session id at render time; a session
+  switch/clear or a terminal turn expires them, and `main.ts` re-checks the binding
+  before POSTing, so an answer can never cross conversations.
+- Branch entries render through the existing nested invocation layout (`thread`
+  metadata) with a small kind tag; a settled turn's cards are expired on replay.
+
+---
+
 
 ## harness
 
@@ -1060,7 +1279,8 @@ await writer('tell me about new year');
   `tool.name` are overwritten to match.
 - **Tool declarations are filtered, not the registry.** `writer.tools` holds the
   preset preload, the configured tools, `toolRequest`, `toolCreate`, `todoManage`,
-  `profileManage`, `chapterManage`, `locationManage`, and `agentDelegate` when
+  `profileManage`, `chapterManage`, `locationManage`, `threadFork` when forks are
+  enabled, `actionRequest` when interaction is configured, and `agentDelegate` when
   there is a subagent; a request declares every core tool
   (`fileRead`/`fileWrite`/`fileEdit`/`fileGlob`, a configured `webSearch`, and the
   harness-owned set), then whatever toolRequest enabled. The searchable remainder
@@ -1079,7 +1299,18 @@ await writer('tell me about new year');
   operator call may run a searchable tool that was never enabled. Nothing else is bypassed — `toolCreate` keeps its guarded
   registration, `agentDelegate` keeps its primary-only check, and a name this harness
   did not register (delegate without subagents) throws instead of inventing an
-  implementation. No progress events are emitted: a manual call is not a turn.
+  implementation. `actionRequest` and `threadFork` are refused explicitly: both
+  need the owning run (`requires the harness run that owns the conversation`).
+  No progress events are emitted: a manual call is not a turn.
+- `forks` resolves to `{ enabled, maxDepth, maxConcurrent, maxHistoryBytes,
+  maxBranchRecords }` with defaults `true, 2, 4, 8 MiB, 64`; `enabled: true`
+  registers `threadFork`. `interaction` presence registers `actionRequest`;
+  `autoAnswer` defaults true and only controls a child/fork request's owner fork.
+  See [Owner questions and history forks](#owner-questions-and-history-forks).
+- `branches()` / `branch(id)` expose DETACHED branch audit records. They are
+  ephemeral: branch records, active slots, and pending action requests are not in
+  `snapshot()`/`restore()` (N3). `branches()` prunes to `maxBranchRecords`, keeping
+  every running record and the newest terminal ones.
 - `presets` (default `true`) preloads `presetTools` into the registry. `false`
   starts from `tools` alone. A configured tool wins on a name collision.
 - `plugins` remains as an optional programmatic extension point
@@ -1092,10 +1323,12 @@ await writer('tell me about new year');
   Created tools stay registered (registry state), just no longer enabled. The
   server resets every agent in a session, not only the primary; its extra
   agent-loop reset does not replace `harness.reset()`, which is what clears the
-  shared `todoManage` and record state.
+  shared `todoManage` and record state. Branch records and action-request state are
+  ephemeral runtime state and are not cleared by `reset()`.
 
 **Members:** callable, `name`, `agent`, `agents`, `subagents`, `tools`, `plugins`,
-`discoveredTools`, `toolCreate(config)`, `executeTool(name, parameters)`, `reset()`.
+`discoveredTools`, `toolCreate(config)`, `executeTool(name, parameters)`,
+`branches()`, `branch(id)`, `reset()`.
 
 ### The loop
 
@@ -1210,8 +1443,12 @@ const ids = await listModels({ baseURL, apiKey, headers?, signal? });
 - The key travels only in the `authorization` header (omitted when empty) and is
   redacted from every error message; errors quote a URL without userinfo, query,
   or fragment.
-- The server calls it with a 10 s abort (`POST /api/models`) because it owns the
-  key and the browser cannot call the provider (no CORS, no key). Nothing is
+- The server calls it with a per-attempt abort (`POST /api/models`) because it
+  owns the key and the browser cannot call the provider (no CORS, no key).
+  Failed provider requests (`'request'`/`'response'`) are retried immediately
+  with a fresh controller and a doubled deadline: 10 s, 20 s, 40 s, ... up to
+  ten total attempts (the last at 5_120 s), stopping on the first success.
+  `'configuration'` errors fail at once with no network call. Nothing is
   persisted or logged.
 
 ---
@@ -1219,17 +1456,23 @@ const ids = await listModels({ baseURL, apiKey, headers?, signal? });
 ## HarnessEvent
 
 ```ts
-| { type: 'start';       agent: string; model: string }
-| { type: 'text';        agent: string; delta: string }
-| { type: 'reasoning';   agent: string; delta: string }
-| { type: 'tool_call';   agent: string; call: HarnessToolCall }
-| { type: 'tool_result'; agent: string; name: string; callId?: string; content: string; isError: boolean; durationMs?: number; pending?: HarnessPendingTool[]; ui?: ToolUiPanel[] }
-| { type: 'usage';      agent: string; usage: HarnessUsage }
-| { type: 'done';        agent: string; message: HarnessAssistantMessage; pending?: HarnessPendingTool[] }
-| { type: 'wakeup';      agent: string; reason: 'pending-tools'; pending: HarnessPendingTool[] }
-| { type: 'error';       agent: string; error: { message: string } }
+| { type: 'start';          agent: string; model: string }
+| { type: 'text';           agent: string; delta: string }
+| { type: 'reasoning';      agent: string; delta: string }
+| { type: 'tool_call';      agent: string; call: HarnessToolCall }
+| { type: 'tool_result';    agent: string; name: string; callId?: string; content: string; isError: boolean; durationMs?: number; pending?: HarnessPendingTool[]; ui?: ToolUiPanel[] }
+| { type: 'usage';         agent: string; usage: HarnessUsage }
+| { type: 'done';           agent: string; message: HarnessAssistantMessage; pending?: HarnessPendingTool[] }
+| { type: 'wakeup';         agent: string; reason: 'pending-tools'; pending: HarnessPendingTool[] }
+| { type: 'action_request'; agent: string; callId: string; request: HarnessActionRequest }
+| { type: 'action_answer';  agent: string; requestId: string; answer: HarnessActionAnswer }
+| { type: 'branch_start';   agent: string; branch: HarnessBranchSummary }
+| { type: 'branch_end';     agent: string; branchId: string; status: HarnessBranchTerminalStatus; error?: HarnessErrorInfo }
+| { type: 'error';          agent: string; error: { message: string } }
 
+// EVERY variant also carries `thread?: HarnessThread` for a non-root run.
 // HarnessPendingTool = { callId: string; name: string; elapsedMs: number }
+// HarnessThread = { id; parentId?; callId?; input?; kind?: 'delegation'|'fork'|'autoanswer'; branchId? }
 ```
 
 Delivered through `report.progress`, which is **awaited** for every step, so a
@@ -1331,6 +1574,95 @@ type ToolSearchOptions = {
 `searchTools()` returns the same shape as a `toolRequest` call, so a UI can rank a
 catalogue without a harness.
 
+## Action and branch types (N3)
+
+```ts
+type HarnessActionOption = { id: string; label: string; description?: string };
+
+type HarnessActionRequest = {
+    requestId: string;                  // runtime-generated
+    question: string;
+    recommended: string;                // one of options[].id
+    options: HarnessActionOption[];     // 2..8, unique ids
+    allowCustom: true;                  // constant, not model-controlled
+};
+
+type HarnessActionChoice =
+    | { kind: 'option'; optionId: string }
+    | { kind: 'custom'; text: string };
+
+type HarnessActionAnswer = {
+    requestId: string;
+    choice: HarnessActionChoice;
+    source: 'owner' | 'auto';
+    branchId?: string;                  // auto answer only
+};
+
+type HarnessActionResult = {
+    requestId: string;
+    answeredBy: 'owner' | 'auto';
+    choice:
+        | { kind: 'option'; optionId: string; label: string; description?: string }
+        | { kind: 'custom'; text: string };
+};
+
+type HarnessActionRequestContext = {
+    requestId: string;
+    agent: string;
+    branchId?: string;                  // the requester's branch
+    threadId?: string;
+    callId: string;
+    request: HarnessActionRequest;
+};
+
+type HarnessActionHandler = (
+    context: HarnessActionRequestContext,
+    signal: AbortSignal
+) => Promise<HarnessActionChoice>;
+
+type HarnessForkResult = { branchId: string; threadId: string; content: string };
+
+type HarnessBranchSummary = {
+    branchId: string;
+    kind: 'fork' | 'autoanswer';
+    agent: string;                      // source/owner agent name
+    role: 'primary' | 'subagent';
+    sourceBranchId?: string;
+    sourceThreadId?: string;
+    callId?: string;
+    requestId?: string;                 // autoanswer only
+    forkDepth: number;                  // ordinary forks; autoanswer inherits
+    model: string;
+    tools: string[];                    // declared wire names ([] for autoanswer)
+};
+
+type HarnessBranchStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+type HarnessBranchRecord = HarnessBranchSummary & {
+    status: HarnessBranchStatus;
+    toolCallIds: Array<{ origin: string; branch: string }>;
+    messages: HarnessMessage[];
+    result?: { content: string; stopReason: HarnessStopReason };
+    error?: HarnessErrorInfo;
+};
+
+type HarnessForkConfiguration = {
+    enabled?: boolean;                  // default true
+    maxDepth?: number;                  // default 2
+    maxConcurrent?: number;             // default 4
+    maxHistoryBytes?: number;           // default 8 MiB
+    maxBranchRecords?: number;          // default 64
+};
+
+type HarnessInteractionConfiguration = {
+    actionRequest?: HarnessActionHandler;
+    autoAnswer?: boolean;               // default true
+};
+```
+
+`src/types/index.ts` is canonical; the runtime parsers are `core/action.ts`, and
+`core/branch.ts` owns the summary/record/bounds. Branch records are runtime state,
+not snapshot v1.
+
 ## Declarative tool panels (R20.2)
 
 A tool result is text for the model. To let a client render a small, safe summary,
@@ -1426,6 +1758,16 @@ normalizer and the exported `TOOL_UI_LIMITS`.
   primary only, is never declared to subagents, is rejected if a subagent guesses
   it, and `runAgent` refuses to re-enter a running agent. Each agent keeps its own
   instructions and transcript; only the answer crosses back.
+- **A branch is a conversation copy, not a sandbox.** `threadFork`/`Agent.fork()`
+  clone the entire committed history at request instant, remap tool ids, and share
+  the transport; external side effects remain shared. Only the final summary
+  returns. Branch records/events are ephemeral audit state (not snapshot v1), and a
+  fork that exceeds the history cap fails explicitly instead of truncating.
+- **A question never selects its recommendation.** `actionRequest` has no model
+  switch for free text (`allowCustom` is always true) and no automatic fallback to
+  `recommended`; a root needs a real host answerer, and a child/fork request is
+  answered by a tool-free owner clone. A failed or expired answer stays a readable
+  tool result and is never fabricated.
 - **Undiscovered tools do not run.** Executing a tool the model was never
   declared would make toolRequest optional in practice. Instead the call comes back
   as a tool result naming the tags that would enable it, which is recoverable and
@@ -1506,6 +1848,8 @@ as their own entries.
   first, then each session's frozen harness, then its core snapshot. A running turn
   is marked interrupted and never replayed; pending background calls are
   interrupted, not resumed (a restored UI shows them abandoned, not running);
+  branch records are not restored, and every recorded `action_request` is expired
+  (the awaiting runtime is gone), so no question or branch is resumed;
   queued prompts are preserved but stay
   paused until an explicit submit or a cancel-all. When the snapshot ended between
   an assistant tool call and its result, restore appends explicit interrupted tool
@@ -1577,7 +1921,7 @@ paths below `/v1/harness` **plus** the bare root:
 | `GET /api/agents` | Trusted agent registry (`AgentDescriptor[]`) |
 | `GET /api/tools` | Full catalogue: session-bound core entries first (`group: 'Core tools'`, `sessionBound: true`), then every direct-call tool (including the core file tools); `webSearch` always present with `availability` |
 | `GET /api/tools/bootstrap` | Alias of `GET /api/tools` — the list the root bootstrap document carries |
-| `POST /api/tools/:name` | `{ parameters, sessionId? }` → `{ ok, result | error, durationMs }`. A `sessionBound` core tool requires `sessionId` (`400` without, `404` unknown session or unavailable tool, `409` while the session is busy - a run, reset, or another manual call) and executes inside that session's harness; a direct-call tool is unchanged and ignores `sessionId` |
+| `POST /api/tools/:name` | `{ parameters, sessionId? }` → `{ ok, result | error, durationMs }`. A `sessionBound` core tool requires `sessionId` (`400` without, `404` unknown session or unavailable tool, `409` while the session is busy - a run, reset, or another manual call) and executes inside that session's harness; `actionRequest`/`threadFork` answer a readable "requires the owning run" refusal; a direct-call tool is unchanged and ignores `sessionId` |
 | `POST /api/tools/:name/call` | Alias of the row above (verb-named spelling), same dispatcher |
 | `POST /api/models` | `{ settings? }` → `{ models: string[] }`; server-side `listModels` |
 | `POST /api/sessions` | `{ harness, settings? }` → `{ session }` |
@@ -1588,6 +1932,7 @@ paths below `/v1/harness` **plus** the bare root:
 | `GET /api/sessions/:id/events` | SSE watcher: one `snapshot`, `turn` upserts (queued/running/terminal), `event` frames, one final `snapshot` on drain. Disconnect only unsubscribes |
 | `POST /api/sessions/:id/reset` | Reset every agent + discovery + todos + record stores; `409` while a run or queued work is pending |
 | `POST /api/sessions/:id/cancel` | `{ all?: boolean }` → `{ cancelled }`. Default aborts the active run only; `all: true` also cancels every queued turn, which stays in `turns` as `cancelled` |
+| `POST /api/sessions/:id/actions/:requestId/answer` | `{ choice: HarnessActionChoice }` → `{ ok: true }`. Settles one pending `actionRequest`; 400 invalid body/unknown option/out-of-bounds text, 404 unknown session or request id, 409 answered or expired. Allowed while busy |
 | `DELETE /api/sessions/:id` | Forget the session: abort active work, drop queued work, close watchers |
 | `GET /v1/harness` | Service only: bootstrap `{ rootPath, presets, agents, tools, defaults, sessions }` |
 
@@ -1633,13 +1978,16 @@ can fix.
   registered and enabled at once, so `GET /sessions/:id` reports its name in
   `discoveredTools`; `GET /tools` remains the static catalogue.
 
-**Core tools in the catalogue (R8).** `src/harnesses/core.ts` adds six entries —
+**Core tools in the catalogue (R8/N4).** `src/harnesses/core.ts` adds six entries -
 `toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`,
-`locationManage` — plus `agentDelegate` to every listing
-(`GET /tools`, its `/tools/bootstrap` alias, and the root bootstrap document). They
-are `group: 'Core tools'`, `visibility: 'core'`, and `sessionBound: true`, and they
-deliberately have **no** `tool` implementation: there is one implementation of each
-(the session's harness). `SessionStore.callTool(id, name, parameters)` →
+`locationManage` - plus `agentDelegate`, `actionRequest`, and `threadFork` to every
+listing (`GET /tools`, its `/tools/bootstrap` alias, and the root bootstrap
+document). The last two are conditional in a session's harness (`interaction`
+configured / `forks.enabled`), but the host-wide catalogue always lists them with
+generic metadata; a session without the capability answers a clear 404 rather than
+inventing it. All are `group: 'Core tools'`, `visibility: 'core'`, and
+`sessionBound: true`, and they deliberately have **no** `tool` implementation:
+there is one implementation of each (the session's harness). `SessionStore.callTool(id, name, parameters)` →
 `harness.executeTool` is therefore the only path: a missing/blank `sessionId` is
 `400`, an unknown session or a tool the session's harness does not register
 (delegate without subagents) is `404`, a session with ANY operation in flight
@@ -1659,7 +2007,9 @@ descriptor cannot advertise a schema the runtime does not use.
 keep their real `tool` implementation and appear in the direct-call catalogue
 (groups `Package presets` / `Web search`), so `POST /api/tools/fileRead` works
 without a `sessionId`. `sessionBound: true` remains exclusive to the six
-harness-owned entries above plus `agentDelegate`. The UI's core dropdown reads
+harness-owned entries above plus `agentDelegate`, `actionRequest`, and `threadFork`
+(the last two are still refused by the manual call path because they need the
+owning run). The UI's core dropdown reads
 `coreTools` from the descriptor, which is computed from the registered names and
 therefore includes the file tools, adds `webSearch` only when this host resolved a
 key, omits `fileList` (and the other searchable tools), and matches the harness's

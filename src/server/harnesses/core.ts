@@ -5,9 +5,11 @@
 // `createToolCatalogue()` (./index.ts) lists tools a host can call DIRECTLY: no
 // harness, no model, no session. The harness-owned core tools are the opposite —
 // toolRequest, toolCreate, todoManage, profileManage, chapterManage, locationManage,
-// and agentDelegate only mean something inside one session's harness, because they
-// mutate that harness's enabled set, registry, todo list, record stores, or agent
-// team. Adding them there would make the CLI promise a callable tool it cannot run.
+// agentDelegate, actionRequest, and threadFork only mean something inside one
+// session's harness, because they mutate that harness's enabled set, registry,
+// todo list, record stores, or agent team (or need that session's owner/fork
+// configuration). Adding them there would make the CLI promise a callable tool it
+// cannot run.
 //
 // R18: the four core FILE tools (fileRead/fileWrite/fileEdit/fileGlob) and a
 // configured webSearch are also `visibility: 'core'`, but they are NOT listed
@@ -37,7 +39,12 @@
 //   - ../api.ts      — compose + session-bound call routing
 //   - ../sessions.ts — SessionStore.callTool → harness.executeTool
 
-import { agentDelegateMetadata, coreToolMetadata } from '../../core/metadata';
+import {
+    ACTION_REQUEST_METADATA,
+    THREAD_FORK_METADATA,
+    agentDelegateMetadata,
+    coreToolMetadata
+} from '../../core/metadata';
 import type { CatalogueEntry } from './types';
 
 // The display group for the core set. A distinct group (rather than 'Harness
@@ -53,12 +60,23 @@ export const CORE_TOOL_SESSION_HINT =
     'Runs inside a session harness: send a sessionId with the call.';
 
 // Build the core entries: the six always-registered harness tools from
-// coreToolMetadata(), then agentDelegate. `agentDelegate` is always listed, with
-// generic metadata: the catalogue is host-wide, while whether agentDelegate is
-// registered is a property of the selected session's harness. A session without
-// subagents answers a clear 404 rather than inventing a subagent.
+// coreToolMetadata(), then the CONDITIONAL harness-owned tools. `agentDelegate`,
+// `actionRequest`, and `threadFork` are always LISTED with generic metadata: the
+// catalogue is host-wide, while whether each is registered is a property of the
+// selected session's harness (subagents declared, an owner answerer configured, a
+// fork configuration supplied). A session without that capability answers a clear
+// 404 rather than inventing it.
+//
+// Order is stable: the always-declared six keep their existing prefix, so a client
+// that indexed the core block by name is unaffected; N4 appends the interaction
+// and fork tools after agentDelegate.
 export const createCoreToolEntries = (): CatalogueEntry[] =>
-    [...coreToolMetadata(), agentDelegateMetadata()].map((metadata) => ({
+    [
+        ...coreToolMetadata(),
+        agentDelegateMetadata(),
+        ACTION_REQUEST_METADATA,
+        THREAD_FORK_METADATA
+    ].map((metadata) => ({
         name: metadata.name,
         group: CORE_TOOL_GROUP,
         // No `tool`: the session's harness owns the implementation (see header).

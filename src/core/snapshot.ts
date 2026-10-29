@@ -24,6 +24,7 @@
 //   - ./creation.ts       — compileToolSource, the trusted-source compiler
 
 import { HarnessError } from '../util';
+import { validateAttachments } from '../shared/attachments';
 import type {
     HarnessAgentSnapshot,
     HarnessDiscoveryOffsetSnapshot,
@@ -75,12 +76,40 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
 
         switch (role) {
             case 'system':
-            case 'user': {
                 readSnapshotKeys(record, ['role', 'content'], entryLabel);
                 return {
                     role,
                     content: readSnapshotString(record.content, `${entryLabel}.content`)
                 };
+
+            case 'user': {
+                // Attachments are OPTIONAL: a pre-attachment snapshot has only
+                // role+content and must keep restoring byte-for-byte. When
+                // present, the shared validator re-checks every field (MIME,
+                // canonical base64, decoded size, magic signature) and returns
+                // detached copies, so a live transcript never aliases a saved
+                // object.
+                readSnapshotKeys(record, ['role', 'content', 'attachments'], entryLabel, [
+                    'attachments'
+                ]);
+
+                const message: Extract<HarnessMessage, { role: 'user' }> = {
+                    role: 'user',
+                    content: readSnapshotString(record.content, `${entryLabel}.content`)
+                };
+
+                if (record.attachments !== undefined) {
+                    try {
+                        message.attachments = validateAttachments(record.attachments);
+                    } catch (error) {
+                        // Keep restore's single error type: HarnessError.
+                        throw new HarnessError(
+                            `${entryLabel}.attachments ${error instanceof Error ? error.message : String(error)}`
+                        );
+                    }
+                }
+
+                return message;
             }
 
             case 'assistant': {

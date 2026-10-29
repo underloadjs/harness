@@ -30,7 +30,11 @@
 //     model-shaped field, `agentModels`, is a validated agent id → model id map.
 //   - byte bounds live in the adapters: the Node adapter rejects while streaming,
 //     the service adapter checks content-length and the serialized parsed body
-//     (see service.ts, which also documents the upstream-allocation residual).
+//     (see service.ts, which also documents the upstream-allocation residual). The
+//     default cap is 1 MB; the two submit routes (/sessions/:id/tasks and
+//     /sessions/:id/messages) carry raw base64 attachments and use the shared
+//     16 MiB MAX_SUBMIT_BODY_BYTES instead (see bodyLimitFor). Both adapters call
+//     that one helper, so a route cannot get a different bound per mount.
 //
 // TOOL EXECUTION (R8): every tool runs on the server. GET /tools (and
 // /tools/bootstrap, and the bootstrap document) lists the whole catalogue PLUS the
@@ -69,11 +73,15 @@ import { createHarnessRegistry } from './harnesses';
 import type { CatalogueEntry, HarnessRegistry, ToolCatalogue } from './harnesses';
 import { toolUiOf, boundToolResult, resolveToolParameters } from '../harness';
 import { listModels, ModelListError } from '../transport/models';
+import type { ModelListConfiguration } from '../transport/models';
 import type {
     AgentDescriptor,
+    AnswerActionRequest,
+    AnswerActionResult,
     CancelSessionRequest,
     CreateHarnessRequest,
     CreateSessionRequest,
+    HarnessAttachment,
     HarnessDescriptor,
     HarnessIndex,
     ModelIndex,
@@ -91,15 +99,84 @@ import type {
 } from './protocol';
 import { mergeSettings, SettingsError } from './config';
 import { HarnessRegistryError } from './harnesses/registry';
-import { SessionError, SessionStore } from './sessions';
+import { MAX_SUBMIT_BODY_BYTES } from '../shared/attachments';
+import { SessionError, SessionStore, validateAttachmentsForSubmit } from './sessions';
 import type { SessionWatch } from './sessions';
 
 const MAX_BODY_BYTES = 1_000_000;
 
 // Listing models is a convenience call, not a run: an unresponsive provider must
 // not hold a request open indefinitely. Ten seconds is generous for a catalogue
-// (providers answer from memory) and short enough to fail visibly.
+// (providers answer from memory) and short enough to fail visibly. This is the
+// FIRST attempt's budget; each retry doubles it (see listModelsWithRetry).
 const MODEL_LIST_TIMEOUT_MS = 10_000;
+
+// Total attempts for the catalogue lookup (the initial call plus nine retries).
+// A provider that is cold-starting, throttling, or restarting usually recovers
+// within a few tries, and the call is an idempotent GET with no side effects.
+// Chosen explicitly by the product owner: ten attempts, with the final window
+// at 10_000 * 2**9 = 5_120_000 ms (~85 minutes).
+const MODEL_LIST_MAX_ATTEMPTS = 10;
+
+// Fetch the catalogue, retrying provider failures with a per-attempt deadline
+// that doubles each time: 10s, 20s, 40s, ... 5_120s on the tenth attempt.
+//
+// Why retry here (route level) instead of inside transport/models.ts:
+//   - `listModels` is a thin, predictable single GET and stays usable as-is by
+//     callers that want their own retry policy;
+//   - the route is the only caller that owns provider credentials and must
+//     produce one HTTP status, so the policy belongs with the status mapping.
+//
+// What is retried: only `ModelListError` of kind 'request' (network/TLS/abort)
+// or 'response' (non-2xx, non-JSON, unusable body). Both mean the provider — not
+// the caller — failed, and a repeat GET can plausibly succeed.
+//
+// What is NOT retried:
+//   - `ModelListError` of kind 'configuration': a blank/invalid base URL cannot
+//     be fixed by trying again, so it fails immediately (route maps it to 400);
+//   - any other thrown value: a programming error, not a provider outage, must
+//     surface unchanged rather than be repeated ten times.
+//
+// Every attempt gets a FRESH AbortController and timer: reusing one aborted
+// signal would make every retry fail instantly, and the timer is cleared in
+// `finally` so a fast success/failure leaves no pending handle. There is no
+// sleep between attempts — the growing timeout IS the retry policy.
+export const listModelsWithRetry = async (configuration: ModelListConfiguration): Promise<string[]> => {
+    for (let attempt = 0; attempt < MODEL_LIST_MAX_ATTEMPTS; attempt += 1) {
+        const controller = new AbortController();
+
+        // Double the window per attempt: attempt 0 → 10s, attempt 9 → 5_120s.
+        const timer = setTimeout(() => controller.abort(), MODEL_LIST_TIMEOUT_MS * 2 ** attempt);
+
+        try {
+            return await listModels({
+                baseURL: configuration.baseURL,
+                apiKey: configuration.apiKey,
+                signal: controller.signal
+            });
+        } catch (error) {
+            // Configuration errors and unexpected exceptions are final. The
+            // route already knows how to map ModelListError; anything else is
+            // rethrown untouched for the adapter's generic error handling.
+            if (!(error instanceof ModelListError) || error.kind === 'configuration') {
+                throw error;
+            }
+
+            // On the final attempt there is no next try: surface the provider's
+            // own (already redacted) message so the route answers 502.
+            if (attempt === MODEL_LIST_MAX_ATTEMPTS - 1) {
+                throw error;
+            }
+        } finally {
+            // Clear on success, failure, and the final throw alike.
+            clearTimeout(timer);
+        }
+    }
+
+    // The loop above either returns or throws on its last iteration; this only
+    // satisfies the compiler's exhaustiveness check.
+    throw new Error('Model list retry loop exited without a result.');
+};
 
 // Mount names accepted by the dispatcher. The paths differ, the routes do not.
 export const STANDALONE_MOUNT = '/api';
@@ -218,6 +295,11 @@ const SESSION_PATCH_FIELDS = ['agentModels'] as const;
 // The only field POST /sessions/:id/cancel accepts. An absent body (or `{}`) is
 // the legacy active-run cancel; `all` also drops the queued backlog.
 const SESSION_CANCEL_FIELDS = ['all'] as const;
+
+// The one field POST /sessions/:id/actions/:requestId/answer accepts (N4). The
+// choice itself is validated by shared core/action.ts against the recorded request;
+// this list only rejects wrapper-level extras.
+const ANSWER_ACTION_FIELDS = ['choice'] as const;
 
 // Reject unknown properties instead of ignoring them. A request that tries to set
 // `instructions` is then a visible contract violation rather than a silent no-op
@@ -355,6 +437,34 @@ const relativeSegments = (pathname: string, mount: string): string[] | undefined
         });
 };
 
+// Maximum bytes for one request body, per route (T3).
+//
+// The two submit routes carry raw base64 media inside JSON, so they alone get the
+// shared MAX_SUBMIT_BODY_BYTES (16 MiB) bound. Everything else keeps the legacy
+// 1 MB cap: an unrelated route must not become a larger allocation surface just
+// because submissions may be large.
+//
+// Matching mirrors the dispatcher (`relativeSegments`): POST only, exactly
+// `/sessions/:id/tasks` or `/sessions/:id/messages` below the mount. Both
+// adapters MUST call this before reading/bounding a body so a route cannot get a
+// different limit on the Node mount than on the service mount.
+export const bodyLimitFor = (method: string, pathname: string, mount: string): number => {
+    if (method.toUpperCase() !== 'POST') return MAX_BODY_BYTES;
+
+    const segments = relativeSegments(pathname, mount);
+
+    if (
+        segments !== undefined &&
+        segments.length === 3 &&
+        segments[0] === 'sessions' &&
+        (segments[2] === 'tasks' || segments[2] === 'messages')
+    ) {
+        return MAX_SUBMIT_BODY_BYTES;
+    }
+
+    return MAX_BODY_BYTES;
+};
+
 // A body is only usable when it is a JSON object. Arrays, `null`, strings, and
 // numbers are rejected before any route reads a field off them: `body.harness`
 // on a string would be `undefined` and turn a malformed request into a confusing
@@ -450,17 +560,15 @@ export const createHarnessApi = ({
             throw new HttpError(400, 'Set a provider base URL before listing models.');
         }
 
-        // Abort rather than let a dead provider pin this request forever. The
-        // timer is cleared on every path so a completed request leaves no handle.
-        const controller = new AbortController();
-        const timer = setTimeout(() => controller.abort(), MODEL_LIST_TIMEOUT_MS);
-
+        // Each attempt aborts after its own deadline, so a dead provider cannot
+        // pin this request forever; failures are retried with a fresh controller
+        // and a doubled deadline until the attempt budget is exhausted (see
+        // listModelsWithRetry).
         try {
-            const ids = await listModels({
+            const ids = await listModelsWithRetry({
                 baseURL: settings.baseURL,
                 // An empty key is omitted, not sent as `Bearer `.
-                apiKey: settings.apiKey.trim().length === 0 ? undefined : settings.apiKey,
-                signal: controller.signal
+                apiKey: settings.apiKey.trim().length === 0 ? undefined : settings.apiKey
             });
 
             const payload: ModelIndex = { models: ids };
@@ -473,8 +581,6 @@ export const createHarnessApi = ({
             }
 
             throw error;
-        } finally {
-            clearTimeout(timer);
         }
     };
 
@@ -647,7 +753,11 @@ export const createHarnessApi = ({
     // task, a still-registered abort would cancel that different task. The store
     // forwards the signal to its own controller and removes the forwarder before
     // releasing the gate (executeTurn), so identity is exact.
-    const runSessionRoute = (id: string, input: string): HarnessApiResult => {
+    const runSessionRoute = (
+        id: string,
+        input: string,
+        attachments: HarnessAttachment[]
+    ): HarnessApiResult => {
         // Validate before a status line is sent, so a busy session can still
         // answer with a normal JSON error (409) rather than an SSE failure frame.
         store.assertRunnable(id);
@@ -660,7 +770,7 @@ export const createHarnessApi = ({
                 if (signal.aborted) return;
 
                 try {
-                    await store.run(id, input, emit, { signal });
+                    await store.run(id, input, emit, { signal }, attachments);
                 } catch (error) {
                     // The pre-flight check passed, so this is a race or an
                     // internal failure. The stream is already open; report it as
@@ -1093,7 +1203,9 @@ export const createHarnessApi = ({
                             throw new HttpError(400, 'A task must be a string.');
                         }
 
-                        const submitted = store.enqueue(first, body.input);
+                        // Attachments are a trailing store argument (T3); the store
+                        // validates them (400/413/415) before the queued turn exists.
+                        const submitted = store.enqueue(first, body.input, body.attachments);
 
                         return {
                             kind: 'json',
@@ -1122,12 +1234,20 @@ export const createHarnessApi = ({
                             throw new HttpError(400, 'A task must be a string.');
                         }
 
+                        // Validate media BEFORE opening the SSE response: an invalid
+                        // or oversized clip must answer a real 400/413/415 JSON body,
+                        // not a failed frame on a stream that already started. The
+                        // store validates the same copies again before creating the
+                        // turn, so a route bypass cannot admit unvalidated bytes.
+                        const attachments = validateAttachmentsForSubmit(body.attachments);
+
                         const input = body.input.trim();
-                        if (input.length === 0) {
+                        // Empty text is allowed only when a clip carries the task.
+                        if (input.length === 0 && attachments.length === 0) {
                             throw new HttpError(400, 'A task cannot be empty.');
                         }
 
-                        return runSessionRoute(first, input);
+                        return runSessionRoute(first, input, attachments);
                     }
 
                     if (second === 'reset') {
@@ -1161,6 +1281,41 @@ export const createHarnessApi = ({
                             body: { cancelled: store.cancel(first, { all: body.all === true }) }
                         };
                     }
+                }
+
+                if (segments.length === 5 && second === 'actions' && segments[4] === 'answer') {
+                    // POST /sessions/:id/actions/:requestId/answer (N4) — the ONLY
+                    // owner-answer surface. Deliberately allowed while the session
+                    // is busy: the active run is awaiting exactly this answer, so a
+                    // 409 busy gate would make questions unanswerable.
+                    if (method !== 'POST') {
+                        throw new HttpError(
+                            405,
+                            `Use POST for ${mount}/sessions/:id/actions/:requestId/answer.`
+                        );
+                    }
+
+                    const body = requireObjectBody<AnswerActionRequest>(
+                        await readBody<AnswerActionRequest>()
+                    );
+
+                    // One field only. Unknown keys are a client bug: accepting them
+                    // would silently ignore a `source`/`answer` the caller believed
+                    // was authoritative.
+                    requireKnownFields(body, ANSWER_ACTION_FIELDS);
+
+                    if (body.choice === undefined) {
+                        throw new HttpError(400, 'An action answer requires a `choice`.');
+                    }
+
+                    // The store re-validates the choice against the recorded
+                    // request (option id membership, custom text bounds) and
+                    // resolves the pending promise exactly once. 400/404/409 come
+                    // from SessionError and are mapped by the outer catch.
+                    store.answerAction(first, segments[3], body.choice);
+
+                    const payload: AnswerActionResult = { ok: true };
+                    return { kind: 'json', status: 200, body: payload };
                 }
             }
 

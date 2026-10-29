@@ -299,7 +299,12 @@ const demo: HarnessPreset = {
             report: {
                 progress,
                 ...(report?.stateChange === undefined ? {} : { stateChange: report.stateChange })
-            }
+            },
+            // N4: the same owner-interaction hook every live factory gets. The
+            // scripted transport never calls actionRequest, but forwarding it keeps
+            // "a preset choice changes agents, not host capabilities". It must be a
+            // TOP-LEVEL configuration field: presence registers the tool.
+            ...(report?.interaction === undefined ? {} : { interaction: report.interaction })
         })
 };
 

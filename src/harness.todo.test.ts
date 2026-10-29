@@ -83,7 +83,8 @@ describe('todoManage', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
         expect((entry.messages[2] as { content: string }).content).toBe(
             '{"todo":{"id":"1","text":"Draft plan","completed":false},"counts":{"total":1,"completed":0,"remaining":1}}'
@@ -173,7 +174,8 @@ describe('todoManage', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
-            'agentDelegate'
+            'agentDelegate',
+            'threadFork',
         ]);
         expect(declaredNames(researcherSeen[0])).toEqual([
             'peek',
@@ -182,7 +184,8 @@ describe('todoManage', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
     });
 
@@ -256,7 +259,8 @@ describe('todoManage', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
     });
 

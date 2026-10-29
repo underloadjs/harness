@@ -188,7 +188,8 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
 
         const restoredFlaky = registry.find('flaky')!;

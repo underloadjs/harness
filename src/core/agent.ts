@@ -28,19 +28,36 @@
 //   - stream() yields failures as `error` events (long-running CLIs must
 //     survive). turn() throws them (the harness owns recovery there).
 //
+// N3: Agent.fork() delegates to core/branch.ts. A fork is a DETACHED transcript
+// clone (remapped tool ids, pending-call placeholders) with a detached reset
+// baseline; it shares the transport, never a sandbox.
+//
 // Cross-references:
 //   - ../types.ts     — Agent, AgentConfiguration, AgentStreamEvent
 //   - ../transport.ts — openAICompatible(), the default HarnessStream
+//   - ./branch.ts     — fork identity, materialization, bounds
 //   - ../harness.ts   — the loop that drives turn() repeatedly
 
 import { HarnessError, toErrorInfo } from '../util';
 import { openAICompatible } from '../transport';
+import { validateAttachments } from '../shared/attachments';
+import {
+    agentBranchOf,
+    assertForkDepth,
+    createBranchId,
+    materializeBranchHistory,
+    normalizeForkAgentOptions,
+    registerAgentBranch,
+    registerAgentForker
+} from './branch';
+import type { NormalizedForkAgentOptions } from './branch';
 import type {
     Agent,
     AgentConfiguration,
     AgentStreamEvent,
     AgentStreamOptions,
     HarnessAssistantMessage,
+    HarnessAttachment,
     HarnessMessage,
     HarnessStopReason,
     HarnessStream,
@@ -77,11 +94,48 @@ const resolveStream = (configuration: AgentConfiguration): HarnessStream => {
     return openAICompatible(configuration.provider);
 };
 
+// Deep-copy one baseline message for a fork's reset seed. A fork must be able to
+// reset repeatedly, so the baseline is cloned on EVERY seed rather than handed
+// out as a shared array. Attachments are re-validated by the shared gate (which
+// also returns detached copies); tool calls are copied one by one.
+const copyBaselineMessage = (message: HarnessMessage): HarnessMessage => {
+    switch (message.role) {
+        case 'user':
+            return message.attachments !== undefined
+                ? {
+                      role: 'user',
+                      content: message.content,
+                      attachments: validateAttachments(message.attachments)
+                  }
+                : { role: 'user', content: message.content };
+
+        case 'assistant':
+            return {
+                role: 'assistant',
+                content: message.content,
+                ...(message.toolCalls !== undefined
+                    ? { toolCalls: message.toolCalls.map((call) => ({ ...call })) }
+                    : {}),
+                ...(message.reasoning !== undefined ? { reasoning: message.reasoning } : {})
+            };
+
+        default:
+            return { ...message };
+    }
+};
+
 // ---------------------------------------------------------------------------
 // Factory
 // ---------------------------------------------------------------------------
 
-export const agent = (configuration: AgentConfiguration): Agent => {
+// `baseline` is an INTERNAL seed used only by Agent.fork(): when present, the
+// branch's initial transcript and reset baseline are the materialized clone,
+// while `instructions` stays the source's instruction snapshot. The public
+// `agent()` wrapper below never exposes it.
+const createAgent = (
+    configuration: AgentConfiguration,
+    baseline?: readonly HarnessMessage[]
+): Agent => {
     if (!configuration.model) {
         throw new HarnessError('An agent requires a model.');
     }
@@ -101,13 +155,50 @@ export const agent = (configuration: AgentConfiguration): Agent => {
     const messages: HarnessMessage[] = [];
 
     const seed = (): void => {
-        messages.length = 0;
+        // Build the fully validated next transcript FIRST and replace the live
+        // array only once every seed message passed. reset() calls this on an
+        // already-committed conversation, so a bad seeded attachment (the caller
+        // may have mutated `configuration.messages` after construction) must
+        // throw WITHOUT erasing the transcript the session is using.
+        const next: HarnessMessage[] = [];
+
+        // FORK BASELINE: a branch starts from its cloned source transcript, not
+        // from instructions + configuration.messages (the source's history
+        // already contains those). Reset re-clones it, so a branch never shares
+        // mutable state with its source or with a previous reset.
+        if (baseline !== undefined) {
+            for (const message of baseline) {
+                next.push(copyBaselineMessage(message));
+            }
+
+            messages.length = 0;
+            for (const message of next) messages.push(message);
+            return;
+        }
+
         for (const instruction of instructions) {
-            messages.push({ role: 'system', content: instruction });
+            next.push({ role: 'system', content: instruction });
         }
+
         for (const message of configuration.messages ?? []) {
-            messages.push({ ...message });
+            // Seeded user messages may carry attachments too. Validate and copy
+            // them now, so a bad seed fails construction instead of reaching a
+            // transport (and so the configuration's array is never aliased by
+            // live history). Text-only seeds keep their exact old shape.
+            if (message.role === 'user' && message.attachments !== undefined) {
+                next.push({
+                    ...message,
+                    attachments: validateAttachments(message.attachments)
+                });
+                continue;
+            }
+
+            next.push({ ...message });
         }
+
+        // Commit point: everything above succeeded.
+        messages.length = 0;
+        for (const message of next) messages.push(message);
     };
 
     seed();
@@ -117,6 +208,25 @@ export const agent = (configuration: AgentConfiguration): Agent => {
 
     const append = (role: 'system' | 'user' | 'assistant', content: string): Agent => {
         messages.push({ role, content });
+        return self;
+    };
+
+    // User append with optional attachments. Validation is the FIRST thing that
+    // happens, so a malformed attachment can never leave a half-validated user
+    // message in history. `validateAttachments` returns detached copies, so the
+    // caller's array/objects cannot be mutated into (or out of) the transcript.
+    //
+    // The `attachments` key is omitted for a text-only message: that keeps every
+    // pre-attachment transcript and snapshot byte-identical.
+    const appendUser = (content: string, attachments?: HarnessAttachment[]): Agent => {
+        const validated = validateAttachments(attachments);
+
+        messages.push(
+            validated.length > 0
+                ? { role: 'user', content, attachments: validated }
+                : { role: 'user', content }
+        );
+
         return self;
     };
 
@@ -146,7 +256,17 @@ export const agent = (configuration: AgentConfiguration): Agent => {
         // the harness may reuse. The assistant message still commits below to the
         // canonical `messages` array, never to the projection.
         const source = options?.transcript ?? messages;
-        const transcript = source.map((message) => ({ ...message }));
+        // Copy the transcript shallowly, and COPY an attachment array so the
+        // transport never receives a live array it could mutate (the same rule
+        // that governs the message list itself).
+        const transcript = source.map((message) =>
+            message.role === 'user' && message.attachments !== undefined
+                ? {
+                      ...message,
+                      attachments: message.attachments.map((attachment) => ({ ...attachment }))
+                  }
+                : { ...message }
+        );
 
         for await (const event of transport({
             model: requestModel,
@@ -220,8 +340,22 @@ export const agent = (configuration: AgentConfiguration): Agent => {
         input: string,
         options?: AgentStreamOptions
     ): AsyncGenerator<AgentStreamEvent> {
+        // Validate before mutating: a malformed attachment yields an `error`
+        // event (stream never throws) and leaves history exactly as it was.
+        let attachments: HarnessAttachment[];
+        try {
+            attachments = validateAttachments(options?.attachments);
+        } catch (error) {
+            yield { type: 'error', error: toErrorInfo(error) };
+            return;
+        }
+
         const commitIndex = messages.length;
-        messages.push({ role: 'user', content: input });
+        messages.push(
+            attachments.length > 0
+                ? { role: 'user', content: input, attachments }
+                : { role: 'user', content: input }
+        );
 
         try {
             yield* request(options);
@@ -229,6 +363,68 @@ export const agent = (configuration: AgentConfiguration): Agent => {
             messages.splice(commitIndex);
             yield { type: 'error', error: toErrorInfo(error) };
         }
+    };
+
+    // N3 branch creation. Everything is resolved BEFORE the clone so a bad
+    // option (depth, label, byte cap) never produces a half-built branch.
+    //
+    // Depth: an ordinary fork consumes one level; an autoanswer fork does not
+    // (it inherits the source depth) because it is a tool-free, single-iteration
+    // owner read. Both still consume a runtime concurrency slot, which the
+    // harness enforces.
+    //
+    // History: the materializer remaps every tool id and pairs pending calls
+    // with an explicit non-success placeholder. The live `messages` array is
+    // only READ here; the source transcript is never mutated.
+    const forkFrom = (options: NormalizedForkAgentOptions): Agent => {
+        const parent = agentBranchOf(self);
+        const parentDepth = parent?.forkDepth ?? 0;
+        const depth =
+            options.kind === 'autoanswer'
+                ? parentDepth
+                : assertForkDepth(parentDepth + 1, options.maxDepth);
+
+        const branchId = createBranchId();
+        const materialized = materializeBranchHistory({
+            messages,
+            branchId,
+            reason: options.reason,
+            maxHistoryBytes: options.maxHistoryBytes
+        });
+
+        // The child shares the resolved transport (so provider credentials and
+        // external side effects are shared, not sandboxed). Its instructions are
+        // the source's snapshot, while its seed/baseline is the cloned transcript.
+        const child = createAgent(
+            {
+                name: self.name,
+                model,
+                instruction: [...instructions],
+                stream: transport
+            },
+            materialized.messages
+        );
+
+        registerAgentBranch(child, {
+            branchId,
+            kind: options.kind,
+            forkDepth: depth,
+            model,
+            // Keep the remap with the branch identity: the runtime needs it to
+            // fill HarnessBranchRecord.toolCallIds without re-materializing.
+            toolCallIds: materialized.toolCallIds,
+            ...(options.label !== undefined ? { label: options.label } : {}),
+            ...(options.sourceBranchId !== undefined
+                ? { sourceBranchId: options.sourceBranchId }
+                : {}),
+            ...(options.sourceThreadId !== undefined
+                ? { sourceThreadId: options.sourceThreadId }
+                : {}),
+            ...(options.callId !== undefined ? { callId: options.callId } : {}),
+            ...(options.requestId !== undefined ? { requestId: options.requestId } : {})
+        });
+
+        return child;
     };
 
     self = {
@@ -246,7 +442,7 @@ export const agent = (configuration: AgentConfiguration): Agent => {
         }) as Agent['model'],
 
         system: (content: string) => append('system', content),
-        user: (content: string) => append('user', content),
+        user: (content: string, attachments?: HarnessAttachment[]) => appendUser(content, attachments),
         assistant: (content: string, toolCalls?: HarnessToolCall[]) => {
             messages.push({
                 role: 'assistant',
@@ -258,8 +454,20 @@ export const agent = (configuration: AgentConfiguration): Agent => {
 
         stream,
         turn,
+        // Public branch entry point: display label only. Runtime autoanswer goes
+        // through `forkAgent` (core/branch), which supplies kind/request identity.
+        fork: (options?: { label?: string }) =>
+            forkFrom(normalizeForkAgentOptions(options)),
         reset: seed
     };
 
+    // Let the runtime create an AUTOANSWER owner fork through the same closure.
+    // The registry is a WeakMap, so this adds no field to the public Agent shape.
+    registerAgentForker(self, (options) => forkFrom(options));
+
     return self;
 };
+
+// Public factory. The optional baseline stays internal (see createAgent above),
+// so the exported function keeps the historical one-argument contract.
+export const agent = (configuration: AgentConfiguration): Agent => createAgent(configuration);

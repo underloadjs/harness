@@ -83,8 +83,11 @@ import type {
     SessionTurn,
     ToolDescriptor
 } from '../server/protocol';
+import type { HarnessActionChoice, HarnessAttachment } from '../types';
+import { validateAttachments } from '../shared/attachments';
 import {
     API_ROOT,
+    answerAction,
     callTool,
     cancelSession,
     createHarness,
@@ -117,12 +120,27 @@ import {
 import { createCreateHarnessPanel } from './ui/create-harness';
 import { createAgentRow } from './ui/agents';
 import { composerActionOf, composerFieldHeight, composerMaxHeight } from './ui/composer';
+import {
+    attachmentChipElement,
+    attachmentFileName,
+    attachmentPreviewUrl,
+    attachmentRecordOf,
+    clipboardFilesOf,
+    createAttachmentCounters,
+    insertAttachmentMarkers,
+    nextAttachmentMarker,
+    planAttachmentBatch,
+    readFileAsBase64,
+    releaseAttachmentPreview,
+    removeAttachmentMarker
+} from './ui/attachments';
+import type { AttachmentCounters, AttachmentKind } from './ui/attachments';
 import { applyActivity, activityOfTurns, paintActivity } from './ui/activity';
 import { highlightCode, looksLikeJson, prettyJson } from './ui/markdown';
 import { applyPanels, createPanelHost, mediaOfTurns } from './ui/panels';
 import type { PanelMedia } from './ui/panels';
 import { createTurnBoard } from './ui/turns';
-import type { TurnHandle } from './ui/turns';
+import type { AnswerActionInput, TurnHandle } from './ui/turns';
 
 // ---------------------------------------------------------------------------
 // Small DOM helpers
@@ -239,10 +257,15 @@ const forgetRememberedSession = (): void => {
 
 type View = {
     pane: HTMLElement;
+    // N3: tell the board which session its turns belong to, so a human answer is
+    // routed to the conversation that ASKED it and a stale question is expired
+    // when the reader switches conversations.
+    bindSession: (sessionId: string | undefined) => void;
     // Start a new user turn and return its handle. Called by `run()` *before* the
     // task is enqueued, so the tile shows `queued` (neutral, no clock) until the
-    // server accepts it and advances it to running.
-    begin: (prompt: string) => TurnHandle;
+    // server accepts it and advances it to running. Attachments are rendered as
+    // chips on the optimistic tile, then replaced by the server record.
+    begin: (prompt: string, attachments?: readonly HarnessAttachment[]) => TurnHandle;
     clear: () => void;
     notice: (text: string, tone?: 'info' | 'error') => void;
     // Session-scoped outcome line (a failed/cancelled run's detail), rendered in
@@ -267,7 +290,10 @@ type View = {
     dispose: () => void;
 };
 
-const createView = (descriptor: HarnessDescriptor): View => {
+const createView = (
+    descriptor: HarnessDescriptor,
+    answer?: (input: AnswerActionInput) => Promise<void>
+): View => {
     const pane = el('div', 'pane');
     const logWrap = el('div', 'log-wrap');
 
@@ -287,7 +313,10 @@ const createView = (descriptor: HarnessDescriptor): View => {
     // One tile per user turn. The board owns expansion state (exactly one tile
     // open, newest auto-opened) and keeps every tile's DOM, so reading an older
     // turn is never interrupted by deltas arriving for a newer one.
-    const board = createTurnBoard({ empty });
+    const board = createTurnBoard({
+        empty,
+        ...(answer === undefined ? {} : { answerAction: answer })
+    });
 
     const log = el('div', 'log');
     log.append(board.element);
@@ -324,8 +353,11 @@ const createView = (descriptor: HarnessDescriptor): View => {
 
     return {
         pane,
-        begin: (prompt) => {
-            const turn = board.begin(prompt);
+        bindSession: (sessionId) => {
+            board.bindSession(sessionId);
+        },
+        begin: (prompt, attachments) => {
+            const turn = board.begin(prompt, attachments);
             // A new turn is the one thing that always scrolls: the user just
             // submitted it.
             stick(true);
@@ -1390,7 +1422,36 @@ stage.id = 'harness-stage';
 //   - Keyboard (R1): Enter inserts a newline like any textarea; Ctrl/Cmd+Enter is
 //     the shortcut that sends, and the in-field button stays the primary send path.
 //     See the `keydown` listener below the submit wiring for the full matrix.
+//
+// Attachments (T5 clip/attach) are an ACCESSORY, not a second input:
+//   - `.composer-body` is a column holding the chip strip, the error line and the
+//     existing field wrapper, so `.composer-field`/`.composer-action` keep their
+//     exact layout contract (composer-style.test.ts);
+//   - the attach button is a sibling of that column (a real button, never a nested
+//     one) and opens the hidden file input;
+//   - paste/drop file detection lives on the textarea/composer below. The prompt
+//     keeps plain-text markers; bytes travel separately in `attachments`.
 const composer = el('form', 'composer');
+
+const composerBody = el('div', 'composer-body');
+
+// Chips ("[Image 1] photo.png ×"). role=list so the strip is announced as a group;
+// each chip is a listitem built by ui/attachments.ts.
+const attachmentStrip = el('div', 'composer-attachments');
+attachmentStrip.id = 'composer-attachments';
+attachmentStrip.setAttribute('role', 'list');
+attachmentStrip.setAttribute('aria-label', 'Attached files');
+attachmentStrip.hidden = true;
+
+// The explicit error line. role=status is polite: a rejected batch or a failed
+// read is announced without stealing focus, and the draft (text + other chips)
+// stays exactly as it was.
+const attachmentError = el('p', 'composer-attachment-error');
+attachmentError.id = 'composer-attachment-error';
+attachmentError.setAttribute('role', 'status');
+attachmentError.setAttribute('aria-live', 'polite');
+attachmentError.hidden = true;
+
 // The field is the positioning context for the action, so the button travels with
 // the box as it grows instead of sitting in a separate column.
 const composerField = el('div', 'composer-field');
@@ -1410,7 +1471,301 @@ const actionButton = el('button', 'composer-action');
 actionButton.type = 'submit';
 actionButton.hidden = true;
 composerField.append(input, actionButton);
-composer.append(composerField);
+composerBody.append(attachmentStrip, attachmentError, composerField);
+
+// File chooser accessory. The visible button is the only focusable control; the
+// native input is hidden from the tab order and from AT (its button carries the
+// accessible name). Selecting the same file twice still fires `change` because the
+// input is reset after every pick.
+const attachButton = el('button', 'composer-attach', '+');
+attachButton.type = 'button';
+attachButton.setAttribute('aria-label', 'Attach files');
+attachButton.title = 'Attach an image, video, audio file, PDF or other file';
+const fileInput = el('input', 'composer-file');
+fileInput.type = 'file';
+fileInput.multiple = true;
+fileInput.hidden = true;
+fileInput.tabIndex = -1;
+attachButton.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', () => {
+    const chosen = fileInput.files === null ? [] : Array.from(fileInput.files);
+    // Reset before reading so a second pick of the same file is a new change.
+    fileInput.value = '';
+    if (chosen.length > 0) addFiles(chosen);
+});
+
+composer.append(composerBody, attachButton, fileInput);
+
+// --- attachment draft state ------------------------------------------------
+//
+// `draftAttachments` is the ONE draft the composer owns. It is deliberately
+// module-scoped (like the textarea's text) so switching sessions does not lose an
+// attachment the user just pasted; only a SUCCESSFUL send (or the user pressing a
+// chip's ×) removes an entry. Every entry carries the marker already in the text,
+// so the prompt and the payload can never drift.
+//
+// Reads are per-file: markers are inserted SYNCHRONOUSLY at the captured selection
+// in clipboard order, then each file is encoded independently. A read failure
+// removes only that marker/chip and reports it; the rest of the draft is intact.
+// `attachmentReads` counts in-flight reads and gates the send action, so a turn
+// can never be submitted with a missing payload.
+type DraftAttachment = {
+    id: string;
+    kind: AttachmentKind;
+    marker: string;
+    name: string;
+    mime: string;
+    size: number;
+    // Undefined until the FileReader completes (or forever, if the read failed and
+    // the entry was removed).
+    data: string | undefined;
+    // Object URL for a raster image thumbnail; revoked on remove/reset/teardown.
+    previewUrl?: string;
+};
+
+let draftAttachments: DraftAttachment[] = [];
+let attachmentCounters: AttachmentCounters = createAttachmentCounters();
+let attachmentReads = 0;
+let attachmentSeq = 0;
+
+const setAttachmentError = (message?: string): void => {
+    const text = message?.trim() ?? '';
+    attachmentError.textContent = text;
+    attachmentError.hidden = text.length === 0;
+};
+
+// The payload for this draft. Only encoded entries are ready; callers must still
+// check `attachmentReads` (an entry could be mid-read if state is inconsistent).
+const readyAttachmentRecords = (): HarnessAttachment[] =>
+    draftAttachments.flatMap((draft) =>
+        draft.data === undefined
+            ? []
+            : [
+                  {
+                      id: draft.id,
+                      kind: draft.kind,
+                      marker: draft.marker,
+                      name: draft.name,
+                      mime: draft.mime,
+                      size: draft.size,
+                      data: draft.data
+                  }
+              ]
+    );
+
+const paintAttachments = (): void => {
+    attachmentStrip.replaceChildren(
+        ...draftAttachments.map((draft) =>
+            attachmentChipElement(
+                {
+                    kind: draft.kind,
+                    marker: draft.marker,
+                    name: draft.name,
+                    mime: draft.mime,
+                    pending: draft.data === undefined,
+                    ...(draft.previewUrl === undefined ? {} : { previewUrl: draft.previewUrl })
+                },
+                // During the short enqueue window the sent payload is frozen: chips
+                // render without a remove control so a failed submit can restore the
+                // prompt and this draft exactly as they were.
+                submitting ? {} : { onRemove: () => removeDraftAttachment(draft) }
+            )
+        )
+    );
+    attachmentStrip.hidden = draftAttachments.length === 0;
+    attachmentStrip.setAttribute('aria-busy', attachmentReads > 0 ? 'true' : 'false');
+
+    // The action depends on whether any READY attachment exists.
+    paintComposer();
+};
+
+// Remove one draft atomically: its chip, its object URL, and the FIRST occurrence
+// of its marker. Removing a chip therefore removes the reference the user sees,
+// not a marker the user typed by hand elsewhere (first-match is the documented
+// association).
+const removeDraftAttachment = (draft: DraftAttachment): void => {
+    // The submit snapshot is frozen: no removal between capture and the 202/error.
+    if (submitting) return;
+
+    const index = draftAttachments.indexOf(draft);
+    if (index < 0) return;
+
+    draftAttachments.splice(index, 1);
+    releaseAttachmentPreview(draft.previewUrl);
+
+    const next = removeAttachmentMarker(input.value, draft.marker);
+    if (next !== input.value) {
+        input.value = next;
+        autoGrow();
+    }
+
+    paintAttachments();
+};
+
+// Finish one read. `data` is the canonical base64, or an Error describing the
+// failure (reader error, malformed data URL, signature/MIME mismatch from the
+// shared validator). The entry is removed on failure so the draft only ever
+// contains sendable records; the text and every other chip stay untouched.
+const finishAttachmentRead = (draft: DraftAttachment, data: string | Error): void => {
+    attachmentReads = Math.max(0, attachmentReads - 1);
+
+    // The user removed the chip while the read was in flight: nothing to apply.
+    if (!draftAttachments.includes(draft)) {
+        paintAttachments();
+        return;
+    }
+
+    if (data instanceof Error) {
+        draftAttachments.splice(draftAttachments.indexOf(draft), 1);
+        releaseAttachmentPreview(draft.previewUrl);
+
+        const next = removeAttachmentMarker(input.value, draft.marker);
+        if (next !== input.value) {
+            input.value = next;
+            autoGrow();
+        }
+
+        setAttachmentError(`Could not attach "${draft.name}": ${messageOf(data)}`);
+        paintAttachments();
+        return;
+    }
+
+    try {
+        // Validate the ENCODED record through the shared gate. This checks canonical
+        // base64, size agreement and the magic signature; returning a detached copy
+        // means the draft can only hold values the server would accept too.
+        const record = attachmentRecordOf({
+            id: draft.id,
+            kind: draft.kind,
+            marker: draft.marker,
+            name: draft.name,
+            mime: draft.mime,
+            size: draft.size,
+            data
+        });
+
+        draft.data = record.data;
+        draft.size = record.size;
+        draft.mime = record.mime;
+    } catch (error) {
+        draftAttachments.splice(draftAttachments.indexOf(draft), 1);
+        releaseAttachmentPreview(draft.previewUrl);
+
+        const next = removeAttachmentMarker(input.value, draft.marker);
+        if (next !== input.value) {
+            input.value = next;
+            autoGrow();
+        }
+
+        setAttachmentError(`Could not attach "${draft.name}": ${messageOf(error)}`);
+    }
+
+    paintAttachments();
+};
+
+// Add a clipboard/drop/file-chooser batch. The budget gate runs BEFORE any bytes
+// are read and is ATOMIC: one oversized/invalid file rejects the whole batch with
+// an explicit reason, inserting nothing. A read failure afterwards is partial and
+// per-file (see finishAttachmentRead) because the markers are already in the text.
+const addFiles = (files: File[]): void => {
+    if (files.length === 0) return;
+
+    const plan = planAttachmentBatch(
+        files.map((file) => ({ name: file.name, mime: file.type, size: file.size })),
+        draftAttachments
+    );
+
+    if (!plan.ok) {
+        setAttachmentError(plan.message);
+        return;
+    }
+
+    setAttachmentError(undefined);
+
+    // CAPTURE the selection before touching the field. Insertion is synchronous,
+    // so the asynchronous reads never have to restore a caret the user may have
+    // moved (the new text is already in place and the caret sits after it).
+    const selection = {
+        start: input.selectionStart ?? input.value.length,
+        end: input.selectionEnd ?? input.value.length
+    };
+
+    const pending = files.map((file, index) => {
+        const planned = plan.entries[index];
+        const previewUrl = attachmentPreviewUrl(file, planned.kind);
+
+        const draft: DraftAttachment = {
+            id: `attach-${++attachmentSeq}`,
+            kind: planned.kind,
+            // Markers are allocated in clipboard order; a later removal never
+            // renumbers the rest of the draft.
+            marker: nextAttachmentMarker(attachmentCounters, planned.kind),
+            name: attachmentFileName(file.name, planned.mime, attachmentSeq),
+            mime: planned.mime,
+            size: file.size,
+            data: undefined,
+            ...(previewUrl === undefined ? {} : { previewUrl })
+        };
+
+        return { file, draft };
+    });
+
+    draftAttachments.push(...pending.map((entry) => entry.draft));
+
+    const insertion = insertAttachmentMarkers(
+        input.value,
+        selection,
+        pending.map((entry) => entry.draft.marker)
+    );
+    if (insertion.text !== input.value) input.value = insertion.text;
+    input.setSelectionRange(insertion.caret, insertion.caret);
+
+    attachmentReads += pending.length;
+    paintAttachments();
+    autoGrow();
+
+    for (const { file, draft } of pending) {
+        void readFileAsBase64(file).then(
+            (data) => finishAttachmentRead(draft, data),
+            (error: unknown) =>
+                finishAttachmentRead(draft, error instanceof Error ? error : new Error(String(error)))
+        );
+    }
+};
+
+// OS clipboard files (screenshots copied from another app) land on paste. If there
+// are none, the handler does nothing at all: normal text/rich paste is untouched.
+// When files DO exist the clipboard's text is deliberately ignored so one gesture
+// cannot insert both an image and its HTML/plain copy.
+input.addEventListener('paste', (event) => {
+    const files = clipboardFilesOf(event.clipboardData);
+    if (files.length === 0) return;
+
+    event.preventDefault();
+    addFiles(files);
+});
+
+// Drag/drop is the third way in (straightforward, same gate/atomicity). Only a
+// payload that actually carries files is intercepted; dragging text over the
+// textarea keeps the browser's native edit behavior.
+const carriesFiles = (data: DataTransfer | null): boolean =>
+    data !== null && clipboardFilesOf(data).length > 0;
+
+composer.addEventListener('dragover', (event) => {
+    if (!carriesFiles(event.dataTransfer)) return;
+    event.preventDefault();
+    if (event.dataTransfer !== null) event.dataTransfer.dropEffect = 'copy';
+});
+
+composer.addEventListener('drop', (event) => {
+    const files = clipboardFilesOf(event.dataTransfer);
+    if (files.length === 0) return;
+
+    event.preventDefault();
+    addFiles(files);
+    input.focus();
+});
+
 
 // R9/R5: grow/shrink the field with its content. The inline height is cleared FIRST
 // so a deleted line measures the smaller content honestly; `composerFieldHeight` adds
@@ -1450,14 +1805,24 @@ const autoGrow = (): void => {
 // keydown contract below). In stop mode it is a plain button wired to `stopRun`.
 const paintComposer = (): void => {
     const pending = running || current?.pending === true;
-    const action = composerActionOf(input.value, pending);
+    // Only READY attachments count as submittable content; a still-encoding file is
+    // shown as a pending chip but cannot turn the empty field into a send.
+    const ready = draftAttachments.reduce((count, draft) => count + (draft.data === undefined ? 0 : 1), 0);
+    const action = composerActionOf(input.value, pending, ready);
 
     actionButton.dataset.action = action;
     actionButton.hidden = action === 'none';
-    // Submit follows the old Run guard exactly (the short enqueue window + boot);
-    // stop is always live in its state because that state requires pending work.
-    actionButton.disabled = action === 'submit' ? submitting || !booted : false;
+    // Submit follows the old Run guard exactly (the short enqueue window + boot).
+    // A read in flight disables submit: the payload is not complete yet, and the
+    // stop state stays live because that state requires pending work.
+    const reading = attachmentReads > 0;
+    actionButton.disabled = action === 'submit' ? submitting || !booted || reading : false;
     actionButton.type = action === 'stop' ? 'button' : 'submit';
+
+    // The attach accessory is locked only during the short enqueue window, so the
+    // payload a submit captured cannot change underneath it.
+    attachButton.disabled = submitting || !booted;
+    fileInput.disabled = attachButton.disabled;
 
     if (action === 'stop') {
         actionButton.textContent = '×';
@@ -1467,6 +1832,12 @@ const paintComposer = (): void => {
     }
 
     actionButton.textContent = '▶';
+    if (action === 'submit' && reading) {
+        actionButton.setAttribute('aria-label', 'Send task — attachments are still loading');
+        actionButton.title = 'Reading the attached file…';
+        return;
+    }
+
     actionButton.setAttribute('aria-label', 'Send task');
     // The title must state the real shortcut (R1): Enter is a newline now, so the
     // only keyboard send is Ctrl+Enter (Cmd+Enter on macOS).
@@ -1773,6 +2144,25 @@ let pollToken = 0;
 const descriptorFor = (name: string): HarnessDescriptor | undefined =>
     presetDescriptors.find((candidate) => candidate.name === name);
 
+// N3: route one human answer from a turn board to the session that asked it.
+//
+// The board captured `sessionId` when the card was rendered and main re-checks it
+// against the instance's CURRENT session before the POST. That double binding is
+// what stops an answer from leaking into a conversation the reader switched to
+// after the question appeared. `answerAction` itself only resolves the pending
+// question (it never enqueues a task), so answering while the turn is busy is the
+// intended path.
+const answerActionFor = async (harnessName: string, input: AnswerActionInput): Promise<void> => {
+    const instance = instances.get(harnessName);
+    if (instance === undefined) throw new Error('This harness view is no longer open.');
+    if (instance.sessionId === undefined) throw new Error('No session is open for this question.');
+    if (input.sessionId === undefined || input.sessionId !== instance.sessionId) {
+        throw new Error('This question belongs to another session.');
+    }
+
+    await answerAction(instance.sessionId, input.requestId, input.choice);
+};
+
 const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
     const existing = instances.get(descriptor.name);
     if (existing !== undefined) {
@@ -1784,7 +2174,7 @@ const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
 
     const instance: Instance = {
         descriptor,
-        view: createView(descriptor),
+        view: createView(descriptor, (input) => answerActionFor(descriptor.name, input)),
         activity: new Set<string>(),
         panels: new Map<string, PanelMedia>(),
         pending: false,
@@ -2654,6 +3044,9 @@ const forgetDeletedSession = (id: string): void => {
         // deleted conversation must not leak its team, models or discovery into
         // the empty view (R8).
         instance.sessionId = undefined;
+        // N3: expiring the question cards before the board is cleared means a stale
+        // answer control cannot survive the deletion.
+        instance.view.bindSession(undefined);
         instance.frozen = undefined;
         instance.sessionModels = undefined;
         instance.sessionModel = undefined;
@@ -2933,6 +3326,9 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     if (deletedSessions.has(session.id)) return;
 
     instance.sessionId = session.id;
+    // N3: bind before reconciling so every card rendered from this snapshot knows
+    // which session may answer it (and cards from a previous session expire).
+    instance.view.bindSession(session.id);
 
     // Snapshot watermark (R2). `session.updatedAt` is monotonic on the server, so a
     // snapshot stamped BEFORE the newest one already applied is stale: it can only
@@ -3357,6 +3753,9 @@ const openSession = async (id: string): Promise<void> => {
     }
 
     target.sessionId = id;
+    // N3: an answer card from the conversation being left cannot follow the
+    // reader here; binding expires it before the new transcript is drawn.
+    target.view.bindSession(id);
     target.frozen = frozenDefinitionOf(session);
 
     selectHarness(descriptor.name);
@@ -3394,6 +3793,9 @@ const newSession = (): void => {
     stopWatching();
     stopPolling();
     instance.sessionId = undefined;
+    // N3: a card left on the old conversation can no longer be answered; expire it
+    // before the board is cleared.
+    instance.view.bindSession(undefined);
     instance.frozen = undefined;
     instance.sessionModels = undefined;
     instance.sessionModel = undefined;
@@ -3522,6 +3924,10 @@ const ensureSession = async (instance: Instance): Promise<string> => {
     }
 
     instance.sessionId = session.id;
+    // N3: the first submit of a new conversation creates the session before the
+    // task is enqueued, so bind here: any action card that arrives with the run is
+    // answerable against this id.
+    instance.view.bindSession(session.id);
     instance.frozen = frozenDefinitionOf(session);
     // The creation answer carries this session's effective model map, which is also
     // the map a later PATCH /sessions/:id replaces (R2).
@@ -3556,9 +3962,21 @@ const ensureSession = async (instance: Instance): Promise<string> => {
 const run = async (): Promise<void> => {
     const prompt = input.value.trim();
 
+    // An in-flight read is not a draft: submitting now would send a prompt whose
+    // marker has no bytes. The action is disabled in that state, and the shortcut
+    // is guarded here so it cannot race the read either.
+    if (attachmentReads > 0) {
+        setAttachmentError('Wait for the attached file to finish loading.');
+        return;
+    }
+
+    // Attachment-only turns are allowed by the server, so an empty prompt is not
+    // by itself a refusal when a ready attachment exists.
+    const attachments = readyAttachmentRecords();
+
     // Only the short enqueue window is single-flight (R4). Pending work does NOT
     // block a submit: a task submitted while another runs is the queue.
-    if (submitting || savingAgents || prompt.length === 0) return;
+    if (submitting || savingAgents || (prompt.length === 0 && attachments.length === 0)) return;
 
     const instance = current;
     if (instance === undefined || currentTool !== undefined) return;
@@ -3569,16 +3987,36 @@ const run = async (): Promise<void> => {
         return;
     }
 
+    // Re-validate the WHOLE payload immediately before it leaves the browser. The
+    // per-file gate already ran on encode; this is the boundary check (count, total
+    // bytes, uniqueness) and its failure must not clear the draft.
+    let validated: HarnessAttachment[];
+    try {
+        validated = validateAttachments(attachments);
+    } catch (error) {
+        setAttachmentError(messageOf(error));
+        return;
+    }
+
+    if (validated.length === 0 && prompt.length === 0) return;
+
+    // Snapshot the drafts this submit sends. They are removed only on SUCCESS, so
+    // a failure leaves the chips (and their markers) intact for a retry.
+    const sentDrafts = draftAttachments.filter((draft) => draft.data !== undefined);
+    setAttachmentError(undefined);
+
     // The tile exists before the request does, in submission order, so a second
     // task visibly sits BEHIND the active one from the first frame. It starts
     // `queued` and neutral: no ring, no clock.
-    const turn = instance.view.begin(prompt);
+    const turn = instance.view.begin(prompt, validated);
     input.value = '';
     // R9: the field shrinks back to one row immediately; the inline height from the
     // filled state would otherwise leave a tall empty box until the next keystroke.
     autoGrow();
     submitting = true;
     paintControls();
+    // Freeze the chip strip (remove controls disappear) for the enqueue window.
+    paintAttachments();
     // No header write: the optimistic tile already shows the submit lifecycle, and
     // the topbar pill is app-scoped (R1).
 
@@ -3592,7 +4030,7 @@ const run = async (): Promise<void> => {
 
         // 202: the server retained the task and answered with its record. The
         // request is over here — execution and streaming happen on GET /events.
-        const { session, turn: record } = await enqueueTask(sessionId, prompt);
+        const { session, turn: record } = await enqueueTask(sessionId, prompt, validated);
 
         // Bind the server id/index and mirror the queue position. `merge` applies
         // only events that are not already on the tile (normally none yet), so a
@@ -3610,6 +4048,15 @@ const run = async (): Promise<void> => {
             startWatching(instance, sessionId);
             if (current === instance) rememberSession(sessionId);
         }
+
+        // SUCCESS is the only point at which the sent draft is consumed. Any chip
+        // the user added during the short enqueue window stays (the markers already
+        // left the field with the previous submit); counters reset only when the
+        // draft is empty, so a surviving marker's number is never reused.
+        for (const draft of sentDrafts) releaseAttachmentPreview(draft.previewUrl);
+        draftAttachments = draftAttachments.filter((draft) => !sentDrafts.includes(draft));
+        if (draftAttachments.length === 0) attachmentCounters = createAttachmentCounters();
+        paintAttachments();
     } catch (error) {
         turn.flush();
         const message = messageOf(error);
@@ -3634,9 +4081,15 @@ const run = async (): Promise<void> => {
         }
 
         // A failed submit is the TASK's failure (rejected input, unreachable
-        // server): the tile and the transcript notice say so, and the prompt stays.
-        // It is not a stream failure, and it is NOT painted into the app-scoped
-        // header (R1): a run failure must not outlive the session it belongs to.
+        // server): the tile and the transcript notice say so, and the draft stays.
+        // The textarea was cleared optimistically; restoring it (only when the
+        // reader has not started a new message meanwhile) means no input is lost.
+        if (input.value.length === 0 && prompt.length > 0) {
+            input.value = prompt;
+            autoGrow();
+        }
+        // Not a stream failure, and it is NOT painted into the app-scoped header
+        // (R1): a run failure must not outlive the session it belongs to.
         turn.setState('error', message);
         instance.view.notice(`task failed: ${message}`, 'error');
         void refreshSessions();
@@ -3647,6 +4100,9 @@ const run = async (): Promise<void> => {
         setBusy(current?.pending === true);
         turn.flush();
         input.focus();
+        // Release the frozen chip strip (remove controls return; a successful send
+        // already emptied it above).
+        paintAttachments();
     }
 };
 
@@ -3776,6 +4232,12 @@ window.addEventListener('pagehide', () => {
     stopWatching();
     stopPolling();
     clearActivity();
+
+    // Object URLs for draft thumbnails are page-lifetime only; release them so a
+    // reload/new document does not leak blob storage. The bytes themselves are in
+    // the draft records (which this document is dropping anyway).
+    for (const draft of draftAttachments) releaseAttachmentPreview(draft.previewUrl);
+    draftAttachments = [];
 
     for (const instance of instances.values()) instance.view.dispose();
 });

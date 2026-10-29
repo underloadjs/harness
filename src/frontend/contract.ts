@@ -10,6 +10,7 @@
 //   - per-turn timings (`eventTimes`) and per-frame `at`;
 //   - `tool_result.callId`;
 //   - concurrent-tool fields (`toolResult.durationMs`, `pending`, `wakeup`);
+//   - interactive action requests/answers and fork/autoanswer branch events (N3);
 //   - legacy harness aliases for the sessions filter.
 //
 // Every accessor has to be safe on an older payload: a missing field must degrade
@@ -25,6 +26,14 @@ import type {
     SessionStreamItem,
     SessionTurn
 } from '../server/protocol';
+// N3 interaction/branch wire shapes live in the shared type barrel. They are read
+// structurally below so a server that predates them (or a malformed frame) cannot
+// make the transcript throw; the canonical types only anchor the return values.
+import type {
+    HarnessActionAnswer,
+    HarnessActionChoice,
+    HarnessActionRequest
+} from '../types';
 
 // Legacy fallback: the harness-owned core tools an OLD server (no `coreTools`)
 // declared. R21.2 removed the right-rail core dropdown and the tool catalogue that
@@ -264,7 +273,14 @@ export const threadOf = (source: unknown): HarnessThreadInfo | undefined => {
     const raw = (source as { thread?: unknown }).thread;
     if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
 
-    const candidate = raw as { id?: unknown; parentId?: unknown; callId?: unknown; input?: unknown };
+    const candidate = raw as {
+        id?: unknown;
+        parentId?: unknown;
+        callId?: unknown;
+        input?: unknown;
+        kind?: unknown;
+        branchId?: unknown;
+    };
     if (typeof candidate.id !== 'string' || candidate.id.length === 0) return undefined;
 
     const result: HarnessThreadInfo = { id: candidate.id };
@@ -281,7 +297,204 @@ export const threadOf = (source: unknown): HarnessThreadInfo | undefined => {
     if (typeof candidate.callId === 'string' && candidate.callId.length > 0) result.callId = candidate.callId;
     if (typeof candidate.input === 'string') result.input = candidate.input;
 
+    // N3: what spawned this non-root invocation. Omitted for historical records
+    // and hand-written reporters, so it is read only when it is a known kind.
+    if (candidate.kind === 'delegation' || candidate.kind === 'fork' || candidate.kind === 'autoanswer') {
+        result.kind = candidate.kind;
+    }
+    if (typeof candidate.branchId === 'string' && candidate.branchId.length > 0) {
+        result.branchId = candidate.branchId;
+    }
+
     return result;
+};
+
+// --- Interactive action requests (N3) ---------------------------------------
+//
+// `actionRequest` asks the OWNER a bounded question. The frozen wire shape is:
+//
+//   request: { requestId, question, recommended, options[], allowCustom: true }
+//   choice:  { kind: 'option', optionId } | { kind: 'custom', text }
+//   answer:  { requestId, choice, source: 'owner' | 'auto', branchId? }
+//
+// The UI must never act on a partially-malformed request: a card whose option id
+// is not a string could otherwise post a bogus answer. These parsers therefore
+// return undefined unless EVERY required field is well-formed, and drop malformed
+// optional fields (`description`) instead of failing the whole request. Custom
+// text is part of the contract (`allowCustom: true`) and is not a switch a server
+// may turn off; a request that omits it is still rendered with custom input.
+const actionOptionOf = (value: unknown): HarnessActionRequest['options'][number] | undefined => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+
+    const candidate = value as { id?: unknown; label?: unknown; description?: unknown };
+    if (typeof candidate.id !== 'string' || candidate.id.length === 0) return undefined;
+    if (typeof candidate.label !== 'string' || candidate.label.length === 0) return undefined;
+
+    return {
+        id: candidate.id,
+        label: candidate.label,
+        ...(typeof candidate.description === 'string' && candidate.description.length > 0
+            ? { description: candidate.description }
+            : {})
+    };
+};
+
+export const actionRequestOf = (value: unknown): HarnessActionRequest | undefined => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+
+    const candidate = value as {
+        requestId?: unknown;
+        question?: unknown;
+        recommended?: unknown;
+        options?: unknown;
+        allowCustom?: unknown;
+    };
+
+    if (typeof candidate.requestId !== 'string' || candidate.requestId.length === 0) return undefined;
+    if (typeof candidate.question !== 'string' || candidate.question.length === 0) return undefined;
+    if (typeof candidate.recommended !== 'string' || candidate.recommended.length === 0) return undefined;
+    if (!Array.isArray(candidate.options)) return undefined;
+
+    const options: HarnessActionRequest['options'] = [];
+    const seen = new Set<string>();
+    for (const raw of candidate.options) {
+        const option = actionOptionOf(raw);
+        // Duplicate ids would make the radio group ambiguous; keep the first.
+        if (option === undefined || seen.has(option.id)) continue;
+        seen.add(option.id);
+        options.push(option);
+    }
+
+    // The frozen contract always allows custom answers. A legacy/malformed frame
+    // without the flag is still treated as allowing them (the UI never withholds
+    // the free-text path); `false` is not part of the contract and is ignored.
+    return {
+        requestId: candidate.requestId,
+        question: candidate.question,
+        recommended: candidate.recommended,
+        options,
+        allowCustom: true
+    };
+};
+
+export const actionChoiceOf = (value: unknown): HarnessActionChoice | undefined => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+
+    const candidate = value as { kind?: unknown; optionId?: unknown; text?: unknown };
+    if (candidate.kind === 'option') {
+        return typeof candidate.optionId === 'string' && candidate.optionId.length > 0
+            ? { kind: 'option', optionId: candidate.optionId }
+            : undefined;
+    }
+    if (candidate.kind === 'custom') {
+        // Empty custom text is not a usable answer: the submit control stays
+        // disabled until the user typed something, and the server rejects it too.
+        return typeof candidate.text === 'string' && candidate.text.trim().length > 0
+            ? { kind: 'custom', text: candidate.text }
+            : undefined;
+    }
+
+    return undefined;
+};
+
+export const actionAnswerOf = (value: unknown): HarnessActionAnswer | undefined => {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return undefined;
+
+    const candidate = value as {
+        requestId?: unknown;
+        choice?: unknown;
+        source?: unknown;
+        branchId?: unknown;
+    };
+
+    if (typeof candidate.requestId !== 'string' || candidate.requestId.length === 0) return undefined;
+    if (candidate.source !== 'owner' && candidate.source !== 'auto') return undefined;
+
+    const choice = actionChoiceOf(candidate.choice);
+    if (choice === undefined) return undefined;
+
+    return {
+        requestId: candidate.requestId,
+        choice,
+        source: candidate.source,
+        ...(typeof candidate.branchId === 'string' && candidate.branchId.length > 0
+            ? { branchId: candidate.branchId }
+            : {})
+    };
+};
+
+// The whole `action_request` frame, validated. A frame that lacks the agent/call
+// identity is not routable (we cannot attribute the card), so it is dropped rather
+// than guessed at.
+export const actionRequestEventOf = (
+    event: HarnessEvent
+): Extract<HarnessEvent, { type: 'action_request' }> | undefined => {
+    if (event.type !== 'action_request') return undefined;
+    if (typeof event.agent !== 'string' || event.agent.length === 0) return undefined;
+    if (typeof event.callId !== 'string' || event.callId.length === 0) return undefined;
+
+    const request = actionRequestOf(event.request);
+    if (request === undefined) return undefined;
+
+    return { ...event, request };
+};
+
+export const actionAnswerEventOf = (
+    event: HarnessEvent
+): Extract<HarnessEvent, { type: 'action_answer' }> | undefined => {
+    if (event.type !== 'action_answer') return undefined;
+    if (typeof event.agent !== 'string' || event.agent.length === 0) return undefined;
+    if (typeof event.requestId !== 'string' || event.requestId.length === 0) return undefined;
+
+    const answer = actionAnswerOf(event.answer);
+    if (answer === undefined) return undefined;
+    // The envelope and the frame must name the SAME request; a frame that answers
+    // a different one is malformed and would resolve the wrong card.
+    if (answer.requestId !== event.requestId) return undefined;
+
+    return { ...event, answer };
+};
+
+// --- Fork / autoanswer branches (N3) ---------------------------------------
+//
+// A branch run is a NON-ROOT invocation with `thread.kind` = 'fork' | 'autoanswer'
+// and a `branchId`. The two branch events summarize its lifecycle:
+//
+//   branch_start { agent, branch: HarnessBranchSummary, thread? }
+//   branch_end   { agent, branchId, status: completed|failed|cancelled, error?, thread? }
+//
+// A malformed summary has no identity or unknown kind, so it cannot be rendered
+// as a real row; returning undefined leaves the transcript and activity unchanged.
+export const branchStartEventOf = (
+    event: HarnessEvent
+): Extract<HarnessEvent, { type: 'branch_start' }> | undefined => {
+    if (event.type !== 'branch_start') return undefined;
+    if (typeof event.agent !== 'string' || event.agent.length === 0) return undefined;
+
+    const branch = event.branch;
+    if (branch === null || typeof branch !== 'object') return undefined;
+    if (typeof branch.branchId !== 'string' || branch.branchId.length === 0) return undefined;
+    if (branch.kind !== 'fork' && branch.kind !== 'autoanswer') return undefined;
+    if (typeof branch.agent !== 'string' || branch.agent.length === 0) return undefined;
+    if (branch.role !== 'primary' && branch.role !== 'subagent') return undefined;
+    if (!Number.isFinite(branch.forkDepth) || branch.forkDepth < 0) return undefined;
+    if (typeof branch.model !== 'string') return undefined;
+    if (!Array.isArray(branch.tools)) return undefined;
+
+    return event;
+};
+
+export const branchEndEventOf = (
+    event: HarnessEvent
+): Extract<HarnessEvent, { type: 'branch_end' }> | undefined => {
+    if (event.type !== 'branch_end') return undefined;
+    if (typeof event.agent !== 'string' || event.agent.length === 0) return undefined;
+    if (typeof event.branchId !== 'string' || event.branchId.length === 0) return undefined;
+    if (event.status !== 'completed' && event.status !== 'failed' && event.status !== 'cancelled') {
+        return undefined;
+    }
+
+    return event;
 };
 
 export const finiteOf = (value: unknown): number | undefined =>

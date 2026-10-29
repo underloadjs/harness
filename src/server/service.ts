@@ -42,13 +42,16 @@
 // packages/underload/service/src/server/start.ts), so a large JSON body has
 // already been buffered and parsed by the time we see it, and a parse failure has
 // already been swallowed into `{}`. This adapter can only:
-//   - reject a declared `content-length` over MAX_API_BODY_BYTES with 413 before
-//     any dispatcher work;
-//   - reject a parsed body whose serialized size exceeds the same cap with 413.
-// It cannot prevent the loader's upstream allocation, and it cannot tell a
-// malformed body from a literal `{}`. The dispatcher therefore requires an
-// object body for action endpoints and a `parameters` property for tool calls,
-// which is what keeps a swallowed parse failure from executing a tool. Fixing the
+//   - reject a declared `content-length` over the ROUTE limit with 413 before any
+//     dispatcher work;
+//   - reject a parsed body whose serialized size exceeds the same limit with 413.
+// The route limit comes from api.ts bodyLimitFor: the submit routes (/tasks and
+// /messages) allow the shared 16 MiB MAX_SUBMIT_BODY_BYTES for base64 attachments,
+// every other route keeps the 1 MB default. It cannot prevent the loader's
+// upstream allocation (already done before this function), and it cannot tell a
+// malformed body from a literal `{}`. The dispatcher therefore requires an object
+// body for action endpoints and a `parameters` property for tool calls, which is
+// what keeps a swallowed parse failure from executing a tool. Fixing the
 // allocation itself belongs in the service loader, not here.
 //
 // PERSISTENCE (R3b): the loader calls `handler(context, parameters, variables)`.
@@ -66,7 +69,7 @@
 //   - ./api.ts     — routes, body policy, bootstrap document
 //   - ../../service/src/server/start.ts — endpoint contract and registration
 
-import { MAX_API_BODY_BYTES, SERVICE_MOUNT } from './api';
+import { bodyLimitFor, SERVICE_MOUNT } from './api';
 import type { HarnessApiEmit, HarnessApiStream } from './api';
 import { isLoopbackHostname } from '../shared/origin';
 import type { HarnessRuntime } from './runtime';
@@ -253,8 +256,9 @@ const rootFromVariables = (variables: Record<string, unknown> | undefined): stri
 };
 
 // Same sentence the Node adapter uses for a streamed body, so both mounts answer
-// an over-sized request identically.
-const BODY_TOO_LARGE_MESSAGE = `A request body cannot exceed ${MAX_API_BODY_BYTES} bytes.`;
+// an over-sized request identically (the number is the ROUTE limit).
+const bodyTooLargeMessage = (limit: number): string =>
+    `A request body cannot exceed ${limit} bytes.`;
 
 // Serialized size of the already-parsed body. JSON.parse output always
 // serializes; a multipart File value does not, and returns undefined so the
@@ -273,16 +277,20 @@ const serializedBodyBytes = (body: unknown): number | undefined => {
 
 // Bounds the request twice: the declared length (a client that tells the truth is
 // rejected before the body is inspected) and the serialized parsed body (the
-// loader may have accepted a chunked or lying request). See the file header for
-// what this cannot do.
-const exceedsBodyLimit = (context: ServiceEndpointContext, body: unknown): boolean => {
+// loader may have accepted a chunked or lying request). `limit` is the ROUTE cap
+// from bodyLimitFor. See the file header for what this cannot do.
+const exceedsBodyLimit = (
+    context: ServiceEndpointContext,
+    body: unknown,
+    limit: number
+): boolean => {
     const declared = Number.parseInt(context.req.header('content-length') ?? '', 10);
 
-    if (Number.isFinite(declared) && declared > MAX_API_BODY_BYTES) return true;
+    if (Number.isFinite(declared) && declared > limit) return true;
 
     const serialized = serializedBodyBytes(body);
 
-    return serialized !== undefined && serialized > MAX_API_BODY_BYTES;
+    return serialized !== undefined && serialized > limit;
 };
 
 export const createHarnessServiceHandler = (
@@ -306,11 +314,16 @@ export const createHarnessServiceHandler = (
         // the dispatcher can reject it as a non-object instead of treating it as
         // an empty body (`?? {}` used to hide that difference).
         const body = parameters?.body === undefined ? {} : parameters.body;
+        // Route-aware cap (T3): submit routes carry base64 media and get 16 MiB;
+        // every other route keeps 1 MB. Resolved with the SAME helper the Node
+        // adapter uses, before any runtime work.
+        const method = context.req.raw?.method ?? 'GET';
+        const limit = bodyLimitFor(method, pathname, SERVICE_MOUNT);
 
         // Before the runtime is created: a rejected body must not trigger the
         // lazy `.env` load, catalogue build, or any session work.
-        if (exceedsBodyLimit(context, body)) {
-            return { status: 413, response: { error: { message: BODY_TOO_LARGE_MESSAGE } } };
+        if (exceedsBodyLimit(context, body, limit)) {
+            return { status: 413, response: { error: { message: bodyTooLargeMessage(limit) } } };
         }
 
         // R3b: the loader's third argument is the storage boundary. The runtime is

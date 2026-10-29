@@ -30,7 +30,9 @@
 //   - ./index.ts      — the transport barrel
 
 import { toErrorInfo } from '../util';
+import { validateAttachments } from '../shared/attachments';
 import type {
+    HarnessAttachment,
     HarnessMessage,
     HarnessProviderConfiguration,
     HarnessSampling,
@@ -46,9 +48,143 @@ import type {
 // Wire format
 // ---------------------------------------------------------------------------
 
+// `data:` URL for a binary attachment (images and the OpenRouter video part).
+const dataUrlOf = (attachment: HarnessAttachment): string =>
+    `data:${attachment.mime};base64,${attachment.data}`;
+
+// OpenAI's input_audio format is an enum of two: wav and mp3. The MIME already
+// passed validation, so this is only a name normalization.
+const audioFormatOf = (mime: string): 'wav' | 'mp3' =>
+    mime === 'audio/wav' || mime === 'audio/x-wav' || mime === 'audio/wave' ? 'wav' : 'mp3';
+
+// Map ONE attachment onto the provider part documented for its kind:
+//   image -> image_url (data URL)   [OpenAI image inputs]
+//   pdf   -> file (file_data data URL) [OpenAI file inputs]
+//   audio -> input_audio (raw base64 + wav|mp3) [OpenAI audio inputs]
+//   video -> video_url (data URL)   [OpenRouter multimodal videos ONLY]
+// Anything else is an explicit unsupported error, never a stringified binary.
+//
+// Sources (authoritative for these shapes):
+//   https://developers.openai.com/api/docs/guides/file-inputs?api-mode=chat
+//   https://openrouter.ai/docs/guides/overview/multimodal/videos
+const attachmentPart = (attachment: HarnessAttachment, allowVideo: boolean): Record<string, unknown> => {
+    switch (attachment.kind) {
+        case 'image':
+            return { type: 'image_url', image_url: { url: dataUrlOf(attachment) } };
+
+        case 'pdf':
+            return {
+                type: 'file',
+                file: { filename: attachment.name, file_data: dataUrlOf(attachment) }
+            };
+
+        case 'audio':
+            return {
+                type: 'input_audio',
+                input_audio: { data: attachment.data, format: audioFormatOf(attachment.mime) }
+            };
+
+        case 'video':
+            // Video is an OpenRouter extension, not an OpenAI chat field. The
+            // decision is made on the ACTUAL request hostname, so a custom
+            // gateway that proxies OpenAI is never sent an unsupported part.
+            if (!allowVideo) {
+                throw new Error(
+                    `Attachments of kind "video" are only supported by OpenRouter (request host openrouter.ai).`
+                );
+            }
+
+            return { type: 'video_url', video_url: { url: dataUrlOf(attachment) } };
+
+        default:
+            // `kind: 'file'` (and any future unknown kind). Representable, but
+            // the chat-completions transport has no documented part for it.
+            throw new Error(
+                `Attachments of kind "file" (${attachment.mime}) are not supported by this transport; send the content as text instead.`
+            );
+    }
+};
+
+// Build the user message content. A text-only message keeps the historical
+// `{ role, content: string }` shape EXACTLY.
+//
+// With attachments, the prompt is split around each attachment's marker:
+//   text before marker | marker label | media part | ... | trailing text
+// Markers keep their literal text so the model sees the label the user typed.
+// Attachments whose marker never appears are appended at the end (label+part).
+// A marker that appears twice is ambiguous and is rejected.
+const wireUserMessage = (
+    message: Extract<HarnessMessage, { role: 'user' }>,
+    allowVideo: boolean
+): Record<string, unknown> => {
+    if (message.attachments === undefined || message.attachments.length === 0) {
+        return { role: 'user', content: message.content };
+    }
+
+    // Re-validate at the wire boundary: a transport can be called directly, and
+    // a hand-built HarnessMessage may not have gone through the agent/harness.
+    const attachments = validateAttachments(message.attachments);
+    const positions: Array<{ attachment: HarnessAttachment; index: number }> = [];
+
+    for (const attachment of attachments) {
+        const first = message.content.indexOf(attachment.marker);
+
+        if (first < 0) continue;
+
+        if (message.content.indexOf(attachment.marker, first + attachment.marker.length) >= 0) {
+            throw new Error(`The marker "${attachment.marker}" appears more than once in the user prompt.`);
+        }
+
+        positions.push({ attachment, index: first });
+    }
+
+    positions.sort((left, right) => left.index - right.index);
+
+    const parts: Array<Record<string, unknown>> = [];
+    const placed = new Set<string>();
+    let cursor = 0;
+
+    for (const { attachment, index } of positions) {
+        const before = message.content.slice(cursor, index);
+        if (before.length > 0) parts.push({ type: 'text', text: before });
+
+        // The label stays immediately before the media part.
+        parts.push({ type: 'text', text: attachment.marker });
+        parts.push(attachmentPart(attachment, allowVideo));
+
+        placed.add(attachment.id);
+        cursor = index + attachment.marker.length;
+    }
+
+    const trailing = message.content.slice(cursor);
+    if (trailing.length > 0) parts.push({ type: 'text', text: trailing });
+
+    // Attachments the prompt never referenced still travel: append them at the
+    // end, each with its own label, in attachment order.
+    for (const attachment of attachments) {
+        if (placed.has(attachment.id)) continue;
+        parts.push({ type: 'text', text: attachment.marker });
+        parts.push(attachmentPart(attachment, allowVideo));
+    }
+
+    return { role: 'user', content: parts };
+};
+
+// Whether this request is going to OpenRouter itself, which is the only host
+// that accepts the `video_url` part.
+const allowsVideoFor = (url: string): boolean => {
+    try {
+        return new URL(url).hostname === 'openrouter.ai';
+    } catch {
+        // A malformed base URL fails at fetch anyway; do not enable an extension
+        // for it.
+        return false;
+    }
+};
+
 // Map an internal transcript entry onto the provider payload. The internal shape
 // is uniform (strings, explicit tool ids); the wire shape is not.
-const wireMessage = (message: HarnessMessage): Record<string, unknown> => {
+const wireMessage = (message: HarnessMessage, allowVideo: boolean): Record<string, unknown> => {
     switch (message.role) {
         case 'assistant': {
             const wire: Record<string, unknown> = {
@@ -76,8 +212,13 @@ const wireMessage = (message: HarnessMessage): Record<string, unknown> => {
                 content: message.content
             };
 
+        case 'system':
+            return { role: 'system', content: message.content };
+
         default:
-            return { role: message.role, content: message.content };
+            // Remaining branch is 'user'. A text-only user message keeps the
+            // plain string content; attachments become multimodal parts.
+            return wireUserMessage(message, allowVideo);
     }
 };
 
@@ -275,6 +416,19 @@ export const openAICompatible = (configuration: HarnessProviderConfiguration): H
     return async function* stream(request): AsyncGenerator<HarnessStreamEvent> {
         const key = resolveKey();
         const toolList = (request.tools ?? []).map(wireTool);
+        const allowVideo = allowsVideoFor(url);
+
+        // Build the wire transcript BEFORE fetch: an unsupported attachment
+        // (video off OpenRouter, any `file` kind, malformed stored bytes) must
+        // fail honestly without sending the request or stringifying binary into
+        // text. Mapping errors surface as an error frame.
+        let messages: Array<Record<string, unknown>>;
+        try {
+            messages = request.messages.map((message) => wireMessage(message, allowVideo));
+        } catch (error) {
+            yield { type: 'error', message: toErrorInfo(error).message };
+            return;
+        }
 
         let response: Response;
         try {
@@ -288,7 +442,7 @@ export const openAICompatible = (configuration: HarnessProviderConfiguration): H
                 body: JSON.stringify({
                     model: request.model,
                     stream: true,
-                    messages: request.messages.map(wireMessage),
+                    messages,
                     ...(toolList.length > 0 ? { tools: toolList } : {}),
                     ...samplingBody(sampling)
                 }),

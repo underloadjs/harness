@@ -218,19 +218,51 @@ import {
     agentDelegateMetadata,
     createTaskScheduler,
     TOOL_CANCEL_METADATA,
-    TOOL_CANCEL_NAME
+    TOOL_CANCEL_NAME,
+    // N6 runtime: branch identity/creation, action-request parsing, fork bounds,
+    // and the private metadata of the two branch tools.
+    ACTION_REQUEST_METADATA,
+    ACTION_REQUEST_NAME,
+    THREAD_FORK_METADATA,
+    THREAD_FORK_NAME,
+    MAX_FORK_CONCURRENT,
+    MAX_FORK_DEPTH,
+    MAX_FORK_HISTORY_BYTES,
+    MAX_BRANCH_RECORDS,
+    agentBranchOf,
+    assertBranchConcurrency,
+    forkAgent,
+    incorporateBranchHistory,
+    normalizeBranchLabel,
+    pruneBranchRecords,
+    validateActionChoice,
+    validateActionRequestParameters
 } from './core';
+import type { AgentBranchMetadata } from './core';
 import { presetTools, createWebSearchTool, WEB_SEARCH_TOOL_NAME } from './tools';
 import { runPlugins } from './plugin';
+import { validateAttachments } from './shared/attachments';
 import type {
     Agent,
     Harness,
+    HarnessActionAnswer,
+    HarnessActionChoice,
+    HarnessActionRequest,
+    HarnessActionRequestContext,
+    HarnessActionResult,
     HarnessAgentSnapshot,
     HarnessAssistantMessage,
+    HarnessAttachment,
+    HarnessBranchRecord,
+    HarnessBranchStatus,
+    HarnessBranchSummary,
+    HarnessBranchTerminalStatus,
     HarnessConfiguration,
     HarnessDelegationResult,
     HarnessErrorInfo,
     HarnessEvent,
+    HarnessForkConfiguration,
+    HarnessForkResult,
     HarnessMessage,
     HarnessPendingTool,
     HarnessProgress,
@@ -292,6 +324,72 @@ const resolveMaxIterations = (value: number | undefined): number => {
     return value;
 };
 
+// Fork/branch configuration, resolved once at construction. The defaults are the
+// frozen core bounds (core/branch.ts): forks enabled, depth 2, four live branches,
+// 8 MiB of history, 64 retained records. A value that is not a positive safe
+// integer is a configuration bug, not something to silently clamp.
+const resolveForks = (value: HarnessForkConfiguration | undefined): Required<HarnessForkConfiguration> => {
+    const enabled = value?.enabled ?? true;
+
+    if (typeof enabled !== 'boolean') {
+        throw new HarnessError(`forks.enabled must be a boolean; received ${String(enabled)}.`);
+    }
+
+    const positive = (field: string, candidate: number | undefined, fallback: number): number => {
+        if (candidate === undefined) return fallback;
+
+        if (!Number.isSafeInteger(candidate) || candidate < 1) {
+            throw new HarnessError(
+                `forks.${field} must be a positive safe integer; received ${String(candidate)}.`
+            );
+        }
+
+        return candidate;
+    };
+
+    return {
+        enabled,
+        maxDepth: positive('maxDepth', value?.maxDepth, MAX_FORK_DEPTH),
+        maxConcurrent: positive('maxConcurrent', value?.maxConcurrent, MAX_FORK_CONCURRENT),
+        maxHistoryBytes: positive('maxHistoryBytes', value?.maxHistoryBytes, MAX_FORK_HISTORY_BYTES),
+        maxBranchRecords: positive('maxBranchRecords', value?.maxBranchRecords, MAX_BRANCH_RECORDS)
+    };
+};
+
+// At most four actionRequests may be awaiting an owner at once. Beyond that a
+// model is not asking a focused question; it is fanning out and should retry
+// after an answer. Enforced synchronously at launch, so the bound also covers a
+// host handler that never resolves.
+const MAX_PENDING_ACTION_REQUESTS = 4;
+
+// A branch is an ephemeral side transcript. Its agent must NOT share the source's
+// queue/actor keys, or a fork could deadlock behind the run it was forked from.
+// `actorKey` is therefore the runtime scheduling identity: the display name for a
+// registered agent, and a namespaced branch id for a branch.
+type HarnessActorRole = 'primary' | 'subagent';
+
+const cloneMessages = (messages: readonly HarnessMessage[]): HarnessMessage[] =>
+    JSON.parse(JSON.stringify(messages)) as HarnessMessage[];
+
+const cloneBranchRecord = (record: HarnessBranchRecord): HarnessBranchRecord => ({
+    ...record,
+    toolCallIds: record.toolCallIds.map((entry) => ({ ...entry })),
+    messages: cloneMessages(record.messages),
+    ...(record.result !== undefined ? { result: { ...record.result } } : {}),
+    ...(record.error !== undefined ? { error: { ...record.error } } : {})
+});
+
+// Parse + schema-validate one model tool call. Shared by the ordinary launch path
+// and the two branch controls, so malformed arguments produce the same error
+// wording everywhere. The caller converts a throw into a readable tool result.
+const parseToolCallArguments = (
+    schema: Record<string, unknown> | undefined,
+    call: HarnessToolCall
+): unknown => {
+    const parsed: unknown = call.arguments.trim().length > 0 ? JSON.parse(call.arguments) : {};
+    return resolveToolParameters(schema, parsed, 'model');
+};
+
 // The discovery entry point. The harness owns this name: the whole visibility
 // scheme depends on there being exactly one tool that can enable the rest.
 const TOOL_REQUEST = TOOL_REQUEST_NAME;
@@ -311,11 +409,19 @@ const AGENT_DELEGATE = AGENT_DELEGATE_NAME;
 // calling agent has work in flight; the name is nonetheless reserved so no
 // configured, preset, plugin, or created tool can shadow the control.
 const TOOL_CANCEL = TOOL_CANCEL_NAME;
+// N6 branch controls. threadFork is registered whenever forks are enabled
+// (default true); actionRequest is registered whenever `interaction` is
+// configured. Both are core declarations, but both are RUNTIME-ONLY: the manual
+// executeTool path refuses them because a host call has no owning run transcript
+// to fork or ask from.
+const THREAD_FORK = THREAD_FORK_NAME;
+const ACTION_REQUEST = ACTION_REQUEST_NAME;
 
 // Names no configured, preset, plugin, or model-created tool may take. Keeping
 // the whole list in one place is what makes the reservation check exhaustive.
 // Order matches the registration order below (and therefore the declaration
-// order on every request), with agentDelegate last because it is primary-only.
+// order on every request), with agentDelegate last among the pre-N6 tools and
+// the branch controls after it.
 const RESERVED_TOOL_NAMES = [
     TOOL_REQUEST,
     TOOL_CREATE,
@@ -324,7 +430,9 @@ const RESERVED_TOOL_NAMES = [
     CHAPTER_MANAGE,
     LOCATION_MANAGE,
     AGENT_DELEGATE,
-    TOOL_CANCEL
+    TOOL_CANCEL,
+    THREAD_FORK,
+    ACTION_REQUEST
 ] as const;
 
 // Budget for toolCreate: registration is cheap but not free, and an unbounded
@@ -404,6 +512,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const toolCreation = resolveToolCreation(configuration.toolCreation);
     const maxCreatedTools = resolveMaxCreatedTools(configuration.maxCreatedTools);
 
+    // N6 fork bounds and owner interaction, both resolved before any run can
+    // start. `interaction` presence is what registers actionRequest; `forks`
+    // enabled (the default) is what registers threadFork.
+    const forks = resolveForks(configuration.forks);
+    const interaction = configuration.interaction;
+
     const agentNames = Object.keys(configuration.agents ?? {});
     if (agentNames.length === 0) {
         throw new HarnessError('A harness requires at least one agent.');
@@ -435,6 +549,31 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     }
 
     const primary = agents[primaryName];
+
+    // Runtime role/actor identity (N6). The registry key stays the DISPLAY name
+    // used by events and `run(name)`; a branch additionally needs a scheduling
+    // identity that is distinct from its source, so a fork never queues behind
+    // the run that created it. Both maps are WeakMaps: they add no field to the
+    // public Agent shape and disappear with the branch.
+    const actorRoles = new WeakMap<Agent, HarnessActorRole>();
+    const actorKeys = new WeakMap<Agent, string>();
+
+    // A branch inherits the SOURCE's role (a fork of the primary keeps
+    // agentDelegate/toolCreate; a fork of a subagent does not). Registered
+    // agents fall back to the registry comparison, so a plugin-added agent is a
+    // subagent without extra bookkeeping.
+    const roleOf = (brain: Agent): HarnessActorRole =>
+        actorRoles.get(brain) ?? (brain === primary ? 'primary' : 'subagent');
+
+    // Scheduler/mailbox/turn-queue identity. `branch:${branchId}` cannot collide
+    // with a display name (branch ids are runtime-generated and reserved).
+    const actorKeyOf = (brain: Agent): string => {
+        const explicit = actorKeys.get(brain);
+        if (explicit !== undefined) return explicit;
+
+        const branch = agentBranchOf(brain);
+        return branch === undefined ? brain.name : `branch:${branch.branchId}`;
+    };
 
     // Resolve the delegation allowlist once, at construction. `agents` order is no
     // longer the routing decision when one is given explicitly.
@@ -591,11 +730,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // to an agent that never receives it).
     const visibleCoreTools = (brain: Agent): Tool[] => {
         const core: Tool[] = [];
+        const role = roleOf(brain);
 
         for (const definition of Object.values(tools)) {
             if (definition.visibility !== 'core') continue;
-            if (definition.name === AGENT_DELEGATE && brain !== primary) continue;
-            if (definition.name === TOOL_CREATE && toolCreation === 'primary' && brain !== primary) continue;
+            if (definition.name === AGENT_DELEGATE && role !== 'primary') continue;
+            if (definition.name === TOOL_CREATE && toolCreation === 'primary' && role !== 'primary') continue;
             core.push(definition);
         }
 
@@ -721,7 +861,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // 'primary' policy: the tool is also not DECLARED to subagents
                 // (see declared()), so this is the defence-in-depth check for a
                 // guessed name — same shape as agentDelegate's own guard.
-                if (toolCreation === 'primary' && caller !== primary) {
+                if (toolCreation === 'primary' && roleOf(caller ?? primary) !== 'primary') {
                     throw new HarnessError(
                         `Only the primary agent "${primaryName}" can create tools; "${caller?.name ?? 'a host'}" cannot.`
                     );
@@ -782,7 +922,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             execute: async ({ agent: caller, run, runDepth, parameters }) => {
                 // Defence in depth: the tool is not declared to subagents, but a
                 // model can guess a name, so the caller is checked here too.
-                if (caller !== primary) {
+                if (roleOf(caller ?? primary) !== 'primary') {
                     throw new HarnessError(
                         `Only the primary agent "${primaryName}" can delegate; "${caller?.name ?? 'a host'}" cannot.`
                     );
@@ -830,6 +970,38 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         });
     }
 
+    // -----------------------------------------------------------------------
+    // N6 branch controls: threadFork and actionRequest
+    // -----------------------------------------------------------------------
+    //
+    // Both are runtime-only tools: launchToolCall special-cases them BEFORE the
+    // registry is consulted, because each needs the owning RunState (the exact
+    // transcript snapshot and the owner run) rather than an ordinary tool
+    // context. They are still registered here so declarations, reserved names,
+    // and the host's `tools` view all name one definition, and their execute
+    // bodies fail loudly if some future path calls them directly.
+    if (forks.enabled) {
+        tools[THREAD_FORK] = defineTool<{ input: string; label?: string }, HarnessForkResult>({
+            ...THREAD_FORK_METADATA,
+            execute: () => {
+                throw new HarnessError(
+                    'threadFork requires the harness run that owns the conversation; call it from a model tool call.'
+                );
+            }
+        });
+    }
+
+    if (interaction !== undefined) {
+        tools[ACTION_REQUEST] = defineTool<Record<string, unknown>, HarnessActionResult>({
+            ...ACTION_REQUEST_METADATA,
+            execute: () => {
+                throw new HarnessError(
+                    'actionRequest requires the harness run that owns the conversation; call it from a model tool call.'
+                );
+            }
+        });
+    }
+
     // The tools a request may declare: every core tool first (file tools, a
     // configured webSearch, and the harness-owned set), then everything discovered
     // so far. Everything else stays out of the context window on purpose.
@@ -855,18 +1027,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // round shows up in the very next request. Per-brain because agentDelegate is a
     // primary-only declaration.
     //
-    // toolCancel is appended ONLY while this agent has a background call pending:
-    // that is the only moment it can succeed, and keeping it off ordinary requests
-    // costs no context and leaves the historical declaration list unchanged for a
-    // run with no background work (T3/R4).
-    const declarations = (brain: Agent): HarnessStreamTool[] => {
-        const list = declared(brain).map(({ name, description, parameters }) => ({
+    // toolCancel is appended ONLY while this agent's ACTOR has background work
+    // pending: that is the only moment it can succeed, and keeping it off ordinary
+    // requests costs no context and leaves the historical declaration list
+    // unchanged for a run with no background work (T3/R4).
+    //
+    // An AUTOANSWER branch is tool-free and single-iteration by contract: it is
+    // declared no tools at all (not even toolCancel), so the owner can only
+    // produce the directive answer this runtime parses.
+    const declarations = (run: RunState): HarnessStreamTool[] => {
+        if (run.autoAnswer) return [];
+
+        const list = declared(run.agent).map(({ name, description, parameters }) => ({
             name,
             description,
             parameters
         }));
 
-        if (scheduler.pending(brain.name).length > 0) {
+        if (scheduler.pending(run.actorKey).length > 0) {
             list.push({
                 name: TOOL_CANCEL,
                 description: TOOL_CANCEL_METADATA.description,
@@ -913,6 +1091,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         id: number;
         scope: string;
         agent: Agent;
+        // Scheduling/mailbox identity (N6): the display name for a registered
+        // agent, `branch:<id>` for a branch. Event `agent` stays the display
+        // name; this key is what isolates a fork from its source's queues.
+        actorKey: string;
+        // Delegation depth (1 = a top-level run). A branch run starts at 1 again:
+        // fork nesting is bounded by forkDepth (core/branch.ts), NOT by
+        // MAX_RUN_DEPTH, so a normal fork may fork itself.
+        depth: number;
+        // True for an autoanswer owner branch: no tools, exactly one model
+        // request, and any tool call is an invalid directive answer.
+        autoAnswer: boolean;
+        // Branch metadata when this run IS a branch (fork/autoanswer). Absent for
+        // every ordinary run. Branch agent_history mutations are NOT persisted:
+        // branches are ephemeral and excluded from snapshot v1.
+        branch?: AgentBranchMetadata;
         // Invocation identity reported on every event of a NON-ROOT run (T3 UI
         // threads); undefined for a root run, whose events keep their historical
         // shape. Built once in runAgent so every frame of this invocation (start,
@@ -924,6 +1117,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         active: boolean;
         aborted: boolean;
         iteration: number;
+        // Root-prompt attachments (T3). Validated once at runAgent entry and
+        // consumed by runAgentCore when it appends the user message. Always
+        // empty for delegated/ctx.run children: the root's bytes are never
+        // re-sent with an unrelated subagent prompt.
+        attachments: HarnessAttachment[];
         // True when new work (a completion or a wake) arrived and the loop should
         // take another turn instead of waiting/returning.
         dirty: boolean;
@@ -965,6 +1163,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // substantive, a `length` stop, and a failure/abort all keep their
         // existing result.
         delegateAnswer?: boolean;
+        // N6: this run executes a branch. `metadata` is the fork identity created
+        // by core/branch.ts; `autoAnswer` marks the tool-free single-iteration
+        // owner read. A branch run is owned/cancellable by its requester but does
+        // not consume a delegation depth level.
+        branch?: { metadata: AgentBranchMetadata; autoAnswer: boolean };
     };
 
     // The delegate answer policy (T2/R1). One shared instance so the model path
@@ -977,6 +1180,72 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const runs = new Set<RunState>();
     let runSequence = 0;
     let activeRuns = 0;
+
+    // N6 branch state. Ephemeral, deliberately NOT part of snapshot v1. Records
+    // are kept in creation order; active branch ids are the concurrency slots.
+    let branchRecords: HarnessBranchRecord[] = [];
+    const activeBranches = new Set<string>();
+    // Pending actionRequests across the whole harness (host- and fork-answered).
+    const pendingActionRequests = new Set<string>();
+    let actionRequestSequence = 0;
+
+    // Branch history is runtime state, not session state. The stateChange
+    // observer still fires for SHARED STORE mutations (tool_execute) inside a
+    // branch, but an `agent_message` append there would make a server snapshot a
+    // transcript that snapshot()/restore() never include. Suppress exactly that
+    // reason for branch runs.
+    const notifyRunStateChange = (
+        run: RunState,
+        reason: HarnessStateChangeReason,
+        detail: { agent?: string; tool?: string } = {}
+    ): void => {
+        if (run.branch !== undefined && reason === 'agent_message') return;
+        notifyStateChange(reason, detail);
+    };
+
+    // Retained branch records, bounded by maxBranchRecords. Active records are
+    // never evicted; the newest terminal records fill the remaining budget.
+    const retainedBranches = (): HarnessBranchRecord[] =>
+        pruneBranchRecords(branchRecords, forks.maxBranchRecords);
+
+    // Update one live record in place. The record is internal; every public read
+    // goes through cloneBranchRecord.
+    const branchRecordOf = (branchId: string): HarnessBranchRecord | undefined =>
+        branchRecords.find((record) => record.branchId === branchId);
+
+    // Terminal transition. IDEMPOTENT by design: a branch reaches a terminal state
+    // exactly once, whether the branch task's catch observes the abort, the owning
+    // run's cleanup releases a task that never started, or an in-flight cancel
+    // races that cleanup. Returns true only for the call that actually moved a
+    // `running` record to terminal, which is the ONLY call allowed to emit
+    // `branch_end` (no duplicate terminal audit frames).
+    const finishBranch = (
+        branchId: string,
+        status: HarnessBranchTerminalStatus,
+        detail: {
+            messages?: readonly HarnessMessage[];
+            result?: { content: string; stopReason: HarnessAssistantMessage['stopReason'] };
+            error?: HarnessErrorInfo;
+        }
+    ): boolean => {
+        const record = branchRecordOf(branchId);
+        if (record === undefined || record.status !== 'running') return false;
+
+        record.status = status;
+        if (detail.messages !== undefined) record.messages = cloneMessages(detail.messages);
+        if (detail.result !== undefined) record.result = { ...detail.result };
+        if (detail.error !== undefined) record.error = { ...detail.error };
+
+        // Prune on every terminal transition: a long session must not grow an
+        // unbounded audit list, while a live branch stays addressable.
+        branchRecords = pruneBranchRecords(branchRecords, forks.maxBranchRecords);
+        return true;
+    };
+
+    // Select the terminal status for a failed branch task. A cancellation is a
+    // cancellation (toolCancel or a run abort), not an ordinary tool failure.
+    const branchFailureStatus = (signal: AbortSignal): HarnessBranchTerminalStatus =>
+        signal.aborted ? 'cancelled' : 'failed';
 
     // Per-agent mailbox. Completion deliveries and wakeups for one agent are
     // serialized through this chain, so transcript inserts, events, and state
@@ -1083,6 +1352,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const identity: HarnessThread = { id: thread.id };
         if (thread.parentId !== undefined) identity.parentId = thread.parentId;
         if (thread.callId !== undefined) identity.callId = thread.callId;
+        // N6: branch audit fields are part of EVERY frame, not just `start`.
+        // Without them a client could not group a nested fork's later deltas
+        // under the same branch. `input` still travels on `start` only.
+        if (thread.kind !== undefined) identity.kind = thread.kind;
+        if (thread.branchId !== undefined) identity.branchId = thread.branchId;
         return identity;
     };
 
@@ -1142,23 +1416,25 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // snapshot can be stale by the time a queued delivery runs (a completion
         // may have drained the board), and a stale list would tell the model (and
         // the UI) that finished work is still running.
-        onWake: (agentName) => {
-            enqueueMailbox(agentName, async () => {
+        onWake: (actorKey) => {
+            enqueueMailbox(actorKey, async () => {
                 const live = [...runs].filter(
-                    (run) => run.agent.name === agentName && runOwnsEvents(run)
+                    (run) => run.actorKey === actorKey && runOwnsEvents(run)
                 );
                 if (live.length === 0) return;
 
-                const pending = scheduler.pendingList(agentName);
+                const pending = scheduler.pendingList(actorKey);
 
                 try {
-                    // The wake frames for the run(s) live right now. One agent has at
-                    // most one ACTIVE run (agentQueues serializes them), so the first
-                    // live run is the owner; a root run contributes no thread.
+                    // The wake frames for the run(s) live right now. One ACTOR has
+                    // at most one active run (agentQueues serializes them), so the
+                    // first live run is the owner; a root run contributes no
+                    // thread. The event still names the DISPLAY agent, never the
+                    // actor key.
                     await progress(
                         withThread(live[0], {
                             type: 'wakeup',
-                            agent: agentName,
+                            agent: live[0].agent.name,
                             reason: 'pending-tools',
                             pending
                         })
@@ -1234,7 +1510,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     // Insert one real result into the canonical transcript. Returns false when
     // there is nothing to insert (already answered, or originating block gone).
-    const insertToolMessage = (brain: Agent, call: HarnessToolCall, content: string): boolean => {
+    const insertToolMessage = (
+        brain: Agent,
+        call: HarnessToolCall,
+        content: string,
+        // N6: branch transcripts are ephemeral (snapshot v1 excludes them), so a
+        // branch delivery must not ask a server to persist an agent_message.
+        notify = true
+    ): boolean => {
         if (hasToolResult(brain, call.id)) return false;
 
         const index = resultInsertIndex(brain, call.id);
@@ -1249,7 +1532,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         // Snapshot-managed mutation: notify after the splice, exactly like the
         // synchronous path used to.
-        notifyStateChange('agent_message', { agent: brain.name });
+        if (notify) notifyStateChange('agent_message', { agent: brain.name });
         return true;
     };
 
@@ -1411,7 +1694,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             isError = false;
         }
 
-        insertToolMessage(brain, call, content);
+        insertToolMessage(brain, call, content, run.branch === undefined);
 
         // The outcome is CANONICAL at this point (P1-A). Wake the loop BEFORE the
         // reporter runs: a slow progress callback must not be able to keep
@@ -1421,7 +1704,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         // Computed AFTER the board removed this task, so the list is what is still
         // running, not the call just delivered.
-        const pending = scheduler.pendingList(brain.name);
+        const pending = scheduler.pendingList(run.actorKey);
 
         await emit(run, {
             type: 'tool_result',
@@ -1453,9 +1736,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         withDuration = false
     ): Promise<void> => {
         const content = boundToolResult(raw).content;
-        insertToolMessage(run.agent, call, content);
+        insertToolMessage(run.agent, call, content, run.branch === undefined);
 
-        const pending = scheduler.pendingList(run.agent.name);
+        const pending = scheduler.pendingList(run.actorKey);
 
         await emit(run, {
             type: 'tool_result',
@@ -1485,11 +1768,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         const fail = (content: string): Promise<void> => immediateResult(run, call, content, true);
 
-        const parseArguments = (schema: Record<string, unknown> | undefined): unknown => {
-            const parsed: unknown =
-                call.arguments.trim().length > 0 ? JSON.parse(call.arguments) : {};
-            return resolveToolParameters(schema, parsed, 'model');
-        };
+        const parseArguments = (schema: Record<string, unknown> | undefined): unknown =>
+            parseToolCallArguments(schema, call);
 
         // toolCancel is a HARNESS control, not a registry entry: it exists only
         // while this agent has work in flight (see declarations). Call ids are
@@ -1537,6 +1817,20 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return;
         }
 
+        // N6 branch controls. Both need the owning RunState (an exact transcript
+        // snapshot and, for actionRequest, the owner lineage), so they are
+        // handled here instead of through definition.execute. A branch run is
+        // background work like any other tool call: the requester keeps going.
+        if (call.name === THREAD_FORK && forks.enabled) {
+            await launchThreadFork(run, call, parseArguments);
+            return;
+        }
+
+        if (call.name === ACTION_REQUEST && interaction !== undefined) {
+            await launchActionRequest(run, call, parseArguments);
+            return;
+        }
+
         const definition = tools[call.name];
 
         // Unknown tool: answer the call so the transcript stays valid for strict
@@ -1549,12 +1843,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return;
         }
 
-        if (call.name === AGENT_DELEGATE && brain !== primary) {
+        if (call.name === AGENT_DELEGATE && roleOf(brain) !== 'primary') {
             await fail(`Tool "${AGENT_DELEGATE}" is only available to the primary agent "${primaryName}".`);
             return;
         }
 
-        if (call.name === TOOL_CREATE && toolCreation === 'primary' && brain !== primary) {
+        if (call.name === TOOL_CREATE && toolCreation === 'primary' && roleOf(brain) !== 'primary') {
             await fail(`Tool "${TOOL_CREATE}" is only available to the primary agent "${primaryName}".`);
             return;
         }
@@ -1585,7 +1879,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // the run signal by the scheduler, and toolCancel aborts only this call.
         scheduler.schedule({
             scope: run.scope,
-            agent: brain.name,
+            agent: run.actorKey,
             callId: call.id,
             name: call.name,
             parent: run.signal,
@@ -1596,7 +1890,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     agents,
                     // Always present now: a background call is always cancelable.
                     signal,
-                    runDepth: run.lineage.length,
+                    runDepth: run.depth,
                     run: (agentName: string, input: string) => {
                         const target = agents[agentName];
                         if (!target) {
@@ -1625,10 +1919,813 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 return definition.execute(context);
             },
             onSettled: (task) => {
-                enqueueMailbox(brain.name, () =>
+                enqueueMailbox(run.actorKey, () =>
                     deliverTask(task, run, call).catch((error) => {
                         // Keep the mailbox chain healthy and fail the RUN on the
                         // loop, where the rollback path is.
+                        if (run.deliveryError === undefined) run.deliveryError = error;
+                        markRunDirty(run);
+                    })
+                );
+            }
+        });
+    };
+
+    // -----------------------------------------------------------------------
+    // N6: branch runtime (threadFork / actionRequest)
+    // -----------------------------------------------------------------------
+    //
+    // A branch tool call is still BACKGROUND work: it is scheduled on the same
+    // board, answered through the same per-actor mailbox, and delivered into the
+    // requester's transcript at the original call position. What differs is WHO
+    // runs: threadFork runs a detached clone of the CALLING agent, and
+    // actionRequest either awaits the host (root) or runs a tool-free autoanswer
+    // fork of the immediate OWNER run's agent (a child/fork request).
+    //
+    // Snapshot timing is synchronous at request instant: the fork is created (and
+    // therefore materializes its source transcript) before this function awaits
+    // anything, so later messages can never leak into the branch and the branch
+    // can never see the future.
+
+    // A branch's lifecycle is ephemeral (snapshot v1 excludes it) but its AUDIT
+    // event must still be reported. Ownership suppression would hide a branch_end
+    // after the requester aborted, so branch audit frames bypass `emit` and are
+    // written directly; a reporter failure is parked on the requester exactly
+    // like a delivery failure.
+    // A branch's AUDIT frame carries the BRANCH's own thread, not the requester's:
+    // `branch_start`, `branch_end`, and every frame of the branch run therefore
+    // group under one id/kind/branchId. `parentId` names the REQUester thread when
+    // it has one, which is how a nested fork stays indented.
+    const branchThreadOf = (
+        branchId: string,
+        kind: 'fork' | 'autoanswer',
+        parentRun: RunState,
+        callId: string
+    ): HarnessThread => {
+        const thread: HarnessThread = {
+            id: branchId,
+            kind,
+            branchId
+        };
+        if (parentRun.thread !== undefined) thread.parentId = parentRun.thread.id;
+        thread.callId = callId;
+        return thread;
+    };
+
+    const emitBranchEnd = async (
+        run: RunState,
+        branchId: string,
+        status: HarnessBranchTerminalStatus,
+        kind: 'fork' | 'autoanswer',
+        callId: string,
+        error?: HarnessErrorInfo
+    ): Promise<void> => {
+        try {
+            await progress({
+                type: 'branch_end',
+                agent: run.agent.name,
+                branchId,
+                status,
+                ...(error === undefined ? {} : { error }),
+                thread: branchThreadOf(branchId, kind, run, callId)
+            });
+        } catch (thrown) {
+            if (run.deliveryError === undefined) run.deliveryError = thrown;
+        }
+    };
+
+    // A branch record is born `running`, before its run owns an actor, so a UI can
+    // render the summary immediately. `toolCallIds` is the materializer's exact
+    // origin->branch map; `messages` is a detached baseline that the terminal
+    // transition replaces with the branch's committed transcript.
+    const createBranchRecord = (
+        summary: HarnessBranchSummary,
+        messages: readonly HarnessMessage[],
+        toolCallIds: ReadonlyArray<{ origin: string; branch: string }>,
+        requesterScope: string
+    ): HarnessBranchRecord => {
+        const record: HarnessBranchRecord = {
+            ...summary,
+            toolCallIds: toolCallIds.map((entry) => ({ ...entry })),
+            messages: cloneMessages(messages),
+            status: 'running'
+        };
+
+        branchRecords.push(record);
+        // Bound retained history at creation too: a long session that starts a
+        // branch after many terminal records must not grow the audit list.
+        branchRecords = pruneBranchRecords(branchRecords, forks.maxBranchRecords);
+        activeBranches.add(summary.branchId);
+        branchScopes.set(summary.branchId, requesterScope);
+        return record;
+    };
+
+    // Branch ids created by a run that failed/was aborted before their task could
+    // start. The scheduler does not notify for abandonScope, so the run's finally
+    // releases them here: no record may stay `running` and no concurrency slot may
+    // leak after the owning run is gone.
+    const branchScopes = new Map<string, string>();
+
+    // A branch may be created before its `branch_start` frame is reported. Only a
+    // branch whose start was actually emitted may emit a terminal frame: this set
+    // is what prevents a terminal-without-start audit pair.
+    const branchStarted = new Set<string>();
+
+    // Release every branch owned by this run. AWAITED by runAgent's finally: a
+    // task the scheduler abandons before `run` is invoked has no catch to report
+    // its lifecycle, so this cleanup is the only place that can emit the single
+    // terminal `branch_end` for the already-emitted `branch_start` (D1). It uses
+    // the same idempotent finishBranch as an in-flight catch, so exactly one of
+    // them can report the terminal frame.
+    const releaseBranchesForScope = async (run: RunState): Promise<void> => {
+        for (const [branchId, ownerScope] of [...branchScopes.entries()]) {
+            if (ownerScope !== run.scope) continue;
+
+            activeBranches.delete(branchId);
+            branchScopes.delete(branchId);
+
+            const record = branchRecordOf(branchId);
+            const started = branchStarted.has(branchId);
+            branchStarted.delete(branchId);
+
+            if (record === undefined) continue;
+
+            const kind = record.kind;
+            const callId = record.callId ?? '';
+
+            const transitioned = finishBranch(branchId, 'cancelled', {
+                error: {
+                    message:
+                        'The requesting run ended before this branch could start; the branch was cancelled.'
+                }
+            });
+
+            if (transitioned && started) {
+                await emitBranchEnd(run, branchId, 'cancelled', kind, callId);
+            }
+        }
+    };
+
+    // Pending actionRequests are bounded globally and must also be released when
+    // their requester is abandoned (the scheduler does not notify for that path).
+    const actionRequestScopes = new Map<string, string>();
+
+    const releaseActionRequestsForScope = (scope: string): void => {
+        for (const [requestId, ownerScope] of [...actionRequestScopes.entries()]) {
+            if (ownerScope !== scope) continue;
+            actionRequestScopes.delete(requestId);
+            pendingActionRequests.delete(requestId);
+        }
+    };
+
+    const failBranchTool = (
+        run: RunState,
+        call: HarnessToolCall,
+        message: string
+    ): Promise<void> => immediateResult(run, call, message, true);
+
+    // Turn a validated choice into the model-facing result. An option answer is
+    // widened with the label/description the model never sent, so it can reason
+    // about the human-visible wording.
+    const actionResultOf = (
+        request: HarnessActionRequest,
+        choice: HarnessActionChoice,
+        answeredBy: 'owner' | 'auto'
+    ): HarnessActionResult => {
+        if (choice.kind === 'custom') {
+            return { requestId: request.requestId, answeredBy, choice: { kind: 'custom', text: choice.text } };
+        }
+
+        const option = request.options.find((entry) => entry.id === choice.optionId);
+
+        // validateActionChoice already rejected an unknown id; this guard keeps the
+        // runtime honest if a future caller passes an unvalidated choice.
+        if (option === undefined) {
+            throw new HarnessError(
+                `actionRequest option "${choice.optionId}" is not one of this request's options.`
+            );
+        }
+
+        return {
+            requestId: request.requestId,
+            answeredBy,
+            choice: {
+                kind: 'option',
+                optionId: option.id,
+                label: option.label,
+                ...(option.description !== undefined ? { description: option.description } : {})
+            }
+        };
+    };
+
+    // The strict autoanswer directive. This is a USER message appended to the
+    // owner+child transcript, never a new system instruction: child system text
+    // was already demoted to quoted user data by incorporateBranchHistory.
+    const actionDirective = (request: HarnessActionRequest): string =>
+        [
+            'You are the OWNER of the actionRequest below. No tools are available and you get exactly one reply.',
+            '',
+            `Question: ${request.question}`,
+            '',
+            'Options:',
+            ...request.options.map(
+                (option) =>
+                    `- ${option.id}: ${option.label}${
+                        option.description === undefined ? '' : ` — ${option.description}`
+                    }`
+            ),
+            '',
+            `Advisory recommendation (never applied automatically): ${request.recommended}`,
+            '',
+            'Reply with EXACTLY one line and nothing else:',
+            'option:<id>  — one of the option ids above, or',
+            'custom:<text> — your own answer.'
+        ].join('\n');
+
+    // Parse the autoanswer's one-line directive. Blank, multi-line prose, an
+    // unknown option id, or a malformed custom answer is an EXPLICIT failure. It
+    // is never replaced by `recommended`: that would fabricate an answer nobody
+    // gave.
+    const parseDirectiveAnswer = (
+        content: string,
+        request: HarnessActionRequest
+    ): HarnessActionChoice => {
+        const text = content.trim();
+
+        if (text.length === 0) {
+            throw new HarnessError('The owner fork returned a blank action answer.');
+        }
+
+        const optionMatch = /^option:([A-Za-z0-9_-]+)$/.exec(text);
+        if (optionMatch !== null) {
+            return validateActionChoice({ kind: 'option', optionId: optionMatch[1] }, request);
+        }
+
+        if (text.startsWith('custom:')) {
+            return validateActionChoice({ kind: 'custom', text: text.slice('custom:'.length) }, request);
+        }
+
+        throw new HarnessError(
+            `The owner fork did not answer with exactly "option:<id>" or "custom:<text>"; received "${text}".`
+        );
+    };
+
+    // threadFork: clone the calling agent at request instant, run it as an
+    // independent actor, and return ONLY {branchId, threadId, content}. The fork's
+    // transcript is never merged into the origin; the origin receives one normal
+    // tool result.
+    const launchThreadFork = async (
+        run: RunState,
+        call: HarnessToolCall,
+        parseArguments: (schema: Record<string, unknown> | undefined) => unknown
+    ): Promise<void> => {
+        let parameters: unknown;
+
+        try {
+            parameters = parseArguments(THREAD_FORK_METADATA.parameters);
+        } catch (error) {
+            const info = toErrorInfo(error);
+            await failBranchTool(
+                run,
+                call,
+                error instanceof SyntaxError
+                    ? `Tool "${call.name}" received malformed JSON arguments: ${info.message}`
+                    : `Tool "${call.name}" received arguments that do not match its schema: ${info.message}`
+            );
+            return;
+        }
+
+        const input =
+            typeof (parameters as { input?: unknown })?.input === 'string'
+                ? ((parameters as { input: string }).input).trim()
+                : '';
+
+        if (input.length === 0) {
+            await failBranchTool(run, call, 'threadFork requires a non-empty input task.');
+            return;
+        }
+
+        let label: string | undefined;
+        try {
+            label = normalizeBranchLabel((parameters as { label?: unknown })?.label);
+        } catch (error) {
+            await failBranchTool(run, call, `threadFork received an invalid label: ${toErrorInfo(error).message}`);
+            return;
+        }
+
+        // Concurrency is checked BEFORE any fork is created, so a refused fork
+        // leaves no branch record and no history materialization work.
+        try {
+            assertBranchConcurrency(activeBranches.size, forks.maxConcurrent);
+        } catch (error) {
+            await failBranchTool(run, call, toErrorInfo(error).message);
+            return;
+        }
+
+        const sourceBranch = agentBranchOf(run.agent);
+
+        let branch: Agent;
+        let metadata: AgentBranchMetadata;
+
+        try {
+            // SYNCHRONOUS snapshot at request instant: forkAgent materializes the
+            // calling agent's FULL committed transcript (never a slice), remaps tool
+            // ids, and pairs the pending threadFork call with an explicit
+            // non-success placeholder. core/branch.ts enforces the history cap.
+            branch = forkAgent(run.agent, {
+                ...(label !== undefined ? { label } : {}),
+                kind: 'fork',
+                ...(sourceBranch !== undefined ? { sourceBranchId: sourceBranch.branchId } : {}),
+                ...(run.thread !== undefined ? { sourceThreadId: run.thread.id } : {}),
+                callId: call.id,
+                reason: 'threadFork',
+                maxDepth: forks.maxDepth,
+                maxHistoryBytes: forks.maxHistoryBytes
+            });
+
+            const created = agentBranchOf(branch);
+            if (created === undefined) {
+                throw new HarnessError('The fork was created without branch metadata.');
+            }
+            metadata = created;
+        } catch (error) {
+            await failBranchTool(run, call, `threadFork could not create a branch: ${toErrorInfo(error).message}`);
+            return;
+        }
+
+        // A branch is a separate actor with the SAME role as its source, so a fork
+        // of the primary keeps agentDelegate/toolCreate and a fork of a subagent
+        // does not gain them.
+        actorRoles.set(branch, roleOf(run.agent));
+
+        const summary: HarnessBranchSummary = {
+            branchId: metadata.branchId,
+            kind: 'fork',
+            agent: run.agent.name,
+            role: roleOf(run.agent),
+            ...(metadata.sourceBranchId !== undefined
+                ? { sourceBranchId: metadata.sourceBranchId }
+                : {}),
+            ...(metadata.sourceThreadId !== undefined
+                ? { sourceThreadId: metadata.sourceThreadId }
+                : {}),
+            callId: call.id,
+            forkDepth: metadata.forkDepth,
+            model: metadata.model,
+            tools: declared(branch).map((definition) => definition.name)
+        };
+
+        // The branch's own callable surface is declared exactly like an ordinary
+        // agent's (role-aware, discovery-aware); a fork therefore can fork again
+        // until forkDepth is exhausted.
+        createBranchRecord(summary, branch.messages, metadata.toolCallIds, run.scope);
+
+        await progress({
+            type: 'branch_start',
+            agent: run.agent.name,
+            branch: summary,
+            thread: branchThreadOf(metadata.branchId, 'fork', run, call.id)
+        });
+        // The start frame is now observable: a later release may emit its terminal.
+        branchStarted.add(metadata.branchId);
+
+        scheduler.schedule({
+            scope: run.scope,
+            agent: run.actorKey,
+            callId: call.id,
+            name: call.name,
+            parent: run.signal,
+            run: async (signal) => {
+                try {
+                    const message = await runAgent(
+                        branch,
+                        input,
+                        signal,
+                        run,
+                        call.id,
+                        undefined,
+                        undefined,
+                        { branch: { metadata, autoAnswer: false } }
+                    );
+
+                    const content = message.content.trim();
+                    if (content.length === 0) {
+                        throw new HarnessError(
+                            `threadFork branch "${metadata.branchId}" produced no substantive answer.`
+                        );
+                    }
+
+                    const completed = finishBranch(metadata.branchId, 'completed', {
+                        messages: branch.messages,
+                        result: { content, stopReason: message.stopReason }
+                    });
+                    if (completed) {
+                        await emitBranchEnd(run, metadata.branchId, 'completed', 'fork', call.id);
+                    }
+
+                    const fork: HarnessForkResult = {
+                        branchId: metadata.branchId,
+                        threadId: metadata.branchId,
+                        content
+                    };
+                    return fork;
+                } catch (error) {
+                    const status = branchFailureStatus(signal);
+                    const info = toErrorInfo(error);
+
+                    if (
+                        finishBranch(metadata.branchId, status, {
+                            messages: branch.messages,
+                            error: info
+                        })
+                    ) {
+                        await emitBranchEnd(run, metadata.branchId, status, 'fork', call.id, info);
+                    }
+                    throw error;
+                } finally {
+                    activeBranches.delete(metadata.branchId);
+                    branchScopes.delete(metadata.branchId);
+                    branchStarted.delete(metadata.branchId);
+                }
+            },
+            onSettled: (task) => {
+                enqueueMailbox(run.actorKey, () =>
+                    deliverTask(task, run, call).catch((error) => {
+                        if (run.deliveryError === undefined) run.deliveryError = error;
+                        markRunDirty(run);
+                    })
+                );
+            }
+        });
+    };
+
+    // actionRequest: the owner question. A ROOT run is answered only by the host
+    // handler (no automatic selection, no owner to fork). A CHILD/FORK run is
+    // answered by an autoanswer fork of its immediate owner run, with the owner's
+    // FULL history plus the requester's FULL history at request instant.
+    const launchActionRequest = async (
+        run: RunState,
+        call: HarnessToolCall,
+        parseArguments: (schema: Record<string, unknown> | undefined) => unknown
+    ): Promise<void> => {
+        let parameters: unknown;
+
+        try {
+            parameters = parseArguments(ACTION_REQUEST_METADATA.parameters);
+        } catch (error) {
+            const info = toErrorInfo(error);
+            await failBranchTool(
+                run,
+                call,
+                error instanceof SyntaxError
+                    ? `Tool "${call.name}" received malformed JSON arguments: ${info.message}`
+                    : `Tool "${call.name}" received arguments that do not match its schema: ${info.message}`
+            );
+            return;
+        }
+
+        let body: { question: string; recommended: string; options: HarnessActionRequest['options'] };
+
+        try {
+            body = validateActionRequestParameters(parameters);
+        } catch (error) {
+            await failBranchTool(run, call, toErrorInfo(error).message);
+            return;
+        }
+
+        const ownerRun = run.parent;
+
+        // Root: the host is the only owner. Without a handler there is no answer to
+        // give, and picking `recommended` would fabricate one.
+        if (ownerRun === undefined && interaction?.actionRequest === undefined) {
+            await failBranchTool(
+                run,
+                call,
+                'actionRequest cannot be answered: this root run has no interaction.actionRequest handler. The recommendation is never selected automatically.'
+            );
+            return;
+        }
+
+        if (ownerRun !== undefined) {
+            if (!forks.enabled) {
+                await failBranchTool(
+                    run,
+                    call,
+                    'actionRequest cannot be answered: a child request needs an owner fork, but forks are disabled.'
+                );
+                return;
+            }
+
+            if (interaction?.autoAnswer === false) {
+                await failBranchTool(
+                    run,
+                    call,
+                    'actionRequest cannot be answered: autoAnswer is disabled and a root-only host handler never answers a child request.'
+                );
+                return;
+            }
+        }
+
+        if (pendingActionRequests.size >= MAX_PENDING_ACTION_REQUESTS) {
+            await failBranchTool(
+                run,
+                call,
+                `actionRequest cannot start: ${MAX_PENDING_ACTION_REQUESTS} requests are already awaiting an owner.`
+            );
+            return;
+        }
+
+        const requestId = `request-${++actionRequestSequence}`;
+        const request: HarnessActionRequest = {
+            requestId,
+            question: body.question,
+            recommended: body.recommended,
+            options: body.options,
+            allowCustom: true
+        };
+
+        // Context identifies the requester exactly. `branchId` is the requester's
+        // own branch (absent for a root run), not the owner's.
+        const requesterBranch = agentBranchOf(run.agent);
+        const context: HarnessActionRequestContext = {
+            requestId,
+            agent: run.agent.name,
+            ...(requesterBranch !== undefined ? { branchId: requesterBranch.branchId } : {}),
+            ...(run.thread !== undefined ? { threadId: run.thread.id } : {}),
+            callId: call.id,
+            request
+        };
+
+        // CHILD/FORK: snapshot BOTH full transcripts and create the owner fork now,
+        // synchronously, before any await. Nothing later can enter the branch.
+        let autoBranch: Agent | undefined;
+        let autoMetadata: AgentBranchMetadata | undefined;
+        let autoSummary: HarnessBranchSummary | undefined;
+
+        if (ownerRun !== undefined) {
+            const ownerBranch = agentBranchOf(ownerRun.agent);
+
+            try {
+                assertBranchConcurrency(activeBranches.size, forks.maxConcurrent);
+            } catch (error) {
+                await failBranchTool(run, call, toErrorInfo(error).message);
+                return;
+            }
+
+            try {
+                autoBranch = forkAgent(ownerRun.agent, {
+                    kind: 'autoanswer',
+                    ...(ownerBranch !== undefined ? { sourceBranchId: ownerBranch.branchId } : {}),
+                    ...(ownerRun.thread !== undefined ? { sourceThreadId: ownerRun.thread.id } : {}),
+                    callId: call.id,
+                    requestId,
+                    reason: 'actionRequest',
+                    maxHistoryBytes: forks.maxHistoryBytes
+                });
+
+                const created = agentBranchOf(autoBranch);
+                if (created === undefined) {
+                    throw new HarnessError('The owner fork was created without branch metadata.');
+                }
+                autoMetadata = created;
+
+                // The owner fork must read the OWNER transcript AND the full
+                // requesting transcript (including earlier invocations). The helper
+                // demotes child system messages to quoted user data, so a branch
+                // cannot turn its instructions into the owner's system privilege.
+                const incorporated = incorporateBranchHistory({
+                    ownerMessages: ownerRun.agent.messages,
+                    ownerBranchId: ownerBranch?.branchId ?? 'owner',
+                    branchMessages: run.agent.messages,
+                    branchId: created.branchId,
+                    branchKind: 'autoanswer',
+                    // The owner's still-pending call is the delegation that started
+                    // this requester, not the actionRequest itself: use the neutral
+                    // placeholder. The child's own pending call IS this request.
+                    reason: 'other',
+                    maxHistoryBytes: forks.maxHistoryBytes
+                });
+
+                autoBranch.messages.length = 0;
+                for (const message of incorporated.messages) {
+                    autoBranch.messages.push(message);
+                }
+
+                actorRoles.set(autoBranch, roleOf(ownerRun.agent));
+
+                const summary: HarnessBranchSummary = {
+                    branchId: created.branchId,
+                    kind: 'autoanswer',
+                    agent: ownerRun.agent.name,
+                    role: roleOf(ownerRun.agent),
+                    ...(created.sourceBranchId !== undefined
+                        ? { sourceBranchId: created.sourceBranchId }
+                        : {}),
+                    ...(created.sourceThreadId !== undefined
+                        ? { sourceThreadId: created.sourceThreadId }
+                        : {}),
+                    callId: call.id,
+                    requestId,
+                    forkDepth: created.forkDepth,
+                    model: created.model,
+                    tools: []
+                };
+
+                createBranchRecord(summary, incorporated.messages, incorporated.toolCallIds, run.scope);
+                autoSummary = summary;
+            } catch (error) {
+                // A fork that could not be created is an honest tool error; no
+                // action_request is reported because no owner can answer it.
+                if (autoBranch !== undefined && autoMetadata !== undefined) {
+                    activeBranches.delete(autoMetadata.branchId);
+                    branchScopes.delete(autoMetadata.branchId);
+                }
+                await failBranchTool(
+                    run,
+                    call,
+                    `actionRequest could not create the owner fork: ${toErrorInfo(error).message}`
+                );
+                return;
+            }
+        }
+
+        // The owner fork's audit frame, before the request is announced. Its
+        // `thread` is the REQUESTER's identity; the branch run's own frames carry
+        // the autoanswer thread (kind/branchId).
+        if (autoSummary !== undefined) {
+            await progress({
+                type: 'branch_start',
+                agent: autoSummary.agent,
+                branch: autoSummary,
+                thread: branchThreadOf(autoSummary.branchId, 'autoanswer', run, call.id)
+            });
+            branchStarted.add(autoSummary.branchId);
+        }
+
+        pendingActionRequests.add(requestId);
+        actionRequestScopes.set(requestId, run.scope);
+
+        // The request frame is reported BEFORE the host (or owner fork) is invoked,
+        // so a client can render the pending card while it awaits.
+        try {
+            await emit(run, {
+                type: 'action_request',
+                agent: run.agent.name,
+                callId: call.id,
+                request
+            });
+        } catch (error) {
+            // The action_request could not be reported: fail the run (a reporter
+            // failure is a run failure). The branch, if created, is released by
+            // the requester run's finally, which marks it cancelled.
+            pendingActionRequests.delete(requestId);
+            actionRequestScopes.delete(requestId);
+            throw error;
+        }
+
+        scheduler.schedule({
+            scope: run.scope,
+            agent: run.actorKey,
+            callId: call.id,
+            name: call.name,
+            parent: run.signal,
+            run: async (signal) => {
+                try {
+                    let choice: HarnessActionChoice;
+                    let source: 'owner' | 'auto';
+
+                    if (autoBranch === undefined || autoMetadata === undefined) {
+                        // ROOT: await the host. The handler receives the run's
+                        // cancellation signal; a late resolution after an abort is
+                        // discarded (never turned into a fake answer).
+                        const handler = interaction?.actionRequest;
+
+                        if (handler === undefined) {
+                            throw new HarnessError(
+                                'actionRequest has no owner handler for this root run; the recommendation is never selected automatically.'
+                            );
+                        }
+
+                        try {
+                            choice = await handler(context, signal);
+                        } catch (error) {
+                            throw new HarnessError(
+                                `actionRequest owner handler failed: ${toErrorInfo(error).message}`
+                            );
+                        }
+
+                        if (signal.aborted) throw signal.reason;
+                        choice = validateActionChoice(choice, request);
+                        source = 'owner';
+                    } else {
+                        // CHILD/FORK: a tool-free, single-iteration owner read.
+                        let message: HarnessAssistantMessage;
+
+                        try {
+                            message = await runAgent(
+                                autoBranch,
+                                actionDirective(request),
+                                signal,
+                                run,
+                                call.id,
+                                undefined,
+                                undefined,
+                                { branch: { metadata: autoMetadata, autoAnswer: true } }
+                            );
+                        } catch (error) {
+                            const status = branchFailureStatus(signal);
+                            const info = toErrorInfo(error);
+                            if (
+                                finishBranch(autoMetadata.branchId, status, {
+                                    messages: autoBranch.messages,
+                                    error: info
+                                })
+                            ) {
+                                await emitBranchEnd(
+                                    run,
+                                    autoMetadata.branchId,
+                                    status,
+                                    'autoanswer',
+                                    call.id,
+                                    info
+                                );
+                            }
+                            throw error;
+                        }
+
+                        if (signal.aborted) throw signal.reason;
+
+                        try {
+                            choice = parseDirectiveAnswer(message.content, request);
+                        } catch (error) {
+                            const info = toErrorInfo(error);
+                            if (
+                                finishBranch(autoMetadata.branchId, 'failed', {
+                                    messages: autoBranch.messages,
+                                    error: info
+                                })
+                            ) {
+                                await emitBranchEnd(
+                                    run,
+                                    autoMetadata.branchId,
+                                    'failed',
+                                    'autoanswer',
+                                    call.id,
+                                    info
+                                );
+                            }
+                            throw error;
+                        }
+
+                        if (
+                            finishBranch(autoMetadata.branchId, 'completed', {
+                                messages: autoBranch.messages,
+                                result: { content: message.content, stopReason: message.stopReason }
+                            })
+                        ) {
+                            await emitBranchEnd(
+                                run,
+                                autoMetadata.branchId,
+                                'completed',
+                                'autoanswer',
+                                call.id
+                            );
+                        }
+                        source = 'auto';
+                    }
+
+                    // Report the answer BEFORE the tool result is delivered (the
+                    // delivery happens in onSettled, after this task settles).
+                    const answer: HarnessActionAnswer = {
+                        requestId,
+                        choice,
+                        source,
+                        ...(source === 'auto' && autoMetadata !== undefined
+                            ? { branchId: autoMetadata.branchId }
+                            : {})
+                    };
+
+                    await emit(run, {
+                        type: 'action_answer',
+                        agent: run.agent.name,
+                        requestId,
+                        answer
+                    });
+
+                    return actionResultOf(request, choice, source);
+                } finally {
+                    pendingActionRequests.delete(requestId);
+                    actionRequestScopes.delete(requestId);
+                    if (autoMetadata !== undefined) {
+                        activeBranches.delete(autoMetadata.branchId);
+                        branchScopes.delete(autoMetadata.branchId);
+                        branchStarted.delete(autoMetadata.branchId);
+                    }
+                }
+            },
+            onSettled: (task) => {
+                enqueueMailbox(run.actorKey, () =>
+                    deliverTask(task, run, call).catch((error) => {
                         if (run.deliveryError === undefined) run.deliveryError = error;
                         markRunDirty(run);
                     })
@@ -1668,7 +2765,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const requestTurn = async (run: RunState): Promise<HarnessAssistantMessage> => {
         const brain = run.agent;
 
-        return serializeTurn(brain.name, async () => {
+        return serializeTurn(run.actorKey, async () => {
             // The run may have been aborted while this turn waited behind another
             // turn of the same agent: never start a provider request for it.
             throwIfAborted(run);
@@ -1677,7 +2774,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             const iterator = brain
                 .turn({
                     signal: run.signal,
-                    tools: declarations(brain),
+                    tools: declarations(run),
                     transcript: projection,
                     precommit: () => assertCommitAllowed(run)
                 })
@@ -1836,8 +2933,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const commitIndex = brain.messages.length;
 
         await emit(run, { type: 'start', agent: brain.name, model: brain.model() });
-        brain.user(input);
-        notifyStateChange('agent_message', { agent: brain.name });
+        // Attachments ride ONLY on this run's root user message; the agent
+        // re-validates/copies them before the append (core/agent.ts), so the
+        // transcript owns its own bytes.
+        brain.user(input, run.attachments.length > 0 ? run.attachments : undefined);
+        notifyRunStateChange(run, 'agent_message', { agent: brain.name });
 
         try {
             while (true) {
@@ -1850,13 +2950,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // rejects: one bad delivery must not poison the agent's chain).
                 if (run.deliveryError !== undefined) throw run.deliveryError;
 
-                if (run.iteration >= maxIterations) {
+                if (run.iteration >= (run.autoAnswer ? 1 : maxIterations)) {
                     // Explicit drain: release everything this run started before
                     // the rollback below, so a failure cannot leave a task that
                     // later inserts into a dead transcript.
                     scheduler.abandonScope(run.scope);
+                    const limit = run.autoAnswer ? 1 : maxIterations;
                     throw new HarnessError(
-                        `Agent "${brain.name}" requested tools more than ${maxIterations} times without answering.`
+                        run.autoAnswer
+                            ? 'The owner fork did not answer in one tool-free response; actionRequest accepts no tools.'
+                            : `Agent "${brain.name}" requested tools more than ${limit} times without answering.`
                     );
                 }
 
@@ -1864,7 +2967,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // Deliveries that landed before this turn must be visible to it;
                 // reset dirty AFTER draining so the reset does not hide a real
                 // outcome from `changedDuringRequest` below.
-                await drainMailbox(brain.name);
+                await drainMailbox(run.actorKey);
                 run.dirty = false;
 
                 const message = await requestTurn(run);
@@ -1876,7 +2979,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // `run.dirty` is set at canonical insertion (before the reporter),
                 // so `changedDuringRequest` is reliable even when the reporter is
                 // blocked here.
-                await drainMailbox(brain.name);
+                await drainMailbox(run.actorKey);
 
                 // An abort that arrived while the transport was in flight must stop
                 // the run HERE: an uncooperative provider may still deliver a
@@ -1895,9 +2998,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     assertToolCallIds(brain, message.toolCalls);
                 }
 
+                // Autoanswer branches are tool-free by contract: a tool call is
+                // not a partial answer, it is an invalid directive. Fail before
+                // launching anything so no side effect can run from an owner read.
+                if (run.autoAnswer && message.toolCalls.length > 0) {
+                    throw new HarnessError(
+                        'The owner fork attempted a tool call; actionRequest requires one tool-free directive answer.'
+                    );
+                }
+
                 // agent.turn() committed the assistant message before yielding
                 // `done`; persist that append before any tool work or the next turn.
-                notifyStateChange('agent_message', { agent: brain.name });
+                notifyRunStateChange(run, 'agent_message', { agent: brain.name });
 
                 if (message.usage !== undefined) {
                     await emit(run, { type: 'usage', agent: brain.name, usage: message.usage });
@@ -1939,7 +3051,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // before the run is allowed to resolve. A delivery that raced
                     // this check re-dirties the run and gets its own turn; an abort
                     // that raced it must still fail/roll back rather than resolve.
-                    await drainMailbox(brain.name);
+                    await drainMailbox(run.actorKey);
                     if (run.dirty) continue;
                     throwIfAborted(run);
 
@@ -1976,7 +3088,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             scheduler.abandonScope(run.scope);
 
             brain.messages.splice(commitIndex);
-            notifyStateChange('agent_message', { agent: brain.name });
+            notifyRunStateChange(run, 'agent_message', { agent: brain.name });
 
             const info = toErrorInfo(error);
             await emitError(run, info);
@@ -2080,9 +3192,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         callId?: string,
         // Internal, delegate-only answer extraction (T2/R1). Omitted for host runs
         // and arbitrary ctx.run calls, which keep their historical return value.
-        internals?: RunInternals
+        internals?: RunInternals,
+        // Root-prompt attachments (T3). ONLY the harness callable passes these;
+        // ctx.run/agentDelegate omit them so root bytes never reach a child
+        // prompt. Validated here, before the run acquires the agent or mutates
+        // any history.
+        attachments?: HarnessAttachment[],
+        // N6 branch internals, passed only by the runtime's fork/autoanswer
+        // launches. Kept separate from `internals` so an arbitrary ctx.run cannot
+        // claim to be a branch through the public tool context.
+        branchInternals?: RunInternals
     ): Promise<HarnessAssistantMessage> => {
+        // Validation is the first side-effect-free step: a malformed attachment
+        // rejects the run with nothing appended, nothing emitted, and no queued
+        // actor slot.
+        const validatedAttachments = validateAttachments(attachments);
+
         const ancestors = parent?.lineage ?? [];
+        const branchRun = branchInternals?.branch;
 
         if (ancestors.includes(brain)) {
             throw new HarnessError(
@@ -2090,9 +3217,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             );
         }
 
-        // Central depth/authority rule (R12), checked AFTER the cycle check so a
-        // cycle keeps its own, more precise message.
-        if (ancestors.length >= MAX_RUN_DEPTH) {
+        // Delegation depth is INDEPENDENT of fork depth (N6). A branch run is a
+        // fresh actor and starts at depth 1 again; its nesting is bounded by
+        // core/branch.ts's forkDepth instead. An ordinary run is one level below
+        // its parent. The check is AFTER the cycle check so a cycle keeps its own,
+        // more precise message.
+        const depth = branchRun !== undefined ? 1 : (parent?.depth ?? 0) + 1;
+
+        if (depth > MAX_RUN_DEPTH) {
             throw new HarnessError(
                 `Agent "${brain.name}" cannot run: runs nest at most ${MAX_RUN_DEPTH} deep, and "${ancestors[ancestors.length - 1].name}" is already running.`
             );
@@ -2101,10 +3233,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // An already-cancelled run must not start: check before queueing.
         signal?.throwIfAborted();
 
-        // Wait for this agent's actor. A queued run is not "started" until it owns
-        // the actor, so an abort while waiting rejects without touching history.
-        // The free path returns synchronously (no microtask before `start`).
-        const acquired = acquireAgent(brain.name, signal);
+        // Wait for this actor. A queued run is not "started" until it owns the
+        // actor, so an abort while waiting rejects without touching history. The
+        // free path returns synchronously (no microtask before `start`). The key is
+        // the ACTOR key: a fork never queues behind its source (N6).
+        const acquired = acquireAgent(actorKeyOf(brain), signal);
         const releaseAgent = typeof acquired === 'function' ? acquired : await acquired;
 
         try {
@@ -2115,6 +3248,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 id,
                 scope: String(id),
                 agent: brain,
+                actorKey: actorKeyOf(brain),
+                depth,
+                autoAnswer: branchRun?.autoAnswer === true,
+                ...(branchRun !== undefined ? { branch: branchRun.metadata } : {}),
                 signal,
                 lineage: [...ancestors, brain],
                 parent,
@@ -2123,6 +3260,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 iteration: 0,
                 dirty: false,
                 waiters: [],
+                attachments: validatedAttachments,
                 // Delegate-only answer extraction (T2/R1). A host run and an
                 // arbitrary ctx.run leave this false, so their returned message is
                 // exactly the model's final turn, as before.
@@ -2137,7 +3275,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // is omitted for a direct child of the root (the root has no thread) and
             // set for anything deeper. `input` travels on `start` only (see
             // withThread/threadIdentity).
-            if (parent !== undefined) {
+            //
+            // N6 BRANCH THREADS: id is the branch id, so `branch_start`,
+            // `harness.branch(id)`, and EVERY frame of the branch share one naming
+            // scheme; kind/branchId ride along on every event (threadIdentity).
+            if (branchRun !== undefined) {
+                const metadata = branchRun.metadata;
+                const thread: HarnessThread = {
+                    id: metadata.branchId,
+                    input,
+                    kind: branchRun.autoAnswer ? 'autoanswer' : 'fork',
+                    branchId: metadata.branchId
+                };
+                if (parent?.thread !== undefined) thread.parentId = parent.thread.id;
+                if (callId !== undefined) thread.callId = callId;
+                run.thread = thread;
+            } else if (parent !== undefined) {
                 const thread: HarnessThread = { id: String(id), input };
                 if (parent.thread !== undefined) thread.parentId = parent.thread.id;
                 if (callId !== undefined) thread.callId = callId;
@@ -2170,6 +3323,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // nothing left. This also handles an unexpected throw outside the
                 // loop's own catch.
                 scheduler.abandonScope(run.scope);
+                // Release branch/action bookkeeping this run owned. abandonScope
+                // does not notify, so these are the only cleanup for work that never
+                // started (or whose task was detached by the abort). The branch
+                // release is AWAITED because it may be the only place that can emit
+                // the terminal branch_end for an already-emitted branch_start (D1).
+                await releaseBranchesForScope(run);
+                releaseActionRequestsForScope(run.scope);
                 if (signal) signal.removeEventListener('abort', onAbort);
             }
         } finally {
@@ -2428,6 +3588,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // there is no transcript position for a tool_call/tool_result pair. The
     // caller's request/response carries the duration (ToolCallResult).
     const executeTool = async (name: string, parameters: unknown): Promise<unknown> => {
+        // N6: the branch controls are not host-callable. A manual call has no
+        // requester transcript to fork and no owner run to ask, so it is refused
+        // with a specific error rather than run against the primary agent (which
+        // would answer on the operator's behalf and fabricate owner context).
+        if (name === THREAD_FORK || name === ACTION_REQUEST) {
+            throw new HarnessError(
+                `Tool "${name}" is not available through executeTool: it requires the harness run that owns the conversation.`
+            );
+        }
+
         const definition = tools[name];
 
         // The session owns which tools exist: a harness without subagents has no
@@ -2484,7 +3654,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // The harness is a function you call. Properties ride on it so a CLI has
     // everything in one handle without a second lookup object.
     const run = (input: string, options?: HarnessRunOptions) =>
-        runAgent(primary, input, options?.signal);
+        // `attachments` is the FINAL argument and is intentionally absent from
+        // every nested runAgent call: only the root prompt may carry media.
+        runAgent(primary, input, options?.signal, undefined, undefined, undefined, options?.attachments);
 
     // Every Harness field except `name` and `discoveredTools` is assigned here.
     // Those two are defineProperty'd below: `name` is a built-in function property
@@ -2507,6 +3679,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // Server-facing manual execution (R8): the session-bound tool invocation
         // `POST /tools/:name` uses when a client supplies a sessionId.
         executeTool,
+        // N6 branch audit. Ephemeral: never snapshot/restore state. Every read is a
+        // DETACHED copy, so a caller cannot mutate a live record (or its branch
+        // transcript) through the handle. Retention is bounded by
+        // maxBranchRecords with active records never evicted.
+        branches: () => retainedBranches().map(cloneBranchRecord),
+        branch: (id: string) => {
+            const record = retainedBranches().find((entry) => entry.branchId === id);
+            return record === undefined ? undefined : cloneBranchRecord(record);
+        },
         // R3a persistence. `snapshot` never mutates; `restore` validates fully
         // and recompiles created-tool sources without executing them.
         snapshot,

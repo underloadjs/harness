@@ -1769,6 +1769,20 @@ button {
     font-size: 13px;
 }
 
+/* T5 replay: the chip strip under a recorded turn's prompt. Same chip building
+   blocks as the composer, but no remove control and no `data-state` (a recorded
+   turn is immutable). Hidden when the turn is text-only, so old transcripts keep
+   their exact layout. */
+.turn-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.turn-attachments[hidden] {
+    display: none;
+}
+
 /* R1: the agent flow is also one scale for both blocks: prose, tool rows and
    reasoning sit at the same rhythm inside the main tile and a nested entry. */
 :is(.tile-flow, .thread-flow) {
@@ -2820,6 +2834,162 @@ button {
     background: var(--bg-bar);
 }
 
+/* Attachments (T5 clip/attach) -------------------------------------------
+   `.composer-body` is the composer's flexible column: the chip strip and the
+   error line sit ABOVE the existing `.composer-field`, so the action's absolute
+   position inside the field is unchanged. The attach button is a sibling of the
+   column, bottom-aligned with the field. */
+.composer-body {
+    display: flex;
+    flex: 1;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+}
+
+.composer-attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+/* `hidden` must win over the flex display above: an empty draft shows no strip. */
+.composer-attachments[hidden] {
+    display: none;
+}
+
+.attachment-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 100%;
+    padding: 4px 4px 4px 6px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--bg-input);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+/* A file whose bytes are still being read: visible but not sendable. */
+.attachment-chip[data-state='reading'] {
+    opacity: 0.7;
+    border-style: dashed;
+}
+
+.attachment-thumb {
+    width: 28px;
+    height: 28px;
+    flex: 0 0 auto;
+    border-radius: 4px;
+    object-fit: cover;
+}
+
+.attachment-text {
+    display: inline-flex;
+    align-items: baseline;
+    gap: 5px;
+    min-width: 0;
+}
+
+.attachment-kind {
+    color: var(--muted);
+    font-size: 9.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.attachment-marker {
+    color: var(--accent);
+    white-space: nowrap;
+}
+
+.attachment-name {
+    max-width: 220px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* A plain 18px thumb-sized button: real focus ring, no nested interactive parent
+   (the chip itself is a div, never a button). */
+.attachment-remove {
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.attachment-remove:hover:not(:disabled) {
+    color: var(--danger);
+}
+
+.attachment-remove:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.attachment-remove:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+/* Explicit rejection/read-failure line. It is a live region in main.ts, so it is
+   present but hidden when there is nothing to say. */
+.composer-attachment-error {
+    margin: 0;
+    color: var(--danger);
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.composer-attachment-error[hidden] {
+    display: none;
+}
+
+/* File chooser accessory: the visible, focusable control; the native input stays
+   hidden (main.ts). */
+.composer-attach {
+    width: 34px;
+    height: 34px;
+    flex: 0 0 auto;
+    align-self: flex-end;
+    padding: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--bg-input);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.composer-attach:hover:not(:disabled) {
+    border-color: var(--accent);
+}
+
+.composer-attach:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.composer-attach:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.composer-file {
+    display: none;
+}
+
 /* The box that holds the field AND its single action (R10). `position: relative`
    is what keeps the action inside the input box in every state; `min-width: 0`
    lets the field shrink inside the flex column instead of overflowing it. */
@@ -3681,5 +3851,211 @@ button {
     :is(.tile, .thread-tile):not(.is-expanded)[data-state='waiting']::before,
     :is(.tile, .thread-tile):not(.is-expanded)[data-state='streaming']::before {
         display: none;
+    }
+}
+
+/* N3 actionRequest cards ----------------------------------------------------
+   A question block lives inside the emitting invocation's flow (root tile or a
+   child entry). Recommended option first + highlighted, alternatives after, and
+   the custom answer is ALWAYS present. Non-root requests are read-only and use
+   the same surface with the controls omitted. */
+.action-request {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin: 8px 0 0;
+    padding: 10px 12px;
+    border: 1px solid var(--border-strong);
+    border-left: 3px solid var(--accent);
+    border-radius: var(--radius);
+    background: var(--bg-input);
+    overflow-wrap: anywhere;
+}
+
+.action-request[data-readonly='true'] {
+    border-left-color: var(--muted);
+}
+
+.action-question {
+    margin: 0;
+    color: var(--text);
+    font-weight: 600;
+    line-height: 1.45;
+    white-space: pre-wrap;
+}
+
+.action-note {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.action-options {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    list-style: none;
+}
+
+.action-option,
+.action-option-static {
+    display: flex;
+    flex-direction: row;
+    align-items: flex-start;
+    gap: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-elevated);
+    cursor: pointer;
+}
+
+.action-option:hover {
+    border-color: var(--border-strong);
+}
+
+.action-option[data-recommended='true'],
+.action-option-static[data-recommended='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+.action-option-static {
+    cursor: default;
+    flex-wrap: wrap;
+}
+
+.action-radio {
+    margin: 3px 0 0;
+    accent-color: var(--accent);
+}
+
+.action-option-body {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+}
+
+.action-option-line {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+
+.action-option-label {
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.4;
+}
+
+.action-recommended {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 9.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.action-option-description {
+    color: var(--muted);
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.action-custom-input {
+    width: 100%;
+    min-height: 38px;
+    margin-top: 2px;
+    padding: 6px 8px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--bg);
+    color: var(--text);
+    font: inherit;
+    resize: vertical;
+}
+
+.action-custom-input:disabled {
+    opacity: 0.55;
+}
+
+.action-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+}
+
+.action-status {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+.action-request[data-state='answered'] .action-status {
+    color: var(--ok);
+}
+
+.action-request[data-state='expired'] .action-status {
+    color: var(--warn);
+}
+
+.action-error {
+    margin: 0;
+    color: var(--danger);
+    font-size: 12px;
+    line-height: 1.4;
+}
+
+.action-request[data-state='submitting'] {
+    opacity: 0.85;
+}
+
+/* N3 kind tag on a fork/autoanswer thread row. A small label beside the agent
+   code; it is deliberately NOT the removed oversized role badge. */
+.thread-kind {
+    order: 0;
+    flex: 0 0 auto;
+    padding: 0 5px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    line-height: 1.5;
+    text-transform: uppercase;
+}
+
+.thread-kind[data-kind='fork'] {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.thread-kind[data-kind='autoanswer'] {
+    border-color: var(--warn);
+    color: var(--warn);
+}
+
+@media (forced-colors: active) {
+    .action-request,
+    .action-option,
+    .action-option-static {
+        border-color: CanvasText;
+    }
+
+    .action-option[data-recommended='true'],
+    .action-option-static[data-recommended='true'] {
+        outline: 2px solid CanvasText;
+        outline-offset: -2px;
     }
 }

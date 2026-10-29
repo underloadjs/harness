@@ -8,7 +8,10 @@
 //
 // Cross-references:
 //   - ./origin.ts            — LOOPBACK_HOSTNAMES, isLoopbackHostname, isTrustedRuntimeOrigin
+//   - ./attachments.ts       — the one attachment validator, its size constants,
+//                              and the marker helper shared by composer + server
 //   - ../server/service.ts   — inbound gate
 //   - ../frontend/api.ts     — outbound gate
 //   - ../shared             — also reachable as `@underload/harness/shared`
 export * from './origin';
+export * from './attachments';

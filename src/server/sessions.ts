@@ -48,22 +48,44 @@
 // a live tile and a reloaded one print the same number. Snapshots clone the turns,
 // so a client that mutates a response cannot corrupt the live record.
 //
+// OWNER INTERACTION (N4): buildHarness installs ONE
+// `interaction.actionRequest` handler on every session (fresh and restored, every
+// preset). It parks the runtime's awaited promise in this session's
+// `pendingActions` map, and answerAction (POST
+// /sessions/:id/actions/:requestId/answer) settles exactly one entry after
+// validating the choice against the request the model offered. Four unanswered
+// questions are allowed at once (the runtime enforces the same bound); a fifth is
+// rejected for the model, never auto-selected. cancel(), remove(), dispose(), the
+// end of a turn, and the runtime's run signal all reject outstanding promises;
+// finished ids stay in a bounded history so a stale card answers 409 rather than
+// 404. After a restart nothing is resumed: every recorded question is expired, and
+// the events remain the source a client renders question cards from.
+//
 // Cross-references:
 //   - ./protocol.ts — SessionSnapshot.turns, SessionTurn, SessionStreamItem
 //   - ./handler.ts  — forwards stream items verbatim; no turn inference there
-//   - ./api.ts      — POST /tasks (202), GET /events (watcher), POST /cancel {all}
+//   - ./api.ts      — POST /tasks (202), GET /events (watcher), POST /cancel {all},
+//                     POST /sessions/:id/actions/:requestId/answer
 //   - ./harnesses/registry.ts — the in-memory harness registry
 //   - ./harnesses/descriptor.ts — describeHarness, the frozen definition
+//   - ../core/action.ts — validateActionChoice (the one answer parser)
 
 import { randomUUID } from 'node:crypto';
 import type {
     Harness,
+    HarnessActionChoice,
+    HarnessActionRequest,
+    HarnessActionRequestContext,
+    HarnessAttachment,
     HarnessEvent,
+    HarnessInteractionConfiguration,
     HarnessMessage,
     HarnessSnapshot,
     HarnessStateChangeEvent
 } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
+import { validateAttachments } from '../shared/attachments';
+import { validateActionChoice } from '../core/action';
 import { describeHarness } from './harnesses/descriptor';
 import {
     createHarnessRegistry,
@@ -93,6 +115,56 @@ const MAX_INPUT_LENGTH = 200_000;
 // active turn is not part of the queue, so a session can run one task with this
 // many waiting. Exceeding it is a 429, and the submit mutates nothing.
 const MAX_PENDING_TASKS = 100;
+
+// N4 owner interaction: one session can have at most this many unanswered
+// actionRequest questions. The runtime enforces its own bound too, so this is the
+// server's independent guard against a host (or a misbehaving runtime) parking
+// more promise resolvers than a human could ever answer. A fifth request is
+// REJECTED (the model receives a readable tool error); it is never auto-answered.
+const MAX_PENDING_ACTIONS = 4;
+
+// How many no-longer-answerable request ids a session remembers. `answerAction`
+// uses this to distinguish "expired/already answered" (409) from "never existed"
+// (404) after the pending entry is gone (including after a restart). Bounded so a
+// long conversation cannot grow the set without limit; the oldest ids fall out
+// first.
+const MAX_COMPLETED_ACTIONS = 64;
+
+// Readable rejection texts. The handler promise rejection is turned into a tool
+// result by the runtime, so the model — not just a log — sees why no answer came.
+const ACTION_CANCELLED_MESSAGE =
+    'The action request was cancelled before the owner answered. Ask again only if the question is still required.';
+const ACTION_RUN_ENDED_MESSAGE =
+    'The run ended before the action request was answered. Ask again if the question is still required.';
+const ACTION_SESSION_GONE_MESSAGE =
+    'The session was removed before the action request was answered.';
+const ACTION_DUPLICATE_MESSAGE = 'An action request with this requestId is already pending.';
+
+// One unanswered owner question, registered by the host callback that the runtime
+// awaits. The store owns the resolver: POST /sessions/:id/actions/:requestId/answer
+// settles it exactly once, and cancellation/removal rejects it so the runtime's
+// tool call can finish instead of hanging a turn forever.
+type PendingAction = {
+    requestId: string;
+    // The already-validated request this pending answer belongs to. The answer
+    // route re-validates the choice against it, so an option id the model never
+    // offered is a 400 rather than an answer the runtime must trust.
+    request: HarnessActionRequest;
+    // The handler's own promise settlement (exposed so the store can settle it).
+    settle: (outcome: HarnessActionOutcome) => void;
+    // Run signal the runtime supplied; an abort expires the pending entry.
+    signal: AbortSignal;
+    // Bound abort listener, removed on settlement so a completed action leaves no
+    // listener on a long-lived signal.
+    onAbort: () => void;
+    // Guard that makes the settlement idempotent (resolve/reject exactly once).
+    settled: boolean;
+};
+
+// What settles one pending action: either an accepted choice or a rejection.
+type HarnessActionOutcome =
+    | { ok: true; choice: HarnessActionChoice }
+    | { ok: false; error: Error };
 
 type Emit = (item: SessionStreamItem) => void | Promise<void>;
 
@@ -155,6 +227,14 @@ type Session = {
     // enqueue()'s per-turn completion resolvers, keyed by turn id. Resolved when
     // the turn reaches a terminal status or is dropped by cancel-all.
     settlers: Map<string, () => void>;
+    // N4: unanswered actionRequest questions from the ACTIVE run, keyed by the
+    // runtime-generated requestId. Populated by the interaction handler below and
+    // settled by answerAction (POST .../answer) or by cancellation/teardown.
+    pendingActions: Map<string, PendingAction>;
+    // N4: bounded FIFO of request ids that can no longer be answered (answered,
+    // cancelled, expired, or restored after a restart). A late answer for one of
+    // these is a 409, not a 404.
+    completedActions: string[];
     // Set by remove()/dispose(): the pump stops, pending turns are discarded, and
     // no later frame is published for this session.
     disposed: boolean;
@@ -230,6 +310,31 @@ const copyMessages = (messages: readonly HarnessMessage[]): HarnessMessage[] =>
 const copyEvent = (event: HarnessEvent): HarnessEvent =>
     JSON.parse(JSON.stringify(event)) as HarnessEvent;
 
+// Collect the request ids of every actionRequest recorded in a restored turn
+// list, oldest first, keeping only the most recent MAX_COMPLETED_ACTIONS. After a
+// restart no runtime is awaiting any of them, so every id is EXPIRED: the answer
+// route must answer 409 (the question card is stale), never 404 (unknown) and
+// never start a new run. Action answers present in the record do not need special
+// handling: the request id is no longer answerable either way.
+const expiredActionIds = (turns: readonly SessionTurn[]): string[] => {
+    const ids: string[] = [];
+
+    for (const turn of turns) {
+        for (const event of turn.events) {
+            if (event.type !== 'action_request') continue;
+
+            // Persistence keeps events opaque, so a hand-edited/older record can
+            // carry a malformed request. Skip it rather than fail the whole restore:
+            // an id we cannot read is simply not answerable.
+            const requestId = event.request?.requestId;
+            if (typeof requestId !== 'string' || requestId.length === 0) continue;
+            if (!ids.includes(requestId)) ids.push(requestId);
+        }
+    }
+
+    return ids.slice(Math.max(0, ids.length - MAX_COMPLETED_ACTIONS));
+};
+
 // A turn copy is the only shape a client ever receives. The live SessionTurn stays
 // private to the store; list()/get()/terminal frames all go through here.
 // `eventTimes` is copied when present, preserving the parallel array contract, and
@@ -241,6 +346,12 @@ const copyTurn = (turn: SessionTurn): SessionTurn => ({
     id: turn.id,
     index: turn.index,
     prompt: turn.prompt,
+    // Attachments are copied too (T3): the validated record is plain data and a
+    // client/snapshot consumer must never be able to mutate the stored bytes. The
+    // key stays absent for a text-only turn, preserving every old shape.
+    ...(turn.attachments === undefined
+        ? {}
+        : { attachments: turn.attachments.map((attachment) => ({ ...attachment })) }),
     status: turn.status,
     ...(turn.startedAt === undefined ? {} : { startedAt: turn.startedAt }),
     updatedAt: turn.updatedAt,
@@ -283,10 +394,14 @@ const copyTurns = (turns: readonly SessionTurn[]): SessionTurn[] => turns.map(co
 // Trim + bound a task input. Shared by the legacy run() and the queue enqueue()
 // so the two submit surfaces cannot disagree about what a valid task is. Throws
 // BEFORE any mutation, which is what makes a rejected submit safe to retry.
-const validateInput = (rawInput: string): string => {
+//
+// An empty/whitespace prompt is allowed ONLY when the turn carries attachments
+// (T3): an image dropped without text is a real task. The 200k text cap is
+// unchanged for either shape.
+const validateInput = (rawInput: string, attachmentCount: number): string => {
     const input = rawInput.trim();
 
-    if (input.length === 0) {
+    if (input.length === 0 && attachmentCount === 0) {
         throw new SessionError(400, 'A task cannot be empty.');
     }
 
@@ -295,6 +410,38 @@ const validateInput = (rawInput: string): string => {
     }
 
     return input;
+};
+
+// HTTP status for a rejected attachment. The shared validator throws plain
+// Errors with descriptive messages; map them onto the three honest HTTP answers
+// so a bad clip is never an opaque 500:
+//   - 413: any per-attachment/per-turn byte bound was exceeded;
+//   - 415: a media type, kind/marker agreement, or magic-signature mismatch;
+//   - 400: any other structural problem (missing field, duplicate id, bad base64).
+// The match is intentionally narrow; unknown validator wording falls back to 400,
+// which is still a clear client error.
+const ATTACHMENT_TOO_LARGE = /(?:exceeds|above) the .*byte|byte (?:attachment|per-turn) limit/i;
+const ATTACHMENT_MEDIA_TYPE =
+    /\.mime\b|magic signature|does not match its declared MIME|not valid for kind/i;
+
+const attachmentErrorStatus = (message: string): number => {
+    if (ATTACHMENT_TOO_LARGE.test(message)) return 413;
+    if (ATTACHMENT_MEDIA_TYPE.test(message)) return 415;
+    return 400;
+};
+
+// Validate one submit's attachments and return detached copies. Exported so the
+// HTTP dispatcher can pre-validate BEFORE it opens an SSE response (the legacy
+// /messages route): a malformed clip must answer a real 400/413/415 JSON body,
+// not a failed frame on an already-started stream. The store calls this again on
+// every submit, so no path can reach a turn with unvalidated media.
+export const validateAttachmentsForSubmit = (value: unknown): HarnessAttachment[] => {
+    try {
+        return validateAttachments(value);
+    } catch (error) {
+        const message = messageOf(error);
+        throw new SessionError(attachmentErrorStatus(message), message);
+    }
 };
 
 export class SessionStore {
@@ -421,6 +568,8 @@ export class SessionStore {
             busyWaiters: [],
             drainWaiters: [],
             settlers: new Map(),
+            pendingActions: new Map(),
+            completedActions: [],
             disposed: false,
             // An empty session is a valid commit point: snapshot() succeeds here.
             core: harness.snapshot()
@@ -457,7 +606,174 @@ export class SessionStore {
             if (session !== undefined) this.noteStateChange(session, event);
         };
 
-        return preset.create(settings, progress, { stateChange });
+        // N4: the ONE host answerer every session gets. The closure resolves the
+        // session lazily (the harness is constructed before the Session object
+        // exists) and registers the promise in that session's pending map. The
+        // runtime supplies the requestId/callId, awaits this promise, and emits
+        // action_request/action_answer itself; the server only brokers the answer.
+        //
+        // Passing it on EVERY build (restored and fresh, every preset) is what
+        // keeps owner questions available in the main UI instead of only in a
+        // hand-picked preset. `autoAnswer` is deliberately left unset: a server
+        // host always has an answerer, and this store never picks an option on the
+        // user's behalf.
+        const interaction: HarnessInteractionConfiguration = {
+            actionRequest: (context, signal) => {
+                const session = current();
+
+                if (session === undefined) {
+                    return Promise.reject(new Error(ACTION_SESSION_GONE_MESSAGE));
+                }
+
+                return this.registerActionRequest(session, context, signal);
+            }
+        };
+
+        return preset.create(settings, progress, { stateChange, interaction });
+    }
+
+    // Register one unanswered question from the runtime. Rejections are the
+    // intentional failure mode: the runtime turns a rejected handler into a
+    // readable tool result for the model, so an over-full session or a cancelled
+    // run never leaves a model turn hanging.
+    private registerActionRequest(
+        session: Session,
+        context: HarnessActionRequestContext,
+        signal: AbortSignal
+    ): Promise<HarnessActionChoice> {
+        if (session.disposed) {
+            return Promise.reject(new Error(ACTION_SESSION_GONE_MESSAGE));
+        }
+
+        if (signal.aborted) {
+            this.rememberCompletedAction(session, context.requestId);
+            return Promise.reject(new Error(ACTION_CANCELLED_MESSAGE));
+        }
+
+        if (session.pendingActions.size >= MAX_PENDING_ACTIONS) {
+            // The runtime already announced this request before calling us, so the
+            // question card exists. Remembering the id makes its eventual answer a
+            // 409 (expired) rather than a misleading 404.
+            this.rememberCompletedAction(session, context.requestId);
+            return Promise.reject(
+                new Error(
+                    `This session already has ${MAX_PENDING_ACTIONS} unanswered action requests; answer one before asking another.`
+                )
+            );
+        }
+
+        if (session.pendingActions.has(context.requestId)) {
+            return Promise.reject(new Error(ACTION_DUPLICATE_MESSAGE));
+        }
+
+        return new Promise<HarnessActionChoice>((resolve, reject) => {
+            // `settle` is the ONLY place that resolves/rejects or removes the
+            // listener, and `pending.settled` makes a second route/abort/teardown
+            // a no-op. That is how "settle exactly once" survives a race between
+            // an HTTP answer and the run's abort.
+            let pending: PendingAction;
+
+            pending = {
+                requestId: context.requestId,
+                request: context.request,
+                signal,
+                settled: false,
+                onAbort: () => {
+                    this.finishActionRequest(session, pending, {
+                        ok: false,
+                        error: new Error(ACTION_CANCELLED_MESSAGE)
+                    });
+                },
+                settle: (outcome) => {
+                    if (outcome.ok) {
+                        resolve(outcome.choice);
+                        return;
+                    }
+
+                    reject(outcome.error);
+                }
+            };
+
+            signal.addEventListener('abort', pending.onAbort, { once: true });
+            session.pendingActions.set(context.requestId, pending);
+        });
+    }
+
+    // Answer one pending question. Allowed while the session is BUSY: the run is
+    // by definition awaiting this answer, so rejecting it as a conflict would make
+    // the feature unusable. Validation happens before any mutation, and the
+    // runtime has already parsed the request, so an option id the model did not
+    // offer is a readable 400 (never coerced to the recommendation).
+    answerAction(id: string, requestId: string, choice: unknown): void {
+        const session = this.require(id);
+
+        const pending = session.pendingActions.get(requestId);
+
+        if (pending === undefined) {
+            if (session.completedActions.includes(requestId)) {
+                throw new SessionError(
+                    409,
+                    `Action request "${requestId}" was already answered or has expired.`
+                );
+            }
+
+            throw new SessionError(404, `Unknown action request "${requestId}".`);
+        }
+
+        let validated: HarnessActionChoice;
+
+        try {
+            validated = validateActionChoice(choice, pending.request);
+        } catch (error) {
+            throw new SessionError(400, messageOf(error));
+        }
+
+        this.finishActionRequest(session, pending, { ok: true, choice: validated });
+    }
+
+    // Settle one pending entry exactly once, detach its abort listener, and record
+    // the id as no-longer-answerable (bounded FIFO) so a repeated/stale answer is a
+    // 409 instead of a 404.
+    private finishActionRequest(
+        session: Session,
+        pending: PendingAction,
+        outcome: HarnessActionOutcome
+    ): void {
+        if (pending.settled) return;
+
+        pending.settled = true;
+        session.pendingActions.delete(pending.requestId);
+        pending.signal.removeEventListener('abort', pending.onAbort);
+
+        this.rememberCompletedAction(session, pending.requestId);
+
+        pending.settle(outcome);
+    }
+
+    // Record one request id as no-longer-answerable, keeping the bounded FIFO. Used
+    // by both settlement paths and by rejections that happen BEFORE a pending entry
+    // exists (the runtime announced the request, then the host refused it).
+    private rememberCompletedAction(session: Session, requestId: string): void {
+        // Never record an id twice: an early rejection and a later settlement can
+        // both reach here for the same request.
+        if (session.completedActions.includes(requestId)) return;
+
+        session.completedActions.push(requestId);
+        while (session.completedActions.length > MAX_COMPLETED_ACTIONS) {
+            session.completedActions.shift();
+        }
+    }
+
+    // Fail every unanswered question of this session. Used by cancel(), remove(),
+    // dispose(), and the end of a turn, so no runtime await can outlive the work it
+    // belongs to. Idempotent via finishActionRequest.
+    private expireActions(session: Session, message: string): void {
+        for (const pending of [...session.pendingActions.values()]) {
+            this.finishActionRequest(session, pending, {
+                ok: false,
+                error: new Error(message)
+            });
+        }
     }
 
     private require(id: string): Session {
@@ -699,6 +1015,12 @@ export class SessionStore {
                 busyWaiters: [],
                 drainWaiters: [],
                 settlers: new Map(),
+                pendingActions: new Map(),
+                // Nothing from disk may be answered: a restart expires every
+                // recorded question (the runtime that was awaiting it is gone).
+                // Keeping the ids (bounded) turns a stale UI card's answer into a
+                // 409 instead of a misleading 404.
+                completedActions: expiredActionIds(turns),
                 disposed: false,
                 // Replaced with a fresh snapshot after restore succeeds.
                 core: record.core
@@ -962,11 +1284,17 @@ export class SessionStore {
     // this turn cancelled and aborts this run's controller. A disconnect that
     // arrives after the run finished (before the response closed) is a no-op for
     // the forwarder, so it can never cancel a queued task that has since started.
+    //
+    // `attachments` is a TRAILING optional parameter (T3) so every existing caller
+    // keeps its argument positions. It is validated (shared validator, detaching
+    // copies) before a turn exists; malformed or oversized media is rejected with
+    // 400/413/415 and mutates nothing.
     async run(
         id: string,
         rawInput: string,
         emit: Emit,
-        options: { signal?: AbortSignal } = {}
+        options: { signal?: AbortSignal } = {},
+        attachments?: unknown
     ): Promise<void> {
         const session = this.require(id);
 
@@ -977,7 +1305,11 @@ export class SessionStore {
             throw new SessionError(409, 'A task is already running in this session.');
         }
 
-        const input = validateInput(rawInput);
+        // Validate media BEFORE text/turn mutation. The validator returns detached
+        // copies, so a caller mutating its request body later cannot rewrite this
+        // turn's bytes.
+        const validated = validateAttachmentsForSubmit(attachments);
+        const input = validateInput(rawInput, validated.length);
         const startedAt = Date.now();
 
         // The turn exists before the harness is called, so the very first progress
@@ -987,6 +1319,8 @@ export class SessionStore {
             id: randomUUID(),
             index: session.turns.length,
             prompt: input,
+            // Omitted for a text-only turn so the record keeps its legacy shape.
+            ...(validated.length === 0 ? {} : { attachments: validated }),
             status: 'running',
             startedAt,
             updatedAt: startedAt,
@@ -1009,9 +1343,15 @@ export class SessionStore {
     //
     // The returned promise does NOT wait for execution: the 202 body is ready as
     // soon as the turn is enqueued.
-    enqueue(id: string, rawInput: string): EnqueuedTask {
+    //
+    // `attachments` is a TRAILING optional parameter (T3), so `enqueue(id, input)`
+    // keeps working unchanged. Media validation runs before the pending-count
+    // check and before any mutation, and the accepted copies are persisted with
+    // the queued turn so a restart still has the real bytes.
+    enqueue(id: string, rawInput: string, attachments?: unknown): EnqueuedTask {
         const session = this.require(id);
-        const input = validateInput(rawInput);
+        const validated = validateAttachmentsForSubmit(attachments);
+        const input = validateInput(rawInput, validated.length);
 
         // Pending only. The active turn is not in `queue`, so one task can run
         // while this many wait; that keeps the cap a true backlog bound.
@@ -1031,6 +1371,9 @@ export class SessionStore {
             id: randomUUID(),
             index: session.turns.length,
             prompt: input,
+            // Omitted for a text-only turn (legacy shape); the validated copies
+            // are the ones persisted and later handed to the harness.
+            ...(validated.length === 0 ? {} : { attachments: validated }),
             status: 'queued',
             updatedAt: now,
             events: [],
@@ -1437,7 +1780,14 @@ export class SessionStore {
             // Watchers get the SAME shape as an upsert (the turn just became running).
             this.publish(session, opening());
 
-            await session.harness(turn.prompt, { signal: controller.signal });
+            // Root prompt + its composer attachments (T3). The attachments ride
+            // ONLY on this run's root user message; core validates them once more
+            // before appending history (so a corrupted restored record is rejected
+            // without mutating the transcript). A text-only turn passes no key.
+            await session.harness(turn.prompt, {
+                signal: controller.signal,
+                ...(turn.attachments === undefined ? {} : { attachments: turn.attachments })
+            });
             session.status = 'idle';
             turn.status = 'done';
         } catch (error) {
@@ -1455,6 +1805,13 @@ export class SessionStore {
 
             session.sink = undefined;
             session.controller = undefined;
+            // N4: an unanswered question cannot outlive its run. The runtime
+            // normally resolves or aborts every handler it awaits, so this is a
+            // backstop; finishActionRequest makes it a no-op when there is nothing
+            // left. Rejecting here also releases the pending map before the gate
+            // opens, so the next queued turn starts with a clean slate.
+            this.expireActions(session, ACTION_RUN_ENDED_MESSAGE);
+
             // Release the single-flight gate on success, failure, and cancellation
             // alike: a stuck gate would reject every later chat/reset/manual call
             // and park the queue pump forever.
@@ -1537,6 +1894,10 @@ export class SessionStore {
         if (session.status === 'running') {
             session.cancelled = true;
             session.controller?.abort();
+            // N4: a cancelled run can no longer receive an owner answer. Reject
+            // the awaited promise now (the abort signal also reaches it, but this
+            // makes the outcome explicit and settles exactly once).
+            this.expireActions(session, ACTION_CANCELLED_MESSAGE);
             cancelled = true;
         }
 
@@ -1602,6 +1963,12 @@ export class SessionStore {
         // harness reset above, and the turns belong to the same conversation, so
         // keeping them would make the UI show prompts history no longer contains.
         session.turns = [];
+        // N4: a reset forgets the conversation, so a question from it is no longer
+        // answerable. No pending entry exists here (reset refuses a busy session,
+        // and a run expires its own questions), but the bounded history is cleared
+        // so an old card cannot claim a 409 for a session that no longer knows it.
+        session.pendingActions.clear();
+        session.completedActions = [];
         session.status = 'idle';
         session.cancelled = false;
         session.lastError = undefined;
@@ -1681,6 +2048,11 @@ export class SessionStore {
         // Set BEFORE aborting: the aborted run's terminal publish is then
         // suppressed (the session no longer exists for any client).
         session.disposed = true;
+
+        // N4: no owner question can be answered for a removed/gone session. Reject
+        // the runtime's await before the abort so teardown never leaves a pending
+        // promise (and its abort listener) behind.
+        this.expireActions(session, ACTION_SESSION_GONE_MESSAGE);
 
         // Detach the sink with the session. A provider that ignores its abort
         // signal can still yield progress frames; with no sink they are dropped

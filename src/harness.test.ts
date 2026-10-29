@@ -136,7 +136,8 @@ describe('harness', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
     });
 
@@ -169,7 +170,8 @@ describe('harness', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
     });
 
@@ -286,7 +288,8 @@ describe('harness', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
     });
 
@@ -324,6 +327,7 @@ describe('harness', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'threadFork',
             'syntaxCheck'
         ]);
         expect((entry.messages[4] as { content: string }).content).toBe('true');
@@ -365,7 +369,8 @@ describe('harness', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
         expect(declaredNames(seen[1])).toEqual([
             'toolRequest',
@@ -374,6 +379,7 @@ describe('harness', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'threadFork',
             'fileRead'
         ]);
 
@@ -613,7 +619,7 @@ describe('harness', () => {
             // so the recovery hint lists exactly those and points at toolRequest
             // for the searchable remainder.
             content:
-                'Tool "nope" is not registered. Available tools: fileRead, fileWrite, fileEdit, fileGlob, toolRequest, toolCreate, todoManage, profileManage, chapterManage, locationManage. Call toolRequest with capability tags to search the catalogue.'
+                'Tool "nope" is not registered. Available tools: fileRead, fileWrite, fileEdit, fileGlob, toolRequest, toolCreate, todoManage, profileManage, chapterManage, locationManage, threadFork. Call toolRequest with capability tags to search the catalogue.'
         });
     });
 
@@ -933,6 +939,7 @@ describe('harness', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'threadFork',
             'hidden'
         ]);
         expect(writer.discoveredTools).toEqual(['hidden']);
@@ -949,7 +956,8 @@ describe('harness', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
     });
 
@@ -987,6 +995,7 @@ describe('harness', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'threadFork',
             'reader'
         ]);
         expect(writer.discoveredTools).toEqual(['reader']);
@@ -1002,6 +1011,7 @@ describe('harness', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'threadFork',
             'reader'
         ]);
         expect(writer.discoveredTools).toEqual(['reader']);
@@ -1351,7 +1361,8 @@ describe('executeTool', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
     });
 

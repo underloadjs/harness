@@ -150,7 +150,8 @@ describe('creating a harness', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
-            'agentDelegate'
+            'agentDelegate',
+            'threadFork'
         ]);
 
         // The registry lists it after the built-ins.
@@ -423,7 +424,8 @@ describe('updating a harness', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
         expect(Object.keys(flakyAfter.create(SETTINGS, progress).tools)).toContain('testFlaky');
 
@@ -467,7 +469,8 @@ describe('updating a harness', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
     });
 

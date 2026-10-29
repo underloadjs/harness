@@ -61,7 +61,10 @@ describe('CLI preset selection', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            // N6: forks are enabled by default, so threadFork is registered even
+            // in the scripted fixture (which has no owner interaction).
+            'threadFork'
         ]);
         expect(offline.tools.agentDelegate).toBeUndefined();
     });

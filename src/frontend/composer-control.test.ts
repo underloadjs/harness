@@ -12,6 +12,11 @@
 // (send) / Shift+Alt+Enter (newline) / IME Enter (ignored) / clicking keep the
 // exact submission semantics the old buttons had.
 //
+// T5 adds ONE composer accessory (the file chooser, `.composer-attach`) and the
+// attachment strip above the field. Those are deliberately not part of the
+// single-ACTION matrix above; the attachment flow is pinned in
+// attachments-main.test.ts and ui/attachments.test.ts.
+//
 // The field's growth math is unit-tested in ui/composer.test.ts; here the textarea's
 // `scrollHeight` is stubbed because jsdom has no layout.
 
@@ -184,12 +189,21 @@ it('paints the single in-field action for every state and never renders old cont
     expect(input.getAttribute('aria-label')).toBe('Task message');
     expect(input.getAttribute('placeholder')).toBeNull();
 
-    // R10: the action is a child of the field wrapper, which is the composer's only
-    // content — no sibling action column, no Run/Stop/Reset trio.
+    // R10: the action is a child of the field wrapper; the wrapper is wrapped in
+    // the composer BODY column so the attachment strip can sit above it. T5 adds
+    // exactly one accessory (the file chooser) and its hidden input: there is still
+    // no sibling action column and no Run/Stop/Reset trio.
     expect(input.parentElement).toBe(field);
     expect(action.parentElement).toBe(field);
-    expect(composer.children).toHaveLength(1);
-    expect(composer.querySelectorAll('button')).toHaveLength(1);
+    expect(field.parentElement?.className).toBe('composer-body');
+    expect([...composer.children].map((child) => child.className)).toEqual([
+        'composer-body',
+        'composer-attach',
+        'composer-file'
+    ]);
+    // The in-field action plus the file-chooser accessory; the hidden file input is
+    // not a button.
+    expect(composer.querySelectorAll('button')).toHaveLength(2);
     expect(composer.querySelector('.run')).toBeNull();
     expect(composer.querySelector('.stop')).toBeNull();
     expect(composer.querySelector('.reset')).toBeNull();
@@ -234,8 +248,9 @@ it('paints the single in-field action for every state and never renders old cont
     expect(action.textContent).toBe('×');
     expect(action.getAttribute('aria-label')).toBe('Stop the running task');
     expect(action.title).toBe('Stop');
-    // Still one button: the control changed meaning, not identity.
-    expect(composer.querySelectorAll('button')).toHaveLength(1);
+    // Still one ACTION: the control changed meaning, not identity (the attach
+    // accessory is a separate button and is not part of this matrix).
+    expect(composer.querySelectorAll('.composer-action')).toHaveLength(1);
 
     // TEXT + RUNNING: text wins, so the same spot is an enabled submit (queueing).
     input.value = 'queued';

@@ -50,7 +50,12 @@ const CORE_TOOL_NAMES = [
     'toolCreate',
     'todoManage',
     ...RECORD_TOOL_NAMES,
-    'agentDelegate'
+    'agentDelegate',
+    // N4: conditional harness-owned tools, appended after agentDelegate in the
+    // global catalogue. They are sessionBound and answer 404 in a session whose
+    // harness lacks an owner answerer / fork configuration.
+    'actionRequest',
+    'threadFork'
 ];
 
 // The exact catalogue order after the core set: eight package presets, six harness
@@ -242,7 +247,8 @@ describe('canonical bootstrap document', () => {
                 'toolCreate',
                 'todoManage',
                 ...RECORD_TOOL_NAMES,
-                'agentDelegate'
+                'agentDelegate',
+                'threadFork'
             ],
             builtin: true,
             editable: true
@@ -263,7 +269,7 @@ describe('canonical bootstrap document', () => {
             subagents: [],
             agents: ['demo'],
             tools: ['timeNow'],
-            coreTools: ['toolRequest', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES],
+            coreTools: ['toolRequest', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES, 'threadFork'],
             builtin: true,
             editable: true
         });
@@ -350,23 +356,23 @@ describe('preset descriptor tool metadata', () => {
     // the demo do not. A configured host adds webSearch after the file tools (the
     // order coreToolNames emits).
     const CORE_TOOLS = {
-        instruct: [...FILES, ...CORE_BASE, 'agentDelegate'],
-        research: [...FILES, ...CORE_BASE, 'agentDelegate'],
-        workspace: [...FILES, ...CORE_BASE, 'agentDelegate'],
-        reviewer: [...FILES, ...CORE_BASE, 'agentDelegate'],
-        planner: [...FILES, ...CORE_BASE, 'agentDelegate'],
-        demo: [...CORE_BASE],
-        flaky: [...FILES, ...CORE_BASE]
+        instruct: [...FILES, ...CORE_BASE, 'agentDelegate', 'threadFork'],
+        research: [...FILES, ...CORE_BASE, 'agentDelegate', 'threadFork'],
+        workspace: [...FILES, ...CORE_BASE, 'agentDelegate', 'threadFork'],
+        reviewer: [...FILES, ...CORE_BASE, 'agentDelegate', 'threadFork'],
+        planner: [...FILES, ...CORE_BASE, 'agentDelegate', 'threadFork'],
+        demo: [...CORE_BASE, 'threadFork'],
+        flaky: [...FILES, ...CORE_BASE, 'threadFork']
     };
 
     const CONFIGURED_CORE_TOOLS = {
-        instruct: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate'],
-        research: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate'],
-        workspace: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate'],
-        reviewer: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate'],
-        planner: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate'],
-        demo: [...CORE_BASE],
-        flaky: [...FILES, 'webSearch', ...CORE_BASE]
+        instruct: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate', 'threadFork'],
+        research: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate', 'threadFork'],
+        workspace: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate', 'threadFork'],
+        reviewer: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate', 'threadFork'],
+        planner: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate', 'threadFork'],
+        demo: [...CORE_BASE, 'threadFork'],
+        flaky: [...FILES, 'webSearch', ...CORE_BASE, 'threadFork']
     };
 
     const configuredRuntime = (): HarnessRuntime => {
@@ -1098,7 +1104,14 @@ describe('all-tools manual execution', () => {
 
         // The rest are core-marked, session-bound, and carry a real schema.
         expect(core.slice(1)).toEqual(
-            ['toolCreate', 'todoManage', ...RECORD_TOOL_NAMES, 'agentDelegate'].map((name) => ({
+            [
+                'toolCreate',
+                'todoManage',
+                ...RECORD_TOOL_NAMES,
+                'agentDelegate',
+                'actionRequest',
+                'threadFork'
+            ].map((name) => ({
                 name,
                 group: 'Core tools',
                 description: expect.any(String),
@@ -2113,7 +2126,8 @@ describe('harness registry over HTTP', () => {
                 'toolCreate',
                 'todoManage',
                 ...RECORD_TOOL_NAMES,
-                'agentDelegate'
+                'agentDelegate',
+                'threadFork'
             ],
             builtin: false,
             editable: true
@@ -2399,7 +2413,8 @@ describe('harness registry over HTTP', () => {
                 'toolCreate',
                 'todoManage',
                 ...RECORD_TOOL_NAMES,
-                'agentDelegate'
+                'agentDelegate',
+                'threadFork'
             ],
             builtin: true,
             editable: true
@@ -2544,7 +2559,8 @@ describe('harness registry over HTTP', () => {
             'toolRequest',
             'toolCreate',
             'todoManage',
-            ...RECORD_TOOL_NAMES
+            ...RECORD_TOOL_NAMES,
+            'threadFork'
         ]);
 
         // A NEW session runs the live agent configuration with the shared toolbox.

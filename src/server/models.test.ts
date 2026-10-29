@@ -32,6 +32,10 @@ type Provider = {
     reply: (payload: unknown, status?: number, statusText?: string) => void;
     // Answer with raw text, for malformed-body cases.
     replyText: (body: string, status?: number, statusText?: string) => void;
+    // Fail the next `count` requests with 503, then answer normally. Simulates a
+    // provider recovering mid-retry; `Infinity` keeps failing until the route
+    // exhausts its attempt budget.
+    failNext: (count: number) => void;
     close: () => Promise<void>;
 };
 
@@ -44,6 +48,7 @@ const startProvider = async (): Promise<Provider> => {
     let status = 200;
     let statusText = 'OK';
     let body = '{}';
+    let failures = 0;
     const requests: ProviderRequest[] = [];
 
     const provider = http.createServer((request, response) => {
@@ -52,6 +57,17 @@ const startProvider = async (): Promise<Provider> => {
             url: request.url ?? '',
             authorization: request.headers.authorization
         });
+
+        // Simulated outage: consume one failure and answer 503 with a short body
+        // the route can surface (its retry treats this as a provider failure).
+        if (failures > 0) {
+            failures -= 1;
+            response.statusCode = 503;
+            response.statusText = 'Service Unavailable';
+            response.setHeader('Content-Type', 'application/json');
+            response.end('{"error":"warming up"}');
+            return;
+        }
 
         response.statusCode = status;
         response.statusText = statusText;
@@ -76,6 +92,9 @@ const startProvider = async (): Promise<Provider> => {
             status = nextStatus;
             statusText = nextStatusText;
             body = text;
+        },
+        failNext: (count) => {
+            failures = count;
         },
         close: () =>
             new Promise<void>((resolve, reject) => {
@@ -114,6 +133,7 @@ afterAll(async () => {
 
 beforeEach(() => {
     provider.reply({ object: 'list', data: [{ id: 'model-a' }, { id: 'model-b' }] });
+    provider.failNext(0);
     provider.requests.length = 0;
 });
 
@@ -196,6 +216,49 @@ describe('POST /api/models', () => {
         expect(await response.json()).toEqual({
             error: { message: "The provider's /models response did not include a model list." }
         });
+    });
+
+    it('retries a provider outage and returns the catalogue once it recovers', async () => {
+        // Two 503s, then the configured catalogue: the route must not surface the
+        // transient failures.
+        provider.failNext(2);
+
+        const response = await requestModels({
+            settings: { baseURL: provider.url, apiKey: 'client-key' }
+        });
+
+        expect(response.status).toBe(200);
+        expect(await response.json()).toEqual({ models: ['model-a', 'model-b'] });
+
+        // Two failed attempts plus the recovered one, with the same request each
+        // time (the lookup is an idempotent GET).
+        expect(provider.requests).toEqual([
+            { method: 'GET', url: '/v1/models', authorization: 'Bearer client-key' },
+            { method: 'GET', url: '/v1/models', authorization: 'Bearer client-key' },
+            { method: 'GET', url: '/v1/models', authorization: 'Bearer client-key' }
+        ]);
+    });
+
+    it('stops after ten attempts and reports the last provider failure as 502', async () => {
+        // Never recovers: the route must exhaust its ten-attempt budget and then
+        // answer with the final (already redacted) provider error.
+        provider.failNext(Number.POSITIVE_INFINITY);
+
+        const response = await requestModels({});
+
+        expect(response.status).toBe(502);
+        expect(await response.json()).toEqual({
+            error: { message: 'HTTP 503: {"error":"warming up"}' }
+        });
+
+        // Exactly ten attempts: no eleventh request reaches the provider.
+        expect(provider.requests).toEqual(
+            Array.from({ length: 10 }, () => ({
+                method: 'GET',
+                url: '/v1/models',
+                authorization: `Bearer ${SERVER_KEY}`
+            }))
+        );
     });
 
     it('rejects a blank base URL before contacting anything', async () => {

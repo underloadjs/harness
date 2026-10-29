@@ -5,8 +5,14 @@
 // webSearch (../tools/websearch/index.ts). Their metadata lives with their real
 // implementations; this file stays the single source for the session-bound
 // harness-owned set (toolRequest/toolCreate/todoManage/profileManage/
-// chapterManage/locationManage/agentDelegate), which is also what
-// harnesses/core.ts exports to the server with sessionBound: true.
+// chapterManage/locationManage/agentDelegate, plus the CONDITIONAL actionRequest
+// and threadFork added by N3), which is also what harnesses/core.ts exports to
+// the server with sessionBound: true.
+//
+// N3 conditional tools: actionRequest is registered only when `interaction` is
+// configured, threadFork only when `forks` is enabled. Like TOOL_CANCEL they are
+// exported individually and deliberately omitted from coreToolMetadata(), which
+// stays the always-registered set.
 //
 // WHY THIS FILE EXISTS (single source of truth)
 // ---------------------------------------------
@@ -47,6 +53,7 @@
 
 import type { ToolVisibility } from '../types';
 import { MAX_DISCOVERY_MATCHES } from './discovery';
+import { ACTION_REQUEST_LIMITS } from './action';
 
 // Wire names. They are part of the harness contract: a model (and an operator)
 // calls these exact strings, and the harness reserves them against every other
@@ -58,6 +65,11 @@ export const PROFILE_MANAGE_NAME = 'profileManage';
 export const CHAPTER_MANAGE_NAME = 'chapterManage';
 export const LOCATION_MANAGE_NAME = 'locationManage';
 export const AGENT_DELEGATE_NAME = 'agentDelegate';
+// N3 owner interaction and private history forks. Both are CONDITIONAL core
+// tools (registered only when interaction/forks are configured), like
+// toolCancel, so they are deliberately not part of coreToolMetadata().
+export const ACTION_REQUEST_NAME = 'actionRequest';
+export const THREAD_FORK_NAME = 'threadFork';
 // Targeted cancellation for background tool calls (T3/R4). Not part of
 // coreToolMetadata(): it is declared to the model ONLY while that agent actually
 // has calls in flight, so it costs no context on ordinary requests and a server
@@ -459,6 +471,105 @@ export const TOOL_CANCEL_METADATA: CoreToolMetadata = {
             }
         },
         required: ['callId'],
+        additionalProperties: false
+    }
+};
+
+// N3 owner interaction. The model MUST offer alternatives and a recommendation,
+// and the owner can ALWAYS answer with free text; there is deliberately no
+// `allowCustom` argument for the model to switch off. The description states the
+// recommendation contract because the model reads the description, not this file.
+export const ACTION_REQUEST_METADATA: CoreToolMetadata = {
+    name: ACTION_REQUEST_NAME,
+    description:
+        'Ask the owner a bounded question when the request is genuinely ambiguous and guessing would be unsafe or wasteful. Supply ONE question, 2-8 distinct options (each an id plus a short label and optional description), and `recommended` set to the id of the option you suggest. The owner may still answer with free text, so never assume your recommendation was accepted; the tool result tells you exactly which answer was chosen. Ask at most one focused question at a time, and never use this for a decision you can make safely yourself.',
+    tags: ['question', 'ask', 'clarify', 'owner', 'user', 'choice', 'interaction'],
+    visibility: 'core',
+    parameters: {
+        type: 'object',
+        properties: {
+            question: {
+                type: 'string',
+                minLength: 1,
+                maxLength: ACTION_REQUEST_LIMITS.question,
+                description:
+                    'The one question to ask. Be specific about the decision and why it matters. Maximum 4000 characters.'
+            },
+            recommended: {
+                type: 'string',
+                minLength: ACTION_REQUEST_LIMITS.optionIdMin,
+                maxLength: ACTION_REQUEST_LIMITS.optionIdMax,
+                pattern: '^[A-Za-z0-9_-]+$',
+                description:
+                    'Id of the option you recommend. MUST exactly match one of the supplied option ids; an unknown id is rejected (there is no automatic fallback).'
+            },
+            options: {
+                type: 'array',
+                minItems: ACTION_REQUEST_LIMITS.optionsMin,
+                maxItems: ACTION_REQUEST_LIMITS.optionsMax,
+                description:
+                    'Alternative answers, 2-8 entries with unique ids. The owner can still reply with free text.',
+                items: {
+                    type: 'object',
+                    properties: {
+                        id: {
+                            type: 'string',
+                            minLength: ACTION_REQUEST_LIMITS.optionIdMin,
+                            maxLength: ACTION_REQUEST_LIMITS.optionIdMax,
+                            pattern: '^[A-Za-z0-9_-]+$',
+                            description:
+                                'Stable id, 1-32 characters of letters, digits, "_" or "-". Unique within this request.'
+                        },
+                        label: {
+                            type: 'string',
+                            minLength: ACTION_REQUEST_LIMITS.optionLabelMin,
+                            maxLength: ACTION_REQUEST_LIMITS.optionLabelMax,
+                            description: 'Short human-visible label, 1-120 characters.'
+                        },
+                        description: {
+                            type: 'string',
+                            maxLength: ACTION_REQUEST_LIMITS.optionDescriptionMax,
+                            description:
+                                'Optional supporting detail, at most 500 characters.'
+                        }
+                    },
+                    required: ['id', 'label'],
+                    additionalProperties: false
+                }
+            }
+        },
+        required: ['question', 'recommended', 'options'],
+        additionalProperties: false
+    }
+};
+
+// N3 private history fork. The model names the task for the forked thread; the
+// runtime copies the owner transcript itself, so the model neither supplies nor
+// sees raw history here. `label` is display-only.
+export const THREAD_FORK_METADATA: CoreToolMetadata = {
+    name: THREAD_FORK_NAME,
+    description:
+        'Fork a private thread that reads the ENTIRE current conversation independently and returns one final summary. Use it when a self-contained investigation benefits from isolated reasoning without polluting this transcript. The new thread cannot see later messages and never receives this agent\'s tools automatically beyond the runtime grant. Pass the task as `input`; `label` is an optional short display name. The fork shares this process and any external side effects, so it is not a sandbox.',
+    tags: ['fork', 'thread', 'branch', 'history', 'summarize', 'research'],
+    visibility: 'core',
+    parameters: {
+        type: 'object',
+        properties: {
+            input: {
+                type: 'string',
+                minLength: 1,
+                description:
+                    'The complete task for the forked thread. It reads the full current history, so refer to that context rather than repeating it.'
+            },
+            label: {
+                type: 'string',
+                minLength: 1,
+                maxLength: ACTION_REQUEST_LIMITS.forkLabelMax,
+                description:
+                    'Optional short display label. Maximum 120 characters; it grants no authority.'
+            }
+        },
+        required: ['input'],
         additionalProperties: false
     }
 };

@@ -111,6 +111,17 @@ export const SHARED_TOOL_NAMES: readonly string[] = Object.freeze(Object.keys(SH
 // Instruct has no delegation tool while Research does. That difference is the
 // agent configuration, not a difference in the shareable toolbox. These are the
 // ONLY core tools the server marks sessionBound.
+//
+// N4 actionRequest is deliberately NOT in this descriptor list: whether it is
+// registered depends on host configuration (an owner answerer) that
+// `describeHarness` cannot see, and a static projection must not promise a tool a
+// direct `preset.create()` would not declare. It IS in the global core catalogue
+// (./core.ts), where the server can list it for the Tools tab and answer a clear
+// 404 in a session that lacks the capability.
+//
+// threadFork is appended unconditionally AFTER agentDelegate: forks are enabled by
+// default in the harness (N6), so every preset's runs declare it, but its runtime
+// registration follows agentDelegate and the descriptor must keep that order.
 export const CORE_TOOL_NAMES = [
     'toolRequest',
     'toolCreate',
@@ -148,7 +159,10 @@ export const coreToolNames = (
         ...CORE_PRESET_TOOL_NAMES.filter((name) => available.has(name)),
         ...CORE_ENVIRONMENT_TOOL_NAMES.filter((name) => available.has(name)),
         ...CORE_TOOL_NAMES,
-        ...(subagents.length > 0 ? ['agentDelegate'] : [])
+        ...(subagents.length > 0 ? ['agentDelegate'] : []),
+        // N6: always registered (forks default enabled), after agentDelegate in
+        // the runtime's registration order.
+        'threadFork'
     ];
 };
 
@@ -262,5 +276,13 @@ export const createToolboxHarness = (
         websearch: true,
         // The server's persistence observer rides along with progress; either may
         // be absent (CLI, direct preset creation).
-        report: { progress, ...(observer?.stateChange === undefined ? {} : { stateChange: observer.stateChange }) }
+        report: {
+            progress,
+            ...(observer?.stateChange === undefined ? {} : { stateChange: observer.stateChange })
+        },
+        // N4: the host owner answerer. It belongs on the TOP-LEVEL harness
+        // configuration (not inside `report`), because presence is what makes the
+        // runtime register actionRequest. A missing hook simply means this host has
+        // no answerer and the tool is not declared.
+        ...(observer?.interaction === undefined ? {} : { interaction: observer.interaction })
     });

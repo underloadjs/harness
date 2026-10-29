@@ -149,7 +149,8 @@ describe('agentDelegate', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
-            'agentDelegate'
+            'agentDelegate',
+            'threadFork',
         ]);
         expect(declaredNames(seenResearcher[0])).toEqual([
             'toolRequest',
@@ -157,7 +158,8 @@ describe('agentDelegate', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'threadFork'
         ]);
     });
 

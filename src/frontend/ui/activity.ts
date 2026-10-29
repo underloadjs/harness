@@ -15,6 +15,10 @@
 //   - `wakeup`                             → the agent resumed, so it is active
 //     again (the wake is the only frame that says "background work progressed").
 //
+// N3 interaction/branch frames are part of the same running turn: `action_request`
+// (paused on an answer) and `action_answer` keep the agent lit, `branch_start`
+// activates the branch agent, and `branch_end` ends only that branch.
+//
 // A parent may stay active while a delegated agent runs (the parent's last event
 // is the `tool_call` that started the delegation). Both spinning is the accepted
 // signal: both agents are part of the active turn.
@@ -81,6 +85,26 @@ export const applyActivity = (active: Set<string>, event: HarnessEvent): void =>
             active.delete(event.agent);
             return;
         }
+
+        // N3: the owner is asked a bounded question and the run is paused on that
+        // answer, so the agent has NOT gone idle. An answer (owner or automatic) is
+        // part of the same running turn and keeps the ring lit.
+        case 'action_request':
+        case 'action_answer':
+            active.add(event.agent);
+            return;
+
+        // N3: a fork/autoanswer branch is a nested invocation doing real work. Its
+        // own events also light the agent; `branch_start` is the earliest signal.
+        // `branch_end` is emitted by the REQUESTER (event.agent is the source), so
+        // it must NOT delete that agent's ring; the branch's own `done`/`error`
+        // settles the branch agent through the normal cases above.
+        case 'branch_start':
+            active.add(event.branch.agent);
+            return;
+
+        case 'branch_end':
+            return;
 
         case 'error':
             // Only this agent finished; a delegated sibling keeps its ring.
