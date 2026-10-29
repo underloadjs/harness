@@ -1,9 +1,10 @@
 # Typecheck, test, and build the package and the harness app.
 #
-# There is no static deployment any more: the UI is served by the harness server
-# (`yarn serve`), which owns sessions and executes the harness. This workflow
-# verifies that the library, the server tests, the UI tests, and the client
-# bundle all compile.
+# There is no static deployment any more: the normal host is the @underload/service
+# gateway (`yarn start-service`), which discovers the harness endpoint modules.
+# The UI is a separate Vite launch (`yarn dev:frontend`); the optional standalone
+# API launcher is `yarn dev:server`. This workflow verifies that the library, the
+# server tests, the UI tests, and the client bundle all compile.
 
 name: CI
 
@@ -35,13 +36,13 @@ jobs:
             - name: Test
               run: npm test
 
-            # The UI suite is a separate vitest config (jsdom, playground/), so the
-            # package's default `test` script cannot cover it.
+            # The UI suite is a separate vitest config (jsdom, src/frontend/), so
+            # the package's default `test` script cannot cover it.
             - name: Test UI
-              run: npm run test:playground
+              run: npm run test:frontend
 
             - name: Build library
               run: npm run build
 
             - name: Build UI
-              run: npm run build:playground
+              run: npm run build:frontend

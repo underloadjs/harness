@@ -40,9 +40,23 @@
 //   remove               → { removed, counts }
 
 import { HarnessError } from '../util';
-import type { LocationItem, LocationParameters, RecordAction, Tool } from '../types';
+import type {
+    LocationItem,
+    LocationParameters,
+    LocationStoreState,
+    RecordAction,
+    Tool
+} from '../types';
 import { LOCATION_MANAGE_METADATA } from './metadata';
 import { tool } from './tool';
+import {
+    readSnapshotArray,
+    readSnapshotId,
+    readSnapshotIdCounter,
+    readSnapshotKeys,
+    readSnapshotRecord,
+    readSnapshotString
+} from './snapshot-validation';
 
 // The accepted actions, in the order the error messages and schema advertise
 // them. Identical for all three record tools.
@@ -95,9 +109,14 @@ export type LocationResult = LocationListResult | LocationChangeResult;
 // What createLocationTool() returns. Declared here (rather than in ../types)
 // because the R9 bounded shape is owned by this module while ../types is shared
 // with units still editing the same file; see the final report for the migration.
+//
+// `snapshot`/`restore` (R3a) are the persistence hooks: a JSON-shaped copy out and
+// a fully validated replacement in. They never expose the live arrays.
 export type LocationToolset = {
     tool: Tool<LocationParameters, LocationResult>;
     reset: () => void;
+    snapshot: () => LocationStoreState;
+    restore: (state: unknown) => void;
 };
 
 // Arrays are rejected: valid JSON, but it cannot carry an `action`.
@@ -182,6 +201,51 @@ const paginate = (
     if (page.hasMore) page.nextOffset = consumed;
 
     return { locations, page };
+};
+
+// Validate one persisted location store and return a DEEP COPY. Mirrors
+// readTodoStoreState: ids are unique decimal strings, name/description stay
+// non-empty, notes may be empty, the record cap holds, and nextId cannot collide.
+export const readLocationStoreState = (value: unknown): LocationStoreState => {
+    const root = readSnapshotRecord(value, 'location state');
+    readSnapshotKeys(root, ['items', 'nextId'], 'location state');
+
+    const entries = readSnapshotArray(root.items, 'location state.items');
+
+    if (entries.length > LOCATION_MAX_RECORDS) {
+        throw new HarnessError(
+            `location state holds ${entries.length} locations; the maximum is ${LOCATION_MAX_RECORDS}.`
+        );
+    }
+
+    const items = entries.map((entry, index) => {
+        const label = `location state.items[${index}]`;
+        const record = readSnapshotRecord(entry, label);
+        readSnapshotKeys(record, ['id', 'name', 'description', 'notes'], label);
+
+        return {
+            id: readSnapshotId(record.id, `${label}.id`),
+            name: readSnapshotString(record.name, `${label}.name`, {
+                min: 1,
+                max: LOCATION_MAX_NAME
+            }),
+            description: readSnapshotString(record.description, `${label}.description`, {
+                min: 1,
+                max: LOCATION_MAX_TEXT
+            }),
+            notes: readSnapshotString(record.notes, `${label}.notes`, {
+                max: LOCATION_MAX_TEXT
+            })
+        };
+    });
+
+    const nextId = readSnapshotIdCounter(
+        items.map((item) => item.id),
+        root.nextId,
+        'location state'
+    );
+
+    return { items, nextId };
 };
 
 // The per-harness location list. Ids are decimal strings, monotonic for the life
@@ -416,6 +480,18 @@ export const createLocationTool = (): LocationToolset => {
         reset: () => {
             items.splice(0, items.length);
             nextId = 1;
+        },
+        // Copy out so a snapshot never aliases live state.
+        snapshot: () => ({
+            items: items.map(copyLocation),
+            nextId
+        }),
+        // Validate into copies first, then replace the closure state in one step.
+        restore: (state: unknown) => {
+            const restored = readLocationStoreState(state);
+
+            items.splice(0, items.length, ...restored.items);
+            nextId = restored.nextId;
         }
     };
 };

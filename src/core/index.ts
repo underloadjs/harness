@@ -3,7 +3,10 @@
 //   agent()      — the brain. One turn at a time (`stream` / `turn`).
 //   tool()       — an action the model can request, and that you can call directly.
 //   searchTools() — rank a tool catalogue against capability tags (what toolRequest
-//                  uses). Pure, so tooling and UIs can reuse the ranking.
+//                  uses). Pure, so tooling and UIs can reuse the ranking. Optional
+//                  `declared` core tools are reported as `alreadyAvailable` (never
+//                  enabled), so a query naming a tool the caller already has does
+//                  not come back as "no match".
 //   createDynamicTool() — validate + compile a tool from an async function body.
 //                  The primitive behind the harness's toolCreate tool.
 //   createTodoTool() — the harness's per-session todoManage state, as a factory.
@@ -58,6 +61,15 @@ export { createTodoTool } from './todo';
 export { createProfileTool } from './profile';
 export { createChapterTool } from './chapter';
 export { createLocationTool } from './location';
+// R3a persistence: schema/version + the pure snapshot reader. The store readers
+// live in their own modules (todo/profile/chapter/location) because each owns its
+// invariants; harness.ts is the only caller of the harness-wide reader.
+export {
+    HARNESS_SNAPSHOT_VERSION,
+    cloneToolCreation,
+    readHarnessMessages,
+    readHarnessSnapshot
+} from './snapshot';
 export {
     TOOL_UI_LIMITS,
     normalizeToolUiPanels,

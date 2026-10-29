@@ -3,8 +3,17 @@
     // Extends the package tsconfig but:
     // - emits ONLY .d.ts into dist/ (JS comes from `vite build`);
     // - restricts the root to src/ so only the public source tree is described;
-    // - excludes tests, root-level tooling configs, and the playground, which are
-    //   never part of the published package.
+    // - excludes tests and the development-only launchers, which are never part of
+    //   the published package.
+    //
+    // Everything the package ships now lives under src/, so the old top-level
+    // exclusions (playground/server/cli/harnesses/endpoint) are gone. The src tree
+    // mirrors the published entries:
+    //   src/index.ts -> dist/index.d.ts            (Node root)
+    //   src/browser.ts -> dist/browser.d.ts        (browser root)
+    //   src/server/index.ts -> dist/server/index.d.ts
+    //   src/frontend/index.ts -> dist/frontend/index.d.ts
+    //   src/shared/index.ts -> dist/shared/index.d.ts
     "extends": "./tsconfig.json",
     "compilerOptions": {
         "emitDeclarationOnly": true,
@@ -19,12 +28,22 @@
         "**/*.test.tsx",
         "vite.config.ts",
         "vitest.config.ts",
-        "playground",
-        "server",
-        "cli",
-        "harnesses",
-        // The service-hosted endpoint modules (discovered by @underload/service)
-        // are application wiring, never part of the published library.
-        "endpoint"
+        // Root entries are emitted SEPARATELY (tsconfig.entries.json). Keeping them
+        // out of this program is what stops tsc from collapsing every inferred type
+        // reference onto `import("../..")` (the Node root), which would drag the
+        // server tree — and its `node:http` types — into the library and browser
+        // declaration graphs. See tsconfig.entries.json for the full explanation.
+        "src/index.ts",
+        "src/browser.ts",
+        // Dev launchers + app configs: the frontend one imports `vite`, the server
+        // one only wraps the explicit standalone API, and neither is a published
+        // module, so no declaration is emitted for them.
+        "src/server/dev.ts",
+        "src/frontend/vite.config.ts",
+        "src/frontend/vitest.config.ts",
+        // The application shell (imports styles.css and mounts the DOM on load).
+        // It is reachable from index.html only, never from a published barrel, so
+        // keeping it out of the declaration tree keeps CSS out of dist/*.d.ts.
+        "src/frontend/main.ts"
     ]
 }

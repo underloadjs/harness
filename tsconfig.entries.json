@@ -1,0 +1,43 @@
+// Declaration emit for the two ROOT entries only.
+//
+// WHY THIS IS SEPARATE FROM tsconfig.build.json
+// A `.d.ts` tree emitted from one program will reference types through the module
+// tsc considers canonical — and tsc prefers the shortest re-export path. Because
+// `src/index.ts` sits at the root of `src/`, every inferred type in the library
+// (e.g. `Tool` in `src/tools/files/*.ts`) collapsed to `import("../..")`, i.e. the
+// NODE ROOT. `dist/harness.d.ts` and `dist/tools/*.d.ts` then transitively reached
+// `dist/server/**` (and its `node:http` types) — which is exactly what the browser
+// entry must not do, and what makes a browser `customConditions: ["browser"]`
+// consumer fail.
+//
+// So the inner tree is emitted WITHOUT the root entries (see tsconfig.build.json's
+// `exclude`), which makes tsc pick the declaring module (`../../types`,
+// `../../harness`). The two entries are then emitted here, from a program that still
+// contains the whole graph, and only their own `.d.ts` files are copied into `dist/`.
+// Entry declarations are pure re-export barrels, so they carry no inferred type that
+// could drag the Node root back in.
+//
+// `scripts/build-declarations.mjs` runs both emits, copies the two files, and then
+// fixes the relative specifiers for NodeNext (scripts/fix-declaration-specifiers.mjs).
+//
+// Cross-references:
+//   - ./tsconfig.build.json           — inner declaration emit (excludes the entries)
+//   - ../scripts/build-declarations.mjs — orchestration + copy
+{
+    // tsconfig.json (not build) is the base: it does not exclude the entry files,
+    // and `files` takes precedence for what this program must contain.
+    "extends": "./tsconfig.json",
+    "compilerOptions": {
+        "emitDeclarationOnly": true,
+        "declaration": true,
+        "rootDir": "src",
+        // Staging directory only; build-declarations.mjs copies index.d.ts and
+        // browser.d.ts into dist/ and removes this folder.
+        "outDir": ".entries"
+    },
+    "files": ["src/index.ts", "src/browser.ts", "src/frontend/vite-env.d.ts"],
+    // `include` is inherited from tsconfig.json and would add every root-level .ts
+    // (vite.config.ts, vitest.config.ts) to the program — outside rootDir (TS6059).
+    // An empty include combined with `files` leaves exactly the two entries.
+    "include": []
+}

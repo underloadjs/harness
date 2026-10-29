@@ -73,11 +73,14 @@ export type CoreToolMetadata = {
 
 // Discovery. The description itself carries the R7 contract - at most five
 // matches, and `remaining` as the count of further ones - because the model reads
-// the description, not this file.
+// the description, not this file. It also explains direct core calls and the
+// `alreadyAvailable` report (R1): a query naming an already-declared capability
+// (agentDelegate in a harness with subagents is the motivating case) must not look
+// like a miss, and those tools need no enabling.
 export const TOOL_REQUEST_METADATA: CoreToolMetadata = {
     name: TOOL_REQUEST_NAME,
     description:
-        `Find tools by capability tag and enable them. The searchable catalogue holds the list, shell, git, syntax, time, text, notes, and other tools; the everyday file tools (fileRead, fileWrite, fileEdit, fileGlob) are already available, as is webSearch when the host configured it. Pass the tags you need (for example ["files", "list"] or ["shell"] or ["git", "diff"]) and up to ${MAX_DISCOVERY_MATCHES} of the closest matches become available on your next turn. The result's "remaining" field counts any further tools that matched but were not listed, so add a more specific tag to drill into the rest. Call this before concluding that something cannot be done.`,
+        `Find tools by capability tag and enable them, and check which tools you already have. The searchable catalogue holds the list, shell, git, syntax, time, text, notes, and other tools; the everyday file tools (fileRead, fileWrite, fileEdit, fileGlob) are already available, as is webSearch when the host configured it. Pass the tags you need (for example ["files", "list"] or ["shell"] or ["git", "diff"]) and up to ${MAX_DISCOVERY_MATCHES} of the closest matches become available on your next turn. The result's "remaining" field counts any further tools that matched but were not listed, so add a more specific tag to drill into the rest. The "alreadyAvailable" list names the tools you can call directly right now without enabling anything - for example agentDelegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. Call this before concluding that something cannot be done.`,
     tags: ['discovery', 'tools', 'catalogue'],
     visibility: 'core',
     parameters: {
@@ -393,7 +396,7 @@ export const agentDelegateMetadata = (subagents: readonly string[] = []): CoreTo
             listed.length > 0
                 ? `Delegate a self-contained task to a configured subagent and return its answer. Subagents: ${listed.join(', ')}. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.`
                 : 'Delegate a self-contained task to a configured subagent and return its answer. Only the primary agent can delegate, subagents cannot delegate further, and a harness registers this tool only when it has subagents - a session whose harness has none answers 404.',
-        tags: ['agents', 'delegate', 'subagent', 'team'],
+        tags: ['agents', 'delegate', 'delegation', 'subagent', 'team'],
         visibility: 'core',
         parameters: {
             type: 'object',

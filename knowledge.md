@@ -19,7 +19,7 @@ Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harn
    `src/core/chapter.ts`, `src/core/location.ts`, and `src/transport/openai.ts` +
    `src/transport/models.ts`
 3. Check `src/tools/catalogue.ts` / `src/tools/lazy.ts` when touching presets
-4. Check `server/`, `cli/`, `harnesses/`, and `playground/` for the app contract
+4. Check `src/server/`, `src/frontend/`, and `src/shared/` for the app contract
 5. Update the "Last verified" date
 6. Keep the "Not built yet" list honest — it is the roadmap
 
@@ -49,7 +49,7 @@ src/
     tool.test.ts
     discovery.ts        tag ranking behind toolRequest
     discovery.test.ts
-    metadata.ts         core tool metadata (name/description/tags/schema) — one copy for harness.ts, the record factories, and harnesses/core.ts
+    metadata.ts         core tool metadata (name/description/tags/schema) — one copy for harness.ts, the record factories, and src/harnesses/core.ts
     creation.ts         validate + compile a tool from an async function body
     creation.test.ts
     todo.ts             per-harness session todo list (factory + reset hook)
@@ -63,7 +63,10 @@ src/
   agents/
     index.ts            trusted AgentProfile registry + agentInstruction()
     types.ts            AgentProfile (name, title, description, instruction, guidelines)
-    instruct.ts / research.ts / summarizer.ts / workspace.ts / demo.ts / flaky.ts
+    instruct.ts / research.ts / workspace.ts / reviewer.ts / planner.ts
+                        the five real roles (general, researcher, coder, reviewer, planner)
+    summarizer.ts       the delegated condenser (subagent in every real preset)
+    demo.ts / flaky.ts  fixture profiles (scripted demo; recoverable-failures example)
     agents.test.ts      pinned ids/instructions + guideline composition
   transport/
     index.ts            barrel: openAICompatible, listModels, ModelListError
@@ -112,58 +115,116 @@ src/
     index.ts            every public type
 ```
 
-The published package is `src/` only. The application built on it sits outside that
-tree and is never emitted to `dist/`:
+The published package bundles five entries, all under `src/`: the library
+(`harness.ts`), the Node root (`index.ts`), the browser root (`browser.ts`), and the
+per-layer barrels (`server/index.ts`, `frontend/index.ts`, `shared/index.ts`). The
+application layers are never separate top-level folders:
 
 ```
-cli/
-  index.ts              argv parsing, one-shot, interactive, --serve
-  render.ts             terminal rendering of HarnessEvent
-server/
-  index.ts              standalone node:http server (API + static UI)
+src/index.ts            Node root: library + shared + server + client
+src/browser.ts          browser root: library + shared + client
+src/shared/
+  origin.ts             loopback/same-origin rules (inbound gate + outbound gate)
+src/server/
+  index.ts              server barrel -> @underload/harness/server
+  start.ts              startHarnessServer: standalone node:http server (explicit)
   api.ts                transport-neutral dispatcher: routes, body policy, bootstrap
   handler.ts            Node adapter: /api prefix, X-Harness-Client gate, SSE writer
   service.ts            @underload/service adapter: /v1/harness, Origin gate, raw SSE
-  runtime.ts            lazy shared store/catalogue for the service routes
-  sessions.ts           in-memory session store: authoritative turns + FIFO task
-                        queue, watchers, single-flight gate
+  runtime.ts            lazy shared store/catalogue for the service routes, keyed by root
+  persistence.ts        durable database: versioned JSON DTO, atomic write, validation
+  sessions.ts           authoritative turns + FIFO queue, watchers, single-flight gate,
+                        core-snapshot write-through and restart recovery
+  dev.ts                explicit standalone API launcher (no Vite/UI)
   environment.ts        package-root .env loader (Node entry points only)
   config.ts             provider defaults + mergeSettings credential rule
   protocol.ts           client/server wire types (turns, queue, stream items)
-  static.ts             playground/dist serving
-endpoint/
-  harness/
-    service-route.ts        /v1/harness/*  (discovered by @underload/service)
+  package-root.ts       package root discovered by walking to package.json (build-layout free)
+  static.ts             src/frontend/dist serving
+  cli/
+    index.ts            argv parsing, one-shot, interactive, --serve
+    render.ts           terminal rendering of HarnessEvent
+  endpoint/harness/     discovered by @underload/service
+    service-route.ts        /v1/harness/*
     service-route-root.ts   /v1/harness    (bare bootstrap document)
-harnesses/
-  index.ts              createToolCatalogue: runtime catalogue for CLI and server
-  core.ts               core-tool catalogue entries (sessionBound) for the server (R8)
-  presets.ts            the five built-ins, assembled from src/agents profiles
-  registry.ts           in-memory registry: create/patch, aliases, validation, agentModels (R9)
-  descriptor.ts         describeHarness/describeAgent: the single wire projection
-  toolbox.ts            shared toolbox + createProfiledHarness/createToolboxHarness
-  tools.ts              timeNow, textCount, diceRoll, noteSearch, textSummarize, testFlaky
-  websearch.ts          always-listed webSearch entry (configured or not)
-  demo.ts               scripted offline transport
-  types.ts              RunnerSettings, HarnessPreset, CatalogueEntry, availability
-playground/
-  dev.ts                starts the API and Vite with an /api proxy
-  src/main.ts           UI client: sessions, queue observer, SSE, direct tool calls
-  src/api.ts            root resolution (query/injected/build/api) + fetch + SSE parser
-  src/ui/turns.ts       linear turn timeline: completed grey, active green, queued neutral
-  src/ui/markdown.ts    safe GFM (marked + DOMPurify) + highlight.js fenced code (R5)
+  harnesses/
+    index.ts            createToolCatalogue: runtime catalogue for CLI and server
+    core.ts             core-tool catalogue entries (sessionBound) for the server (R8)
+    presets.ts          the seven built-ins (5 real roles + 2 fixtures), legacy defaults,
+                        and teamOf() — assembled from src/agents profiles
+    registry.ts         in-memory registry: create/patch, aliases, validation, agentModels (R9),
+                        restore policy (refresh unmodified shipped defaults, T3)
+    descriptor.ts       describeHarness/describeAgent: the single wire projection
+    toolbox.ts          shared toolbox + createProfiledHarness/createToolboxHarness
+    tools.ts            timeNow, textCount, diceRoll, noteSearch, textSummarize, testFlaky
+    websearch.ts        always-listed webSearch entry (configured or not)
+    demo.ts             scripted offline transport
+    types.ts            RunnerSettings, HarnessPreset, CatalogueEntry, availability
+src/frontend/
+  index.ts              client barrel -> @underload/harness/frontend (no CSS, no shell)
+  main.ts               app shell: imports styles.css, mounts the DOM (NOT exported)
+  vite.config.ts        Vite dev/build/preview; /api proxy to the service on :5000
+  api.ts                root resolution (query/injected/build/api) + fetch + SSE parser
+  contract.ts           wire validation/presentation helpers
+  ui/turns.ts           linear turn timeline: completed grey, active green, queued neutral
+  ui/markdown.ts        safe GFM (marked + DOMPurify) + highlight.js fenced code (R5)
 ```
 
-`server/` and `cli/` import `src/harness.ts` relatively (they are inside the
-package) and re-use the public harness surface; they add no API to the published
-package. `playground/` imports only the wire types from `server/protocol.ts` and
-never imports the harness, which is why the old `node:` stubs are gone.
+`src/server` and `src/server/cli` import `src/harness.ts` relatively (they are
+inside the package) and re-use the public harness surface. `src/frontend` imports
+the wire types **type-only** from `src/server/protocol.ts` (erased at build time)
+and takes its only runtime cross-tree dependency from `src/shared/origin.ts`, so the
+client never loads server code — which is why the old `node:` stubs are gone.
 
 Tests are colocated with the module they cover, and they import **only** from
 `@underload/harness` — never a relative path. That keeps them honest about the
 public surface and free of `../` chains. `vitest.config.ts` aliases the specifier
 to `src/harness.ts` (and tsconfig `paths` mirrors it), so `vitest run` needs no
-build and can never accidentally test `dist/`.
+build and can never accidentally test `dist/`. Application-layer tests use the
+`/server`, `/frontend` and `/shared` aliases; the jsdom client suite runs with
+`src/frontend/vitest.config.ts` (`yarn test:frontend`).
+
+**Declaration contract (R1 types).** The shipped `.d.ts` tree must satisfy two
+independent constraints:
+
+1. *NodeNext-clean specifiers.* `tsc` preserves the extensionless source specifiers
+   (`./harness`, `./ui/turns`), which Node ESM — and therefore
+   `moduleResolution: node16|nodenext` — rejects with TS2834. `scripts/build-declarations.mjs`
+   post-processes every emitted declaration to the `.js` name TypeScript itself
+   prescribes (`./harness.js`, `./harnesses/index.js`); an unresolvable specifier
+   fails the build instead of shipping.
+2. *Environment-matched types.* The root's `browser` condition resolves
+   `dist/browser.d.ts` (library + shared + client) and the Node/`types` path resolves
+   `dist/index.d.ts` (plus the server). `src/index.ts` and `src/browser.ts` are
+   emitted by a **separate** tsc program (`tsconfig.entries.json`): in one program,
+   tsc references inferred types through the shortest re-export path — the Node root
+   — which dragged `dist/server/**` (`node:http`) into the library and browser
+   declaration graphs. The entry declarations are pure re-export barrels, so they
+   carry no such reference.
+
+`scripts/check-package-types.mjs` (`yarn test:package`, part of `prepublishOnly`)
+verifies the built artifact: every export target is inside `files`, the tree is
+already specifier-fixed, the browser declaration closure reaches neither the Node
+root nor a `node:` built-in, and real NodeNext + `customConditions: ["browser"]`
+consumers type-check against a copied, published shape of the package.
+
+`scripts/check-package-runtime.mjs` (`yarn test:package:runtime`) runs the built
+artifact instead of only reading it: `loadEnvironmentFile` against a fixture (the
+dotenv path), `createHarnessRuntime({ root })` writing its database under an absolute
+temp root, and `startHarnessServer({ databaseRoot, port: 0 })` serving health, the
+harness index and a session POST before closing. It exists because the bundle is a
+browser-platform lib build: bare `require('fs')`/`require('path')` from the bundled
+CommonJS `dotenv` were replaced by an empty `__vite-browser-external` stub, so the
+built `loadEnvironmentFile()` threw `path.resolve is not a function` while imports,
+types and every source test still passed. `vite.config.ts` now externalises the bare
+Node builtins and `dotenv` (declared in `dependencies`); only the server entry
+imports it, so the browser graph is unchanged.
+
+Browser scope of the tools is a documented limitation, not a target: the browser
+entry's static graph is Node-free, but the lazy preset chunks (`fileRead`, `commandRun`,
+`gitDiff`, `syntaxCheck`, …) contain `node:fs`/`node:vm`/`node:child_process` because
+those tools are Node-only by design. Calling them in a browser fails at the dynamic
+import; importing the library, shared or client entries does not load them.
 
 A consequence worth knowing: a symbol that is not exported from the root barrel
 cannot be unit-tested. That is intentional — it is the pressure that keeps the
@@ -352,8 +413,10 @@ mean a second catalogue entry the model could pick by mistake.
 
 What is deliberately **not** renamed:
 
-- **harness / preset ids** — `instruct`, `research`, `workspace`, `demo`, `flaky`
-  are identities, not tool names, and sessions/aliases reference them;
+- **harness / preset ids** — `instruct`, `research`, `workspace`, `reviewer`,
+  `planner`, `demo`, `flaky` are identities, not tool names, and sessions/aliases
+  reference them. `workspace` keeps its id while its visible title is "Coder", so
+  every saved session and bookmark still resolves;
 - **agent ids** — `summarize`'s delegated half still targets the `summarizer` agent;
 - **the `websearch` harness configuration field** — it names the *feature*, not the
   tool (`websearch: true | WebsearchConfiguration`), so renaming it would break
@@ -403,11 +466,12 @@ reserved (`harness()` throws if the config or a preset already has `toolRequest`
   `core/metadata.ts` (one copy the server catalogue also reads); the description
   itself states the five-match cap and the `remaining` count.
 - Result: `{ enabled, tools: [{ name, description, tags }], remaining,
-  unmatchedTags?, availableTags?, truncated? }`. `enabled` doubles as the ranking
-  order.
-- `searchTools(tools, tags, limit?)` (`core/discovery.ts`) is the pure ranking and
-  is exported from the package root so a UI or a test can reuse it. Only
-  `visibility: 'searchable'` tools are candidates — core tools are already declared.
+  unmatchedTags?, availableTags?, offset?, truncated?, alreadyAvailable? }`.
+  `enabled` doubles as the ranking order.
+- `searchTools(tools, tags, limit?, offset?, options?)` (`core/discovery.ts`) is
+  the pure ranking and is exported from the package root so a UI or a test can
+  reuse it. Only `visibility: 'searchable'` tools are candidates for ENABLING —
+  core tools are already declared.
 - Scoring is **OR-style, best-match**: each query tag scores a tool (exact tag 4,
   tag prefix 3, tag contains query 2, query contains tag 2, name/description
   contains query 1), and the tool's rank is its **best single-tag score**. More
@@ -418,9 +482,17 @@ reserved (`harness()` throws if the config or a preset already has `toolRequest`
   a count, never names — and `truncated: true` mirrors it for older clients.
   Results sort by best score, then hit count, then name, so which five survive is
   deterministic. A broad tag is refined (`["files"]` then `["files", "write"]`),
-  which is how the remaining searchable tools are reached without pagination.
-  Core tools never appear in results: the four file tools and a configured
-  `webSearch` are already declared, so a `["files"]` query only finds `fileList`.
+  and repeating an IDENTICAL query advances to the next page (`offset` reports
+  where it starts), so the omitted tail is reachable without a name list.
+- `alreadyAvailable` reports CORE tools the CALLER already has declared
+  (`options.declared`, supplied by the harness from `visibleCoreTools`). This is a
+  report only: they are never enabled, never counted against the cap, and their
+  query tags are added to the matched set so `unmatchedTags` cannot claim an
+  already-callable capability is absent. Core matching is deliberately stricter:
+  wire NAME and TAGS only — never the description, whose everyday words would
+  match almost every query. The caller's view is what makes it honest:
+  `agentDelegate` is never advertised to a subagent, and absent entirely in a
+  one-agent harness.
 - `availableTags` (the sorted vocabulary of searchable tools) is returned when
   nothing matched or when the query was empty, so a failed query teaches the model
   the real tags.
@@ -467,7 +539,7 @@ const { tool, reset } = createTodoTool();   // fresh list + id counter
 - `src/harness.ts` registers the factory's tool under the exact name `todoManage`,
   marks it core (declared to every agent with no discovery), adds it to
   `RESERVED_TOOL_NAMES`, and calls the returned `reset()` from `harness.reset()`.
-  Because `server/sessions.ts` creates one harness per session, todos are isolated
+  Because `src/server/sessions.ts` creates one harness per session, todos are isolated
   per session and shared by the primary and its subagents within one harness.
 - No persistence, no UI panel, no HTTP endpoint, no priorities/statuses. The
   tool-call UI renders the JSON result like any other tool.
@@ -716,7 +788,7 @@ tool. Keys live in the tool closure: two harnesses never share one, and nothing
 enters the schema, arguments, result, events, `RunnerSettings`, the UI, or a client
 payload.
 
-**Catalogue visibility (C1).** `harnesses/websearch.ts` always produces an entry
+**Catalogue visibility (C1).** `src/harnesses/websearch.ts` always produces an entry
 for the direct-call catalogue. `createWebSearchCatalogueEntry()` calls the factory
 at run time and returns `{ entry, tool? }`:
 
@@ -725,7 +797,7 @@ at run time and returns `{ entry, tool? }`:
 | `EXA_API_KEY` / `TAVILY_API_KEY` present | entry + executable tool; `availability: { state: 'available', environment: [...] }` |
 | no usable key | entry with `WEB_SEARCH_METADATA` and no `tool`; `availability: { state: 'unconfigured', environment: [...], hint }` |
 
-`harnesses/index.ts` exports `createToolCatalogue(options?)` instead of module-level
+`src/server/harnesses/index.ts` exports `createToolCatalogue(options?)` instead of module-level
 `catalogue`/`allTools`. The factory is what makes startup ordering safe: the server
 and CLI load `.env` after their imports, then build the catalogue, so the key is
 captured once for the handler's lifetime (never at module evaluation). `websearch`
@@ -781,18 +853,19 @@ either.
 `execute`. No SDK: both adapters use `fetch`. A failed import is a plain tool error
 and is not cached, so a later call can retry.
 
-**Application wiring:** the live presets (`instruct`, `research`, `workspace`)
-pass `websearch: true`, so the CLI and server read search keys from their own
-process environment; the shared-factory `flaky` example opts in too, while
-`demo` stays offline. `flaky`'s preset metadata declares `environmentTools:
-['webSearch']` so its descriptor matches what the factory registers.
+**Application wiring:** the real presets (`instruct`, `research`, `workspace`,
+`reviewer`, `planner`) pass `websearch: true`, so the CLI and server read search
+keys from their own process environment; the shared-factory `flaky` example opts in
+too, while `demo` stays offline. `flaky`'s preset metadata declares
+`environmentTools: ['webSearch']` so its descriptor matches what the factory
+registers.
 This is why no search key was added to `RunnerSettings` or the Endpoint panel. The
 app entry points preload the package-root `.env` into `process.env` (see “CLI,
 server, and UI”); the library still has no autoload and importing it never reads a
 file.
 
 **Preset descriptors follow the catalogue.** Those live presets also declare
-`environmentTools: ['webSearch']` in `harnesses/presets.ts` — metadata only, no
+`environmentTools: ['webSearch']` in `src/harnesses/presets.ts` — metadata only, no
 harness is built to answer a listing. `describeHarness` appends such a name to the
 preset's `tools` only when the runtime catalogue holds an executable definition for
 it, and includes it in `coreTools` under the same condition (R18). A keyless host
@@ -845,10 +918,11 @@ const tool = writer.toolCreate({
   resolved.
 - **Registered searchable and enabled immediately**, so the next turn can call it
   without a second toolRequest round. It stays in the searchable catalogue afterwards.
-- **Session-local, no persistence.** Created tools live in that harness's registry
-  only; nothing is written to disk, two harnesses cannot see each other's tools,
-  and a restart starts clean. `reset()` keeps them registered but clears the
-  enabled set (discovery is conversation state).
+- **Session-local.** Created tools live in that harness's registry only; two
+  harnesses cannot see each other's tools. A server with a database root persists
+  their SOURCES in the session's core snapshot and recompiles them on restore
+  (`reset()` keeps the registry and clears only the enabled set); without a root a
+  restart starts clean.
 - **No sandbox.** The body is compiled with the host realm's `Function`
   constructor and runs with the process's full permissions — the same trust model
   as `commandRun`. Nothing here isolates filesystem, network, or processes.
@@ -884,7 +958,37 @@ const team = harness({
 - `ctx.run(name, input)` inside a tool still runs a full sibling turn; it is the
   tool-side path (used by the `textSummarize` harness tool) and is not model-visible
   delegation.
+
+### Shipped roles and their teams (T3)
+
+`src/server/harnesses/presets.ts` derives every real preset's allowlist from ONE
+list (`SPECIALIST_AGENT_NAMES`) with `teamOf(primary)`: the other four real roles,
+then `summarizer`. The five primaries are `instruct`, `research` (title
+"Researcher"), `workspace` (title "Coder"), `reviewer`, and `planner`. Consequences:
+
+- every real preset registers `agentDelegate` (there is always a target), and the
+  Planner's `research`/`workspace`/`reviewer` targets exist by id;
+- a subagent never re-delegates, so every profile's delegation guideline is
+  conditional on BOTH running as the primary AND this harness declaring
+  `agentDelegate` to it, and tells a subagent/lone agent to do the work itself;
+- `demo` (scripted) and `flaky` (failure example) stay fixtures with no subagents
+  and are listed after the real presets; the CLI and UI both select `instruct`
+  first (the CLI default is the live role, never the demo).
+
+### Persistence restore policy (T3)
+
+`restoreHarnessRegistry()` replays saved rows, but a saved BUILT-IN row whose
+executable fields still match `LEGACY_PRESET_DEFINITIONS` (the previous shipped
+defaults) is refreshed to the current template instead of pinning the old one. It is
+the provable case: any executable difference (team, tools, environment tools,
+template, non-empty `agentModels`) means the operator customised the row, and a
+customised row is replayed verbatim. An edited title/description survives a refresh.
+Frozen sessions never depend on this: `SessionStore.restoreSession` rebuilds from
+the session's own `preset` record, so an old conversation keeps the team it started
+with.
+
 ---
+
 
 ## harness
 
@@ -974,8 +1078,8 @@ throw:
 - more than **maxIterations** tool rounds without an answer. Defaults to **16**
   (the library guard); `harness({ maxIterations })` raises or lowers it and is
   validated at construction as a positive safe integer. The application presets
-  pass 1000 for real sessions; the offline `demo` keeps the default. The bound is
-  per agent run, so a delegated subagent gets its own budget.
+  pass 1000 for real sessions; the offline `demo` keeps the library default of 16.
+  The bound is per agent run, so a delegated subagent gets its own budget.
 
 Multi-tool turns are executed **sequentially in model order**, and every call
 gets a matching `tool` message so strict providers never see a dangling
@@ -1120,7 +1224,14 @@ type ToolSearchResult = {
     remaining: number;                  // matched but excluded by the five-match cap
     unmatchedTags?: string[];           // query tags that matched nothing
     availableTags?: string[];           // vocabulary, when nothing matched
+    offset?: number;                    // start of a later page (progressive discovery)
     truncated?: boolean;                // remaining > 0 (compatibility mirror)
+    alreadyAvailable?: { name: string; description: string; tags: string[] }[];
+                                        // core tools the caller already has; reported, never enabled
+};
+
+type ToolSearchOptions = {
+    declared?: readonly Tool[];         // the caller-visible core set (harness: visibleCoreTools)
 };
 ```
 
@@ -1151,10 +1262,10 @@ normalizer and the exported `TOOL_UI_LIMITS`.
   serializes only `ui.content`; the envelope/panels never enter the transcript or
   a transport request.
 - **The event carries it.** `tool_result.ui` is present only for a recognized
-  envelope. `server/sessions.ts` copies events as before, so SSE and the recorded
+  envelope. `src/server/sessions.ts` copies events as before, so SSE and the recorded
   turn keep the panels and `eventTimes` stays a parallel array with the same
   length/order.
-- **Manual calls unwrap.** `server/api.ts` projects `ToolCallResult.result` to the
+- **Manual calls unwrap.** `src/server/api.ts` projects `ToolCallResult.result` to the
   content and adds optional `panels` (session-bound and direct paths alike).
 - **Safety bounds.** `slot` is an open string (`right` is the default mount, with
   `center`/`left` available to the UI); panels are data only (no HTML/JS/actions).
@@ -1162,7 +1273,7 @@ normalizer and the exported `TOOL_UI_LIMITS`.
   key/value items, bounded text/cell/label lengths, and a 256 KiB total; malformed
   panels/blocks are dropped, non-string cells blanked/padded, and oversized
   panels dropped whole.
-- **Demonstration.** `harnesses/tools.ts` `timeNow` returns a right-slot key/value
+- **Demonstration.** `src/harnesses/tools.ts` `timeNow` returns a right-slot key/value
   panel while keeping its `{ timezone, iso, unix }` content. The server API result
   is unchanged; the chat transcript shows the panel. A direct callable consumer
   receives the branded envelope and should use `toolUiOf()`.
@@ -1214,8 +1325,10 @@ normalizer and the exported `TOOL_UI_LIMITS`.
 - **Created tools are compiled, not run, at registration.** `createDynamicTool`
   validates the shape and compiles the body with the host realm's `Function`
   constructor; execution happens only on call. The harness adds reserved names, a
-  case-insensitive collision check, and a 32-tool budget. It is session-local
-  (no disk, no persistence) and **unsandboxed**.
+  case-insensitive collision check, and a 32-tool budget. It is session-local (a
+  server with a database root persists the creation SOURCES in the core snapshot and
+  recompiles them on restore; nothing is written into the tool catalogue) and
+  **unsandboxed**.
 - **Delegation is one level deep by construction.** `agentDelegate` is core for the
   primary only, is never declared to subagents, is rejected if a subagent guesses
   it, and `runAgent` refuses to re-enter a running agent. Each agent keeps its own
@@ -1243,44 +1356,58 @@ normalizer and the exported `TOOL_UI_LIMITS`.
 
 ## CLI, server, and UI
 
-The app is split so the harness has **no UI dependency**. `src/` stays the
-published library; the three entry points are consumers of it.
+The app is split so the harness has **no UI dependency**. The library
+(`src/harness.ts`) stays the published harness entry; the application layers
+(`src/server`, `src/frontend`, `src/shared`) are consumers of it and are published
+as their own entries.
 
-- **CLI (`cli/`)** runs a preset in-process: one-shot from argv/stdin, or an
+- **CLI (`src/server/cli/`)** runs a preset in-process: one-shot from argv/stdin, or an
   interactive session on a TTY. It renders `HarnessEvent`s directly with
-  `cli/render.ts`, or emits one JSON object per line with `--json`. `--serve`
+  `src/server/cli/render.ts`, or emits one JSON object per line with `--json`. `--serve`
   switches to the HTTP server. The CLI never imports the UI.
-- **Environment (`server/environment.ts`)** loads the package-root `.env` from
-  `cli/index.ts` (before `settingsFrom`) and from the top of
-  `startHarnessServer()` (which `playground/dev.ts` uses), via `dotenv` as a
-  devDependency. The path is module-relative, `override: false` keeps shell values
-  (including empty ones) authoritative, a missing file is a no-op, and
-  `quiet: true` prevents startup logging. It must run before harness construction
-  because search keys are captured there. `src/` never imports it.
-- **Server (`server/`)** owns HTTP and sessions, not harness policy. Routing and
+- **Environment (`src/server/environment.ts`)** loads the package-root `.env` from
+  `src/server/cli/index.ts` (before `settingsFrom`) and from the top of
+  `startHarnessServer()` (used by `src/server/dev.ts` and the service runtime), via `dotenv` as a
+  devDependency. The path is module-relative (`../../.env`), `override: false`
+  keeps shell values (including empty ones) authoritative, a missing file is a
+  no-op, and `quiet: true` prevents startup logging. It must run before harness
+  construction because search keys are captured there. The library graph never
+  imports it.
+- **Server (`src/server/`)** owns HTTP and sessions, not harness policy. Routing and
   validation live in transport-neutral `api.ts`; `handler.ts` is only the Node
   adapter for `/api` (client header, streamed body bound, SSE writer) and
   `service.ts` the `@underload/service` adapter for `/v1/harness` (Origin gate,
-  content-length/serialized body bound, raw SSE `Response`). `SessionStore` keeps
-  one `Harness` per session and owns each run's `SessionTurn`s plus the FIFO task
-  queue, so a second task continues the conversation in order, a reload can replay
-  the transcript from `list()`/`get()`, and a watcher can reattach through
-  `watch()`. `static.ts` serves `playground/dist`; `playground/dev.ts`
-  starts the standalone server and proxies Vite's `/api` to it. There is no CORS
-  in either standalone mode: the UI is same-origin in production and proxied in
-  development.
-- **Service host (`endpoint/` + `server/service.ts`)** is the same API on the
+  content-length/serialized body bound, raw SSE `Response`). `start.ts` holds
+  `startHarnessServer` — the only listener, created when called. `SessionStore`
+  keeps one `Harness` per session and owns each run's `SessionTurn`s plus the FIFO
+  task queue, so a second task continues the conversation in order, a reload can
+  replay the transcript from `list()`/`get()`, and a watcher can reattach through
+  `watch()`. `static.ts` serves `src/frontend/dist`; `dev.ts` is the separate
+  standalone API launcher (`yarn dev:server`, static serving disabled), while
+  `yarn dev:frontend` is Vite only and proxies `/api` to the service on :5000.
+  Set `HARNESS_DEV_API=http://127.0.0.1:5181/api` to point that same proxy at the
+  standalone launcher instead. There is no CORS in the standalone Node mode: the
+  UI is same-origin in production and proxied (or service-hosted) in development.
+- **Service host (`src/server/endpoint/` + `src/server/service.ts`)** is the same API on the
   repository's Hono gateway. `@underload/service` scans the repo root for
   `endpoint`/`endpoints` folders and imports every `service-route*.ts` default
-  export; `endpoint/harness/service-route.ts` registers `/v1/harness/*` and
+  export; `src/server/endpoint/harness/service-route.ts` registers `/v1/harness/*` and
   `service-route-root.ts` registers the bare `/v1/harness` (a wildcard does not
   match the bare path). Neither declares a `port`, so both run on the gateway's
-  single listener — no worker server, no 307, no second port. `server/runtime.ts`
+  single listener — no worker server, no 307, no second port. `src/server/runtime.ts`
   builds one shared store/catalogue lazily on the first request (`.env` loaded
   there, never at import). The bootstrap document's `rootPath` is the canonical
   API URL (`/v1/harness`), not a filesystem root: file tools resolve against
   `process.cwd()` and have no sandbox, so advertising a workspace root would be a
-  lie. `variables.root` is the service's database boundary, not a workspace.
+  lie. `variables.root` is the service's database boundary, not a workspace. The
+  handler selects a runtime keyed by that resolved root, and the runtime writes
+  `<root>/harness/state.json` (see persistence.ts); restoring rebuilds the registry
+  first, then each session's frozen harness, then its core snapshot. A running turn
+  is marked interrupted and never replayed; queued prompts are preserved but stay
+  paused until an explicit submit or a cancel-all. When the snapshot ended between
+  an assistant tool call and its result, restore appends explicit interrupted tool
+  results for the unmatched ids (no re-execution), so the next provider request is
+  coherent.
   The loader's permissive CORS means `X-Harness-Client` is not a boundary there;
   instead the adapter rejects a browser `Origin` that is neither the request host
   nor loopback (`localhost`, `127.0.0.1`, `[::1]`), and allows requests with no
@@ -1288,20 +1415,22 @@ published library; the three entry points are consumers of it.
   who can reach the port is trusted, and the tools are unsandboxed. Prefer a
   loopback host for the service when the port is reachable from untrusted
   networks; this package changes no global host/CORS setting.
-- **Catalogue (`harnesses/`)** holds the presets and harness-level tools shared by
+- **Catalogue (`src/server/harnesses/`)** holds the presets and harness-level tools shared by
   the CLI and server. Presets are factories because a harness bakes its transport
   at construction. `toolbox.ts` owns the one shared toolbox and the factory every
-  live preset uses, so `instruct`, `research`, and `workspace` register the same
-  tools and differ only in agents/instructions/routing. `demo` uses the scripted
+  live preset uses, so `instruct`, `research`, `workspace`, `reviewer` and `planner`
+  register the same tools and differ only in agents/instructions/routing. `demo`
+  uses the scripted
   transport, needs no endpoint, and keeps a timeNow-only registry as a documented
   template exception; `flaky` is the shared toolbox plus the intentional failure
   tool (excluded from the shared set because it fails on purpose). Every template is
   editable (R20.1): the registry copies it, metadata-only patches preserve the
   captured factory, and an executable patch upgrades demo to a live profiled
   harness / rebuilds flaky with `testFlaky` retained. Every preset
-  names its `primary` explicitly (single-agent presets have no subagents, so no
-  `agentDelegate` tool); `research` declares `subagents: ['summarizer']`, and every
-  agent keeps its own instruction. `harnesses/index.ts` exports
+  names its `primary` explicitly; the five real presets declare the same symmetric
+  team (every other real role plus `summarizer`, via `teamOf()`), so each registers
+  `agentDelegate`, while the two fixtures have no subagents and no delegate. Every
+  agent keeps its own instruction. `src/server/harnesses/index.ts` exports
   `createToolCatalogue`, which snapshots the lazy `presetTools` metadata plus the
   harness tools plus the runtime `webSearch` entry; it never executes or imports an
   implementation. `findPreset` resolves the legacy ids (`writer`/`assistant` →
@@ -1309,13 +1438,13 @@ published library; the three entry points are consumers of it.
   server calls the catalogue builder after `loadEnvironmentFile()` and injects the
   result into the handler; the CLI calls it from `--tools`/`/tools`, which run
   after the same load.
-- **UI (`playground/`)** is only a client. It resolves its API root at runtime
+- **UI (`src/frontend/`)** is only a client. It resolves its API root at runtime
   (`?apiRoot=` → `window.__HARNESS_CONFIG__.apiRoot` / meta tag → build-time
   `VITE_HARNESS_API` → `/api`), then lists presets/tools, creates sessions,
   enqueues tasks (`POST /tasks`, `202`), and observes the session's queue through
   one `GET /events` watcher while work is pending (polling fallback). Runtime
   absolute roots must be the
-  page's own origin or loopback (`server/origin.ts`, shared with the service
+  page's own origin or loopback (`src/shared/origin.ts`, shared with the service
   Origin gate) because the saved provider key is posted to that root;
   `VITE_HARNESS_API` is operator-controlled and deliberately trusted across
   origins. It imports no harness code and no `node:` built-ins, which is why
@@ -1329,7 +1458,7 @@ published library; the three entry points are consumers of it.
   leaving the breakpoint clears the state so a resize cannot resurrect a dismissed
   rail. The rails stay in the DOM — CSS only hides them — so their content and
   state survive a toggle, and wider layouts ignore the state and show both rails
-  permanently. `playground/src/rail-toggle.test.ts` pins the DOM of this contract.
+  permanently. `src/frontend/rail-toggle.test.ts` pins the DOM of this contract.
 
 ### API
 
@@ -1352,7 +1481,7 @@ paths below `/v1/harness` **plus** the bare root:
 | `GET /api/sessions`, `GET /api/sessions/:id` | Snapshots, always including `turns` (with `eventTimes`) and the frozen `harnessDefinition`; `model`/`agentModels` are LIVE; `queueDepth` counts pending turns and is omitted at zero |
 | `PATCH /api/sessions/:id` | `{ agentModels: Record<agent, model> }` → `{ session }`. Merges into the live map, validates every key against the session's agents and every value as a model id (400 with nothing applied), rejects `{}` as a no-op, is allowed while the session is busy (no abort/rebuild), and leaves `harnessDefinition` frozen. The current request keeps the model it started with; the next request uses the new one |
 | `POST /api/sessions/:id/messages` | `{ input }` → SSE. LEGACY: the response owns the run (close aborts it); `409` when busy or when queued work is pending |
-| `POST /api/sessions/:id/tasks` | `{ input }` → `202 { session, turn }`. Server-queued FIFO task: the turn is `queued`, has a stable id/index, and has no `startedAt` until the pump starts it. Cap 100 pending (`429`); in-memory only |
+| `POST /api/sessions/:id/tasks` | `{ input }` → `202 { session, turn }`. Server-queued FIFO task: the turn is `queued`, has a stable id/index, and has no `startedAt` until the pump starts it. Cap 100 pending (`429`); queued turns are durable with a database root and paused after a restart |
 | `GET /api/sessions/:id/events` | SSE watcher: one `snapshot`, `turn` upserts (queued/running/terminal), `event` frames, one final `snapshot` on drain. Disconnect only unsubscribes |
 | `POST /api/sessions/:id/reset` | Reset every agent + discovery + todos + record stores; `409` while a run or queued work is pending |
 | `POST /api/sessions/:id/cancel` | `{ all?: boolean }` → `{ cancelled }`. Default aborts the active run only; `all: true` also cancels every queued turn, which stays in `turns` as `cancelled` |
@@ -1401,7 +1530,7 @@ can fix.
   registered and enabled at once, so `GET /sessions/:id` reports its name in
   `discoveredTools`; `GET /tools` remains the static catalogue.
 
-**Core tools in the catalogue (R8).** `harnesses/core.ts` adds six entries —
+**Core tools in the catalogue (R8).** `src/harnesses/core.ts` adds six entries —
 `toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`,
 `locationManage` — plus `agentDelegate` to every listing
 (`GET /tools`, its `/tools/bootstrap` alias, and the root bootstrap document). They
@@ -1463,7 +1592,7 @@ pairs same-name calls exactly.
 
 ### Task queue and presentation (R4/R5)
 
-`SessionStore` (`server/sessions.ts`) owns the queue; no response does.
+`SessionStore` (`src/server/sessions.ts`) owns the queue; no response does.
 
 - **Submit/accept.** `enqueue()` validates and applies the pending cap before any
   mutation, then appends a `SessionTurn` with `status: 'queued'`, a `randomUUID` id,
@@ -1514,7 +1643,7 @@ composes the profile into the seeded system messages (`[instruction, 'Guidelines
 and the application builds agents with `agent({ model, instruction: agentInstruction(profile), provider })`.
 Nothing in a profile is secret, and a client cannot supply one.
 
-`harnesses/registry.ts` is the in-memory harness registry shared by the store and
+`src/harnesses/registry.ts` is the in-memory harness registry shared by the store and
 the dispatcher:
 
 - `list()` → shipped templates (preset order) then user-created harnesses; each entry
@@ -1553,8 +1682,10 @@ the dispatcher:
 Semantic validation lives in the registry; the dispatcher rejects unknown body
 fields, so `instruction`, `tools`, or `provider` cannot be smuggled into a
 create/patch request. `agentModels` is the single model-shaped field: it selects an
-id, never credentials. The registry is **in memory only**: there is no delete and no
-persistence, so a restart restores the shipped catalogue.
+id, never credentials. The registry is **in memory only unless a database root is
+supplied**: with one, registry metadata is saved in `<root>/harness/state.json` and
+replayed on restart (see the Persistence section in README.md); without one, a
+restart returns to the shipped catalogue.
 
 Sessions capture the resolved preset AND a `describeHarness()` snapshot at
 creation. **Team membership, the primary, and that descriptor are frozen**: a
@@ -1594,8 +1725,10 @@ the exception a saved chat exposes directly.
 - **The server is a consumer, not a new layer in `src/`.** `SessionStore` calls the
   same `harness()` a CLI does; neither the CLI nor the server adds tool execution
   or model policy.
-- **Sessions live in memory.** Restarting the server is a clean slate. Persistence
-  is still on the roadmap; this is intentionally the smallest useful session model.
+- **Sessions are durable only when a database root is supplied.** With one, the
+  server writes `<root>/harness/state.json` and a restart rebuilds the registry,
+  sessions, queues, and core state; without one the store is in memory and a
+  restart is a clean slate (the default for direct unit tests).
 - **The queue belongs to the server, not to a response.** `/tasks` answers `202`
   because a task accepted with a socket would die with that socket. Only the legacy
   `/messages` route keeps the old "close cancels" contract, and `/events` watches
@@ -1617,7 +1750,7 @@ the exception a saved chat exposes directly.
   the opposite trade: permissive CORS from the loader, so the boundary is an
   Origin gate (own host or loopback) and not authentication.
 - **The server key follows the configured provider, never the client's URL.** A
-  single `mergeSettings` (`server/config.ts`) serves `POST /models` and
+  single `mergeSettings` (`src/server/config.ts`) serves `POST /models` and
   `POST /sessions`: an omitted/blank key falls back to the configured key only
   when the effective base URL matches that provider's origin + base path
   (trailing slashes normalized); a foreign host/port/path gets no key unless the
@@ -1642,20 +1775,32 @@ the exception a saved chat exposes directly.
 ### Scripts
 
 ```bash
-yarn start                # API + UI end-to-end
-yarn cli "task"           # one-shot, default demo preset
-yarn cli                  # interactive
-yarn serve                # API + built UI (build the UI first)
-yarn dev:playground       # same as start
-yarn preview:playground   # built UI, proxies /api to :5181
-yarn test                 # library + server tests
+yarn cli "task"           # one-shot as the live default preset (instruct)
+yarn cli --preset demo    # explicit offline scripted fixture
+yarn cli                  # interactive Instruct session
+yarn cli --serve          # explicit standalone API + built UI on :5181 (CLI opt-in)
+yarn dev:frontend         # Vite UI on :5180; /api proxies to the service on :5000
+yarn dev:server           # separate standalone API on :5181 (no Vite/UI)
+yarn preview:frontend     # built UI on :5180, proxies /api to the service on :5000
+yarn test                 # library + server + shared tests
+yarn test:frontend        # jsdom client tests
 yarn start-service        # repo root: @underload/service host, /v1/harness on :5000
 ```
 
-`server/server.test.ts` drives the real HTTP server with the scripted demo: create
-a session, stream a task, continue it, reset it, call a tool directly, and check
-the error statuses. The UI build no longer needs a package alias, so
-`playground/dist` is a plain client bundle.
+`dev:frontend` and `dev:server` are independent launches: the first is Vite only
+and never calls `startHarnessServer`; the second is the standalone API only and
+starts no UI. `HARNESS_DEV_API` (default
+`http://127.0.0.1:5000/v1/harness`) selects the Vite proxy target, so the UI can
+be pointed at the standalone `/api` mount when that is the server being run.
+There is no generic `start`/`serve`/`server` script: normal hosting is owned by
+`@underload/service` (`yarn start-service`), and `startHarnessServer()` is an
+explicit API. `src/server/server.test.ts` drives the real HTTP server with the
+scripted demo: create a session, stream a task, continue it, reset it, call a tool
+directly, and check the error statuses. `src/server/service-start.test.ts` runs an
+actual `vite-node` service gateway that discovers
+`src/server/endpoint/harness/service-route*.ts` and answers `/v1/harness`. The UI
+build no longer needs a package alias, so `src/frontend/dist` is a plain client
+bundle.
 
 
 ## Not built yet
@@ -1663,14 +1808,11 @@ the error statuses. The UI build no longer needs a package alias, so
 In the order they are expected:
 
 1. **streaming tool output** — `execute` cannot report progress mid-call yet.
-2. **session persistence** — the server keeps sessions and their task queue in
-   memory; restarting loses both.
-3. **compaction** — history pruning before context limits.
-4. **per-agent tool scoping** — searchable tools are catalogued once; every agent
+2. **compaction** — history pruning before context limits.
+3. **per-agent tool scoping** — searchable tools are catalogued once; every agent
    can discover every searchable tool (only `agentDelegate` is primary-only).
-5. **parallel tool execution** — calls run sequentially today.
-6. **sandboxed presets and created tools** — the file and command tools, and any
+4. **parallel tool execution** — calls run sequentially today.
+5. **sandboxed presets and created tools** — the file and command tools, and any
    `toolCreate` body, run with host permissions; a `root`-scoped/fenced variant
    would be the natural next step.
-7. **persisting created tools** — they live and die with the harness instance.
-8. **more presets** — `fetchUrl` and a patch/multi-edit tool are the obvious gaps.
+6. **more presets** — `fetchUrl` and a patch/multi-edit tool are the obvious gaps.

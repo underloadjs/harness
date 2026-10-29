@@ -40,15 +40,20 @@ const callTool = (id: string, name: string, args: string): HarnessStreamEvent[] 
 const brain = (stream: HarnessStream): ReturnType<typeof agent> =>
     agent({ model: 'merge/ds4-flash', stream });
 
-// Eight searchable fixtures that all carry the exact tag "files", named so the
+// Eight searchable fixtures that all carry the exact tag "widgets", named so the
 // deterministic name-order tiebreak decides both the pages and their order.
+//
+// The tag is deliberately NOT "files": core tools are reported in
+// `alreadyAvailable` for fuzzy tag hits too, and profileManage's "profiles" tag
+// contains "files". This test owns progressive paging, so a neutral tag keeps its
+// exact result shape independent of that (separately tested) report.
 const fixtures = (count: number) =>
     Object.fromEntries(
         Array.from({ length: count }, (_, index) => {
             const name = `file-${String(index).padStart(2, '0')}`;
             return [
                 name,
-                tool({ name, description: `${name} fixture.`, tags: ['files'], execute: () => name })
+                tool({ name, description: `${name} fixture.`, tags: ['widgets'], execute: () => name })
             ];
         })
     );
@@ -57,9 +62,9 @@ describe('progressive discovery', () => {
     it('advances a repeated identical query through the match tail', async () => {
         const entry = brain(
             scripted([
-                callTool('c1', 'toolRequest', '{"tags":["files"]}'),
-                callTool('c2', 'toolRequest', '{"tags":["files"]}'),
-                callTool('c3', 'toolRequest', '{"tags":["files"]}'),
+                callTool('c1', 'toolRequest', '{"tags":["widgets"]}'),
+                callTool('c2', 'toolRequest', '{"tags":["widgets"]}'),
+                callTool('c3', 'toolRequest', '{"tags":["widgets"]}'),
                 answer('done')
             ])
         );
@@ -73,7 +78,7 @@ describe('progressive discovery', () => {
             tools: ['file-00', 'file-01', 'file-02', 'file-03', 'file-04'].map((name) => ({
                 name,
                 description: `${name} fixture.`,
-                tags: ['files']
+                tags: ['widgets']
             })),
             remaining: 3,
             truncated: true
@@ -85,7 +90,7 @@ describe('progressive discovery', () => {
             tools: ['file-05', 'file-06', 'file-07'].map((name) => ({
                 name,
                 description: `${name} fixture.`,
-                tags: ['files']
+                tags: ['widgets']
             })),
             remaining: 0,
             offset: 5
@@ -97,7 +102,7 @@ describe('progressive discovery', () => {
             tools: ['file-00', 'file-01', 'file-02', 'file-03', 'file-04'].map((name) => ({
                 name,
                 description: `${name} fixture.`,
-                tags: ['files']
+                tags: ['widgets']
             })),
             remaining: 3,
             truncated: true
@@ -119,8 +124,8 @@ describe('progressive discovery', () => {
     it('treats the same tags in a different order as the same query', async () => {
         const entry = brain(
             scripted([
-                callTool('c1', 'toolRequest', '{"tags":["files","write"]}'),
-                callTool('c2', 'toolRequest', '{"tags":["write","files"]}'),
+                callTool('c1', 'toolRequest', '{"tags":["widgets","write"]}'),
+                callTool('c2', 'toolRequest', '{"tags":["write","widgets"]}'),
                 answer('done')
             ])
         );
@@ -146,9 +151,9 @@ describe('progressive discovery', () => {
     it('keeps a different query, or a different page size, on its own first page', async () => {
         const entry = brain(
             scripted([
-                callTool('c1', 'toolRequest', '{"tags":["files"]}'),
-                callTool('c2', 'toolRequest', '{"tags":["files"],"limit":3}'),
-                callTool('c3', 'toolRequest', '{"tags":["files"]}'),
+                callTool('c1', 'toolRequest', '{"tags":["widgets"]}'),
+                callTool('c2', 'toolRequest', '{"tags":["widgets"],"limit":3}'),
+                callTool('c3', 'toolRequest', '{"tags":["widgets"]}'),
                 answer('done')
             ])
         );
@@ -177,9 +182,9 @@ describe('progressive discovery', () => {
     it('forgets the progression on reset()', async () => {
         const entry = brain(
             scripted([
-                callTool('c1', 'toolRequest', '{"tags":["files"]}'),
+                callTool('c1', 'toolRequest', '{"tags":["widgets"]}'),
                 answer('first'),
-                callTool('c2', 'toolRequest', '{"tags":["files"]}'),
+                callTool('c2', 'toolRequest', '{"tags":["widgets"]}'),
                 answer('second')
             ])
         );
@@ -200,7 +205,7 @@ describe('progressive discovery', () => {
             tools: ['file-00', 'file-01', 'file-02', 'file-03', 'file-04'].map((name) => ({
                 name,
                 description: `${name} fixture.`,
-                tags: ['files']
+                tags: ['widgets']
             })),
             remaining: 3,
             truncated: true

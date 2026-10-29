@@ -5,10 +5,16 @@
 // primary/subagents against them, and builds the actual runtime agents from the
 // same profiles. A client never supplies instruction text.
 //
-// Order matters: the first entries are the general-purpose agents a picker should
+// Order matters: the first entries are the real specialist roles a picker should
 // show first, followed by the delegated summarizer, then the two fixtures. Tests
 // pin the order, so a new profile is an explicit addition rather than an accident
 // of object key ordering.
+//
+// ROSTER (T3): the five real roles are instruct (general), research (researcher),
+// workspace (coder), reviewer (skeptical bug hunt) and planner (plan + route to
+// specialists). `summarizer` stays as the delegated condenser the research
+// profile's `textSummarize` path uses, and `demo`/`flaky` stay as fixtures — they
+// are examples, never the headline choice.
 //
 // Cross-references:
 //   - ./types.ts      — AgentProfile
@@ -21,6 +27,8 @@ import { instruct } from './instruct';
 import { research } from './research';
 import { summarizer } from './summarizer';
 import { workspace } from './workspace';
+import { reviewer } from './reviewer';
+import { planner } from './planner';
 import { demo } from './demo';
 import { flaky } from './flaky';
 
@@ -31,8 +39,10 @@ export type { AgentProfile } from './types';
 export const AGENT_PROFILES = {
     instruct,
     research,
-    summarizer,
     workspace,
+    reviewer,
+    planner,
+    summarizer,
     demo,
     flaky
 } as const satisfies Record<string, AgentProfile>;
@@ -41,11 +51,15 @@ export type AgentProfileName = keyof typeof AGENT_PROFILES;
 
 // Display/selection order. Kept separate from the object so a reordering never
 // changes ids, and so a caller can iterate without relying on insertion order.
+// Real roles first (in preset order), then the summarizer/fixtures: a picker that
+// renders this list therefore offers the five usable roles before the examples.
 export const AGENT_PROFILE_NAMES: readonly AgentProfileName[] = [
     'instruct',
     'research',
-    'summarizer',
     'workspace',
+    'reviewer',
+    'planner',
+    'summarizer',
     'demo',
     'flaky'
 ];

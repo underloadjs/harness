@@ -243,3 +243,150 @@ describe('searchTools', () => {
         expect(searchTools([definition], ['fileread']).enabled).toEqual(['fileRead']);
     });
 });
+
+// Already-available core tools (R1). A query naming a capability the caller already
+// has declared - agentDelegate is the reported case - must say so instead of "no
+// match", without enabling it or spending the discovery cap.
+describe('searchTools with declared core tools', () => {
+    const delegate = make('agentDelegate', ['agents', 'delegate', 'delegation', 'subagent', 'team'], {
+        visibility: 'core'
+    });
+
+    it('reports an exact core wire name instead of an empty match', () => {
+        // "agentDelegate" is not one of its own tags ("delegate" is), so the wire
+        // name is what has to resolve.
+        const result = searchTools([], ['agentDelegate'], undefined, 0, { declared: [delegate] });
+
+        expect(result).toEqual({
+            enabled: [],
+            tools: [],
+            remaining: 0,
+            alreadyAvailable: [
+                {
+                    name: 'agentDelegate',
+                    description: 'agentDelegate capability.',
+                    tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
+                }
+            ],
+            availableTags: []
+        });
+    });
+
+    it('treats the capability synonyms as a hit on the declared tool', () => {
+        // "agents", "delegate" and "delegation" are all exact tags (the metadata
+        // carries the noun form), so every synonym hits and none may be reported as
+        // unmatched.
+        const result = searchTools([], ['agents', 'delegate', 'delegation'], undefined, 0, {
+            declared: [delegate]
+        });
+
+        expect(result).toEqual({
+            enabled: [],
+            tools: [],
+            remaining: 0,
+            alreadyAvailable: [
+                {
+                    name: 'agentDelegate',
+                    description: 'agentDelegate capability.',
+                    tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
+                }
+            ],
+            availableTags: []
+        });
+    });
+
+    it('never matches a declared tool by its description', () => {
+        // Core descriptions mention everyday words; scanning them would append an
+        // already-available tool to almost every query. Name and tags only.
+        const reader = make('fileRead', ['files', 'read'], {
+            visibility: 'core',
+            description: 'Read a text file.'
+        });
+
+        const result = searchTools([], ['text'], undefined, 0, { declared: [reader] });
+
+        expect(result).toEqual({
+            enabled: [],
+            tools: [],
+            remaining: 0,
+            unmatchedTags: ['text'],
+            availableTags: []
+        });
+    });
+
+    it('reports a declared tool alongside a searchable match without enabling it', () => {
+        const summary = make('agentSummary', ['agents', 'summary']);
+
+        const result = searchTools([summary], ['agents'], undefined, 0, { declared: [delegate] });
+
+        expect(result).toEqual({
+            enabled: ['agentSummary'],
+            tools: [
+                {
+                    name: 'agentSummary',
+                    description: 'agentSummary capability.',
+                    tags: ['agents', 'summary']
+                }
+            ],
+            remaining: 0,
+            alreadyAvailable: [
+                {
+                    name: 'agentDelegate',
+                    description: 'agentDelegate capability.',
+                    tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
+                }
+            ]
+        });
+    });
+
+    it('does not let a declared tool consume the five-match cap', () => {
+        const core = make('filesCore', ['files'], { visibility: 'core' });
+        const tools = Array.from({ length: 6 }, (_, index) =>
+            make(`file-${String(index).padStart(2, '0')}`, ['files'])
+        );
+
+        const result = searchTools(tools, ['files'], undefined, 0, { declared: [core] });
+
+        // The cap still holds five SEARCHABLE tools; the declared tool is a report,
+        // so it neither fills a slot nor changes the `remaining` count.
+        expect(result.enabled).toEqual(['file-00', 'file-01', 'file-02', 'file-03', 'file-04']);
+        expect(result.tools.map((entry) => entry.name)).toEqual([
+            'file-00',
+            'file-01',
+            'file-02',
+            'file-03',
+            'file-04'
+        ]);
+        expect(result.remaining).toBe(1);
+        expect(result.truncated).toBe(true);
+        expect(result.alreadyAvailable).toEqual([
+            { name: 'filesCore', description: 'filesCore capability.', tags: ['files'] }
+        ]);
+    });
+
+    it('orders declared hits by score then name', () => {
+        // Two exact tag hits tie (4) and fall back to name order; the prefix hit
+        // ("filesystem") scores 3 and follows.
+        const zulu = make('zulu', ['files'], { visibility: 'core' });
+        const alpha = make('alpha', ['files'], { visibility: 'core' });
+        const prefix = make('fileTools', ['filesystem'], { visibility: 'core' });
+
+        const result = searchTools([], ['files'], undefined, 0, {
+            declared: [zulu, prefix, alpha]
+        });
+
+        expect(result.alreadyAvailable?.map((entry) => entry.name)).toEqual([
+            'alpha',
+            'zulu',
+            'fileTools'
+        ]);
+    });
+
+    it('keeps an empty query free of an alreadyAvailable report', () => {
+        // No query means nothing matched, so there is nothing to report as already
+        // available - the vocabulary answer keeps its original shape.
+        const result = searchTools([], [], undefined, 0, { declared: [delegate] });
+
+        expect(result).toEqual({ enabled: [], tools: [], remaining: 0, availableTags: [] });
+    });
+});

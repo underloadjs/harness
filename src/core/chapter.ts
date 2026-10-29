@@ -55,12 +55,22 @@ import type {
     ChapterItem,
     ChapterParameters,
     ChapterStatus,
+    ChapterStoreState,
     ChapterSummary,
     RecordAction,
     Tool
 } from '../types';
 import { CHAPTER_MANAGE_METADATA } from './metadata';
 import { tool } from './tool';
+import {
+    readSnapshotArray,
+    readSnapshotId,
+    readSnapshotIdCounter,
+    readSnapshotInteger,
+    readSnapshotKeys,
+    readSnapshotRecord,
+    readSnapshotString
+} from './snapshot-validation';
 
 // The accepted actions, in the order the error messages and schema advertise
 // them. Identical for all three record tools.
@@ -123,9 +133,14 @@ export type ChapterResult = ChapterListResult | ChapterChangeResult;
 // What createChapterTool() returns. Declared here (rather than in ../types)
 // because the R9 bounded shape is owned by this module while ../types is shared
 // with units still editing the same file; see the final report for the migration.
+//
+// `snapshot`/`restore` (R3a) are the persistence hooks: a JSON-shaped copy out and
+// a fully validated replacement in. They never expose the live arrays.
 export type ChapterToolset = {
     tool: Tool<ChapterParameters, ChapterResult>;
     reset: () => void;
+    snapshot: () => ChapterStoreState;
+    restore: (state: unknown) => void;
 };
 
 // Arrays are rejected: valid JSON, but it cannot carry an `action`.
@@ -146,6 +161,13 @@ const copySummary = (item: ChapterSummary): ChapterSummary => {
 
     return summary;
 };
+
+// The full stored chapter, including the body. Used by snapshot(): a persistence
+// copy must never share a record object with the live store.
+const copyChapter = (item: ChapterItem): ChapterItem => ({
+    ...copySummary(item),
+    content: item.content
+});
 
 // Sort position: ordered chapters first by ascending `order`, everything else
 // after them. Comparing explicit ranks (rather than subtracting Infinity) keeps
@@ -267,6 +289,73 @@ const readOrder = (value: unknown): number | undefined => {
     }
 
     return value as number;
+};
+
+// Validate one persisted chapter store and return a DEEP COPY. A chapter's body
+// is part of the snapshot (lists omit it, but a resumed session must not lose it),
+// and the optional `order` is copied only when present.
+export const readChapterStoreState = (value: unknown): ChapterStoreState => {
+    const root = readSnapshotRecord(value, 'chapter state');
+    readSnapshotKeys(root, ['items', 'nextId'], 'chapter state');
+
+    const entries = readSnapshotArray(root.items, 'chapter state.items');
+
+    if (entries.length > CHAPTER_MAX_RECORDS) {
+        throw new HarnessError(
+            `chapter state holds ${entries.length} chapters; the maximum is ${CHAPTER_MAX_RECORDS}.`
+        );
+    }
+
+    const items = entries.map((entry, index) => {
+        const label = `chapter state.items[${index}]`;
+        const record = readSnapshotRecord(entry, label);
+        readSnapshotKeys(
+            record,
+            ['id', 'title', 'summary', 'content', 'status', 'order'],
+            label,
+            ['order']
+        );
+
+        const status = readSnapshotString(record.status, `${label}.status`, { min: 1 });
+
+        if (!STATUSES.includes(status as ChapterStatus)) {
+            throw new HarnessError(
+                `${label}.status must be one of: ${STATUSES.join(', ')}.`
+            );
+        }
+
+        const item: ChapterItem = {
+            id: readSnapshotId(record.id, `${label}.id`),
+            title: readSnapshotString(record.title, `${label}.title`, {
+                min: 1,
+                max: CHAPTER_MAX_NAME
+            }),
+            summary: readSnapshotString(record.summary, `${label}.summary`, {
+                min: 1,
+                max: CHAPTER_MAX_TEXT
+            }),
+            content: readSnapshotString(record.content, `${label}.content`, {
+                max: CHAPTER_MAX_TEXT
+            }),
+            status: status as ChapterStatus
+        };
+
+        // Only a present `order` is reproduced: absence is a real state (an
+        // unordered chapter sorts after the ordered ones).
+        if (record.order !== undefined) {
+            item.order = readSnapshotInteger(record.order, `${label}.order`);
+        }
+
+        return item;
+    });
+
+    const nextId = readSnapshotIdCounter(
+        items.map((item) => item.id),
+        root.nextId,
+        'chapter state'
+    );
+
+    return { items, nextId };
 };
 
 // The per-harness chapter list. Ids are decimal strings, monotonic for the life
@@ -522,6 +611,18 @@ export const createChapterTool = (): ChapterToolset => {
         reset: () => {
             items.splice(0, items.length);
             nextId = 1;
+        },
+        // Copy out (body included) so a snapshot never aliases live state.
+        snapshot: () => ({
+            items: items.map(copyChapter),
+            nextId
+        }),
+        // Validate into copies first, then replace the closure state in one step.
+        restore: (state: unknown) => {
+            const restored = readChapterStoreState(state);
+
+            items.splice(0, items.length, ...restored.items);
+            nextId = restored.nextId;
         }
     };
 };

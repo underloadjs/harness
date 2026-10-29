@@ -5,12 +5,38 @@
     "type": "module",
     "main": "./dist/underload-harness.mjs",
     "module": "./dist/underload-harness.mjs",
-    "types": "./dist/harness.d.ts",
+    "types": "./dist/index.d.ts",
     "exports": {
         ".": {
-            "types": "./dist/harness.d.ts",
-            "import": "./dist/underload-harness.mjs"
-        }
+            "browser": {
+                "types": "./dist/browser.d.ts",
+                "default": "./dist/underload-harness.browser.mjs"
+            },
+            "types": "./dist/index.d.ts",
+            "node": "./dist/underload-harness.mjs",
+            "import": "./dist/underload-harness.mjs",
+            "default": "./dist/underload-harness.mjs"
+        },
+        "./server": {
+            "types": "./dist/server/index.d.ts",
+            "import": "./dist/underload-harness.server.mjs",
+            "default": "./dist/underload-harness.server.mjs"
+        },
+        "./frontend": {
+            "browser": {
+                "types": "./dist/frontend/index.d.ts",
+                "default": "./dist/underload-harness.frontend.mjs"
+            },
+            "types": "./dist/frontend/index.d.ts",
+            "import": "./dist/underload-harness.frontend.mjs",
+            "default": "./dist/underload-harness.frontend.mjs"
+        },
+        "./shared": {
+            "types": "./dist/shared/index.d.ts",
+            "import": "./dist/underload-harness.shared.mjs",
+            "default": "./dist/underload-harness.shared.mjs"
+        },
+        "./package.json": "./package.json"
     },
     "files": [
         "dist"
@@ -32,26 +58,26 @@
         "registry": "https://registry.npmjs.org"
     },
     "scripts": {
-        "build": "vite build && tsc -p tsconfig.build.json",
-        "build:playground": "vite build --config playground/vite.config.ts",
-        "cli": "vite-node cli/index.ts",
-        "dev:playground": "vite-node playground/dev.ts",
-        "preview:playground": "vite preview --config playground/vite.config.ts",
-        "serve": "vite-node cli/index.ts --serve",
-        "server": "vite-node cli/index.ts --serve",
-        "start": "vite-node playground/dev.ts",
-        "prepublishOnly": "npm run typecheck && npm run test && npm run build",
+        "build": "vite build && npm run build:types",
+        "build:types": "node scripts/build-declarations.mjs",
+        "build:frontend": "vite build --config src/frontend/vite.config.ts",
+        "cli": "vite-node src/server/cli/index.ts",
+        "dev:frontend": "vite --config src/frontend/vite.config.ts",
+        "dev:server": "vite-node src/server/dev.ts",
+        "preview:frontend": "vite preview --config src/frontend/vite.config.ts",
+        "prepublishOnly": "npm run typecheck && npm run test && npm run build && npm run test:package && npm run test:package:runtime",
         "test": "vitest run",
-        "test:playground": "vitest run --config playground/vitest.config.ts",
+        "test:frontend": "vitest run --config src/frontend/vitest.config.ts",
+        "test:package": "node scripts/check-package-types.mjs",
         "typecheck": "tsc --noEmit",
-        "release": "vite-node ../../../scripts/publish-safe.ts"
+        "release": "vite-node ../../../scripts/publish-safe.ts",
+        "test:package:runtime": "node scripts/check-package-runtime.mjs"
     },
     "author": "NQQT",
     "license": "ISC",
     "devDependencies": {
         "@types/node": "^25.9.1",
         "dompurify": "^3.4.15",
-        "dotenv": "^17.4.2",
         "highlight.js": "11.12.0",
         "jsdom": "^29.0.2",
         "marked": "^18.0.12",
@@ -59,5 +85,8 @@
         "vite": "^8.0.8",
         "vite-node": "^6.0.0",
         "vitest": "^4.1.4"
+    },
+    "dependencies": {
+        "dotenv": "^17.4.2"
     }
 }

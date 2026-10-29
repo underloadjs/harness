@@ -4,6 +4,8 @@ node_modules/
 # Build output
 dist/
 lib/
+# Declaration-build staging (scripts/build-declarations.mjs)
+.entries/
 
 # Turbo cache
 .turbo/

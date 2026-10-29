@@ -45,9 +45,23 @@
 //   remove               → { removed, counts }
 
 import { HarnessError } from '../util';
-import type { ProfileItem, ProfileParameters, RecordAction, Tool } from '../types';
+import type {
+    ProfileItem,
+    ProfileParameters,
+    ProfileStoreState,
+    RecordAction,
+    Tool
+} from '../types';
 import { PROFILE_MANAGE_METADATA } from './metadata';
 import { tool } from './tool';
+import {
+    readSnapshotArray,
+    readSnapshotId,
+    readSnapshotIdCounter,
+    readSnapshotKeys,
+    readSnapshotRecord,
+    readSnapshotString
+} from './snapshot-validation';
 
 // The accepted actions, in the order the error messages and schema advertise
 // them. Identical for all three record tools.
@@ -104,9 +118,14 @@ export type ProfileResult = ProfileListResult | ProfileChangeResult;
 // What createProfileTool() returns. Declared here (rather than in ../types)
 // because the R9 bounded shape is owned by this module while ../types is shared
 // with units still editing the same file; see the final report for the migration.
+//
+// `snapshot`/`restore` (R3a) are the persistence hooks: a JSON-shaped copy out and
+// a fully validated replacement in. They never expose the live arrays.
 export type ProfileToolset = {
     tool: Tool<ProfileParameters, ProfileResult>;
     reset: () => void;
+    snapshot: () => ProfileStoreState;
+    restore: (state: unknown) => void;
 };
 
 // Arrays are rejected: valid JSON, but it cannot carry an `action`, so accepting
@@ -241,6 +260,75 @@ const readTraits = (value: unknown): string[] | undefined => {
     }
 
     return traits;
+};
+
+// Validate one persisted profile store and return a DEEP COPY. Mirrors
+// readTodoStoreState: ids are unique decimal strings, every field respects the
+// same caps an `add` enforces, traits are unique, the record cap holds, and
+// nextId cannot collide with a restored id.
+export const readProfileStoreState = (value: unknown): ProfileStoreState => {
+    const root = readSnapshotRecord(value, 'profile state');
+    readSnapshotKeys(root, ['items', 'nextId'], 'profile state');
+
+    const entries = readSnapshotArray(root.items, 'profile state.items');
+
+    if (entries.length > PROFILE_MAX_RECORDS) {
+        throw new HarnessError(
+            `profile state holds ${entries.length} profiles; the maximum is ${PROFILE_MAX_RECORDS}.`
+        );
+    }
+
+    const items = entries.map((entry, index) => {
+        const label = `profile state.items[${index}]`;
+        const record = readSnapshotRecord(entry, label);
+        readSnapshotKeys(record, ['id', 'name', 'description', 'traits', 'notes'], label);
+
+        const rawTraits = readSnapshotArray(record.traits, `${label}.traits`);
+
+        if (rawTraits.length > PROFILE_MAX_TRAITS) {
+            throw new HarnessError(
+                `${label}.traits has ${rawTraits.length} entries; the maximum is ${PROFILE_MAX_TRAITS}.`
+            );
+        }
+
+        const traits = rawTraits.map((trait, traitIndex) => {
+            const traitLabel = `${label}.traits[${traitIndex}]`;
+            const text = readSnapshotString(trait, traitLabel, {
+                min: 1,
+                max: PROFILE_MAX_TRAIT
+            });
+
+            // The writer deduplicates traits; a restored duplicate means the
+            // file did not come from a valid store.
+            if (rawTraits.slice(0, traitIndex).some((earlier) => earlier === text)) {
+                throw new HarnessError(`${traitLabel} duplicates the trait "${text}".`);
+            }
+
+            return text;
+        });
+
+        return {
+            id: readSnapshotId(record.id, `${label}.id`),
+            name: readSnapshotString(record.name, `${label}.name`, {
+                min: 1,
+                max: PROFILE_MAX_NAME
+            }),
+            description: readSnapshotString(record.description, `${label}.description`, {
+                min: 1,
+                max: PROFILE_MAX_TEXT
+            }),
+            traits,
+            notes: readSnapshotString(record.notes, `${label}.notes`, { max: PROFILE_MAX_TEXT })
+        };
+    });
+
+    const nextId = readSnapshotIdCounter(
+        items.map((item) => item.id),
+        root.nextId,
+        'profile state'
+    );
+
+    return { items, nextId };
 };
 
 // The per-harness profile list. Ids are decimal strings, monotonic for the life
@@ -490,6 +578,18 @@ export const createProfileTool = (): ProfileToolset => {
         reset: () => {
             items.splice(0, items.length);
             nextId = 1;
+        },
+        // Copy out (traits included) so a snapshot never aliases live state.
+        snapshot: () => ({
+            items: items.map(copyProfile),
+            nextId
+        }),
+        // Validate into copies first, then replace the closure state in one step.
+        restore: (state: unknown) => {
+            const restored = readProfileStoreState(state);
+
+            items.splice(0, items.length, ...restored.items);
+            nextId = restored.nextId;
         }
     };
 };

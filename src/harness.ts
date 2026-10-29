@@ -65,6 +65,13 @@
 // survives across calls (turns), so a capability discovered once stays declared
 // until reset().
 //
+// A query that names an already-declared CORE capability is answered too: the
+// result's `alreadyAvailable` lists those tools (metadata only) so the model does
+// not conclude "no match" for something it can call directly, and such a tag is not
+// reported in `unmatchedTags`. Nothing is enabled for them and the 5-match budget
+// is untouched. The list is the caller's own view: a subagent never sees
+// agentDelegate there, and a harness without subagents never has it to report.
+//
 // Harness-owned names sit outside that scheme:
 //   - toolRequest  — discovery, described above.     (every agent, core)
 //   - toolCreate   — compile-and-register a tool.    (every agent, core)
@@ -166,6 +173,10 @@ import {
     createProfileTool,
     createChapterTool,
     createLocationTool,
+    HARNESS_SNAPSHOT_VERSION,
+    cloneToolCreation,
+    readHarnessMessages,
+    readHarnessSnapshot,
     TOOL_CREATE_METADATA,
     TOOL_CREATE_NAME,
     AGENT_DELEGATE_NAME,
@@ -182,12 +193,15 @@ import { runPlugins } from './plugin';
 import type {
     Agent,
     Harness,
+    HarnessAgentSnapshot,
     HarnessAssistantMessage,
     HarnessConfiguration,
     HarnessDelegationResult,
     HarnessEvent,
     HarnessProgress,
     HarnessRunOptions,
+    HarnessSnapshot,
+    HarnessStateChangeReason,
     HarnessStreamTool,
     HarnessToolCall,
     Tool,
@@ -449,6 +463,37 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         await configuration.report?.progress?.(event);
     };
 
+    // Persistence observer (R3a / T3 addendum). Fires AFTER a mutation a snapshot
+    // would record, so a server can save without waiting for session close. It is
+    // advisory and synchronous: a throwing callback is swallowed here, because a
+    // persistence failure must never turn a completed tool call into a failure or
+    // change the run's outcome.
+    //
+    // snapshot() is safe to call from here even while the run is active (T16):
+    // the callback runs on the same thread immediately after the mutation, so the
+    // read sees the committed transcript/store state and cannot interleave with
+    // another mutation.
+    //
+    // Call sites cover every mutation the harness itself performs: agent history
+    // appends/rollbacks, tool executions (model and manual), host/model tool
+    // creation, reset(), and restore(). Direct agent.user()/assistant()/model()
+    // calls and direct agent.messages edits happen outside the harness and cannot
+    // be observed; see HarnessStateChangeEvent in ./types.
+    const notifyStateChange = (
+        reason: HarnessStateChangeReason,
+        detail: { agent?: string; tool?: string } = {}
+    ): void => {
+        const observer = configuration.report?.stateChange;
+        if (!observer) return;
+
+        try {
+            observer({ type: 'state_change', reason, ...detail });
+        } catch {
+            // Observer failures are not harness failures. The next successful
+            // mutation (or a periodic save) will notify again.
+        }
+    };
+
     // Tools toolRequest has enabled, in discovery order. Searchable tools stay
     // in the registry but are not declared — and not callable — until they land
     // here. Core tools bypass the set entirely. The set is per harness, so a
@@ -474,6 +519,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
+    // The core tools a given agent may actually see: every 'core' definition, minus
+    // the primary-only ones for every other agent. ONE rule, shared by the request
+    // declaration below and by toolRequest's `alreadyAvailable` report, so a tool
+    // cannot be declared to a subagent and omitted from discovery (or advertised
+    // to an agent that never receives it).
+    const visibleCoreTools = (brain: Agent): Tool[] => {
+        const core: Tool[] = [];
+
+        for (const definition of Object.values(tools)) {
+            if (definition.visibility !== 'core') continue;
+            if (definition.name === AGENT_DELEGATE && brain !== primary) continue;
+            if (definition.name === TOOL_CREATE && toolCreation === 'primary' && brain !== primary) continue;
+            core.push(definition);
+        }
+
+        return core;
+    };
+
     // toolRequest is the one discovery tool every harness provides. It is core, so
     // the model can always reach it, and its result both explains the matches and
     // enables them for the next turn.
@@ -482,9 +545,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // five matches per request, `remaining` as the count of further matches, and a
     // `limit` that can only narrow the shortlist. Two schema properties, so the
     // single-property rule does not apply and `parameters` arrives as an object.
+    //
+    // `alreadyAvailable` is the caller-visible CORE set (visibleCoreTools), passed
+    // as a report only: core tools are never enabled here and never spend the cap,
+    // and the agent check is what keeps agentDelegate out of a subagent's answer.
+    // The manual host path sets `agent: primary`, so an operator sees the same
+    // primary view the model does.
     tools[TOOL_REQUEST] = defineTool<{ tags: string[]; limit?: number }, ToolSearchResult>({
         ...TOOL_REQUEST_METADATA,
-        execute: ({ parameters }) => {
+        execute: ({ parameters, agent: caller }) => {
             // Tolerate a bare array (a model ignoring the schema) and a missing
             // `tags`, so a sloppy call still gets the catalogue vocabulary back.
             const query = Array.isArray(parameters)
@@ -498,7 +567,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             const key = discoveryQueryKey(query, limit);
             const offset = discoveryOffsets.get(key) ?? 0;
 
-            const result = searchTools(Object.values(tools), query, limit, offset);
+            const result = searchTools(Object.values(tools), query, limit, offset, {
+                declared: visibleCoreTools(caller ?? primary)
+            });
             enableTools(result.enabled);
 
             // Advance only when this page actually returned matches AND more are
@@ -522,6 +593,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // only. Nothing is written to disk, so two harnesses cannot see each other's
     // tools and a process restart starts clean.
     let createdTools = 0;
+
+    // Persistence records for tools created at runtime (R3a). A Tool carries the
+    // compiled `execute` function, which cannot be serialized, so the harness
+    // keeps the source-shaped request that produced it. The registry remains the
+    // runtime truth; this map only feeds snapshot()/restore() and never executes
+    // anything on capture. Order is creation order, which is also registry
+    // insertion order (important for declaration order after a restore).
+    const createdToolRecords = new Map<string, ToolCreation>();
 
     const createToolFrom = (configuration: ToolCreation): Tool => {
         if (createdTools >= maxCreatedTools) {
@@ -548,11 +627,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         tools[definition.name] = definition;
         createdTools++;
 
+        // Retain the creation request (source included) so snapshot() can persist
+        // it. Clone now: the caller owns `configuration` and may reuse/mutate it,
+        // while the registry record must stay exactly what was compiled.
+        createdToolRecords.set(definition.name, cloneToolCreation(configuration));
+
         // Registered searchable AND enabled immediately: the model just asked for
         // this tool, so making it spend a toolRequest round trip to call it would be
         // wasteful. It stays in the searchable catalogue, so it remains
         // discoverable (and a reset() only clears the enabled set).
         activeTools.add(definition.name);
+
+        // The registry, the enabled set, and the lifetime budget all changed.
+        notifyStateChange('tool_create', { tool: definition.name });
 
         return definition;
     };
@@ -677,22 +764,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //
     // agentDelegate is core for the primary only: it is skipped for every other
     // agent, so a subagent cannot even see the delegation control. toolCreate is
-    // the same under the 'primary' creation policy (R12).
+    // the same under the 'primary' creation policy (R12). That rule lives in
+    // visibleCoreTools, which toolRequest also reads — one source for both.
     const declared = (brain: Agent): Tool[] => {
-        const core: Tool[] = [];
         const discovered: Tool[] = [];
 
         for (const definition of Object.values(tools)) {
-            if (definition.visibility === 'core') {
-                if (definition.name === AGENT_DELEGATE && brain !== primary) continue;
-                if (definition.name === TOOL_CREATE && toolCreation === 'primary' && brain !== primary) continue;
-                core.push(definition);
-            } else if (activeTools.has(definition.name)) {
+            if (definition.visibility !== 'core' && activeTools.has(definition.name)) {
                 discovered.push(definition);
             }
         }
 
-        return [...core, ...discovered];
+        return [...visibleCoreTools(brain), ...discovered];
     };
 
     // Declarations handed to every request. Rebuilt per run so a plugin that
@@ -706,6 +789,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // requested it is already in history (agent.turn() committed it).
     const appendToolResult = (brain: Agent, call: HarnessToolCall, content: string): void => {
         brain.messages.push({ role: 'tool', content, toolCallId: call.id, name: call.name });
+        // The transcript is snapshot-managed: notify after the append so a server
+        // can persist it before the next turn starts.
+        notifyStateChange('agent_message', { agent: brain.name });
     };
 
     // Execute one tool call and report it. Every failure mode is converted into a
@@ -854,6 +940,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             if (runSignal?.aborted === true) throw error;
 
             await fail(`Tool "${call.name}" failed: ${toErrorInfo(error).message}`);
+        } finally {
+            // Notify even when the tool threw: a tool may mutate session state
+            // before failing, and an extra save is harmless. This is also the
+            // single place discovery/todo/profile/chapter/location/create changes
+            // become observable to a persistence layer on the MODEL path.
+            notifyStateChange('tool_execute', { agent: brain.name, tool: call.name });
         }
     };
 
@@ -873,6 +965,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         await progress({ type: 'start', agent: brain.name, model: brain.model() });
         brain.user(input);
+        // The user message is now part of the snapshot-managed transcript.
+        notifyStateChange('agent_message', { agent: brain.name });
 
         try {
             for (let iteration = 0; iteration < maxIterations; iteration++) {
@@ -907,6 +1001,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     throw new HarnessError(`Agent "${brain.name}" ended without producing a message.`);
                 }
 
+                // agent.turn() committed the assistant message before yielding
+                // `done`; persist that append before any tool work or the next turn.
+                notifyStateChange('agent_message', { agent: brain.name });
+
                 // Per-request token accounting, reported for EVERY turn — including
                 // the tool rounds that continue this run — so a client can tally the
                 // whole run's cost while it iterates. The `done` event below reports
@@ -934,6 +1032,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             );
         } catch (error) {
             brain.messages.splice(commitIndex);
+            // The rollback removed this run's messages: notify after the splice so
+            // a saved transcript does not keep a failed call's partial turn.
+            notifyStateChange('agent_message', { agent: brain.name });
 
             const info = toErrorInfo(error);
             await progress({ type: 'error', agent: brain.name, error: info });
@@ -995,6 +1096,207 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             runStack.pop();
             runSignal = previousSignal;
         }
+    };
+
+    // -----------------------------------------------------------------------
+    // R3a: snapshot / restore
+    // -----------------------------------------------------------------------
+    //
+    // snapshot() is a pure synchronous read: it copies agent transcripts, the
+    // model each agent will use, enabled/discovered tools, progressive-discovery
+    // offsets, the lifetime creation budget, runtime-created tool SOURCES, and
+    // every session record store. It deliberately omits configuration,
+    // credentials, functions (transports/tool implementations/plugins/progress
+    // hooks), and in-flight execution state (runStack/runSignal).
+    //
+    // SAFE DURING AN ACTIVE RUN (T16). Agent history is only mutated synchronously
+    // at commit points, and snapshot() runs on the same thread, so a read from a
+    // synchronous boundary (the stateChange observer, a progress callback, or the
+    // host's own event-loop turn) always sees a coherent committed state: a
+    // completed tool's store mutation AND its tool-result message together. That
+    // is what lets a server persist an interrupted turn instead of losing work.
+    //
+    // This does NOT include text/reasoning deltas that have not yet been committed
+    // to agent.messages; those are progress events, not snapshot state. A snapshot
+    // taken from inside a tool body while it is awaiting captures the writes that
+    // tool has completed so far (no torn state is possible; the tool itself owns
+    // its intermediate consistency).
+    //
+    // restore() is still forbidden during a run: it would replace the transcript
+    // the loop is actively using. The asymmetry is intentional.
+    //
+    // restore() validates the whole value before touching anything:
+    //   1. schema/version and every record (readHarnessSnapshot) — pure;
+    //   2. compilation of every created tool (createDynamicTool; compile only,
+    //      never execute, same trusted-source policy as toolCreate);
+    //   3. target-specific checks: agent identity, registry collisions, creation
+    //      budget, and that every discovered name resolves.
+    // Only then is state replaced. Validation failure therefore leaves the target
+    // untouched, which is what makes a corrupt on-disk snapshot safe to report.
+    //
+    // A restore removes tools THIS harness previously restored (tracked in
+    // createdToolRecords) before registering the snapshot's set, so applying the
+    // same snapshot twice is idempotent instead of colliding with itself.
+    const snapshot = (): HarnessSnapshot => {
+        const agentSnapshots: Record<string, HarnessAgentSnapshot> = {};
+
+        for (const [name, brain] of Object.entries(agents)) {
+            // readHarnessMessages validates the same schema restore will enforce,
+            // so this harness cannot emit a snapshot its own restore rejects.
+            agentSnapshots[name] = {
+                model: brain.model(),
+                messages: readHarnessMessages(brain.messages, `agent "${name}" messages`)
+            };
+        }
+
+        return {
+            version: HARNESS_SNAPSHOT_VERSION,
+            agents: agentSnapshots,
+            discovery: {
+                // Set iteration order is discovery order and must survive.
+                enabled: [...activeTools],
+                offsets: [...discoveryOffsets.entries()].map(([query, offset]) => ({
+                    query,
+                    offset
+                }))
+            },
+            // Creation order is registry insertion order, which decides
+            // declaration order after a restore.
+            createdTools: [...createdToolRecords.values()].map(cloneToolCreation),
+            createdToolCount: createdTools,
+            records: {
+                todos: todo.snapshot(),
+                profiles: profile.snapshot(),
+                chapters: chapter.snapshot(),
+                locations: location.snapshot()
+            }
+        };
+    };
+
+    const restore = (value: HarnessSnapshot): void => {
+        if (runStack.length > 0) {
+            throw new HarnessError(
+                'Cannot restore while an agent run is in progress; wait for the run to settle.'
+            );
+        }
+
+        // Phase 1: pure validation. Throws without mutating anything.
+        const next = readHarnessSnapshot(value);
+
+        // Phase 2: compile every created tool. createDynamicTool validates the
+        // name/tags/schema/source bounds and compiles the body, but does NOT run
+        // it. A source that cannot compile fails here, before state is replaced.
+        const restoredTools = next.createdTools.map((creation) =>
+            createDynamicTool(creation, { reserved: RESERVED_TOOL_NAMES })
+        );
+
+        // Phase 3: target-specific checks.
+        //
+        // Registry collisions ignore tools this harness restored earlier: those
+        // are replaced by this restore (idempotent), not treated as conflicts.
+        const occupied = new Set(
+            Object.keys(tools)
+                .filter((name) => !createdToolRecords.has(name))
+                .map((name) => name.toLowerCase())
+        );
+
+        for (const definition of restoredTools) {
+            const key = definition.name.toLowerCase();
+
+            if (occupied.has(key)) {
+                throw new HarnessError(
+                    `Tool "${definition.name}" is already registered in this harness; the snapshot cannot be restored.`
+                );
+            }
+
+            occupied.add(key);
+        }
+
+        if (next.createdToolCount > maxCreatedTools) {
+            throw new HarnessError(
+                `Snapshot records ${next.createdToolCount} created tools; this harness allows at most ${maxCreatedTools}.`
+            );
+        }
+
+        // Agent identity is the registry key. A snapshot applied to a
+        // same-definition harness has exactly the same set, so a mismatch is a
+        // wrong-session/wrong-build signal rather than something to skip.
+        for (const name of Object.keys(next.agents)) {
+            if (!Object.prototype.hasOwnProperty.call(agents, name)) {
+                throw new HarnessError(
+                    `Snapshot agent "${name}" is not registered in this harness.`
+                );
+            }
+        }
+
+        for (const name of Object.keys(agents)) {
+            if (!Object.prototype.hasOwnProperty.call(next.agents, name)) {
+                throw new HarnessError(
+                    `Agent "${name}" is missing from the snapshot; it cannot be resumed from this file.`
+                );
+            }
+        }
+
+        // Discovery may name configured/preset tools or snapshot-created ones.
+        // A name that resolves nowhere would be silently un-callable after
+        // restore, so it is rejected instead.
+        const available = new Set(
+            Object.keys(tools).filter((name) => !createdToolRecords.has(name))
+        );
+
+        for (const definition of restoredTools) available.add(definition.name);
+
+        for (const name of next.discovery.enabled) {
+            if (!available.has(name)) {
+                throw new HarnessError(
+                    `Snapshot discovery names "${name}", which is not registered in this harness.`
+                );
+            }
+        }
+
+        // Phase 4: apply. Everything above succeeded; from here the snapshot is
+        // the new state.
+        for (const name of [...createdToolRecords.keys()]) delete tools[name];
+
+        createdToolRecords.clear();
+
+        restoredTools.forEach((definition, index) => {
+            tools[definition.name] = definition;
+            createdToolRecords.set(
+                definition.name,
+                cloneToolCreation(next.createdTools[index])
+            );
+        });
+
+        // The lifetime budget is state, not configuration: a resumed session
+        // must not regain spent creations. reset() still does not clear it.
+        createdTools = next.createdToolCount;
+
+        activeTools.clear();
+        for (const name of next.discovery.enabled) activeTools.add(name);
+
+        discoveryOffsets.clear();
+        for (const entry of next.discovery.offsets) {
+            discoveryOffsets.set(entry.query, entry.offset);
+        }
+
+        for (const [name, agentSnapshot] of Object.entries(next.agents)) {
+            const brain = agents[name];
+
+            // Replace in place: message arrays are exposed as `agent.messages`,
+            // and callers may already hold that reference.
+            brain.messages.length = 0;
+            for (const message of agentSnapshot.messages) brain.messages.push(message);
+
+            brain.model(agentSnapshot.model);
+        }
+
+        todo.restore(next.records.todos);
+        profile.restore(next.records.profiles);
+        chapter.restore(next.records.chapters);
+        location.restore(next.records.locations);
+
+        notifyStateChange('restore');
     };
 
     // Apply plugins before returning so the handle is complete and consistent.
@@ -1059,21 +1361,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         const resolved = resolveToolParameters(definition.parameters, parameters, 'direct');
 
-        return definition.execute({
-            parameters: resolved,
-            // An explicit host call acts as the session's entry agent: agentDelegate
-            // therefore stays primary-only, and ctx.run cycles and the depth rule are
-            // still enforced by runAgent.
-            agent: primary,
-            agents,
-            run: (agentName: string, input: string) => {
-                const target = agents[agentName];
-                if (!target) {
-                    throw new HarnessError(`Agent "${agentName}" is not registered.`);
+        try {
+            return await definition.execute({
+                parameters: resolved,
+                // An explicit host call acts as the session's entry agent: agentDelegate
+                // therefore stays primary-only, and ctx.run cycles and the depth rule are
+                // still enforced by runAgent.
+                agent: primary,
+                agents,
+                run: (agentName: string, input: string) => {
+                    const target = agents[agentName];
+                    if (!target) {
+                        throw new HarnessError(`Agent "${agentName}" is not registered.`);
+                    }
+                    return runAgent(target, input);
                 }
-                return runAgent(target, input);
-            }
-        });
+            });
+        } finally {
+            // Manual calls emit no progress events (they are not conversation
+            // turns), so this is the ONLY notification a persistence layer gets
+            // for a UI Tools-tab mutation. It fires on failure too, since a tool
+            // may have mutated state before throwing.
+            notifyStateChange('tool_execute', { tool: name });
+        }
     };
 
     // The harness is a function you call. Properties ride on it so a CLI has
@@ -1102,6 +1412,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // Server-facing manual execution (R8): the session-bound tool invocation
         // `POST /tools/:name` uses when a client supplies a sessionId.
         executeTool,
+        // R3a persistence. `snapshot` never mutates; `restore` validates fully
+        // and recompiles created-tool sources without executing them.
+        snapshot,
+        restore,
         // reset() is "start over": EVERY agent's conversation goes back to its
         // seeded instructions (R12 — a subagent used to keep its transcript, which
         // leaked one session into the next), tool discovery is forgotten, and the
@@ -1123,6 +1437,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             profile.reset();
             chapter.reset();
             location.reset();
+            // A reset is a snapshot-managed mutation too: a server must persist
+            // the cleared transcripts/stores instead of keeping the old file.
+            notifyStateChange('reset');
         }
     }) as unknown as Harness;
 
@@ -1169,6 +1486,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 // alongside each tool so a consumer can type a direct call without reaching into
 // an internal path.
 export { agent, tool, searchTools, compileToolSource, createDynamicTool, toolUi, toolUiOf } from './core';
+// R3a persistence: the schema version a caller stores beside a snapshot. The
+// snapshot types (HarnessSnapshot, HarnessAgentSnapshot, ...) and the per-store
+// state types are part of `export type * from './types'` below.
+export { HARNESS_SNAPSHOT_VERSION } from './core';
 // R10/R11/R12 shared helpers. `boundToolResult` + MODEL_TOOL_RESULT_BUDGET_BYTES
 // are the model-facing 64 KiB cap, exported so a server can apply the SAME cap
 // when it serializes a manual `executeTool` result, and so a tool author can

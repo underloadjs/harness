@@ -8,6 +8,10 @@
         "module": "ESNext",
         "target": "ESNext",
         "moduleResolution": "bundler",
+        // `src/frontend/vite.config.ts` is loaded natively by Vite, which requires
+        // explicit extensions; it imports `./vite-proxy.ts`. Both compiler modes
+        // here are no-emit or declaration-only, so this is safe for the package.
+        "allowImportingTsExtensions": true,
         "jsx": "react",
         "skipLibCheck": true,
         "allowJs": true,
@@ -19,10 +23,16 @@
         "lib": ["decorators", "dom", "es5", "scripthost", "es2015.collection"],
         "types": ["node", "vitest/globals"],
         // Tests import the package by name, never by relative path. Mirror the
-        // vitest alias here so the same specifier resolves for editors and for
-        // any typecheck that includes test files.
+        // vitest aliases here so the same specifier resolves for editors and for
+        // any typecheck that includes test files. The bare name stays the library
+        // entry (`src/harness.ts`); the application layers are published
+        // subpaths (`./server`, `./frontend`, `./shared`) and resolve to their src
+        // barrels so the source tree and the published map agree.
         "paths": {
-            "@underload/harness": ["./src/harness.ts"]
+            "@underload/harness": ["./src/harness.ts"],
+            "@underload/harness/server": ["./src/server/index.ts"],
+            "@underload/harness/frontend": ["./src/frontend/index.ts"],
+            "@underload/harness/shared": ["./src/shared/index.ts"]
         }
     },
     "exclude": ["node_modules", "Temp", "**/*.test.ts", "**/dist/*", "**/lib/*"],

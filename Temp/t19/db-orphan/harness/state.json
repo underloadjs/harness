@@ -1,0 +1,207 @@
+{
+  "version": 1,
+  "savedAt": 1793236829608,
+  "registry": [
+    {
+      "name": "probe",
+      "title": "probe",
+      "description": "scripted tool-call probe",
+      "requiresEndpoint": false,
+      "primary": "probe",
+      "subagents": [],
+      "agents": [
+        "probe"
+      ],
+      "tools": [
+        "hang"
+      ],
+      "builtin": true,
+      "editable": true
+    }
+  ],
+  "sessions": [
+    {
+      "id": "d75c1e05-27ad-4fdf-8bc9-e21a3369b6b4",
+      "harness": "probe",
+      "preset": {
+        "name": "probe",
+        "title": "probe",
+        "description": "scripted tool-call probe",
+        "requiresEndpoint": false,
+        "primary": "probe",
+        "subagents": [],
+        "agents": [
+          "probe"
+        ],
+        "tools": [
+          "hang"
+        ],
+        "builtin": true,
+        "editable": true
+      },
+      "definition": {
+        "name": "probe",
+        "title": "probe",
+        "description": "scripted tool-call probe",
+        "requiresEndpoint": false,
+        "primary": "probe",
+        "subagents": [],
+        "agents": [
+          "probe"
+        ],
+        "tools": [
+          "hang"
+        ],
+        "coreTools": [
+          "toolRequest",
+          "toolCreate",
+          "todoManage",
+          "profileManage",
+          "chapterManage",
+          "locationManage"
+        ],
+        "builtin": true,
+        "editable": true
+      },
+      "settings": {
+        "baseURL": "http://scripted.invalid/v1",
+        "model": "scripted/test"
+      },
+      "status": "idle",
+      "createdAt": 1793236829537,
+      "updatedAt": 1793236829604,
+      "turns": [
+        {
+          "id": "fa2647c1-ee15-4c41-b5d0-c7b1a42da11e",
+          "index": 0,
+          "prompt": "run the tool",
+          "status": "error",
+          "startedAt": 1793236829542,
+          "updatedAt": 1793236829584,
+          "events": [
+            {
+              "type": "start",
+              "agent": "probe",
+              "model": "scripted/test"
+            },
+            {
+              "type": "tool_call",
+              "agent": "probe",
+              "call": {
+                "id": "call_1",
+                "name": "hang",
+                "arguments": "{}"
+              }
+            }
+          ],
+          "eventTimes": [
+            1793236829553,
+            1793236829567
+          ]
+        },
+        {
+          "id": "9179135c-56db-4379-98e2-bad8ca7abf51",
+          "index": 1,
+          "prompt": "continue please",
+          "status": "done",
+          "startedAt": 1793236829586,
+          "updatedAt": 1793236829604,
+          "events": [
+            {
+              "type": "start",
+              "agent": "probe",
+              "model": "scripted/test"
+            },
+            {
+              "type": "text",
+              "agent": "probe",
+              "delta": "continued"
+            },
+            {
+              "type": "done",
+              "agent": "probe",
+              "message": {
+                "role": "assistant",
+                "content": "continued",
+                "reasoning": "",
+                "toolCalls": [],
+                "model": "scripted/test",
+                "stopReason": "stop"
+              }
+            }
+          ],
+          "eventTimes": [
+            1793236829591,
+            1793236829598,
+            1793236829601
+          ]
+        }
+      ],
+      "queue": [],
+      "core": {
+        "version": 1,
+        "agents": {
+          "probe": {
+            "model": "scripted/test",
+            "messages": [
+              {
+                "role": "system",
+                "content": "probe"
+              },
+              {
+                "role": "user",
+                "content": "run the tool"
+              },
+              {
+                "role": "assistant",
+                "content": "",
+                "toolCalls": [
+                  {
+                    "id": "call_1",
+                    "name": "hang",
+                    "arguments": "{}"
+                  }
+                ]
+              },
+              {
+                "role": "user",
+                "content": "continue please"
+              },
+              {
+                "role": "assistant",
+                "content": "continued"
+              }
+            ]
+          }
+        },
+        "discovery": {
+          "enabled": [],
+          "offsets": []
+        },
+        "createdTools": [],
+        "createdToolCount": 0,
+        "records": {
+          "todos": {
+            "items": [],
+            "nextId": 1
+          },
+          "profiles": {
+            "items": [],
+            "nextId": 1
+          },
+          "chapters": {
+            "items": [],
+            "nextId": 1
+          },
+          "locations": {
+            "items": [],
+            "nextId": 1
+          }
+        }
+      },
+      "agentModels": {
+        "probe": "scripted/test"
+      }
+    }
+  ]
+}

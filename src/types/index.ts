@@ -275,7 +275,11 @@ export type ToolSearchResult = {
     // Always present (0 when every match fits). No names are exposed for the
     // excluded tail: tag refinement, not pagination, is the way to reach them.
     remaining: number;
-    // Query tags that matched no tag, name, or description.
+    // Query tags that matched no tag, name, or description in the SEARCHABLE
+    // catalogue and no tag or name among the core tools the caller already has
+    // declared (see ToolSearchOptions.declared). A tag that only names an
+    // already-available core tool is therefore NOT reported as unmatched, so the
+    // model is never told a capability it can already call is absent.
     unmatchedTags?: string[];
     // Every tag in the searchable catalogue. Present only when nothing matched,
     // so the model can retry with real vocabulary instead of guessing.
@@ -288,6 +292,27 @@ export type ToolSearchResult = {
     offset?: number;
     // Retained for compatibility: true exactly when `remaining > 0`.
     truncated?: boolean;
+    // Core tools the CALLER already has declared and that match the query — they
+    // can be called directly right now. Reported, never enabled: they are already
+    // in every request's declarations, so putting them in `enabled`/`tools` would
+    // spend the discovery budget (MAX_DISCOVERY_MATCHES) and imply a new grant.
+    //
+    // Present only when at least one core tool matches, so an ordinary result keeps
+    // its old exact shape. The harness supplies only the core tools VISIBLE to the
+    // calling agent (agentDelegate is excluded for subagents, toolCreate under the
+    // 'primary' policy too), which is what keeps this list honest rather than a
+    // registry dump.
+    alreadyAvailable?: ToolMatch[];
+};
+
+// Optional context for `searchTools()`. Purely additive: a caller that omits it
+// gets the pre-existing searchable-only ranking, byte for byte.
+export type ToolSearchOptions = {
+    // Core tools the caller considers already declared. Discovery never ranks them
+    // as enable candidates; it scores their wire NAME and TAGS (never their
+    // description, which mentions everyday words and would match almost anything)
+    // and reports the hits as `alreadyAvailable`.
+    declared?: readonly Tool[];
 };
 
 // A request to create a tool at runtime, either from the model-facing toolCreate
@@ -421,6 +446,14 @@ export type TodoCounts = {
     remaining: number;
 };
 
+// The complete restorable todo store (R3a). `nextId` is persisted so a resumed
+// session cannot reuse an id that already exists in `items`; both fields are
+// validated by core/todo.ts before a restore mutates anything.
+export type TodoStoreState = {
+    items: TodoItem[];
+    nextId: number;
+};
+
 // Every todoManage result is a bounded page or a single mutation result; the
 // canonical types live in ./core/todo.ts and are re-exported below (R9).
 
@@ -483,6 +516,12 @@ export type ProfileParameters = {
 // Counts are derived on every call, like TodoCounts.
 export type ProfileCounts = {
     total: number;
+};
+
+// The complete restorable profile store (R3a), matching TodoStoreState.
+export type ProfileStoreState = {
+    items: ProfileItem[];
+    nextId: number;
 };
 
 // R9: result and toolset shapes are OWNED by ./core/todo.ts, ./core/profile.ts,
@@ -563,6 +602,14 @@ export type ChapterCounts = {
     complete: number;
 };
 
+// The complete restorable chapter store (R3a). `content` is included here even
+// though lists and mutation results carry summaries: a resumed session must not
+// lose chapter bodies.
+export type ChapterStoreState = {
+    items: ChapterItem[];
+    nextId: number;
+};
+
 // Every chapterManage result is a bounded page of summaries or one mutation
 // result; `content` is present only for `get`. Canonical types: ./core/chapter.ts.
 
@@ -591,6 +638,12 @@ export type LocationParameters = {
 // Counts are derived on every call, like TodoCounts.
 export type LocationCounts = {
     total: number;
+};
+
+// The complete restorable location store (R3a), matching TodoStoreState.
+export type LocationStoreState = {
+    items: LocationItem[];
+    nextId: number;
 };
 
 // Every locationManage result is a bounded page or one mutation result; canonical
@@ -777,6 +830,44 @@ export type HarnessEvent =
 
 export type HarnessProgress = (event: HarnessEvent) => void | Promise<void>;
 
+// Optional persistence observer (R3a/T3 addendum). It fires AFTER a mutation that
+// the snapshot below would record — agent history, discovery, created tools, the
+// session record stores, reset, and restore — so a server can save without waiting
+// for session close. It is deliberately NOT a second event stream: there is no
+// ordering contract, no payload of changed data, and no replay. A callback that
+// throws is ignored (see harness.ts), so a failing persistence layer can never
+// change harness behaviour or turn a completed tool call into a failure.
+//
+// `reason` is a coarse hint for coalescing/debouncing a save; the authoritative
+// state is always `harness.snapshot()`. The callback may call snapshot()
+// synchronously, INCLUDING during an active run: it runs immediately after the
+// mutation, so completed store changes and their tool-result message are captured
+// together (T16).
+//
+// Observable gaps a caller must handle itself:
+//   - direct `agent.user()/.assistant()/.model()` calls outside harness methods;
+//   - `agent.messages` mutated by a tool or host code directly;
+//   - text/reasoning deltas that are not committed to agent.messages yet (they are
+//     progress events, not snapshot state; snapshot() never includes partial text);
+//   - any mutation made before the callback was configured (take a snapshot).
+// These are documented rather than papered over, because the harness cannot
+// intercept its own public objects without wrapping them.
+export type HarnessStateChangeReason =
+    | 'agent_message'
+    | 'tool_execute'
+    | 'tool_create'
+    | 'reset'
+    | 'restore';
+
+export type HarnessStateChangeEvent = {
+    type: 'state_change';
+    reason: HarnessStateChangeReason;
+    // The agent whose history changed, when the reason names one.
+    agent?: string;
+    // The tool whose execution/create caused the change, when applicable.
+    tool?: string;
+};
+
 export type HarnessRunOptions = {
     // Cancellation for this run. Forwarded to every model request, into each
     // tool's `ToolContext.signal`, and to every run it causes (ctx.run and
@@ -790,6 +881,78 @@ export type HarnessRunOptions = {
     // mutating. The run then fails, history is truncated back to where the call
     // started, and the error propagates.
     signal?: AbortSignal;
+};
+
+// ---------------------------------------------------------------------------
+// Persisted core state (R3a)
+// ---------------------------------------------------------------------------
+//
+// `harness.snapshot()` returns this shape and `harness.restore(snapshot)` applies
+// it to a fresh harness built from the SAME definition (same agents, tools,
+// primary, subagents, and policy). It is deliberately DATA ONLY:
+//   - no provider configuration, API key, header, or other credential;
+//   - no functions (transports, tool implementations, plugins, progress hooks);
+//   - no live execution state (run stack, abort signal, in-flight turns).
+// Everything here survives JSON.stringify/JSON.parse unchanged, which is what a
+// server needs to write it to disk under DATABASE_ROOT.
+//
+// snapshot() is safe to take during an active run (T16): the value reflects the
+// committed transcript, discovery, created-tool sources, and store state at that
+// synchronous instant. Partial text/reasoning deltas are not included until the
+// assistant message commits.
+//
+// `version` gates the schema. restore() rejects any other version rather than
+// guessing; a newer/older snapshot is a migration problem, not a silent drop.
+export type HarnessSnapshotVersion = 1;
+
+// One agent's resolvable state. `messages` is the ENTIRE transcript (seeded
+// instructions plus turns and tool results), and `model` is the model accessor's
+// current value, so a resumed agent sends the same request on its next turn.
+// The registry key is the agent identity; no name is duplicated inside.
+export type HarnessAgentSnapshot = {
+    model: string;
+    messages: HarnessMessage[];
+};
+
+// One progressive-discovery cursor (R12). `query` is the opaque normalized query
+// key the harness already uses (JSON [tags, limit]); it is persisted verbatim so
+// repeating a query after a restart continues the same tranche.
+export type HarnessDiscoveryOffsetSnapshot = {
+    query: string;
+    offset: number;
+};
+
+// Everything a snapshot records. Creation ORDER is preserved in `createdTools`
+// (registry order affects declarations), and ids remain stable because each
+// record store carries its own nextId.
+export type HarnessSnapshot = {
+    version: HarnessSnapshotVersion;
+    // Keyed by registry name. Every configured agent must appear (restore checks
+    // both directions when the snapshot is applied).
+    agents: Record<string, HarnessAgentSnapshot>;
+    discovery: {
+        // Enabled searchable tool names, in discovery order (Set order).
+        enabled: string[];
+        // Per-query offsets for progressive discovery; empty when no query has a
+        // continued tail.
+        offsets: HarnessDiscoveryOffsetSnapshot[];
+    };
+    // Tools created at runtime (host `createTool` or the model's toolCreate).
+    // `source` is retained and RECOMPILED on restore through the existing
+    // trusted-source path; restoring never executes it. Configured/preset tools
+    // are owned by the harness definition and are not recorded here (they carry
+    // function implementations that cannot be serialized).
+    createdTools: ToolCreation[];
+    // Lifetime creation budget already spent. Equals createdTools.length in a
+    // snapshot this harness produced; restore validates it and refuses a count
+    // the target's maxCreatedTools cannot hold.
+    createdToolCount: number;
+    records: {
+        todos: TodoStoreState;
+        profiles: ProfileStoreState;
+        chapters: ChapterStoreState;
+        locations: LocationStoreState;
+    };
 };
 
 export type HarnessConfiguration = {
@@ -860,6 +1023,11 @@ export type HarnessConfiguration = {
     // pace the run, and a `console.log` can just print.
     report?: {
         progress?: HarnessProgress;
+        // Persistence observer (R3a). Synchronous and advisory: it runs after a
+        // snapshot-recorded mutation so a server can schedule a save. Errors
+        // thrown by it are ignored. See HarnessStateChangeEvent for what it does
+        // and does not cover.
+        stateChange?: (event: HarnessStateChangeEvent) => void;
     };
     // Optional programmatic extension point, retained from the plugin design.
     plugins?: readonly HarnessPlugin[];
@@ -921,6 +1089,21 @@ export type Harness = {
     executeTool: (name: string, parameters: unknown) => Promise<unknown>;
     // Names of the applied plugins, in order.
     readonly plugins: readonly string[];
+    // A complete, JSON-serializable core-state snapshot (R3a). See HarnessSnapshot
+    // for what is and is not included. Safe to call DURING an active run (T16):
+    // it synchronously captures the committed transcript, discovery, created-tool
+    // sources, and store state, so a completed tool mutation is persistable before
+    // the turn settles. Text/reasoning deltas not yet committed to messages are
+    // not part of it.
+    snapshot: () => HarnessSnapshot;
+    // Apply a snapshot to this harness (R3a). Intended for a FRESH harness built
+    // from the same definition. Validation is complete and up front: schema,
+    // version, agent identity, discovery names, created-tool source compilation,
+    // creation budget, and every record store. Nothing is mutated when validation
+    // fails, and no created-tool source is executed (compilation only). Applying a
+    // snapshot is idempotent: tools previously restored here are replaced, not
+    // duplicated. Throws HarnessError while an agent run is in progress.
+    restore: (snapshot: HarnessSnapshot) => void;
     // Names of the tools toolRequest has enabled so far, in discovery order.
     // Persists for the harness's lifetime (not just one call), which is what lets a
     // later turn call a tool discovered earlier. Copied on read; `reset()` empties

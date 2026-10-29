@@ -1325,14 +1325,23 @@ describe('executeTool', () => {
     it('runs a core tool against this harness and rejects an unregistered name', async () => {
         const writer = harness({ agents: { writer: brain(scripted([answer('hi')])) } });
 
-        // A core tool is NOT searchable, so asking for its tag matches nothing: the
-        // manual path runs the real implementation, not a shortcut.
-        expect(await writer.executeTool('toolRequest', { tags: ['todo'] })).toMatchObject({
+        // A core tool is NOT searchable, so it is never enabled by discovery. It IS
+        // reported in `alreadyAvailable` (tag "todo" is an exact tag on todoManage),
+        // and that report means the tag must not also appear in `unmatchedTags`.
+        const result = await writer.executeTool('toolRequest', { tags: ['todo'] });
+
+        expect(result).toMatchObject({
             enabled: [],
             tools: [],
             remaining: 0,
-            unmatchedTags: ['todo']
+            alreadyAvailable: [
+                {
+                    name: 'todoManage',
+                    tags: ['todo', 'todos', 'task', 'tasks', 'checklist', 'plan']
+                }
+            ]
         });
+        expect((result as { unmatchedTags?: string[] }).unmatchedTags).toBeUndefined();
         expect(writer.discoveredTools).toEqual([]);
 
         await expect(writer.executeTool('nope', {})).rejects.toThrow(

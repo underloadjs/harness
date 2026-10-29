@@ -4,6 +4,10 @@
 // composition rule that makes guidelines affect the runtime prompt: the profile IS
 // the source of the system messages, so adding a guideline cannot silently become
 // documentation that never reaches a model.
+//
+// T3 roster: the five real roles (instruct, research, workspace, reviewer,
+// planner) come first in picker order, then the delegated summarizer, then the two
+// fixtures. Order is pinned so a new profile is an explicit addition.
 
 import { describe, expect, it } from 'vitest';
 import {
@@ -16,14 +20,24 @@ import {
 } from './index';
 import { summarizer } from './summarizer';
 import { instruct } from './instruct';
+import { reviewer } from './reviewer';
+import { planner } from './planner';
+import { research } from './research';
+import { workspace } from './workspace';
+
+// The exact error text a client sees for a bad id: the message lists the known set
+// in picker order, so this is also a roster pin.
+const KNOWN = 'instruct, research, workspace, reviewer, planner, summarizer, demo, flaky';
 
 describe('agent profiles', () => {
-    it('lists the trusted agents in picker order', () => {
+    it('lists the trusted agents with the real roles first', () => {
         expect([...AGENT_PROFILE_NAMES]).toEqual([
             'instruct',
             'research',
-            'summarizer',
             'workspace',
+            'reviewer',
+            'planner',
+            'summarizer',
             'demo',
             'flaky'
         ]);
@@ -53,13 +67,28 @@ describe('agent profiles', () => {
         );
     });
 
+    it('gives the visible roles the requested titles and ids', () => {
+        expect(
+            [instruct, research, workspace, reviewer, planner].map((profile) => ({
+                name: profile.name,
+                title: profile.title
+            }))
+        ).toEqual([
+            { name: 'instruct', title: 'Instruct' },
+            { name: 'research', title: 'Researcher' },
+            { name: 'workspace', title: 'Coder' },
+            { name: 'reviewer', title: 'Reviewer' },
+            { name: 'planner', title: 'Planner' }
+        ]);
+    });
+
     it('resolves ids and rejects unknown ones', () => {
         expect(agentProfile('summarizer')).toBe(summarizer);
+        expect(agentProfile('reviewer')).toBe(reviewer);
+        expect(agentProfile('planner')).toBe(planner);
         expect(isAgentProfileName('workspace')).toBe(true);
-        expect(isAgentProfileName('nope')).toBe(false);
-        expect(() => agentProfile('nope')).toThrow(
-            'Unknown agent "nope". Known agents: instruct, research, summarizer, workspace, demo, flaky.'
-        );
+        expect(isAgentProfileName('critic')).toBe(false);
+        expect(() => agentProfile('critic')).toThrow(`Unknown agent "critic". Known agents: ${KNOWN}.`);
     });
 });
 

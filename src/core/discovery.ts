@@ -39,17 +39,38 @@
 // counts the matches left AFTER the returned page, and the pure function stays
 // pure — a caller that never passes an offset keeps the old first-page result.
 //
-// Only `visibility: 'searchable'` tools are candidates: core tools are already
-// declared, so returning them would waste the model's turn. Only metadata is ever
-// read here — name, description, tags — never `execute`, so a lazily-imported
-// preset (src/tools) is rankable without loading its implementation.
+// Only `visibility: 'searchable'` tools are candidates for ENABLING: core tools
+// are already declared, so returning them in `enabled` would waste the model's
+// turn and spend the cap. Only metadata is ever read here — name, description,
+// tags — never `execute`, so a lazily-imported preset (src/tools) is rankable
+// without loading its implementation.
+//
+// ALREADY-AVAILABLE CORE TOOLS (additive, never enabled). A query used to answer
+// "no match" for a capability the caller could already call — the reported case
+// was tag "agentDelegate" in a harness WITH subagents, where the tool is declared
+// on every request yet discovery claimed nothing matched. searchTools now also
+// scores the core tools the CALLER already has (options.declared, supplied by the
+// harness from its own declaration rule) and reports the hits as
+// `alreadyAvailable`. This is a report only:
+//   - nothing is added to `enabled`/`tools`, so the 5-match budget is untouched;
+//   - no declaration changes, because those tools were declared already;
+//   - the caller supplies the visible set, so a subagent (which never sees
+//     agentDelegate) or a one-agent harness (which has no agentDelegate at all)
+//     gets no such entry — absence stays honest;
+//   - a core hit also counts as a MATCHED query tag, so `unmatchedTags` cannot
+//     claim a capability is absent when it is available.
+//
+// Core scoring is deliberately stricter than searchable scoring: wire NAME and
+// TAGS only, never the description. Core descriptions mention everyday words
+// ("session", "tools", "file") and scanning them would append an already-available
+// capability to almost every query, burying the real shortlist.
 //
 // Cross-references:
 //   - ../types       — ToolSearchResult, ToolMatch, ToolVisibility
 //   - ./tool         — where tags are normalized
 //   - ../harness     — toolRequest, which enables the matches for the next turn
 
-import type { Tool, ToolSearchResult } from '../types';
+import type { Tool, ToolMatch, ToolSearchOptions, ToolSearchResult } from '../types';
 import { normalizeTags } from './tool';
 
 // Default cap on one discovery result, and the hard maximum (R7). Discovery
@@ -112,6 +133,80 @@ const scoreTool = (tool: Tool, needle: string): number => {
     return best;
 };
 
+// Score one ALREADY-DECLARED (core) tool against one query tag.
+//
+// Same ladder as scoreTag (exact 4, prefix 3, contains 2) but applied to the wire
+// NAME as well as the tags, and NEVER to the description. Name comparison is
+// case-insensitive because normalizeTags lower-cases the query, and it is what
+// makes an exact-name lookup ("agentDelegate") resolve even though tag matching
+// alone would stop at "delegate".
+const scoreDeclaredTool = (tool: Tool, needle: string): number => {
+    let best = 0;
+
+    for (const tag of tool.tags) {
+        const points = scoreTag(tag, needle);
+        if (points > best) best = points;
+    }
+
+    const name = tool.name.toLowerCase();
+
+    if (name === needle) {
+        // An exact wire name is as strong as an exact tag.
+        best = Math.max(best, 4);
+    } else if (needle.length >= MIN_PREFIX_LENGTH && name.startsWith(needle)) {
+        best = Math.max(best, 3);
+    } else if (needle.length >= MIN_FUZZY_LENGTH && name.includes(needle)) {
+        best = Math.max(best, 2);
+    }
+
+    return best;
+};
+
+// Rank the declared core tools against the query, with the same OR-style rule as
+// the searchable catalogue: a tool's score is its best single query-tag hit, and
+// breadth is not additive. Order is best score first, then name, so the report is
+// deterministic; the whole list is returned (no cap) because these tools are
+// already in context and naming them costs no schema.
+//
+// `matched` is the set of query tags that hit ANY declared tool. It feeds the
+// `unmatchedTags` computation so a tag naming an available core capability is
+// never reported as unmatched.
+const rankDeclared = (
+    declared: readonly Tool[],
+    needles: readonly string[]
+): { scored: { tool: Tool; best: number }[]; matched: string[] } => {
+    const scored: { tool: Tool; best: number }[] = [];
+    const matched: string[] = [];
+
+    for (const tool of declared) {
+        let best = 0;
+
+        for (const needle of needles) {
+            const points = scoreDeclaredTool(tool, needle);
+            if (points === 0) continue;
+
+            if (!matched.includes(needle)) matched.push(needle);
+            if (points > best) best = points;
+        }
+
+        if (best > 0) scored.push({ tool, best });
+    }
+
+    scored.sort(
+        (left, right) => right.best - left.best || left.tool.name.localeCompare(right.tool.name)
+    );
+
+    return { scored, matched };
+};
+
+// The model-facing shape of an already-declared tool: the same metadata a search
+// match carries, copied so a result can never alias a live tool's tag array.
+const toMatch = (tool: Tool): ToolMatch => ({
+    name: tool.name,
+    description: tool.description,
+    tags: [...tool.tags]
+});
+
 const vocabulary = (tools: readonly Tool[]): string[] => {
     const tags = new Set<string>();
 
@@ -145,11 +240,18 @@ const resolveLimit = (limit: number | undefined): number => {
 // It is clamped to the ranked list, so an over-large offset is simply an empty
 // page. The result carries `offset` only when it is non-zero, so a first-page
 // result keeps its original exact shape.
+//
+// `options.declared` is the set of core tools the CALLER already has declared
+// (the harness passes exactly what its declaration rule allows that agent to see).
+// They are scored by name/tag only and reported as `alreadyAvailable`; they are
+// never enabled, never affect `remaining`, and never consume the cap. Omitting
+// `options` reproduces the pre-existing behaviour exactly.
 export const searchTools = (
     tools: readonly Tool[],
     tags: readonly string[],
     limit?: number,
-    offset = 0
+    offset = 0,
+    options?: ToolSearchOptions
 ): ToolSearchResult => {
     const needles = normalizeTags(tags);
     const catalogue = tools.filter((tool) => tool.visibility === 'searchable');
@@ -157,10 +259,17 @@ export const searchTools = (
     const cap = resolveLimit(limit);
 
     // No usable query: hand back the vocabulary so the model can retry instead of
-    // guessing at tags. Nothing matched, so nothing is left over.
+    // guessing at tags. Nothing matched, so nothing is left over. Deliberately no
+    // `alreadyAvailable`: with no query there is nothing to report as matching.
     if (needles.length === 0) {
         return { enabled: [], tools: [], remaining: 0, availableTags };
     }
+
+    // Core tools are reported, not ranked into the enable list (see the header).
+    const { scored: declaredScored, matched: declaredMatched } = rankDeclared(
+        options?.declared ?? [],
+        needles
+    );
 
     // OR ranking: `best` is the strongest single-tag hit, `hits` only breaks ties.
     const scored: { tool: Tool; best: number; hits: string[] }[] = [];
@@ -188,10 +297,24 @@ export const searchTools = (
     );
 
     const matchedTags = new Set(scored.flatMap((entry) => entry.hits));
+    // A declared core hit is a match too: `unmatchedTags` must not claim an
+    // already-callable capability is absent.
+    for (const needle of declaredMatched) matchedTags.add(needle);
+
     const unmatchedTags = needles.filter((needle) => !matchedTags.has(needle));
 
+    // Same field order regardless of which related fields are present; absent
+    // fields keep earlier exact-shape results unchanged.
+    const alreadyAvailable = declaredScored.map(({ tool }) => toMatch(tool));
+
     if (scored.length === 0) {
-        return { enabled: [], tools: [], remaining: 0, unmatchedTags, availableTags };
+        const none: ToolSearchResult = { enabled: [], tools: [], remaining: 0 };
+
+        if (alreadyAvailable.length > 0) none.alreadyAvailable = alreadyAvailable;
+        if (unmatchedTags.length > 0) none.unmatchedTags = unmatchedTags;
+        none.availableTags = availableTags;
+
+        return none;
     }
 
     // Split the ranked list into what is returned and what is only counted. The
@@ -218,6 +341,7 @@ export const searchTools = (
     if (unmatchedTags.length > 0) result.unmatchedTags = unmatchedTags;
     if (start > 0) result.offset = start;
     if (remaining > 0) result.truncated = true;
+    if (alreadyAvailable.length > 0) result.alreadyAvailable = alreadyAvailable;
 
     return result;
 };

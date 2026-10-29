@@ -47,9 +47,18 @@
 //   remove                        → { removed, counts }
 
 import { HarnessError } from '../util';
-import type { TodoAction, TodoCounts, TodoItem, TodoParameters, Tool } from '../types';
+import type { TodoAction, TodoCounts, TodoItem, TodoParameters, TodoStoreState, Tool } from '../types';
 import { TODO_MANAGE_METADATA } from './metadata';
 import { tool } from './tool';
+import {
+    readSnapshotArray,
+    readSnapshotBoolean,
+    readSnapshotId,
+    readSnapshotIdCounter,
+    readSnapshotKeys,
+    readSnapshotRecord,
+    readSnapshotString
+} from './snapshot-validation';
 
 // The accepted actions, in the order the error message and schema advertise
 // them. `uncheck` is an explicit alias for `check` with `completed: false`.
@@ -96,9 +105,14 @@ export type TodoResult = TodoListResult | TodoChangeResult;
 // What createTodoTool() returns. Declared here (rather than in ../types) because
 // the R9 bounded shape is owned by this module while ../types is shared with
 // units still editing the same file; see the final report for the migration.
+//
+// `snapshot`/`restore` (R3a) are the persistence hooks: a JSON-shaped copy out and
+// a fully validated replacement in. They never expose the live arrays.
 export type TodoToolset = {
     tool: Tool<TodoParameters, TodoResult>;
     reset: () => void;
+    snapshot: () => TodoStoreState;
+    restore: (state: unknown) => void;
 };
 
 // Type guard for the argument object. Arrays are rejected: `[1,2]` is valid
@@ -199,11 +213,54 @@ const paginate = (
     return { todos, page };
 };
 
+// Validate one persisted todo store and return a DEEP COPY. This is the pure
+// half of restore: the harness calls it while preparing a snapshot, and
+// createTodoTool.restore calls it again before touching the closure, so a bad
+// file can never leave a half-restored list.
+//
+// Invariants mirror the mutations above: ids are unique decimal strings, text is
+// non-empty and inside TODO_MAX_TEXT, the record cap holds, and nextId is greater
+// than every stored id (so the next `add` cannot collide).
+export const readTodoStoreState = (value: unknown): TodoStoreState => {
+    const root = readSnapshotRecord(value, 'todo state');
+    readSnapshotKeys(root, ['items', 'nextId'], 'todo state');
+
+    const entries = readSnapshotArray(root.items, 'todo state.items');
+
+    if (entries.length > TODO_MAX_RECORDS) {
+        throw new HarnessError(
+            `todo state holds ${entries.length} todos; the maximum is ${TODO_MAX_RECORDS}.`
+        );
+    }
+
+    const items = entries.map((entry, index) => {
+        const label = `todo state.items[${index}]`;
+        const record = readSnapshotRecord(entry, label);
+        readSnapshotKeys(record, ['id', 'text', 'completed'], label);
+
+        return {
+            id: readSnapshotId(record.id, `${label}.id`),
+            text: readSnapshotString(record.text, `${label}.text`, {
+                min: 1,
+                max: TODO_MAX_TEXT
+            }),
+            completed: readSnapshotBoolean(record.completed, `${label}.completed`)
+        };
+    });
+
+    const nextId = readSnapshotIdCounter(
+        items.map((item) => item.id),
+        root.nextId,
+        'todo state'
+    );
+
+    return { items, nextId };
+};
+
 // The per-harness todo list. IDs are decimal strings, monotonic for the life of
 // this instance, and restart at "1" after reset() (a reset is a clean start:
 // the conversation and every id referring to it are gone too).
-export const createTodoTool = (): TodoToolset => {
-    const items: TodoItem[] = [];
+export const createTodoTool = (): TodoToolset => {    const items: TodoItem[] = [];
     let nextId = 1;
 
     // Resolve an id for every action that names one. A missing, non-string, or
@@ -376,6 +433,21 @@ export const createTodoTool = (): TodoToolset => {
         reset: () => {
             items.splice(0, items.length);
             nextId = 1;
+        },
+        // Copy out: a snapshot must never alias the live list, or a caller could
+        // mutate session state by editing a saved object.
+        snapshot: () => ({
+            items: items.map(copyItem),
+            nextId
+        }),
+        // Validate into a copy first, then replace the closure state in one step.
+        // The records are already copies from readTodoStoreState, so the live
+        // store is not aliased either.
+        restore: (state: unknown) => {
+            const restored = readTodoStoreState(state);
+
+            items.splice(0, items.length, ...restored.items);
+            nextId = restored.nextId;
         }
     };
 };
