@@ -142,6 +142,7 @@ import { UNNAMED_AGENT_PLACEHOLDER, paintAgentColor } from './agent-color';
 // block header. Raw agent ids never reach the DOM as text (R2/R3); the allocator is
 // per turn so the numbering is deterministic on replay.
 import { createAgentLabels } from './agent-label';
+import type { AgentBlockDescriptor } from './references';
 import { markdownFragment, plainPreview } from './markdown';
 import { elapsedBetween, formatDuration } from './time';
 import { formatTokens } from './tokens';
@@ -264,6 +265,12 @@ export type TurnHandle = {
     // record; never renders the base64 payload as text (filename/marker only, plus
     // a safe raster-image thumbnail).
     setAttachments: (attachments: readonly HarnessAttachment[]) => void;
+    // Real agent blocks in this turn, root first then nested invocations, in
+    // allocation order. This is the ONLY source for the composer's # reference
+    // popup (ui/references.ts): each descriptor carries the exact turn/thread
+    // binding, display label, raw agent id, status and latest text. Empty while
+    // the tile has no server id (an unbound optimistic tile cannot be referenced).
+    blocks: () => AgentBlockDescriptor[];
     // Stop every timer the tile owns (elapsed tick, tool timers, pending text
     // frame). Called when the board clears or the page is hidden.
     destroy: () => void;
@@ -335,6 +342,10 @@ export type TurnBoard = {
     // without duplicating them, adopt new turns, drop removed ones, and keep the
     // reader's expanded tile. This is the snapshot path for a live queue.
     reconcile: (turns: readonly SessionTurn[], options?: HydrateOptions) => TurnHandle[];
+    // Every real block across the visible turns, oldest→newest then root/nested.
+    // The # popup uses this order together with ui/references.ts
+    // `latestReferenceBlock` (latest matching label wins across turns).
+    blocks: () => AgentBlockDescriptor[];
     // Stop every live timer the board owns. Safe to call repeatedly; the page's
     // `pagehide` handler and a view teardown both use it.
     destroy: () => void;
@@ -675,6 +686,10 @@ type AgentSection = {
     flow: HTMLElement;
     meta: HTMLElement;
     text: TextBlock | undefined;
+    // The LAST closed prose block's cumulative buffer. `closeText` clears `text`
+    // when a `done` ends the agent's message; retaining the buffer here is what
+    // keeps the final answer available to the # reference descriptor (T8).
+    lastText: string | undefined;
     reasoning: { details: HTMLDetailsElement; summary: HTMLElement; body: HTMLElement; buffer: string } | undefined;
     tools: ToolCallCard[];
     // Active wrapping row for consecutive tool calls, or undefined when the last
@@ -791,6 +806,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const element = el('div', 'turns');
 
     const turns: TurnHandle[] = [];
+    // Every real block across the visible turns, oldest→newest. The composer's #
+    // popup reads this on open (and on each keystroke while it stays open); the
+    // list is computed live so a streaming turn's new nested block appears without
+    // an extra subscription.
+    const blocks = (): AgentBlockDescriptor[] => turns.flatMap((turn) => turn.blocks());
     let expandedTurn: TurnHandle | undefined;
     // N3 session binding for answer routing. Cards capture this value when created
     // (see create/action handler), never read it at click time, so a switch cannot
@@ -1115,7 +1135,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                           ? 'outcome · interrupted when the turn failed.'
                           : 'outcome · interrupted when the turn ended without a result.';
                 for (const entry of threads.values()) {
-                    if (entry.row === undefined || isTerminalThread(entry.state)) continue;
+                    // Root state is owned by the tile (`state`) — it already carries
+                    // this terminal transition. Every other entry, INCLUDING a
+                    // row-less legacy `inline:<agent>` block, must settle too or
+                    // blocks() would keep advertising it as running (T11).
+                    if (entry.key === ROOT_KEY || isTerminalThread(entry.state)) continue;
                     completeThread(entry, next, reason);
                     // The server will send no further event for this child, so freeze
                     // its block clock at the local observation (R1). A recorded child
@@ -1206,6 +1230,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 flow: sectionFlow,
                 meta: agentMeta,
                 text: undefined,
+                lastText: undefined,
                 reasoning: undefined,
                 tools: [],
                 toolGroup: undefined,
@@ -1844,6 +1869,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             if (section.text === undefined) return;
 
             flushText(section);
+            // Retain the cumulative answer for the # reference descriptor; the
+            // rendered nodes stay in place, only the incremental writer is closed.
+            section.lastText = section.text.buffer;
             section.text = undefined;
         };
 
@@ -2469,7 +2497,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 case 'done': {
                     const entry = route();
                     const section = entry.section;
+                    const message = event.message;
                     closeText(section);
+                    // A provider can omit streamed deltas and put the answer only on
+                    // the terminal message. Keep that answer as the block content too.
+                    if (message.content.length > 0) section.lastText = message.content;
                     // The agent turn is over: a later call in a new turn gets its
                     // own row rather than joining calls from the finished turn.
                     closeToolGroup(section);
@@ -2484,7 +2516,6 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     // land, and only the server's terminal turn status settles the
                     // tile. `pending` is only rendered when present, so a legacy
                     // response prints exactly the old line.
-                    const message = event.message;
                     const parts = [message.model, message.stopReason];
                     if (message.toolCalls.length > 0) {
                         parts.push(`${message.toolCalls.length} tool call${message.toolCalls.length === 1 ? '' : 's'}`);
@@ -2508,7 +2539,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     // entry only — the parent tile and every other invocation keep
                     // their own state. A parent tool_result that arrives later may
                     // still attach its outcome (see `completeThread`).
-                    if (entry.row !== undefined && (pending === undefined || pending.length === 0)) {
+                    //
+                    // Row-less legacy `inline:<agent>` entries settle too: their
+                    // # descriptor used to stay `running` after a successful done,
+                    // and (for error/cancelled) the popup offered them (T11). The
+                    // root is deliberately excluded — the tile's `state` owns it.
+                    if (entry.key !== ROOT_KEY && (pending === undefined || pending.length === 0)) {
                         completeThread(entry, 'done');
                         settleInvocation(entry, at, origin);
                     }
@@ -2528,8 +2564,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
                     // A child that reported its own failure is terminal; the parent's
                     // tool_result (if any) only confirms it. Its block clock freezes at
-                    // the failing event's stamp (R1).
-                    if (entry.row !== undefined) {
+                    // the failing event's stamp (R1). Row-less legacy inline entries
+                    // settle too, so blocks()/the # popup cannot offer a failed block
+                    // (T11); the root stays tile-state owned.
+                    if (entry.key !== ROOT_KEY) {
                         completeThread(entry, 'error', `error · ${event.error.message}`);
                         settleInvocation(entry, at, origin);
                     }
@@ -2741,6 +2779,45 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             actionCards.clear();
         };
 
+        // Shared descriptor status: the tile's transport-facing states collapse to
+        // the server's block vocabulary (`streaming` -> running, `waiting` -> the
+        // queued request it represents). The # popup filters failed/cancelled.
+        const referenceStatus = (value: TurnState | ThreadState): AgentBlockDescriptor['status'] =>
+            value === 'streaming' ? 'running' : value === 'waiting' ? 'queued' : value;
+
+        const blocks = (): AgentBlockDescriptor[] => {
+            // An optimistic tile has no server turn id yet. It cannot be referenced
+            // (the wire binding would be undefined), so it contributes nothing.
+            if (serverId === undefined) return [];
+
+            const descriptors: AgentBlockDescriptor[] = [];
+
+            // Map insertion order is allocation order: root (created by the first
+            // event), then each delegated invocation. The label allocator is per
+            // turn, so this is exactly the numbering the transcript shows.
+            for (const entry of threads.values()) {
+                const isRoot = entry.key === ROOT_KEY;
+                // While prose is still streaming read the live buffer; after a
+                // `done` closes it, `lastText` retains the final answer (T8).
+                const content = entry.section.text?.buffer ?? entry.section.lastText;
+
+                descriptors.push({
+                    turnId: serverId,
+                    // Root = the wire's "no threadId" signal. Nested entries use
+                    // their CURRENT stable identity (`thread.id` after adoption,
+                    // otherwise `call:<callId>` / `inline:<agent>`), which shared
+                    // `findAgentResultBlock` explicitly supports as an alias.
+                    ...(isRoot ? {} : { threadId: entry.key }),
+                    label: entry.label,
+                    agent: entry.agent,
+                    status: referenceStatus(isRoot ? state : entry.state),
+                    ...(content !== undefined && content.length > 0 ? { content } : {})
+                });
+            }
+
+            return descriptors;
+        };
+
         const turn: TurnHandle = {
             element: card,
             prompt,
@@ -2759,6 +2836,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             summary: () => ({ agents: threads.size, tools: toolCount, primary: primaryAgent }),
             attachments: () => attachmentRecords,
             setAttachments,
+            blocks,
             destroy
         };
 
@@ -3003,6 +3081,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         adopt,
         hydrate,
         reconcile,
+        blocks,
         destroy
     };
 };

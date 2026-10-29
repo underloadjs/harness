@@ -3013,24 +3013,186 @@ button {
     font-family: var(--sans);
     font-size: 13.5px;
     line-height: 1.45;
+    /* The chat field is a contentEditable div now (T5 R1): newlines are real LF
+       characters and must render, and long paths never force a horizontal scroll. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    word-break: break-word;
 }
 
 /* R9/R5: the CHAT field is one row by default and grows by script (main.ts autoGrow)
    up to a LINE cap — 3 text lines on a phone viewport (<=860px), 5 on desktop — then
-   scrolls. `min-height: 0` lets `rows = 1` decide the empty height instead of the
-   base 54px; `resize` is off because the drag handle would fight the measured height.
-   `max-height: none` is deliberate: the script computes the cap from the field's live
-   line-height/padding/borders, so the base 200px box (still used by the tool-runner
-   arguments textarea) must not clip the fifth line at large fonts or zoom. The
-   right padding reserves the action's footprint so text never runs underneath it
-   (R10). */
+   scrolls. A contentEditable div has no `rows` attribute, so the one-row minimum is
+   an explicit line box + padding (13.5px * 1.45 + 20px), replacing the old
+   `rows = 1` default; the script still owns every height above that. `resize` is off
+   because the drag handle would fight the measured height. `max-height: none` is
+   deliberate: the script computes the cap from the field's live line-height/padding/
+   borders, so the base 200px box (still used by the tool-runner arguments textarea)
+   must not clip the fifth line at large fonts or zoom. The right padding reserves
+   the action's footprint so text never runs underneath it (R10). */
 .composer-field .composer-input {
     width: 100%;
-    min-height: 0;
+    min-height: 40px;
     max-height: none;
     padding: 10px 52px 10px 12px;
     resize: none;
     overflow-y: auto;
+}
+
+/* Inline atomic chips (T5 R1). contenteditable=false on the span makes the caret
+   step over it as one character; these rules only paint the token, the optional
+   raster thumbnail and the attachment remove affordance. */
+.composer-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    max-width: 100%;
+    margin: 0 1px;
+    padding: 0 4px;
+    border-radius: 4px;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 600;
+    line-height: 1.6;
+    white-space: nowrap;
+    vertical-align: baseline;
+    user-select: none;
+    cursor: default;
+}
+
+/* Draft attachment: the marker token, same cyan accent as the old strip. */
+.composer-chip-attachment {
+    background: var(--accent-soft);
+    color: var(--accent);
+}
+
+.composer-chip-file {
+    background: rgba(4, 120, 87, 0.16);
+    color: #6ee7b7;
+}
+
+.composer-chip-reference {
+    background: rgba(129, 140, 248, 0.18);
+    color: #c7d2fe;
+}
+
+/* A file still being read: visible but not sendable. */
+.composer-chip[data-state='reading'] {
+    opacity: 0.7;
+    box-shadow: inset 0 0 0 1px currentColor;
+}
+
+.composer-chip-thumb {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 auto;
+    border-radius: 3px;
+    object-fit: cover;
+}
+
+.composer-chip-text {
+    white-space: nowrap;
+}
+
+/* Real button inside a non-editable chip: no nested interactive parent, visible
+   focus ring, and pointer clicks never place a caret inside the chip. */
+.composer-chip-remove {
+    width: 14px;
+    height: 14px;
+    padding: 0;
+    border: 0;
+    border-radius: 3px;
+    background: transparent;
+    color: inherit;
+    font-family: var(--sans);
+    font-size: 11px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.composer-chip-remove:hover:not(:disabled) {
+    background: rgba(0, 0, 0, 0.18);
+}
+
+.composer-chip-remove:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.composer-chip-remove:disabled {
+    opacity: 0.4;
+    cursor: default;
+}
+
+/* @ / # popup. Positioned at the caret by main.ts (absolute coordinates inside
+   .composer-field); the fallback top keeps it attached before first placement. */
+.composer-popup {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 40;
+    display: flex;
+    flex-direction: column;
+    min-width: 220px;
+    max-width: min(480px, 100%);
+    max-height: 240px;
+    padding: 4px;
+    overflow-y: auto;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--bg-bar);
+    box-shadow: 0 12px 24px rgba(0, 0, 0, 0.35);
+}
+
+.composer-popup[hidden] {
+    display: none;
+}
+
+.composer-popup-option {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 6px 8px;
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.composer-popup-option[data-active='true'] {
+    background: var(--accent-soft);
+}
+
+.composer-popup-token {
+    flex: 0 0 auto;
+    color: var(--accent);
+    font-family: var(--mono);
+    font-weight: 600;
+}
+
+.composer-popup-name {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.composer-popup-state {
+    flex: 0 0 auto;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 9.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.composer-popup-note {
+    padding: 6px 8px;
+    color: var(--muted);
+    font-size: 11px;
 }
 
 .composer-input:focus {

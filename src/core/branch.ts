@@ -138,6 +138,14 @@ export const registerAgentBranch = (agent: Agent, metadata: AgentBranchMetadata)
 let branchSequence = 0;
 export const createBranchId = (): string => `branch-${++branchSequence}`;
 
+// Restore high-water mark (R3 durability). Restored fork results carry their
+// original `branch-N` invocation id; a future fork in this process must not reuse
+// that id, or the archived result would be overwritten. The value is a no-op when
+// the module counter is already past it.
+export const reserveBranchSequence = (value: number): void => {
+    if (Number.isSafeInteger(value) && value > branchSequence) branchSequence = value;
+};
+
 // ---------------------------------------------------------------------------
 // Fork factory indirection
 // ---------------------------------------------------------------------------

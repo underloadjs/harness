@@ -5,9 +5,9 @@
 // webSearch (../tools/websearch/index.ts). Their metadata lives with their real
 // implementations; this file stays the single source for the session-bound
 // harness-owned set (toolRequest/toolCreate/todoManage/profileManage/
-// chapterManage/locationManage/agentDelegate, plus the CONDITIONAL actionRequest
-// and threadFork added by N3), which is also what harnesses/core.ts exports to
-// the server with sessionBound: true.
+// chapterManage/locationManage/agentManage/agentResult/agentDelegate, plus the
+// CONDITIONAL actionRequest and threadFork added by N3), which is also what
+// harnesses/core.ts exports to the server with sessionBound: true.
 //
 // N3 conditional tools: actionRequest is registered only when `interaction` is
 // configured, threadFork only when `forks` is enabled. Like TOOL_CANCEL they are
@@ -29,8 +29,8 @@
 // registration and the server catalogue read it - makes that drift impossible.
 //
 // NAMING (T14): every tool is `<namespace><action>` - toolRequest, toolCreate,
-// todoManage, profileManage, chapterManage, locationManage, agentDelegate - and
-// the preset tools follow the same rule
+// todoManage, profileManage, chapterManage, locationManage, agentManage,
+// agentResult, agentDelegate - and the preset tools follow the same rule
 // (fileRead, fileWrite, fileEdit, fileList, fileGlob, commandRun, webSearch,
 // timeNow, textCount, diceRoll, noteSearch, textSummarize, testFlaky). The
 // namespace is what groups related tools in discovery; the action is what the
@@ -64,6 +64,13 @@ export const TODO_MANAGE_NAME = 'todoManage';
 export const PROFILE_MANAGE_NAME = 'profileManage';
 export const CHAPTER_MANAGE_NAME = 'chapterManage';
 export const LOCATION_MANAGE_NAME = 'locationManage';
+// Agent inspection (R3). agentManage lists every configured agent plus truncated
+// result previews; agentResult reads one completed result in pages. Both are
+// ALWAYS-registered core tools: a subagent has the same view of the session's
+// other agents as the primary, so a delegated worker can inspect what its
+// siblings already produced.
+export const AGENT_MANAGE_NAME = 'agentManage';
+export const AGENT_RESULT_NAME = 'agentResult';
 export const AGENT_DELEGATE_NAME = 'agentDelegate';
 // N3 owner interaction and private history forks. Both are CONDITIONAL core
 // tools (registered only when interaction/forks are configured), like
@@ -399,6 +406,80 @@ export const LOCATION_MANAGE_METADATA: CoreToolMetadata = {
     }
 };
 
+// Agent inspection (R3). These bounds are the declared contract AND the runtime
+// values (the harness imports them), so the descriptions cannot advertise a
+// preview/page size the implementation does not use.
+//
+//   - PREVIEW: how many characters of each completed answer agentManage shows;
+//   - LIST_PER_AGENT: how many recent invocations per agent agentManage lists;
+//   - RETENTION: how many completed invocation results the harness keeps
+//     (active runs are always retained regardless of this cap);
+//   - PAGE / PAGE_MAX: the default and maximum characters agentResult returns
+//     per page. The page cap is deliberately far below the 64 KiB serialized
+//     tool-result bound even with JSON escaping, so a long result is paged
+//     explicitly instead of being silently truncated by boundToolResult.
+export const AGENT_MANAGE_PREVIEW_CHARS = 200;
+export const AGENT_MANAGE_LIST_PER_AGENT = 5;
+export const AGENT_RESULT_RETENTION = 64;
+export const AGENT_RESULT_PAGE_CHARS = 4000;
+export const AGENT_RESULT_PAGE_MAX_CHARS = 8000;
+
+// Listing. No arguments: the session already defines the agent set, so a
+// parameter would only invite the model to filter it.
+export const AGENT_MANAGE_METADATA: CoreToolMetadata = {
+    name: AGENT_MANAGE_NAME,
+    description:
+        `List every configured agent in this harness session with previews of recent results. Each entry carries the agent's name, role (primary/subagent), model, invocationCount, and up to ${AGENT_MANAGE_LIST_PER_AGENT} recent invocations - roots, delegations, and forks - newest first. A result preview is at most ${AGENT_MANAGE_PREVIEW_CHARS} characters, flags whether it was truncated, and reports the full contentLength; a running invocation has status "running" and no content. Use agentResult with the agent name and optional invocationId to read a full completed result. Only completed answer text is ever exposed here: never system instructions, transcript messages, tool arguments, or tool bodies.`,
+    tags: ['agents', 'results', 'preview', 'subagent', 'team', 'inspect'],
+    visibility: 'core',
+    parameters: {
+        type: 'object',
+        properties: {},
+        additionalProperties: false
+    }
+};
+
+// Full retrieval. `agent` is required; omitting `invocationId` selects that
+// agent's latest completed result. `offset`/`limit` page a long answer without
+// relying on the harness's 64 KiB result cap.
+export const AGENT_RESULT_METADATA: CoreToolMetadata = {
+    name: AGENT_RESULT_NAME,
+    description:
+        `Read the completed result of one agent invocation. Pass "agent"; optionally pass "invocationId" from agentManage (omit it for that agent's latest completed result). The result contains content, contentLength, offset, limit, hasMore, and nextOffset when more remains; page through by passing nextOffset back as offset. Each page is at most ${AGENT_RESULT_PAGE_MAX_CHARS} characters (default ${AGENT_RESULT_PAGE_CHARS}), so a long answer is returned in full across pages instead of being silently truncated. A running invocation returns status "running" with no content, a failed or cancelled invocation reports its error and no content, an unknown invocation is an error, and an agent that has not run yet returns status "empty". Only completed answer text is exposed - never system instructions, transcripts, tool arguments, or tool bodies.`,
+    tags: ['agents', 'result', 'answer', 'output', 'subagent', 'inspect'],
+    visibility: 'core',
+    parameters: {
+        type: 'object',
+        properties: {
+            agent: {
+                type: 'string',
+                minLength: 1,
+                description: 'Configured agent name whose result to read.'
+            },
+            invocationId: {
+                type: 'string',
+                minLength: 1,
+                description:
+                    'Invocation id from agentManage. Omit to read that agent\'s latest completed result.'
+            },
+            offset: {
+                type: 'integer',
+                minimum: 0,
+                description:
+                    '0-based character offset into the result. Defaults to 0; use nextOffset from the previous page.'
+            },
+            limit: {
+                type: 'integer',
+                minimum: 1,
+                maximum: AGENT_RESULT_PAGE_MAX_CHARS,
+                description: `Page size in characters, 1-${AGENT_RESULT_PAGE_MAX_CHARS}. Defaults to ${AGENT_RESULT_PAGE_CHARS}.`
+            }
+        },
+        required: ['agent'],
+        additionalProperties: false
+    }
+};
+
 // Delegation (R4). Capability-by-configuration: the harness registers agentDelegate
 // only when the allowlist is non-empty, so this metadata has two honest forms:
 //   - with subagents - the runtime declaration, whose `agent` enum is the exact
@@ -439,15 +520,18 @@ export const agentDelegateMetadata = (subagents: readonly string[] = []): CoreTo
 };
 
 // The core set a harness without subagents registers: discovery, creation, todos,
-// and the three session record tools. Order is the registration order the
-// harness uses, so this list is also what a catalogue projection reads.
+// the three session record tools, and agent inspection. Order is the
+// registration order the harness uses, so this list is also what a catalogue
+// projection reads.
 export const coreToolMetadata = (): CoreToolMetadata[] => [
     TOOL_REQUEST_METADATA,
     TOOL_CREATE_METADATA,
     TODO_MANAGE_METADATA,
     PROFILE_MANAGE_METADATA,
     CHAPTER_MANAGE_METADATA,
-    LOCATION_MANAGE_METADATA
+    LOCATION_MANAGE_METADATA,
+    AGENT_MANAGE_METADATA,
+    AGENT_RESULT_METADATA
 ];
 
 // Targeted cancellation (T3/R4). The harness declares this ONLY while the calling

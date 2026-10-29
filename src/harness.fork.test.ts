@@ -187,6 +187,8 @@ describe('threadFork runtime', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
 

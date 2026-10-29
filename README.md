@@ -55,9 +55,10 @@ configured it is declared on the first request. The bundled catalogue splits the
 same way (R18): `fileRead`, `fileWrite`, `fileEdit`, and `fileGlob` are core, while
 `fileList`, `commandRun`, `gitDiff`, and `syntaxCheck` are discovered through the
 core `toolRequest` tool — see [Tool discovery](#tool-discovery). The harness-owned
-`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, and
-`locationManage` (plus `agentDelegate` when subagents exist) are also declared up
-front and are the only session-bound core tools. Two conditional harness-owned
+`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`,
+`locationManage`, `agentManage`, and `agentResult` (plus `agentDelegate` when
+subagents exist) are also declared up front and are the only session-bound core
+tools. Two conditional harness-owned
 tools join them: `actionRequest` when `interaction` is configured, and `threadFork`
 when forks are enabled (the default) — see
 [Owner questions and history forks](#owner-questions-and-history-forks).
@@ -332,7 +333,8 @@ Every harness also preloads the bundled preset catalogue by default (`presets:
 true`), so its tools are available with no imports at all. The four core file tools
 (`fileRead`, `fileWrite`, `fileEdit`, `fileGlob`) plus a configured `webSearch` are
 declared from the first request, together with the harness-owned `toolRequest`,
-`toolCreate`, `todoManage`, `profileManage`, `chapterManage`, and `locationManage`
+`toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`,
+`agentManage`, and `agentResult`
 (and `agentDelegate` when subagents exist). `actionRequest` joins that set when
 `interaction` is configured, and `threadFork` when `forks.enabled` is true
 (the default). `fileList`, `commandRun`, `gitDiff`, `syntaxCheck`, and the app tools
@@ -374,7 +376,7 @@ and their tags are not reported in `unmatchedTags`.
 | Rule | Behaviour |
 |---|---|
 | Tags | Required. Trimmed, lowercased, deduplicated. |
-| Default visibility | `'searchable'`. The core set is `fileRead`/`fileWrite`/`fileEdit`/`fileGlob`, a configured `webSearch`, the harness-owned `toolRequest`/`toolCreate`/`todoManage`/`profileManage`/`chapterManage`/`locationManage`, plus `agentDelegate` on a primary with subagents, `actionRequest` when `interaction` is configured, and `threadFork` when forks are enabled. `fileList` is searchable. |
+| Default visibility | `'searchable'`. The core set is `fileRead`/`fileWrite`/`fileEdit`/`fileGlob`, a configured `webSearch`, the harness-owned `toolRequest`/`toolCreate`/`todoManage`/`profileManage`/`chapterManage`/`locationManage`/`agentManage`/`agentResult`, plus `agentDelegate` on a primary with subagents, `actionRequest` when `interaction` is configured, and `threadFork` when forks are enabled. `fileList` is searchable. |
 | Core vs session-bound | `core` means always declared. Only the harness-owned set is `sessionBound` (needs a `sessionId` for a manual server call); core file tools and webSearch run directly. |
 | Ranking | OR-style: a tool needs only one query tag to be a candidate, and its rank is its **best single-tag score** — exact tag (4) > tag prefix (3) > tag substring (2) > name/description hit (1). More matching tags only breaks ties, so a broad tool cannot outrank an exact hit. |
 | Cap | 5 matches — the default AND the maximum. `limit` may only ask for fewer (1–5). `remaining` counts the matches the cap excluded; `truncated: true` mirrors it for older clients. |
@@ -382,7 +384,7 @@ and their tags are not reported in `unmatchedTags`.
 | No match | when neither a searchable nor an already-available core tool matches, the result carries `unmatchedTags` and the full `availableTags`, so the model retries with real vocabulary. |
 | Undiscovered tool | calling one returns a tool result naming tags that would enable it — it does not run. |
 | Lifetime | discovery is per harness and kept across calls; `reset()` forgets it with the conversation. `harness.discoveredTools` exposes the enabled names. |
-| Reserved names | `toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, and `locationManage` belong to the harness, and `agentDelegate`, `actionRequest`, and `threadFork` too when they are registered; using one throws. |
+| Reserved names | `toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, and `agentResult` belong to the harness, and `agentDelegate`, `actionRequest`, and `threadFork` too when they are registered; using one throws. |
 | Manual call | an operator may run any registered tool through `harness.executeTool()` / `POST /tools/:name`; discovery gates the model, not the user. Core file tools need no session; the harness-owned set does. `actionRequest` and `threadFork` are the exception: they need the run that owns the conversation and are refused by the manual path. |
 
 `searchTools(tools, tags, limit?, offset?, options?)` is the same ranking without
@@ -473,6 +475,48 @@ Profiles and locations return whole records, so an empty `notes` is a normal
 stored value, and `traits: []` clears a profile's traits. Like `todoManage`,
 nothing is persisted and no HTTP/UI surface reads these stores: the tool result
 is the record.
+
+### Agent results (`agentManage`, `agentResult`)
+
+Two core tools, declared to the primary **and** to every subagent, let an agent
+inspect what the session's other agents have produced without reading their
+transcripts:
+
+```ts
+agentManage({})                                  // agents + truncated result previews
+agentResult({ agent: 'researcher' })             // latest completed result
+agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
+```
+
+`agentManage` lists EVERY configured agent (even one that has not run), with
+`name`, `role`, `model`, `invocationCount`, and up to five recent invocations
+newest first. Each invocation preview carries `invocationId`, `kind` (`root`,
+`delegation`, `fork`, or `autoanswer`), `status`, `contentLength`, a
+200-character `preview`, and a `truncated` flag. A running invocation has status
+`running` and no content — a streamed partial is never presented as a result.
+
+`agentResult` returns one completed answer. Omit `invocationId` for that agent's
+latest **finished** result (completion order, so a fork that finished earlier does
+not mask the root's answer). The result is `{ content, contentLength, offset,
+limit, hasMore, nextOffset? }`: pages are 4000 characters by default and at most
+8000, so a long answer is read in full across pages instead of being silently
+truncated by the harness's 64 KiB tool-result bound. Offsets are UTF-16 code-unit
+indices; page edges snap to surrogate-pair boundaries, so a non-BMP glyph is never
+split (the returned `offset` is the one actually used). A failed/cancelled invocation
+reports `error` and no content; an unknown id or agent is an error; an agent that
+has not run returns `status: 'empty'`.
+
+Both tools expose ONLY the completed assistant answer value. They never return
+system instructions, transcript messages, tool arguments, or tool bodies. Results
+are held in a bounded per-harness registry (64 completed records, active runs are
+never evicted) and are **durable across snapshot/restore**: terminal results —
+completed, failed, or cancelled — are stored as an optional `agentResults` array
+in the existing snapshot v1 (`invocationId`, `sequence`, `completedOrder`, agent,
+role, kind, status, content, error?), so a restart keeps every answer that already
+exists. Running invocations are omitted from a snapshot (they have no answer yet),
+old snapshots without the field restore with an empty registry, restore advances
+the run/completion/branch id counters so a later run cannot overwrite an archived
+id, and `reset()` clears the archive with the conversation.
 
 ### Tool names
 
@@ -814,13 +858,13 @@ repeat the name inside the definition.
 | `writer.agent` | The entry agent. `writer.agent.messages` is the live transcript. |
 | `writer.agents` | Every agent, including the entry one. |
 | `writer.subagents` | The agents the primary may delegate to, keyed by name. Empty when delegation is not configured. |
-| `writer.tools` | The registered tools, including the harness-owned core `toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentDelegate` when it exists, `threadFork` when forks are enabled, and `actionRequest` when interaction is configured. |
+| `writer.tools` | The registered tools, including the harness-owned core `toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `agentDelegate` when it exists, `threadFork` when forks are enabled, and `actionRequest` when interaction is configured. |
 | `writer.discoveredTools` | Names `toolRequest` has enabled, in discovery order. Read-only copy; `reset()` empties it. |
 | `writer.toolCreate(config)` | Host-side runtime creation. Same validation/registry/budget as the model's `toolCreate`; throws `HarnessError`. |
 | `writer.executeTool(name, parameters)` | Run one registered tool directly, with this harness's context (`agent`, `agents`, `run`). The server's manual-execution path: discovery gates the model, not the operator, so an un-discovered searchable tool still runs. Reserved policy is kept (`toolCreate` registration, primary-only `agentDelegate`); an unregistered name throws, and `actionRequest`/`threadFork` are refused because they need the owning run. |
 | `writer.branches()` | Detached copies of retained branch audit records (`HarnessBranchRecord[]`), newest terminal records within `maxBranchRecords`; active records are never evicted. Ephemeral: not part of the snapshot. |
 | `writer.branch(id)` | One detached branch record by id, or `undefined`. |
-| `writer.reset()` | Reset the entry agent's conversation, forget discovered tools, and clear `todoManage`, `profileManage`, `chapterManage`, and `locationManage`. Created tools stay registered but are no longer enabled. Branch records and pending questions are ephemeral runtime state and are **not** cleared here. |
+| `writer.reset()` | Reset the entry agent's conversation, forget discovered tools, and clear `todoManage`, `profileManage`, `chapterManage`, `locationManage`, and the `agentManage`/`agentResult` registry. Created tools stay registered but are no longer enabled. Branch records and pending questions are ephemeral runtime state and are **not** cleared here. |
 
 ### Runtime tool creation
 
@@ -1513,7 +1557,8 @@ toolbox is identical: all eight package tools (`syntaxCheck`, the five file tool
 `commandRun`, `gitDiff`), the app tools (`timeNow`, `textCount`, `diceRoll`,
 `noteSearch`, `textSummarize`), opt-in `webSearch`, and the harness-owned core tools
 (`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`,
-`locationManage`, plus `agentDelegate` only when the preset declares a subagent,
+`locationManage`, `agentManage`, `agentResult`, plus `agentDelegate` only when the
+preset declares a subagent,
 `threadFork` when forks are enabled, and `actionRequest` when the host supplies an
 interaction handler).
 R18 splits declarations: the four core file tools and a
@@ -1619,9 +1664,9 @@ resource paths below `/v1/harness` and adds a bootstrap document at its root; se
 | `POST /api/harnesses` | Create a harness from trusted agent ids — body `{ name, title?, description?, primary, subagents?, agentModels? }` → `201 { harness }` |
 | `PATCH /api/harnesses/:name` | Change any harness — body `{ title?, description?, primary?, subagents?, agentModels? }` → `{ harness }` |
 | `GET /api/agents` | The trusted agent registry (`name`, `title`, `description`, `instruction`, `guidelines`) |
-| `GET /api/tools` | The whole tool catalogue, session-bound core tools first (`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentDelegate`, `actionRequest`, `threadFork`) then every direct-call tool (including the core file tools); `webSearch` always appears with `availability` |
+| `GET /api/tools` | The whole tool catalogue, session-bound core tools first (`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `agentDelegate`, `actionRequest`, `threadFork`) then every direct-call tool (including the core file tools); `webSearch` always appears with `availability` |
 | `GET /api/tools/bootstrap` | Alias of `GET /api/tools` (the list the root bootstrap document carries) |
-| `POST /api/tools/:name` | Call one tool on the server. A session-bound tool (`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentDelegate`, `actionRequest`, `threadFork`) needs `sessionId`; every other tool - including the core file tools - keeps its session-less runner. `actionRequest`/`threadFork` are refused because they need the owning run. An unconfigured tool returns `ok: false`. See [the call body](#the-tool-call-body) |
+| `POST /api/tools/:name` | Call one tool on the server. A session-bound tool (`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `agentDelegate`, `actionRequest`, `threadFork`) needs `sessionId`; every other tool - including the core file tools - keeps its session-less runner. `actionRequest`/`threadFork` are refused because they need the owning run. An unconfigured tool returns `ok: false`. See [the call body](#the-tool-call-body) |
 | `POST /api/tools/:name/call` | Alias of the row above (verb-named spelling), same dispatcher |
 | `POST /api/models` | Server-side `GET {baseURL}/models`; returns `{ models: string[] }` for the UI dropdown |
 | `POST /api/sessions` | Create a session for a preset |
@@ -1793,7 +1838,7 @@ session registers, including `commandRun`, the file tools, and a configured
 **Core tools** group is different by design: those entries are `sessionBound`, their
 call must carry the selected `sessionId`, and they execute inside that session's
 harness, so a manual `toolRequest`, `toolCreate`, `todoManage`, `profileManage`,
-`chapterManage`, `locationManage`, or `agentDelegate`
+`chapterManage`, `locationManage`, `agentManage`, `agentResult`, or `agentDelegate`
 call changes the conversation the user is looking at (and is refused with `409` while any session
 operation is in flight: a chat turn, queued work, a reset, or another manual call). A manual
 call is not a turn - it never changes `status` or appends a turn, only a private
@@ -1899,7 +1944,7 @@ create sessions and drive tools, so use this only on a trusted network.
 ```json
 {
     "rootPath": "/v1/harness",
-    "presets": [{ "name": "demo", "title": "…", "requiresEndpoint": false, "primary": "demo", "subagents": [], "agents": ["demo"], "tools": ["timeNow"], "coreTools": ["toolRequest", "toolCreate", "todoManage", "profileManage", "chapterManage", "locationManage", "threadFork"], "builtin": true, "editable": true }],
+    "presets": [{ "name": "demo", "title": "…", "requiresEndpoint": false, "primary": "demo", "subagents": [], "agents": ["demo"], "tools": ["timeNow"], "coreTools": ["toolRequest", "toolCreate", "todoManage", "profileManage", "chapterManage", "locationManage", "agentManage", "agentResult", "threadFork"], "builtin": true, "editable": true }],
     "agents": [{ "name": "instruct", "title": "Instruct", "description": "…", "instruction": "…", "guidelines": ["…"] }],
     "tools": [{ "name": "toolRequest", "group": "Core tools", "tags": ["discovery"], "visibility": "core", "sessionBound": true, "parameters": {}, "availability": { "state": "available", "hint": "Runs inside a session harness: send a sessionId with the call." } }, { "name": "fileRead", "group": "Package presets", "tags": ["files"], "visibility": "core", "parameters": {} }],
     "defaults": { "baseURL": "…", "model": "…", "hasApiKey": true },
@@ -1963,7 +2008,8 @@ Recovery policy on restart:
 - each session rebuilds its harness from its OWN frozen preset record, so a
   registry `PATCH` made after creation cannot change or break an old session;
 - the core snapshot is restored (agent transcripts, discovery, created-tool
-  sources — recompiled, never executed, todo/profile/chapter/location stores);
+  sources — recompiled, never executed, todo/profile/chapter/location stores, and
+  the terminal agent-result archive);
 - an in-flight turn is marked `error` and the session reports
   "interrupted by a server restart"; it is **never replayed**, so no tool
   operation runs twice. Pending background calls are interrupted, not resumed —

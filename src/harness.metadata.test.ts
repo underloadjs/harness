@@ -10,7 +10,7 @@
 // descriptor advertises; `server/api.test.ts` asserts that projection end to end.
 //
 // T14: the wire names are toolRequest / toolCreate / todoManage / profileManage /
-// chapterManage / locationManage / agentDelegate.
+// chapterManage / locationManage / agentManage / agentResult / agentDelegate.
 
 import { describe, expect, it } from 'vitest';
 import { agent, harness } from '@underload/harness';
@@ -58,10 +58,17 @@ describe('core tool metadata', () => {
         const writer = solo();
 
         expect(
-            ['toolRequest', 'toolCreate', 'todoManage', 'profileManage', 'chapterManage', 'locationManage'].map(
-                (name) => writer.tools[name].visibility
-            )
-        ).toEqual(['core', 'core', 'core', 'core', 'core', 'core']);
+            [
+                'toolRequest',
+                'toolCreate',
+                'todoManage',
+                'profileManage',
+                'chapterManage',
+                'locationManage',
+                'agentManage',
+                'agentResult'
+            ].map((name) => writer.tools[name].visibility)
+        ).toEqual(['core', 'core', 'core', 'core', 'core', 'core', 'core', 'core']);
 
         expect(writer.tools.toolCreate.description).toBe(
             "Create a tool for yourself from JavaScript source. `source` is the BODY of an async function, for example `return args.toUpperCase();`: it receives `args` (the call arguments; a one-property schema passes the value itself) and `context` (agent, agents, run). Registering validates and compiles the source and enables the tool for your next turn, without running it. The body runs with this process's full permissions - there is no sandbox - so only create tools you are willing to run, and keep them small."

@@ -104,6 +104,8 @@ const TOOL_NAMES = [
     'profileManage',
     'chapterManage',
     'locationManage',
+    'agentManage',
+    'agentResult',
     'agentDelegate',
     // N4: conditional harness-owned tools, appended to the global catalogue.
     'actionRequest',

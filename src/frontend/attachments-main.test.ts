@@ -184,7 +184,7 @@ const taskBodies = (calls: Call[]): unknown[] =>
     calls.filter((call) => call.url === '/api/sessions/s1/tasks' && call.method === 'POST').map((call) => call.body);
 
 const composerChips = (): HTMLElement[] => [
-    ...document.querySelectorAll<HTMLElement>('.composer-attachments .attachment-chip')
+    ...document.querySelectorAll<HTMLElement>('.composer-input [data-chip="attachment"]')
 ];
 
 beforeEach(() => {
@@ -216,7 +216,7 @@ it('inserts "[Image 1]" at the caret on paste and sends the bytes separately', a
     expect(input.selectionStart).toBe(33);
     expect(composerChips().map((chip) => chip.dataset.kind)).toEqual(['image']);
     expect(composerChips()[0]?.dataset.state).toBe('reading');
-    expect(byClass('.composer-attachments .attachment-name', 'span').textContent).toBe('shot.png');
+    expect(composerChips()[0]?.dataset.attachmentName).toBe('shot.png');
     const action = byClass('.composer-action', 'button');
     expect(action.dataset.action).toBe('submit');
     expect(action.disabled).toBe(true);
@@ -269,11 +269,11 @@ it('restores the prompt and keeps the chip when the send itself fails', async ()
     // The draft survives a rejected submit: text (with its marker) and the chip.
     expect(input.value).toBe('send me [Image 1]');
     expect(composerChips()).toHaveLength(1);
-    expect(composerChips()[0]?.querySelector('.attachment-name')?.textContent).toBe('keep.png');
+    expect(composerChips()[0]?.dataset.attachmentName).toBe('keep.png');
     expect(document.querySelector('.log .notice')?.textContent).toBe('task failed: submit rejected');
 });
 
-it('leaves normal text paste alone when the clipboard carries no files', async () => {
+it('always prevents native paste and inserts nothing for an empty payload', async () => {
     stubServer();
     await mount();
 
@@ -281,7 +281,9 @@ it('leaves normal text paste alone when the clipboard carries no files', async (
     input.value = 'plain';
     const event = pasteFiles(input, []);
 
-    expect(event.defaultPrevented).toBe(false);
+    // The native paste is always intercepted; with no text/plain there is simply
+    // nothing to insert.
+    expect(event.defaultPrevented).toBe(true);
     expect(input.value).toBe('plain');
     expect(composerChips()).toEqual([]);
 });
@@ -307,7 +309,7 @@ it('accepts the file-chooser alternative and the same gate', async () => {
     expect(composerChips()[0]?.dataset.state).toBeUndefined();
 });
 
-it('accepts dropped files and lets a non-file drag through', async () => {
+it('accepts dropped files and prevents a text/empty drop natively', async () => {
     stubServer();
     await mount();
 
@@ -322,7 +324,8 @@ it('accepts dropped files and lets a non-file drag through', async () => {
         value: { items: [{ kind: 'string', getAsFile: () => null }], files: [] }
     });
     composer.dispatchEvent(textDrag);
-    expect(textDrag.defaultPrevented).toBe(false);
+    // Every native drop is intercepted; a payload with no files/text inserts nothing.
+    expect(textDrag.defaultPrevented).toBe(true);
     expect(input.value).toBe('drop ');
 
     const fileDrop = new Event('drop', { bubbles: true, cancelable: true });
@@ -342,7 +345,7 @@ it('sends an attachment-only turn with an empty prompt', async () => {
     const calls = stubServer();
     await mount();
 
-    const input = byClass('.composer-input', 'textarea');
+    const input = byClass('.composer-input', 'div');
     pasteFiles(input, [new File([PNG_BYTES], 'shot.png', { type: 'image/png' })]);
     await flush();
 
@@ -350,12 +353,6 @@ it('sends an attachment-only turn with an empty prompt', async () => {
     expect(input.value).toBe('[Image 1]');
     expect(action.dataset.action).toBe('submit');
     expect(action.hidden).toBe(false);
-
-    // Remove the marker text by hand: the chip (and therefore the payload) remains,
-    // and an empty prompt is still a valid attachment-only turn.
-    input.value = '';
-    input.dispatchEvent(new Event('input', { bubbles: true }));
-    expect(action.dataset.action).toBe('submit');
     expect(action.disabled).toBe(false);
 
     submit();
@@ -363,7 +360,7 @@ it('sends an attachment-only turn with an empty prompt', async () => {
 
     expect(taskBodies(calls)).toEqual([
         {
-            input: '',
+            input: '[Image 1]',
             attachments: [
                 {
                     id: 'attach-1',
@@ -473,7 +470,7 @@ it('removes only the failed chip/marker when one read cannot be validated', asyn
 
     // Only the failed attachment is gone; the good one keeps its marker number.
     expect(composerChips().map((chip) => chip.dataset.kind)).toEqual(['image']);
-    expect(byClass('.composer-attachments .attachment-marker', 'span').textContent).toBe('[Image 1]');
+    expect(composerChips()[0]?.dataset.chipLabel).toBe('[Image 1]');
     expect(input.value).toBe('[Image 1]');
     expect(byClass('.composer-attachment-error', 'p').textContent).toContain(
         'Could not attach "bad.png":'
@@ -496,12 +493,12 @@ it('removes the associated first marker when a chip is removed', async () => {
 
     expect(input.value).toBe('one [Image 1] [Image 2]');
     const firstChip = composerChips()[0];
-    expect(firstChip?.querySelector('.attachment-marker')?.textContent).toBe('[Image 1]');
+    expect(firstChip?.dataset.chipLabel).toBe('[Image 1]');
 
-    firstChip?.querySelector<HTMLButtonElement>('.attachment-remove')?.click();
+    firstChip?.querySelector<HTMLButtonElement>('.composer-chip-remove')?.click();
 
     expect(input.value).toBe('one [Image 2]');
-    expect(composerChips().map((chip) => chip.querySelector('.attachment-marker')?.textContent)).toEqual([
+    expect(composerChips().map((chip) => chip.dataset.chipLabel)).toEqual([
         '[Image 2]'
     ]);
 
@@ -509,10 +506,38 @@ it('removes the associated first marker when a chip is removed', async () => {
     input.setSelectionRange(input.value.length, input.value.length);
     pasteFiles(input, [new File([PNG_BYTES], 'third.png', { type: 'image/png' })]);
     await flush();
-    expect(composerChips().map((chip) => chip.querySelector('.attachment-marker')?.textContent)).toEqual([
+    expect(composerChips().map((chip) => chip.dataset.chipLabel)).toEqual([
         '[Image 2]',
         '[Image 3]'
     ]);
+});
+
+it('synchronizes the draft when an inline chip is deleted atomically', async () => {
+    const calls = stubServer();
+    await mount();
+
+    const input = byClass('.composer-input', 'div');
+    pasteFiles(input, [new File([PNG_BYTES], 'gone.png', { type: 'image/png' })]);
+    await flush();
+
+    expect(composerChips()).toHaveLength(1);
+    expect(byClass('.composer-action', 'button').dataset.action).toBe('submit');
+
+    // Backspace/Delete removes the chip inside the browser's editing machinery;
+    // the observer must drop the draft bytes with it.
+    composerChips()[0]?.remove();
+    await flush();
+
+    expect(input.value).toBe('');
+    expect(composerChips()).toEqual([]);
+    expect(byClass('.composer-action', 'button').hidden).toBe(true);
+    expect(byClass('.composer-action', 'button').dataset.action).toBe('none');
+
+    // A later text-only submit carries no stale attachment payload.
+    input.value = 'text only';
+    submit();
+    await flush();
+    expect(taskBodies(calls)).toEqual([{ input: 'text only' }]);
 });
 
 it('renders recorded attachments as filename/type chips, never as base64 text', async () => {

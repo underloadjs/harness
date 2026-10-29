@@ -100,10 +100,18 @@ import type {
 import { mergeSettings, SettingsError } from './config';
 import { HarnessRegistryError } from './harnesses/registry';
 import { MAX_SUBMIT_BODY_BYTES } from '../shared/attachments';
+import { parseAgentReferenceLabels } from '../shared/agent-results';
 import { SessionError, SessionStore, validateAttachmentsForSubmit } from './sessions';
 import type { SessionWatch } from './sessions';
 
 const MAX_BODY_BYTES = 1_000_000;
+
+// Legacy /messages owns its run via the SSE response and does NOT carry the R2
+// reference binding. Rejecting both the payload field and typed `#LABEL` tokens is
+// explicit: silently ignoring either would run a task without the context the
+// user asked for. /tasks is the supported submit surface for references.
+const LEGACY_REFERENCES_UNSUPPORTED =
+    'Result references are not supported by /messages; submit this task through /tasks.';
 
 // Listing models is a convenience call, not a run: an unresponsive provider must
 // not hold a request open indefinitely. Ten seconds is generous for a catalogue
@@ -1205,7 +1213,14 @@ export const createHarnessApi = ({
 
                         // Attachments are a trailing store argument (T3); the store
                         // validates them (400/413/415) before the queued turn exists.
-                        const submitted = store.enqueue(first, body.input, body.attachments);
+                        // References are the next trailing argument (R2): the store
+                        // validates/binds them (400) before any mutation.
+                        const submitted = store.enqueue(
+                            first,
+                            body.input,
+                            body.attachments,
+                            body.references
+                        );
 
                         return {
                             kind: 'json',
@@ -1234,6 +1249,13 @@ export const createHarnessApi = ({
                             throw new HttpError(400, 'A task must be a string.');
                         }
 
+                        // R2/T7: the legacy response-owned run has no reference
+                        // expansion. Reject the field explicitly rather than
+                        // ignoring it (and reject typed #LABEL for the same reason).
+                        if ((body as { references?: unknown }).references !== undefined) {
+                            throw new HttpError(400, LEGACY_REFERENCES_UNSUPPORTED);
+                        }
+
                         // Validate media BEFORE opening the SSE response: an invalid
                         // or oversized clip must answer a real 400/413/415 JSON body,
                         // not a failed frame on a stream that already started. The
@@ -1242,6 +1264,9 @@ export const createHarnessApi = ({
                         const attachments = validateAttachmentsForSubmit(body.attachments);
 
                         const input = body.input.trim();
+                        if (parseAgentReferenceLabels(input).length > 0) {
+                            throw new HttpError(400, LEGACY_REFERENCES_UNSUPPORTED);
+                        }
                         // Empty text is allowed only when a clip carries the task.
                         if (input.length === 0 && attachments.length === 0) {
                             throw new HttpError(400, 'A task cannot be empty.');

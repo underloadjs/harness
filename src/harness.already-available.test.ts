@@ -15,6 +15,7 @@
 import { describe, expect, it } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
 import type { HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '@underload/harness';
+import { AGENT_MANAGE_METADATA, AGENT_RESULT_METADATA } from './core/metadata';
 
 const scripted = (turns: HarnessStreamEvent[][], seen?: HarnessStreamRequest[]): HarnessStream => {
     let index = 0;
@@ -52,6 +53,18 @@ const DELEGATE_MATCH = {
         'Delegate a self-contained task to a configured subagent and return its answer. Subagents: researcher. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.',
     tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
 };
+
+// R3: agentManage/agentResult are core too, and their `agents` tag makes them
+// genuine matches for an agent-capability query. The literal metadata is imported
+// from the one declarative source the runtime registers, so this expectation
+// cannot drift from what the model actually sees.
+const agentMatch = (metadata: { name: string; description: string; tags: readonly string[] }) => ({
+    name: metadata.name,
+    description: metadata.description,
+    tags: [...metadata.tags]
+});
+
+const AGENT_MATCHES = [agentMatch(AGENT_MANAGE_METADATA), agentMatch(AGENT_RESULT_METADATA)];
 
 describe('toolRequest already-available core tools', () => {
     it('reports agentDelegate on an exact wire-name query instead of no match', async () => {
@@ -93,12 +106,13 @@ describe('toolRequest already-available core tools', () => {
 
         // All three synonyms are exact tags on agentDelegate (the metadata carries
         // "delegation" as the noun form), so `unmatchedTags` is absent from the
-        // exact shape.
+        // exact shape. The two agent-inspection core tools also carry the exact
+        // "agents" tag, so they are reported (metadata only) beside it.
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
             enabled: [],
             tools: [],
             remaining: 0,
-            alreadyAvailable: [DELEGATE_MATCH],
+            alreadyAvailable: [DELEGATE_MATCH, ...AGENT_MATCHES],
             availableTags: []
         });
     });
@@ -126,7 +140,8 @@ describe('toolRequest already-available core tools', () => {
             enabled: [],
             tools: [],
             remaining: 0,
-            unmatchedTags: ['agentdelegate', 'agents', 'delegate'],
+            unmatchedTags: ['agentdelegate', 'delegate'],
+            alreadyAvailable: AGENT_MATCHES,
             availableTags: []
         });
     });
@@ -156,7 +171,8 @@ describe('toolRequest already-available core tools', () => {
             enabled: [],
             tools: [],
             remaining: 0,
-            unmatchedTags: ['agentdelegate', 'agents', 'delegate'],
+            unmatchedTags: ['agentdelegate', 'delegate'],
+            alreadyAvailable: AGENT_MATCHES,
             availableTags: []
         });
     });
@@ -216,6 +232,8 @@ describe('toolRequest already-available core tools', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork',
             'tool-00',
             'tool-01',

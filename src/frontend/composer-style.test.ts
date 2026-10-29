@@ -90,7 +90,9 @@ it('makes the chat field one row by default, auto-grown and scrolling at the cap
     // R9: rows=1 + min-height 0 decide the empty height, script growth owns the rest.
     const field = blockOf('.composer-field .composer-input {');
     expect(field).toContain('width: 100%');
-    expect(field).toContain('min-height: 0');
+    // A contentEditable div has no `rows` attribute: one line box + padding is the
+    // explicit empty height, and the script owns every height above it.
+    expect(field).toContain('min-height: 40px');
     expect(field).not.toContain('min-height: 54px');
     // R10: the right gutter reserves the 28px action + margins, so text never
     // runs under the icon; the other sides keep the normal field padding.

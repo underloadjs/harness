@@ -422,6 +422,8 @@ describe('harness snapshot/restore', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'agentDelegate',
             'threadFork',
             'bulk01',

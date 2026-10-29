@@ -52,6 +52,7 @@ import type {
 } from '../harness';
 import type { HarnessDescriptor, SessionStatus, SessionTurn } from './protocol';
 import { validateAttachments } from '../shared/attachments';
+import { readAgentResultReferenceList } from '../shared/agent-results';
 
 // Bumped only when the on-disk document becomes incompatible. The core snapshot
 // carries its own version (HARNESS_SNAPSHOT_VERSION); this one gates the
@@ -353,10 +354,28 @@ const readTurn = (value: unknown, label: string): SessionTurn => {
                   }
               })();
 
+    // Result references (R2) are OPTIONAL and validated structurally by the shared
+    // reader: a malformed persisted reference must fail the load rather than
+    // restore a task whose lookup would later miss. The labels are normalised to
+    // the allocator's uppercase form; an absent key stays absent.
+    const references =
+        record.references === undefined
+            ? undefined
+            : (() => {
+                  try {
+                      return readAgentResultReferenceList(record.references, `${label}.references`);
+                  } catch (error) {
+                      throw new TypeError(
+                          `${label}.references is invalid: ${error instanceof Error ? error.message : String(error)}`
+                      );
+                  }
+              })();
+
     return {
         id: requireString(record.id, `${label}.id`),
         index: requireNumber(record.index, `${label}.index`),
         prompt: requireString(record.prompt, `${label}.prompt`),
+        ...(references === undefined ? {} : { references }),
         ...(attachments === undefined ? {} : { attachments }),
         status: status as SessionTurn['status'],
         ...(record.startedAt === undefined

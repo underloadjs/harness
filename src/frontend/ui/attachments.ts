@@ -1,16 +1,18 @@
-// Composer attachment helpers (R1 clip/attach UX).
+// Composer attachment helpers (R1 clip/attach).
 //
-// The textarea stays the single input: a pasted/chosen file is represented by a
-// plain-text marker ("[Image 1]") inserted at the captured selection, while the
-// bytes travel in the submit body's `attachments` array. This module owns every
-// decision that can be pinned without a browser:
+// The composer's contentEditable field (ui/editor.ts) is the single input: a
+// pasted/chosen file is represented by an atomic inline chip whose serialized text
+// is the plain marker ("[Image 1]"), while the bytes travel in the submit body's
+// `attachments` array. This module owns every decision that can be pinned without
+// a browser:
 //
-//   - marker placement/spacing (insert at selection, remove by first occurrence);
+//   - marker placement/spacing rules (insertAttachmentMarkers/removeAttachmentMarker
+//     are reused by ui/editor.ts for the DOM chip insertion/removal);
 //   - deterministic per-kind numbering that survives removals within one draft;
 //   - the pre-read budget gate (count / per-file / total bytes) and MIME-to-kind
 //     classification;
 //   - raw-base64 extraction from a FileReader data URL;
-//   - the chip DOM (filename via textContent, optional safe image thumbnail).
+//   - the history chip DOM (filename via textContent, optional safe image thumbnail).
 //
 // Contract sources (frozen, don't re-invent):
 //   - ../../types/index.ts          — HarnessAttachment (single type owner)
@@ -18,8 +20,9 @@
 //
 // Cross-references:
 //   - ./main.ts                     — composer state machine that consumes these
+//   - ./editor.ts                   — inline atomic chips (draft attachments)
 //   - ./turns.ts                    — replay/history chips (same chip builder)
-//   - ../../frontend/styles.css     — `.composer-attachments`, `.attachment-chip`
+//   - ../../frontend/styles.css     — `.composer-chip`, `.attachment-chip`
 
 import type { HarnessAttachment } from '../../types';
 import {

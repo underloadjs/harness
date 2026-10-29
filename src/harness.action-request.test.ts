@@ -204,6 +204,8 @@ describe('actionRequest runtime', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork',
             'actionRequest'
         ]);

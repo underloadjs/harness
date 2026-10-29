@@ -15,17 +15,22 @@
 //   - no silent loss: unknown fields, missing fields, wrong types, duplicate ids,
 //     and mismatched counters are errors. A file that this version cannot
 //     represent in full is refused, not partially accepted.
+//   - backward compatibility: the terminal agent-result archive is an OPTIONAL
+//     `agentResults` field on the existing version 1. Snapshots written before
+//     the feature (no field) still restore, with an empty result registry.
 //
 // Cross-references:
 //   - ../types            — HarnessSnapshot and its parts
 //   - ./snapshot-validation — primitive readers shared with the store modules
 //   - ./todo.ts / profile.ts / chapter.ts / location.ts — record state readers
+//   - ./metadata.ts       — AGENT_RESULT_RETENTION (the archive bound)
 //   - ../harness.ts       — snapshot()/restore() implementation
 //   - ./creation.ts       — compileToolSource, the trusted-source compiler
 
 import { HarnessError } from '../util';
 import { validateAttachments } from '../shared/attachments';
 import type {
+    HarnessAgentResultSnapshot,
     HarnessAgentSnapshot,
     HarnessDiscoveryOffsetSnapshot,
     HarnessMessage,
@@ -33,6 +38,7 @@ import type {
     HarnessToolCall,
     ToolCreation
 } from '../types';
+import { AGENT_RESULT_RETENTION } from './metadata';
 import { readChapterStoreState } from './chapter';
 import { readLocationStoreState } from './location';
 import { readProfileStoreState } from './profile';
@@ -67,6 +73,132 @@ const readToolCalls = (value: unknown, label: string): HarnessToolCall[] =>
             arguments: readSnapshotString(record.arguments, `${entryLabel}.arguments`)
         };
     });
+
+// R3 durability: validate the OPTIONAL terminal agent-result records. This runs
+// inside readHarnessSnapshot, before the harness mutates anything, so a corrupt
+// result array rejects the whole restore. Connections to live state are checked
+// here too: every record names an agent present in snapshot.agents, ids/orders are
+// globally unique, and the list is bounded by the same retention as the runtime.
+const readAgentResults = (
+    value: unknown,
+    label: string,
+    agentNames: ReadonlySet<string>
+): HarnessAgentResultSnapshot[] => {
+    const entries = readSnapshotArray(value, label);
+
+    if (entries.length > AGENT_RESULT_RETENTION) {
+        throw new HarnessError(
+            `${label} contains ${entries.length} records; at most ${AGENT_RESULT_RETENTION} are retained.`
+        );
+    }
+
+    const ids = new Set<string>();
+    const sequences = new Set<number>();
+    const completionOrders = new Set<number>();
+
+    return entries.map((entry, index) => {
+        const entryLabel = `${label}[${index}]`;
+        const record = readSnapshotRecord(entry, entryLabel);
+        readSnapshotKeys(
+            record,
+            [
+                'invocationId',
+                'sequence',
+                'completedOrder',
+                'agent',
+                'role',
+                'kind',
+                'status',
+                'content',
+                'error'
+            ],
+            entryLabel,
+            ['error']
+        );
+
+        const invocationId = readSnapshotString(record.invocationId, `${entryLabel}.invocationId`, {
+            min: 1
+        });
+        const sequence = readSnapshotInteger(record.sequence, `${entryLabel}.sequence`, { min: 1 });
+        const completedOrder = readSnapshotInteger(
+            record.completedOrder,
+            `${entryLabel}.completedOrder`,
+            { min: 1 }
+        );
+        const agent = readSnapshotString(record.agent, `${entryLabel}.agent`, { min: 1 });
+        const role = readSnapshotString(record.role, `${entryLabel}.role`, { min: 1 });
+        const kind = readSnapshotString(record.kind, `${entryLabel}.kind`, { min: 1 });
+        const status = readSnapshotString(record.status, `${entryLabel}.status`, { min: 1 });
+        const content = readSnapshotString(record.content, `${entryLabel}.content`);
+
+        if (!agentNames.has(agent)) {
+            throw new HarnessError(
+                `${entryLabel}.agent names "${agent}", which is not present in snapshot.agents.`
+            );
+        }
+
+        if (role !== 'primary' && role !== 'subagent') {
+            throw new HarnessError(`${entryLabel}.role must be one of: primary, subagent.`);
+        }
+
+        if (kind !== 'root' && kind !== 'delegation' && kind !== 'fork' && kind !== 'autoanswer') {
+            throw new HarnessError(
+                `${entryLabel}.kind must be one of: root, delegation, fork, autoanswer.`
+            );
+        }
+
+        if (status !== 'completed' && status !== 'failed' && status !== 'cancelled') {
+            throw new HarnessError(
+                `${entryLabel}.status must be one of: completed, failed, cancelled (running is not persisted).`
+            );
+        }
+
+        if (ids.has(invocationId)) {
+            throw new HarnessError(
+                `${label} contains the duplicate invocationId "${invocationId}".`
+            );
+        }
+        if (sequences.has(sequence)) {
+            throw new HarnessError(`${label} contains the duplicate sequence ${sequence}.`);
+        }
+        if (completionOrders.has(completedOrder)) {
+            throw new HarnessError(
+                `${label} contains the duplicate completedOrder ${completedOrder}.`
+            );
+        }
+
+        ids.add(invocationId);
+        sequences.add(sequence);
+        completionOrders.add(completedOrder);
+
+        const result: HarnessAgentResultSnapshot = {
+            invocationId,
+            sequence,
+            completedOrder,
+            agent,
+            role,
+            kind,
+            status,
+            content
+        };
+
+        if (record.error !== undefined) {
+            result.error = readSnapshotString(record.error, `${entryLabel}.error`, { min: 1 });
+        }
+
+        if (status === 'completed' && result.error !== undefined) {
+            throw new HarnessError(`${entryLabel}.error must be absent on a completed result.`);
+        }
+
+        if (status !== 'completed' && result.error === undefined) {
+            throw new HarnessError(
+                `${entryLabel}.error is required when status is ${status}.`
+            );
+        }
+
+        return result;
+    });
+};
 
 export const readHarnessMessages = (value: unknown, label: string): HarnessMessage[] =>
     readSnapshotArray(value, label).map((entry, index) => {
@@ -217,8 +349,9 @@ export const readHarnessSnapshot = (value: unknown): HarnessSnapshot => {
     const root = readSnapshotRecord(value, 'snapshot');
     readSnapshotKeys(
         root,
-        ['version', 'agents', 'discovery', 'createdTools', 'createdToolCount', 'records'],
-        'snapshot'
+        ['version', 'agents', 'discovery', 'createdTools', 'createdToolCount', 'agentResults', 'records'],
+        'snapshot',
+        ['agentResults']
     );
 
     const version = readSnapshotInteger(root.version, 'snapshot.version', { min: 1 });
@@ -336,6 +469,14 @@ export const readHarnessSnapshot = (value: unknown): HarnessSnapshot => {
         );
     }
 
+    // R3 durability: OPTIONAL terminal results. An old snapshot (field absent)
+    // restores to an empty registry. The reader validates every record against
+    // snapshot.agents and the retention bound, so nothing is accepted partially.
+    const agentResults =
+        root.agentResults === undefined
+            ? undefined
+            : readAgentResults(root.agentResults, 'snapshot.agentResults', new Set(agentNames));
+
     // Record stores: each reader validates its own bounds and returns copies.
     const records = readSnapshotRecord(root.records, 'snapshot.records');
     readSnapshotKeys(records, ['todos', 'profiles', 'chapters', 'locations'], 'snapshot.records');
@@ -346,6 +487,7 @@ export const readHarnessSnapshot = (value: unknown): HarnessSnapshot => {
         discovery: { enabled, offsets },
         createdTools,
         createdToolCount,
+        ...(agentResults === undefined || agentResults.length === 0 ? {} : { agentResults }),
         records: {
             todos: readTodoStoreState(records.todos),
             profiles: readProfileStoreState(records.profiles),

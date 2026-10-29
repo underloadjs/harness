@@ -17,6 +17,7 @@ import type {
     ToolUiPanel
 } from '../harness';
 import type { RunnerSettings } from './harnesses/types';
+import type { AgentResultReference } from '../shared/agent-results';
 
 export type {
     HarnessActionAnswer,
@@ -36,6 +37,7 @@ export type {
     ToolUiPanel
 } from '../harness';
 export type { RunnerSettings } from './harnesses/types';
+export type { AgentResultReference, AgentResultBlock, AgentResultStatus } from '../shared/agent-results';
 
 export type SessionStatus = 'idle' | 'running' | 'error';
 
@@ -64,6 +66,14 @@ export type SessionTurn = {
     index: number;
     // The trimmed task text the harness received, not the raw request body.
     prompt: string;
+    // Result blocks this task was submitted with (R2). A block is referenced by
+    // the turn that produced it plus its `threadId` (omitted for the turn's ROOT
+    // invocation) and its compact per-turn label. The server binds these at
+    // enqueue (rejecting unknown/already-failed targets), then expands each
+    // referenced block's terminal `done` content into the run prompt AFTER that
+    // block has completed. Omitted for a task that references nothing, so every
+    // pre-reference record keeps its exact shape.
+    references?: AgentResultReference[];
     // Composer attachments the user submitted with this turn (T3). Omitted for a
     // text-only turn, so every pre-attachment record and response keeps its exact
     // old shape. The server validates and deep-copies them before the turn exists,
@@ -334,6 +344,10 @@ export type UpdateSessionRequest = {
 // attachment is present. The server re-validates every field (shared
 // validateAttachments) BEFORE creating a turn, so malformed, oversized, or
 // mismatched media answers 400/413/415 with nothing mutated.
+//
+// `/messages` (the response-owned legacy run) does NOT support result references:
+// a `references` field or a typed `#LABEL` in `input` is rejected with 400 rather
+// than silently running without the context. Use /tasks (SubmitTaskRequest).
 export type SubmitMessageRequest = {
     input: string;
     attachments?: HarnessAttachment[];
@@ -346,7 +360,16 @@ export type SubmitMessageRequest = {
 // belongs to that response (a disconnect aborts it). /tasks answers 202
 // `{ session, turn }` immediately and the server pump runs the task even if the
 // browser is gone. Task text is trimmed and bounded exactly like /messages.
-export type SubmitTaskRequest = SubmitMessageRequest;
+//
+// `references` (R2) names prior blocks whose completed results this task wants as
+// context. The UI sends `{turnId, threadId?, label}` entries; OMITTING the array
+// keeps the legacy body byte-identical. Typed `#LABEL` tokens in `input` are also
+// resolved server-side when the array is absent (or does not already cover that
+// label), so a client without metadata still works. Malformed entries, unknown
+// turns/labels, and already-failed/cancelled blocks are a 400 before a turn exists.
+export type SubmitTaskRequest = SubmitMessageRequest & {
+    references?: AgentResultReference[];
+};
 
 // Body of POST /api/sessions/:id/actions/:requestId/answer (N4).
 //

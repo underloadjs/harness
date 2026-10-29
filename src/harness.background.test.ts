@@ -457,6 +457,8 @@ describe('background tool calls', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
 

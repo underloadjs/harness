@@ -873,33 +873,18 @@ describe('R3b durable harness database', () => {
             page: { offset: 0, limit: 20, hasMore: false }
         });
 
-        // An explicit next prompt must send a provider-valid transcript: every
-        // tool_call id has a matching tool result, immediately after the orphan
-        // assistant message.
+        // T4 introduced fresh blocks: every server turn reseeds the agent
+        // conversation, so the next prompt sends only the instructions plus THIS
+        // prompt. The repaired orphan remains part of the RESTORED record (asserted
+        // above) but is deliberately not replayed into a new block, and it was never
+        // executed. This replaces the old "history is inherited" expectation.
         await second.store.run(created.id, 'continue please', async () => {});
         const sent = requests[0];
-        const orphanIndex = sent.findIndex(
-            (message) =>
-                message.role === 'assistant' &&
-                message.toolCalls?.some((call) => call.id === 'orphan-1') === true
-        );
-        expect(orphanIndex).toBeGreaterThan(-1);
-        expect(sent[orphanIndex + 1]).toEqual({
-            role: 'tool',
-            content: INTERRUPTED_TOOL_RESULT_TEXT,
-            toolCallId: 'orphan-1',
-            name: 'todoManage'
-        });
-        expect(sent.at(-1)).toEqual({ role: 'user', content: 'continue please' });
-
-        const callIds = sent.flatMap((message) =>
-            message.role === 'assistant' ? (message.toolCalls ?? []).map((call) => call.id) : []
-        );
-        const answeredIds = new Set(
-            sent.flatMap((message) => (message.role === 'tool' ? [message.toolCallId] : []))
-        );
-        expect(callIds).toEqual(['orphan-1']);
-        for (const id of callIds) expect(answeredIds.has(id)).toBe(true);
+        expect(sent).toEqual([
+            { role: 'system', content: 'Record the transcript, then answer.' },
+            { role: 'user', content: 'continue please' }
+        ]);
+        expect(sent.some((message) => message.role === 'tool')).toBe(false);
     });
 
     it('recovers a genuinely hanging tool as interrupted on a fresh runtime and never re-executes it', async () => {

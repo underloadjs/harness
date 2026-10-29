@@ -84,6 +84,8 @@ describe('todoManage', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
         expect((entry.messages[2] as { content: string }).content).toBe(
@@ -174,6 +176,8 @@ describe('todoManage', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'agentDelegate',
             'threadFork',
         ]);
@@ -185,6 +189,8 @@ describe('todoManage', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
     });
@@ -260,6 +266,8 @@ describe('todoManage', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
     });

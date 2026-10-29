@@ -121,20 +121,43 @@ import { createCreateHarnessPanel } from './ui/create-harness';
 import { createAgentRow } from './ui/agents';
 import { composerActionOf, composerFieldHeight, composerMaxHeight } from './ui/composer';
 import {
-    attachmentChipElement,
     attachmentFileName,
     attachmentPreviewUrl,
     attachmentRecordOf,
     clipboardFilesOf,
     createAttachmentCounters,
-    insertAttachmentMarkers,
     nextAttachmentMarker,
     planAttachmentBatch,
     readFileAsBase64,
-    releaseAttachmentPreview,
-    removeAttachmentMarker
+    releaseAttachmentPreview
 } from './ui/attachments';
 import type { AttachmentCounters, AttachmentKind } from './ui/attachments';
+import {
+    editorChips,
+    editorCollapseChipGap,
+    editorInsertChips,
+    editorInsertPlainText,
+    editorRemoveAttachment,
+    editorRestore,
+    editorSelection,
+    editorSetAttachmentState,
+    editorSetText,
+    editorSnapshot,
+    editorText,
+    installEditorAccessors
+} from './ui/editor';
+import {
+    fileChipOf,
+    fileGlobPattern,
+    filePathsOf,
+    filterFilePathList,
+    isReferenceableBlock,
+    mentionTriggerAt,
+    normalizeReferenceLabel,
+    referenceChipOf,
+    referencesOfChips
+} from './ui/references';
+import type { AgentBlockDescriptor, MentionTrigger } from './ui/references';
 import { applyActivity, activityOfTurns, paintActivity } from './ui/activity';
 import { highlightCode, looksLikeJson, prettyJson } from './ui/markdown';
 import { applyPanels, createPanelHost, mediaOfTurns } from './ui/panels';
@@ -286,6 +309,10 @@ type View = {
     upsert: (turn: SessionTurn, model?: string) => TurnHandle;
     // Look up a tile by the server turn id carried on a stream `event` frame.
     turn: (id: string) => TurnHandle | undefined;
+    // Every real block in this conversation (root+nested), oldest→newest. The
+    // composer's # reference popup reads it; the latest matching label wins
+    // (ui/references.ts) exactly like the server's plain-text resolution.
+    blocks: () => AgentBlockDescriptor[];
     // Stop every live timer this view owns (elapsed labels, tool durations).
     dispose: () => void;
 };
@@ -419,6 +446,7 @@ const createView = (
             return board.adopt(turn, model);
         },
         turn: (id) => board.find(id),
+        blocks: () => board.blocks(),
         dispose: () => board.destroy()
     };
 };
@@ -1405,7 +1433,7 @@ stage.id = 'harness-stage';
 
 // Composer (R9/R10 + R5): ONE input field with ONE action inside it.
 //
-//   - The textarea starts at a single row (`rows = 1`) and grows with its content
+//   - The contentEditable field starts at one line box and grows with its content
 //     up to a line cap, then scrolls: 3 text lines on a phone viewport (<=860px) and
 //     5 on desktop. `autoGrow` below is the only writer of its inline height and
 //     derives the cap from the live computed line-height/padding/borders, so the cap
@@ -1419,33 +1447,27 @@ stage.id = 'harness-stage';
 //         empty + idle           -> no control at all
 //   - Reset is gone (R10). Starting over is the Sessions rail's New session; the
 //     server still owns POST /sessions/:id/reset for other clients (untouched).
-//   - Keyboard (R1): Enter inserts a newline like any textarea; Ctrl/Cmd+Enter is
-//     the shortcut that sends, and the in-field button stays the primary send path.
-//     See the `keydown` listener below the submit wiring for the full matrix.
+//   - Keyboard (R1): Enter inserts a newline like any multiline editor; Ctrl/Cmd+
+//     Enter is the shortcut that sends, and the in-field button stays the primary
+//     send path. See the `keydown` listener below the submit wiring for the full
+//     matrix (including @/# popup navigation).
 //
-// Attachments (T5 clip/attach) are an ACCESSORY, not a second input:
-//   - `.composer-body` is a column holding the chip strip, the error line and the
-//     existing field wrapper, so `.composer-field`/`.composer-action` keep their
-//     exact layout contract (composer-style.test.ts);
+// Attachments (T5 clip/attach) are INLINE chips in that field, not a second input:
+//   - `.composer-body` is a column holding the error line and the field wrapper, so
+//     `.composer-field`/`.composer-action` keep their exact layout contract
+//     (composer-style.test.ts);
 //   - the attach button is a sibling of that column (a real button, never a nested
 //     one) and opens the hidden file input;
-//   - paste/drop file detection lives on the textarea/composer below. The prompt
-//     keeps plain-text markers; bytes travel separately in `attachments`.
+//   - paste/drop file detection lives on the field/composer below. Each file becomes
+//     one atomic chip; its serialized text is the plain marker and the bytes travel
+//     separately in `attachments`.
 const composer = el('form', 'composer');
 
 const composerBody = el('div', 'composer-body');
 
-// Chips ("[Image 1] photo.png ×"). role=list so the strip is announced as a group;
-// each chip is a listitem built by ui/attachments.ts.
-const attachmentStrip = el('div', 'composer-attachments');
-attachmentStrip.id = 'composer-attachments';
-attachmentStrip.setAttribute('role', 'list');
-attachmentStrip.setAttribute('aria-label', 'Attached files');
-attachmentStrip.hidden = true;
-
-// The explicit error line. role=status is polite: a rejected batch or a failed
-// read is announced without stealing focus, and the draft (text + other chips)
-// stays exactly as it was.
+// Chips now live INLINE in the contentEditable field (T5 R1): the old chip strip
+// above the field is gone. The explicit error line stays above the field so a
+// rejected batch / failed read is announced without moving the caret.
 const attachmentError = el('p', 'composer-attachment-error');
 attachmentError.id = 'composer-attachment-error';
 attachmentError.setAttribute('role', 'status');
@@ -1455,14 +1477,36 @@ attachmentError.hidden = true;
 // The field is the positioning context for the action, so the button travels with
 // the box as it grows instead of sitting in a separate column.
 const composerField = el('div', 'composer-field');
-const input = el('textarea', 'input composer-input');
-input.rows = 1;
-// R9/R2 accessibility: the field has a real accessible name. There is deliberately
-// NO placeholder: it is not a label, it vanishes as soon as the reader types, and
-// its keyboard hints were guidance the compact composer does not need. The empty
-// field still starts at one row and `autoGrow` keeps the multiline behaviour.
+// R1: ONE contentEditable surface. Chips are atomic non-editable spans
+// (ui/editor.ts); its plain-text value is still the old marker grammar, so the
+// server contract and attachment payload are unchanged.
+const input = el('div', 'input composer-input');
+input.setAttribute('contenteditable', 'true');
+input.contentEditable = 'true';
+// R9/R2 accessibility: the field has a real accessible name and multiline textbox
+// semantics. No placeholder, for the same reason as before: it is not a label and
+// vanishes as soon as the reader types.
+input.setAttribute('role', 'textbox');
+input.setAttribute('aria-multiline', 'true');
 input.setAttribute('aria-label', 'Task message');
+input.setAttribute('aria-autocomplete', 'list');
+input.setAttribute('aria-haspopup', 'listbox');
+input.setAttribute('aria-controls', 'composer-popup');
+input.setAttribute('aria-expanded', 'false');
 input.spellcheck = false;
+// The textarea-compatible value/selection accessors are installed once. They keep
+// insertAttachmentMarkers' captured-selection contract (and the draft-restore path)
+// available on a chip-bearing surface.
+installEditorAccessors(input);
+
+// @ / # popup anchored at the caret inside the field. role=listbox + option rows
+// mirror UniversalTextBox's mention popup, but the harness keeps its own keyboard
+// submit (Ctrl/Cmd+Enter) and its plain Enter newline.
+const composerPopup = el('div', 'composer-popup');
+composerPopup.id = 'composer-popup';
+composerPopup.setAttribute('role', 'listbox');
+composerPopup.setAttribute('aria-label', 'Composer suggestions');
+composerPopup.hidden = true;
 
 // One button, switched by state — never two visible controls. It starts hidden
 // (idle + empty) and type=submit so a future paint cannot submit a blank field
@@ -1470,8 +1514,8 @@ input.spellcheck = false;
 const actionButton = el('button', 'composer-action');
 actionButton.type = 'submit';
 actionButton.hidden = true;
-composerField.append(input, actionButton);
-composerBody.append(attachmentStrip, attachmentError, composerField);
+composerField.append(input, composerPopup, actionButton);
+composerBody.append(attachmentError, composerField);
 
 // File chooser accessory. The visible button is the only focusable control; the
 // native input is hidden from the tab order and from AT (its button carries the
@@ -1499,10 +1543,10 @@ composer.append(composerBody, attachButton, fileInput);
 // --- attachment draft state ------------------------------------------------
 //
 // `draftAttachments` is the ONE draft the composer owns. It is deliberately
-// module-scoped (like the textarea's text) so switching sessions does not lose an
+// module-scoped (like the field's text) so switching sessions does not lose an
 // attachment the user just pasted; only a SUCCESSFUL send (or the user pressing a
-// chip's ×) removes an entry. Every entry carries the marker already in the text,
-// so the prompt and the payload can never drift.
+// chip's ×) removes an entry. Every entry carries the marker already in its inline
+// chip, so the prompt and the payload can never drift.
 //
 // Reads are per-file: markers are inserted SYNCHRONOUSLY at the captured selection
 // in clipboard order, then each file is encoded independently. A read failure
@@ -1554,51 +1598,46 @@ const readyAttachmentRecords = (): HarnessAttachment[] =>
     );
 
 const paintAttachments = (): void => {
-    attachmentStrip.replaceChildren(
-        ...draftAttachments.map((draft) =>
-            attachmentChipElement(
-                {
-                    kind: draft.kind,
-                    marker: draft.marker,
-                    name: draft.name,
-                    mime: draft.mime,
-                    pending: draft.data === undefined,
-                    ...(draft.previewUrl === undefined ? {} : { previewUrl: draft.previewUrl })
-                },
-                // During the short enqueue window the sent payload is frozen: chips
-                // render without a remove control so a failed submit can restore the
-                // prompt and this draft exactly as they were.
-                submitting ? {} : { onRemove: () => removeDraftAttachment(draft) }
-            )
-        )
-    );
-    attachmentStrip.hidden = draftAttachments.length === 0;
-    attachmentStrip.setAttribute('aria-busy', attachmentReads > 0 ? 'true' : 'false');
+    // Chips are INLINE: only their reading/ready state and remove affordance are
+    // repainted. The draft text itself is never rewritten here — that would flatten
+    // chips and lose the exact caret.
+    for (const draft of draftAttachments) {
+        editorSetAttachmentState(input, draft.id, draft.data === undefined ? 'reading' : undefined);
+    }
+
+    // During the short enqueue window the sent payload is frozen: remove controls
+    // are disabled so a failed submit can restore the prompt and draft exactly.
+    for (const button of Array.from(input.querySelectorAll<HTMLButtonElement>('[data-chip-remove]'))) {
+        button.disabled = submitting;
+    }
 
     // The action depends on whether any READY attachment exists.
     paintComposer();
 };
 
-// Remove one draft atomically: its chip, its object URL, and the FIRST occurrence
-// of its marker. Removing a chip therefore removes the reference the user sees,
-// not a marker the user typed by hand elsewhere (first-match is the documented
-// association).
+// Forget one draft entry WITHOUT touching the field. Used by the chip removal
+// button (which removes the DOM chip itself) and by the MutationObserver when the
+// reader backspaces a chip.
+const forgetDraftAttachment = (id: string): void => {
+    const index = draftAttachments.findIndex((draft) => draft.id === id);
+    if (index < 0) return;
+
+    const [draft] = draftAttachments.splice(index, 1);
+    if (draft !== undefined) releaseAttachmentPreview(draft.previewUrl);
+};
+
+// Remove one draft atomically: its inline chip, its object URL and its draft
+// entry. The chip's serialized marker disappears with the DOM node, so the prompt
+// and the bytes can never drift.
 const removeDraftAttachment = (draft: DraftAttachment): void => {
     // The submit snapshot is frozen: no removal between capture and the 202/error.
     if (submitting) return;
 
-    const index = draftAttachments.indexOf(draft);
-    if (index < 0) return;
+    if (!draftAttachments.includes(draft)) return;
 
-    draftAttachments.splice(index, 1);
-    releaseAttachmentPreview(draft.previewUrl);
-
-    const next = removeAttachmentMarker(input.value, draft.marker);
-    if (next !== input.value) {
-        input.value = next;
-        autoGrow();
-    }
-
+    forgetDraftAttachment(draft.id);
+    editorRemoveAttachment(input, draft.id, draft.marker);
+    autoGrow();
     paintAttachments();
 };
 
@@ -1616,16 +1655,11 @@ const finishAttachmentRead = (draft: DraftAttachment, data: string | Error): voi
     }
 
     if (data instanceof Error) {
-        draftAttachments.splice(draftAttachments.indexOf(draft), 1);
-        releaseAttachmentPreview(draft.previewUrl);
-
-        const next = removeAttachmentMarker(input.value, draft.marker);
-        if (next !== input.value) {
-            input.value = next;
-            autoGrow();
-        }
+        forgetDraftAttachment(draft.id);
+        editorRemoveAttachment(input, draft.id, draft.marker);
 
         setAttachmentError(`Could not attach "${draft.name}": ${messageOf(data)}`);
+        autoGrow();
         paintAttachments();
         return;
     }
@@ -1648,15 +1682,8 @@ const finishAttachmentRead = (draft: DraftAttachment, data: string | Error): voi
         draft.size = record.size;
         draft.mime = record.mime;
     } catch (error) {
-        draftAttachments.splice(draftAttachments.indexOf(draft), 1);
-        releaseAttachmentPreview(draft.previewUrl);
-
-        const next = removeAttachmentMarker(input.value, draft.marker);
-        if (next !== input.value) {
-            input.value = next;
-            autoGrow();
-        }
-
+        forgetDraftAttachment(draft.id);
+        editorRemoveAttachment(input, draft.id, draft.marker);
         setAttachmentError(`Could not attach "${draft.name}": ${messageOf(error)}`);
     }
 
@@ -1685,10 +1712,7 @@ const addFiles = (files: File[]): void => {
     // CAPTURE the selection before touching the field. Insertion is synchronous,
     // so the asynchronous reads never have to restore a caret the user may have
     // moved (the new text is already in place and the caret sits after it).
-    const selection = {
-        start: input.selectionStart ?? input.value.length,
-        end: input.selectionEnd ?? input.value.length
-    };
+    const selection = editorSelection(input);
 
     const pending = files.map((file, index) => {
         const planned = plan.entries[index];
@@ -1712,13 +1736,24 @@ const addFiles = (files: File[]): void => {
 
     draftAttachments.push(...pending.map((entry) => entry.draft));
 
-    const insertion = insertAttachmentMarkers(
-        input.value,
+    // Inline atomic chips (R1). Spacing/caret are identical to the old plain-text
+    // `insertAttachmentMarkers`, so a marker still sits exactly where the caret
+    // was and a paste mid-word pads both sides.
+    editorInsertChips(
+        input,
         selection,
-        pending.map((entry) => entry.draft.marker)
+        pending.map(({ draft }) => ({
+            kind: 'attachment' as const,
+            id: draft.id,
+            label: draft.marker,
+            ...(draft.previewUrl === undefined ? {} : { previewUrl: draft.previewUrl }),
+            data: {
+                kind: draft.kind,
+                attachmentKind: draft.kind,
+                attachmentName: draft.name
+            }
+        }))
     );
-    if (insertion.text !== input.value) input.value = insertion.text;
-    input.setSelectionRange(insertion.caret, insertion.caret);
 
     attachmentReads += pending.length;
     paintAttachments();
@@ -1733,36 +1768,67 @@ const addFiles = (files: File[]): void => {
     }
 };
 
-// OS clipboard files (screenshots copied from another app) land on paste. If there
-// are none, the handler does nothing at all: normal text/rich paste is untouched.
-// When files DO exist the clipboard's text is deliberately ignored so one gesture
+// OS clipboard files (screenshots copied from another app) land on paste. When
+// files DO exist the clipboard's text is deliberately ignored so one gesture
 // cannot insert both an image and its HTML/plain copy.
+//
+// EVERY paste is intercepted: the clipboard's text/html flavor is never parsed
+// (no foreign markup, no script, no auto-chips). Only `text/plain` may be inserted,
+// and an HTML-only / empty payload inserts nothing. Letting the native paste run
+// for an "empty" plain string would still let the browser paste HTML.
 input.addEventListener('paste', (event) => {
-    const files = clipboardFilesOf(event.clipboardData);
-    if (files.length === 0) return;
-
     event.preventDefault();
-    addFiles(files);
+    closeComposerPopup();
+
+    const files = clipboardFilesOf(event.clipboardData);
+    if (files.length > 0) {
+        addFiles(files);
+        return;
+    }
+
+    const text =
+        typeof event.clipboardData?.getData === 'function'
+            ? event.clipboardData.getData('text/plain')
+            : '';
+    if (text.length === 0) return;
+
+    editorInsertPlainText(input, editorSelection(input), text);
+    autoGrow();
+    paintComposer();
 });
 
-// Drag/drop is the third way in (straightforward, same gate/atomicity). Only a
-// payload that actually carries files is intercepted; dragging text over the
-// textarea keeps the browser's native edit behavior.
-const carriesFiles = (data: DataTransfer | null): boolean =>
-    data !== null && clipboardFilesOf(data).length > 0;
-
+// Drag/drop is the third way in. Like paste, the native drop is ALWAYS prevented:
+// a drop payload is either files (same gate/atomicity) or plain text, never HTML.
 composer.addEventListener('dragover', (event) => {
-    if (!carriesFiles(event.dataTransfer)) return;
+    // Prevent default even for text: the drop handler owns what lands in the field.
     event.preventDefault();
     if (event.dataTransfer !== null) event.dataTransfer.dropEffect = 'copy';
 });
 
 composer.addEventListener('drop', (event) => {
-    const files = clipboardFilesOf(event.dataTransfer);
-    if (files.length === 0) return;
-
     event.preventDefault();
-    addFiles(files);
+    closeComposerPopup();
+
+    const files = clipboardFilesOf(event.dataTransfer);
+    if (files.length > 0) {
+        addFiles(files);
+        input.focus();
+        return;
+    }
+
+    const text =
+        typeof event.dataTransfer?.getData === 'function'
+            ? event.dataTransfer.getData('text/plain')
+            : '';
+    if (text.length === 0) {
+        input.focus();
+        return;
+    }
+
+    // A drop can land anywhere on the composer; insert at the field's caret.
+    editorInsertPlainText(input, editorSelection(input), text);
+    autoGrow();
+    paintComposer();
     input.focus();
 });
 
@@ -1795,6 +1861,307 @@ const autoGrow = (): void => {
     input.style.height = height > 0 ? `${height}px` : '';
 };
 
+// --- @ / # popup -------------------------------------------------------------
+//
+// One popup, two sources:
+//   - `@query`: a DEBOUNCED, query-aware fileGlob call (the existing /tools
+//     endpoint; no new route). Each query changes the glob, so the server walk is
+//     narrowed instead of permanently limiting the picker to the first 100 files.
+//     A monotonically increasing sequence drops stale replies.
+//   - `#query`: the board's REAL root+nested agent blocks (view.blocks()), deduped
+//     by label with the latest occurrence winning (the server's plain-text
+//     resolution rule). No network.
+//
+// Accessibility: the field owns aria-expanded/aria-activedescendant and the popup
+// is a listbox of option rows. Mouse rows preventDefault on mousedown so picking
+// one never blurs the editor before the click runs.
+type ComposerPopupItem =
+    | { kind: 'file'; path: string }
+    | { kind: 'reference'; block: AgentBlockDescriptor };
+
+type ComposerPopupState = {
+    trigger: MentionTrigger;
+    items: ComposerPopupItem[];
+    index: number;
+    truncated: boolean;
+    loading: boolean;
+    // A real lookup failure (HTTP/tool error). Rendered as an error note, NOT as
+    // the empty-result "No matching files" message.
+    error?: string;
+};
+
+let composerPopupState: ComposerPopupState | undefined;
+let lookupTimer: number | undefined;
+let lookupSeq = 0;
+
+const closeComposerPopup = (): void => {
+    if (lookupTimer !== undefined) {
+        window.clearTimeout(lookupTimer);
+        lookupTimer = undefined;
+    }
+
+    // Invalidate any in-flight lookup so its answer cannot reopen the popup.
+    lookupSeq += 1;
+    composerPopupState = undefined;
+    composerPopup.hidden = true;
+    composerPopup.replaceChildren();
+    input.setAttribute('aria-expanded', 'false');
+    input.removeAttribute('aria-activedescendant');
+};
+
+const referencePopupItems = (query: string): ComposerPopupItem[] => {
+    const blocks = (current?.view.blocks() ?? []).filter(isReferenceableBlock);
+    // Latest occurrence wins: deleting before setting moves the label to the end,
+    // so the popup shows the block the server would resolve for a plain `#LABEL`.
+    // Failed/cancelled blocks are filtered FIRST, so they never hide an earlier
+    // completed block with the same label.
+    const latest = new Map<string, AgentBlockDescriptor>();
+    for (const block of blocks) {
+        const label = normalizeReferenceLabel(block.label);
+        latest.delete(label);
+        latest.set(label, block);
+    }
+
+    const labelQuery = normalizeReferenceLabel(query);
+    const textQuery = query.trim().toLowerCase();
+
+    return [...latest.values()]
+        .filter((block) => {
+            const label = normalizeReferenceLabel(block.label);
+            const labelMatch = labelQuery.length === 0 || label.includes(labelQuery);
+            const agentMatch = textQuery.length === 0 || block.agent.toLowerCase().includes(textQuery);
+            return labelMatch || agentMatch;
+        })
+        .map((block) => ({ kind: 'reference' as const, block }));
+};
+
+const popupRow = (item: ComposerPopupItem, index: number, selected: boolean): HTMLElement => {
+    const row = el('div', 'composer-popup-option');
+    row.id = `composer-option-${index}`;
+    row.setAttribute('role', 'option');
+    row.setAttribute('aria-selected', selected ? 'true' : 'false');
+    row.dataset.index = String(index);
+    if (selected) row.dataset.active = 'true';
+
+    if (item.kind === 'file') {
+        row.append(el('span', 'composer-popup-token', '@'), el('span', 'composer-popup-name', item.path));
+        row.title = item.path;
+    } else {
+        row.append(
+            el('span', 'composer-popup-token', `#${normalizeReferenceLabel(item.block.label)}`),
+            el('span', 'composer-popup-name', item.block.agent),
+            el('span', 'composer-popup-state', item.block.status)
+        );
+    }
+
+    return row;
+};
+
+const placeComposerPopup = (): void => {
+    // Caret geometry is only available in a real layout; jsdom reports zeros and
+    // the stylesheet fallback (top of the field) is used.
+    const selection = typeof window === 'undefined' ? null : window.getSelection();
+    if (selection === null || selection.rangeCount === 0) return;
+
+    const range = selection.getRangeAt(0);
+    // jsdom (and some embedders) do not implement Range geometry. Placement is
+    // cosmetic; the stylesheet fallback keeps the popup attached to the field.
+    if (typeof range.getBoundingClientRect !== 'function') return;
+
+    const rect = range.getBoundingClientRect();
+    const field = composerField.getBoundingClientRect();
+    if (!Number.isFinite(rect.top)) return;
+
+    const top = Math.max(0, Math.round(rect.bottom - field.top + 4));
+    const left = Math.max(0, Math.round(rect.left - field.left));
+    composerPopup.style.top = `${top}px`;
+    composerPopup.style.left = `${left}px`;
+};
+
+const paintComposerPopup = (): void => {
+    const state = composerPopupState;
+    if (state === undefined) {
+        closeComposerPopup();
+        return;
+    }
+
+    const rows: HTMLElement[] = [];
+
+    if (state.error !== undefined) {
+        const error = el('div', 'composer-popup-note composer-popup-error', state.error);
+        error.setAttribute('role', 'presentation');
+        rows.push(error);
+    } else if (state.items.length === 0) {
+        const note = el('div', 'composer-popup-note');
+        note.setAttribute('role', 'presentation');
+        note.textContent = state.loading
+            ? 'Searching files…'
+            : state.trigger.kind === 'file'
+              ? 'No matching files'
+              : 'No referenceable agent blocks';
+        rows.push(note);
+    } else {
+        state.items.forEach((item, index) => {
+            const row = popupRow(item, index, index === state.index);
+            // Mouse down must not blur the editor before the click runs.
+            row.addEventListener('mousedown', (event) => event.preventDefault());
+            row.addEventListener('click', () => selectComposerPopup(index));
+            rows.push(row);
+        });
+    }
+
+    if (state.truncated && state.items.length > 0) {
+        const more = el('div', 'composer-popup-note', 'Showing the first matches — type to narrow.');
+        more.setAttribute('role', 'presentation');
+        rows.push(more);
+    }
+
+    composerPopup.replaceChildren(...rows);
+    composerPopup.hidden = false;
+    input.setAttribute('aria-expanded', 'true');
+
+    if (state.items.length === 0) input.removeAttribute('aria-activedescendant');
+    else input.setAttribute('aria-activedescendant', `composer-option-${state.index}`);
+
+    placeComposerPopup();
+};
+
+const scheduleFileLookup = (trigger: MentionTrigger & { kind: 'file' }): void => {
+    if (lookupTimer !== undefined) window.clearTimeout(lookupTimer);
+
+    const seq = ++lookupSeq;
+    // 160ms: long enough to coalesce normal typing, short enough that the list
+    // feels live. The query is re-sent (not filtered from an old capped page).
+    lookupTimer = window.setTimeout(() => {
+        lookupTimer = undefined;
+        void (async () => {
+            try {
+                const response = await callTool('fileGlob', {
+                    patterns: fileGlobPattern(trigger.query),
+                    paths: ['.'],
+                    maxResults: 100
+                });
+
+                // A newer keystroke, a closed popup, or a different trigger makes
+                // this answer stale. Never paint it.
+                if (seq !== lookupSeq) return;
+                const state = composerPopupState;
+                if (state === undefined || state.trigger.kind !== 'file' || state.trigger.query !== trigger.query) {
+                    return;
+                }
+
+                if (!response.ok) {
+                    // A refused lookup is an ERROR, not an empty result: the
+                    // reader must not be told "no matching files" when the walk
+                    // itself failed.
+                    state.items = [];
+                    state.truncated = false;
+                    state.error = response.error.message;
+                } else {
+                    const result = response.result as { truncated?: unknown } | undefined;
+                    const files = filterFilePathList(filePathsOf(response.result), trigger.query);
+                    state.items = files.map((path) => ({ kind: 'file', path }));
+                    state.truncated = result?.truncated === true;
+                    state.error = undefined;
+                }
+
+                state.loading = false;
+                state.index = 0;
+                paintComposerPopup();
+            } catch (error) {
+                if (seq !== lookupSeq) return;
+                const state = composerPopupState;
+                if (state === undefined || state.trigger.kind !== 'file') return;
+
+                state.items = [];
+                state.loading = false;
+                state.error = messageOf(error);
+                paintComposerPopup();
+            }
+        })();
+    }, 160);
+};
+
+// Re-evaluate the trigger at the caret. Called on input and on arrow/home/end
+// key moves; a non-collapsed selection or no trigger closes the popup.
+const updateComposerPopup = (): void => {
+    const selection = editorSelection(input);
+    if (selection.start !== selection.end) {
+        closeComposerPopup();
+        return;
+    }
+
+    const trigger = mentionTriggerAt(editorText(input), selection.start);
+    if (trigger === undefined) {
+        closeComposerPopup();
+        return;
+    }
+
+    if (trigger.kind === 'reference') {
+        const items = referencePopupItems(trigger.query);
+        const state = composerPopupState;
+        const same =
+            state !== undefined && state.trigger.kind === 'reference' && state.trigger.start === trigger.start;
+
+        composerPopupState = {
+            trigger,
+            items,
+            index: same ? Math.min(state.index, Math.max(0, items.length - 1)) : 0,
+            truncated: false,
+            loading: false
+        };
+        paintComposerPopup();
+        return;
+    }
+
+    const state = composerPopupState;
+    const same = state !== undefined && state.trigger.kind === 'file' && state.trigger.start === trigger.start;
+
+    if (same && state.trigger.query === trigger.query && state.error === undefined) return;
+
+    // A new @ query: show the previous query's rows (if any) until this answer
+    // arrives, then replace them. `loading` only renders when there is nothing to
+    // show, so typing does not flicker an empty list.
+    composerPopupState = {
+        trigger,
+        items: same ? state.items : [],
+        index: 0,
+        truncated: false,
+        loading: true
+    };
+    paintComposerPopup();
+    scheduleFileLookup(trigger);
+};
+
+const moveComposerPopup = (delta: number): boolean => {
+    const state = composerPopupState;
+    if (state === undefined || state.items.length === 0) return false;
+
+    state.index = (state.index + delta + state.items.length) % state.items.length;
+    paintComposerPopup();
+    return true;
+};
+
+// Pick the active row: replace `[trigger.start, caret)` with one atomic chip.
+// Returns false when there is nothing to pick, so Enter can fall through to
+// newline / submit.
+const selectComposerPopup = (index = composerPopupState?.index): boolean => {
+    const state = composerPopupState;
+    if (state === undefined || index === undefined) return false;
+
+    const item = state.items[index];
+    if (item === undefined) return false;
+
+    const caret = editorSelection(input).end;
+    const chip = item.kind === 'file' ? fileChipOf(item.path) : referenceChipOf(item.block);
+
+    editorInsertChips(input, { start: state.trigger.start, end: Math.max(state.trigger.start, caret) }, [chip]);
+    closeComposerPopup();
+    autoGrow();
+    paintComposer();
+    return true;
+};
+
 // Paint the single action from the same `pending` value `paintControls` uses: the
 // local run flag OR the selected session's server-owned queue.
 //
@@ -1808,7 +2175,7 @@ const paintComposer = (): void => {
     // Only READY attachments count as submittable content; a still-encoding file is
     // shown as a pending chip but cannot turn the empty field into a send.
     const ready = draftAttachments.reduce((count, draft) => count + (draft.data === undefined ? 0 : 1), 0);
-    const action = composerActionOf(input.value, pending, ready);
+    const action = composerActionOf(editorText(input), pending, ready);
 
     actionButton.dataset.action = action;
     actionButton.hidden = action === 'none';
@@ -1844,12 +2211,81 @@ const paintComposer = (): void => {
     actionButton.title = 'Send (Ctrl/Cmd+Enter)';
 };
 
-// Typing is the only thing that changes the action outside a paintControls pass:
-// measure the new height and re-derive the icon as text appears or disappears.
+// Typing / deletion is the only thing that changes the action outside a
+// paintControls pass: measure the new height, re-derive the icon, and re-evaluate
+// an @/# trigger at the caret.
 input.addEventListener('input', () => {
     autoGrow();
     paintComposer();
+    updateComposerPopup();
 });
+
+// Caret moves can enter or leave an @/# query without changing the text.
+input.addEventListener('keyup', (event) => {
+    if (event.key === 'ArrowLeft' || event.key === 'ArrowRight' || event.key === 'Home' || event.key === 'End') {
+        updateComposerPopup();
+    }
+});
+
+// Leaving the field closes the popup. Popup rows preventDefault on mousedown, so
+// a real blur only happens when the reader actually left the composer.
+input.addEventListener('blur', () => {
+    closeComposerPopup();
+});
+
+// Clicking a chip's × removes that draft atomically. The chip itself is inside a
+// contenteditable=false island, so the click cannot move the caret into it.
+composer.addEventListener('click', (event) => {
+    const target = event.target;
+    if (!(target instanceof Element)) return;
+
+    const button = target.closest<HTMLElement>('[data-chip-remove]');
+    if (button === null) return;
+
+    event.preventDefault();
+    const draft = draftAttachments.find((entry) => entry.id === button.dataset.chipRemove);
+    if (draft !== undefined) removeDraftAttachment(draft);
+});
+
+// Backspace/Delete/cut removes an atomic chip inside the browser's editing
+// machinery, not in our handlers. Synchronize the DRAFT to the surviving chips:
+// a chip the reader deleted must drop its bytes, preview URL and record. The
+// submit window is frozen (the payload was captured; a failed submit restores the
+// exact snapshot), so removals during `submitting` are ignored.
+const chipObserver = new MutationObserver((records) => {
+    if (submitting) return;
+
+    let changed = false;
+
+    for (const record of records) {
+        for (const node of Array.from(record.removedNodes)) {
+            // Skip moves (a browser can transiently detach/re-insert a node).
+            if (node.isConnected) continue;
+            if (!(node instanceof Element)) continue;
+
+            const chips =
+                node.getAttribute('data-chip') === 'attachment'
+                    ? [node as HTMLElement]
+                    : Array.from(node.querySelectorAll<HTMLElement>('[data-chip="attachment"]'));
+
+            for (const chip of chips) {
+                const id = chip.dataset.chipId ?? '';
+                if (!draftAttachments.some((draft) => draft.id === id)) continue;
+
+                editorCollapseChipGap(record.previousSibling, record.nextSibling);
+                forgetDraftAttachment(id);
+                changed = true;
+            }
+        }
+    }
+
+    if (!changed) return;
+
+    autoGrow();
+    paintAttachments();
+});
+
+chipObserver.observe(input, { childList: true, subtree: true });
 
 // R9/R5 responsive: a layout reflow (phone rail opening, window resize, rotation)
 // changes the wrap width — and possibly the cap itself when the 860px breakpoint is
@@ -3960,7 +4396,7 @@ const ensureSession = async (instance: Instance): Promise<string> => {
 };
 
 const run = async (): Promise<void> => {
-    const prompt = input.value.trim();
+    const prompt = editorText(input).trim();
 
     // An in-flight read is not a draft: submitting now would send a prompt whose
     // marker has no bytes. The action is disabled in that state, and the shortcut
@@ -4003,19 +4439,26 @@ const run = async (): Promise<void> => {
     // Snapshot the drafts this submit sends. They are removed only on SUCCESS, so
     // a failure leaves the chips (and their markers) intact for a retry.
     const sentDrafts = draftAttachments.filter((draft) => draft.data !== undefined);
+    // Exact # bindings carried by reference chips, plus a DOM snapshot of the
+    // whole draft. A failed submit restores the snapshot, so a reference chip keeps
+    // its turn/thread binding instead of degrading to plain `#LABEL` text.
+    const references = referencesOfChips(editorChips(input));
+    const draftSnapshot = editorSnapshot(input);
     setAttachmentError(undefined);
 
     // The tile exists before the request does, in submission order, so a second
     // task visibly sits BEHIND the active one from the first frame. It starts
     // `queued` and neutral: no ring, no clock.
     const turn = instance.view.begin(prompt, validated);
-    input.value = '';
+    // `submitting` is set BEFORE the field is cleared so the chip MutationObserver
+    // does not mistake this programmatic clear for a user deletion.
+    submitting = true;
+    editorSetText(input, '');
     // R9: the field shrinks back to one row immediately; the inline height from the
     // filled state would otherwise leave a tall empty box until the next keystroke.
     autoGrow();
-    submitting = true;
     paintControls();
-    // Freeze the chip strip (remove controls disappear) for the enqueue window.
+    // Freeze the inline chips (remove controls disable) for the enqueue window.
     paintAttachments();
     // No header write: the optimistic tile already shows the submit lifecycle, and
     // the topbar pill is app-scoped (R1).
@@ -4030,7 +4473,14 @@ const run = async (): Promise<void> => {
 
         // 202: the server retained the task and answered with its record. The
         // request is over here — execution and streaming happen on GET /events.
-        const { session, turn: record } = await enqueueTask(sessionId, prompt, validated);
+        // `references` carries the exact block bindings picked via # (omitted when
+        // the prompt has none, so a plain typed `#LABEL` keeps the old body shape).
+        const { session, turn: record } = await enqueueTask(
+            sessionId,
+            prompt,
+            validated,
+            references.length === 0 ? undefined : references
+        );
 
         // Bind the server id/index and mirror the queue position. `merge` applies
         // only events that are not already on the tile (normally none yet), so a
@@ -4082,10 +4532,11 @@ const run = async (): Promise<void> => {
 
         // A failed submit is the TASK's failure (rejected input, unreachable
         // server): the tile and the transcript notice say so, and the draft stays.
-        // The textarea was cleared optimistically; restoring it (only when the
-        // reader has not started a new message meanwhile) means no input is lost.
-        if (input.value.length === 0 && prompt.length > 0) {
-            input.value = prompt;
+        // The field was cleared optimistically; restoring the DOM snapshot (only
+        // when the reader has not started a new message meanwhile) means no input
+        // is lost AND reference chips keep their exact turn/thread binding.
+        if (editorText(input).length === 0 && prompt.length > 0) {
+            editorRestore(input, draftSnapshot);
             autoGrow();
         }
         // Not a stream failure, and it is NOT painted into the app-scoped header
@@ -4112,12 +4563,17 @@ composer.addEventListener('submit', (event) => {
 });
 
 // Keyboard contract (R1). The send button is the primary path; the keyboard only
-// mirrors it:
+// mirrors it, EXCEPT while an @/# popup is open (UniversalTextBox parity):
+//   popup open + ArrowDown/ArrowUp -> move the active row
+//   popup open + Enter or Tab      -> pick the active row (never submit/newline)
+//   popup open + Escape            -> close the popup
 //   Enter              -> native newline. NEVER prevented and NEVER submits, so the
-//                         textarea behaves like any other multiline field.
+//                         field behaves like any other multiline editor.
 //   Shift+Enter        -> native newline (unchanged).
 //   Alt+Enter          -> native newline (also unchanged: Alt is a content modifier).
-//   Ctrl+Enter, Cmd+Enter -> explicit send shortcut. The ONLY keyboard submit path.
+//   Ctrl+Enter, Cmd+Enter -> explicit send shortcut. The ONLY keyboard submit path
+//                         (it wins over the popup, so a reader can queue the task
+//                         without picking a suggestion).
 //   IME composition    -> ignored entirely: the Enter that confirms a candidate
 //                         belongs to the input method, so it must not submit and must
 //                         not be prevented (`isComposing`, plus keyCode 229 for older
@@ -4125,14 +4581,44 @@ composer.addEventListener('submit', (event) => {
 // Both the shortcut and the button run through the form's own `submit` path, so
 // queueing while a run is in flight (R4) stays identical.
 input.addEventListener('keydown', (event) => {
-    if (event.key !== 'Enter') return;
-
-    // IME guard first: no composition Enter may reach the send logic at all.
+    // IME guard first: no composition key may reach the popup or send logic.
     if (event.isComposing || event.keyCode === 229) return;
+
+    const sending = (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey;
+
+    if (composerPopupState !== undefined) {
+        if (event.key === 'ArrowDown') {
+            event.preventDefault();
+            moveComposerPopup(1);
+            return;
+        }
+
+        if (event.key === 'ArrowUp') {
+            event.preventDefault();
+            moveComposerPopup(-1);
+            return;
+        }
+
+        if (event.key === 'Escape') {
+            event.preventDefault();
+            closeComposerPopup();
+            return;
+        }
+
+        if ((event.key === 'Enter' || event.key === 'Tab') && !sending) {
+            // Only hijacked when there is something to pick; an empty/loading list
+            // lets Enter stay a newline and Tab stay a focus move.
+            if (selectComposerPopup()) {
+                event.preventDefault();
+                return;
+            }
+        }
+    }
+
+    if (event.key !== 'Enter') return;
 
     // Send only on Ctrl/Cmd. Shift or Alt alongside it is still a newline request
     // (content modifiers win), and a bare Enter is left to the browser.
-    const sending = (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey;
     if (!sending) return;
 
     event.preventDefault();

@@ -90,6 +90,8 @@ describe('toolCreation policy', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
 

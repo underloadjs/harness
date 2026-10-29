@@ -86,6 +86,8 @@
 //   - profileManage — session character profiles.    (every agent, core)
 //   - chapterManage — session chapter tracking.      (every agent, core)
 //   - locationManage — session places/settings.      (every agent, core)
+//   - agentManage  — list agents and result previews.(every agent, core)
+//   - agentResult  — read one completed result.       (every agent, core)
 //   - agentDelegate — hand a task to a subagent.     (primary agent only, core)
 //
 // toolCreate is the R2b capability: the model can author a JavaScript tool body
@@ -209,6 +211,15 @@ import {
     TOOL_CREATE_METADATA,
     TOOL_CREATE_NAME,
     AGENT_DELEGATE_NAME,
+    AGENT_MANAGE_METADATA,
+    AGENT_MANAGE_NAME,
+    AGENT_MANAGE_LIST_PER_AGENT,
+    AGENT_MANAGE_PREVIEW_CHARS,
+    AGENT_RESULT_METADATA,
+    AGENT_RESULT_NAME,
+    AGENT_RESULT_PAGE_CHARS,
+    AGENT_RESULT_PAGE_MAX_CHARS,
+    AGENT_RESULT_RETENTION,
     TOOL_REQUEST_METADATA,
     TOOL_REQUEST_NAME,
     TODO_MANAGE_NAME,
@@ -235,6 +246,7 @@ import {
     incorporateBranchHistory,
     normalizeBranchLabel,
     pruneBranchRecords,
+    reserveBranchSequence,
     validateActionChoice,
     validateActionRequestParameters
 } from './core';
@@ -404,6 +416,11 @@ const TODO_MANAGE = TODO_MANAGE_NAME;
 const PROFILE_MANAGE = PROFILE_MANAGE_NAME;
 const CHAPTER_MANAGE = CHAPTER_MANAGE_NAME;
 const LOCATION_MANAGE = LOCATION_MANAGE_NAME;
+// Agent inspection (R3): every agent, including a subagent, may read the
+// session's agents and their completed results. Registration order matches
+// coreToolMetadata() and RESERVED_TOOL_NAMES below.
+const AGENT_MANAGE = AGENT_MANAGE_NAME;
+const AGENT_RESULT = AGENT_RESULT_NAME;
 const AGENT_DELEGATE = AGENT_DELEGATE_NAME;
 // Targeted cancellation for a background call (T3/R4). Declared only while the
 // calling agent has work in flight; the name is nonetheless reserved so no
@@ -420,8 +437,8 @@ const ACTION_REQUEST = ACTION_REQUEST_NAME;
 // Names no configured, preset, plugin, or model-created tool may take. Keeping
 // the whole list in one place is what makes the reservation check exhaustive.
 // Order matches the registration order below (and therefore the declaration
-// order on every request), with agentDelegate last among the pre-N6 tools and
-// the branch controls after it.
+// order on every request), with agentManage/agentResult after the record tools,
+// agentDelegate last among the pre-N6 tools, and the branch controls after it.
 const RESERVED_TOOL_NAMES = [
     TOOL_REQUEST,
     TOOL_CREATE,
@@ -429,6 +446,8 @@ const RESERVED_TOOL_NAMES = [
     PROFILE_MANAGE,
     CHAPTER_MANAGE,
     LOCATION_MANAGE,
+    AGENT_MANAGE,
+    AGENT_RESULT,
     AGENT_DELEGATE,
     TOOL_CANCEL,
     THREAD_FORK,
@@ -906,6 +925,351 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     const location = createLocationTool();
     tools[LOCATION_MANAGE] = location.tool;
+
+    // -----------------------------------------------------------------------
+    // Agent inspection (R3): agentManage / agentResult
+    // -----------------------------------------------------------------------
+    //
+    // WHY A PER-INVOCATION REGISTRY
+    // -----------------------------
+    // agent.messages is the canonical transcript, but exposing it would leak
+    // system instructions, user prompts, tool arguments, and tool bodies. The
+    // registry records ONLY the completed answer value a run returns (plus its
+    // identity), so agentManage/agentResult can never read anything else.
+    //
+    // Invocation identity:
+    //   - root run            -> String(run.id)
+    //   - delegation/ctx.run  -> run.thread.id === String(run.id)
+    //   - fork/autoanswer     -> run.thread.id === branchId
+    // Branch runs are recorded too, so a fork result is available without
+    // parsing the owner's transcript (kind 'fork' / 'autoanswer').
+    //
+    // Retention is bounded by AGENT_RESULT_RETENTION: completed records beyond it
+    // are evicted oldest-first, while a still-running record is NEVER evicted.
+    // TERMINAL records are durable through the OPTIONAL `agentResults` field of
+    // snapshot v1 (same version, backward compatible); `running` records are
+    // omitted because they have no answer yet. reset() clears the registry with
+    // the conversation, because invocation ids are session-scoped.
+    type AgentInvocationKind = 'root' | 'delegation' | 'fork' | 'autoanswer';
+    type AgentInvocationStatus = 'running' | 'completed' | 'failed' | 'cancelled';
+
+    type AgentInvocationRecord = {
+        invocationId: string;
+        // The run sequence. It is monotonic per harness and sorts records
+        // deterministically without a wall-clock timestamp.
+        sequence: number;
+        // Monotonic completion order. agentResult without an invocation id uses
+        // this (not start order) so the agent's LAST FINISHED answer wins even
+        // when a fork started later but completed earlier. 0 while running; set
+        // once on the terminal transition and persisted in snapshot v1.
+        completedOrder: number;
+        agent: string;
+        role: 'primary' | 'subagent';
+        kind: AgentInvocationKind;
+        status: AgentInvocationStatus;
+        // Completed answer text only. Empty for running/failed/cancelled.
+        content: string;
+        // Failure/cancellation message (never a transcript or tool body).
+        error?: string;
+    };
+
+    const invocationRecords = new Map<string, AgentInvocationRecord>();
+    let invocationCompletionSequence = 0;
+
+    const invocationIdOf = (run: RunState): string => run.thread?.id ?? String(run.id);
+
+    const invocationKindOf = (run: RunState): AgentInvocationKind => {
+        if (run.branch !== undefined) return run.branch.kind;
+        return run.parent === undefined ? 'root' : 'delegation';
+    };
+
+    // Evict oldest TERMINAL records only. Active runs are retained without
+    // bound by this policy (in practice the scheduler/run guards bound them),
+    // so a long-running invocation is always addressable.
+    const pruneInvocationRecords = (): void => {
+        const overflow = invocationRecords.size - AGENT_RESULT_RETENTION;
+        if (overflow <= 0) return;
+
+        const removable = [...invocationRecords.values()]
+            .filter((record) => record.status !== 'running')
+            .sort((left, right) => left.sequence - right.sequence)
+            .slice(0, overflow);
+
+        for (const record of removable) invocationRecords.delete(record.invocationId);
+    };
+
+    const registerInvocation = (run: RunState): void => {
+        const invocationId = invocationIdOf(run);
+
+        invocationRecords.set(invocationId, {
+            invocationId,
+            sequence: run.id,
+            agent: run.agent.name,
+            role: roleOf(run.agent),
+            kind: invocationKindOf(run),
+            status: 'running',
+            content: '',
+            completedOrder: 0
+        });
+
+        pruneInvocationRecords();
+    };
+
+    // Terminal transition. A success records the resolved answer (which may be
+    // empty); a failure keeps only the error message. Deliberately pure from the
+    // run's perspective: it must never affect history, events, or the outcome.
+    const finishInvocation = (
+        run: RunState,
+        outcome: { message?: HarnessAssistantMessage; error?: unknown }
+    ): void => {
+        const record = invocationRecords.get(invocationIdOf(run));
+        if (record === undefined) return;
+
+        record.completedOrder = ++invocationCompletionSequence;
+
+        if (outcome.message !== undefined) {
+            record.status = 'completed';
+            record.content = typeof outcome.message.content === 'string' ? outcome.message.content : '';
+        } else {
+            record.status =
+                run.aborted || run.signal?.aborted === true ? 'cancelled' : 'failed';
+            record.error = toErrorInfo(
+                outcome.error ?? new HarnessError(`Agent "${run.agent.name}" ended without a result.`)
+            ).message;
+        }
+
+        pruneInvocationRecords();
+    };
+
+    // A preview is whitespace-trimmed answer text, capped at the declared size.
+    // The ellipsis marks truncation explicitly; `truncated` is the machine flag.
+    const invocationPreviewOf = (record: AgentInvocationRecord) => {
+        if (record.status !== 'completed') {
+            return {
+                invocationId: record.invocationId,
+                kind: record.kind,
+                status: record.status,
+                contentLength: 0,
+                preview: '',
+                truncated: false
+            };
+        }
+
+        const trimmed = record.content.trim();
+        const truncated = trimmed.length > AGENT_MANAGE_PREVIEW_CHARS;
+
+        return {
+            invocationId: record.invocationId,
+            kind: record.kind,
+            status: record.status,
+            contentLength: record.content.length,
+            preview: truncated ? `${trimmed.slice(0, AGENT_MANAGE_PREVIEW_CHARS)}…` : trimmed,
+            truncated
+        };
+    };
+
+    // Newest first within one agent. `sequence` is unique, so the order is total.
+    const recordsForAgent = (name: string): AgentInvocationRecord[] =>
+        [...invocationRecords.values()]
+            .filter((record) => record.agent === name)
+            .sort((left, right) => right.sequence - left.sequence);
+
+    // Pagination must not cut a UTF-16 surrogate pair in half. `offset` is a
+    // character (code-unit) index, which can land inside a non-BMP glyph; move the
+    // start back one unit to include the whole pair, then keep the page at `limit`
+    // units and move the END back when it would split the next pair. ASCII results
+    // are unchanged byte-for-byte.
+    const isHighSurrogate = (code: number): boolean => code >= 0xd800 && code <= 0xdbff;
+    const isLowSurrogate = (code: number): boolean => code >= 0xdc00 && code <= 0xdfff;
+
+    const resultPageOf = (
+        content: string,
+        requestedOffset: number,
+        limit: number
+    ): { content: string; offset: number; hasMore: boolean; nextOffset?: number } => {
+        const total = content.length;
+        let start = Math.min(Math.max(0, requestedOffset), total);
+
+        if (
+            start > 0 &&
+            start < total &&
+            isLowSurrogate(content.charCodeAt(start)) &&
+            isHighSurrogate(content.charCodeAt(start - 1))
+        ) {
+            start--;
+        }
+
+        let end = Math.min(start + limit, total);
+
+        if (
+            end > start &&
+            end < total &&
+            isHighSurrogate(content.charCodeAt(end - 1)) &&
+            isLowSurrogate(content.charCodeAt(end))
+        ) {
+            end--;
+        }
+
+        const hasMore = end < total;
+
+        return {
+            content: content.slice(start, end),
+            offset: start,
+            hasMore,
+            ...(hasMore ? { nextOffset: end } : {})
+        };
+    };
+
+    // Listing. Every configured agent appears (even with no results), so a model
+    // can see who exists before anything has run.
+    tools[AGENT_MANAGE] = defineTool<Record<string, never>, unknown>({
+        ...AGENT_MANAGE_METADATA,
+        execute: () => {
+            const records = [...invocationRecords.values()];
+            let listed = 0;
+
+            const agentsView = Object.entries(agents).map(([name, brain]) => {
+                const recent = recordsForAgent(name);
+                const visible = recent.slice(0, AGENT_MANAGE_LIST_PER_AGENT);
+                listed += visible.length;
+
+                return {
+                    name,
+                    role: roleOf(brain),
+                    model: brain.model(),
+                    invocationCount: recent.length,
+                    results: visible.map(invocationPreviewOf)
+                };
+            });
+
+            return {
+                agents: agentsView,
+                totalResults: records.length,
+                activeResults: records.filter((record) => record.status === 'running').length,
+                // True when at least one agent has more retained invocations than
+                // this listing shows. Full text is always retrievable by id via
+                // agentResult while the record is retained.
+                truncated: records.length > listed
+            };
+        }
+    });
+
+    // Full retrieval by agent (and preferably invocation id). There is no
+    // transcript access at all: every branch below reads the recorded answer
+    // value only.
+    tools[AGENT_RESULT] = defineTool<
+        { agent: string; invocationId?: string; offset?: number; limit?: number },
+        unknown
+    >({
+        ...AGENT_RESULT_METADATA,
+        execute: ({ parameters }) => {
+            const name = parameters?.agent;
+            const configured = Object.prototype.hasOwnProperty.call(agents, name);
+
+            if (!configured) {
+                throw new HarnessError(
+                    `Agent "${String(name)}" is not registered. Configured agents: ${Object.keys(agents).join(', ')}.`
+                );
+            }
+
+            const requestedId =
+                typeof parameters?.invocationId === 'string' ? parameters.invocationId : undefined;
+
+            let record: AgentInvocationRecord | undefined;
+
+            if (requestedId !== undefined) {
+                const candidate = invocationRecords.get(requestedId);
+
+                // An id belonging to another agent is reported as unavailable for
+                // THIS agent: the lookup is scoped, so a caller cannot probe
+                // sibling results through the wrong name.
+                if (candidate === undefined || candidate.agent !== name) {
+                    throw new HarnessError(
+                        `No result "${requestedId}" is available for agent "${name}".`
+                    );
+                }
+
+                record = candidate;
+            } else {
+                const recent = recordsForAgent(name);
+                // Latest FINISHED result wins (completion order, not start order,
+                // so a fork that finished earlier never masks the root's answer);
+                // a still-running invocation does not hide the last finished
+                // answer. Fall back to the newest started record so a failure or
+                // an active-only agent is still explainable.
+                const completed = recent
+                    .filter((entry) => entry.status === 'completed')
+                    .sort((left, right) => right.completedOrder - left.completedOrder);
+
+                record = completed[0] ?? recent[0];
+            }
+
+            const limit =
+                typeof parameters?.limit === 'number'
+                    ? Math.min(parameters.limit, AGENT_RESULT_PAGE_MAX_CHARS)
+                    : AGENT_RESULT_PAGE_CHARS;
+
+            // No invocation at all: an honest empty state, not an error.
+            if (record === undefined) {
+                return {
+                    agent: name,
+                    status: 'empty',
+                    content: '',
+                    contentLength: 0,
+                    offset: 0,
+                    limit,
+                    hasMore: false
+                };
+            }
+
+            const base = {
+                agent: name,
+                invocationId: record.invocationId,
+                kind: record.kind,
+                status: record.status
+            };
+
+            if (record.status === 'running') {
+                // A run in flight has NO answer yet. Never return a streamed
+                // partial as if it were a completed result.
+                return {
+                    ...base,
+                    content: '',
+                    contentLength: 0,
+                    offset: 0,
+                    limit,
+                    hasMore: false
+                };
+            }
+
+            if (record.status === 'failed' || record.status === 'cancelled') {
+                return {
+                    ...base,
+                    content: '',
+                    contentLength: 0,
+                    offset: 0,
+                    limit,
+                    hasMore: false,
+                    error: record.error ?? 'The invocation did not complete.'
+                };
+            }
+
+            const total = record.content.length;
+            const offset =
+                typeof parameters?.offset === 'number' ? Math.min(parameters.offset, total) : 0;
+            const page = resultPageOf(record.content, offset, limit);
+
+            return {
+                ...base,
+                content: page.content,
+                contentLength: total,
+                offset: page.offset,
+                limit,
+                hasMore: page.hasMore,
+                ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset })
+            };
+        }
+    });
 
     // Bounded delegation (R4). Registered only when there is somewhere to
     // delegate: a tool that can only fail would cost context on every request.
@@ -3313,8 +3677,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             runs.add(run);
             activeRuns++;
 
+            // R3: make this invocation visible to agentManage/agentResult while
+            // it runs. The registry entry is completed in the catch/return below;
+            // it never touches history or events.
+            registerInvocation(run);
+
             try {
-                return await runAgentCore(run, input);
+                const message = await runAgentCore(run, input);
+                finishInvocation(run, { message });
+                return message;
+            } catch (error) {
+                finishInvocation(run, { error });
+                throw error;
             } finally {
                 run.active = false;
                 runs.delete(run);
@@ -3343,10 +3717,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //
     // snapshot() is a pure synchronous read: it copies agent transcripts, the
     // model each agent will use, enabled/discovered tools, progressive-discovery
-    // offsets, the lifetime creation budget, runtime-created tool SOURCES, and
-    // every session record store. It deliberately omits configuration,
-    // credentials, functions (transports/tool implementations/plugins/progress
-    // hooks), and in-flight execution state (runStack/runSignal).
+    // offsets, the lifetime creation budget, runtime-created tool SOURCES, every
+    // session record store, and the TERMINAL agent-result archive (R3 durability).
+    // It deliberately omits configuration, credentials, functions
+    // (transports/tool implementations/plugins/progress hooks), in-flight
+    // execution state (runStack/runSignal), and `running` agent results (they have
+    // no answer yet and are written by the next boundary snapshot if they finish).
     //
     // SAFE DURING AN ACTIVE RUN (T16). Agent history is only mutated synchronously
     // at commit points, and snapshot() runs on the same thread, so a read from a
@@ -3370,7 +3746,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //      never execute, same trusted-source policy as toolCreate);
     //   3. target-specific checks: agent identity, registry collisions, creation
     //      budget, and that every discovered name resolves.
-    // Only then is state replaced. Validation failure therefore leaves the target
+    // Only then is state replaced (including the agent-result archive and its id
+    // high-water counters). Validation failure therefore leaves the target
     // untouched, which is what makes a corrupt on-disk snapshot safe to report.
     //
     // A restore removes tools THIS harness previously restored (tracked in
@@ -3388,6 +3765,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             };
         }
 
+        // R3 durability: persist only TERMINAL results, in run-start order. A
+        // running invocation has no answer yet; it is omitted rather than written
+        // as a fabricated/cancelled result. Its eventual completion is recorded by
+        // the next mutation-boundary snapshot (or lost only if the process dies
+        // mid-run, which is the same guarantee as any other in-flight work).
+        const agentResults = [...invocationRecords.values()]
+            .filter((record) => record.status !== 'running')
+            .sort((left, right) => left.sequence - right.sequence)
+            .map((record) => ({
+                invocationId: record.invocationId,
+                sequence: record.sequence,
+                completedOrder: record.completedOrder,
+                agent: record.agent,
+                role: record.role,
+                kind: record.kind,
+                status: record.status as 'completed' | 'failed' | 'cancelled',
+                content: record.content,
+                ...(record.error === undefined ? {} : { error: record.error })
+            }));
+
         return {
             version: HARNESS_SNAPSHOT_VERSION,
             agents: agentSnapshots,
@@ -3403,6 +3800,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // declaration order after a restore.
             createdTools: [...createdToolRecords.values()].map(cloneToolCreation),
             createdToolCount: createdTools,
+            // Omitted when empty so a snapshot without results (and every older
+            // fixture) keeps its exact prior shape.
+            ...(agentResults.length === 0 ? {} : { agentResults }),
             records: {
                 todos: todo.snapshot(),
                 profiles: profile.snapshot(),
@@ -3518,6 +3918,52 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         for (const entry of next.discovery.offsets) {
             discoveryOffsets.set(entry.query, entry.offset);
         }
+
+        // R3 durability: replace the result registry with the snapshot's terminal
+        // records. An old snapshot (no agentResults) intentionally restores an
+        // EMPTY registry: a pre-feature file could not have persisted one, so
+        // there is nothing to reconstruct. Counters are advanced to the archived
+        // high-water marks; otherwise a new root run could reuse an archived
+        // numeric invocation id, or a new fork `branch-N` could overwrite the
+        // archived result with the same id.
+        const restoredResults = next.agentResults ?? [];
+
+        invocationRecords.clear();
+        for (const result of restoredResults) {
+            invocationRecords.set(result.invocationId, {
+                invocationId: result.invocationId,
+                sequence: result.sequence,
+                completedOrder: result.completedOrder,
+                agent: result.agent,
+                role: result.role,
+                kind: result.kind,
+                status: result.status,
+                content: result.content,
+                ...(result.error === undefined ? {} : { error: result.error })
+            });
+        }
+
+        const maxSequence = restoredResults.reduce(
+            (max, result) => Math.max(max, result.sequence),
+            0
+        );
+        const maxCompletionOrder = restoredResults.reduce(
+            (max, result) => Math.max(max, result.completedOrder),
+            0
+        );
+        let maxBranchSequence = 0;
+
+        for (const result of restoredResults) {
+            const match = /^branch-([1-9][0-9]*)$/.exec(result.invocationId);
+            if (match !== null) maxBranchSequence = Math.max(maxBranchSequence, Number(match[1]));
+        }
+
+        runSequence = Math.max(runSequence, maxSequence);
+        invocationCompletionSequence = Math.max(
+            invocationCompletionSequence,
+            maxCompletionOrder
+        );
+        reserveBranchSequence(maxBranchSequence);
 
         for (const [name, agentSnapshot] of Object.entries(next.agents)) {
             const brain = agents[name];
@@ -3694,10 +4140,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         restore,
         // reset() is "start over": EVERY agent's conversation goes back to its
         // seeded instructions (R12 — a subagent used to keep its transcript, which
-        // leaked one session into the next), tool discovery is forgotten, and the
+        // leaked one session into the next), tool discovery is forgotten, the
         // session todo list and record stores (profiles, chapters, locations) are
-        // cleared (ids restart at "1"), so the next run begins from the core set
-        // and empty session state.
+        // cleared (ids restart at "1"), and the agent-result registry is emptied
+        // (invocation ids are session-scoped), so the next run begins from the core
+        // set and empty session state.
         //
         // Deliberately NOT reset:
         //   - tools created at runtime stay in the catalogue (registry state, not
@@ -3713,6 +4160,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             profile.reset();
             chapter.reset();
             location.reset();
+            invocationRecords.clear();
             // A reset is a snapshot-managed mutation too: a server must persist
             // the cleared transcripts/stores instead of keeping the old file.
             notifyStateChange('reset');

@@ -149,6 +149,8 @@ describe('agentDelegate', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'agentDelegate',
             'threadFork',
         ]);
@@ -159,6 +161,8 @@ describe('agentDelegate', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
     });

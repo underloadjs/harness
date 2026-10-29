@@ -1,13 +1,16 @@
 // Compact agent labels (R2/R3).
 //
-// The label is part of the visible UI contract — a header reads `RH1`, not a raw
-// agent id — so every value here is asserted exactly: the first/last letters, the
-// per-agent occurrence, and the behaviour across normalisation and reset.
+// The allocator now lives in `shared/agent-results.ts` (single owner); this file
+// pins the FRONTEND import path and the shared rules:
+//   - uppercase first + last ASCII LETTER (digits/punctuation ignored), fallback AG;
+//   - counters are keyed by the two-letter CODE, so different ids with the same
+//     code share one sequence instead of colliding;
+//   - reset re-numbers a rebuilt turn; separate allocators are independent.
 
 import { createAgentLabels } from './agent-label';
 
 describe('createAgentLabels', () => {
-    it('uses the uppercase first and last letter plus a 1-based occurrence', () => {
+    it('uses the uppercase first and last ASCII letter plus a 1-based occurrence', () => {
         const labels = createAgentLabels();
 
         expect(labels.next('research')).toBe('RH1');
@@ -18,29 +21,40 @@ describe('createAgentLabels', () => {
         expect(labels.next('summarizer')).toBe('SR1');
     });
 
-    it('keeps one occurrence sequence per normalised agent', () => {
+    it('normalises identity before allocating', () => {
         const labels = createAgentLabels();
 
-        // Identity normalisation is shared with the colour (`agentKeyOf`): case and
-        // surrounding whitespace never mint a second sequence.
         expect(labels.next('Helper')).toBe('HR1');
         expect(labels.next(' helper ')).toBe('HR2');
         expect(labels.next('HELPER')).toBe('HR3');
-        // A different agent starts its own sequence.
         expect(labels.next('deeper')).toBe('DR1');
     });
 
-    it('skips punctuation and falls back for an unnamed agent', () => {
+    it('ignores digits and non-ASCII glyphs, falling back to AG', () => {
         const labels = createAgentLabels();
 
-        // Non-alphanumeric glyphs are skipped, so the code stays two characters.
-        expect(labels.next('research-2')).toBe('R21');
-        // A one-character id yields the same letter twice (first AND last).
+        // `research-2` -> letters only -> RH; the digit is not part of the code.
+        expect(labels.next('research-2')).toBe('RH1');
+        // A one-letter id yields the same letter twice.
         expect(labels.next('a')).toBe('AA1');
-        // No letters/digits at all: the neutral code, still counted apart.
+        // No ASCII letters at all: one shared neutral sequence.
         expect(labels.next('')).toBe('AG1');
         expect(labels.next(undefined)).toBe('AG2');
         expect(labels.next('???')).toBe('AG3');
+        expect(labels.next('研究员')).toBe('AG4');
+        expect(labels.next('123')).toBe('AG5');
+    });
+
+    it('counts per two-letter code so colliding ids cannot mint duplicate labels', () => {
+        const labels = createAgentLabels();
+
+        expect(labels.next('research')).toBe('RH1');
+        // Same first+last letters, different agent: same code sequence.
+        expect(labels.next('rhesearch')).toBe('RH2');
+        expect(labels.next('research')).toBe('RH3');
+
+        expect(labels.next('reviewer')).toBe('RR1');
+        expect(labels.next('reader')).toBe('RR2');
     });
 
     it('resets every occurrence so a rebuilt projection re-numbers from 1', () => {

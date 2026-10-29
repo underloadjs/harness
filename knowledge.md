@@ -289,6 +289,7 @@ reach into `src/`.
 - [Tool discovery](#tool-discovery) — Tags, visibility, toolRequest, and the ranking
 - [Session todos](#session-todos) — Core todoManage, incremental ids, per-harness state
 - [Session records](#session-records) — Core profileManage/chapterManage/locationManage stores
+- [Agent results](#agent-results-r3) — Core agentManage/agentResult result inspection
 - [toolCreate](#createtool) — Runtime tool creation from an async function body
 - [Delegation](#delegation) — Explicit primary/subagents, one level deep
 - [Owner questions and history forks](#owner-questions-and-history-forks) —
@@ -435,7 +436,7 @@ Every tool — core and preset — is named `<namespace><action>`:
 | `profile*` | `profileManage` (session character/people records) |
 | `chapter*` | `chapterManage` (session chapters, summaries + ordered list) |
 | `location*` | `locationManage` (session locations/places) |
-| `agent*` | `agentDelegate` (bounded delegation) |
+| `agent*` | `agentManage` (list agents + result previews), `agentResult` (read one completed result), `agentDelegate` (bounded delegation) |
 | `action*` | `actionRequest` (conditional owner question; `interaction` configured) |
 | `thread*` | `threadFork` (conditional private history fork; forks enabled) |
 | `file*` | `fileRead`, `fileWrite`, `fileEdit`, `fileList`, `fileGlob` |
@@ -488,7 +489,8 @@ request and need no discovery. `fileList`, `syntaxCheck`, `commandRun`, and
 `gitDiff` stay searchable: a model that needs a directory listing asks for
 `files`/`list`. A configured tool replaces a preloaded preset of the same name.
 The harness-owned toolRequest/toolCreate/todoManage/profileManage/chapterManage/
-locationManage (plus delegate for a primary with subagents) are core too, and a
+locationManage/agentManage/agentResult (plus delegate for a primary with
+subagents) are core too, and a
 configured `webSearch` is core as well. `actionRequest` is core only when
 `interaction` is configured; `threadFork` is core when `forks.enabled` (the
 default). Both are registered as standalone definitions whose `execute` refuses a
@@ -504,7 +506,8 @@ surface (filename mode, or content mode with `content`), and it is now core.
 it closes over the live registry and the harness's active set. It is registered
 after the declarative tools and before plugins, is always core, and its name is
 reserved (`harness()` throws if the config or a preset already has `toolRequest`).
-`toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, and
+`toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`,
+`agentManage`, `agentResult`, and
 (when subagents exist) `agentDelegate` are reserved the same way, as are
 `actionRequest` and `threadFork` when their configuration registers them.
 
@@ -663,6 +666,60 @@ tools return.
 - **No persistence, no UI panel, no HTTP endpoint of their own.** The stores are
   reached only through their core tools (the server's `sessionBound` catalogue
   entries and `harness.executeTool`).
+
+---
+
+## Agent results (R3)
+
+Two ALWAYS-registered core tools expose the session's completed agent answers to
+every configured agent, primary **and** subagent:
+
+```ts
+agentManage({})                                  // every agent + truncated previews
+agentResult({ agent: 'researcher' })             // latest finished result
+agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
+```
+
+| Tool | Input | Result |
+|---|---|---|
+| `agentManage` | `{}` | `{ agents: [{ name, role, model, invocationCount, results }], totalResults, activeResults, truncated }`; each result is `{ invocationId, kind, status, contentLength, preview, truncated }` |
+| `agentResult` | `{ agent, invocationId?, offset?, limit? }` | `{ agent, invocationId, kind, status, content, contentLength, offset, limit, hasMore, nextOffset? }` (plus `error` for a failed/cancelled run; `status: 'empty'` before any run) |
+
+- **Identity.** `invocationId` is the run id for a root run and the thread id for
+  a delegated/ctx.run child; a fork/autoanswer uses its `branchId`. The harness
+  records roots, delegations, forks, and autoanswer branches in a bounded
+  registry (`AGENT_RESULT_RETENTION` = 64 completed records, active runs are never
+  evicted) and persists every TERMINAL record as the OPTIONAL `agentResults` array
+  of snapshot v1. Restoring advances the run, completion, and branch-id counters to
+  the archived high-water marks, so a future run cannot reuse/overwrite an archived
+  invocation id. Old snapshots without the field restore an empty registry, and
+  `reset()` clears it with the conversation.
+- **Completed answers only.** The registry records the value `runAgentCore`
+  returns, never a streamed delta, so a running invocation has `status: 'running'`
+  and no content and is OMITTED from a snapshot (never written as a fabricated or
+  cancelled answer). `agentResult` without an id selects the latest result by
+  COMPLETION order, so a fork that finished earlier cannot mask the root's final
+  answer.
+- **Durability is strict.** `snapshot.agentResults` is validated before any restore
+  mutation: unique `invocationId`/`sequence`/`completedOrder`, an agent present in
+  `snapshot.agents`, terminal status only, `error` required exactly for
+  failed/cancelled, and at most 64 records. A corrupt array rejects the whole
+  restore and leaves the live registry untouched.
+- **Previews are bounded.** `agentManage` lists up to 5 recent invocations per
+  agent and at most 200 characters of each answer (whitespace-trimmed); the full
+  answer stays in the registry.
+- **No private data.** Neither tool reads system instructions, transcript
+  messages, tool arguments, or tool bodies. Only the completed answer value and
+  run identity cross the boundary.
+- **Paging, not silent truncation.** `agentResult` defaults to 4000 characters per
+  page and caps `limit` at 8000 (far below the 64 KiB serialized tool-result
+  bound even with JSON escaping). `nextOffset` pages the remainder, so a long
+  result is read in full instead of being cut by `boundToolResult`. Offsets are
+  UTF-16 code-unit indices; both page edges are moved to a surrogate-pair boundary
+  so a non-BMP glyph is never split (the returned `offset` is the one actually
+  used).
+- **Reserved names.** `agentManage` and `agentResult` are in
+  `RESERVED_TOOL_NAMES`; a configured, plugin, or created tool cannot shadow them.
 
 ---
 
@@ -1279,7 +1336,8 @@ await writer('tell me about new year');
   `tool.name` are overwritten to match.
 - **Tool declarations are filtered, not the registry.** `writer.tools` holds the
   preset preload, the configured tools, `toolRequest`, `toolCreate`, `todoManage`,
-  `profileManage`, `chapterManage`, `locationManage`, `threadFork` when forks are
+  `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`,
+  `threadFork` when forks are
   enabled, `actionRequest` when interaction is configured, and `agentDelegate` when
   there is a subagent; a request declares every core tool
   (`fileRead`/`fileWrite`/`fileEdit`/`fileGlob`, a configured `webSearch`, and the
@@ -1293,7 +1351,7 @@ await writer('tell me about new year');
   this harness's context (`agent: primary`, `agents`, `run`). It is the server's
   manual-execution path for the session-bound tools (`POST /tools/:name` with a
   `sessionId`), so a manual toolRequest/toolCreate/todoManage/profileManage/
-  chapterManage/locationManage/delegate call mutates
+  chapterManage/locationManage/agentManage/agentResult/delegate call mutates
   this session. Core file tools and webSearch are ordinary direct-call catalogue
   entries and do not need a session. Discovery gates the MODEL only: an explicit
   operator call may run a searchable tool that was never enabled. Nothing else is bypassed — `toolCreate` keeps its guarded
@@ -1318,8 +1376,10 @@ await writer('tell me about new year');
   a plugin-added tool is searchable like any other. The reserved names stay
   reserved for plugins too.
 - `reset()` clears the entry agent's conversation, the discovered-tool set, the
-  session todo list, and the three record stores, so a reset run starts from the
-  core set and empty session state.
+  session todo list, the three record stores, and the agent-result archive, so a
+  reset run starts from the core set and empty session state. The terminal result
+  archive is otherwise durable through snapshot/restore (see
+  [Agent results](#agent-results-r3)).
   Created tools stay registered (registry state), just no longer enabled. The
   server resets every agent in a session, not only the primary; its extra
   agent-loop reset does not replace `harness.reset()`, which is what clears the
@@ -1775,7 +1835,7 @@ normalizer and the exported `TOOL_UI_LIMITS`.
 - **Preload the catalogue, declare only the core.** Shipping the presets into
   every harness by default stays cheap: only the four core file tools are declared
   up front, alongside toolRequest/toolCreate/todoManage/profileManage/
-  chapterManage/locationManage (and delegate when
+  chapterManage/locationManage/agentManage/agentResult (and delegate when
   applicable), while the searchable remainder costs no context until discovered.
   `presets: false` exists for callers who want an empty catalogue, which is also
   what the harness tests use when they assert exact discovery results.
@@ -1978,9 +2038,9 @@ can fix.
   registered and enabled at once, so `GET /sessions/:id` reports its name in
   `discoveredTools`; `GET /tools` remains the static catalogue.
 
-**Core tools in the catalogue (R8/N4).** `src/harnesses/core.ts` adds six entries -
+**Core tools in the catalogue (R8/N4).** `src/harnesses/core.ts` adds eight entries -
 `toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`,
-`locationManage` - plus `agentDelegate`, `actionRequest`, and `threadFork` to every
+`locationManage`, `agentManage`, `agentResult` - plus `agentDelegate`, `actionRequest`, and `threadFork` to every
 listing (`GET /tools`, its `/tools/bootstrap` alias, and the root bootstrap
 document). The last two are conditional in a session's harness (`interaction`
 configured / `forks.enabled`), but the host-wide catalogue always lists them with
@@ -2006,7 +2066,7 @@ descriptor cannot advertise a schema the runtime does not use.
 `fileEdit`, `fileGlob`, and a configured `webSearch` are `visibility: 'core'` but
 keep their real `tool` implementation and appear in the direct-call catalogue
 (groups `Package presets` / `Web search`), so `POST /api/tools/fileRead` works
-without a `sessionId`. `sessionBound: true` remains exclusive to the six
+without a `sessionId`. `sessionBound: true` remains exclusive to the eight
 harness-owned entries above plus `agentDelegate`, `actionRequest`, and `threadFork`
 (the last two are still refused by the manual call path because they need the
 owning run). The UI's core dropdown reads

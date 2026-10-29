@@ -61,7 +61,9 @@ const CORE_ORDER = [
     'todoManage',
     'profileManage',
     'chapterManage',
-    'locationManage'
+    'locationManage',
+    'agentManage',
+    'agentResult'
 ];
 
 // N6: threadFork is core for every agent; agentDelegate stays primary-only and is

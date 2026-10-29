@@ -94,7 +94,9 @@ const CORE = [
     'todoManage',
     'profileManage',
     'chapterManage',
-    'locationManage'
+    'locationManage',
+    'agentManage',
+    'agentResult'
 ];
 
 // The five real primaries, in catalogue order.

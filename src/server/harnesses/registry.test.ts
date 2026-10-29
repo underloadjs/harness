@@ -150,6 +150,8 @@ describe('creating a harness', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'agentDelegate',
             'threadFork'
         ]);
@@ -425,6 +427,8 @@ describe('updating a harness', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
         expect(Object.keys(flakyAfter.create(SETTINGS, progress).tools)).toContain('testFlaky');
@@ -470,6 +474,8 @@ describe('updating a harness', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
     });

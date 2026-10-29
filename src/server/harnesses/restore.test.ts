@@ -189,6 +189,8 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
 

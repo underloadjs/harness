@@ -10,8 +10,11 @@
 //   - ./origin.ts            — LOOPBACK_HOSTNAMES, isLoopbackHostname, isTrustedRuntimeOrigin
 //   - ./attachments.ts       — the one attachment validator, its size constants,
 //                              and the marker helper shared by composer + server
+//   - ./agent-results.ts     — block labels, result-block projection, reference
+//                              parsing/validation, and delimited prompt composition
 //   - ../server/service.ts   — inbound gate
 //   - ../frontend/api.ts     — outbound gate
 //   - ../shared             — also reachable as `@underload/harness/shared`
 export * from './origin';
 export * from './attachments';
+export * from './agent-results';

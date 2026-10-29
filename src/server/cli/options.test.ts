@@ -62,6 +62,8 @@ describe('CLI preset selection', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             // N6: forks are enabled by default, so threadFork is registered even
             // in the scripted fixture (which has no owner interaction).
             'threadFork'

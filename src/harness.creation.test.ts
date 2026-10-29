@@ -87,6 +87,8 @@ describe('toolCreate', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
     });
@@ -115,6 +117,8 @@ describe('toolCreate', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
         expect(declaredNames(seen[1])).toEqual([
@@ -124,6 +128,8 @@ describe('toolCreate', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork',
             'repeat'
         ]);
@@ -240,6 +246,8 @@ describe('toolCreate', () => {
             'profileManage',
             'chapterManage',
             'locationManage',
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
     });
@@ -305,9 +313,10 @@ describe('toolCreate', () => {
             });
         }
 
-        // Seven harness-owned core tools plus the 32 creations (toolRequest,
-        // toolCreate, the four record tools, and N6's threadFork).
-        expect(Object.keys(writer.tools)).toHaveLength(39);
+        // Nine harness-owned core tools plus the 32 creations (toolRequest,
+        // toolCreate, the four record tools, agentManage/agentResult, and N6's
+        // threadFork).
+        expect(Object.keys(writer.tools)).toHaveLength(41);
         expect(() =>
             writer.createTool({
                 name: 'generated32',

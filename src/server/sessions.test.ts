@@ -1211,6 +1211,8 @@ describe('SessionStore turns', () => {
                     'profileManage',
                     'chapterManage',
                     'locationManage',
+                    'agentManage',
+                    'agentResult',
                     'threadFork'
                 ],
                 builtin: true,
@@ -1492,8 +1494,11 @@ describe('SessionStore agent model retargeting', () => {
         expect(terminal.session.model).toBe('next/model');
         expect(terminal.session.agentModels).toEqual({ lead: 'next/model', helper: 'scripted/test' });
 
-        // The NEXT request of the same agent targets the new model, with the
-        // history still intact (one user message from the first run).
+        // The NEXT request of the same agent targets the new model. INTENTIONAL
+        // T4 behaviour change: every server turn is a NEW block, so the harness
+        // conversation is reseeded from the agent instructions before execution.
+        // The previous block's user message is NOT inherited; its result remains
+        // available through the session turn record / # references instead.
         setClock(3_000);
         await store.run(created.id, 'second', async () => {});
         expect(requests).toEqual(['scripted/test', 'next/model']);
@@ -1501,7 +1506,6 @@ describe('SessionStore agent model retargeting', () => {
         const second = store.get(created.id).turns[1];
         expect(second.events[0]).toEqual({ type: 'start', agent: 'lead', model: 'next/model' });
         expect(store.get(created.id).messages.filter((message) => message.role === 'user')).toEqual([
-            { role: 'user', content: 'first' },
             { role: 'user', content: 'second' }
         ]);
     });

@@ -136,7 +136,9 @@ describe('conditional core registration', () => {
             'todoManage',
             'profileManage',
             'chapterManage',
-            'locationManage'
+            'locationManage',
+            'agentManage',
+            'agentResult'
         ]);
     });
 });

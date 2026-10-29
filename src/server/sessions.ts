@@ -38,6 +38,16 @@
 // success, failure, and cancellation. cancel() aborts an active run; a manual call
 // has no controller.
 //
+// FRESH BLOCKS + RESULT REFERENCES (R2): every submitted turn is a NEW block, not
+// a resumed transcript. Before the harness runs, executeTurn reseeds every agent's
+// conversation (`agent.reset()`, NOT `harness.reset()`), so the previous block's
+// user/assistant messages are never inherited while discovery, todos, record
+// stores, created tools, and the session's `turns` archive survive. A task may
+// carry `references` (or type `#LABEL`), which the store binds at enqueue and
+// expands at EXECUTION from the referenced turn's recorded terminal `done`
+// content; the raw `turn.prompt` stays user-facing. See shared/agent-results.ts
+// for the block projection and prompt delimiters.
+//
 // Record ownership (H3): the server — not the browser — is the source of truth for
 // the renderable transcript. Each submitted task becomes one SessionTurn that owns
 // the prompt, status, timestamps, and every HarnessEvent the run produced
@@ -68,6 +78,7 @@
 //                     POST /sessions/:id/actions/:requestId/answer
 //   - ./harnesses/registry.ts — the in-memory harness registry
 //   - ./harnesses/descriptor.ts — describeHarness, the frozen definition
+//   - ../shared/agent-results.ts — labels, block projection, reference prompt
 //   - ../core/action.ts — validateActionChoice (the one answer parser)
 
 import { randomUUID } from 'node:crypto';
@@ -85,6 +96,15 @@ import type {
 } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { validateAttachments } from '../shared/attachments';
+import {
+    composeAgentResultPrompt,
+    findAgentResultBlock,
+    findLatestAgentResultBlock,
+    MAX_AGENT_REFERENCES,
+    parseAgentReferenceLabels,
+    readAgentResultReferenceList
+} from '../shared/agent-results';
+import type { AgentResultBlock, AgentResultReference } from '../shared/agent-results';
 import { validateActionChoice } from '../core/action';
 import { describeHarness } from './harnesses/descriptor';
 import {
@@ -115,6 +135,10 @@ const MAX_INPUT_LENGTH = 200_000;
 // active turn is not part of the queue, so a session can run one task with this
 // many waiting. Exceeding it is a 429, and the submit mutates nothing.
 const MAX_PENDING_TASKS = 100;
+
+// Result references (R2) are bounded by the shared reader (MAX_AGENT_REFERENCES).
+// The per-submit cap is enforced there, so the store and persistence cannot
+// disagree about what a valid reference payload is.
 
 // N4 owner interaction: one session can have at most this many unanswered
 // actionRequest questions. The runtime enforces its own bound too, so this is the
@@ -224,6 +248,12 @@ type Session = {
     busyWaiters: (() => void)[];
     // waitForIdle() callers, resolved after the drain snapshot is published.
     drainWaiters: (() => void)[];
+    // Result-reference waiters (R2). A turn that references a block belonging to
+    // a turn that is still queued/running parks here until that turn reaches a
+    // terminal status; every settlement path wakes them and they re-check. FIFO
+    // means this is normally a no-op (prior turns finish first), but the wait is
+    // explicit so a reference can never expand partial/still-streaming content.
+    turnWaiters: (() => void)[];
     // enqueue()'s per-turn completion resolvers, keyed by turn id. Resolved when
     // the turn reaches a terminal status or is dropped by cancel-all.
     settlers: Map<string, () => void>;
@@ -352,6 +382,12 @@ const copyTurn = (turn: SessionTurn): SessionTurn => ({
     ...(turn.attachments === undefined
         ? {}
         : { attachments: turn.attachments.map((attachment) => ({ ...attachment })) }),
+    // Result references (R2) are copied for the same reason: a snapshot consumer
+    // must not be able to retarget a stored reference through the response it was
+    // handed. Absent when the turn references nothing (exact legacy shape).
+    ...(turn.references === undefined || turn.references.length === 0
+        ? {}
+        : { references: turn.references.map((reference) => ({ ...reference })) }),
     status: turn.status,
     ...(turn.startedAt === undefined ? {} : { startedAt: turn.startedAt }),
     updatedAt: turn.updatedAt,
@@ -567,6 +603,7 @@ export class SessionStore {
             pumping: false,
             busyWaiters: [],
             drainWaiters: [],
+            turnWaiters: [],
             settlers: new Map(),
             pendingActions: new Map(),
             completedActions: [],
@@ -1014,6 +1051,7 @@ export class SessionStore {
                 pumping: false,
                 busyWaiters: [],
                 drainWaiters: [],
+                turnWaiters: [],
                 settlers: new Map(),
                 pendingActions: new Map(),
                 // Nothing from disk may be answered: a restart expires every
@@ -1334,6 +1372,235 @@ export class SessionStore {
         await this.executeTurn(session, turn, emit, options.signal);
     }
 
+    // -----------------------------------------------------------------------
+    // R2 result references: bind at enqueue, expand at execution
+    // -----------------------------------------------------------------------
+
+    // Validate and bind one submit's references. `references` is the raw request
+    // field; `input` is the trimmed prompt (typed `#LABEL` tokens are resolved from
+    // it). Everything here runs BEFORE the turn is created, so a rejected submit
+    // mutates nothing.
+    //
+    // Two sources are merged:
+    //   1. EXPLICIT entries from the client (the UI sends the block descriptor it
+    //      picked). These carry turnId/threadId, so they are exact.
+    //   2. Typed `#LABEL` tokens in the prompt that the explicit list does not
+    //      already cover. Each resolves to the LATEST prior block with that label
+    //      (server-side, using the shared allocator); an unknown label is rejected
+    //      rather than silently ignored.
+    //
+    // A target may still be running/queued: binding records it, execution waits for
+    // completion. A target that is already failed/cancelled, names a turn that is
+    // not EARLIER than this one, or has no matching block is a clear 400.
+    private normalizeReferences(
+        session: Session,
+        turnIndex: number,
+        input: string,
+        raw: unknown
+    ): AgentResultReference[] {
+        let explicit: AgentResultReference[];
+
+        try {
+            explicit = readAgentResultReferenceList(raw) ?? [];
+        } catch (error) {
+            throw new SessionError(400, messageOf(error));
+        }
+
+        const bound: AgentResultReference[] = [];
+
+        for (const reference of explicit) {
+            bound.push(this.bindReference(session, turnIndex, reference));
+        }
+
+        // Typed tokens are resolved in prompt order. An explicit reference for the
+        // same label wins (it is exact), so the same result is never injected twice.
+        for (const label of parseAgentReferenceLabels(input)) {
+            if (bound.some((reference) => reference.label === label)) continue;
+
+            // Only PRIOR turns are candidates: a reference points backwards, never
+            // at the block being submitted or one queued behind it.
+            const candidates = session.turns.filter((turn) => turn.index < turnIndex);
+            const block = findLatestAgentResultBlock(candidates, label);
+
+            if (block === undefined) {
+                throw new SessionError(
+                    400,
+                    `No earlier block is labelled "#${label}". Type a label from a completed result.`
+                );
+            }
+
+            if (block.status === 'error' || block.status === 'cancelled') {
+                throw new SessionError(
+                    400,
+                    `Block "#${label}" cannot be referenced because it ended as ${block.status}.`
+                );
+            }
+
+            bound.push({
+                turnId: block.turnId,
+                ...(block.threadId === undefined ? {} : { threadId: block.threadId }),
+                label: block.label
+            });
+        }
+
+        // The explicit reader rejects duplicate turn+thread pairs; the merge above
+        // can still add the same label once per source, which is intended. Return
+        // detached copies (the caller stores them on the turn).
+        if (bound.length > MAX_AGENT_REFERENCES) {
+            throw new SessionError(
+                400,
+                `A task cannot reference more than ${MAX_AGENT_REFERENCES} result blocks.`
+            );
+        }
+
+        return bound.map((reference) => ({ ...reference }));
+    }
+
+    // Bind one explicit reference against the session record. Returns the exact
+    // normalised reference to store. See normalizeReferences for the status rules.
+    private bindReference(
+        session: Session,
+        turnIndex: number,
+        reference: AgentResultReference
+    ): AgentResultReference {
+        const target = session.turns.find((turn) => turn.id === reference.turnId);
+
+        if (target === undefined) {
+            throw new SessionError(
+                400,
+                `Referenced turn "${reference.turnId}" does not exist in this session.`
+            );
+        }
+
+        // A reference is always BACKWARD: this also makes a queued-target wait
+        // safe, because the target precedes the pump head that will expand it.
+        if (target.index >= turnIndex) {
+            throw new SessionError(
+                400,
+                `A reference must target an earlier block; turn "${target.id}" is not earlier than this task.`
+            );
+        }
+
+        // A terminal target must resolve NOW, so a missing/failed block is a 400
+        // rather than a turn that fails later.
+        if (target.status === 'running' || target.status === 'queued') {
+            // A running target may not have produced the block yet. Keep the
+            // client's binding (the UI's stable `call:<callId>` alias for a pending
+            // delegation, or `inline:<agent>` for a legacy stream) and resolve it at
+            // EXECUTION after adoption/completion. Nothing partial is read here.
+            return { ...reference };
+        }
+
+        const block = findAgentResultBlock([target], reference);
+
+        if (block === undefined) {
+            throw new SessionError(
+                400,
+                `Turn "${target.id}" has no block labelled "#${reference.label}"${reference.threadId === undefined ? '' : ` (thread "${reference.threadId}")`}.`
+            );
+        }
+
+        if (block.status === 'error' || block.status === 'cancelled') {
+            throw new SessionError(
+                400,
+                `Block "#${reference.label}" cannot be referenced because it ended as ${block.status}.`
+            );
+        }
+
+        if (block.status !== 'done') {
+            throw new SessionError(
+                400,
+                `Block "#${reference.label}" cannot be referenced because it is still ${block.status}.`
+            );
+        }
+
+        if (block.content === undefined) {
+            throw new SessionError(
+                400,
+                `Block "#${reference.label}" has no completed result content to reference.`
+            );
+        }
+
+        return {
+            turnId: block.turnId,
+            ...(block.threadId === undefined ? {} : { threadId: block.threadId }),
+            label: block.label
+        };
+    }
+
+    // Expand every reference into the prompt the harness actually receives. This
+    // runs at EXECUTION, after the fresh-conversation reset, so:
+    //   - a target that was still streaming has had time to finish;
+    //   - the content is the recorded terminal `done` text, never a delta stream;
+    //   - a target that failed/cancelled after binding rejects THIS turn clearly
+    //     instead of injecting nothing and silently running.
+    private async expandReferences(session: Session, turn: SessionTurn): Promise<string> {
+        const references = turn.references;
+
+        if (references === undefined || references.length === 0) return turn.prompt;
+
+        const entries: { block: AgentResultBlock; content: string }[] = [];
+
+        for (const reference of references) {
+            const target = session.turns.find((candidate) => candidate.id === reference.turnId);
+
+            if (target === undefined) {
+                throw new Error(
+                    `Referenced block "#${reference.label}" is no longer available: turn "${reference.turnId}" is gone.`
+                );
+            }
+
+            // Coarse but honest: wait for the whole target TURN to settle. FIFO
+            // normally means it already has; this is the explicit guarantee for a
+            // target that was streaming when the task was accepted.
+            await this.waitForTurnTerminal(session, target);
+
+            if (session.disposed) {
+                throw new Error('The session was removed while waiting for a referenced block.');
+            }
+
+            const block = findAgentResultBlock([target], reference);
+
+            if (block === undefined) {
+                throw new Error(
+                    `Referenced block "#${reference.label}" is missing from turn "${target.id}".`
+                );
+            }
+
+            if (block.status !== 'done') {
+                throw new Error(
+                    `Referenced block "#${reference.label}" cannot be used because it ended as ${block.status}.`
+                );
+            }
+
+            if (block.content === undefined) {
+                throw new Error(
+                    `Referenced block "#${reference.label}" has no completed result content.`
+                );
+            }
+
+            entries.push({ block, content: block.content });
+        }
+
+        return composeAgentResultPrompt(turn.prompt, entries);
+    }
+
+    // Park until one turn is no longer queued/running. `turnWaiters` is woken by
+    // every settlement path (executeTurn finally, cancel-all, dispose) and the
+    // caller re-checks the status, so a wake for a different turn is harmless.
+    private async waitForTurnTerminal(session: Session, turn: SessionTurn): Promise<void> {
+        while (!session.disposed && (turn.status === 'queued' || turn.status === 'running')) {
+            await new Promise<void>((resolve) => {
+                session.turnWaiters.push(resolve);
+            });
+        }
+    }
+
+    private releaseTurnWaiters(session: Session): void {
+        const waiters = session.turnWaiters.splice(0);
+        for (const wake of waiters) wake();
+    }
+
     // QUEUE submit (POST /sessions/:id/tasks): accept the task now, execute later.
     //
     // Validation and the pending cap run BEFORE any mutation, so a 400/413/429
@@ -1345,13 +1612,30 @@ export class SessionStore {
     // soon as the turn is enqueued.
     //
     // `attachments` is a TRAILING optional parameter (T3), so `enqueue(id, input)`
-    // keeps working unchanged. Media validation runs before the pending-count
-    // check and before any mutation, and the accepted copies are persisted with
-    // the queued turn so a restart still has the real bytes.
-    enqueue(id: string, rawInput: string, attachments?: unknown): EnqueuedTask {
+    // keeps working unchanged. `references` is an even later trailing parameter
+    // (R2), for the same compatibility reason. Media and reference validation run
+    // before the pending-count check and before any mutation, and the accepted
+    // copies are persisted with the queued turn so a restart still has the real
+    // bytes and the bound reference list.
+    enqueue(
+        id: string,
+        rawInput: string,
+        attachments?: unknown,
+        references?: unknown
+    ): EnqueuedTask {
         const session = this.require(id);
         const validated = validateAttachmentsForSubmit(attachments);
         const input = validateInput(rawInput, validated.length);
+        // BIND now (R2): the referenced turn/block must exist and be a PRIOR
+        // completion target, so a bad reference is a 400 before a turn exists.
+        // Content is deliberately NOT read here: a still-running target is queued
+        // and expanded at EXECUTION (see expandReferences) after it completes.
+        const boundReferences = this.normalizeReferences(
+            session,
+            session.turns.length,
+            input,
+            references
+        );
 
         // Pending only. The active turn is not in `queue`, so one task can run
         // while this many wait; that keeps the cap a true backlog bound.
@@ -1371,6 +1655,9 @@ export class SessionStore {
             id: randomUUID(),
             index: session.turns.length,
             prompt: input,
+            // Omitted when nothing was referenced, so a plain task keeps the exact
+            // legacy record shape. The bound list is persisted and expanded later.
+            ...(boundReferences.length === 0 ? {} : { references: boundReferences }),
             // Omitted for a text-only turn (legacy shape); the validated copies
             // are the ones persisted and later handed to the harness.
             ...(validated.length === 0 ? {} : { attachments: validated }),
@@ -1587,6 +1874,22 @@ export class SessionStore {
         }
     }
 
+    // Start a NEW block with a fresh conversation. Only agent histories are
+    // cleared: `Agent.reset()` reseeds the instruction messages and nothing else.
+    // This is the "explicit suitable API" — `harness.reset()` would also wipe
+    // discovery, todos, and record stores, which are session capabilities, not the
+    // previous conversation's transcript.
+    //
+    // Historical results remain in `session.turns[].events`, which is exactly what
+    // expandReferences and the shared result-block helpers read. A tool that wants
+    // prior results must therefore read that archive (or a session-provided view of
+    // it), never the live agent transcript this reset clears.
+    private resetConversations(session: Session): void {
+        for (const brain of Object.values(session.harness.agents)) {
+            brain.reset();
+        }
+    }
+
     // Execute ONE turn against the harness. Called by run() (legacy, with a
     // per-response emitter) and by the pump (watcher fan-out only).
     //
@@ -1780,11 +2083,37 @@ export class SessionStore {
             // Watchers get the SAME shape as an upsert (the turn just became running).
             this.publish(session, opening());
 
+            // R2 FRESH BLOCK. Every submitted turn is a NEW conversation: the
+            // previous block's user/assistant transcript must not be inherited (its
+            // results stay available through the SESSION turn record and the
+            // reference expansion below). `agent.reset()` reseeds only the
+            // conversation from the agent's instructions — it deliberately leaves
+            // discovery, the todo list, record stores, created tools, and the
+            // session's `turns` archive untouched, so historical results are not
+            // discarded. This is why `harness.reset()` is NOT used here.
+            this.resetConversations(session);
+
+            // Commit the fresh transcript as the active state. A crash during this
+            // block then restores a coherent empty+partial conversation rather than
+            // replaying the previous block's history into it.
+            try {
+                session.core = session.harness.snapshot();
+            } catch {
+                // Defensive: keep the previous committed snapshot; the turn is
+                // still valid because the live harness was reset above.
+            }
+            this.persistBestEffort();
+
+            // Expand AFTER the reset and only once every referenced turn is
+            // terminal, so the injected text is the recorded `done` content. With
+            // no references this is the user's prompt by identity.
+            const runPrompt = await this.expandReferences(session, turn);
+
             // Root prompt + its composer attachments (T3). The attachments ride
             // ONLY on this run's root user message; core validates them once more
             // before appending history (so a corrupted restored record is rejected
             // without mutating the transcript). A text-only turn passes no key.
-            await session.harness(turn.prompt, {
+            await session.harness(runPrompt, {
                 signal: controller.signal,
                 ...(turn.attachments === undefined ? {} : { attachments: turn.attachments })
             });
@@ -1818,6 +2147,9 @@ export class SessionStore {
             session.busy = false;
             session.updatedAt = Date.now();
             turn.updatedAt = session.updatedAt;
+            // The turn's terminal status is now visible; a turn parked while
+            // referencing it may continue (and re-check) on its next tick.
+            this.releaseTurnWaiters(session);
             this.releaseBusy(session);
         }
 
@@ -1924,6 +2256,9 @@ export class SessionStore {
         if (dropped.length > 0) {
             cancelled = true;
             session.updatedAt = now;
+            // Dropped turns are terminal without an executeTurn finally, so wake
+            // reference waiters here too.
+            this.releaseTurnWaiters(session);
 
             // With nothing executing, no pump is left to publish the drain
             // snapshot, so send it here. When a turn IS active the pump sends it.
@@ -2091,8 +2426,9 @@ export class SessionStore {
         }
 
         // Wake a pump parked on the gate (it will see `disposed` and exit) and any
-        // waitForIdle() caller.
+        // waitForIdle()/reference waiter.
         this.releaseBusy(session);
         this.releaseDrain(session);
+        this.releaseTurnWaiters(session);
     }
 }

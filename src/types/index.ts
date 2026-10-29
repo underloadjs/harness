@@ -1312,6 +1312,34 @@ export type HarnessAgentSnapshot = {
     messages: HarnessMessage[];
 };
 
+// One TERMINAL agent result persisted by snapshot v1 (R3 durability). Active
+// (`running`) invocations are deliberately omitted: they have no answer yet, and
+// fabricating one would misrepresent an in-flight run. A result is immutable once
+// terminal, so this record is the minimum needed to rebuild the agentResult
+// registry: identity, ordering, and the completed answer (or failure message).
+//
+// `status` excludes 'running' by construction. `error` is required for a
+// failed/cancelled record and forbidden for a completed one.
+export type HarnessAgentResultSnapshot = {
+    invocationId: string;
+    // Run sequence (the harness's monotonic run id). Restored as a high-water
+    // mark so a future run can never reuse a persisted invocation id.
+    sequence: number;
+    // Monotonic completion order across the harness. Restored so a later
+    // completion sorts after every archived one and "latest finished" stays
+    // correct.
+    completedOrder: number;
+    agent: string;
+    role: 'primary' | 'subagent';
+    kind: 'root' | 'delegation' | 'fork' | 'autoanswer';
+    status: 'completed' | 'failed' | 'cancelled';
+    // Completed answer text; empty for failed/cancelled.
+    content: string;
+    // Failure/cancellation message. Required for a non-completed result, never
+    // present on a completed one.
+    error?: string;
+};
+
 // One progressive-discovery cursor (R12). `query` is the opaque normalized query
 // key the harness already uses (JSON [tags, limit]); it is persisted verbatim so
 // repeating a query after a restart continues the same tranche.
@@ -1345,6 +1373,12 @@ export type HarnessSnapshot = {
     // snapshot this harness produced; restore validates it and refuses a count
     // the target's maxCreatedTools cannot hold.
     createdToolCount: number;
+    // R3 durability: terminal agent results, bounded to AGENT_RESULT_RETENTION
+    // (64). OPTIONAL on purpose: pre-feature snapshots have no field and restore
+    // them with an empty registry, and a snapshot with no terminal results omits
+    // the field so older fixtures/tests keep their exact shape. Running
+    // invocations are omitted (never written as a partial/cancelled answer).
+    agentResults?: HarnessAgentResultSnapshot[];
     records: {
         todos: TodoStoreState;
         profiles: ProfileStoreState;

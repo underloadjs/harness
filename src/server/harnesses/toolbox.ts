@@ -112,6 +112,10 @@ export const SHARED_TOOL_NAMES: readonly string[] = Object.freeze(Object.keys(SH
 // agent configuration, not a difference in the shareable toolbox. These are the
 // ONLY core tools the server marks sessionBound.
 //
+// R3: agentManage/agentResult are unconditional and available to every agent
+// (primary and subagent alike), so they sit with the record tools before
+// agentDelegate.
+//
 // N4 actionRequest is deliberately NOT in this descriptor list: whether it is
 // registered depends on host configuration (an owner answerer) that
 // `describeHarness` cannot see, and a static projection must not promise a tool a
@@ -128,7 +132,9 @@ export const CORE_TOOL_NAMES = [
     'todoManage',
     'profileManage',
     'chapterManage',
-    'locationManage'
+    'locationManage',
+    'agentManage',
+    'agentResult'
 ] as const;
 
 // Package presets that are declared on every request (R18). Their metadata lives

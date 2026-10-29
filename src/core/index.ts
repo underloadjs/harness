@@ -19,6 +19,8 @@
 //   coreToolMetadata()/agentDelegateMetadata() — the CORE tools' declarative half
 //                  (name, description, tags, schema). The runtime registration in
 //                  ../harness.ts and the server catalogue both read this copy.
+//                  Includes the agentManage/agentResult inspection pair and their
+//                  preview/page bounds.
 //   MAX_DISCOVERY_MATCHES — the discovery cap (R7) the toolRequest schema
 //                  advertises and searchTools enforces.
 //   boundToolResult()/MODEL_TOOL_RESULT_BUDGET_BYTES — the model-facing 64 KiB
@@ -101,6 +103,15 @@ export {
     TOOL_CREATE_METADATA,
     TOOL_CREATE_NAME,
     AGENT_DELEGATE_NAME,
+    AGENT_MANAGE_METADATA,
+    AGENT_MANAGE_NAME,
+    AGENT_MANAGE_LIST_PER_AGENT,
+    AGENT_MANAGE_PREVIEW_CHARS,
+    AGENT_RESULT_METADATA,
+    AGENT_RESULT_NAME,
+    AGENT_RESULT_PAGE_CHARS,
+    AGENT_RESULT_PAGE_MAX_CHARS,
+    AGENT_RESULT_RETENTION,
     ACTION_REQUEST_METADATA,
     ACTION_REQUEST_NAME,
     THREAD_FORK_METADATA,
@@ -152,7 +163,8 @@ export {
     normalizeBranchLabel,
     normalizeForkAgentOptions,
     pruneBranchRecords,
-    quotedBranchSystemInstruction
+    quotedBranchSystemInstruction,
+    reserveBranchSequence
 } from './branch';
 export type {
     AgentBranchKind,

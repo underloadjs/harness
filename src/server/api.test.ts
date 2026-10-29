@@ -50,6 +50,8 @@ const CORE_TOOL_NAMES = [
     'toolCreate',
     'todoManage',
     ...RECORD_TOOL_NAMES,
+    'agentManage',
+    'agentResult',
     'agentDelegate',
     // N4: conditional harness-owned tools, appended after agentDelegate in the
     // global catalogue. They are sessionBound and answer 404 in a session whose
@@ -247,6 +249,8 @@ describe('canonical bootstrap document', () => {
                 'toolCreate',
                 'todoManage',
                 ...RECORD_TOOL_NAMES,
+                'agentManage',
+                'agentResult',
                 'agentDelegate',
                 'threadFork'
             ],
@@ -269,7 +273,7 @@ describe('canonical bootstrap document', () => {
             subagents: [],
             agents: ['demo'],
             tools: ['timeNow'],
-            coreTools: ['toolRequest', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES, 'threadFork'],
+            coreTools: ['toolRequest', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES, 'agentManage', 'agentResult', 'threadFork'],
             builtin: true,
             editable: true
         });
@@ -336,7 +340,14 @@ describe('preset descriptor tool metadata', () => {
     // agentDelegate; the two examples do not.
     const REAL = ['instruct', 'research', 'workspace', 'reviewer', 'planner'] as const;
     const FILES = ['fileRead', 'fileWrite', 'fileEdit', 'fileGlob'];
-    const CORE_BASE = ['toolRequest', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES];
+    const CORE_BASE = [
+        'toolRequest',
+        'toolCreate',
+        'todoManage',
+        ...RECORD_TOOL_NAMES,
+        'agentManage',
+        'agentResult'
+    ];
 
     const CONFIGURED_PRESET_TOOLS = {
         instruct: [...TOOLBOX, 'webSearch'],
@@ -1108,6 +1119,8 @@ describe('all-tools manual execution', () => {
                 'toolCreate',
                 'todoManage',
                 ...RECORD_TOOL_NAMES,
+                'agentManage',
+                'agentResult',
                 'agentDelegate',
                 'actionRequest',
                 'threadFork'
@@ -2126,6 +2139,8 @@ describe('harness registry over HTTP', () => {
                 'toolCreate',
                 'todoManage',
                 ...RECORD_TOOL_NAMES,
+                'agentManage',
+                'agentResult',
                 'agentDelegate',
                 'threadFork'
             ],
@@ -2413,6 +2428,8 @@ describe('harness registry over HTTP', () => {
                 'toolCreate',
                 'todoManage',
                 ...RECORD_TOOL_NAMES,
+                'agentManage',
+                'agentResult',
                 'agentDelegate',
                 'threadFork'
             ],
@@ -2560,6 +2577,8 @@ describe('harness registry over HTTP', () => {
             'toolCreate',
             'todoManage',
             ...RECORD_TOOL_NAMES,
+            'agentManage',
+            'agentResult',
             'threadFork'
         ]);
 

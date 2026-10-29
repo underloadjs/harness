@@ -178,19 +178,22 @@ it('paints the single in-field action for every state and never renders old cont
 
     const composer = byClass('.composer', 'form');
     const field = byClass('.composer-field', 'div');
-    const input = byClass('.composer-input', 'textarea');
+    const input = byClass('.composer-input', 'div');
     const action = byClass('.composer-action', 'button');
 
-    // R9/R2: ONE row by default (autoGrow owns the inline height from here on), with
-    // a real accessible name rather than relying on the placeholder. The compact UI
-    // deliberately carries NO placeholder: it is not a label, it disappears on the
-    // first keystroke, and its keyboard hints were guidance the composer does not need.
-    expect(input.rows).toBe(1);
+    // R9/R2/T5: ONE-row contentEditable field (autoGrow owns the inline height from
+    // here on), with real textbox semantics and an accessible name rather than
+    // relying on the placeholder. The compact UI deliberately carries NO placeholder:
+    // it is not a label, it disappears on the first keystroke, and its keyboard hints
+    // were guidance the composer does not need.
+    expect(input.getAttribute('contenteditable')).toBe('true');
+    expect(input.getAttribute('role')).toBe('textbox');
+    expect(input.getAttribute('aria-multiline')).toBe('true');
     expect(input.getAttribute('aria-label')).toBe('Task message');
     expect(input.getAttribute('placeholder')).toBeNull();
 
     // R10: the action is a child of the field wrapper; the wrapper is wrapped in
-    // the composer BODY column so the attachment strip can sit above it. T5 adds
+    // the composer BODY column (the attachment error line sits above it). T5 adds
     // exactly one accessory (the file chooser) and its hidden input: there is still
     // no sibling action column and no Run/Stop/Reset trio.
     expect(input.parentElement).toBe(field);

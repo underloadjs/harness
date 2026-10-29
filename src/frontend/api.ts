@@ -32,6 +32,7 @@
 
 import { isTrustedRuntimeOrigin } from '../shared/origin';
 import type { HarnessActionChoice, HarnessAttachment } from '../types';
+import type { HarnessTurnReference } from './ui/references';
 import type {
     AgentDescriptor,
     CreateHarnessRequest,
@@ -464,16 +465,33 @@ export type EnqueueTaskResult = {
 // draft has none, so a text-only submit stays byte-identical to the pre-attachment
 // contract. The server validates the same array with shared/attachments.ts; this
 // client passes records the composer already built through that validator.
+//
+// `references` (T5 R2) is the agreed optional array of EXACT block bindings
+// `{ turnId, threadId?, label }`; `undefined` threadId means the turn's root
+// block. It is omitted when empty, so a plain typed `#LABEL` (which the server
+// resolves to the latest matching turn) keeps the old body shape.
 export const enqueueTask = async (
     id: string,
     input: string,
-    attachments?: readonly HarnessAttachment[]
+    attachments?: readonly HarnessAttachment[],
+    references?: readonly HarnessTurnReference[]
 ): Promise<EnqueueTaskResult> => {
+    const body: Record<string, unknown> = { input };
+
+    if (attachments !== undefined && attachments.length > 0) body.attachments = attachments;
+    if (references !== undefined && references.length > 0) {
+        // Copy every entry to a plain wire object: undefined `threadId` is omitted
+        // (the root signal) and no draft-only field can leak into the request.
+        body.references = references.map((reference) => ({
+            turnId: reference.turnId,
+            ...(reference.threadId === undefined ? {} : { threadId: reference.threadId }),
+            label: reference.label
+        }));
+    }
+
     return request<EnqueueTaskResult>(`/sessions/${encodeURIComponent(id)}/tasks`, {
         method: 'POST',
-        body: JSON.stringify(
-            attachments === undefined || attachments.length === 0 ? { input } : { input, attachments }
-        )
+        body: JSON.stringify(body)
     });
 };
 
