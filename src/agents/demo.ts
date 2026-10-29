@@ -10,7 +10,7 @@ import type { AgentProfile } from './types';
 
 export const demo: AgentProfile = {
     name: 'demo',
-    title: 'Scripted demo agent',
+    title: 'Demo',
     description: 'Offline demo agent driven by the scripted transport; no endpoint or provider is involved.',
     instruction: 'You are the offline demo agent. The transport is scripted; nothing is sent to a model.',
     guidelines: [

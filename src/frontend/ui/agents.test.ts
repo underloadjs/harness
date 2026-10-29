@@ -76,6 +76,26 @@ describe('createAgentRow', () => {
         expect(removeButtons(element)[0].title).toBe('A harness needs at least one agent.');
     });
 
+    it('resolves the primary TITLE in the promotion tooltip, never the slug', () => {
+        const { element } = mount({ members: ['instruct', 'summarizer'], primary: 'instruct' });
+
+        const buttons = mainButtons(element);
+        expect(buttons[1].title).toBe('Make Summarizer the primary agent; Instruct becomes a subagent.');
+        // The slug never appears: only the two one-word titles do (F4/R3).
+        expect(buttons[1].title).not.toContain('summarizer');
+        expect(buttons[1].title).not.toContain('instruct');
+    });
+
+    it('labels an unknown member neutrally instead of exposing its slug', () => {
+        const { element } = mount({ members: ['ghost'], primary: 'ghost' });
+
+        // F4/R3: a member without preset details reads a neutral word; the slug is
+        // still the tile's `data-agent` (internal identity).
+        expect(element.querySelector<HTMLElement>('.agent-tile-name')?.textContent).toBe('Agent');
+        expect(element.querySelector<HTMLElement>('.agent-tile')?.dataset.agent).toBe('ghost');
+        expect(element.textContent).not.toContain('ghost');
+    });
+
     it('promotes a secondary through onSelectPrimary and ignores a click on the primary', () => {
         const { element, options } = mount({ members: ['instruct', 'summarizer'] });
 
@@ -100,6 +120,14 @@ describe('createAgentRow', () => {
 
         const options_ = [...element.querySelectorAll<HTMLElement>('.agent-option')];
         expect(options_.map((option) => option.dataset.agent)).toEqual(['instruct', 'summarizer']);
+        // R3/R5: ONE visible label per preset (the single-word display title). The
+        // slug stays on `data-agent` for the callback and is never rendered text.
+        expect(options_.map((option) => option.querySelector('.agent-option-title')?.textContent)).toEqual([
+            'Instruct',
+            'Summarizer'
+        ]);
+        expect(element.querySelector('.agent-option-name')).toBeNull();
+        expect(options_[1].textContent).not.toContain('summarizer');
         // A member remains visible so the team is understandable, but cannot be added twice.
         expect(options_[0].dataset.state).toBe('member');
         expect(options_[0].querySelector<HTMLButtonElement>('.agent-option-add')?.disabled).toBe(true);
@@ -118,6 +146,21 @@ describe('createAgentRow', () => {
         options_[1].querySelector<HTMLButtonElement>('.agent-option-add')?.click();
         expect(options.onAdd).toHaveBeenCalledWith('summarizer');
         expect(picker?.hidden).toBe(true);
+    });
+
+    it('never renders a raw id when a preset descriptor has no title', () => {
+        const { element } = mount({
+            agents: [
+                { name: 'mystery', title: '', description: 'No title.', instruction: '', guidelines: [] }
+            ]
+        });
+
+        element.querySelector<HTMLButtonElement>('.agent-add')?.click();
+        const option = element.querySelector<HTMLElement>('.agent-option[data-agent="mystery"]');
+
+        // R3: a missing display title falls back to a neutral word, not the slug.
+        expect(option?.querySelector('.agent-option-title')?.textContent).toBe('Agent');
+        expect(option?.textContent).not.toContain('mystery');
     });
 
     it('reports a removal, including the primary tile', () => {
@@ -155,11 +198,14 @@ describe('createAgentRow', () => {
         ]);
     });
 
-    it('renders a fallback title for a member the preset library does not know', () => {
+    it('renders a neutral fallback title for a member the preset library does not know', () => {
         const { element } = mount({ members: ['instruct', 'legacy-helper'] });
 
         const tile = element.querySelector<HTMLElement>('.agent-tile[data-agent="legacy-helper"]');
-        expect(tile?.querySelector('.agent-tile-name')?.textContent).toBe('legacy-helper');
+        // F4/R3: an unknown member reads a neutral word; the slug stays internal
+        // (`data-agent`) and is never visible text.
+        expect(tile?.querySelector('.agent-tile-name')?.textContent).toBe('Agent');
+        expect(tile?.textContent).not.toContain('legacy-helper');
         expect(element.querySelectorAll('.agent-option')).toHaveLength(agents.length);
     });
 });
@@ -453,20 +499,20 @@ describe('agent card deck', () => {
 
         // The strips are real buttons carrying the agent's human name, so an edge
         // identifies its agent. The front card offers no strip (nothing to reveal).
-        // `workspace` is not in this file's preset fixture, so its fallback title is
-        // the slug (detailsOf), exactly like a member from an older session.
+        // `workspace` is not in this file's preset fixture, so it reads the neutral
+        // fallback title (F4/R3) — never the slug.
         expect(
             handleList(element).map((handle) => [handle.dataset.agent, handle.hidden, handle.textContent, handle.getAttribute('aria-label')])
         ).toEqual([
             ['instruct', true, 'Instruct', 'View Instruct'],
             ['summarizer', false, 'Summarizer', 'View Summarizer'],
-            ['workspace', false, 'workspace', 'View workspace']
+            ['workspace', false, 'Agent', 'View Agent']
         ]);
         expect(handleList(element).map((handle) => handle.type)).toEqual(['button', 'button', 'button']);
         expect(handleList(element).map((handle) => handle.title)).toEqual([
             'View Instruct',
             'View Summarizer',
-            'View workspace'
+            'View Agent'
         ]);
         // A strip is a pure view control: it contains neither the remove button nor
         // the native model select, so a mis-click cannot delete or open one.

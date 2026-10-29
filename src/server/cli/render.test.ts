@@ -131,7 +131,7 @@ describe('createRenderer', () => {
 
         expect(out).toEqual([
             '← fileRead · 300ms\n  ok\n',
-            '  pending · webSearch 900ms, commandRun 1m 05s\n'
+            '  pending · webSearch 900ms, commandRun 1m05s\n'
         ]);
     });
 

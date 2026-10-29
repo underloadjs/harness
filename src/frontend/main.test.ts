@@ -390,7 +390,9 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
 
     const tile = byClass('.tile', 'article');
     expect(tile.dataset.state).toBe('done');
-    expect(tile.querySelector('.tile-index')?.textContent).toBe('#1');
+    // R3: the header carries no `#ordinal` and no raw agent id; it is the metadata
+    // cluster only (the agent label lives in the section header).
+    expect(tile.querySelector('.tile-index')).toBeNull();
     expect(tile.querySelector('.tile-status-text')?.textContent).toBe('done');
     expect(tile.querySelector('.turn-prompt')?.textContent).toBe('say hi\n');
     expect(tile.querySelector('.agent-text')?.innerHTML).toBe('<h1>Hi</h1>\n<p>a <strong>b</strong></p>\n');
@@ -833,7 +835,7 @@ it('creates a harness from preset agents with an initial primary', async () => {
     byClass('.create-agent-add', 'button').click();
 
     expect([...document.querySelectorAll('.create-chip-name')].map((chip) => chip.textContent)).toEqual([
-        'summarizer'
+        'Summarizer'
     ]);
 
     byClass('.create-form', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));

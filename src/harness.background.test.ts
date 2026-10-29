@@ -993,6 +993,297 @@ describe('delegation under background tools', () => {
 });
 
 // ---------------------------------------------------------------------------
+// T2/R1 — delegated answer extraction
+// ---------------------------------------------------------------------------
+//
+// A delegated child can show a substantive answer and then, after a pending
+// completion re-prompts it, take a final turn that is a NORMAL `stop` with
+// whitespace-only text ("\n"). The delegate result must be the last substantive
+// tool-free answer of THAT run. The regression is exercised through real pending
+// work (a gated tool), never by assuming a particular turn index alone: the
+// child answers while the call is in flight, which is exactly the state the
+// reported session was in.
+
+describe('delegated answer extraction', () => {
+    // A child whose call stays pending, then answers for real, then stops blank.
+    const gatedChild = (gate: Deferred<string>, facts: string, final: HarnessStreamEvent[]) =>
+        agent({
+            model: 'test/child',
+            stream: streamFrom((turn) => {
+                if (turn === 0) return calls(call('s1', 'slow', '{"value":"x"}'));
+                if (turn === 1) return answer(facts);
+                return final;
+            }, [])
+        });
+
+    const parent = () =>
+        agent({
+            model: 'test/parent',
+            stream: streamFrom((turn) =>
+                turn === 0
+                    ? calls(
+                          call(
+                              'd1',
+                              'agentDelegate',
+                              '{"agent":"researcher","input":"find facts"}'
+                          )
+                      )
+                    : answer('parent-done'),
+                []
+            )
+        });
+
+    it('returns the last substantive child answer when the final turn is whitespace-only', async () => {
+        const slowGate = deferred<string>();
+        const events: HarnessEvent[] = [];
+        const researcher = gatedChild(slowGate, 'the researched facts', answer('\n'));
+
+        const writer = harness({
+            agents: { writer: parent(), researcher },
+            tools: { slow: gatedTool('slow', slowGate) },
+            primary: 'writer',
+            subagents: ['researcher'],
+            presets: false,
+            report: {
+                progress: (event) => {
+                    events.push(event);
+                }
+            }
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+
+        // The child is paused on a REAL answer while its own call is pending:
+        // this is the visible answer the reported session stopped on.
+        expect(researcher.messages).toEqual([
+            { role: 'user', content: 'find facts' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 's1', name: 'slow', arguments: '{"value":"x"}' }]
+            },
+            { role: 'assistant', content: 'the researched facts' }
+        ]);
+        expect(state.status).toBe('pending');
+
+        slowGate.resolve('slow-done');
+        await flush();
+
+        expect(state.status).toBe('resolved');
+        expect(state.value?.content).toBe('parent-done');
+
+        // Only the answer crosses back — the substantive one, not the blank
+        // terminal turn.
+        expect(toolMessages(writer.agent.messages)).toEqual([
+            {
+                toolCallId: 'd1',
+                name: 'agentDelegate',
+                content: '{"agent":"researcher","content":"the researched facts"}'
+            }
+        ]);
+
+        // The child's own transcript keeps the literal final turn: extraction
+        // changes the DELEGATE RESULT, never history.
+        expect(researcher.messages.at(-1)).toEqual({ role: 'assistant', content: '\n' });
+
+        // Streaming is untouched: the substantive text was emitted as a delta,
+        // and the blank terminal turn still streamed its own text.
+        expect(
+            events
+                .filter(
+                    (event): event is Extract<HarnessEvent, { type: 'text' }> =>
+                        event.type === 'text' && event.agent === 'researcher'
+                )
+                .map((event) => event.delta)
+        ).toEqual(['the researched facts', '\n']);
+
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('lets a genuinely later non-blank answer win', async () => {
+        const slowGate = deferred<string>();
+        const researcher = gatedChild(slowGate, 'the researched facts', answer('final facts'));
+
+        const writer = harness({
+            agents: { writer: parent(), researcher },
+            tools: { slow: gatedTool('slow', slowGate) },
+            primary: 'writer',
+            subagents: ['researcher'],
+            presets: false
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+        slowGate.resolve('slow-done');
+        await flush();
+
+        expect(state.value?.content).toBe('parent-done');
+        expect(toolMessages(writer.agent.messages)).toEqual([
+            {
+                toolCallId: 'd1',
+                name: 'agentDelegate',
+                content: '{"agent":"researcher","content":"final facts"}'
+            }
+        ]);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('extracts the answer for a manual executeTool delegation too', async () => {
+        const slowGate = deferred<string>();
+        const researcher = gatedChild(slowGate, 'manual facts', answer('\n'));
+
+        const writer = harness({
+            agents: {
+                lead: agent({ model: 'test/lead', stream: streamFrom(() => answer('lead'), []) }),
+                researcher
+            },
+            primary: 'lead',
+            subagents: ['researcher'],
+            tools: { slow: gatedTool('slow', slowGate) },
+            presets: false
+        });
+
+        const state = probe(
+            writer.executeTool('agentDelegate', { agent: 'researcher', input: 'find facts' })
+        );
+        await flush();
+        expect(state.status).toBe('pending');
+
+        slowGate.resolve('slow-done');
+        await flush();
+
+        expect(state.status).toBe('resolved');
+        expect(state.value).toEqual({ agent: 'researcher', content: 'manual facts' });
+
+        // A manual delegation is still not a conversation turn on the caller.
+        expect(writer.agent.messages).toEqual([]);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('does not rescue a length-truncated final turn', async () => {
+        const slowGate = deferred<string>();
+        const truncated: HarnessStreamEvent[] = [
+            { type: 'text', delta: '\n' },
+            { type: 'done', stopReason: 'length', toolCalls: [] }
+        ];
+        const researcher = gatedChild(slowGate, 'the researched facts', truncated);
+
+        const writer = harness({
+            agents: {
+                lead: agent({ model: 'test/lead', stream: streamFrom(() => answer('lead'), []) }),
+                researcher
+            },
+            primary: 'lead',
+            subagents: ['researcher'],
+            tools: { slow: gatedTool('slow', slowGate) },
+            presets: false
+        });
+
+        const state = probe(
+            writer.executeTool('agentDelegate', { agent: 'researcher', input: 'find facts' })
+        );
+        await flush();
+        slowGate.resolve('slow-done');
+        await flush();
+
+        // A truncation is a fact about the final turn, not a blank answer to
+        // repair: the earlier text is NOT substituted.
+        expect(state.value).toEqual({ agent: 'researcher', content: '\n' });
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('leaves an ordinary ctx.run return untouched', async () => {
+        const slowGate = deferred<string>();
+        const researcher = gatedChild(slowGate, 'helper facts', answer('\n'));
+
+        // ctx.run is the generic sibling-agent call, not delegation: it must keep
+        // the literal final turn (T2/R2 — no broad semantic change).
+        const ask = tool({
+            description: 'Ask the researcher and return its raw answer.',
+            tags: ['test'],
+            visibility: 'core',
+            execute: async ({ run }) => (await run!('researcher', 'find facts')).content
+        });
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/parent',
+                    stream: streamFrom(
+                        (turn) => (turn === 0 ? calls(call('q1', 'ask', '{}')) : answer('parent-done')),
+                        []
+                    )
+                }),
+                researcher
+            },
+            tools: { slow: gatedTool('slow', slowGate), ask },
+            primary: 'writer',
+            subagents: ['researcher'],
+            presets: false
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+        slowGate.resolve('slow-done');
+        await flush();
+
+        expect(state.value?.content).toBe('parent-done');
+        expect(toolMessages(writer.agent.messages)).toEqual([
+            { toolCallId: 'q1', name: 'ask', content: '\n' }
+        ]);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    it('does not carry an answer into a later run of the same agent', async () => {
+        const slowGate = deferred<string>();
+
+        // Turns 0-2 belong to the first delegated run, turn 3 to the second. The
+        // second run never became substantive, so it must stay genuinely blank
+        // even though the SAME agent answered in the previous run.
+        const seen: SeenRequest[] = [];
+        const researcher = agent({
+            model: 'test/child',
+            stream: streamFrom((turn) => {
+                if (turn === 0) return calls(call('s1', 'slow', '{"value":"x"}'));
+                if (turn === 1) return answer('first facts');
+                return answer('\n');
+            }, seen)
+        });
+
+        const writer = harness({
+            agents: {
+                lead: agent({ model: 'test/lead', stream: streamFrom(() => answer('lead'), []) }),
+                researcher
+            },
+            primary: 'lead',
+            subagents: ['researcher'],
+            tools: { slow: gatedTool('slow', slowGate) },
+            presets: false
+        });
+
+        const first = probe(
+            writer.executeTool('agentDelegate', { agent: 'researcher', input: 'find facts' })
+        );
+        await flush();
+        slowGate.resolve('slow-done');
+        await flush();
+
+        expect(first.value).toEqual({ agent: 'researcher', content: 'first facts' });
+
+        const second = probe(
+            writer.executeTool('agentDelegate', { agent: 'researcher', input: 'find more' })
+        );
+        await flush();
+
+        expect(second.status).toBe('resolved');
+        expect(second.value).toEqual({ agent: 'researcher', content: '\n' });
+        expect(seen).toHaveLength(4);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+});
+
+// ---------------------------------------------------------------------------
 // R4 — targeted cancellation
 // ---------------------------------------------------------------------------
 

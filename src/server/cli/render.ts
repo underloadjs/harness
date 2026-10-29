@@ -50,7 +50,8 @@ const durationOf = (event: HarnessEvent): number | undefined => {
 };
 
 // Mirror of `formatDuration` in src/frontend/ui/time.ts (tests assert exact text):
-// <1s in whole ms, <1min in tenths, otherwise minutes plus zero-padded seconds.
+// <1s in whole ms, <1min in tenths, otherwise minutes plus zero-padded seconds with
+// no separator (R4: `4m12s`), so the terminal and the UI agree.
 const formatMs = (milliseconds: number): string => {
     const rounded = Math.round(milliseconds);
     if (rounded < 1000) return `${rounded}ms`;
@@ -58,7 +59,7 @@ const formatMs = (milliseconds: number): string => {
     if (rounded < 60_000) return `${(rounded / 1000).toFixed(1)}s`;
 
     const seconds = Math.floor(rounded / 1000);
-    return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, '0')}s`;
+    return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`;
 };
 
 // `name 1.2s, webSearch 900ms` — deterministic order: the server's array order.

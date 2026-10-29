@@ -11,7 +11,7 @@ import type { AgentProfile } from './types';
 
 export const flaky: AgentProfile = {
     name: 'flaky',
-    title: 'Recoverable failures agent',
+    title: 'Flaky',
     description: 'Example agent that retries a deliberately unreliable tool, showing that a tool error is readable data rather than the end of the run.',
     instruction: 'You are testing tool reliability.',
     guidelines: [

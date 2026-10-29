@@ -18,10 +18,13 @@ describe('formatDuration', () => {
         expect(formatDuration(59_949)).toBe('59.9s');
     });
 
-    it('renders minutes plus zero-padded seconds from one minute up', () => {
-        expect(formatDuration(60_000)).toBe('1m 00s');
-        expect(formatDuration(65_400)).toBe('1m 05s');
-        expect(formatDuration(3_600_000)).toBe('60m 00s');
+    it('renders minutes plus zero-padded seconds from one minute up, with no gap', () => {
+        // R4: compact `4m12s` — no space between the minute and second parts, and
+        // the seconds keep their zero padding (and sub-minute tenths) intact.
+        expect(formatDuration(60_000)).toBe('1m00s');
+        expect(formatDuration(65_400)).toBe('1m05s');
+        expect(formatDuration(252_000)).toBe('4m12s');
+        expect(formatDuration(3_600_000)).toBe('60m00s');
     });
 
     it('returns an empty label for invalid or negative spans', () => {

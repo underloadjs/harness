@@ -9,6 +9,9 @@
 //     re-entering a running agent is refused (ctx.run cycles included);
 //   - each agent keeps its own seeded instructions and transcript; only the answer
 //     crosses back;
+//   - a delegated child's result is the last substantive tool-free answer of THAT
+//     run when its final normal turn is whitespace-only (the literal transcript
+//     and `done` stay unchanged); a truly blank child stays blank;
 //   - primary/subagent names are validated at construction, so a typo fails fast.
 
 import { describe, expect, it } from 'vitest';
@@ -248,6 +251,71 @@ describe('agentDelegate', () => {
         expect(content(entry.messages[2])).toBe(
             'Tool "recurse" failed: Agent "writer" is already running; it cannot be re-entered (delegation cycle).'
         );
+    });
+
+    // T2/R1: a tool-call turn's visible text is a PREAMBLE, not an answer. A blank
+    // final turn must never be "repaired" with it.
+    it('does not rescue text from a tool-call preamble', async () => {
+        const probe = tool({
+            description: 'Probe the catalogue.',
+            tags: ['test'],
+            visibility: 'core',
+            execute: () => 'probed'
+        });
+
+        const researcher = brain(
+            scripted([
+                [
+                    { type: 'text', delta: 'checking the catalogue' },
+                    {
+                        type: 'done',
+                        stopReason: 'tool_calls',
+                        toolCalls: [{ id: 'r1', name: 'probe', arguments: '{}' }]
+                    }
+                ],
+                answer('\n')
+            ])
+        );
+
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"find facts"}'),
+                answer('final')
+            ])
+        );
+
+        const writer = harness({
+            agents: { writer: writerAgent, researcher },
+            tools: { probe },
+            presets: false
+        });
+
+        await writer('go');
+
+        // The literal blank terminal turn crosses back: the preamble is not an
+        // answer, so there is nothing substantive to fall back to.
+        expect(content(writerAgent.messages[2])).toBe('{"agent":"researcher","content":"\\n"}');
+    });
+
+    // T2/R1: no substantive text anywhere in the run => keep the exact blank result
+    // rather than inventing an answer.
+    it('keeps a genuinely blank answer when nothing substantive was said', async () => {
+        const researcher = brain(scripted([answer('\n')]));
+
+        const writerAgent = brain(
+            scripted([
+                callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"find facts"}'),
+                answer('final')
+            ])
+        );
+
+        const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
+        await writer('go');
+
+        // The child's own transcript keeps the blank turn...
+        expect(content(researcher.messages.at(-1))).toBe('\n');
+        // ...and the delegate returns it verbatim.
+        expect(content(writerAgent.messages[2])).toBe('{"agent":"researcher","content":"\\n"}');
     });
 
     // R12: reset() is a session restart, so it must clear EVERY agent's

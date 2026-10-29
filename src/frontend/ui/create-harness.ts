@@ -43,6 +43,13 @@ const el = <K extends keyof HTMLElementTagNameMap>(
     return node;
 };
 
+// The ONE visible label for a preset agent: its single-word display title (R5).
+// R3: the slug (`AgentDescriptor.name`) is an internal id — it is the <option>
+// value / chip `data-agent` and is never rendered. A descriptor with no title falls
+// back to a neutral word so an id can never leak into the form.
+const displayTitleOf = (agent: AgentDescriptor): string =>
+    agent.title.trim().length > 0 ? agent.title : 'Agent';
+
 // The server's name rule (src/harnesses/registry.ts): a letter first, then letters,
 // digits, underscores or dashes, at most 64 characters. Mirrored so the user gets
 // an immediate explanation instead of a round trip.
@@ -128,6 +135,14 @@ export const createCreateHarnessPanel = (options: CreateHarnessOptions): CreateH
     const chosenNames = (): string[] =>
         secondaries.filter((name) => name !== primarySelect.value && name.length > 0);
 
+    // Title for a chosen member. Looks the descriptor up on every render (the
+    // catalogue is a live accessor); a name the server no longer advertises still
+    // reads a neutral word rather than its slug (R3).
+    const titleFor = (name: string): string => {
+        const agent = options.agents().find((candidate) => candidate.name === name);
+        return agent === undefined ? 'Agent' : displayTitleOf(agent);
+    };
+
     const renderChosen = (): void => {
         chosen.replaceChildren();
 
@@ -138,12 +153,16 @@ export const createCreateHarnessPanel = (options: CreateHarnessOptions): CreateH
         }
 
         for (const name of names) {
+            const title = titleFor(name);
             const chip = el('span', 'create-chip');
-            chip.append(el('span', 'create-chip-name', name));
+            // The slug stays on the chip as data for tests/automation; the visible
+            // text is the title only (R3).
+            chip.dataset.agent = name;
+            chip.append(el('span', 'create-chip-name', title));
 
             const remove = el('button', 'chip-remove', '×');
             remove.type = 'button';
-            remove.setAttribute('aria-label', `Remove ${name} from the new harness`);
+            remove.setAttribute('aria-label', `Remove ${title} from the new harness`);
             remove.addEventListener('click', () => {
                 secondaries = secondaries.filter((candidate) => candidate !== name);
                 renderChosen();
@@ -178,7 +197,9 @@ export const createCreateHarnessPanel = (options: CreateHarnessOptions): CreateH
         addAgentButton.disabled = false;
 
         for (const agent of available) {
-            const option = el('option', undefined, `${agent.name} — ${agent.title}`);
+            // R3/F4: the option text is the ONE-WORD display title; the slug stays the
+            // option's value (what the form submits) and is never rendered.
+            const option = el('option', undefined, displayTitleOf(agent));
             option.value = agent.name;
             secondarySelect.append(option);
         }
@@ -189,7 +210,7 @@ export const createCreateHarnessPanel = (options: CreateHarnessOptions): CreateH
         primarySelect.replaceChildren();
 
         for (const agent of options.agents()) {
-            const option = el('option', undefined, `${agent.name} — ${agent.title}`);
+            const option = el('option', undefined, displayTitleOf(agent));
             option.value = agent.name;
             primarySelect.append(option);
         }

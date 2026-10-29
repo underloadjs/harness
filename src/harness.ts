@@ -820,7 +820,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 const message = await run(target, parameters.input);
 
                 // Only the answer crosses back: the subagent keeps its own
-                // transcript and instructions.
+                // transcript and instructions. `message` is the run's ANSWER, not
+                // necessarily its literal final turn: when the child's last turn is
+                // a normal stop with blank text, the harness resolves the last
+                // substantive tool-free response of that same run (T2/R1). The child's
+                // transcript and `done` events stay literal.
                 return { agent: target, content: message.content };
             }
         });
@@ -935,7 +939,38 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // throws, so the error is parked here and rethrown by the loop: a failing
         // emitter still fails the run, exactly like a synchronous event would.
         deliveryError?: unknown;
+        // Delegation answer extraction (T2/R1), opted into by the two agentDelegate
+        // call sites only (see RunInternals). When true, the run also records the
+        // last substantive tool-free response below and may resolve to it instead
+        // of a whitespace-only terminal turn.
+        delegateAnswer: boolean;
+        // The latest substantive response THIS run produced: no tool calls, a
+        // normal stop, and non-blank text. Captured on the run itself so the
+        // fallback never rescans agent history after the run returns — the agent
+        // queue releases before the delegate promise resolves (runAgent's finally
+        // releases the actor), so a queued follow-up may already be appending to
+        // the same transcript by the time a caller looks. Undefined until such a
+        // response occurs; reset naturally with each new RunState.
+        answer?: HarnessAssistantMessage;
     };
+
+    // Internal run knobs. Deliberately NOT part of the public HarnessRunOptions:
+    // a host call and an arbitrary ctx.run keep their exact historical semantics,
+    // and only the built-in delegation paths opt in.
+    type RunInternals = {
+        // T2/R1: when this run's FINAL turn is a normal `stop` with whitespace-only,
+        // tool-free text, resolve to `RunState.answer` (the last substantive
+        // tool-free response of this same run) instead of that blank turn. A
+        // genuinely later non-blank answer, a run that never said anything
+        // substantive, a `length` stop, and a failure/abort all keep their
+        // existing result.
+        delegateAnswer?: boolean;
+    };
+
+    // The delegate answer policy (T2/R1). One shared instance so the model path
+    // (launchToolCall) and the manual path (executeTool) opt into identical
+    // semantics.
+    const DELEGATE_ANSWER: RunInternals = { delegateAnswer: true };
 
     // Every live run, so a scheduler wake can mark the right runs dirty. Runs are
     // removed in runAgent's finally.
@@ -1571,7 +1606,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         // delegation also cancels the work it started. `call.id`
                         // labels the child's events with the tool call that spawned
                         // it (T3 UI threads); the runtime guards above are unchanged.
-                        return runAgent(target, input, signal, run, call.id);
+                        //
+                        // T2/R1: only the built-in agentDelegate opts into answer
+                        // extraction (a whitespace-only final turn resolves to the
+                        // run's last substantive tool-free response). Any other tool
+                        // using ctx.run keeps the literal final-turn return.
+                        return runAgent(
+                            target,
+                            input,
+                            signal,
+                            run,
+                            call.id,
+                            call.name === AGENT_DELEGATE ? DELEGATE_ANSWER : undefined
+                        );
                     }
                 };
 
@@ -1747,6 +1794,34 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
+    // Resolve the message a DELEGATED run hands back (T2/R1). Only the exact
+    // reported failure case is rescued: a normal `stop` whose content is
+    // whitespace only, after the same run already produced a substantive
+    // tool-free answer (a pending background completion re-prompts the model,
+    // which then "stops" with a blank turn). Everything else passes through:
+    //   - a later, non-blank turn wins (its content is the answer);
+    //   - a `length` stop is a truncation fact, not a blank answer, so it is
+    //     never replaced (R2);
+    //   - a tool-call turn is a preamble, never a candidate (recorded below);
+    //   - a run with no substantive response keeps its literal result, so a
+    //     genuinely empty answer stays empty (R2);
+    //   - failures and aborts throw before this point, so they never reach it.
+    // The TRANSCRIPT and the terminal `done` event keep the literal final turn:
+    // only the value returned to the delegating caller is resolved, which is what
+    // changes and leaves streaming/transport untouched.
+    const resolveRunAnswer = (
+        run: RunState,
+        message: HarnessAssistantMessage
+    ): HarnessAssistantMessage => {
+        if (!run.delegateAnswer) return message;
+        if (message.stopReason !== 'stop') return message;
+        // Defensive: the terminal path below only calls this for tool-free turns.
+        if (message.toolCalls.length > 0) return message;
+        if (message.content.trim().length > 0) return message;
+
+        return run.answer ?? message;
+    };
+
     // Run one agent until it has answered AND nothing it started is still
     // running. `maxIterations` bounds model turns; exhaustion cancels the pending
     // work before throwing so no orphan task survives a rolled-back run.
@@ -1828,6 +1903,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     await emit(run, { type: 'usage', agent: brain.name, usage: message.usage });
                 }
 
+                // Answer-so-far (T2/R1): record a completed, tool-free, non-blank
+                // response as this run's substantive answer. Recording happens on
+                // the RUN (not in agent history) so the delegate fallback needs no
+                // post-return transcript scan and cannot see a queued follow-up's
+                // turns. `length` responses are excluded: a truncated answer is not
+                // a better answer than the blank terminal turn.
+                if (
+                    run.delegateAnswer &&
+                    message.toolCalls.length === 0 &&
+                    message.stopReason === 'stop' &&
+                    message.content.trim().length > 0
+                ) {
+                    run.answer = message;
+                }
+
                 if (message.toolCalls.length === 0) {
                     const pending = runPending(run);
 
@@ -1863,7 +1953,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // successful answer.
                     throwIfAborted(run);
 
-                    return message;
+                    // T2/R1: a delegated run resolves to its answer, not necessarily
+                    // to this literal final turn — see resolveRunAnswer. The
+                    // transcript and the `done` emitted above stay literal.
+                    return resolveRunAnswer(run, message);
                 }
 
                 // Launch every requested call; they run concurrently. A launch
@@ -1984,7 +2077,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // The parent tool call that spawned this run (T3 UI threads). `ctx.run`
         // and agentDelegate pass their own `call.id`; a host/root invocation passes
         // nothing. It only labels the child's events — it grants no authority.
-        callId?: string
+        callId?: string,
+        // Internal, delegate-only answer extraction (T2/R1). Omitted for host runs
+        // and arbitrary ctx.run calls, which keep their historical return value.
+        internals?: RunInternals
     ): Promise<HarnessAssistantMessage> => {
         const ancestors = parent?.lineage ?? [];
 
@@ -2026,7 +2122,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 aborted: false,
                 iteration: 0,
                 dirty: false,
-                waiters: []
+                waiters: [],
+                // Delegate-only answer extraction (T2/R1). A host run and an
+                // arbitrary ctx.run leave this false, so their returned message is
+                // exactly the model's final turn, as before.
+                delegateAnswer: internals?.delegateAnswer === true
             };
 
             // Invocation identity (T3 UI threads), built ONCE after the actor is
@@ -2357,7 +2457,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     if (!target) {
                         throw new HarnessError(`Agent "${agentName}" is not registered.`);
                     }
-                    return runAgent(target, input);
+                    // T2/R1: a MANUAL agentDelegate call gets the same answer
+                    // extraction as the model path, so a host-triggered delegation
+                    // cannot return a blank terminal turn while the child already
+                    // answered substantively. Other manual ctx.run tools keep the
+                    // literal final-turn return.
+                    return runAgent(
+                        target,
+                        input,
+                        undefined,
+                        undefined,
+                        undefined,
+                        name === AGENT_DELEGATE ? DELEGATE_ANSWER : undefined
+                    );
                 }
             });
         } finally {

@@ -49,6 +49,18 @@ describe('createCreateHarnessPanel', () => {
 
         expect(panel.isOpen()).toBe(true);
         expect(byClass('.create-primary', 'select').value).toBe('instruct');
+        // F4/R3: every option reads the single-word display title; the slug stays the
+        // option VALUE (what the form submits) and is never rendered as text.
+        expect([...byClass('.create-primary', 'select').options].map((option) => option.textContent)).toEqual([
+            'Instruct',
+            'Summarizer',
+            'Workspace'
+        ]);
+        expect(
+            [...byClass('.create-agent-select', 'select').options].map((option) => option.textContent)
+        ).toEqual(['Summarizer', 'Workspace']);
+        expect(byClass('.create-form', 'form').textContent).not.toContain('summarizer');
+        expect(byClass('.create-form', 'form').textContent).not.toContain('workspace');
         expect(document.querySelector('.create-empty')?.textContent).toBe(
             'No additional agents. The harness will have one agent.'
         );
@@ -96,8 +108,15 @@ describe('createCreateHarnessPanel', () => {
         secondary.value = 'summarizer';
         byClass('.create-agent-add', 'button').click();
         expect([...document.querySelectorAll('.create-chip-name')].map((chip) => chip.textContent)).toEqual([
-            'summarizer'
+            'Summarizer'
         ]);
+        // The slug is still carried internally (chip `data-agent`) and the remove
+        // control names the same one-word title (R3/F4).
+        const chip = byClass('.create-chip', 'span');
+        expect(chip.dataset.agent).toBe('summarizer');
+        expect(chip.querySelector('.chip-remove')?.getAttribute('aria-label')).toBe(
+            'Remove Summarizer from the new harness'
+        );
 
         submit();
         await tick();

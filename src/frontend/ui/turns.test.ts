@@ -34,7 +34,10 @@ describe('createTurnBoard', () => {
         expect(turn.state()).toBe('queued');
         expect(turn.element.dataset.state).toBe('queued');
         expect(turn.element.classList.contains('is-expanded')).toBe(true);
-        expect(turn.element.querySelector('.tile-index')?.textContent).toBe('#1');
+        // R3: the header has NO `#ordinal` — the server position is not displayed.
+        expect(turn.element.querySelector('.tile-index')).toBeNull();
+        // R1/F3: the root code is not claimed before an event names the agent.
+        expect(turn.element.querySelector<HTMLElement>('.tile-agent')?.hidden).toBe(true);
         expect(turn.element.querySelector('.tile-status-text')?.textContent).toBe('queued');
         expect(turn.element.querySelector('.tile-select')?.getAttribute('aria-expanded')).toBe('true');
         expect(turn.element.querySelector('.tile-prompt')?.textContent).toBe('Hello world');
@@ -50,6 +53,14 @@ describe('createTurnBoard', () => {
 
         turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
         expect(turn.state()).toBe('streaming');
+
+        // R2/R3: the main block names its agent by the compact code (first + last
+        // letter + occurrence), never by the raw agent id. R1/F3: the code lives in
+        // the COMPACT header, in the same slot a child block uses.
+        expect(turn.element.querySelector('.agent-name')?.textContent).toBe('WR1');
+        expect(turn.element.querySelector<HTMLElement>('.tile-agent')?.textContent).toBe('WR1');
+        expect(turn.element.querySelector<HTMLElement>('.tile-agent')?.hidden).toBe(false);
+        expect(turn.element.textContent).not.toContain('writer');
 
         turn.apply({ type: 'text', agent: 'writer', delta: '# Hi\n\n' });
         turn.apply({ type: 'text', agent: 'writer', delta: 'a **b**' });
@@ -231,8 +242,10 @@ describe('createTurnBoard', () => {
         expect(board.element.contains(empty)).toBe(true);
         expect(turn.element.isConnected).toBe(false);
 
-        // Numbering restarts with the new conversation.
-        expect(board.begin('again').element.querySelector('.tile-index')?.textContent).toBe('#1');
+        // A new conversation starts with a fresh tile that still shows no ordinal.
+        const again = board.begin('again');
+        expect(again.element.querySelector('.tile-index')).toBeNull();
+        expect(board.turns()).toEqual([again]);
     });
 
     it('turns an agent error event into a visible, readable node', () => {
@@ -258,19 +271,20 @@ describe('server turns', () => {
         ...overrides
     });
 
-    it('binds the server id and the 1-based display index onto an optimistic tile', () => {
+    it('binds the server id while keeping the protocol index unrendered', () => {
         const { board } = mount();
         const turn = board.begin('optimistic');
 
         expect(turn.id()).toBeUndefined();
         expect(turn.element.dataset.turnId).toBeUndefined();
 
-        // Server `index` is 0-based; the fourth server turn is displayed "#5".
+        // The server `index` (0-based) is retained for ordering/identity but R3
+        // removed its visible `#position` label from the header.
         turn.bind({ id: 'server-7', index: 4 });
 
         expect(turn.id()).toBe('server-7');
         expect(turn.element.dataset.turnId).toBe('server-7');
-        expect(turn.element.querySelector('.tile-index')?.textContent).toBe('#5');
+        expect(turn.element.querySelector('.tile-index')).toBeNull();
         expect(board.find('server-7')).toBe(turn);
         expect(board.find('other')).toBeUndefined();
     });
@@ -294,7 +308,7 @@ describe('server turns', () => {
         expect(turn.state()).toBe('done');
         expect(turn.id()).toBe('t1');
         expect(turn.element.dataset.state).toBe('done');
-        expect(turn.element.querySelector('.tile-index')?.textContent).toBe('#1');
+        expect(turn.element.querySelector('.tile-index')).toBeNull();
         expect(turn.element.querySelector('.tile-status-text')?.textContent).toBe('done');
         expect(turn.element.querySelector('.agent-text')?.innerHTML).toBe('<p>recorded <strong>prose</strong></p>\n');
         expect(turn.element.querySelector<HTMLElement>('details.tool')?.dataset.state).toBe('ok');
@@ -334,7 +348,9 @@ describe('server turns', () => {
 
         expect(handles.map((handle) => handle.id())).toEqual(['a', 'b']);
         expect(board.turns()).toEqual(handles);
-        expect(tileIndexes(board)).toEqual(['#1', '#2']);
+        // R3: server order is the DOM order; no ordinal text is rendered.
+        expect(turnPrompts(board)).toEqual(['first', 'second']);
+        expect(handles.map((handle) => handle.element.querySelector('.tile-index'))).toEqual([null, null]);
         expect(handles.map((handle) => handle.state())).toEqual(['done', 'error']);
         expect(board.expanded()).toBe(handles[1]);
         expect(handles[0].element.classList.contains('is-expanded')).toBe(false);
@@ -414,9 +430,14 @@ describe('server turns', () => {
     });
 });
 
-// Helper shared by the server-turn cases: reads a tile's index labels.
-const tileIndexes = (board: ReturnType<typeof createTurnBoard>): (string | null)[] =>
-    [...board.element.querySelectorAll<HTMLElement>('.tile-index')].map((node) => node.textContent);
+// Helper shared by the server-turn cases: reads the tiles' prompts in DOM order.
+// It replaced the old `#index` label reader: order is now proven by the rendered
+// rows themselves, because the ordinal is no longer displayed (R3).
+const turnPrompts = (board: ReturnType<typeof createTurnBoard>): string[] =>
+    [...board.element.querySelectorAll<HTMLElement>('.tile')].map((node) => {
+        const prompt = node.querySelector<HTMLElement>('.tile-prompt');
+        return prompt?.textContent ?? '';
+    });
 
 // ---------------------------------------------------------------------------
 // Server queue (R4)
@@ -664,10 +685,8 @@ describe('server queue', () => {
         }), queuedB], { model: 'm1' });
 
         expect(handles).toEqual([active, optimistic]);
-        expect(handles.map((handle) => handle.element.querySelector('.tile-index')?.textContent)).toEqual([
-            '#1',
-            '#2'
-        ]);
+        // Submission order is the rendered row order; the ordinal itself is gone.
+        expect(turnPrompts(board)).toEqual(['first', 'second']);
         expect(board.element.querySelectorAll('.turn-row')).toHaveLength(2);
     });
 
@@ -1114,7 +1133,8 @@ describe('elapsed timing', () => {
 // ---------------------------------------------------------------------------
 //
 // The header prints TWO deliberately different scopes next to the elapsed label:
-// `#1  2m 29s | 150 (140)   [done]`.
+// `2m29s | 150 (140)   [done]` (R3 removed the old `#position` label; R4 is the
+// compact, unspaced duration).
 //   - primary: the LATEST model request's input/context size (provider
 //     `prompt_tokens`, including that request's cached subset);
 //   - bracket: total cached (replayed) input sent across the whole turn.
@@ -1186,7 +1206,7 @@ describe('token tally', () => {
         expect(label?.title).toBe(
             'Latest request context: 150 input tokens · Total cached input sent: 140 tokens'
         );
-        expect(topClasses(turn)).toEqual(['tile-index', 'tile-elapsed', 'tile-tokens', 'tile-status']);
+        expect(topClasses(turn)).toEqual(['tile-elapsed', 'tile-tokens', 'tile-status']);
     });
 
     it('falls back to the cumulative input only when no usage event was recorded', () => {

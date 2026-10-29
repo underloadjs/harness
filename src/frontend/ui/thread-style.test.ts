@@ -76,8 +76,9 @@ it('gives a nested block the same surface and agent outline as a main block', ()
     // The main tile carries the identical outline treatment.
     expect(blockOf('.tile {')).toContain('outline: 1px solid var(--agent-line)');
 
-    // The agent name reads the same property the outline uses.
-    expect(blockOf('.thread-name {')).toContain('color: var(--agent-color)');
+    // The agent code reads the same property the outline uses; R1/F3 paints the
+    // root block's `.tile-agent` with the SAME rule as the nested `.thread-name`.
+    expect(blockOf(':is(.tile-agent, .thread-name) {')).toContain('color: var(--agent-color)');
 
     // R3 STATE PARITY: the surface/expanded/ring rules are written ONCE against the
     // grouped block-owner selector, so main and nested cannot drift (before the
@@ -136,9 +137,55 @@ it('keeps a collapsed entry to ONE compact line with an ellipsised preview', () 
     expect(preview).toContain('text-overflow: ellipsis');
     expect(preview).not.toContain('white-space: normal');
 
-    // Status is a visible word; colour is reinforcement only.
-    expect(blockOf('.thread-status {')).not.toContain('display: none');
+    // Status is TEXT (never colour-only), and R1 gives the nested word the SAME
+    // typography as the main block's (one grouped rule) while its colour only
+    // reinforces the state.
+    expect(blockOf(':is(.tile-status, .thread-status) {\n    position: relative;')).toContain(
+        'font-family: var(--mono)'
+    );
+    expect(blockOf(':is(.tile-status, .thread-status) {\n    position: relative;')).not.toContain(
+        'display: none'
+    );
     expect(blockOf(".thread-row[data-state='error'] .thread-status {")).toContain('color: var(--danger)');
+    // R1 parity: every state the nested entry can reach is coloured, and a compact
+    // nested word is clipped (not shown) exactly like the compact tile's.
+    expect(blockOf(".thread-row[data-state='waiting'] .thread-status {")).toContain('color: var(--warn)');
+    expect(
+        blockOf(
+            ':is(.tile:not(.is-expanded), .thread-row:not(.is-expanded)) :is(.tile-status-text, .thread-status-text) {'
+        )
+    ).toContain('clip-path: inset(50%)');
+});
+
+// R1: the parent and nested blocks share ONE anatomy — header metadata, body and
+// prompt scale are single grouped rules, so the two owners cannot drift again.
+it('shares the tile header metadata, body and prompt scale with the nested block', () => {
+    expect(blockOf(':is(.tile-elapsed, .thread-elapsed) {')).toContain('font-size: 10.5px');
+    expect(blockOf(':is(.tile-tokens, .thread-tokens) {')).toContain('font-variant-numeric: tabular-nums');
+    expect(
+        blockOf(
+            ':is(.tile-elapsed, .thread-elapsed):not([hidden]) + :is(.tile-tokens, .thread-tokens):not([hidden])::before {'
+        )
+    ).toContain("content: ' | '");
+
+    const body = blockOf(':is(.tile-body, .thread-body) {');
+    expect(body).toContain('gap: 10px');
+    expect(body).toContain('padding: 12px 14px 14px');
+    expect(blockOf(':is(.turn-prompt, .thread-prompt) {')).toContain('padding: 9px 11px');
+    expect(blockOf(':is(.tile-flow, .thread-flow) {')).toContain('gap: 10px');
+
+    // The nested header keeps the compact tile's order: flexible preview then the
+    // metadata cluster; the code leads. `order` (not DOM order) places them.
+    expect(blockOf(':is(.tile-agent, .thread-name) {')).toContain('order: 0');
+    expect(blockOf('.thread-preview {')).toContain('order: 1');
+    expect(blockOf('.thread-top {')).toContain('order: 2');
+    expect(blockOf('.thread-top {')).toContain('margin-left: auto');
+
+    // F3: the root code is in the COMPACT header, so the expanded primary section
+    // head (the same code again) is hidden. Flat legacy subagent heads stay visible
+    // because they name DIFFERENT agents.
+    expect(blockOf(".tile-flow > .agent[data-role='primary'] .agent-head {")).toContain('display: none');
+    expect(css).not.toContain(".tile-flow > .agent[data-role='subagent'] .agent-head");
 });
 
 it('styles the per-invocation outcome and keeps it readable at depth', () => {
@@ -162,7 +209,8 @@ it('outlines a flat legacy subagent section without double-outlining the primary
     expect(flat).toContain('outline-offset: -2px');
     expect(flat).not.toContain('padding-top');
 
-    // The primary section is never selected (no second frame around the main content).
-    expect(rules).not.toContain(".tile-flow > .agent[data-role='primary']");
+    // The primary section is never OUTLINED (no second frame around the main content);
+    // F3 only hides its redundant head, which is a different rule.
+    expect(rules).not.toContain(".tile-flow > .agent[data-role='primary'] {");
     expect(rules).not.toContain('.tile-flow > .agent {');
 });

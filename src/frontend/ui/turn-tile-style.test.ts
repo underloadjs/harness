@@ -72,12 +72,19 @@ it('keeps a collapsed tile a single full-width line instead of a square card', (
 });
 
 it('clips the compact status word and colour-codes the rows', () => {
-    const statusText = blockOf('.tile:not(.is-expanded) .tile-status-text {');
+    // R1: ONE grouped rule clips the status WORD in both block owners, so a
+    // collapsed child is as compact as a collapsed parent.
+    const statusText = blockOf(
+        ':is(.tile:not(.is-expanded), .thread-row:not(.is-expanded)) :is(.tile-status-text, .thread-status-text) {'
+    );
     expect(statusText).toContain('position: absolute');
     expect(statusText).toContain('clip-path: inset(50%)');
     // Clipped rather than `display: none`: the word stays readable to a screen
     // reader while the tile itself shows colour instead.
     expect(statusText).not.toContain('display: none');
+
+    // R3: the turn ordinal was removed from the DOM, so its rule is gone too.
+    expect(rules).not.toContain('.tile-index');
 
     // R4: completed is GREY; green is reserved for the one active task. R3: the
     // surface rules are grouped with `.thread-tile` so a nested block gets the SAME

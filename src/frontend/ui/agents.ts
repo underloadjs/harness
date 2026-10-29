@@ -151,16 +151,23 @@ const el = <K extends keyof HTMLElementTagNameMap>(
 let nextId = 0;
 
 // Resolve preset metadata for a name. A descriptor can name an agent the picker
-// does not know (an old saved session); the tile still renders, with the name as
-// its title, rather than disappearing.
+// does not know (an old saved session); the tile still renders instead of
+// disappearing. The fallback title is a neutral word, NOT the slug: R3 keeps every
+// raw agent id out of visible text, and `data-agent` still carries the id.
 const detailsOf = (agents: readonly AgentDescriptor[], name: string): AgentDescriptor =>
     agents.find((agent) => agent.name === name) ?? {
         name,
-        title: name,
+        title: 'Agent',
         description: 'No preset details are available for this agent.',
         instruction: '',
         guidelines: []
     };
+
+// The ONE visible label used by the preset picker: the server's display title.
+// R3: the slug is an internal id, so a descriptor without a title (never one of the
+// built-in profiles) falls back to a neutral word instead of exposing the id.
+const displayTitleOf = (agent: AgentDescriptor): string =>
+    agent.title.trim().length > 0 ? agent.title : 'Agent';
 
 const presetDetail = (agent: AgentDescriptor): HTMLElement => {
     const detail = el('details', 'agent-detail');
@@ -287,7 +294,7 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
     const teamId = `agent-team-${++nextId}`;
     row.id = teamId;
 
-    const teamLabel = detailsOf(options.agents, options.primary).title;
+    const teamLabel = displayTitleOf(detailsOf(options.agents, options.primary));
     const summary = el('button', 'agent-summary');
     summary.type = 'button';
     summary.setAttribute('aria-controls', teamId);
@@ -366,9 +373,13 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
         const choose = el('button', 'agent-option-add');
         choose.type = 'button';
         choose.disabled = !options.editable || member;
+        // R3/R5: ONE visible line per preset — the server's single-word display
+        // title. The slug (`agent.name`) is an INTERNAL id: it stays on the option's
+        // `data-agent` for the add callback/tests but is never rendered. A descriptor
+        // with no title (the built-in profiles always send one) falls back to a
+        // neutral word rather than leaking the id into the picker.
         choose.append(
-            el('span', 'agent-option-name', agent.name),
-            el('span', 'agent-option-title', agent.title),
+            el('span', 'agent-option-title', displayTitleOf(agent)),
             el('span', 'agent-option-description', agent.description),
             el('span', 'agent-option-state', member ? 'already in team' : 'add')
         );
@@ -516,13 +527,13 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
         main.setAttribute('aria-pressed', isPrimary ? 'true' : 'false');
         // Exactly one human-readable name (the preset title). The slug is kept in
         // `data-agent` for the callbacks and tests but is never displayed, so a
-        // tile reads "Summarizer", not "summarizer" + "Summarizer". The fallback
-        // descriptor in detailsOf sets title = name when details are missing.
-        const label = agent.title.trim().length > 0 ? agent.title : agent.name;
+        // tile reads "Summarizer", not "summarizer" + "Summarizer". An unknown
+        // descriptor (see detailsOf) or an empty title reads a neutral word (R3).
+        const label = displayTitleOf(agent);
 
         main.title = isPrimary
             ? 'This agent is the primary (entry) agent.'
-            : `Make ${label} the primary agent; ${options.primary} becomes a subagent.`;
+            : `Make ${label} the primary agent; ${teamLabel} becomes a subagent.`;
 
         main.append(el('span', 'agent-tile-name', label));
         main.addEventListener('click', () => {

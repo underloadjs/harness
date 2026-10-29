@@ -124,7 +124,7 @@ describe('invocation thread entries', () => {
             depth: '1',
             agent: 'helper',
             state: 'queued',
-            name: 'helper',
+            name: 'HR1',
             status: 'queued',
             preview: 'look up the docs',
             text: undefined,
@@ -146,6 +146,10 @@ describe('invocation thread entries', () => {
         expect(select).not.toBeNull();
         expect(select?.tagName).toBe('BUTTON');
         expect(select?.type).toBe('button');
+        // A real button is the whole keyboard contract: Enter/Space activate it
+        // natively, and it is a natural tab stop (no artificial tabindex).
+        expect(select?.hasAttribute('tabindex')).toBe(false);
+        expect(select?.disabled).toBe(false);
         expect(select?.getAttribute('aria-expanded')).toBe('false');
         const bodyId = select?.getAttribute('aria-controls');
         expect(bodyId).toBe(row.querySelector<HTMLElement>('.thread-body')?.id);
@@ -192,7 +196,7 @@ describe('invocation thread entries', () => {
                 depth: '1',
                 agent: 'helper',
                 state: 'done',
-                name: 'helper',
+                name: 'HR1',
                 status: 'done',
                 preview: 'first task',
                 text: 'first answer\n',
@@ -225,7 +229,7 @@ describe('invocation thread entries', () => {
                 depth: '1',
                 agent: 'helper',
                 state: 'done',
-                name: 'helper',
+                name: 'HR1',
                 status: 'done',
                 preview: 'first task',
                 text: 'first answer\n',
@@ -236,7 +240,7 @@ describe('invocation thread entries', () => {
                 depth: '1',
                 agent: 'helper',
                 state: 'done',
-                name: 'helper',
+                name: 'HR2',
                 status: 'done',
                 preview: 'second task',
                 text: undefined,
@@ -282,6 +286,13 @@ describe('invocation thread entries', () => {
         expect([...host.children].map((child) => (child as HTMLElement).dataset.threadId)).toEqual(['t1', 't5']);
         expect(threadRows(turn).map((row) => row.dataset.threadId)).toEqual(['t1', 't3', 't5']);
         expect(threadRows(turn).map((row) => row.dataset.depth)).toEqual(['1', '2', '1']);
+        // R2: the code is per INVOCATION and ordered by spawn, at any depth:
+        // helper → HR1, deeper → DR1, the second helper → HR2.
+        expect(threadRows(turn).map((row) => row.querySelector('.thread-name')?.textContent)).toEqual([
+            'HR1',
+            'DR1',
+            'HR2'
+        ]);
 
         const t1 = host.children[0] as HTMLElement;
         const nestedHost = t1.lastElementChild as HTMLElement;
@@ -439,7 +450,7 @@ describe('invocation thread entries', () => {
                 depth: '1',
                 agent: 'helper',
                 state: 'done',
-                name: 'helper',
+                name: 'HR1',
                 status: 'done',
                 preview: 'first task',
                 text: 'one\n',
@@ -450,7 +461,7 @@ describe('invocation thread entries', () => {
                 depth: '1',
                 agent: 'helper',
                 state: 'done',
-                name: 'helper',
+                name: 'HR2',
                 status: 'done',
                 preview: 'second task',
                 text: 'two\n',
@@ -499,7 +510,7 @@ describe('invocation thread entries', () => {
                 depth: '1',
                 agent: 'helper',
                 state: 'done',
-                name: 'helper',
+                name: 'HR1',
                 status: 'done',
                 preview: 'same task',
                 text: 'same answer\n',
@@ -571,7 +582,7 @@ describe('invocation thread entries', () => {
                 depth: '1',
                 agent: 'helper',
                 state: 'cancelled',
-                name: 'helper',
+                name: 'HR1',
                 status: 'cancelled',
                 preview: 'child task',
                 text: undefined,
@@ -595,7 +606,7 @@ describe('invocation thread entries', () => {
                 depth: '1',
                 agent: 'helper',
                 state: 'error',
-                name: 'helper',
+                name: 'HR1',
                 status: 'error',
                 preview: 'queued task',
                 text: undefined,
@@ -760,10 +771,10 @@ describe('invocation thread entries', () => {
         );
     });
 
-    // R4: a collapsed entry is ONE row — the header button holds a single row that
-    // contains the name, the ellipsised preview and the status. The old layout put
-    // the preview on a second line.
-    it('renders a collapsed entry as a single header row', () => {
+    // R4/R1: a collapsed entry is ONE row with the same anatomy as a compact turn
+    // tile — `code · preview · [elapsed | tokens] status`. The old layout put the
+    // preview on a second line and had no header metadata.
+    it('renders a collapsed entry as a single header row with the tile metadata cluster', () => {
         const board = mount();
         const turn = board.begin('one line');
         turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
@@ -773,17 +784,26 @@ describe('invocation thread entries', () => {
         const select = row.querySelector<HTMLElement>('.thread-select');
         const top = select?.querySelector<HTMLElement>('.thread-top');
 
-        // One child element in the button, and every item lives inside that row.
-        expect([...(select?.children ?? [])].map((child) => child.className)).toEqual(['thread-top']);
-        expect([...(top?.children ?? [])].map((child) => child.className)).toEqual([
+        // The button holds the code, the flexible preview and the metadata cluster —
+        // the same three-part row the compact tile uses (prompt + `.tile-top`).
+        expect([...(select?.children ?? [])].map((child) => child.className)).toEqual([
             'thread-name',
             'thread-preview',
+            'thread-top'
+        ]);
+        expect([...(top?.children ?? [])].map((child) => child.className)).toEqual([
+            'thread-elapsed',
+            'thread-tokens',
             'thread-status'
         ]);
-        expect(top?.querySelector('.thread-preview')?.textContent).toBe(
+        expect(top?.querySelector('.thread-preview')).toBeNull();
+        expect(select?.querySelector('.thread-preview')?.textContent).toBe(
             'a very long delegated task description'
         );
         expect(top?.querySelector('.thread-status')?.textContent).toBe('queued');
+        // R3/R2: the visible agent identity is the compact code, never the raw id.
+        expect(select?.querySelector('.thread-name')?.textContent).toBe('HR1');
+        expect(row.textContent).not.toContain('helper');
 
         // Expansion is unchanged: the body opens and the header row stays a row
         // (the preview is replaced by the full Markdown task in the body).
@@ -792,5 +812,481 @@ describe('invocation thread entries', () => {
         expect(row.classList.contains('is-expanded')).toBe(true);
         expect(button.getAttribute('aria-expanded')).toBe('true');
         expect(row.querySelector('.thread-body')?.contains(row.querySelector('.thread-prompt'))).toBe(true);
+    });
+
+    // R1: a nested block carries the SAME metadata as a main block — its own elapsed
+    // span and its own token tally, both derived from ITS events. Nothing here is
+    // inherited from the parent tile, and nothing is fabricated when the record has
+    // no stamps.
+    it('shows a nested block its own elapsed span and usage from its events', () => {
+        const T = 1_700_000_000_000;
+        const board = mount();
+
+        const [turn] = board.hydrate([
+            {
+                ...serverTurn({
+                    events: [
+                        { type: 'start', agent: 'writer', model: 'm1' },
+                        delegateCall('helper', 'child task', 'd1'),
+                        withThread(
+                            { type: 'start', agent: 'helper', model: 'h1' },
+                            { id: 't1', callId: 'd1', input: 'child task' }
+                        ),
+                        withThread(
+                            {
+                                type: 'usage',
+                                agent: 'helper',
+                                usage: { input: 120, output: 5, total: 125, cached: 40 }
+                            },
+                            { id: 't1' }
+                        ),
+                        withThread({ type: 'text', agent: 'helper', delta: 'answer' }, { id: 't1' }),
+                        withThread({ type: 'done', agent: 'helper', message: doneMessage('helper') }, { id: 't1' }),
+                        {
+                            type: 'tool_result',
+                            agent: 'writer',
+                            name: 'agentDelegate',
+                            callId: 'd1',
+                            content: 'ok',
+                            isError: false
+                        }
+                    ]
+                }),
+                startedAt: T,
+                updatedAt: T + 9000,
+                // Child start T+200, child done T+7000 → exactly 6.8s.
+                eventTimes: [T, T + 100, T + 200, T + 300, T + 400, T + 7000, T + 7000]
+            }
+        ]);
+
+        // Main block: the server span (T → T+9000).
+        expect(turn.elapsed()).toBe('9.0s');
+
+        const row = threadRows(turn)[0];
+        const elapsed = row.querySelector<HTMLElement>('.thread-elapsed');
+        const tokens = row.querySelector<HTMLElement>('.thread-tokens');
+
+        expect(elapsed?.textContent).toBe('6.8s');
+        expect(elapsed?.hidden).toBe(false);
+        expect(tokens?.textContent).toBe('120 (40)');
+        expect(tokens?.hidden).toBe(false);
+        // The tally names both scopes exactly like the main block's.
+        expect(tokens?.title).toBe(
+            'Latest request context: 120 input tokens · Total cached input sent: 40 tokens'
+        );
+    });
+
+    // R1: the nested clock is honest about unknown data — a record with no event
+    // stamps shows no duration rather than 0ms.
+    it('leaves a nested duration hidden when its events carry no stamps', () => {
+        const board = mount();
+        const [turn] = board.hydrate([
+            serverTurn({
+                events: [
+                    { type: 'start', agent: 'writer', model: 'm1' },
+                    delegateCall('helper', 'child task', 'd1'),
+                    withThread(
+                        { type: 'start', agent: 'helper', model: 'h1' },
+                        { id: 't1', callId: 'd1', input: 'child task' }
+                    ),
+                    withThread({ type: 'done', agent: 'helper', message: doneMessage('helper') }, { id: 't1' })
+                ]
+            })
+        ]);
+
+        const row = threadRows(turn)[0];
+        const elapsed = row.querySelector<HTMLElement>('.thread-elapsed');
+        expect(elapsed?.textContent).toBe('');
+        expect(elapsed?.hidden).toBe(true);
+        // No usage event either: the tally claims nothing.
+        expect(row.querySelector<HTMLElement>('.thread-tokens')?.hidden).toBe(true);
+    });
+
+    // F1: a REPLAYED child with no recorded end must never derive a span from the
+    // current wall clock. Two runs at very different "now"s must both hide it.
+    it('never derives a replayed child duration from the wall clock', () => {
+        const T = 1_700_000_000_000;
+        const source = (): SessionTurn => ({
+            ...serverTurn({
+                status: 'cancelled',
+                events: [
+                    { type: 'start', agent: 'writer', model: 'm1' },
+                    delegateCall('helper', 'never finished', 'd1'),
+                    withThread(
+                        { type: 'start', agent: 'helper', model: 'h1' },
+                        { id: 't1', callId: 'd1', input: 'never finished' }
+                    )
+                ]
+            }),
+            startedAt: T,
+            updatedAt: T + 20_000,
+            eventTimes: [T, T + 100, T + 1_000]
+        });
+
+        const read = (now: number): [string, boolean] => {
+            vi.useFakeTimers();
+            vi.setSystemTime(new Date(now));
+            try {
+                const board = mount();
+                const [turn] = board.hydrate([source()]);
+
+                // Sanity: the root keeps the record's own span (T → T+20s).
+                expect(turn.elapsed()).toBe('20.0s');
+
+                const elapsed = threadRows(turn)[0].querySelector<HTMLElement>('.thread-elapsed');
+                return [elapsed?.textContent ?? '', elapsed?.hidden ?? false];
+            } finally {
+                vi.useRealTimers();
+            }
+        };
+
+        // One day later and two years later: the replayed child has NO end stamp, so
+        // the answer is "unavailable" in both — never the replay's age.
+        expect(read(T + 86_400_000)).toEqual(['', true]);
+        expect(read(T + 2 * 365 * 86_400_000)).toEqual(['', true]);
+    });
+
+    // F2 (live): the child's OWN `done` fixes its end; a later parent `tool_result`
+    // may not stretch it.
+    it('keeps a live child end when the parent result lands later', () => {
+        const T = 1_700_000_000_000;
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T + 2_000));
+
+        try {
+            const board = mount();
+            const turn = board.begin('live endpoints');
+            turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+            turn.apply(delegateCall('helper', 'child task', 'd1'));
+            turn.apply(
+                withThread(
+                    { type: 'start', agent: 'helper', model: 'h1' },
+                    { id: 't1', callId: 'd1', input: 'child task' }
+                )
+            );
+
+            // The child answers at +4s (2s after its start).
+            vi.setSystemTime(new Date(T + 4_000));
+            turn.apply(withThread({ type: 'done', agent: 'helper', message: doneMessage('helper') }, { id: 't1' }));
+
+            const elapsed = threadRows(turn)[0].querySelector<HTMLElement>('.thread-elapsed');
+            expect(elapsed?.textContent).toBe('2.0s');
+
+            // The parent observes the result at +9s: the span must NOT become 7s.
+            vi.setSystemTime(new Date(T + 9_000));
+            turn.apply({
+                type: 'tool_result',
+                agent: 'writer',
+                name: 'agentDelegate',
+                callId: 'd1',
+                content: 'ok',
+                isError: false,
+                durationMs: 2_000
+            });
+            expect(elapsed?.textContent).toBe('2.0s');
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    // F2 (replay): identical rule with recorded stamps — the child's `done` at +4s
+    // wins over the parent's result at +19s.
+    it('keeps a recorded child end when the parent result is stamped later', () => {
+        const T = 1_700_000_000_000;
+        const board = mount();
+
+        const [turn] = board.hydrate([
+            {
+                ...serverTurn({
+                    status: 'done',
+                    events: [
+                        { type: 'start', agent: 'writer', model: 'm1' },
+                        delegateCall('helper', 'child task', 'd1'),
+                        withThread(
+                            { type: 'start', agent: 'helper', model: 'h1' },
+                            { id: 't1', callId: 'd1', input: 'child task' }
+                        ),
+                        withThread(
+                            { type: 'done', agent: 'helper', message: doneMessage('helper') },
+                            { id: 't1' }
+                        ),
+                        {
+                            type: 'tool_result',
+                            agent: 'writer',
+                            name: 'agentDelegate',
+                            callId: 'd1',
+                            content: 'ok',
+                            isError: false,
+                            durationMs: 3_000
+                        }
+                    ]
+                }),
+                startedAt: T,
+                updatedAt: T + 20_000,
+                // child start +1s, child done +4s (3s), parent result +19s
+                eventTimes: [T, T + 100, T + 1_000, T + 4_000, T + 19_000]
+            }
+        ]);
+
+        const elapsed = threadRows(turn)[0].querySelector<HTMLElement>('.thread-elapsed');
+        expect(elapsed?.textContent).toBe('3.0s');
+    });
+
+    // F2: the parent result is still allowed to supply an endpoint the child never
+    // reported — that is a KNOWN recorded time, not a wall-clock guess.
+    it('lets a recorded parent result supply the missing child endpoint', () => {
+        const T = 1_700_000_000_000;
+        const board = mount();
+
+        const [turn] = board.hydrate([
+            {
+                ...serverTurn({
+                    status: 'done',
+                    events: [
+                        { type: 'start', agent: 'writer', model: 'm1' },
+                        delegateCall('helper', 'child task', 'd1'),
+                        withThread(
+                            { type: 'start', agent: 'helper', model: 'h1' },
+                            { id: 't1', callId: 'd1', input: 'child task' }
+                        ),
+                        {
+                            type: 'tool_result',
+                            agent: 'writer',
+                            name: 'agentDelegate',
+                            callId: 'd1',
+                            content: 'ok',
+                            isError: false,
+                            durationMs: 8_000
+                        }
+                    ]
+                }),
+                startedAt: T,
+                updatedAt: T + 20_000,
+                // child start +1s, no child `done`, parent result +9s → 8s span.
+                eventTimes: [T, T + 100, T + 1_000, T + 9_000]
+            }
+        ]);
+
+        const elapsed = threadRows(turn)[0].querySelector<HTMLElement>('.thread-elapsed');
+        expect(elapsed?.textContent).toBe('8.0s');
+    });
+
+    // F3/R1: the collapsed ROOT block is the same anatomy as a collapsed CHILD —
+    // agent code first, then the flexible preview, then the metadata cluster.
+    it('gives the collapsed root the same code-preview-metadata anatomy as a child', () => {
+        const board = mount();
+        const turn = board.begin('shapes');
+        turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+        turn.apply(delegateCall('helper', 'child task', 'd1'));
+
+        const rootSelect = turn.element.querySelector<HTMLElement>('.tile-select');
+        expect([...(rootSelect?.children ?? [])].map((child) => child.className)).toEqual([
+            'tile-agent',
+            'tile-top',
+            'tile-prompt',
+            'tile-meta'
+        ]);
+        expect(rootSelect?.querySelector('.tile-agent')?.textContent).toBe('WR1');
+        expect([...(rootSelect?.querySelector('.tile-top')?.children ?? [])].map((child) => child.className)).toEqual(
+            ['tile-elapsed', 'tile-tokens', 'tile-status']
+        );
+
+        const childSelect = threadRows(turn)[0].querySelector<HTMLElement>('.thread-select');
+        expect([...(childSelect?.children ?? [])].map((child) => child.className)).toEqual([
+            'thread-name',
+            'thread-preview',
+            'thread-top'
+        ]);
+        expect(childSelect?.querySelector('.thread-name')?.textContent).toBe('HR1');
+        expect([...(childSelect?.querySelector('.thread-top')?.children ?? [])].map((child) => child.className)).toEqual(
+            ['thread-elapsed', 'thread-tokens', 'thread-status']
+        );
+
+        // F3: the code stays first and correct after the projection is rebuilt.
+        turn.merge({
+            ...serverTurn({
+                status: 'running',
+                events: [
+                    // A different model forces a rebuild (prefix disagreement).
+                    { type: 'start', agent: 'writer', model: 'm2' },
+                    delegateCall('helper', 'child task', 'd1')
+                ]
+            }),
+            updatedAt: 11
+        });
+
+        expect(turn.element.querySelector('.tile-select')?.firstElementChild?.className).toBe('tile-agent');
+        expect(turn.element.querySelector('.tile-agent')?.textContent).toBe('WR1');
+    });
+
+    // R1: a nested block ticks like the main block while it runs, and the tick stops
+    // when the board is destroyed (a detached interval would keep painting).
+    it('ticks a nested block clock while it streams and stops it with the board', () => {
+        const T = 1_700_000_000_000;
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T));
+
+        try {
+            const board = mount();
+            const turn = board.begin('live child');
+            turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+            turn.apply(delegateCall('helper', 'child task', 'd1'));
+            turn.apply(
+                withThread(
+                    { type: 'start', agent: 'helper', model: 'h1' },
+                    { id: 't1', callId: 'd1', input: 'child task' }
+                )
+            );
+
+            const elapsed = threadRows(turn)[0].querySelector<HTMLElement>('.thread-elapsed');
+            expect(elapsed?.textContent).toBe('0ms');
+            expect(elapsed?.hidden).toBe(false);
+
+            vi.advanceTimersByTime(2500);
+            expect(elapsed?.textContent).toBe('2.5s');
+
+            const settled = elapsed?.textContent;
+
+            board.clear();
+            vi.advanceTimersByTime(10_000);
+            expect(elapsed?.textContent).toBe(settled);
+        } finally {
+            vi.useRealTimers();
+        }
+    });
+
+    // R2: the code is first+last letter + occurrence within the turn, ordered by
+    // invocation, root included — and a repeated event does not bump the number.
+    it('labels invocations RH1/RH2 with the root counted, and never per event', () => {
+        const board = mount();
+        const turn = board.begin('research twice');
+
+        // The root invocation is itself an invocation of `research`.
+        turn.apply({ type: 'start', agent: 'research', model: 'r1' });
+        expect(turn.element.querySelector('.agent-name')?.textContent).toBe('RH1');
+
+        const spawn = (input: string, id: string): HarnessEvent => ({
+            type: 'tool_call',
+            agent: 'research',
+            call: { id, name: 'agentDelegate', arguments: JSON.stringify({ agent: 'research', input }) }
+        });
+
+        turn.apply(spawn('first child', 'd1'));
+        turn.apply(spawn('second child', 'd2'));
+        turn.apply(
+            withThread(
+                { type: 'start', agent: 'research', model: 'r1' },
+                { id: 't1', callId: 'd1', input: 'first child' }
+            )
+        );
+        turn.apply(
+            withThread(
+                { type: 'start', agent: 'research', model: 'r1' },
+                { id: 't2', callId: 'd2', input: 'second child' }
+            )
+        );
+        // Several more events for the SAME invocations: no new occurrence is taken.
+        turn.apply(withThread({ type: 'text', agent: 'research', delta: 'a' }, { id: 't1' }));
+        turn.apply(withThread({ type: 'text', agent: 'research', delta: 'b' }, { id: 't1' }));
+        turn.apply(withThread({ type: 'text', agent: 'research', delta: 'c' }, { id: 't2' }));
+
+        expect(threadRows(turn).map((row) => row.querySelector('.thread-name')?.textContent)).toEqual([
+            'RH2',
+            'RH3'
+        ]);
+        // R3: every VISIBLE agent identity is a code — the root header and both
+        // invocation headers. (Tool-card arguments are model data, not labels.)
+        expect(turn.element.querySelector('.agent-name')?.textContent).toBe('RH1');
+        // The ids remain available internally (colour, routing, tests).
+        expect(threadRows(turn).map((row) => row.dataset.agent)).toEqual(['research', 'research']);
+    });
+
+    // R2: replay determinism — the same recorded turn yields the same labels on a
+    // fresh board, including after a superseding record rebuilds the projection.
+    it('replays the same invocation codes after a projection rebuild', () => {
+        const events: HarnessEvent[] = [
+            { type: 'start', agent: 'research', model: 'r1' },
+            delegateCall('research', 'first child', 'd1'),
+            delegateCall('workspace', 'second child', 'd2'),
+            withThread(
+                { type: 'start', agent: 'research', model: 'r1' },
+                { id: 't1', callId: 'd1', input: 'first child' }
+            ),
+            withThread(
+                { type: 'start', agent: 'workspace', model: 'w1' },
+                { id: 't2', callId: 'd2', input: 'second child' }
+            )
+        ];
+
+        const board = mount();
+        const turn = board.begin('replay');
+        for (const event of events) turn.apply(event);
+        expect(threadRows(turn).map((row) => row.querySelector('.thread-name')?.textContent)).toEqual([
+            'RH2',
+            'WE1'
+        ]);
+
+        // A record whose prefix DISAGREES forces `resetProjection`, then replays in
+        // full: the labels must restart from the record's order, not keep counting.
+        const superseding: HarnessEvent[] = [
+            events[0],
+            events[1],
+            events[3],
+            withThread({ type: 'text', agent: 'research', delta: 'again' }, { id: 't1' })
+        ];
+        turn.merge({ ...serverTurn({ status: 'running', events: superseding }), updatedAt: 11 });
+
+        expect(threadRows(turn).map((row) => row.querySelector('.thread-name')?.textContent)).toEqual([
+            'RH2'
+        ]);
+        expect(turn.element.querySelector('.agent-name')?.textContent).toBe('RH1');
+    });
+
+    // R1: expanding a child is independent of the parent AND survives a projection
+    // rebuild (a superseding record replays the entries; the reader's choice is
+    // restored by canonical key).
+    it('keeps an expanded child open when a superseding record rebuilds', () => {
+        const board = mount();
+        const turn = board.begin('rebuild');
+
+        turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+        turn.apply(delegateCall('helper', 'child task', 'd1'));
+        turn.apply(
+            withThread(
+                { type: 'start', agent: 'helper', model: 'h1' },
+                { id: 't1', callId: 'd1', input: 'child task' }
+            )
+        );
+
+        const before = threadRows(turn)[0];
+        before.querySelector<HTMLButtonElement>('.thread-select')?.click();
+        expect(before.classList.contains('is-expanded')).toBe(true);
+        expect(turn.element.classList.contains('is-expanded')).toBe(true);
+
+        // A DISAGREEING prefix forces `resetProjection`, so the row below is a NEW
+        // element created by the replay.
+        turn.merge({
+            ...serverTurn({
+                status: 'running',
+                events: [
+                    { type: 'start', agent: 'writer', model: 'm1' },
+                    delegateCall('helper', 'child task', 'd1'),
+                    withThread(
+                        { type: 'start', agent: 'helper', model: 'h1' },
+                        { id: 't1', callId: 'd1', input: 'changed by the record' }
+                    )
+                ]
+            }),
+            updatedAt: 11
+        });
+
+        const after = threadRows(turn)[0];
+        expect(after).not.toBe(before);
+        expect(after.dataset.threadId).toBe('t1');
+        expect(after.classList.contains('is-expanded')).toBe(true);
+        expect(after.querySelector('.thread-select')?.getAttribute('aria-expanded')).toBe('true');
+        expect(after.querySelector('.thread-prompt')?.textContent).toBe('changed by the record\n');
+        // The rebuilt header still shows the SAME code for that invocation.
+        expect(after.querySelector('.thread-name')?.textContent).toBe('HR1');
     });
 });

@@ -14,8 +14,8 @@
 //   - src/frontend/ui/tools.ts — tool duration in the summary line
 
 // Format a non-negative duration. Deterministic on purpose (tests assert exact
-// text): <1s in whole milliseconds, <1min in tenths of a second, otherwise
-// minutes plus zero-padded seconds.
+// text): <1s in whole milliseconds, <1min in tenths of a second, otherwise minutes
+// plus zero-padded seconds with NO separator between the units (R4: `4m12s`).
 export const formatDuration = (milliseconds: number): string => {
     if (!Number.isFinite(milliseconds) || milliseconds < 0) return '';
 
@@ -28,7 +28,7 @@ export const formatDuration = (milliseconds: number): string => {
     const minutes = Math.floor(seconds / 60);
     const rest = seconds % 60;
 
-    return `${minutes}m ${String(rest).padStart(2, '0')}s`;
+    return `${minutes}m${String(rest).padStart(2, '0')}s`;
 };
 
 // Difference between two epoch-millisecond stamps, or undefined when either side

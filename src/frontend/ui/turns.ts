@@ -37,6 +37,21 @@
 // deterministic tone from ui/agent-color.ts (name colour + block outline), so the
 // same agent keeps one colour across the whole transcript.
 //
+// Block anatomy (R1): the main tile and every nested entry share ONE header and body
+// design — a compact one-line header (`agent code · preview · elapsed | tokens
+// status`) that expands into the same body scale, the same native button
+// (click/Enter/Space, `aria-expanded`/`aria-controls`) and the same `createBlockMeta`
+// clock/tally implementation. They differ only by depth indentation and by the
+// root's server-supplied timing.
+//
+// Agent labels (R2/R3): a header names its agent with the compact code from
+// ui/agent-label.ts (`RH1` = first+last letter of `research` + its 1-based
+// occurrence within the turn, root invocation included). A code is allocated ONCE
+// per invocation, so a stream cannot inflate it, and a rebuilt projection
+// (`resetProjection`) re-numbers from the record, so replay is deterministic. Raw
+// agent ids never appear as text; they stay on `data-agent` for colour/routing and
+// in the runtime metadata. The turn's protocol `index` is bound but not displayed.
+//
 // Collapsed blocks (R4): the main tile and EVERY nested entry are exactly one
 // compact row (`.tile:not(.is-expanded)`, `.thread-row:not(.is-expanded)`).
 // Whatever does not fit — prompt/task preview, status, meta — is ellipsised (or
@@ -108,6 +123,10 @@ import type { HarnessPendingTool, HarnessThreadInfo } from '../contract';
 // constant keeps the "cannot attribute this stream" sentinel in ONE place, so the
 // tile and its section resolve to the same neutral tone.
 import { UNNAMED_AGENT_PLACEHOLDER, paintAgentColor } from './agent-color';
+// Compact per-turn agent labels (`RH1`, `RH2`, …): the visible agent identity in a
+// block header. Raw agent ids never reach the DOM as text (R2/R3); the allocator is
+// per turn so the numbering is deterministic on replay.
+import { createAgentLabels } from './agent-label';
 import { markdownFragment, plainPreview } from './markdown';
 import { elapsedBetween, formatDuration } from './time';
 import { formatTokens } from './tokens';
@@ -315,6 +334,265 @@ const cancel = (block: TextBlock): void => {
     block.handle = undefined;
 };
 
+// --- compact block metadata (R1) --------------------------------------------
+//
+// The elapsed clock + token tally that sit in a block header. ONE implementation is
+// shared by the MAIN tile and every NESTED invocation block, so both blocks tick,
+// freeze, hide and format identically and only the class names differ
+// (`tile-elapsed`/`tile-tokens` vs `thread-elapsed`/`thread-tokens`) — see
+// styles.css, where the two are grouped into one rule per concern.
+//
+// Behaviour inherited from the original tile clock (do not weaken it):
+//   - a block with no known start shows NOTHING (no fabricated `0ms`);
+//   - while the block is live the label ticks every 250ms (the text resolution);
+//   - a terminal block stops the tick and keeps the span;
+//   - a RECORDED baseline (`settle`) is never overwritten by a later replay
+//     transition, so a poll/rebuild shows the server's duration, not "now";
+//   - a REPLAYED block reads no wall clock at all: with no recorded end stamp its
+//     duration is unknown and the label is hidden (F1);
+//   - the first endpoint wins: a later parent result cannot rewrite it (F2);
+//   - usage is never invented: both the input figure and the cache bracket stay
+//     absent until something reported them.
+type BlockMeta = {
+    // `<span class="…-elapsed">`, hidden until a real span exists.
+    elapsed: HTMLElement;
+    // `<span class="…-tokens">`, hidden until a request reported usage.
+    tokens: HTMLElement;
+    // Replace the baseline with server/authoritative stamps. The block becomes a
+    // RECORDED one: later state transitions must not restart the local clock or
+    // clear the recorded end.
+    settle: (timing: { startedAt?: number; endedAt?: number }) => void;
+    // First stamp for a block that was never settled (a live/bound start). A second
+    // call is ignored: the block started when it started. `recorded` says the stamp
+    // came from a replayed record, so only a recorded END can complete the span.
+    begin: (at: number | undefined, recorded: boolean) => void;
+    // Server start for the ROOT tile: replaces the local baseline (the record's
+    // stamp wins) without marking the block as a recorded replay.
+    bindStart: (at: number) => void;
+    // Terminal stamp. The FIRST endpoint wins: a later parent `tool_result` can only
+    // supply an endpoint the block never had, never move one it reported. Without a
+    // recorded endpoint the label stays hidden (no wall-clock age is invented).
+    finish: (at: number | undefined, recorded: boolean) => void;
+    // Non-terminal transition (root tile): drop a local end and tick while active.
+    // A recorded block keeps its stamps (hydration/replay path).
+    reopen: (active: boolean) => void;
+    paint: () => void;
+    stop: () => void;
+    // One request's usage, from that block's own `usage` events.
+    noteUsage: (usage: HarnessUsage | undefined) => void;
+    // Authoritative cumulative tally (the root tile's `SessionTurn.usage`).
+    setTally: (usage: HarnessUsage | undefined) => void;
+    // Forget the per-event usage a discarded projection contributed; the tally is
+    // kept because the caller re-applies it from the record after the rebuild.
+    clearUsage: () => void;
+    recorded: () => boolean;
+};
+
+const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMeta => {
+    const elapsed = el('span', classes.elapsed);
+    elapsed.hidden = true;
+    const tokens = el('span', classes.tokens);
+    tokens.hidden = true;
+
+    // Timing baseline. `endedAt` undefined means "no end known"; the label is then
+    // either LIVE (read `startedAt → now`, gated by `nowAllowed`) or UNAVAILABLE and
+    // hidden. A recorded/replayed block is never `nowAllowed`: its duration must come
+    // from recorded stamps only, so no wall-clock age is invented (F1).
+    let startedAt: number | undefined;
+    let endedAt: number | undefined;
+    let tick: number | undefined;
+    let recorded = false;
+    // True only while a `now`-based span is honest: the live/streaming root tile and
+    // a live child invocation. A replayed block keeps this false.
+    let nowAllowed = false;
+
+    // Two token scopes (see the token tally block in `create`): the LATEST request's
+    // input and the cumulative cached input. `tally` is the server's authoritative
+    // sum; the per-event sum is the legacy fallback.
+    let tally: HarnessUsage | undefined;
+    let latestInput: number | undefined;
+    let eventCached = 0;
+    let eventCachedReported = false;
+
+    // Same grouping as the visible figure, for the explanatory title only.
+    const titleNumber = new Intl.NumberFormat('en-US');
+    const titleCount = (value: number): string => titleNumber.format(Math.trunc(Math.max(value, 0)));
+
+    const paint = (): void => {
+        // A recorded span exists ONLY when both endpoints are recorded. Reading the
+        // clock for a replayed block would turn a replay's wall age (hours/days)
+        // into a fake duration; such a label stays hidden instead.
+        const span =
+            endedAt !== undefined
+                ? elapsedBetween(startedAt, endedAt)
+                : nowAllowed
+                  ? elapsedBetween(startedAt, Date.now())
+                  : undefined;
+
+        elapsed.textContent = span === undefined ? '' : formatDuration(span);
+        elapsed.hidden = span === undefined;
+    };
+
+    const stop = (): void => {
+        if (tick === undefined) return;
+
+        window.clearInterval(tick);
+        tick = undefined;
+    };
+
+    const startTick = (): void => {
+        // Quarter second: enough resolution to look live, cheap enough to ignore.
+        if (tick !== undefined || startedAt === undefined || endedAt !== undefined) return;
+
+        tick = window.setInterval(paint, 250);
+    };
+
+    const paintTokens = (): void => {
+        // Latest reported context; fall back to the cumulative input only when no
+        // usage event was recorded (never on a live/hydrated block that has one, so
+        // the two scopes cannot silently collapse).
+        const input = latestInput ?? tally?.input;
+        const cached = tally?.cached ?? (eventCachedReported ? eventCached : undefined);
+        const text = formatTokens(input, cached);
+
+        tokens.textContent = text;
+        tokens.hidden = text.length === 0;
+
+        if (text.length === 0) {
+            tokens.removeAttribute('title');
+            return;
+        }
+
+        // R2: the compact numbers alone cannot express that they measure different
+        // scopes. The title spells it out for both sighted and assistive readers
+        // without adding a second visible line.
+        const context = input === undefined ? 'unknown' : titleCount(input);
+        const cache = cached === undefined ? 'unknown' : titleCount(cached);
+        const scope =
+            latestInput === undefined && tally !== undefined
+                ? 'Cumulative input (latest request not recorded)'
+                : 'Latest request context';
+        tokens.title =
+            `${scope}: ${context} input tokens · ` + `Total cached input sent: ${cache} tokens`;
+    };
+
+    const settle = (timing: { startedAt?: number; endedAt?: number }): void => {
+        // Assign explicitly: an unknown server start must stay unknown, not fall
+        // back to "now" (which would render a fabricated 0ms).
+        recorded = true;
+        // The server baseline is the LIVE turn view: a running record has no end
+        // stamp and legitimately counts up from `startedAt`; a terminal record always
+        // carries `updatedAt` as `endedAt`, so no clock is read for it.
+        nowAllowed = true;
+        startedAt = finiteOf(timing.startedAt);
+        endedAt = finiteOf(timing.endedAt);
+
+        stop();
+        paint();
+        if (endedAt === undefined) startTick();
+    };
+
+    const begin = (at: number | undefined, isRecorded: boolean): void => {
+        if (at === undefined || startedAt !== undefined) return;
+
+        recorded = isRecorded;
+        // A recorded (replayed) invocation has no live view: its span exists only
+        // once a recorded END stamp does (see `paint`). Reading `Date.now()` there
+        // would report the replay's wall age as the child's duration.
+        nowAllowed = !isRecorded;
+        startedAt = at;
+
+        paint();
+        if (nowAllowed) startTick();
+    };
+
+    const bindStart = (at: number): void => {
+        // A bound server start is the live tile's baseline: count up until an end.
+        startedAt = at;
+        nowAllowed = true;
+
+        paint();
+        startTick();
+    };
+
+    const finish = (at: number | undefined, isRecorded: boolean): void => {
+        stop();
+        // Freeze the live view first: after this point only recorded/known endpoints
+        // may describe the span.
+        nowAllowed = false;
+
+        // FIRST endpoint wins. A child that reported its own `done` at +3s must not
+        // be stretched by the parent's later `tool_result` (+19s); that result may only
+        // supply an endpoint the invocation never had.
+        if (startedAt !== undefined && endedAt === undefined) {
+            if (at !== undefined) endedAt = at;
+            else if (!isRecorded) endedAt = Date.now();
+            // A recorded block with no end stamp stays UNAVAILABLE: `paint` hides it
+            // rather than freezing a wall-clock age that was never measured.
+        }
+
+        paint();
+    };
+
+    const reopen = (active: boolean): void => {
+        if (recorded) {
+            // Hydration/replay: the record owns the span, so a replay transition must
+            // not clear its end or restart a local tick.
+            paint();
+            return;
+        }
+
+        endedAt = undefined;
+        nowAllowed = true;
+
+        if (active) {
+            if (startedAt === undefined) startedAt = Date.now();
+            startTick();
+        }
+
+        paint();
+    };
+
+    const noteUsage = (usage: HarnessUsage | undefined): void => {
+        if (usage === undefined) return;
+
+        const reported = finiteOf(usage.input);
+        if (reported !== undefined) latestInput = reported;
+
+        const cached = finiteOf(usage.cached);
+        if (cached !== undefined) {
+            eventCachedReported = true;
+            eventCached += Math.max(cached, 0);
+        }
+
+        paintTokens();
+    };
+
+    return {
+        elapsed,
+        tokens,
+        settle,
+        begin,
+        bindStart,
+        finish,
+        reopen,
+        paint,
+        stop,
+        noteUsage,
+        setTally(usage?: HarnessUsage): void {
+            tally = usage;
+            paintTokens();
+        },
+        clearUsage(): void {
+            latestInput = undefined;
+            eventCached = 0;
+            eventCachedReported = false;
+            paintTokens();
+        },
+        recorded: () => recorded
+    };
+};
+
 type AgentSection = {
     root: HTMLElement;
     flow: HTMLElement;
@@ -361,6 +639,10 @@ type ThreadState = 'queued' | 'streaming' | 'done' | 'error' | 'cancelled';
 type ThreadEntry = {
     key: string;
     agent: string;
+    // Compact display label (`RH1`), allocated once when this invocation's block is
+    // created (ui/agent-label.ts). The raw `agent` id stays here for colour/routing
+    // but is never written as text (R2/R3).
+    label: string;
     input: string | undefined;
     callId: string | undefined;
     // Parent invocation key. Undefined means "child of the turn root" — the
@@ -381,7 +663,14 @@ type ThreadEntry = {
     tile: HTMLElement | undefined;
     body: HTMLElement | undefined;
     select: HTMLButtonElement | undefined;
+    // Compressed header metadata: the nested counterpart of `.tile-top`
+    // (`elapsed | tokens | status`, R1). The root entry has no header of its own —
+    // the tile's own `BlockMeta` covers it — so this is undefined there.
+    meta: BlockMeta | undefined;
+    // The state word inside `.thread-status`. Kept separate so the compact CSS can
+    // clip the WORD (`.thread-status-text`) while the outer span keeps the layout.
     status: HTMLElement | undefined;
+    statusText: HTMLElement | undefined;
     preview: HTMLElement | undefined;
     prompt: HTMLElement | undefined;
     outcome: HTMLElement | undefined;
@@ -405,6 +694,9 @@ const isTerminalThread = (state: ThreadState): boolean =>
 type PendingTool = {
     card: ToolCallCard;
     section: AgentSection;
+    // Invocation that owns the card. Kept with the call so a result stamps the
+    // right block's clock (same-agent siblings have separate sections, R1/R3).
+    entry: ThreadEntry;
     name: string;
     callId: string | undefined;
     startedAt: number | undefined;
@@ -415,7 +707,6 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
     const turns: TurnHandle[] = [];
     let expandedTurn: TurnHandle | undefined;
-    let sequence = 0;
 
     // The empty state lives inside the grid so it inherits the same width and
     // padding; it is removed when the first turn starts and restored on clear.
@@ -445,15 +736,13 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         expandedTurn = undefined;
     };
 
-    const begin = (prompt: string): TurnHandle => {
-        sequence += 1;
-        return create(prompt, sequence);
-    };
+    const begin = (prompt: string): TurnHandle => create(prompt);
 
-    // One tile, shared by the optimistic `begin` path and server adoption. The
-    // label is the 1-based display position; a server turn overrides it through
-    // `bind()` so a hydrated transcript is numbered by the server's `index`.
-    const create = (prompt: string, label: number): TurnHandle => {
+    // One tile, shared by the optimistic `begin` path and server adoption. R3: the
+    // tile no longer paints a `#position` ordinal; the server's `index` still binds
+    // (protocol/ordering) but is never displayed. The agent identity in the header
+    // is the compact per-turn label (`RH1`), not a raw agent id.
+    const create = (prompt: string): TurnHandle => {
         empty?.remove();
 
         const id = `turn-${++nextId}`;
@@ -479,19 +768,14 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         select.setAttribute('aria-controls', `${id}-body`);
 
         const top = el('span', 'tile-top');
-        const index = el('span', 'tile-index', `#${label}`);
-        // Server-recorded or live elapsed time. Painted from `startedAt`; hidden
-        // when the span is unknown (legacy fixture), never "NaN".
-        const elapsedLabel = el('span', 'tile-elapsed');
-        elapsedLabel.hidden = true;
-        // Token tally, right after the elapsed label: the latest request's input
-        // context with the turn's cumulative cached input in brackets
-        // (`150 (140)`, different scopes; the title explains both). Hidden until
-        // the first request reports usage, so a provider that sends none leaves the
-        // header clean instead of claiming "0". The `|` separator is CSS
-        // decoration (styles.css), not part of either value.
-        const tokensLabel = el('span', 'tile-tokens');
-        tokensLabel.hidden = true;
+        // Compact block metadata (R1): the elapsed clock and the token tally. ONE
+        // shared implementation (`createBlockMeta`) paints the main tile and every
+        // nested entry, so both headers tick, hide and format identically. The
+        // elapsed label stays hidden until a real span exists (never "NaN" or a
+        // fabricated "0ms"); the tally stays hidden until a request reports usage.
+        // The `|` between them is CSS decoration (styles.css), not part of either
+        // value.
+        const blockMeta = createBlockMeta({ elapsed: 'tile-elapsed', tokens: 'tile-tokens' });
         const badge = el('span', 'tile-status');
         badge.dataset.state = 'queued';
         // No decorative dot: the status is TEXT (`tile-status-text`), visible on
@@ -502,8 +786,17 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
         const promptPreview = el('span', 'tile-prompt', plainPreview(prompt, 220));
         const meta = el('span', 'tile-meta', 'waiting for the first event');
-        top.append(index, elapsedLabel, tokensLabel, badge);
-        select.append(top, promptPreview, meta);
+        // R1/R2: the root block's compact header carries the SAME agent code a nested
+        // block shows (`.tile-agent`, group-styled with `.thread-name`). It stays
+        // hidden until an event names the root agent (`rootSection` fills it from the
+        // per-turn label allocator), so an optimistic tile never claims an identity.
+        const tileAgent = el('span', 'tile-agent');
+        tileAgent.hidden = true;
+        // R3: no `#ordinal` span. The header group is the metadata cluster
+        // (`elapsed | tokens | status`) only; the turn's protocol `index` is bound
+        // for ordering/identity but never displayed.
+        top.append(blockMeta.elapsed, blockMeta.tokens, badge);
+        select.append(tileAgent, top, promptPreview, meta);
 
         const body = el('div', 'tile-body');
         body.id = `${id}-body`;
@@ -545,50 +838,17 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
         // --- timing --------------------------------------------------------
         // A queued tile has NO clock (R4): the task may wait behind another run for
-        // minutes, and counting that wait would be a lie. `startedAt` is set when
-        // the tile actually starts working (`waiting`/`streaming`), or replaced by
-        // the server's `startedAt` through `bind()`/`setTiming()`. `endedAt` is set
-        // when the turn settles: the local clock for a live run, `updatedAt` on
-        // hydration (which is why a poll/rebuild never resets the shown duration).
-        let startedAt: number | undefined;
-        let endedAt: number | undefined;
-        let elapsedTick: number | undefined;
-        // True once `setTiming` supplied recorded server stamps. A replay calls
-        // `apply`/`setState` for every recorded event, and those must not wipe
-        // the hydrated `endedAt` or start a local tick.
-        let recordedTiming = false;
-
-        const paintElapsed = (): void => {
-            const span = elapsedBetween(startedAt, endedAt ?? Date.now());
-            elapsedLabel.textContent = span === undefined ? '' : formatDuration(span);
-            elapsedLabel.hidden = span === undefined;
-        };
-
-        const stopElapsed = (): void => {
-            if (elapsedTick === undefined) return;
-
-            window.clearInterval(elapsedTick);
-            elapsedTick = undefined;
-        };
-
-        const startElapsed = (): void => {
-            if (elapsedTick !== undefined || endedAt !== undefined || startedAt === undefined) return;
-
-            // The label renders tenths of a second, so the tick is a quarter
-            // second: enough resolution to look live, cheap enough to ignore.
-            elapsedTick = window.setInterval(paintElapsed, 250);
-        };
+        // minutes, and counting that wait would be a lie. `bind()` supplies the
+        // server's start and `setTiming` the recorded baseline; the clock state
+        // itself lives in `blockMeta`, because a nested entry header needs the
+        // identical behaviour (R1) and only one implementation should own it.
+        const paintElapsed = (): void => blockMeta.paint();
+        const stopElapsed = (): void => blockMeta.stop();
 
         const setTiming = (timing: { startedAt?: number; endedAt?: number }): void => {
-            // Assign explicitly: an unknown server start must stay unknown, not
-            // fall back to "now" (which would render a fabricated 0ms).
-            recordedTiming = true;
-            startedAt = finiteOf(timing.startedAt);
-            endedAt = finiteOf(timing.endedAt);
-
-            stopElapsed();
-            paintElapsed();
-            startElapsed();
+            // Recorded stamps are authoritative and REPLAY-derived: a later
+            // `apply`/`setState` must not overwrite them with the local clock.
+            blockMeta.settle(timing);
         };
 
         // --- token tally ----------------------------------------------------
@@ -607,51 +867,15 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         // conservative fallback for a record whose events were trimmed/absent
         // (the latest request is then unknowable and the cumulative input is an
         // upper bound that never understates the context). See ui/tokens.ts.
-        let tally: HarnessUsage | undefined;
-        let latestInput: number | undefined;
-        let eventCached = 0;
-        let eventCachedReported = false;
+        // The figures themselves live in `blockMeta`, which also paints a nested
+        // entry's tally from that entry's own `usage` events (R1).
+        const setUsage = (usage?: HarnessUsage): void => blockMeta.setTally(usage);
 
-        // Same grouping as the visible figure, for the explanatory title only.
-        const titleNumber = new Intl.NumberFormat('en-US');
-        const titleCount = (value: number): string => titleNumber.format(Math.trunc(Math.max(value, 0)));
-
-        const paintTokens = (): void => {
-            // Latest reported context; fall back to the cumulative input only when
-            // no usage event was recorded (never on a live/hydrated turn that has
-            // one, so the two scopes cannot silently collapse).
-            const input = latestInput ?? tally?.input;
-            const cached = tally?.cached ?? (eventCachedReported ? eventCached : undefined);
-            const text = formatTokens(input, cached);
-
-            tokensLabel.textContent = text;
-            tokensLabel.hidden = text.length === 0;
-
-            // R2: the compact numbers alone cannot express that they measure
-            // different scopes. The title spells it out for both sighted and
-            // assistive readers without adding a second visible line.
-            if (text.length === 0) {
-                tokensLabel.removeAttribute('title');
-                return;
-            }
-
-            const context = input === undefined ? 'unknown' : titleCount(input);
-            const cache = cached === undefined ? 'unknown' : titleCount(cached);
-            // A legacy record with no events can only show the cumulative input;
-            // say so instead of claiming it is the latest request's context.
-            const scope =
-                latestInput === undefined && tally !== undefined
-                    ? 'Cumulative input (latest request not recorded)'
-                    : 'Latest request context';
-            tokensLabel.title =
-                `${scope}: ${context} input tokens · ` +
-                `Total cached input sent: ${cache} tokens`;
-        };
-
-        const setUsage = (usage?: HarnessUsage): void => {
-            tally = usage;
-            paintTokens();
-        };
+        // Compact agent labels (`RH1`, `RH2`, …): ONE allocator per turn, consumed
+        // once per invocation (root included). The raw agent id never reaches the
+        // header text (R2/R3); `resetProjection` clears it so a rebuilt turn
+        // re-numbers from 1 in recorded order.
+        const labels = createAgentLabels();
 
         // One entry per INVOCATION in this turn. The map is keyed by the canonical
         // invocation key (runtime `thread.id`, synthesized placeholder key, or
@@ -659,6 +883,11 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         // merge two known invocations: adoption REKEYS a placeholder, it does not
         // append a duplicate.
         const threads = new Map<string, ThreadEntry>();
+        // Invocation keys the reader has expanded (R1, independent child expansion).
+        // Kept OUTSIDE the entries so a rebuilt projection (`resetProjection` on a
+        // superseding record) reopens the SAME invocations instead of collapsing
+        // what the reader was reading.
+        const expandedThreads = new Set<string>();
         // Calls whose result has not arrived yet.
         const pendingTools: PendingTool[] = [];
         // Call ids already settled on this tile — a result applied, or a card
@@ -704,8 +933,10 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             // started (cancelled while queued) had no span, so leave the label
             // hidden rather than printing a fabricated 0ms.
             if (next === 'done' || next === 'error' || next === 'cancelled') {
-                if (startedAt !== undefined && endedAt === undefined && !recordedTiming) endedAt = Date.now();
-                stopElapsed();
+                // `finish` freezes the span: a non-recorded run ends at the local
+                // clock, a recorded one keeps the server's `updatedAt` (or the last
+                // span it painted when the record carried no end stamp).
+                blockMeta.finish(undefined, blockMeta.recorded());
                 // The turn is over, so nothing can still be pending: drop the
                 // waiting line first (R6). A call left unsettled is INTERRUPTED —
                 // cancel/restart never resumes it — so it is abandoned with a reason
@@ -743,16 +974,16 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 for (const entry of threads.values()) {
                     if (entry.row === undefined || isTerminalThread(entry.state)) continue;
                     completeThread(entry, next, reason);
+                    // The server will send no further event for this child, so freeze
+                    // its block clock at the local observation (R1). A recorded child
+                    // keeps its last painted span.
+                    if (entry.meta !== undefined) entry.meta.finish(undefined, entry.meta.recorded());
                 }
-            } else if (!recordedTiming) {
-                endedAt = undefined;
-
-                // The clock starts only when the task actually runs (R4). `queued`
-                // deliberately does not start it; `waiting`/`streaming` do.
-                if (next === 'waiting' || next === 'streaming') {
-                    if (startedAt === undefined) startedAt = Date.now();
-                    startElapsed();
-                }
+            } else {
+                // A non-terminal transition: clear a local end and tick while the task
+                // actually runs (R4 — `queued` deliberately does not start a clock).
+                // A recorded baseline keeps its stamps: hydration/replay owns them.
+                blockMeta.reopen(isLive(next));
             }
 
             paintElapsed();
@@ -778,10 +1009,16 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         // context): R3 removed the visible role badge, because a nested block is
         // the same surface as a main block and is told apart by indentation plus
         // its agent colour, not by the word "subagent".
+        //
+        // `label` is the compact per-turn agent code (`RH1`) allocated once by the
+        // caller for THIS invocation: the section header shows the code, never the
+        // raw agent id (R2/R3). The id is still mirrored on `data-agent` by
+        // `paintAgentColor` for colour/routing.
         const createSection = (
             container: HTMLElement,
             agentName: string,
-            role: 'primary' | 'subagent'
+            role: 'primary' | 'subagent',
+            label: string
         ): AgentSection => {
             const root = el('section', 'agent');
             root.dataset.role = role;
@@ -792,7 +1029,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             paintAgentColor(root, agentName);
 
             const head = el('header', 'agent-head');
-            head.append(el('span', 'agent-name', agentName));
+            head.append(el('span', 'agent-name', label));
 
             const sectionFlow = el('div', 'agent-flow');
             const agentMeta = el('div', 'agent-meta');
@@ -825,6 +1062,11 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             entry.row.classList.toggle('is-expanded', expanded);
             entry.tile?.classList.toggle('is-expanded', expanded);
             entry.select?.setAttribute('aria-expanded', String(expanded));
+
+            // Remember the reader's choice by canonical key so a projection rebuild
+            // can restore it (the entry objects are recreated, the keys are stable).
+            if (expanded) expandedThreads.add(entry.key);
+            else expandedThreads.delete(entry.key);
         };
 
         // Where a child row belongs. A parent with a row has a children host AFTER
@@ -904,7 +1146,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             // The tile mirrors the state for the shared block-surface rules
             // (`:is(.tile, .thread-tile)[data-state=…]`, styles.css R3).
             if (entry.tile !== undefined) entry.tile.dataset.state = state;
-            if (entry.status !== undefined) entry.status.textContent = STATE_TEXT[state];
+            if (entry.status !== undefined) entry.status.dataset.state = state;
+            if (entry.statusText !== undefined) entry.statusText.textContent = STATE_TEXT[state];
         };
 
         // Outcome line for one invocation. FIRST outcome wins: a replay can deliver
@@ -928,6 +1171,36 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             if (isTerminalThread(entry.state)) return;
 
             setThreadState(entry, state);
+        };
+
+        // --- nested block metadata (R1) ------------------------------------
+        // The FIRST event routed to an invocation starts its own clock; the event
+        // that settles it freezes the span. There is no server record for a nested
+        // block, so `at`/`eventTimes` are the only honest source: a recorded replay
+        // without a stamp leaves the clock unknown instead of inventing one. The
+        // root invocation has no `entry.meta` — the tile's server-driven
+        // `blockMeta` covers it.
+        const observeInvocation = (
+            entry: ThreadEntry,
+            at: number | undefined,
+            origin: ApplyOrigin
+        ): void => {
+            if (entry.meta === undefined) return;
+
+            entry.meta.begin(at ?? (origin === 'live' ? Date.now() : undefined), origin === 'recorded');
+        };
+
+        // Freeze a nested block's clock. `at` is the settling event's server stamp;
+        // a live event without one ends at the local clock, a recorded one keeps the
+        // last painted span (never a fabricated duration).
+        const settleInvocation = (
+            entry: ThreadEntry,
+            at: number | undefined,
+            origin: ApplyOrigin
+        ): void => {
+            if (entry.meta === undefined) return;
+
+            entry.meta.finish(at, origin === 'recorded');
         };
 
         // The placeholder created when an `agentDelegate` tool call was observed,
@@ -999,13 +1272,25 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             select.setAttribute('aria-expanded', 'false');
             select.setAttribute('aria-controls', bodyId);
 
-            // R4: the whole collapsed entry is ONE row — `name · preview · status`,
-            // exactly like a compact turn tile's `prompt · metadata` row. The
-            // preview therefore lives INSIDE `.thread-top` (between the name and the
-            // status) instead of on a second line; CSS ellipsises it.
+            // R4/R1: the whole collapsed entry is ONE row, with the SAME anatomy as a
+            // compact turn tile — `name · preview · [elapsed | tokens] status`. The
+            // agent code leads (the tile's prompt is its own leading item), the preview
+            // is the single flexible, ellipsised item, and the metadata cluster
+            // (`.thread-top`) is the nested counterpart of `.tile-top`. Both clusters
+            // carry the same two labels from the shared `createBlockMeta`, so a child
+            // block shows its own duration and usage when its events report them.
+            const label = labels.next(options.agent);
+            const name = el('span', 'thread-name', label);
+            const blockMeta = createBlockMeta({ elapsed: 'thread-elapsed', tokens: 'thread-tokens' });
+            // Status stays TEXT: the word is clipped (not removed) on a compact row,
+            // exactly like `.tile-status-text`, and colour only reinforces it.
+            const status = el('span', 'thread-status');
+            status.dataset.state = options.state;
+            const statusText = el('span', 'thread-status-text', STATE_TEXT[options.state]);
+            status.append(statusText);
+
             const top = el('span', 'thread-top');
-            const name = el('span', 'thread-name', options.agent);
-            const status = el('span', 'thread-status', STATE_TEXT[options.state]);
+            top.append(blockMeta.elapsed, blockMeta.tokens, status);
             const preview = el(
                 'span',
                 'thread-preview',
@@ -1013,8 +1298,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     ? 'delegated task'
                     : plainPreview(options.input, 160)
             );
-            top.append(name, preview, status);
-            select.append(top);
+            select.append(name, preview, top);
 
             const body = el('div', 'thread-body');
             body.id = bodyId;
@@ -1037,6 +1321,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             const entry: ThreadEntry = {
                 key: options.key,
                 agent: options.agent,
+                label,
                 input: options.input,
                 callId: options.callId,
                 parentKey: options.parentKey,
@@ -1044,12 +1329,14 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 explicitId: options.explicitId,
                 started: options.started,
                 state: options.state,
-                section: createSection(threadFlow, options.agent, 'subagent'),
+                section: createSection(threadFlow, options.agent, 'subagent', label),
                 row: threadRow,
                 tile,
                 body,
                 select,
+                meta: blockMeta,
                 status,
+                statusText,
                 preview,
                 prompt: undefined,
                 outcome,
@@ -1062,6 +1349,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             if (options.input !== undefined) renderThreadPrompt(entry, options.input);
 
             threads.set(options.key, entry);
+            // R1: restore the reader's expansion across a rebuilt projection.
+            if (expandedThreads.has(options.key)) setThreadExpanded(entry, true);
             updateMeta();
             return entry;
         };
@@ -1087,10 +1376,21 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             // attribute.
             paintAgentColor(card, agentName);
 
-            const section = createSection(flow, agentName, 'primary');
+            // The root invocation consumes the first occurrence of its agent (the
+            // requirement counts the entry agent too, R2). Its header label lives in
+            // the section head; the tile header itself carries the metadata cluster.
+            const label = labels.next(agentName);
+            const section = createSection(flow, agentName, 'primary', label);
+            // R1/F3: the compact root header shows the same code as a child header.
+            // The section's own `.agent-head` is hidden by CSS for the primary part
+            // (the code would otherwise appear twice); flat legacy subagent sections
+            // keep their head because they are DIFFERENT agents that need telling apart.
+            tileAgent.textContent = label;
+            tileAgent.hidden = false;
             threads.set(ROOT_KEY, {
                 key: ROOT_KEY,
                 agent: agentName,
+                label,
                 input: undefined,
                 callId: undefined,
                 parentKey: undefined,
@@ -1103,7 +1403,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 tile: undefined,
                 body: undefined,
                 select: undefined,
+                meta: undefined,
                 status: undefined,
+                statusText: undefined,
                 preview: undefined,
                 prompt: undefined,
                 outcome: undefined,
@@ -1130,10 +1432,15 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 return rootSection(agentName);
             }
 
-            const section = createSection(flow, agentName, 'subagent');
+            // The flat legacy block consumes one occurrence, like any other
+            // invocation of that agent; the same label goes to the header and to the
+            // entry (R2).
+            const label = labels.next(agentName);
+            const section = createSection(flow, agentName, 'subagent', label);
             threads.set(key, {
                 key,
                 agent: agentName,
+                label,
                 input: undefined,
                 callId: undefined,
                 parentKey: undefined,
@@ -1146,7 +1453,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 tile: undefined,
                 body: undefined,
                 select: undefined,
+                meta: undefined,
                 status: undefined,
+                statusText: undefined,
                 preview: undefined,
                 prompt: undefined,
                 outcome: undefined,
@@ -1184,6 +1493,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             entry.row?.setAttribute('data-thread-id', meta.id);
             threads.set(meta.id, entry);
 
+            // The reader's expansion follows the entry to its canonical key.
+            if (expandedThreads.delete(previousKey)) expandedThreads.add(meta.id);
+
             // Descendants (synthetic nested metadata, or a grandchild that started
             // before the parent's explicit record) follow the rekey so depth
             // recomputation and future nesting keep pointing at this entry.
@@ -1197,6 +1509,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
             entry.started = true;
             setThreadState(entry, 'streaming');
+            // R1: an adopted entry inherits the reader's expansion for its canonical
+            // key (the placeholder was created under the synthesized key).
+            if (expandedThreads.has(entry.key)) setThreadExpanded(entry, true);
         };
 
         // Resolve an explicit `thread` record to its entry. The first record for an
@@ -1287,8 +1602,6 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
             return entryForLegacy(event);
         };
-
-        const sectionFor = (event: HarnessEvent): AgentSection => entryFor(event).section;
 
         const renderText = (block: TextBlock): void => {
             block.node.replaceChildren(markdownFragment(block.buffer));
@@ -1490,7 +1803,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             toolGroupOf(section).append(card.element);
             // A new call must appear ABOVE the pending summary line, never below it.
             if (section.pending !== undefined) section.flow.append(section.pending);
-            pendingTools.push({ card, section, name, callId, startedAt });
+            pendingTools.push({ card, section, entry, name, callId, startedAt });
             toolCount += 1;
 
             // Queued delegation placeholder (legacy fallback, R3): the entry appears
@@ -1522,10 +1835,11 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         };
 
         // Outcome of applying one `tool_result`: which card it settled (undefined for
-        // an ignored duplicate/late frame) and that card's owning section. The caller
-        // uses it to prune the per-call pending display without treating an absent
-        // `pending` field as a global drain.
-        type ResolvedTool = { section: AgentSection; callId: string | undefined };
+        // an ignored duplicate/late frame) and that card's owning section/entry. The
+        // caller uses it to prune the per-call pending display without treating an
+        // absent `pending` field as a global drain, and to stamp the owning
+        // invocation's block clock (R1).
+        type ResolvedTool = { entry: ThreadEntry; section: AgentSection; callId: string | undefined };
 
         const resolveTool = (
             name: string,
@@ -1570,7 +1884,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     isError,
                     durationMs ?? elapsedBetween(tool.startedAt, finishedAt)
                 );
-                return { section: tool.section, callId: tool.callId };
+                return { entry: tool.entry, section: tool.section, callId: tool.callId };
             }
 
             // No running call for this result. Once the turn is terminal, any such
@@ -1583,14 +1897,15 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             // reports results without calls, or a missed tool_call): show it rather
             // than dropping information. It belongs to the root invocation when one
             // emitted, otherwise to a truthful flat section for that agent name.
-            const section = threads.get(ROOT_KEY)?.section ?? inlineSection(primaryAgent ?? UNNAMED_AGENT_PLACEHOLDER);
+            const owner = threads.get(ROOT_KEY) ?? inlineEntry(primaryAgent ?? UNNAMED_AGENT_PLACEHOLDER);
+            const section = owner.section;
             const card = createToolCallCard(name, '');
             card.resolve(content, isError);
             toolGroupOf(section).append(card.element);
             section.tools.push(card);
             toolCount += 1;
             updateMeta();
-            return { section, callId: undefined };
+            return { entry: owner, section, callId: undefined };
         };
 
         // Discard everything the browser rendered from a now-superseded event
@@ -1601,6 +1916,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             for (const entry of threads.values()) {
                 if (entry.section.text !== undefined) cancel(entry.section.text);
                 for (const tool of entry.section.tools) tool.destroy();
+                // Stop the nested clock too: the rebuilt projection creates new
+                // entries, and a surviving interval would paint detached DOM forever.
+                entry.meta?.stop();
             }
 
             threads.clear();
@@ -1616,9 +1934,14 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             appliedEvents.length = 0;
             // Token figures derived from the discarded events must go too; the
             // server tally is re-applied by the caller after the rebuild.
-            latestInput = undefined;
-            eventCached = 0;
-            eventCachedReported = false;
+            blockMeta.clearUsage();
+            // R2: the rebuilt pass re-numbers the agents from 1 in recorded order, so
+            // a replayed turn always shows the same labels.
+            labels.reset();
+            // The root code belongs to the discarded projection: hide it until the
+            // replay's `rootSection` names the root agent again (F3).
+            tileAgent.textContent = '';
+            tileAgent.hidden = true;
         };
 
         // --- events -------------------------------------------------------
@@ -1634,6 +1957,40 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             appliedCount += 1;
             appliedEvents.push(event);
 
+            // Route an event to its invocation and stamp that block's clock on the
+            // first event it receives (R1). ONE entry point, so every handler below
+            // observes the same "this invocation is running" moment.
+            const route = (): ThreadEntry => {
+                const entry = entryFor(event);
+                observeInvocation(entry, at, origin);
+                return entry;
+            };
+
+            // The block that emitted a `usage` event, WITHOUT creating one: usage is
+            // a metadata frame, so it must never mint a section for an agent that
+            // sent nothing else. `thread` metadata is authoritative; otherwise the
+            // same legacy rules the tile uses (root agent, or the single started
+            // non-terminal invocation of that agent).
+            const usageOwner = (): ThreadEntry | undefined => {
+                const info = threadOf(event);
+                if (info !== undefined) return threads.get(info.id);
+
+                const root = threads.get(ROOT_KEY);
+                if (root !== undefined && event.agent === root.agent) return root;
+
+                let found: ThreadEntry | undefined;
+                let count = 0;
+                for (const candidate of threads.values()) {
+                    if (candidate.row === undefined) continue;
+                    if (candidate.agent !== event.agent || !candidate.started) continue;
+                    if (isTerminalThread(candidate.state)) continue;
+                    found = candidate;
+                    count += 1;
+                }
+
+                return count === 1 ? found : threads.get(`inline:${event.agent}`);
+            };
+
             // Background-tool wakeup (R6). A wake is a RESUME, so it must not
             // settle the tile, resolve a card, or stop any timer — it only makes
             // the un-parking visible and replaces the pending snapshot the server
@@ -1642,7 +1999,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             // (absence must not claim "everything settled").
             const wakeup = wakeupOf(event);
             if (wakeup !== undefined) {
-                const entry = entryFor(event);
+                const entry = route();
                 appendWakeup(entry.section, wakeup.pending);
                 paintPending(entry.section, wakeup.pending);
                 updateMeta();
@@ -1651,7 +2008,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
             switch (event.type) {
                 case 'start': {
-                    const entry = entryFor(event);
+                    const entry = route();
                     const section = entry.section;
                     section.root.dataset.model = event.model;
 
@@ -1673,22 +2030,15 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 }
 
                 case 'reasoning':
-                    appendReasoning(sectionFor(event), event.delta);
+                    appendReasoning(route().section, event.delta);
                     break;
 
                 case 'text':
-                    appendText(sectionFor(event), event.delta);
+                    appendText(route().section, event.delta);
                     break;
 
                 case 'tool_call':
-                    appendTool(
-                        entryFor(event),
-                        event.call.name,
-                        event.call.arguments,
-                        event.call.id,
-                        at,
-                        origin
-                    );
+                    appendTool(route(), event.call.name, event.call.arguments, event.call.id, at, origin);
                     break;
 
                 case 'tool_result': {
@@ -1704,6 +2054,10 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     );
 
                     if (outcome !== undefined) {
+                        // The settling event is also this invocation's clock stamp
+                        // (a call can be the first thing an invocation does).
+                        observeInvocation(outcome.entry, at, origin);
+
                         // A PRESENT array is the server's authoritative snapshot for
                         // that agent; otherwise the call that just settled is pruned
                         // from the per-call map. Absence alone is never read as "the
@@ -1721,7 +2075,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     // with pending work is not terminal, and a delegation cancelled
                     // before the child ever started still resolves its placeholder
                     // here. Matching is by callId, so same-agent siblings settle the
-                    // right entry.
+                    // right entry. Its block clock freezes at this event's stamp.
                     if (callId !== undefined) {
                         const child = findThreadByCallId(callId);
                         if (child !== undefined) {
@@ -1731,6 +2085,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                                 event.isError ? 'error' : 'done',
                                 `${event.isError ? 'error' : 'outcome'} · ${preview.length === 0 ? 'no output' : preview}`
                             );
+                            settleInvocation(child, at, origin);
                         }
                     }
                     break;
@@ -1744,22 +2099,20 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 // legacy/missing-tally path and refreshes the latest context on
                 // every live usage event. A missing cache figure stays absent
                 // (never zero-filled).
+                //
+                // R1: the NESTED block that emitted the request also shows its own
+                // usage (`thread-tokens`), from exactly these events; the root block
+                // keeps the turn-wide figure below.
                 case 'usage': {
-                    const reported = finiteOf(event.usage.input);
-                    if (reported !== undefined) latestInput = reported;
+                    const owner = usageOwner();
+                    if (owner?.meta !== undefined) owner.meta.noteUsage(event.usage);
 
-                    const cached = finiteOf(event.usage.cached);
-                    if (cached !== undefined) {
-                        eventCachedReported = true;
-                        eventCached += Math.max(cached, 0);
-                    }
-
-                    paintTokens();
+                    blockMeta.noteUsage(event.usage);
                     break;
                 }
 
                 case 'done': {
-                    const entry = entryFor(event);
+                    const entry = route();
                     const section = entry.section;
                     closeText(section);
                     // The agent turn is over: a later call in a new turn gets its
@@ -1802,12 +2155,13 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     // still attach its outcome (see `completeThread`).
                     if (entry.row !== undefined && (pending === undefined || pending.length === 0)) {
                         completeThread(entry, 'done');
+                        settleInvocation(entry, at, origin);
                     }
                     break;
                 }
 
                 case 'error': {
-                    const entry = entryFor(event);
+                    const entry = route();
                     const section = entry.section;
                     closeText(section);
                     // The error notice is not a chip, so the next call starts a
@@ -1818,9 +2172,11 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     section.flow.append(error);
 
                     // A child that reported its own failure is terminal; the parent's
-                    // tool_result (if any) only confirms it.
+                    // tool_result (if any) only confirms it. Its block clock freezes at
+                    // the failing event's stamp (R1).
                     if (entry.row !== undefined) {
                         completeThread(entry, 'error', `error · ${event.error.message}`);
+                        settleInvocation(entry, at, origin);
                     }
                     break;
                 }
@@ -1839,25 +2195,21 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             for (const entry of threads.values()) flushText(entry.section);
         };
 
-        // Attach the server identity. `index` is 0-based on the wire; tiles are
-        // numbered from 1 so the first turn reads "#1". A late bind (the opening
-        // `turn` frame) is normal, not an error: the optimistic tile existed
-        // before the request reached the server. When the start stamp arrives it
-        // replaces the local baseline, so a later hydrate and the live label agree.
+        // Attach the server identity. `index` is the server's 0-based position; it
+        // is KEPT for ordering/protocol identity but no longer rendered (R3 removed
+        // the visible `#ordinal`). A late bind (the opening `turn` frame) is normal,
+        // not an error: the optimistic tile existed before the request reached the
+        // server. When the start stamp arrives it replaces the local baseline, so a
+        // later hydrate and the live label agree.
         const bind = (server: Pick<SessionTurn, 'id' | 'index'> & { startedAt?: number }): void => {
             serverId = server.id;
             card.dataset.turnId = server.id;
-            index.textContent = `#${server.index + 1}`;
 
             // A queued turn has no `startedAt` yet (optional until execution), so a
             // queued tile keeps its clock hidden. Once the server supplies a start,
             // it replaces the local baseline and the tick resumes if still live.
             const serverStart = finiteOf(server.startedAt);
-            if (serverStart !== undefined) {
-                startedAt = serverStart;
-                paintElapsed();
-                if (isLive(state) && endedAt === undefined) startElapsed();
-            }
+            if (serverStart !== undefined) blockMeta.bindStart(serverStart);
         };
 
         // Reconcile this tile with an authoritative server record (R4). This is the
@@ -1937,6 +2289,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             for (const entry of threads.values()) {
                 if (entry.section.text !== undefined) cancel(entry.section.text);
                 for (const tool of entry.section.tools) tool.destroy();
+                // A nested entry ticks on its own clock; a cleared board or a hidden
+                // page must not keep it running.
+                entry.meta?.stop();
             }
         };
 
@@ -1952,8 +2307,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             id: () => serverId,
             bind,
             setTiming,
-            elapsed: () => elapsedLabel.textContent ?? '',
-            tokens: () => tokensLabel.textContent ?? '',
+            elapsed: () => blockMeta.elapsed.textContent ?? '',
+            tokens: () => blockMeta.tokens.textContent ?? '',
             setUsage,
             summary: () => ({ agents: threads.size, tools: toolCount, primary: primaryAgent }),
             destroy
@@ -1995,7 +2350,6 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         for (const node of [...element.querySelectorAll<HTMLElement>('.notice')]) node.remove();
 
         expandedTurn = undefined;
-        sequence = 0;
         if (empty !== undefined) element.append(empty);
     };
 
@@ -2032,9 +2386,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
     // than trusting browser state) is what makes a reload render the same
     // transcript: `events` includes subagent events the server recorded.
     const adopt = (source: SessionTurn, model?: string): TurnHandle => {
-        sequence += 1;
-
-        const handle = create(source.prompt, source.index + 1);
+        // R3: the server `index` is not rendered, so adoption only needs the prompt;
+        // the record's position is the list order (`reconcile` re-orders by record).
+        const handle = create(source.prompt);
         // One code path with `merge` keeps a freshly adopted tile and a reconciled
         // live tile identical: timing, events, tally and status all come from the
         // record, and `appliedCount` starts at zero for a new tile.

@@ -82,6 +82,26 @@ describe('agent profiles', () => {
         ]);
     });
 
+    // R5: the display title is the ONLY visible agent name in the picker, and every
+    // profile title is ONE word. The ids (`name`) stay untouched: they are the
+    // persisted harness/protocol identity, not a display string.
+    it('keeps every profile display title a single word', () => {
+        expect(agentProfiles().map((profile) => profile.title)).toEqual([
+            'Instruct',
+            'Researcher',
+            'Coder',
+            'Reviewer',
+            'Planner',
+            'Summarizer',
+            'Demo',
+            'Flaky'
+        ]);
+        // One word = exactly one whitespace-separated token per title.
+        expect(agentProfiles().map((profile) => profile.title.trim().split(/\s+/).length)).toEqual([
+            1, 1, 1, 1, 1, 1, 1, 1
+        ]);
+    });
+
     it('resolves ids and rejects unknown ones', () => {
         expect(agentProfile('summarizer')).toBe(summarizer);
         expect(agentProfile('reviewer')).toBe(reviewer);

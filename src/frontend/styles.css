@@ -1214,11 +1214,6 @@ button {
     cursor: default;
 }
 
-.agent-option-name {
-    font-family: var(--mono);
-    font-size: 12px;
-}
-
 .agent-option-title {
     color: var(--text);
     font-size: 12px;
@@ -1469,8 +1464,8 @@ button {
     line-height: 1.4;
 }
 
-/* The header group (index, elapsed, tally, badge) is the LAST item, so the row
-   reads prompt → metadata. It never shrinks: the badge is the state cue. */
+/* The header group (elapsed, tally, badge) is the LAST item, so the row reads
+   prompt → metadata. It never shrinks: the badge is the state cue. */
 .tile:not(.is-expanded) .tile-top {
     order: 2;
     flex: 0 0 auto;
@@ -1494,25 +1489,23 @@ button {
     white-space: nowrap;
 }
 
-/* Compact headers use the smallest type in the app so the index, clock, tally
-   and badge fit on one line; the ellipsis rules below are only a guard for
-   extreme values, not the normal rendering. */
-.tile:not(.is-expanded) .tile-index,
-.tile:not(.is-expanded) .tile-elapsed,
-.tile:not(.is-expanded) .tile-tokens,
-.tile:not(.is-expanded) .tile-status {
+/* Compact headers use the smallest type in the app so the clock, tally and badge
+   fit on one line; the ellipsis rules below are only a guard for extreme values,
+   not the normal rendering. R1: the nested block's metadata cluster is grouped in
+   here too, so a collapsed child row is the same height and register as a
+   collapsed parent row. R3: no `.tile-index` — the ordinal is gone from the DOM. */
+:is(.tile:not(.is-expanded), .thread-row:not(.is-expanded)) :is(.tile-elapsed, .thread-elapsed, .tile-tokens, .thread-tokens, .tile-status, .thread-status) {
     font-size: 10px;
 }
 
-.tile:not(.is-expanded) .tile-elapsed,
-.tile:not(.is-expanded) .tile-tokens {
+:is(.tile:not(.is-expanded), .thread-row:not(.is-expanded)) :is(.tile-elapsed, .thread-elapsed, .tile-tokens, .thread-tokens) {
     min-width: 0;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-.tile:not(.is-expanded) .tile-status {
+:is(.tile:not(.is-expanded), .thread-row:not(.is-expanded)) :is(.tile-status, .thread-status) {
     flex: 0 0 auto;
 }
 
@@ -1565,14 +1558,13 @@ button {
     min-width: 0;
 }
 
-.tile-index {
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 10.5px;
-}
+/* R3: no `.tile-index` rule exists — the turn ordinal was removed from the DOM,
+   so there is nothing to style. The server `index` still binds for ordering. */
 
-/* Live then frozen elapsed time. Text carries the value; no colour-only state. */
-.tile-elapsed {
+/* Live then frozen elapsed time. Text carries the value; no colour-only state.
+   R1: the same rule paints the NESTED header's clock (`.thread-elapsed`), so a
+   child block and the main block can never drift apart in typography/colour. */
+:is(.tile-elapsed, .thread-elapsed) {
     color: var(--muted);
     font-family: var(--mono);
     font-size: 10.5px;
@@ -1583,8 +1575,9 @@ button {
    next to the elapsed label.
    The `|` between them is decoration applied here rather than a character in
    either value, so each span stays a clean, copy-pastable number; it disappears
-   when the timer is hidden (a legacy record with no start stamp). */
-.tile-tokens {
+   when the timer is hidden (a legacy record with no start stamp). R1: grouped with
+   the nested `.thread-tokens` so both headers print the same figure format. */
+:is(.tile-tokens, .thread-tokens) {
     color: var(--muted);
     font-family: var(--mono);
     font-size: 10.5px;
@@ -1592,11 +1585,11 @@ button {
     white-space: nowrap;
 }
 
-.tile-elapsed:not([hidden]) + .tile-tokens:not([hidden])::before {
+:is(.tile-elapsed, .thread-elapsed):not([hidden]) + :is(.tile-tokens, .thread-tokens):not([hidden])::before {
     content: ' | ';
 }
 
-.tile-status {
+:is(.tile-status, .thread-status) {
     position: relative;
     display: inline-flex;
     align-items: center;
@@ -1612,8 +1605,10 @@ button {
 /* Compact tiles convey the state by colour and the activity ring below, so the
    status word would be a second visible label ("done" next to the meta line).
    It stays in the DOM for assistive tech — clipped, not removed. Expanded tiles
-   keep the word: there, the header is the only place the state is spelled out. */
-.tile:not(.is-expanded) .tile-status-text {
+   keep the word: there, the header is the only place the state is spelled out.
+   R1: the NESTED row's status word gets the identical treatment, so a collapsed
+   parent and a collapsed child both show state by colour, not by a second label. */
+:is(.tile:not(.is-expanded), .thread-row:not(.is-expanded)) :is(.tile-status-text, .thread-status-text) {
     position: absolute;
     width: 1px;
     height: 1px;
@@ -1741,6 +1736,10 @@ button {
 }
 
 .tile-meta {
+    /* R1/F3: after the metadata cluster in the expanded column, so the compact header
+       reads code → prompt → cluster and the expanded header reads code → cluster →
+       details (the compact copy of this line is absolutely positioned/sr-only). */
+    order: 3;
     margin-top: auto;
     color: var(--muted);
     font-family: var(--mono);
@@ -1749,7 +1748,10 @@ button {
     overflow-wrap: anywhere;
 }
 
-.tile-body {
+/* R1: the main block and the nested block share ONE body scale (padding, gap,
+   divider). Before this, a child's body was tighter than its parent's, so the two
+   surfaces read as different components. */
+:is(.tile-body, .thread-body) {
     display: flex;
     flex-direction: column;
     gap: 10px;
@@ -1757,7 +1759,9 @@ button {
     border-top: 1px solid var(--border);
 }
 
-.turn-prompt {
+/* R1: the prompt block is the same surface in both owners (a delegated task is the
+   child's "prompt"). One rule, so the accent bar/padding/type cannot drift. */
+:is(.turn-prompt, .thread-prompt) {
     padding: 9px 11px;
     border-left: 2px solid var(--accent);
     border-radius: 0 8px 8px 0;
@@ -1765,7 +1769,9 @@ button {
     font-size: 13px;
 }
 
-.tile-flow {
+/* R1: the agent flow is also one scale for both blocks: prose, tool rows and
+   reasoning sit at the same rhythm inside the main tile and a nested entry. */
+:is(.tile-flow, .thread-flow) {
     display: flex;
     flex-direction: column;
     gap: 10px;
@@ -1779,7 +1785,7 @@ button {
    says WHO owns the block and the nesting says WHERE it belongs. Structure:
      .thread-row          ← data-depth (1 = direct child of the turn root), state
        .thread-tile       ← agent-coloured outline (same surface as `.tile`)
-         .thread-select   ← button: ONE row = name · preview · status, aria-expanded
+         .thread-select   ← button: ONE row = code · preview · [elapsed|tokens] status
          .thread-body     ← input prompt, agent flow, outcome (hidden collapsed)
        .thread-children   ← this entry's own descendants, in spawn order
    The children host is OUTSIDE the body and BELOW the tile, so collapsing a parent
@@ -1846,9 +1852,12 @@ button {
     border-color: var(--border-strong);
 }
 
-/* Compact entry (R4): ONE row — agent name, then the task preview, then the status.
-   Same paddings/line height as `.tile:not(.is-expanded) .tile-select`, so a
-   collapsed parent and a collapsed child are the same height. */
+/* Compact entry (R1): ONE row with the same anatomy as a compact turn tile —
+   `agent code · preview · [elapsed | tokens] status`. Same paddings/line height as
+   `.tile:not(.is-expanded) .tile-select`, so a collapsed parent and a collapsed
+   child are the same height. The three children are ordered here (not in the DOM)
+   exactly like the tile's `prompt`/`tile-top` pair: the code leads, the preview is
+   the flexible middle, the metadata cluster sits flush right. */
 .thread-select {
     display: flex;
     flex-direction: row;
@@ -1869,19 +1878,27 @@ button {
     outline-offset: -2px;
 }
 
-/* The single header row. `min-width: 0` is what lets the preview ellipsise instead
-   of pushing the status off the row. */
+/* The nested metadata cluster: the counterpart of `.tile-top` (R1). It holds the
+   elapsed clock, the token tally and the state word in that order, with the same
+   gap the compact tile uses. `min-width: 0` lets the labels ellipsise instead of
+   pushing the state off the row. */
 .thread-top {
+    order: 2;
     display: flex;
     align-items: center;
-    gap: 8px;
-    width: 100%;
+    gap: 6px;
+    flex: 0 0 auto;
+    margin-left: auto;
     min-width: 0;
 }
 
-/* Agent name: the visible half of the agent identity (the outline is the other
-   half). Same mono/uppercase register and size as `.agent-name`. */
-.thread-name {
+/* Agent code (R2/F3): the visible half of the agent identity (the outline is the
+   other half). ONE rule paints the root block's `.tile-agent` and the nested
+   `.thread-name`, so a collapsed parent and a collapsed child show the code in the
+   same position, register and size. The label is the compact per-turn code (`RH1`),
+   never the raw agent id (R3). */
+:is(.tile-agent, .thread-name) {
+    order: 0;
     flex: 0 0 auto;
     max-width: 40%;
     overflow: hidden;
@@ -1894,14 +1911,16 @@ button {
     white-space: nowrap;
 }
 
-/* Status is TEXT (never colour-only); colour only reinforces it. Same size as the
-   compact turn status word. */
-.thread-status {
-    flex: 0 0 auto;
+/* Status is TEXT (never colour-only); colour only reinforces it. Typography and
+   layout come from the grouped `:is(.tile-status, .thread-status)` rule, so the
+   nested word is the same size/register as the main block's. R1 parity: the state
+   colours below cover every state a nested entry can reach. */
+.thread-row[data-state='queued'] .thread-status {
     color: var(--muted);
-    font-family: var(--mono);
-    font-size: 10px;
-    white-space: nowrap;
+}
+
+.thread-row[data-state='waiting'] .thread-status {
+    color: var(--warn);
 }
 
 .thread-row[data-state='streaming'] .thread-status {
@@ -1916,10 +1935,15 @@ button {
     color: var(--danger);
 }
 
+.thread-row[data-state='cancelled'] .thread-status {
+    color: var(--muted);
+}
+
 /* R4: the only flexible item of the single-row header, so the task preview takes
    the leftover width and ellipsises on one line — never a second row, never a
    wrap. Same type size as the compact turn prompt. */
 .thread-preview {
+    order: 1;
     flex: 1 1 auto;
     min-width: 0;
     display: block;
@@ -1937,32 +1961,12 @@ button {
     display: none;
 }
 
-.thread-body {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
-    padding: 8px 10px 10px;
-    border-top: 1px solid var(--border);
-}
-
 /* Collapsed entries keep ONLY the header: the body is display:none, exactly like
-   a compact turn tile. Descendants are outside this element, so they stay. */
+   a compact turn tile. Descendants are outside this element, so they stay.
+   R1: the body itself is styled by the grouped `:is(.tile-body, .thread-body)`
+   rule, so both blocks share one padding/gap scale. */
 .thread-row:not(.is-expanded) .thread-body {
     display: none;
-}
-
-.thread-prompt {
-    padding: 7px 9px;
-    border-left: 2px solid var(--accent);
-    border-radius: 0 6px 6px 0;
-    background: var(--accent-soft);
-    font-size: 12.5px;
-}
-
-.thread-flow {
-    display: flex;
-    flex-direction: column;
-    gap: 8px;
 }
 
 .thread-flow > .agent:first-child {
@@ -2033,6 +2037,13 @@ button {
 /* R3: there is no `.agent-role` / `.thread-role` badge any more — the visible role
    chip was removed from the DOM (ui/turns.ts). `data-role` remains as a structural
    attribute only, so hierarchy is expressed by nesting + agent colour. */
+
+/* F3/R1: the compact header already names the root agent, so the PRIMARY section
+   head is redundant in the expanded body. Flat legacy SUBAGENT sections keep their
+   head: they are different agents whose codes must stay distinguishable. */
+.tile-flow > .agent[data-role='primary'] .agent-head {
+    display: none;
+}
 
 /* A FLAT legacy section (an agent the stream could not attribute to an invocation)
    is still an agent-owned block, so it gets its own colour outline. The PRIMARY
