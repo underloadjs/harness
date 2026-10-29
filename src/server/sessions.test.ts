@@ -490,6 +490,10 @@ describe('SessionStore turns', () => {
                 callId: 'c1',
                 content:
                     '{"todos":[],"counts":{"total":0,"completed":0,"remaining":0},"page":{"offset":0,"limit":20,"hasMore":false}}',
+                // Every EXECUTED call reports its span, inline ones included
+                // (harness.ts deliverTask). The clock is pinned at 2_000, so the
+                // inline todoManage round is exactly 0 ms.
+                durationMs: 0,
                 isError: false
             },
             { type: 'text', agent: 'rounds', delta: 'all done' },
@@ -725,6 +729,9 @@ describe('SessionStore turns', () => {
                 name: 'agentDelegate',
                 callId: 'call_1',
                 content: '{"agent":"helper","content":"helper answer"}',
+                // Additive execution span (harness.ts deliverTask). The clock is
+                // pinned at 2_000, so the delegated inline call is exactly 0 ms.
+                durationMs: 0,
                 isError: false
             },
             { type: 'text', agent: 'lead', delta: 'done by helper' },
@@ -958,7 +965,17 @@ describe('SessionStore turns', () => {
                 events: [
                     { type: 'start', agent: 'hanging', model: 'scripted/test' },
                     { type: 'text', agent: 'hanging', delta: 'partial' },
-                    { type: 'error', agent: 'hanging', error: { message: 'The run was aborted.' } }
+                    // T15: cancellation is PREEMPTIVE, so the recorded error is the
+                    // run signal's reason rather than the transport's own rejection
+                    // (harness.ts abortErrorOf). The store aborts without a reason
+                    // (sessions.ts forwardAbort), so the DOM default is the exact
+                    // text; the session banner still uses `lastError`, asserted
+                    // above as 'The run was cancelled.'.
+                    {
+                        type: 'error',
+                        agent: 'hanging',
+                        error: { message: 'This operation was aborted' }
+                    }
                 ],
                 eventTimes: [2_000, 2_000, 2_000]
             }

@@ -8,7 +8,31 @@
 // NAMING (T14): the scripted tool calls use the CURRENT wire names — toolRequest
 // and timeNow. The harness id and the preset id stay `demo`.
 
-import type { HarnessStream, HarnessStreamEvent } from '../../harness';
+import type { HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '../../harness';
+
+// Tool-call ids must be unique across a CONVERSATION (the harness rejects a
+// reused id before executing anything). The demo is reused by successive tasks in
+// one session and by a restored session, so a per-process or per-call counter is
+// not enough. Derive the next free id from the transcript itself: it survives a
+// restart (the ids are persisted with the messages), survives a restore, and
+// cannot collide with a foreign id already present in the conversation.
+const usedCallIds = (request: HarnessStreamRequest): ReadonlySet<string> => {
+    const used = new Set<string>();
+
+    for (const message of request.messages) {
+        if (message.role !== 'assistant') continue;
+        for (const call of message.toolCalls ?? []) used.add(call.id);
+    }
+
+    return used;
+};
+
+const nextCallId = (used: ReadonlySet<string>, base: string): string => {
+    for (let index = 1; ; index++) {
+        const candidate = `${base}_${index}`;
+        if (!used.has(candidate)) return candidate;
+    }
+};
 
 const sleep = (ms: number, signal?: AbortSignal): Promise<void> =>
     new Promise((resolve, reject) => {
@@ -69,6 +93,8 @@ export const scriptedDemo = (): HarnessStream =>
     async function* (request): AsyncGenerator<HarnessStreamEvent> {
         const last = request.messages[request.messages.length - 1];
         const afterTool = last !== undefined && last.role === 'tool' ? last : undefined;
+        // One scan per request; both rounds mint from the same live conversation.
+        const used = usedCallIds(request);
 
         if (afterTool !== undefined && afterTool.name === 'timeNow') {
             const text =
@@ -94,7 +120,13 @@ export const scriptedDemo = (): HarnessStream =>
             yield {
                 type: 'done',
                 stopReason: 'tool_calls',
-                toolCalls: [{ id: 'call_time_now_1', name: 'timeNow', arguments: '{"timezone":"UTC"}' }],
+                toolCalls: [
+                    {
+                        id: nextCallId(used, 'call_time_now'),
+                        name: 'timeNow',
+                        arguments: '{"timezone":"UTC"}'
+                    }
+                ],
                 // Second request: the first prompt is now a cached prefix.
                 usage: { input: 96, output: 22, total: 118, cached: 48 }
             };
@@ -106,7 +138,13 @@ export const scriptedDemo = (): HarnessStream =>
         yield {
             type: 'done',
             stopReason: 'tool_calls',
-            toolCalls: [{ id: 'call_tool_request_1', name: 'toolRequest', arguments: '{"tags":["time"]}' }],
+            toolCalls: [
+                {
+                    id: nextCallId(used, 'call_tool_request'),
+                    name: 'toolRequest',
+                    arguments: '{"tags":["time"]}'
+                }
+            ],
             // First request: no prefix to reuse yet, so nothing is cached.
             usage: { input: 48, output: 18, total: 66, cached: 0 }
         };

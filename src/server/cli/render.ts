@@ -3,8 +3,67 @@
 // The harness reports the same `HarnessEvent`s a UI receives; this module is the
 // CLI's projection of them. `--json` replaces it with one JSON object per line, so
 // another program can consume the stream without parsing prose.
+//
+// Concurrency (R6): tools run concurrently, an agent's response can complete while
+// its calls are still in flight, and a `wakeup` resumes it once outcomes land. The
+// CLI therefore prints the authoritative `durationMs` on a result, a `pending`
+// line for calls still running, and a wake line. It never treats `done` with a
+// non-empty `pending` list as the end of the work.
 
-import type { HarnessAssistantMessage, HarnessEvent } from '../../harness';
+import type { HarnessAssistantMessage, HarnessEvent, HarnessPendingTool } from '../../harness';
+
+// Validate the background-tool fields. The canonical shape is
+// `HarnessPendingTool` (src/types/index.ts); the CLI still validates entries
+// because persisted/older frames are untrusted input, and the browser has the
+// equivalent accessors in src/frontend/contract.ts (the entries stay separate, so
+// the small validator is repeated rather than shared through a new module).
+const pendingListOf = (value: unknown): HarnessPendingTool[] | undefined => {
+    if (!Array.isArray(value)) return undefined;
+
+    const result: HarnessPendingTool[] = [];
+    for (const item of value) {
+        if (item === null || typeof item !== 'object') continue;
+
+        const candidate = item as { callId?: unknown; name?: unknown; elapsedMs?: unknown };
+        if (typeof candidate.callId !== 'string' || candidate.callId.length === 0) continue;
+        if (typeof candidate.name !== 'string' || candidate.name.length === 0) continue;
+
+        const elapsed = candidate.elapsedMs;
+        if (typeof elapsed !== 'number' || !Number.isFinite(elapsed) || elapsed < 0) continue;
+
+        result.push({ callId: candidate.callId, name: candidate.name, elapsedMs: elapsed });
+    }
+
+    return result;
+};
+
+const pendingOf = (event: HarnessEvent): HarnessPendingTool[] | undefined => {
+    if (event.type !== 'tool_result' && event.type !== 'done') return undefined;
+    return pendingListOf(event.pending);
+};
+
+const durationOf = (event: HarnessEvent): number | undefined => {
+    if (event.type !== 'tool_result') return undefined;
+
+    const duration = event.durationMs;
+    return typeof duration === 'number' && Number.isFinite(duration) && duration >= 0 ? duration : undefined;
+};
+
+// Mirror of `formatDuration` in src/frontend/ui/time.ts (tests assert exact text):
+// <1s in whole ms, <1min in tenths, otherwise minutes plus zero-padded seconds.
+const formatMs = (milliseconds: number): string => {
+    const rounded = Math.round(milliseconds);
+    if (rounded < 1000) return `${rounded}ms`;
+
+    if (rounded < 60_000) return `${(rounded / 1000).toFixed(1)}s`;
+
+    const seconds = Math.floor(rounded / 1000);
+    return `${Math.floor(seconds / 60)}m ${String(seconds % 60).padStart(2, '0')}s`;
+};
+
+// `name 1.2s, webSearch 900ms` — deterministic order: the server's array order.
+const describePending = (pending: readonly HarnessPendingTool[]): string =>
+    pending.map((tool) => `${tool.name} ${formatMs(tool.elapsedMs)}`).join(', ');
 
 export type RenderOptions = {
     json: boolean;
@@ -29,7 +88,10 @@ const indent = (text: string): string =>
         .map((line) => `  ${line}`)
         .join('\n');
 
-const describeDone = (message: HarnessAssistantMessage): string => {
+const describeDone = (
+    message: HarnessAssistantMessage,
+    pending?: readonly HarnessPendingTool[]
+): string => {
     const parts = [message.model, message.stopReason];
 
     if (message.toolCalls.length > 0) {
@@ -38,6 +100,12 @@ const describeDone = (message: HarnessAssistantMessage): string => {
 
     if (message.usage !== undefined) {
         parts.push(`${message.usage.total} tokens`);
+    }
+
+    // A response that still waits on concurrent calls is not a finished agent:
+    // say so instead of printing a line that reads terminal (R6).
+    if (pending !== undefined && pending.length > 0) {
+        parts.push(`${pending.length} tool${pending.length === 1 ? '' : 's'} still running`);
     }
 
     return parts.join(' · ');
@@ -72,6 +140,23 @@ export const createRenderer = ({ json, color }: RenderOptions): Renderer => {
                 break;
             }
 
+            // Background-tool wakeup (R6). A resume, not a completion: it prints the
+            // calls still running and never closes a card. A frame without a usable
+            // `pending` list is malformed and prints nothing.
+            case 'wakeup': {
+                const pending = pendingListOf(event.pending);
+                if (pending === undefined) break;
+
+                endLine();
+                const agent = event.agent.length > 0 ? event.agent : 'agent';
+                const detail =
+                    pending.length === 0
+                        ? 'pending tools finished · continuing'
+                        : `${pending.length} still running · ${describePending(pending)}`;
+                process.stdout.write(`${dim(`~ ${agent} woke · ${detail}`)}\n`);
+                break;
+            }
+
             case 'reasoning': {
                 if (streamKind === 'text') endLine();
                 streamKind = 'reasoning';
@@ -96,8 +181,21 @@ export const createRenderer = ({ json, color }: RenderOptions): Renderer => {
 
             case 'tool_result': {
                 endLine();
-                const head = event.isError ? red(`← ${event.name} (error)`) : green(`← ${event.name}`);
+
+                // The server's `durationMs` is authoritative: with concurrent calls
+                // it excludes time spent waiting behind other work. Absent on an
+                // older event, in which case the name is printed alone.
+                const duration = durationOf(event);
+                const label = duration === undefined ? event.name : `${event.name} · ${formatMs(duration)}`;
+                const head = event.isError ? red(`← ${label} (error)`) : green(`← ${label}`);
                 process.stdout.write(`${head}\n${indent(truncate(event.content.length > 0 ? event.content : '(empty result)'))}\n`);
+
+                // Calls still running when this one finished (R6). Absent means the
+                // frame predates the field: print nothing rather than "0 pending".
+                const pending = pendingOf(event);
+                if (pending !== undefined && pending.length > 0) {
+                    process.stdout.write(`${dim(`  pending · ${describePending(pending)}`)}\n`);
+                }
                 break;
             }
 
@@ -111,7 +209,7 @@ export const createRenderer = ({ json, color }: RenderOptions): Renderer => {
 
             case 'done': {
                 endLine();
-                process.stdout.write(`${dim(`  ${describeDone(event.message)}`)}\n`);
+                process.stdout.write(`${dim(`  ${describeDone(event.message, pendingOf(event))}`)}\n`);
                 break;
             }
 

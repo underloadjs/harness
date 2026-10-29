@@ -986,6 +986,16 @@ describe('queue HTTP contract', () => {
         if (accepted.kind !== 'json') throw new Error('expected JSON');
         expect(accepted.status).toBe(202);
 
+        // FIXTURE RACE: the pump starts the queued task on a later tick, so comparing
+        // the subscription frame with a LIVE `store.get()` read afterwards can differ
+        // (the frame is a snapshot taken at subscribe time). Wait until the scripted
+        // transport has entered — the fixture resolves `started` once the prompt is
+        // committed and the request reached it — and then capture the expected
+        // snapshot. The per-prompt gate holds the stream open, so the store cannot
+        // change again before the frame is taken.
+        await fixture.started('survivor').promise;
+        const subscribed = runtime.store.get(id);
+
         const handler = createHarnessServiceHandler({ runtime });
         const abort = new AbortController();
         const result = await handler(
@@ -1035,7 +1045,7 @@ describe('queue HTTP contract', () => {
         };
 
         // Consume the initial snapshot, then disconnect like a closing tab.
-        expect(await readItem()).toEqual({ type: 'snapshot', session: runtime.store.get(id) });
+        expect(await readItem()).toEqual({ type: 'snapshot', session: subscribed });
 
         abort.abort();
 

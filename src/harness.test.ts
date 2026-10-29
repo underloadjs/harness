@@ -476,8 +476,10 @@ describe('harness', () => {
             call: { id: 'c1', name: 'webSearch', arguments: '{}' }
         });
         // The call id lets a UI pair a result with its exact call even when two
-        // calls in one turn share a name.
-        expect(events[2]).toEqual({
+        // calls in one turn share a name. `durationMs` is now measured for every
+        // executed call; it is wall clock, so assert its shape and pin the rest
+        // exactly.
+        expect(events[2]).toMatchObject({
             type: 'tool_result',
             agent: 'writer',
             name: 'webSearch',
@@ -485,6 +487,8 @@ describe('harness', () => {
             content: 'found',
             isError: false
         });
+        expect((events[2] as { durationMs?: unknown }).durationMs).toEqual(expect.any(Number));
+        expect((events[2] as { durationMs?: number }).durationMs).toBeGreaterThanOrEqual(0);
         expect(events[3]).toMatchObject({ type: 'text', agent: 'writer', delta: 'done' });
         expect(events[4]).toMatchObject({ type: 'done', agent: 'writer' });
     });
@@ -554,7 +558,16 @@ describe('harness', () => {
         await writer('go');
 
         const results = events.filter((event) => event.type === 'tool_result');
-        expect(results).toEqual([
+        // `durationMs` is the authoritative span of each executed call; strip it
+        // before the exact comparison and assert it separately as wall clock.
+        expect(
+            results.map((event) => {
+                const { durationMs, ...rest } = event as { durationMs?: number };
+                expect(durationMs).toEqual(expect.any(Number));
+                expect(durationMs).toBeGreaterThanOrEqual(0);
+                return rest;
+            })
+        ).toEqual([
             {
                 type: 'tool_result',
                 agent: 'writer',
@@ -740,12 +753,14 @@ describe('harness', () => {
     });
 
     it('stops a runaway tool loop instead of recursing forever', async () => {
-        // Always asks for another tool, never answers.
+        // Always asks for another tool, never answers. Ids are unique per turn:
+        // reusing a committed call id is rejected as aliasing (P2-B).
+        let sequence = 0;
         const loop: HarnessStream = async function* () {
             yield {
                 type: 'done' as const,
                 stopReason: 'tool_calls' as const,
-                toolCalls: [{ id: 'c', name: 'again', arguments: '{}' }]
+                toolCalls: [{ id: `c${sequence++}`, name: 'again', arguments: '{}' }]
             };
         };
 
@@ -794,12 +809,13 @@ describe('harness', () => {
     });
 
     it('fails at the configured bound and names it in the error', async () => {
-        // Always asks for another tool, never answers.
+        // Always asks for another tool, never answers; unique ids per turn.
+        let sequence = 0;
         const loop: HarnessStream = async function* () {
             yield {
                 type: 'done' as const,
                 stopReason: 'tool_calls' as const,
-                toolCalls: [{ id: 'c', name: 'again', arguments: '{}' }]
+                toolCalls: [{ id: `c${sequence++}`, name: 'again', arguments: '{}' }]
             };
         };
 

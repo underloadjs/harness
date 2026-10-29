@@ -9,6 +9,7 @@
 //   - session freezing (`harnessDefinition`);
 //   - per-turn timings (`eventTimes`) and per-frame `at`;
 //   - `tool_result.callId`;
+//   - concurrent-tool fields (`toolResult.durationMs`, `pending`, `wakeup`);
 //   - legacy harness aliases for the sessions filter.
 //
 // Every accessor has to be safe on an older payload: a missing field must degrade
@@ -229,6 +230,94 @@ export const callIdOf = (event: HarnessEvent): string | undefined => {
 
 export const finiteOf = (value: unknown): number | undefined =>
     typeof value === 'number' && Number.isFinite(value) ? value : undefined;
+
+// --- Concurrent / background tool execution (R6) -----------------------------
+//
+// The runtime runs tools concurrently with one serialized model stream per agent:
+// an agent's response can complete while its own tool calls are still in flight,
+// and a periodic wake brings it back once outcomes land. The wire contract is:
+//
+//   - `tool_result.durationMs` — the authoritative span of the call that just
+//     ended (a call that waited behind other work must not be timed in the
+//     browser);
+//   - `tool_result.pending` / `done.pending` — calls STILL running at the moment
+//     the frame was produced, with their elapsed spans. The runtime OMITS the
+//     field when nothing remains, so absence is "no new information", not "the
+//     queue drained".
+//   - `{ type: 'wakeup', agent, reason: 'pending-tools', pending }` — the agent
+//     resumed because pending work progressed. `pending` is REQUIRED: a frame
+//     without it is malformed and must produce no update.
+//
+// The canonical members live in src/types/index.ts. The two names below are
+// DERIVED from the event union rather than restated, so this module can never
+// drift from the wire contract; `HarnessPendingTool` keeps its public name because
+// the frontend barrel exports it.
+export type HarnessPendingTool = NonNullable<
+    Extract<HarnessEvent, { type: 'tool_result' }>['pending']
+>[number];
+
+// The wakeup frame itself (canonical member of the union).
+export type HarnessWakeupEvent = Extract<HarnessEvent, { type: 'wakeup' }>;
+
+// Validate a `pending` array. `undefined` means the FIELD WAS ABSENT (older
+// persisted turn, or a frame that reports nothing new) and is deliberately distinct
+// from `[]` ("the server reports nothing running"): only presence may replace the
+// UI's pending snapshot. Invalid entries are dropped one by one; malformed input
+// never throws.
+const pendingListOf = (value: unknown): HarnessPendingTool[] | undefined => {
+    if (!Array.isArray(value)) return undefined;
+
+    const result: HarnessPendingTool[] = [];
+    for (const item of value) {
+        if (item === null || typeof item !== 'object') continue;
+
+        const candidate = item as { callId?: unknown; name?: unknown; elapsedMs?: unknown };
+        if (typeof candidate.callId !== 'string' || candidate.callId.length === 0) continue;
+        if (typeof candidate.name !== 'string' || candidate.name.length === 0) continue;
+
+        const elapsed = finiteOf(candidate.elapsedMs);
+        // A negative or non-finite span is not a duration: drop the entry rather
+        // than render "NaN" or a fabricated negative.
+        if (elapsed === undefined || elapsed < 0) continue;
+
+        result.push({ callId: candidate.callId, name: candidate.name, elapsedMs: elapsed });
+    }
+
+    return result;
+};
+
+// Calls still running per a `tool_result` or `done` frame. Undefined when the
+// frame has no `pending` field at all.
+export const pendingOf = (event: HarnessEvent): HarnessPendingTool[] | undefined => {
+    if (event.type !== 'tool_result' && event.type !== 'done') return undefined;
+    return pendingListOf(event.pending);
+};
+
+// Authoritative duration for the `tool_result` that just arrived, if the server
+// measured one. Prefer it over the browser's local span (see ui/turns.ts).
+export const toolDurationOf = (event: HarnessEvent): number | undefined => {
+    if (event.type !== 'tool_result') return undefined;
+
+    const duration = finiteOf(event.durationMs);
+    return duration === undefined || duration < 0 ? undefined : duration;
+};
+
+// The wakeup frame, or undefined for every other event type. A frame whose
+// `pending` is missing — or is a non-empty array with no valid entry — is
+// MALFORMED and returns undefined (no update). It must never be normalised to an
+// empty list: that would clear the pending line and claim "everything settled",
+// which the frame never said.
+export const wakeupOf = (event: HarnessEvent): HarnessWakeupEvent | undefined => {
+    if (event.type !== 'wakeup') return undefined;
+    if (event.agent.length === 0) return undefined;
+    if (!Array.isArray(event.pending)) return undefined;
+
+    const pending = pendingListOf(event.pending);
+    if (pending === undefined) return undefined;
+    if (event.pending.length > 0 && pending.length === 0) return undefined;
+
+    return { type: 'wakeup', agent: event.agent, reason: event.reason, pending };
+};
 
 // Agent presets from descriptor data, for an older server with no agents list.
 // The seed is intentionally minimal: the picker still works, and the detail panel

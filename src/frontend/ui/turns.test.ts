@@ -1293,3 +1293,382 @@ describe('token tally', () => {
         expect(second.element.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(false);
     });
 });
+
+// --- Concurrent/background tools (R6) ---------------------------------------
+//
+// Tools are scheduled concurrently, so a tile can show one finished call while
+// others are still running and can receive an agent response while its own calls
+// are in flight. These tests pin the three additive wire fields and the rules the
+// presentation must keep:
+//   - `durationMs` wins over the browser's frame gap;
+//   - a `pending` array updates the line but never resolves/abandons a card, and a
+//     settled call is pruned from it even when the frame omits `pending`;
+//   - `done` with pending is an interim response, not the end of the turn;
+//   - `wakeup` is visible, keeps cards running, and does not settle the tile; a
+//     wake without its required `pending` list is ignored;
+//   - a terminal turn abandons calls that never returned (interrupted, not resumed),
+//     and duplicate/late results never add a second card.
+// The event helpers cast a `Record<string, unknown>` so a test can express one
+// wire frame without restating every required field; the union itself is canonical.
+describe('background tools (R6)', () => {
+    const start = (): HarnessEvent => ({ type: 'start', agent: 'writer', model: 'm1' });
+
+    const call = (id: string, name = 'fileRead'): HarnessEvent => ({
+        type: 'tool_call',
+        agent: 'writer',
+        call: { id, name, arguments: '{}' }
+    });
+
+    const result = (fields: Record<string, unknown> = {}): HarnessEvent =>
+        ({
+            type: 'tool_result',
+            agent: 'writer',
+            name: 'fileRead',
+            callId: 'c1',
+            content: 'ok',
+            isError: false,
+            ...fields
+        }) as unknown as HarnessEvent;
+
+    const responseDone = (fields: Record<string, unknown> = {}): HarnessEvent =>
+        ({
+            type: 'done',
+            agent: 'writer',
+            message: doneMessage('writer'),
+            ...fields
+        }) as unknown as HarnessEvent;
+
+    const wake = (fields: Record<string, unknown> = {}): HarnessEvent =>
+        ({
+            type: 'wakeup',
+            agent: 'writer',
+            reason: 'pending-tools',
+            pending: [],
+            ...fields
+        }) as unknown as HarnessEvent;
+
+    const card = (turn: { element: HTMLElement }): Element | null =>
+        turn.element.querySelector('details.tool');
+
+    it('prints the authoritative server duration instead of the browser gap', () => {
+        const { board } = mount();
+        const turn = board.begin('timed');
+
+        turn.apply(start());
+        turn.apply(call('c1'));
+        // A recorded replay has no frame stamps: only `durationMs` can supply a span.
+        turn.apply(result({ durationMs: 1250 }), undefined, 'recorded');
+
+        expect(card(turn)?.getAttribute('data-state')).toBe('ok');
+        expect(turn.element.querySelector('.tool-duration')?.textContent).toBe('1.3s');
+    });
+
+    it('shows calls the server still has in flight, with their elapsed spans', () => {
+        const { board } = mount();
+        const turn = board.begin('two calls');
+
+        turn.apply(start());
+        turn.apply(call('c1'));
+        turn.apply(call('c2', 'webSearch'));
+
+        // c1 finished; the server reports c2 still running.
+        turn.apply(
+            result({ durationMs: 300, pending: [{ callId: 'c2', name: 'webSearch', elapsedMs: 900 }] }),
+            undefined,
+            'recorded'
+        );
+
+        expect(turn.element.querySelector('.agent-pending')?.textContent).toBe(
+            'pending · webSearch 900ms'
+        );
+        expect(turn.element.querySelector('.tile-meta')?.textContent).toBe(
+            '1 agent · 2 tool calls · 1 tool still running'
+        );
+
+        // A present-but-empty array means the server has nothing running: the line
+        // goes away. (The cards are untouched either way.)
+        turn.apply(result({ callId: 'c2', content: 'done', pending: [] }), undefined, 'recorded');
+        expect(turn.element.querySelector('.agent-pending')).toBeNull();
+        expect(turn.element.querySelector('.tile-meta')?.textContent).toBe('1 agent · 2 tool calls');
+    });
+
+    it('keeps pending cards alive across an interim done and keeps the tile running', () => {
+        const { board } = mount();
+        const turn = board.begin('interim');
+
+        turn.apply(start());
+        turn.apply(call('c1'));
+        turn.apply(
+            responseDone({ pending: [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }] })
+        );
+
+        // The response is complete, the turn is not: the card still runs and the
+        // snapshot list names it with the server's span.
+        expect(turn.state()).toBe('streaming');
+        expect(card(turn)?.getAttribute('data-state')).toBe('running');
+        expect(turn.element.querySelector('.agent-pending')?.textContent).toBe('pending · fileRead 1.2s');
+        expect(turn.element.querySelector('.agent-meta')?.textContent).toBe(
+            'writer-model · stop · 1 tool still running'
+        );
+        expect(turn.element.querySelector('.tile-meta')?.textContent).toBe(
+            '1 agent · 1 tool call · 1 tool still running'
+        );
+    });
+
+    it('marks a wakeup and never resolves the running call it woke for', () => {
+        const { board } = mount();
+        const turn = board.begin('woken');
+
+        turn.apply(start());
+        turn.apply(call('c1'));
+        turn.apply(
+            responseDone({ pending: [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }] })
+        );
+
+        turn.apply(wake({ pending: [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }] }));
+
+        const labels = [...turn.element.querySelectorAll('.agent-wakeup-label')].map((node) => node.textContent);
+        const texts = [...turn.element.querySelectorAll('.agent-wakeup-text')].map((node) => node.textContent);
+
+        expect(labels).toEqual(['wakeup']);
+        expect(texts).toEqual(['1 tool still running · continuing']);
+        // A wake is a resume: the card is still running and the tile is not settled.
+        expect(card(turn)?.getAttribute('data-state')).toBe('running');
+        expect(turn.state()).toBe('streaming');
+
+        // A second wake with nothing left says so, and clears the pending line.
+        turn.apply(wake({ pending: [] }));
+        expect([...turn.element.querySelectorAll('.agent-wakeup-text')].map((node) => node.textContent)).toEqual([
+            '1 tool still running · continuing',
+            'pending tools finished · continuing'
+        ]);
+        expect(turn.element.querySelector('.agent-pending')).toBeNull();
+
+        // Only the call's own result resolves it.
+        turn.apply(result({ durationMs: 1200 }));
+        expect(card(turn)?.getAttribute('data-state')).toBe('ok');
+        expect(turn.element.querySelector('.tool-duration')?.textContent).toBe('1.2s');
+    });
+
+    it('abandons an interrupted call when the server settles the turn as cancelled', () => {
+        const { board } = mount();
+        const turn = board.begin('cancelled');
+
+        turn.merge({
+            id: 't1',
+            index: 0,
+            prompt: 'cancelled',
+            status: 'cancelled',
+            updatedAt: 300,
+            events: [start(), call('c1')]
+        });
+
+        expect(turn.state()).toBe('cancelled');
+        expect(card(turn)?.getAttribute('data-state')).toBe('cancelled');
+        expect(turn.element.querySelector('.tool-state')?.textContent).toBe('cancelled');
+        expect(turn.element.querySelector('.tool-pending')?.textContent).toBe(
+            'Cancelled before the call returned.'
+        );
+        expect(turn.element.querySelector('.agent-pending')).toBeNull();
+
+        // A late result for that call (queued before the cancel) is ignored: the
+        // runtime detaches it, so the tile must not add a second resolved card.
+        turn.apply(result({ durationMs: 1200 }));
+        expect(turn.element.querySelectorAll('details.tool')).toHaveLength(1);
+        expect(card(turn)?.getAttribute('data-state')).toBe('cancelled');
+    });
+
+    it('abandons an unmatched call when a turn ends without its result', () => {
+        const { board } = mount();
+        const turn = board.begin('ended');
+
+        turn.merge({
+            id: 't1',
+            index: 0,
+            prompt: 'ended',
+            status: 'done',
+            updatedAt: 300,
+            events: [start(), call('c1')]
+        });
+
+        expect(turn.state()).toBe('done');
+        expect(card(turn)?.getAttribute('data-state')).toBe('cancelled');
+        expect(turn.element.querySelector('.tool-pending')?.textContent).toBe(
+            'Interrupted when the turn ended without a result.'
+        );
+    });
+
+    it('abandons a pending call when the turn fails', () => {
+        const { board } = mount();
+        const turn = board.begin('failed');
+
+        turn.merge({
+            id: 't1',
+            index: 0,
+            prompt: 'failed',
+            status: 'error',
+            updatedAt: 300,
+            events: [start(), call('c1')]
+        });
+
+        expect(turn.state()).toBe('error');
+        expect(card(turn)?.getAttribute('data-state')).toBe('cancelled');
+        expect(turn.element.querySelector('.tool-pending')?.textContent).toBe(
+            'Interrupted when the turn failed.'
+        );
+    });
+
+    it('ignores a duplicate result for an already-settled call id', () => {
+        const { board } = mount();
+        const turn = board.begin('dupe');
+
+        turn.apply(start());
+        turn.apply(call('c1'));
+        turn.apply(result({ durationMs: 900 }), undefined, 'recorded');
+        // Retried/replayed frame for the SAME id: no second card, no overwrite.
+        turn.apply(result({ content: 'duplicate', durationMs: 5000 }), undefined, 'recorded');
+
+        const cards = [...turn.element.querySelectorAll('details.tool')];
+        expect(cards).toHaveLength(1);
+        expect(cards[0].getAttribute('data-state')).toBe('ok');
+        expect(cards[0].querySelector('.tool-duration')?.textContent).toBe('900ms');
+        expect(cards[0].querySelector('.tool-result code')?.textContent).toBe('ok');
+    });
+
+    it('resolves same-name concurrent calls by id, out of order', () => {
+        const { board } = mount();
+        const turn = board.begin('siblings');
+
+        turn.apply(start());
+        turn.apply(call('c1'));
+        turn.apply(call('c2'));
+        turn.apply(result({ callId: 'c2', content: 'second', durationMs: 800 }), undefined, 'recorded');
+        turn.apply(result({ callId: 'c1', content: 'first', durationMs: 400 }), undefined, 'recorded');
+
+        const cards = [...turn.element.querySelectorAll('details.tool')];
+        expect(cards.map((node) => node.getAttribute('data-state'))).toEqual(['ok', 'ok']);
+        expect(cards.map((node) => node.querySelector('.tool-result code')?.textContent)).toEqual([
+            'first',
+            'second'
+        ]);
+
+        // A repeated id after both settled is ignored, not appended.
+        turn.apply(result({ callId: 'c2', content: 'again', durationMs: 1 }), undefined, 'recorded');
+        expect(turn.element.querySelectorAll('details.tool')).toHaveLength(2);
+    });
+
+    it('does not invent a card for a name-only result after a terminal turn', () => {
+        const { board } = mount();
+        const turn = board.begin('late');
+
+        turn.merge({
+            id: 't1',
+            index: 0,
+            prompt: 'late',
+            status: 'cancelled',
+            updatedAt: 300,
+            events: [start(), call('c1')]
+        });
+
+        // Legacy frame with no callId arriving after the turn settled: the runtime
+        // detached the call, so nothing may be added to the transcript.
+        turn.apply({ type: 'tool_result', agent: 'writer', name: 'fileRead', content: 'late', isError: false });
+
+        expect(turn.element.querySelectorAll('details.tool')).toHaveLength(1);
+        expect(card(turn)?.getAttribute('data-state')).toBe('cancelled');
+    });
+
+    it('still renders a legacy result-only frame during a live turn', () => {
+        const { board } = mount();
+        const turn = board.begin('legacy');
+
+        turn.apply(start());
+        turn.apply({ type: 'tool_result', agent: 'writer', name: 'timeNow', content: '12:00', isError: false });
+
+        expect(turn.element.querySelectorAll('details.tool')).toHaveLength(1);
+        expect(card(turn)?.getAttribute('data-state')).toBe('ok');
+    });
+
+    it('prunes a settled call from the pending snapshot when the frame omits pending', () => {
+        const { board } = mount();
+        const turn = board.begin('drain');
+
+        turn.apply(start());
+        turn.apply(call('c1'));
+        turn.apply(call('c2', 'webSearch'));
+        turn.apply(
+            responseDone({
+                pending: [
+                    { callId: 'c1', name: 'fileRead', elapsedMs: 1200 },
+                    { callId: 'c2', name: 'webSearch', elapsedMs: 900 }
+                ]
+            })
+        );
+        expect(turn.element.querySelector('.agent-pending')?.textContent).toBe(
+            'pending · fileRead 1.2s · webSearch 900ms'
+        );
+
+        // EXACT runtime shape for a finishing call: `durationMs` present, `pending`
+        // omitted because nothing remained at that instant. The completed call must
+        // still leave the line; the sibling must stay.
+        turn.apply(result({ callId: 'c1', durationMs: 1200 }), undefined, 'recorded');
+        expect(turn.element.querySelector('.agent-pending')?.textContent).toBe('pending · webSearch 900ms');
+        expect(turn.element.querySelector('.tile-meta')?.textContent).toBe(
+            '1 agent · 2 tool calls · 1 tool still running'
+        );
+
+        turn.apply(result({ callId: 'c2', name: 'webSearch', durationMs: 900 }), undefined, 'recorded');
+        expect(turn.element.querySelector('.agent-pending')).toBeNull();
+        expect(turn.element.querySelector('.tile-meta')?.textContent).toBe('1 agent · 2 tool calls');
+    });
+
+    it("keeps another agent's pending line when one agent drains", () => {
+        const { board } = mount();
+        const turn = board.begin('multi');
+
+        turn.apply(start());
+        turn.apply(call('c1'));
+        turn.apply(responseDone({ pending: [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }] }));
+
+        turn.apply({ type: 'start', agent: 'helper', model: 'm2' });
+        turn.apply({
+            type: 'tool_call',
+            agent: 'helper',
+            call: { id: 'h1', name: 'commandRun', arguments: '{}' }
+        });
+        turn.apply({
+            type: 'done',
+            agent: 'helper',
+            message: doneMessage('helper'),
+            pending: [{ callId: 'h1', name: 'commandRun', elapsedMs: 5000 }]
+        });
+
+        expect([...turn.element.querySelectorAll('.agent-pending')].map((node) => node.textContent)).toEqual([
+            'pending · fileRead 1.2s',
+            'pending · commandRun 5.0s'
+        ]);
+
+        // The writer dries up; the helper's snapshot is untouched.
+        turn.apply(result({ durationMs: 1200 }), undefined, 'recorded');
+        expect([...turn.element.querySelectorAll('.agent-pending')].map((node) => node.textContent)).toEqual([
+            'pending · commandRun 5.0s'
+        ]);
+    });
+
+    it('leaves the pending line alone when a wakeup has no pending list', () => {
+        const { board } = mount();
+        const turn = board.begin('malformed wake');
+
+        turn.apply(start());
+        turn.apply(call('c1'));
+        turn.apply(responseDone({ pending: [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }] }));
+
+        // `pending` is required on a wake frame: absence is malformed, not "settled".
+        turn.apply(wake({ pending: undefined }));
+
+        expect(turn.element.querySelector('.agent-pending')?.textContent).toBe('pending · fileRead 1.2s');
+        expect(turn.element.querySelector('.agent-wakeup')).toBeNull();
+        expect(card(turn)?.getAttribute('data-state')).toBe('running');
+        expect(turn.state()).toBe('streaming');
+    });
+});

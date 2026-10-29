@@ -8,7 +8,12 @@
 //   - `text` / `reasoning` / `tool_call` / `tool_result` → reactivate it, because a
 //     delegated subagent can speak again after an intermediate `done`-less gap and
 //     a parent waiting on a delegated tool is still working;
-//   - `done` / `error`                     → only that agent leaves the set.
+//   - `done` / `error`                     → only that agent leaves the set —
+//     EXCEPT a `done` whose `pending` list is non-empty (R6): the response is
+//     complete but its own calls are still running, so the agent is not idle; a
+//     later `wakeup` resumes it and the ring must not blink off in between;
+//   - `wakeup`                             → the agent resumed, so it is active
+//     again (the wake is the only frame that says "background work progressed").
 //
 // A parent may stay active while a delegated agent runs (the parent's last event
 // is the `tool_call` that started the delegation). Both spinning is the accepted
@@ -33,10 +38,20 @@
 // ring.
 
 import type { HarnessEvent, SessionTurn } from '../../server/protocol';
+import { pendingOf, wakeupOf } from '../contract';
 
 // Apply one event to an activity set. Mutates the set (per-instance state is
 // intentionally a live `Set`, not a value the renderer has to reconcile).
 export const applyActivity = (active: Set<string>, event: HarnessEvent): void => {
+    // Background-tool wakeup (R6), before the switch: the event is additive, so an
+    // older server/record never reaches this branch and the reducer below keeps its
+    // exact old behaviour. A wake means the agent is working again.
+    const wakeup = wakeupOf(event);
+    if (wakeup !== undefined) {
+        active.add(wakeup.agent);
+        return;
+    }
+
     switch (event.type) {
         case 'start':
         case 'text':
@@ -50,7 +65,23 @@ export const applyActivity = (active: Set<string>, event: HarnessEvent): void =>
             active.add(event.agent);
             return;
 
-        case 'done':
+        case 'done': {
+            // `done` closes the agent's RESPONSE. With concurrent tools that does
+            // not make it idle: a non-empty `pending` list means its own calls are
+            // still running and it will be woken. Keeping the ring lit avoids a
+            // blink that would suggest the work stopped (R6). An absent `pending`
+            // field is the pre-concurrency response: the agent is done.
+            const pending = pendingOf(event);
+            if (pending !== undefined && pending.length > 0) {
+                active.add(event.agent);
+                return;
+            }
+
+            // Only this agent finished; a delegated sibling keeps its ring.
+            active.delete(event.agent);
+            return;
+        }
+
         case 'error':
             // Only this agent finished; a delegated sibling keeps its ring.
             active.delete(event.agent);

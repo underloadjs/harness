@@ -23,3 +23,7 @@ export * from './harness';
 export * from './shared';
 export * from './server';
 export * from './frontend';
+// The runtime and the browser client both describe pending background calls. The
+// two shapes are identical and frozen (T3); the RUNTIME one is authoritative, so
+// name it explicitly to resolve the star-export ambiguity.
+export type { HarnessPendingTool } from './harness';

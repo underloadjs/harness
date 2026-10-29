@@ -32,6 +32,19 @@
 // Delegation — one agent calling another — shows up as extra agents inside the
 // same turn (each event names its agent) and is labelled as a subagent.
 //
+// Concurrency (R6): tools are scheduled concurrently and the agent's response can
+// finish while its own calls are still running. Three additive frames drive this
+// view, none of them a new tile state:
+//   - `tool_result.durationMs` — the call's authoritative span;
+//   - `tool_result.pending` / `done.pending` — calls still running, rendered as a
+//     `pending · name 1.2s` line in the agent section (and a "still running"
+//     count in the tile meta) while the cards themselves stay untouched;
+//   - `wakeup` — the agent resumed because pending work progressed. It appends a
+//     visible marker and keeps the section active; it never resolves a card and
+//     never settles the tile.
+// A terminal turn (cancel/error/done from the server) abandons any call that
+// never returned, because pending work is interrupted, not resumed.
+//
 // Rendering model: assistant text is Markdown, re-rendered per animation frame
 // while it streams (see src/frontend/ui/markdown.ts for the sanitizer) and
 // synced once when the turn settles. Reasoning is plain text: it is scratch
@@ -48,7 +61,16 @@
 //     describe a turn whose optimistic tile is still unbound (`claim`).
 
 import type { HarnessEvent, HarnessUsage, SessionTurn, SessionTurnStatus } from '../../server/protocol';
-import { callIdOf, eventTimesOf, finiteOf, usageOf } from '../contract';
+import {
+    callIdOf,
+    eventTimesOf,
+    finiteOf,
+    pendingOf,
+    toolDurationOf,
+    usageOf,
+    wakeupOf
+} from '../contract';
+import type { HarnessPendingTool } from '../contract';
 import { markdownFragment, plainPreview } from './markdown';
 import { elapsedBetween, formatDuration } from './time';
 import { formatTokens } from './tokens';
@@ -268,12 +290,25 @@ type AgentSection = {
     // flow child was not a tool. Keeping the group alive across calls is what lets
     // `[websearch][fileRead]` share a line; prose/reasoning/error resets it.
     toolGroup: HTMLElement | undefined;
+    // `pending · name 1.2s` line for calls the SERVER still has in flight (R6).
+    // Undefined means nothing is pending (or the server never reported it). It
+    // lives in the flow, after the tool row, and is never inside `.tool-group`, so
+    // it cannot break chip grouping. `pendingCalls` is the authoritative per-call
+    // state behind the line: a snapshot from the last frame that carried `pending`,
+    // minus each call whose own result has arrived (the runtime omits the field
+    // when nothing remains). The tile meta sums these maps across sections, so one
+    // delegated child can be pending while the parent is idle.
+    pending: HTMLElement | undefined;
+    pendingCalls: Map<string, HarnessPendingTool>;
 };
 
-// One unresolved tool call. `callId` is the authoritative match; name+order is the
-// fallback for a server that sends `tool_result` without a call id.
+// One unresolved tool call. `callId` is the authoritative match. A server that
+// sends `tool_result` without a call id (legacy) is matched by name, oldest first;
+// with concurrent calls that fallback is only used when no id is present, because
+// it cannot tell two same-name siblings apart.
 type PendingTool = {
     card: ToolCallCard;
+    section: AgentSection;
     name: string;
     callId: string | undefined;
     startedAt: number | undefined;
@@ -518,10 +553,14 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         };
 
         const sections = new Map<string, AgentSection>();
-        // Calls whose result has not arrived yet. `callId` is the authoritative
-        // match when the server sends it; otherwise the match is by tool name,
-        // oldest first — which is the order the harness runs them in.
+        // Calls whose result has not arrived yet.
         const pendingTools: PendingTool[] = [];
+        // Call ids already settled on this tile — a result applied, or a card
+        // abandoned at the terminal transition. A repeated frame for one of these
+        // is a DUPLICATE (retried event, replay overlap) and is ignored: it must not
+        // add a second card or overwrite the first answer. Cleared with the
+        // projection.
+        const settledCalls = new Set<string>();
 
         const updateMeta = (): void => {
             const live = isLive(state);
@@ -529,6 +568,18 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
             if (sections.size > 0) parts.push(`${sections.size} agent${sections.size === 1 ? '' : 's'}`);
             if (toolCount > 0) parts.push(`${toolCount} tool call${toolCount === 1 ? '' : 's'}`);
+            // A completed response may still wait on background calls. The count is
+            // summed across sections because a delegated child can be pending on its
+            // own. NOTE: on a compact row the meta line is visually clipped (sr-only,
+            // styles.css `.tile:not(.is-expanded) .tile-meta`); it is read out and
+            // shown in full only when the tile is expanded.
+            const pendingTotal = [...sections.values()].reduce(
+                (total, section) => total + section.pendingCalls.size,
+                0
+            );
+            if (pendingTotal > 0) {
+                parts.push(`${pendingTotal} tool${pendingTotal === 1 ? '' : 's'} still running`);
+            }
             if (detail !== undefined && detail.length > 0) parts.push(detail);
             if (parts.length === 0) parts.push(live ? 'waiting for the first event' : 'no events yet');
 
@@ -547,11 +598,26 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             if (next === 'done' || next === 'error' || next === 'cancelled') {
                 if (startedAt !== undefined && endedAt === undefined && !recordedTiming) endedAt = Date.now();
                 stopElapsed();
-                // A tool call left pending when the run ended must not keep a live
-                // ticker running on a settled tile.
+                // The turn is over, so nothing can still be pending: drop the
+                // waiting line first (R6). A call left unsettled is INTERRUPTED —
+                // cancel/restart never resumes it — so it is abandoned with a reason
+                // instead of being frozen as a live-looking `running` card.
                 for (const section of sections.values()) {
+                    paintPending(section, []);
                     for (const tool of section.tools) {
-                        if (tool.state() === 'running') tool.destroy();
+                        if (tool.state() !== 'running') continue;
+
+                        tool.abandon(
+                            next === 'cancelled'
+                                ? 'Cancelled before the call returned.'
+                                : next === 'error'
+                                  ? 'Interrupted when the turn failed.'
+                                  : 'Interrupted when the turn ended without a result.'
+                        );
+
+                        // Remember the id so a late/duplicate result is ignored
+                        // instead of producing a second, resolved card.
+                        if (tool.callId !== undefined) settledCalls.add(tool.callId);
                     }
                 }
             } else if (!recordedTiming) {
@@ -612,7 +678,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 text: undefined,
                 reasoning: undefined,
                 tools: [],
-                toolGroup: undefined
+                toolGroup: undefined,
+                pending: undefined,
+                pendingCalls: new Map()
             };
 
             sections.set(agentName, section);
@@ -658,6 +726,73 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             return section.toolGroup;
         };
 
+        // Repaint one agent's pending line from its per-call map (R6). The line is a
+        // STATIC snapshot of the server's last reported spans: it does not tick
+        // locally, because the browser is not measuring these calls. The tool cards
+        // themselves are never touched here: a `pending` entry is state, not a
+        // result, so it must not resolve, abandon or restart a card.
+        const renderPending = (section: AgentSection): void => {
+            if (section.pendingCalls.size === 0) {
+                section.pending?.remove();
+                section.pending = undefined;
+                updateMeta();
+                return;
+            }
+
+            const node = section.pending ?? el('div', 'agent-pending');
+            // Deterministic text (tests assert it): `pending · fileRead 1.2s · webSearch 900ms`.
+            node.textContent = `pending · ${[...section.pendingCalls.values()]
+                .map((tool) => `${tool.name} ${formatDuration(tool.elapsedMs)}`)
+                .join(' · ')}`;
+
+            section.pending = node;
+            // Appending an already-attached node MOVES it, which keeps the pending
+            // line last after any tool_call appended in the meantime.
+            section.flow.append(node);
+
+            updateMeta();
+        };
+
+        // Replace one agent's pending snapshot with a server-supplied array. Only a
+        // PRESENT array reaches here; absence must leave the line alone (the runtime
+        // omits `pending` when nothing remains, so absence is not a drain signal).
+        const paintPending = (section: AgentSection, pending: readonly HarnessPendingTool[]): void => {
+            section.pendingCalls.clear();
+            for (const tool of pending) section.pendingCalls.set(tool.callId, tool);
+            renderPending(section);
+        };
+
+        // A call finished, so drop THAT call from its agent's snapshot even when the
+        // frame carried no `pending` array. Scoped to the call id: same-name siblings
+        // and another agent's pending calls stay listed until they settle too.
+        const noteSettled = (section: AgentSection, callId: string): void => {
+            if (!section.pendingCalls.delete(callId)) return;
+            renderPending(section);
+        };
+
+        // Visible marker for a wakeup (R6). The agent resumed because pending work
+        // progressed; this is NOT a completion, so nothing here resolves a card or
+        // changes the tile state. Closing the text block and the chip row means the
+        // post-wake prose and any new calls start below this line instead of being
+        // glued onto the pre-wake ones.
+        const appendWakeup = (section: AgentSection, pending: readonly HarnessPendingTool[]): void => {
+            closeText(section);
+            closeToolGroup(section);
+
+            const node = el('div', 'agent-wakeup');
+            node.append(el('span', 'agent-wakeup-label', 'wakeup'));
+            node.append(
+                el(
+                    'span',
+                    'agent-wakeup-text',
+                    pending.length === 0
+                        ? 'pending tools finished · continuing'
+                        : `${pending.length} tool${pending.length === 1 ? '' : 's'} still running · continuing`
+                )
+            );
+            section.flow.append(node);
+        };
+
         const appendText = (section: AgentSection, delta: string): void => {
             // Prose after a call ends the tool row: the next call must start below
             // this text rather than float back up into the previous group.
@@ -668,6 +803,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 section.flow.append(node);
                 section.text = { node, buffer: '', handle: undefined, viaFrame: false };
             }
+
+            // The pending summary is a status line: it stays after any new prose.
+            if (section.pending !== undefined) section.flow.append(section.pending);
 
             const block = section.text;
             block.buffer += delta;
@@ -687,6 +825,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 section.flow.append(details);
                 section.reasoning = { details, summary, body: reasoningBody, buffer: '' };
             }
+
+            // Status line last, exactly like prose.
+            if (section.pending !== undefined) section.flow.append(section.pending);
 
             const block = section.reasoning;
             block.buffer += delta;
@@ -718,10 +859,18 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
             section.tools.push(card);
             toolGroupOf(section).append(card.element);
-            pendingTools.push({ card, name, callId, startedAt });
+            // A new call must appear ABOVE the pending summary line, never below it.
+            if (section.pending !== undefined) section.flow.append(section.pending);
+            pendingTools.push({ card, section, name, callId, startedAt });
             toolCount += 1;
             updateMeta();
         };
+
+        // Outcome of applying one `tool_result`: which card it settled (undefined for
+        // an ignored duplicate/late frame) and that card's owning section. The caller
+        // uses it to prune the per-call pending display without treating an absent
+        // `pending` field as a global drain.
+        type ResolvedTool = { section: AgentSection; callId: string | undefined };
 
         const resolveTool = (
             name: string,
@@ -729,33 +878,55 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             isError: boolean,
             callId: string | undefined,
             at: number | undefined,
-            origin: ApplyOrigin
-        ): void => {
-            // Authoritative match first, then the documented fallback: same name,
-            // oldest running call.
-            let index =
-                callId === undefined
-                    ? -1
-                    : pendingTools.findIndex(
-                          (tool) => tool.callId === callId && tool.card.state() === 'running'
-                      );
+            origin: ApplyOrigin,
+            durationMs: number | undefined
+        ): ResolvedTool | undefined => {
+            // A result for an id this tile already settled — resolved ok/error, or
+            // abandoned when the turn went terminal — is a DUPLICATE/late frame.
+            // Ignoring it is what keeps one call to one card: it must not add a
+            // second card, overwrite the first answer, or (after a cancel) resurrect
+            // a card the runtime already detached.
+            if (callId !== undefined && settledCalls.has(callId)) return undefined;
 
-            if (index < 0) {
-                index = pendingTools.findIndex(
-                    (tool) => tool.name === name && tool.card.state() === 'running'
-                );
-            }
+            // The call id is authoritative. The name+oldest fallback is only for a
+            // legacy frame that carries no id: with concurrent same-name calls it
+            // cannot tell the siblings apart, so using it when an id IS present could
+            // settle the wrong sibling.
+            const index =
+                callId !== undefined
+                    ? pendingTools.findIndex(
+                          (tool) => tool.callId === callId && tool.card.state() === 'running'
+                      )
+                    : pendingTools.findIndex(
+                          (tool) => tool.name === name && tool.card.state() === 'running'
+                      );
 
             const finishedAt = at ?? (origin === 'live' ? Date.now() : undefined);
 
             if (index >= 0) {
                 const [tool] = pendingTools.splice(index, 1);
-                tool.card.resolve(content, isError, elapsedBetween(tool.startedAt, finishedAt));
-                return;
+                if (tool.callId !== undefined) settledCalls.add(tool.callId);
+                // Prefer the server's authoritative span: with concurrent calls the
+                // wall-clock gap between this browser's call/result frames includes
+                // time spent waiting behind other work, which is not this call's
+                // duration. Legacy frames without `durationMs` keep the local span.
+                tool.card.resolve(
+                    content,
+                    isError,
+                    durationMs ?? elapsedBetween(tool.startedAt, finishedAt)
+                );
+                return { section: tool.section, callId: tool.callId };
             }
 
-            // A result with no matching call (a retried event, or a protocol that
-            // reports only results): show it rather than dropping information.
+            // No running call for this result. Once the turn is terminal, any such
+            // frame is LATE (queued before the cancel/end, or a name-only result
+            // after it): the runtime ignores results after detaching, so the tile
+            // renders nothing rather than a phantom card.
+            if (state !== 'streaming' && state !== 'waiting' && state !== 'queued') return undefined;
+
+            // Genuine legacy result-only frame during a live turn (a protocol that
+            // reports results without calls, or a missed tool_call): show it rather
+            // than dropping information.
             const section = sections.get(primaryAgent ?? 'unknown') ?? ensureSection('unknown');
             const card = createToolCallCard(name, '');
             card.resolve(content, isError);
@@ -763,6 +934,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             section.tools.push(card);
             toolCount += 1;
             updateMeta();
+            return { section, callId: undefined };
         };
 
         const appendAgentMeta = (agentName: string, text: string): void => {
@@ -782,6 +954,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
             sections.clear();
             pendingTools.length = 0;
+            settledCalls.clear();
             flow.replaceChildren();
             primaryAgent = undefined;
             toolCount = 0;
@@ -806,6 +979,21 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
             appliedCount += 1;
             appliedEvents.push(event);
+
+            // Background-tool wakeup (R6). A wake is a RESUME, so it must not
+            // settle the tile, resolve a card, or stop any timer — it only makes
+            // the un-parking visible and replaces the pending snapshot the server
+            // just reported. `wakeupOf` rejects a frame without a `pending` array:
+            // such a frame falls through with no rendering and no pending update
+            // (absence must not claim "everything settled").
+            const wakeup = wakeupOf(event);
+            if (wakeup !== undefined) {
+                const section = ensureSection(wakeup.agent);
+                appendWakeup(section, wakeup.pending);
+                paintPending(section, wakeup.pending);
+                updateMeta();
+                return;
+            }
 
             switch (event.type) {
                 case 'start': {
@@ -837,16 +1025,31 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     );
                     break;
 
-                case 'tool_result':
-                    resolveTool(
+                case 'tool_result': {
+                    const outcome = resolveTool(
                         event.name,
                         event.content,
                         event.isError,
                         callIdOf(event),
                         at,
-                        origin
+                        origin,
+                        toolDurationOf(event)
                     );
+
+                    if (outcome !== undefined) {
+                        // A PRESENT array is the server's authoritative snapshot for
+                        // that agent; otherwise the call that just settled is pruned
+                        // from the per-call map. Absence alone is never read as "the
+                        // queue drained" — the runtime omits `pending` when nothing
+                        // remains, and siblings of another agent must stay listed.
+                        const pending = pendingOf(event);
+                        if (pending !== undefined) paintPending(outcome.section, pending);
+                        else if (outcome.callId !== undefined) {
+                            noteSettled(outcome.section, outcome.callId);
+                        }
+                    }
                     break;
+                }
 
                 // Per-request usage. The tile keeps two derived facts: the LATEST
                 // reported request's input (primary) and, as a fallback for records
@@ -880,12 +1083,30 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     // `done` closes one *agent* turn, which may be a subagent
                     // nested inside a tool call. The user turn only settles when
                     // the stream itself ends, so the tile state is left alone.
+                    //
+                    // Concurrency (R6): this response can be complete while its own
+                    // calls are STILL RUNNING (`pending` non-empty). That is not a
+                    // finish: the cards stay live, the agent is woken when outcomes
+                    // land, and only the server's terminal turn status settles the
+                    // tile. `pending` is only rendered when present, so a legacy
+                    // response prints exactly the old line.
                     const message = event.message;
                     const parts = [message.model, message.stopReason];
                     if (message.toolCalls.length > 0) {
                         parts.push(`${message.toolCalls.length} tool call${message.toolCalls.length === 1 ? '' : 's'}`);
                     }
                     if (message.usage !== undefined) parts.push(`${message.usage.total} tokens`);
+
+                    const pending = pendingOf(event);
+                    if (pending !== undefined) {
+                        paintPending(section, pending);
+                        if (pending.length > 0) {
+                            parts.push(
+                                `${pending.length} tool${pending.length === 1 ? '' : 's'} still running`
+                            );
+                        }
+                    }
+
                     section.meta.textContent = parts.join(' · ');
                     break;
                 }
@@ -901,6 +1122,12 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     section.flow.append(error);
                     break;
                 }
+
+                // A wakeup `wakeupOf` rejected (no usable `pending` list) lands
+                // here on purpose: the event is recorded for prefix matching, but
+                // nothing is rendered and the pending snapshot is left untouched.
+                case 'wakeup':
+                    break;
             }
 
             updateMeta();

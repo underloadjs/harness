@@ -21,17 +21,24 @@
 //     repeat:
 //         turn()                      -> assistant message (+ tool calls)
 //         usage?                      -> report what that request spent
-//         no tool calls?              -> report done, return the message
-//         for each call:              -> execute, append a tool message
-//         (loop again)
+//         no tool calls?              -> pending work? pause : report done and return
+//         for each call:              -> LAUNCH it (validation is synchronous,
+//                                        execution is background/concurrent)
+//         (loop again immediately, with placeholders for unfinished calls)
+//
+// Calls complete on their own schedule. Every completion is committed at the
+// call's ORIGINAL position in the transcript and wakes the run for another turn;
+// a pause (`done` with `pending`) keeps the harness promise open until the whole
+// tree drains. See the "Background tool scheduling" block below for the protocol.
 //
 // Termination:
 //   - the model answers with text (normal);
 //   - an unknown tool, an undiscovered tool, malformed arguments, or a throwing
 //     tool becomes a tool result the model can read and recover from — it does
 //     not end the run;
-//   - exceeding the configured tool-loop limit (`maxIterations`, default
-//     DEFAULT_MAX_ITERATIONS), or a transport failure, ends the run: history is
+//   - exceeding the configured model-request limit (`maxIterations`, default
+//     DEFAULT_MAX_ITERATIONS) — every turn counts, including pauses with pending
+//     work and wake-driven turns — or a transport failure ends the run: history is
 //     truncated back to where the call started and the harness throws.
 //
 // Tool visibility:
@@ -94,12 +101,34 @@
 //   - `maxCreatedTools` (default 32) is a LIFETIME budget per harness: reset()
 //     does not restore it, because created tools stay registered across a reset.
 //
-// Cancellation (R10): `HarnessRunOptions.signal` reaches every model request, every
-// tool's `ToolContext.signal`, and every run a tool or agentDelegate starts. The
-// harness checks it BEFORE each turn and before each tool CALL, so a cancelled run
-// starts no new side effects; a call already running is awaited to completion (no
-// racing), because a tool that ignores the signal may still be mutating and the
-// harness must not claim to have stopped it nor release exclusivity early.
+// Cancellation (R10, T3): `HarnessRunOptions.signal` reaches every model request,
+// every tool's `ToolContext.signal`, and every run a tool or agentDelegate starts.
+// Tools now run in the BACKGROUND with a per-call AbortController linked to the
+// run signal: cancelling the run aborts all of them, while the model's `toolCancel`
+// aborts exactly one. The harness releases a cancelled call LOGICALLY at once
+// (removes it from the pending view, discards a late result) because arbitrary
+// JavaScript cannot be preempted; a cooperative tool stops its own work, an
+// uncooperative one may finish in the background with nobody listening. A run
+// abort rolls back every actor's transcript to the start of its call and leaves
+// the harness reusable.
+//
+// Model turns are preemptive too (T15): the turn consumer races the run signal, so
+// a provider that never returns cannot keep the agent's actor, its active-run slot,
+// or later same-agent delegation reserved. The abandoned stream is detached; the
+// agent's precommit guard refuses any late commit and the ownership guard suppresses
+// its frames, so it cannot touch a later run's transcript (arbitrary provider work
+// may still exist; it is logically ignored, like an aborted tool).
+//
+// Background tools (T3): every call is launched CONCURRENTLY and the run keeps
+// going. Tool validation stays synchronous (an unknown/undiscovered/malformed
+// call is still an immediate result), but execution is scheduled. Until a call
+// settles, the request projection answers it with a placeholder and the model may
+// answer, call more tools, or pause (`done` with `pending`). Each completion is
+// committed at the call's ORIGINAL position and drives another turn. The harness
+// promise resolves only when the model has answered AND the whole tree (delegated
+// children included) has drained. A `wakeup` heartbeat (default every 600000 ms)
+// re-requests a paused agent so it can inspect elapsed times and cancel a hung
+// call through the `toolCancel` control. Scheduler: core/scheduler.ts.
 //
 // Model-facing output cap (R10): every serialized tool result AND tool error is
 // passed through `boundToolResult` (64 KiB UTF-8 by default, core/result-budget.ts).
@@ -186,7 +215,10 @@ import {
     PROFILE_MANAGE_NAME,
     CHAPTER_MANAGE_NAME,
     LOCATION_MANAGE_NAME,
-    agentDelegateMetadata
+    agentDelegateMetadata,
+    createTaskScheduler,
+    TOOL_CANCEL_METADATA,
+    TOOL_CANCEL_NAME
 } from './core';
 import { presetTools, createWebSearchTool, WEB_SEARCH_TOOL_NAME } from './tools';
 import { runPlugins } from './plugin';
@@ -197,7 +229,10 @@ import type {
     HarnessAssistantMessage,
     HarnessConfiguration,
     HarnessDelegationResult,
+    HarnessErrorInfo,
     HarnessEvent,
+    HarnessMessage,
+    HarnessPendingTool,
     HarnessProgress,
     HarnessRunOptions,
     HarnessSnapshot,
@@ -209,18 +244,38 @@ import type {
     ToolCreation,
     ToolCreationPolicy,
     ToolCreationResult,
-    ToolSearchResult
+    ToolSearchResult,
+    ToolUiPanel
 } from './types';
 
-// Hard stop for a model that keeps requesting tools forever. This is a guard,
-// not a policy knob, so the library default stays deliberately small; a real
-// agent session can raise it with `harness({ maxIterations })` (the application
-// presets do, see harnesses/presets.ts). A runaway loop must not be able to run a
-// CLI process out of money or stack, so `maxIterations` is validated at
-// construction (positive safe integer) and can never be Infinity.
+// Hard stop for a model that keeps requesting turns forever (tool rounds, pauses
+// with pending work, and wake-driven turns all count). This is a guard, not a
+// policy knob, so the library default stays deliberately small; a real agent
+// session can raise it with `harness({ maxIterations })` (the application presets
+// do, see harnesses/presets.ts). A runaway loop must not be able to run a CLI
+// process out of money or stack, so `maxIterations` is validated at construction
+// (positive safe integer) and can never be Infinity.
 const DEFAULT_MAX_ITERATIONS = 16;
 
-// Validate and resolve the configured tool-loop bound. Rejecting anything that is
+// Recurring wake while background tool calls are pending (R4): 10 minutes. This
+// is a LIVENESS heartbeat, not a timeout — nothing is killed automatically (the
+// model decides, via toolCancel). Configurable through `wakeIntervalMs` so tests
+// can exercise it in milliseconds; the timer exists only while work is pending.
+const DEFAULT_WAKE_INTERVAL_MS = 600_000;
+
+const resolveWakeInterval = (value: number | undefined): number => {
+    if (value === undefined) return DEFAULT_WAKE_INTERVAL_MS;
+
+    if (!Number.isSafeInteger(value) || value < 1) {
+        throw new HarnessError(
+            `wakeIntervalMs must be a positive safe integer; received ${String(value)}.`
+        );
+    }
+
+    return value;
+};
+
+// Validate and resolve the configured model-request bound. Rejecting anything that is
 // not a positive safe integer keeps the guard meaningful: 0 would make every tool
 // request fail, 1.5/NaN/Infinity have no well-defined round count, and values
 // beyond Number.MAX_SAFE_INTEGER cannot be counted exactly.
@@ -251,6 +306,10 @@ const PROFILE_MANAGE = PROFILE_MANAGE_NAME;
 const CHAPTER_MANAGE = CHAPTER_MANAGE_NAME;
 const LOCATION_MANAGE = LOCATION_MANAGE_NAME;
 const AGENT_DELEGATE = AGENT_DELEGATE_NAME;
+// Targeted cancellation for a background call (T3/R4). Declared only while the
+// calling agent has work in flight; the name is nonetheless reserved so no
+// configured, preset, plugin, or created tool can shadow the control.
+const TOOL_CANCEL = TOOL_CANCEL_NAME;
 
 // Names no configured, preset, plugin, or model-created tool may take. Keeping
 // the whole list in one place is what makes the reservation check exhaustive.
@@ -263,7 +322,8 @@ const RESERVED_TOOL_NAMES = [
     PROFILE_MANAGE,
     CHAPTER_MANAGE,
     LOCATION_MANAGE,
-    AGENT_DELEGATE
+    AGENT_DELEGATE,
+    TOOL_CANCEL
 ] as const;
 
 // Budget for toolCreate: registration is cheap but not free, and an unbounded
@@ -314,7 +374,7 @@ const MAX_RUN_DEPTH = 2;
 
 // Tool results are text on the wire. Strings pass through untouched so a tool
 // can return prose; everything else is JSON. The model-facing cap is applied by
-// boundToolResult at the ONE place a result is appended (see executeToolCall).
+// boundToolResult at the ONE place a result is committed (see deliverTask).
 const serialize = (value: unknown): string => {
     if (value === undefined) return '';
     if (typeof value === 'string') return value;
@@ -333,6 +393,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // run in this harness (entry, ctx.run, and delegated subagents); each run gets
     // its own budget because the check lives in runAgentCore's loop.
     const maxIterations = resolveMaxIterations(configuration.maxIterations);
+
+    // Background heartbeat interval (T3/R4), validated at construction like every
+    // other numeric bound so a typo fails before a run starts.
+    const wakeIntervalMs = resolveWakeInterval(configuration.wakeIntervalMs);
 
     // R12 policy resolved once, at construction: a bad `toolCreation` or
     // `maxCreatedTools` fails here rather than after a run has started spending.
@@ -704,7 +768,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     // Bounded delegation (R4). Registered only when there is somewhere to
     // delegate: a tool that can only fail would cost context on every request.
-    // Subagents never receive it (see declared()), and executeToolCall rejects a
+    // Subagents never receive it (see declared()), and launchToolCall rejects a
     // guessed call, so delegation is exactly one level deep. runAgent rejects
     // re-entering an agent that is already running, which closes the ctx.run
     // cycle as well.
@@ -714,7 +778,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // shared metadata: the runtime declaration names the allowlist, and the
             // server catalogue describes the same capability generically.
             ...agentDelegateMetadata(subagentNames),
-            execute: async ({ agent: caller, run, parameters }) => {
+            execute: async ({ agent: caller, run, runDepth, parameters }) => {
                 // Defence in depth: the tool is not declared to subagents, but a
                 // model can guess a name, so the caller is checked here too.
                 if (caller !== primary) {
@@ -724,8 +788,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 }
 
                 // Delegation is a top-level capability. A primary reached as a
-                // subagent of another run must not recurse outward.
-                if (runStack.length > 1) {
+                // subagent of another run must not recurse outward. `runDepth` is
+                // the calling run's depth (1 = top level), carried on the tool
+                // context so this rule survives concurrent runs without a global
+                // run stack.
+                if ((runDepth ?? 1) > 1) {
                     throw new HarnessError(
                         'Delegation is only available from the primary agent\'s own run, not from inside another agent.'
                     );
@@ -782,60 +849,625 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // registers tools mid-flight is picked up on the next call, and so a toolRequest
     // round shows up in the very next request. Per-brain because agentDelegate is a
     // primary-only declaration.
-    const declarations = (brain: Agent): HarnessStreamTool[] =>
-        declared(brain).map(({ name, description, parameters }) => ({ name, description, parameters }));
+    //
+    // toolCancel is appended ONLY while this agent has a background call pending:
+    // that is the only moment it can succeed, and keeping it off ordinary requests
+    // costs no context and leaves the historical declaration list unchanged for a
+    // run with no background work (T3/R4).
+    const declarations = (brain: Agent): HarnessStreamTool[] => {
+        const list = declared(brain).map(({ name, description, parameters }) => ({
+            name,
+            description,
+            parameters
+        }));
 
-    // Append the model-facing result of one tool call. The assistant message that
-    // requested it is already in history (agent.turn() committed it).
-    const appendToolResult = (brain: Agent, call: HarnessToolCall, content: string): void => {
-        brain.messages.push({ role: 'tool', content, toolCallId: call.id, name: call.name });
-        // The transcript is snapshot-managed: notify after the append so a server
-        // can persist it before the next turn starts.
-        notifyStateChange('agent_message', { agent: brain.name });
+        if (scheduler.pending(brain.name).length > 0) {
+            list.push({
+                name: TOOL_CANCEL,
+                description: TOOL_CANCEL_METADATA.description,
+                parameters: TOOL_CANCEL_METADATA.parameters
+            });
+        }
+
+        return list;
     };
 
-    // Execute one tool call and report it. Every failure mode is converted into a
-    // tool result the model can read, so one bad call cannot end the run.
+    // -----------------------------------------------------------------------
+    // Background tool scheduling (T3)
+    // -----------------------------------------------------------------------
     //
-    // EXCEPTION: an abort is not a tool failure. It propagates out of this function
-    // (no tool message is written for it) so the run stops and rolls back instead
-    // of inviting the model to retry a call the operator cancelled. See the abort
-    // boundary at the top.
-    const executeToolCall = async (brain: Agent, call: HarnessToolCall): Promise<void> => {
-        // ABORT BOUNDARY (R10). Checked BEFORE any work: starting a call that has
-        // already been cancelled would add side effects nobody asked for. The
-        // signal is never raced against the implementation below, because a tool
-        // that ignores it may keep mutating after we stopped awaiting — the harness
-        // therefore always awaits the call it started and makes no claim about
-        // stopping side effects it does not control.
-        runSignal?.throwIfAborted();
+    // A tool call no longer blocks the conversation. Each call is launched on the
+    // scheduler immediately and the run continues: the next model request sees a
+    // provider-safe PROJECTION in which unfinished calls have placeholder tool
+    // results. Real results are committed to the canonical transcript as they
+    // arrive (always immediately after the assistant block that requested them),
+    // and each completion makes the run dirty, which drives another model turn so
+    // the model actually sees the outcome.
+    //
+    // Consequences that are deliberate:
+    //   - the 0ms settle window after a launch lets ordinary synchronous /
+    //     microtask tools finish in the SAME round, preserving the historical
+    //     transcript and event order for fast tools. It is not a wait for
+    //     completion: a tool doing real I/O stays pending and the run continues.
+    //   - a `done` event carries `pending` when the run pauses with work in
+    //     flight; the harness promise stays open until the whole tree drains.
+    //   - a response immediately superseded by a completion that landed while its
+    //     request was in flight emits no `done` (it is an intermediate turn, like
+    //     a tool-call round).
+    //   - cancellation is logical: a cancelled call is removed at once and its
+    //     late result is discarded. JavaScript cannot be preempted, so a tool that
+    //     ignores its signal may still keep running (documented, not hidden).
 
-        await progress({ type: 'tool_call', agent: brain.name, call });
+    // One logical agent run. State lives HERE rather than in module globals so
+    // concurrent runs (delegation, ctx.run, two harness calls) cannot corrupt each
+    // other. The lineage is the ancestry chain, which is what makes the cycle and
+    // depth rules work without a global run stack.
+    type RunState = {
+        // Monotonic id; also the scheduler scope, so toolCancel can never reach a
+        // sibling run's tasks.
+        id: number;
+        scope: string;
+        agent: Agent;
+        signal?: AbortSignal;
+        lineage: readonly Agent[];
+        parent?: RunState;
+        active: boolean;
+        aborted: boolean;
+        iteration: number;
+        // True when new work (a completion or a wake) arrived and the loop should
+        // take another turn instead of waiting/returning.
+        dirty: boolean;
+        waiters: Array<() => void>;
+        // The error a tool threw while the run was being aborted. A cancellation
+        // discards late RESULTS, but a tool that observed the abort and threw
+        // gives the more specific error the caller should see (the historical
+        // behaviour), so keep the first one and prefer it over the generic
+        // AbortError.
+        abortError?: unknown;
+        // A progress/observer failure raised while delivering a background
+        // outcome or a wake. The mailbox must stay serialized even when a callback
+        // throws, so the error is parked here and rethrown by the loop: a failing
+        // emitter still fails the run, exactly like a synchronous event would.
+        deliveryError?: unknown;
+    };
 
-        // Bound every model-facing failure too (R10): a throwing tool can carry an
-        // arbitrarily large message, and it would be replayed for the rest of the
-        // conversation just like a result.
-        const fail = async (content: string): Promise<void> => {
-            const bounded = boundToolResult(content).content;
-            appendToolResult(brain, call, bounded);
-            // `callId` pairs the result with the exact tool_call that caused it,
-            // even when two calls in one turn share a name. The server's timing
-            // record uses it to attribute elapsed time without guesswork.
-            await progress({
-                type: 'tool_result',
-                agent: brain.name,
-                name: call.name,
-                callId: call.id,
-                content: bounded,
-                isError: true
+    // Every live run, so a scheduler wake can mark the right runs dirty. Runs are
+    // removed in runAgent's finally.
+    const runs = new Set<RunState>();
+    let runSequence = 0;
+    let activeRuns = 0;
+
+    // Per-agent mailbox. Completion deliveries and wakeups for one agent are
+    // serialized through this chain, so transcript inserts, events, and state
+    // changes never interleave for a single agent. Different agents still run
+    // concurrently.
+    const mailboxes = new Map<string, Promise<void>>();
+
+    const enqueueMailbox = (agentName: string, work: () => Promise<void>): void => {
+        const previous = mailboxes.get(agentName) ?? Promise.resolve();
+        const next = previous.then(work).catch(() => {
+            // Delivery work is already careful about its own failures; swallowing
+            // here guarantees one bad delivery cannot poison an agent's mailbox.
+        });
+        mailboxes.set(agentName, next);
+
+        // Release the tail reference once this delivery is the settled tail, so a
+        // long session does not grow an unbounded promise chain per agent.
+        void next.then(() => {
+            if (mailboxes.get(agentName) === next) mailboxes.delete(agentName);
+        });
+    };
+
+    const markRunDirty = (run: RunState): void => {
+        run.dirty = true;
+        const waiters = run.waiters.splice(0);
+        for (const resolve of waiters) resolve();
+    };
+
+    // Let every delivery already queued for this agent settle before asking the
+    // model again. This is what COALESCES simultaneous completions into one turn
+    // (otherwise each completion could spend its own request) and guarantees the
+    // request projection sees every outcome the mailbox has accepted. A completion
+    // that arrives after this drain marks the run dirty and gets its own turn.
+    //
+    // Loops until the mailbox map has no tail (the cleanup microtask removes a
+    // settled tail): returning with ANY queued delivery is the P1-A lost-outcome
+    // bug. The bound is a paranoia guard, not an expected exit.
+    const drainMailbox = async (agentName: string): Promise<void> => {
+        for (let pass = 0; pass < 1_000; pass++) {
+            const tail = mailboxes.get(agentName);
+            if (tail === undefined) return;
+            await tail;
+            // Let `next.then(cleanup)` run so a settled tail is removed; a tail
+            // that was replaced by a newer job is awaited on the next pass.
+            await Promise.resolve();
+        }
+    };
+
+    // Cancellation check for a run. A tool that observed the abort and threw
+    // supplies a more specific error, which is the historical contract; otherwise
+    // the standard AbortError propagates.
+    const throwIfAborted = (run: RunState): void => {
+        if (run.signal?.aborted === true) {
+            throw run.abortError ?? run.signal.reason;
+        }
+    };
+
+    // The reason to throw for a cancelled request. DOM gives a DOMException with a
+    // standard message when the caller aborted without one; reuse the exact reason
+    // the signal carries so callers/tests see their own error.
+    const abortErrorOf = (signal: AbortSignal): unknown =>
+        signal.reason ?? new DOMException('This operation was aborted', 'AbortError');
+
+    // Pre-commit ownership guard (passed to core/agent as `precommit`). A provider
+    // that ignores its signal may finish a turn LONG after the run was aborted and
+    // its actor released; the assistant message must not be appended to a
+    // transcript another run is now using. This runs immediately before the only
+    // commit point, so a late transport cannot mutate history.
+    const assertCommitAllowed = (run: RunState): void => {
+        if (!run.active || run.aborted || run.signal?.aborted === true) {
+            throw run.signal === undefined
+                ? new HarnessError(
+                      `Agent "${run.agent.name}" no longer owns its turn; the late response was discarded.`
+                  )
+                : abortErrorOf(run.signal);
+        }
+    };
+
+    // Ownership check for streamed progress. A run owns events only while it and
+    // every ANCESTOR are live: an uncooperative provider can still yield frames
+    // after its run (or an ancestor) aborted, and those must never be attributed
+    // to a later turn that happens to be streaming on the same sink.
+    //
+    // The run itself is released on abort by requestTurn's signal race (T15), so
+    // ownership is checked against released state too: the detached provider's
+    // generator may still exist, but it can neither emit (this guard) nor commit
+    // (core/agent's precommit guard) into a later run.
+    const runOwnsEvents = (run: RunState): boolean => {
+        if (!run.active || run.aborted) return false;
+
+        let ancestor = run.parent;
+        while (ancestor !== undefined) {
+            if (!ancestor.active || ancestor.aborted) return false;
+            ancestor = ancestor.parent;
+        }
+
+        return true;
+    };
+
+    // Every streamed event goes through this guard (P2-A). The run's canonical
+    // commit/rollback is separate: this only decides whether a frame is reported.
+    const emit = async (run: RunState, event: HarnessEvent): Promise<void> => {
+        if (!runOwnsEvents(run)) return;
+        await progress(event);
+    };
+
+    // Terminal error is the one frame a CANCELLED ROOT still reports (its call
+    // failed). A child whose cancellation came from its tree is silent: the owner
+    // already reports the cause, and a late child error would land in the next
+    // session. A normally-failing child still reports its own error.
+    //
+    // Deliberately does NOT require `run.active`: the caller is runAgentCore's
+    // catch, which marks the run inactive first so no delivery can touch the
+    // transcript it is about to roll back. This runs at most once per run.
+    const emitError = async (run: RunState, error: HarnessErrorInfo): Promise<void> => {
+        if (run.aborted && run.parent !== undefined) return;
+
+        let ancestor = run.parent;
+        while (ancestor !== undefined) {
+            if (!ancestor.active) return;
+            ancestor = ancestor.parent;
+        }
+
+        await progress({ type: 'error', agent: run.agent.name, error });
+    };
+
+    // The one board per harness. It owns the per-call AbortControllers and the
+    // single recurring wake timer.
+    const scheduler = createTaskScheduler({
+        wakeIntervalMs,
+        // Wake delivery goes through the per-agent mailbox for the same reason a
+        // completion does: it may append nothing, but it emits an event and starts
+        // a turn, and those must not race a completion for the same agent.
+        //
+        // The pending list is recomputed INSIDE the mailbox: the scheduler's tick
+        // snapshot can be stale by the time a queued delivery runs (a completion
+        // may have drained the board), and a stale list would tell the model (and
+        // the UI) that finished work is still running.
+        onWake: (agentName) => {
+            enqueueMailbox(agentName, async () => {
+                const live = [...runs].filter(
+                    (run) => run.agent.name === agentName && runOwnsEvents(run)
+                );
+                if (live.length === 0) return;
+
+                const pending = scheduler.pendingList(agentName);
+
+                try {
+                    await progress({
+                        type: 'wakeup',
+                        agent: agentName,
+                        reason: 'pending-tools',
+                        pending
+                    });
+                } catch (error) {
+                    // A failing reporter fails the run(s), as a synchronous event
+                    // would. Park the error and wake the loop.
+                    for (const run of live) {
+                        if (run.deliveryError === undefined) run.deliveryError = error;
+                        markRunDirty(run);
+                    }
+                    return;
+                }
+
+                // Always give a live run its wake turn, even when the recomputed
+                // list is empty: the tick is a liveness prompt, and a completion
+                // that drained in the meantime may still be queued behind this
+                // mailbox job. Suppressing it could hide the last-drain wake.
+                for (const run of live) markRunDirty(run);
             });
+        }
+    });
+
+    // Tool calls still running for one run, as the wire view.
+    const runPending = (run: RunState, at: number = Date.now()): HarnessPendingTool[] =>
+        scheduler.pendingOfScope(run.scope).map((task) => ({
+            callId: task.callId,
+            name: task.name,
+            elapsedMs: Math.max(0, at - task.startedAt)
+        }));
+
+    // Where a tool result belongs: immediately after the assistant message that
+    // requested it, ordered by CALL ORDER (not arrival), and before any assistant
+    // turn committed later. Returns -1 when no such assistant message exists (the
+    // run was rolled back, or a host edited history), in which case the delivery
+    // is discarded rather than appending an unpaired result at the end.
+    const resultInsertIndex = (brain: Agent, callId: string): number => {
+        let assistantIndex = -1;
+        let order: readonly HarnessToolCall[] = [];
+
+        for (let index = brain.messages.length - 1; index >= 0; index--) {
+            const message = brain.messages[index];
+            if (message.role !== 'assistant') continue;
+            if (message.toolCalls?.some((call) => call.id === callId)) {
+                assistantIndex = index;
+                order = message.toolCalls;
+                break;
+            }
+        }
+
+        if (assistantIndex < 0) return -1;
+
+        const position = new Map(order.map((call, index) => [call.id, index]));
+        const target = position.get(callId) ?? Number.POSITIVE_INFINITY;
+
+        let insertAt = assistantIndex + 1;
+        while (insertAt < brain.messages.length) {
+            const message = brain.messages[insertAt];
+            if (message.role !== 'tool') break;
+
+            const existing = position.get(message.toolCallId);
+            // A recorded result for a LATER call must stay after this one, which is
+            // what makes an out-of-order completion land in its own slot.
+            if (existing !== undefined && existing > target) break;
+            insertAt++;
+        }
+
+        return insertAt;
+    };
+
+    const hasToolResult = (brain: Agent, callId: string): boolean =>
+        brain.messages.some((message) => message.role === 'tool' && message.toolCallId === callId);
+
+    // Insert one real result into the canonical transcript. Returns false when
+    // there is nothing to insert (already answered, or originating block gone).
+    const insertToolMessage = (brain: Agent, call: HarnessToolCall, content: string): boolean => {
+        if (hasToolResult(brain, call.id)) return false;
+
+        const index = resultInsertIndex(brain, call.id);
+        if (index < 0) return false;
+
+        brain.messages.splice(index, 0, {
+            role: 'tool',
+            content,
+            toolCallId: call.id,
+            name: call.name
+        });
+
+        // Snapshot-managed mutation: notify after the splice, exactly like the
+        // synchronous path used to.
+        notifyStateChange('agent_message', { agent: brain.name });
+        return true;
+    };
+
+    // Build the request-only transcript. Real results are canonical; unanswered
+    // calls get a placeholder tool message so a strict provider (assistant tool
+    // calls MUST be followed by their results) accepts the request.
+    //
+    // Ordering is CALL ORDER, not completion order: each assistant block is
+    // followed by one tool message per call, using the real result when it has
+    // arrived and a placeholder otherwise. The canonical records may be in
+    // arrival order (or interleaved with later assistant turns), so this is also
+    // what keeps the wire pairing valid. Placeholders are NEVER committed: they
+    // depend on wall-clock elapsed time and would be stale the moment they landed.
+    const projectTranscript = (
+        brain: Agent,
+        pending: readonly HarnessPendingTool[]
+    ): HarnessMessage[] => {
+        const pendingById = new Map(pending.map((entry) => [entry.callId, entry]));
+        const projected: HarnessMessage[] = [];
+
+        let index = 0;
+        while (index < brain.messages.length) {
+            const message = brain.messages[index];
+            index++;
+
+            projected.push({ ...message });
+
+            if (message.role !== 'assistant' || !message.toolCalls?.length) continue;
+
+            // Consume the contiguous tool block that belongs to this assistant
+            // message. In a harness transcript every contiguous tool message after
+            // a call block belongs to it; keying by call id keeps a restored or
+            // hand-edited transcript from mis-pairing.
+            const realById = new Map<string, Extract<HarnessMessage, { role: 'tool' }>>();
+            while (index < brain.messages.length && brain.messages[index].role === 'tool') {
+                const candidate = brain.messages[index] as Extract<HarnessMessage, { role: 'tool' }>;
+                if (message.toolCalls.some((call) => call.id === candidate.toolCallId)) {
+                    realById.set(candidate.toolCallId, candidate);
+                }
+                index++;
+            }
+
+            for (const call of message.toolCalls) {
+                const real = realById.get(call.id);
+
+                if (real !== undefined) {
+                    projected.push({ ...real });
+                    continue;
+                }
+
+                const entry = pendingById.get(call.id);
+                projected.push({
+                    role: 'tool',
+                    toolCallId: call.id,
+                    name: call.name,
+                    content: JSON.stringify({
+                        status: 'pending',
+                        callId: call.id,
+                        name: call.name,
+                        ...(entry === undefined ? {} : { elapsedMs: entry.elapsedMs }),
+                        note:
+                            entry === undefined
+                                ? 'This tool call has not produced a result yet.'
+                                : 'This tool call is still running in the background. Its real result arrives in a later turn; use toolCancel with this callId to abandon it.'
+                    })
+                });
+            }
+        }
+
+        return projected;
+    };
+
+    // A malformed assistant turn (P2-B): duplicate/empty call ids, or an id that
+    // aliases one already committed, would make result pairing ambiguous — the
+    // scheduler keys on scope+callId and the transcript dedupes by callId, so one
+    // call's result would silently replace the other. Validation happens BEFORE
+    // any call is launched, so rejection has no side effects: the run rolls back
+    // the assistant turn and nothing ran.
+    const assertToolCallIds = (brain: Agent, calls: readonly HarnessToolCall[]): void => {
+        const seen = new Set<string>();
+
+        for (const call of calls) {
+            if (typeof call.id !== 'string' || call.id.trim().length === 0) {
+                throw new HarnessError(
+                    `Agent "${brain.name}" requested a tool call with an empty id; the turn is malformed.`
+                );
+            }
+
+            if (seen.has(call.id)) {
+                throw new HarnessError(
+                    `Agent "${brain.name}" requested tool call id "${call.id}" more than once in one turn; refusing to execute an ambiguous call.`
+                );
+            }
+
+            seen.add(call.id);
+        }
+
+        // The current assistant message was committed by agent.turn() just before
+        // `done`; every earlier message is prior history. Reusing an id from there
+        // would alias an existing (possibly still pending) result.
+        const history = brain.messages.slice(0, -1);
+
+        for (const message of history) {
+            if (message.role !== 'assistant' || !message.toolCalls) continue;
+
+            for (const call of message.toolCalls) {
+                if (!seen.has(call.id)) continue;
+
+                throw new HarnessError(
+                    `Agent "${brain.name}" reused tool call id "${call.id}" from an earlier turn; tool call ids must be unique within the conversation.`
+                );
+            }
+        }
+    };
+
+    // Deliver one settled task. Runs inside the agent's mailbox, so the insert and
+    // the event are one serialized step. A task whose run has already ended (or
+    // was aborted) is discarded: the transcript it would touch was rolled back.
+    const deliverTask = async (
+        task: ReturnType<typeof scheduler.schedule>,
+        run: RunState,
+        call: HarnessToolCall
+    ): Promise<void> => {
+        // A run-level abort discards results that lost the race with cancellation.
+        // Keep a tool's own abort error, though: a tool that observed the signal
+        // and threw explains the cancellation better than "operation was aborted".
+        if (run.aborted) {
+            if (run.abortError === undefined && task.error !== undefined) run.abortError = task.error;
+            return;
+        }
+
+        if (!run.active) return;
+
+        const brain = run.agent;
+        const durationMs = Math.max(0, Date.now() - task.startedAt);
+
+        let content: string;
+        let isError: boolean;
+        let panels: ToolUiPanel[] | undefined;
+
+        if (task.status === 'cancelled') {
+            // A targeted cancellation is a result the model must see: without it
+            // the provider projection would keep a placeholder forever. It is
+            // error-shaped because no usable value exists.
+            content = boundToolResult(
+                `Tool call "${call.name}" (${call.id}) was cancelled before it completed; no result is available.`
+            ).content;
+            isError = true;
+        } else if (task.error !== undefined) {
+            content = boundToolResult(
+                `Tool "${call.name}" failed: ${toErrorInfo(task.error).message}`
+            ).content;
+            isError = true;
+        } else {
+            // Same unwrap/cap as the historical synchronous path (R10/R20.2).
+            const ui = toolUiOf(task.result);
+            content = boundToolResult(serialize(ui === undefined ? task.result : ui.content)).content;
+            panels = ui?.panels;
+            isError = false;
+        }
+
+        insertToolMessage(brain, call, content);
+
+        // The outcome is CANONICAL at this point (P1-A). Wake the loop BEFORE the
+        // reporter runs: a slow progress callback must not be able to keep
+        // `dirty` false while the loop decides the response is final, and two
+        // completions must not be lost behind one blocked mailbox job.
+        markRunDirty(run);
+
+        // Computed AFTER the board removed this task, so the list is what is still
+        // running, not the call just delivered.
+        const pending = scheduler.pendingList(brain.name);
+
+        await emit(run, {
+            type: 'tool_result',
+            agent: brain.name,
+            name: call.name,
+            callId: call.id,
+            content,
+            isError,
+            // Every EXECUTED call reports its span. An inline call is a real
+            // (usually sub-millisecond) measurement, not a milder kind of call;
+            // consumers can render 0ms without special-casing background work.
+            durationMs,
+            ...(panels === undefined ? {} : { ui: panels }),
+            ...(pending.length === 0 ? {} : { pending })
+        });
+
+        // A tool may have mutated session state; notify for every settled call,
+        // success or failure, exactly like the synchronous path's finally.
+        notifyStateChange('tool_execute', { agent: brain.name, tool: call.name });
+    };
+
+    // Emit a result that never became background work (validation failure, or a
+    // toolCancel acknowledgement). It is inserted and reported in one step.
+    const immediateResult = async (
+        run: RunState,
+        call: HarnessToolCall,
+        raw: string,
+        isError: boolean,
+        withDuration = false
+    ): Promise<void> => {
+        const content = boundToolResult(raw).content;
+        insertToolMessage(run.agent, call, content);
+
+        const pending = scheduler.pendingList(run.agent.name);
+
+        await emit(run, {
+            type: 'tool_result',
+            agent: run.agent.name,
+            name: call.name,
+            callId: call.id,
+            content,
+            isError,
+            ...(withDuration ? { durationMs: 0 } : {}),
+            ...(pending.length === 0 ? {} : { pending })
+        });
+    };
+
+    // Launch one tool call. Validation is still synchronous and every failure
+    // mode still becomes a readable tool result; only the implementation runs in
+    // the background.
+    //
+    // EXCEPTION: an abort is not a tool failure. It propagates (no result is
+    // written for it) so the run rolls back instead of inviting a retry.
+    const launchToolCall = async (run: RunState, call: HarnessToolCall): Promise<void> => {
+        // ABORT BOUNDARY (R10): no call starts into a cancelled run.
+        throwIfAborted(run);
+
+        await emit(run, { type: 'tool_call', agent: run.agent.name, call });
+
+        const brain = run.agent;
+
+        const fail = (content: string): Promise<void> => immediateResult(run, call, content, true);
+
+        const parseArguments = (schema: Record<string, unknown> | undefined): unknown => {
+            const parsed: unknown =
+                call.arguments.trim().length > 0 ? JSON.parse(call.arguments) : {};
+            return resolveToolParameters(schema, parsed, 'model');
         };
+
+        // toolCancel is a HARNESS control, not a registry entry: it exists only
+        // while this agent has work in flight (see declarations). Call ids are
+        // resolved inside the CALLING run's scope, so a run can never cancel a
+        // sibling's work.
+        if (call.name === TOOL_CANCEL) {
+            let parameters: unknown;
+
+            try {
+                parameters = parseArguments(TOOL_CANCEL_METADATA.parameters);
+            } catch (error) {
+                const info = toErrorInfo(error);
+                await fail(
+                    error instanceof SyntaxError
+                        ? `Tool "${call.name}" received malformed JSON arguments: ${info.message}`
+                        : `Tool "${call.name}" received arguments that do not match its schema: ${info.message}`
+                );
+                return;
+            }
+
+            const callId = typeof parameters === 'string' ? parameters : '';
+            const task = scheduler.find(run.scope, callId);
+
+            if (!task) {
+                await fail(
+                    `No pending tool call "${callId}" belongs to this run. Use a callId from tool_call events or the pending list.`
+                );
+                return;
+            }
+
+            // Remove it before acknowledging, so the acknowledgement's own
+            // `pending` list is already accurate. Delivery of the cancelled
+            // result is queued on the mailbox and the late implementation result
+            // (if any) is ignored by the scheduler.
+            scheduler.cancel(run.scope, callId);
+            await immediateResult(
+                run,
+                call,
+                JSON.stringify({ cancelled: true, callId, name: task.name }),
+                false,
+                // The acknowledgement is a control result; report its (zero)
+                // span so a UI can render it like any other completed call.
+                true
+            );
+            return;
+        }
 
         const definition = tools[call.name];
 
-        // Unknown tool: still answer the call so the transcript stays valid for
-        // strict providers, and so the model can correct itself — pointing it at
-        // discovery, since the catalogue is not declared.
+        // Unknown tool: answer the call so the transcript stays valid for strict
+        // providers, and point the model at discovery.
         if (!definition) {
             const available = declared(brain).map((tool) => tool.name).join(', ') || 'none';
             await fail(
@@ -844,23 +1476,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return;
         }
 
-        // Delegation is primary-only. agentDelegate is core, so the visibility check
-        // below would let it through; a subagent that guesses the name is stopped
-        // here, in addition to never seeing it declared.
         if (call.name === AGENT_DELEGATE && brain !== primary) {
             await fail(`Tool "${AGENT_DELEGATE}" is only available to the primary agent "${primaryName}".`);
             return;
         }
 
-        // Creation policy (R12) is the same shape of defence for toolCreate.
         if (call.name === TOOL_CREATE && toolCreation === 'primary' && brain !== primary) {
             await fail(`Tool "${TOOL_CREATE}" is only available to the primary agent "${primaryName}".`);
             return;
         }
 
-        // A searchable tool the model has not discovered is not callable, even when
-        // it guesses the name: being declared is what makes a tool available, and
-        // toolRequest is how a tool gets declared.
         if (definition.visibility !== 'core' && !activeTools.has(call.name)) {
             const tags = definition.tags.slice(0, 3).map((tag) => `"${tag}"`).join(', ');
             await fail(
@@ -869,123 +1494,124 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return;
         }
 
-        // Malformed JSON never reaches validation, and unmatched arguments never
-        // reach the implementation (R11). The two are reported separately so the
-        // model knows whether to fix its syntax or its shape.
         let parameters: unknown;
+
         try {
-            const parsed: unknown =
-                call.arguments.trim().length > 0 ? JSON.parse(call.arguments) : {};
-            parameters = resolveToolParameters(definition.parameters, parsed, 'model');
+            parameters = parseArguments(definition.parameters);
         } catch (error) {
             const info = toErrorInfo(error);
-
-            // A SyntaxError came from JSON.parse; anything else is a schema
-            // mismatch raised by resolveToolParameters.
-            const malformed = error instanceof SyntaxError;
             await fail(
-                malformed
+                error instanceof SyntaxError
                     ? `Tool "${call.name}" received malformed JSON arguments: ${info.message}`
                     : `Tool "${call.name}" received arguments that do not match its schema: ${info.message}`
             );
             return;
         }
 
-        const context: ToolContext = {
-            parameters,
-            agent: brain,
-            agents,
-            // Only present when a run supplied one, so a context object keeps its
-            // original shape for every existing tool and test.
-            ...(runSignal === undefined ? {} : { signal: runSignal }),
-            run: (agentName: string, input: string) => {
-                const target = agents[agentName];
-                if (!target) {
-                    throw new HarnessError(`Agent "${agentName}" is not registered.`);
-                }
-                // The run's cancellation and the central depth rule both apply to a
-                // tool-triggered run, exactly as they do to agentDelegate.
-                return runAgent(target, input, runSignal);
+        // Launch. The task's own signal is what the tool sees; it is linked to
+        // the run signal by the scheduler, and toolCancel aborts only this call.
+        scheduler.schedule({
+            scope: run.scope,
+            agent: brain.name,
+            callId: call.id,
+            name: call.name,
+            parent: run.signal,
+            run: async (signal) => {
+                const context: ToolContext = {
+                    parameters,
+                    agent: brain,
+                    agents,
+                    // Always present now: a background call is always cancelable.
+                    signal,
+                    runDepth: run.lineage.length,
+                    run: (agentName: string, input: string) => {
+                        const target = agents[agentName];
+                        if (!target) {
+                            throw new HarnessError(`Agent "${agentName}" is not registered.`);
+                        }
+                        // The child inherits THIS call's signal, so cancelling a
+                        // delegation also cancels the work it started.
+                        return runAgent(target, input, signal, run);
+                    }
+                };
+
+                return definition.execute(context);
+            },
+            onSettled: (task) => {
+                enqueueMailbox(brain.name, () =>
+                    deliverTask(task, run, call).catch((error) => {
+                        // Keep the mailbox chain healthy and fail the RUN on the
+                        // loop, where the rollback path is.
+                        if (run.deliveryError === undefined) run.deliveryError = error;
+                        markRunDirty(run);
+                    })
+                );
             }
-        };
-
-        try {
-            const result = await definition.execute(context);
-
-            // R20.2: a tool may return a `toolUi(content, panels)` envelope.
-            // Unwrap it exactly here, so the model gets the ordinary content and
-            // the client gets optional declarative panels. Ordinary values pass
-            // through unchanged, and a malformed/fake envelope is not recognized.
-            const ui = toolUiOf(result);
-            // R10: the ONE place a model-facing result is capped. Small results are
-            // returned byte-exact; a large one becomes a small, valid truncation
-            // envelope. Panels are bounded separately by core/tool-ui.ts.
-            const content = boundToolResult(serialize(ui === undefined ? result : ui.content)).content;
-            appendToolResult(brain, call, content);
-            await progress({
-                type: 'tool_result',
-                agent: brain.name,
-                name: call.name,
-                callId: call.id,
-                content,
-                isError: false,
-                // Absent for every ordinary tool, so recorded events keep their
-                // existing shape. The model never sees this field.
-                ...(ui === undefined ? {} : { ui: ui.panels })
-            });
-        } catch (error) {
-            // An abort raised by a cooperating tool is a cancellation, not a tool
-            // failure: propagate it so the run rolls back instead of feeding the
-            // model a "failed" result it would try to work around.
-            if (runSignal?.aborted === true) throw error;
-
-            await fail(`Tool "${call.name}" failed: ${toErrorInfo(error).message}`);
-        } finally {
-            // Notify even when the tool threw: a tool may mutate session state
-            // before failing, and an extra save is harmless. This is also the
-            // single place discovery/todo/profile/chapter/location/create changes
-            // become observable to a persistence layer on the MODEL path.
-            notifyStateChange('tool_execute', { agent: brain.name, tool: call.name });
-        }
+        });
     };
 
-    // Run one agent to completion. This is the loop the harness exists for.
-    //
-    // Renamed from runAgent: the guarded entry point is the wrapper below, so
-    // every path (harness call, ctx.run, agentDelegate) shares one recursion check,
-    // one depth rule, and one cancellation signal.
-    const runAgentCore = async (
-        brain: Agent,
-        input: string,
-        signal?: AbortSignal
-    ): Promise<HarnessAssistantMessage> => {
-        // Everything past this index belongs to this run. A failure truncates
-        // back to it, so a failed call is never replayed on the next attempt.
-        const commitIndex = brain.messages.length;
+    // Provider-safe projection + serialized model turn. One active turn per agent:
+    // two independent runs of the same agent queue here instead of interleaving
+    // requests and commits. The projection is built INSIDE the lock because a
+    // background completion may have landed while this turn waited.
+    const turnQueues = new Map<string, Promise<void>>();
 
-        await progress({ type: 'start', agent: brain.name, model: brain.model() });
-        brain.user(input);
-        // The user message is now part of the snapshot-managed transcript.
-        notifyStateChange('agent_message', { agent: brain.name });
+    const serializeTurn = <T>(agentName: string, work: () => Promise<T>): Promise<T> => {
+        const previous = turnQueues.get(agentName) ?? Promise.resolve();
+        let release!: () => void;
+        const gate = new Promise<void>((resolve) => {
+            release = resolve;
+        });
+        const tail = previous.then(() => gate);
+        turnQueues.set(agentName, tail);
 
-        try {
-            for (let iteration = 0; iteration < maxIterations; iteration++) {
-                // ABORT BOUNDARY (R10): no new model request once cancelled. The
-                // check sits at the top of the loop AND at the top of
-                // executeToolCall (so a cancellation during a tool round stops the
-                // remaining calls of that round instead of starting them).
-                signal?.throwIfAborted();
+        void tail.then(() => {
+            if (turnQueues.get(agentName) === tail) turnQueues.delete(agentName);
+        });
 
-                let message: HarnessAssistantMessage | undefined;
+        return previous.then(work).finally(() => release());
+    };
 
-                for await (const event of brain.turn({ signal, tools: declarations(brain) })) {
+    // One model turn, made abort-PREEMPTIVE (T15). The transport may ignore its
+    // signal entirely, so we do not rely on it settling: the consumer races the
+    // run signal and throws as soon as the run is cancelled. The abandoned
+    // generator is drained in the background; core/agent's `precommit` guard is
+    // what refuses a late commit, so the detached stream cannot touch the
+    // transcript (or emit events through `emit`, which is ownership-guarded).
+    const requestTurn = async (run: RunState): Promise<HarnessAssistantMessage> => {
+        const brain = run.agent;
+
+        return serializeTurn(brain.name, async () => {
+            // The run may have been aborted while this turn waited behind another
+            // turn of the same agent: never start a provider request for it.
+            throwIfAborted(run);
+
+            const projection = projectTranscript(brain, runPending(run));
+            const iterator = brain
+                .turn({
+                    signal: run.signal,
+                    tools: declarations(brain),
+                    transcript: projection,
+                    precommit: () => assertCommitAllowed(run)
+                })
+                [Symbol.asyncIterator]();
+
+            let message: HarnessAssistantMessage | undefined;
+
+            const consume = (async (): Promise<HarnessAssistantMessage> => {
+                while (true) {
+                    const next = await iterator.next();
+                    if (next.done === true) break;
+
+                    const event = next.value;
+
                     switch (event.type) {
                         case 'text':
-                            await progress({ type: 'text', agent: brain.name, delta: event.delta });
+                            await emit(run, { type: 'text', agent: brain.name, delta: event.delta });
                             break;
 
                         case 'reasoning':
-                            await progress({ type: 'reasoning', agent: brain.name, delta: event.delta });
+                            await emit(run, { type: 'reasoning', agent: brain.name, delta: event.delta });
                             break;
 
                         case 'done':
@@ -1001,100 +1627,394 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     throw new HarnessError(`Agent "${brain.name}" ended without producing a message.`);
                 }
 
+                return message;
+            })();
+
+            // A losing consumer settles after the race is decided; it must never
+            // become an unhandled rejection.
+            void consume.catch(() => undefined);
+
+            // Captured once: the run signal never changes, and a local const keeps
+            // the abort wiring below reliably narrowed.
+            const signal = run.signal;
+
+            if (signal === undefined) {
+                try {
+                    return await consume;
+                } catch (error) {
+                    // Preserve for-await's close-on-early-exit semantics even
+                    // though this path has no abort race (e.g. a reporter threw):
+                    // unwind the generator and the transport it is iterating.
+                    if (iterator.return) {
+                        void iterator.return(undefined).catch(() => undefined);
+                    }
+                    throw error;
+                }
+            }
+
+            let rejectAborted!: (reason: unknown) => void;
+            const aborted = new Promise<never>((_, reject) => {
+                rejectAborted = reject;
+            });
+            const abortHandler = (): void => rejectAborted(abortErrorOf(signal));
+            if (signal.aborted) abortHandler();
+            else signal.addEventListener('abort', abortHandler, { once: true });
+
+            try {
+                return await Promise.race([consume, aborted]);
+            } catch (error) {
+                // Unwind at the next suspension (no await: a provider stuck in a
+                // pending next() may take forever, and that is fine — the
+                // precommit guard keeps it harmless).
+                if (iterator.return) {
+                    void iterator.return(undefined).catch(() => undefined);
+                }
+                throw error;
+            } finally {
+                signal.removeEventListener('abort', abortHandler);
+            }
+        });
+    };
+
+    // Wait until a completion/wake/abort marks the run dirty. The loop always
+    // re-checks the real state after waking; this is a notification, not a
+    // decision.
+    const waitForWork = (run: RunState): Promise<void> => {
+        if (run.dirty) {
+            run.dirty = false;
+            return Promise.resolve();
+        }
+
+        return new Promise<void>((resolve) => {
+            run.waiters.push(() => {
+                run.dirty = false;
+                resolve();
+            });
+        });
+    };
+
+    // Bounded microtask window after a launch. Tools that settle without yielding
+    // to real I/O (synchronous bodies, resolved promises, a delegated child whose
+    // scripted transport is microtask-only) finish in the SAME round, preserving
+    // the historical transcript/event order. A tool that is genuinely waiting
+    // (timer, socket, a gated promise) stays pending and the run continues with
+    // placeholders. Microtasks rather than setTimeout also keeps this deterministic
+    // under fake timers: no timer is created, so no timer can leak.
+    const settleWindow = async (run: RunState): Promise<void> => {
+        for (let pass = 0; pass < 256; pass++) {
+            if (scheduler.pendingOfScope(run.scope).length === 0) return;
+            await Promise.resolve();
+        }
+    };
+
+    // Run one agent until it has answered AND nothing it started is still
+    // running. `maxIterations` bounds model turns; exhaustion cancels the pending
+    // work before throwing so no orphan task survives a rolled-back run.
+    const runAgentCore = async (
+        run: RunState,
+        input: string
+    ): Promise<HarnessAssistantMessage> => {
+        const brain = run.agent;
+
+        // Everything past this index belongs to this run. A failure truncates
+        // back to it, so a failed call is never replayed on the next attempt.
+        const commitIndex = brain.messages.length;
+
+        await emit(run, { type: 'start', agent: brain.name, model: brain.model() });
+        brain.user(input);
+        notifyStateChange('agent_message', { agent: brain.name });
+
+        try {
+            while (true) {
+                // ABORT BOUNDARY (R10): no new model request or tool launch once
+                // the run is cancelled.
+                throwIfAborted(run);
+
+                // A background delivery or wake whose reporter threw fails the run
+                // here, where the rollback path is (the mailbox itself never
+                // rejects: one bad delivery must not poison the agent's chain).
+                if (run.deliveryError !== undefined) throw run.deliveryError;
+
+                if (run.iteration >= maxIterations) {
+                    // Explicit drain: release everything this run started before
+                    // the rollback below, so a failure cannot leave a task that
+                    // later inserts into a dead transcript.
+                    scheduler.abandonScope(run.scope);
+                    throw new HarnessError(
+                        `Agent "${brain.name}" requested tools more than ${maxIterations} times without answering.`
+                    );
+                }
+
+                run.iteration++;
+                // Deliveries that landed before this turn must be visible to it;
+                // reset dirty AFTER draining so the reset does not hide a real
+                // outcome from `changedDuringRequest` below.
+                await drainMailbox(brain.name);
+                run.dirty = false;
+
+                const message = await requestTurn(run);
+
+                // P1-A: a completion may have landed WHILE this request was in
+                // flight, and its slow reporter may still be running. Drain the
+                // agent's mailbox BEFORE deciding this response is final, so the
+                // run can never return with a run-owned delivery still queued.
+                // `run.dirty` is set at canonical insertion (before the reporter),
+                // so `changedDuringRequest` is reliable even when the reporter is
+                // blocked here.
+                await drainMailbox(brain.name);
+
+                // An abort that arrived while the transport was in flight must stop
+                // the run HERE: an uncooperative provider may still deliver a
+                // message, but it is not an answer for a cancelled run (and its
+                // assistant commit must be rolled back with the rest).
+                throwIfAborted(run);
+
+                const changedDuringRequest = run.dirty;
+                run.dirty = false;
+
+                // Validate id integrity BEFORE any persistence/usage boundary: a
+                // malformed turn must never be written to a snapshot even briefly.
+                // The agent already committed it in memory; the throw below rolls
+                // it back and only the post-rollback state is persisted.
+                if (message.toolCalls.length > 0) {
+                    assertToolCallIds(brain, message.toolCalls);
+                }
+
                 // agent.turn() committed the assistant message before yielding
                 // `done`; persist that append before any tool work or the next turn.
                 notifyStateChange('agent_message', { agent: brain.name });
 
-                // Per-request token accounting, reported for EVERY turn — including
-                // the tool rounds that continue this run — so a client can tally the
-                // whole run's cost while it iterates. The `done` event below reports
-                // only the FINAL request, which is why this event exists separately.
-                // A transport that reports no usage for a request emits nothing here;
-                // an unreported request must not look like a free one.
                 if (message.usage !== undefined) {
-                    await progress({ type: 'usage', agent: brain.name, usage: message.usage });
+                    await emit(run, { type: 'usage', agent: brain.name, usage: message.usage });
                 }
 
-                // The model answered with text: the run is done.
                 if (message.toolCalls.length === 0) {
-                    await progress({ type: 'done', agent: brain.name, message });
+                    const pending = runPending(run);
+
+                    // Paused, not finished: report the response with the work it
+                    // is waiting on, then wait for a completion or the wake timer.
+                    if (pending.length > 0) {
+                        await emit(run, { type: 'done', agent: brain.name, message, pending });
+
+                        if (!changedDuringRequest) await waitForWork(run);
+                        continue;
+                    }
+
+                    // Work arrived while the request was in flight: take another
+                    // turn so the model sees the new results. No `done` is emitted
+                    // for this superseded response.
+                    if (changedDuringRequest) continue;
+
+                    // Final guard: the mailbox is drained and dirty is clear right
+                    // before the run is allowed to resolve. A delivery that raced
+                    // this check re-dirties the run and gets its own turn; an abort
+                    // that raced it must still fail/roll back rather than resolve.
+                    await drainMailbox(brain.name);
+                    if (run.dirty) continue;
+                    throwIfAborted(run);
+
+                    await emit(run, { type: 'done', agent: brain.name, message });
+
+                    // Terminal boundary (T18): the reporter that receives `done`
+                    // may abort the run (a UI cancelling from its own handler). The
+                    // check before emit is not enough because the abort happens
+                    // DURING the awaited reporter; re-check before resolving so a
+                    // cancelled run rolls back and rejects instead of returning a
+                    // successful answer.
+                    throwIfAborted(run);
+
                     return message;
                 }
 
-                // Otherwise run every requested tool, then re-request.
+                // Launch every requested call; they run concurrently. A launch
+                // failure is already a tool result, so the round always completes.
                 for (const call of message.toolCalls) {
-                    await executeToolCall(brain, call);
+                    throwIfAborted(run);
+                    await launchToolCall(run, call);
                 }
-            }
 
-            throw new HarnessError(
-                `Agent "${brain.name}" requested tools more than ${maxIterations} times without answering.`
-            );
+                await settleWindow(run);
+            }
         } catch (error) {
+            // Mark the run dead BEFORE any await: a completion racing this catch
+            // must not insert into the transcript that is about to be truncated.
+            run.active = false;
+            run.aborted = run.signal?.aborted === true;
+            scheduler.abandonScope(run.scope);
+
             brain.messages.splice(commitIndex);
-            // The rollback removed this run's messages: notify after the splice so
-            // a saved transcript does not keep a failed call's partial turn.
             notifyStateChange('agent_message', { agent: brain.name });
 
             const info = toErrorInfo(error);
-            await progress({ type: 'error', agent: brain.name, error: info });
+            await emitError(run, info);
 
             throw error instanceof HarnessError ? error : new HarnessError(info.message, { cause: error });
         }
     };
 
-    // Agents currently executing, outermost first. Three jobs now:
-    //   - refuse to re-enter a running agent (self-delegation, the primary reached
-    //     from inside a subagent, a ctx.run cycle). That can never produce an
-    //     answer, only a stack;
-    //   - enforce MAX_RUN_DEPTH, so "one level of delegation" is a CENTRAL rule
-    //     that a created tool holding the whole `context` cannot widen (R12);
-    //   - let the agentDelegate tool prove it runs at the top level.
-    const runStack: Agent[] = [];
+    // One active RUN per agent (the actor). Model turns are already serialized by
+    // turnQueues, but a run appends a user message and a transcript; two runs of
+    // the same agent interleaving those appends would show each other's prompts.
+    // Queuing the whole run is what makes repeated delegation/follow-ups to the
+    // same subagent sequential. Independent agents still run concurrently, and
+    // tools within a run are concurrent.
+    const agentQueues = new Map<string, Promise<void>>();
 
-    // Cancellation of the run that is executing RIGHT NOW (outermost runs save and
-    // restore the previous value, so a nested run inherits and returns it). This is
-    // what makes a signal reach tool contexts and delegated subagents (R10).
-    let runSignal: AbortSignal | undefined;
+    const acquireAgent = (
+        agentName: string,
+        signal?: AbortSignal
+    ): (() => void) | Promise<() => void> => {
+        const previous = agentQueues.get(agentName);
+
+        const createGate = (): { release: () => void; tail: Promise<void> } => {
+            let releaseGate!: () => void;
+            const gate = new Promise<void>((resolve) => {
+                releaseGate = resolve;
+            });
+            let released = false;
+            const release = (): void => {
+                if (released) return;
+                released = true;
+                releaseGate();
+            };
+            return { release, tail: gate };
+        };
+
+        // FAST PATH: no run of this agent is active or queued. Return the release
+        // function SYNCHRONOUSLY so the run can emit `start` in the same tick the
+        // caller invoked it (the server's event contract depends on that: the
+        // first turn's start predates a watcher attached just after submission).
+        if (previous === undefined) {
+            const { release, tail } = createGate();
+            agentQueues.set(agentName, tail);
+            void tail.then(() => {
+                if (agentQueues.get(agentName) === tail) agentQueues.delete(agentName);
+            });
+            return release;
+        }
+
+        // QUEUED PATH: wait for the current actor. A queued run must remain
+        // cancelable: a follow-up waiting behind a hung sibling should reject when
+        // its own signal aborts instead of starting later. Releasing the gate on
+        // abort lets the NEXT waiter through.
+        return (async () => {
+            const { release, tail } = createGate();
+            const queued = previous.then(() => tail);
+            agentQueues.set(agentName, queued);
+
+            void queued.then(() => {
+                if (agentQueues.get(agentName) === queued) agentQueues.delete(agentName);
+            });
+
+            if (signal) {
+                let onAbort: (() => void) | undefined;
+                const aborted = new Promise<never>((_, reject) => {
+                    onAbort = () => reject(signal.reason);
+                    if (signal.aborted) onAbort();
+                    else signal.addEventListener('abort', onAbort, { once: true });
+                });
+
+                try {
+                    await Promise.race([previous, aborted]);
+                } catch (error) {
+                    release();
+                    throw error;
+                } finally {
+                    if (onAbort) signal.removeEventListener('abort', onAbort);
+                }
+            } else {
+                await previous;
+            }
+
+            return release;
+        })();
+    };
 
     // The one entry point every path uses: the harness call, ctx.run, and
-    // agentDelegate. The guards live here rather than in the tools so none of them
-    // can be bypassed through the general tool context.
+    // agentDelegate. Guards live here so none can be bypassed through a tool's
+    // general context.
+    //
+    // Per-run state replaces the old global runStack/runSignal: concurrent tools
+    // and delegated agents must not overwrite each other's signal or lineage.
     const runAgent = async (
         brain: Agent,
         input: string,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        parent?: RunState
     ): Promise<HarnessAssistantMessage> => {
-        if (runStack.includes(brain)) {
+        const ancestors = parent?.lineage ?? [];
+
+        if (ancestors.includes(brain)) {
             throw new HarnessError(
                 `Agent "${brain.name}" is already running; it cannot be re-entered (delegation cycle).`
             );
         }
 
-        // Central depth/authority rule (R12). Checked AFTER the cycle check so a
+        // Central depth/authority rule (R12), checked AFTER the cycle check so a
         // cycle keeps its own, more precise message.
-        if (runStack.length >= MAX_RUN_DEPTH) {
+        if (ancestors.length >= MAX_RUN_DEPTH) {
             throw new HarnessError(
-                `Agent "${brain.name}" cannot run: runs nest at most ${MAX_RUN_DEPTH} deep, and "${runStack[runStack.length - 1].name}" is already running.`
+                `Agent "${brain.name}" cannot run: runs nest at most ${MAX_RUN_DEPTH} deep, and "${ancestors[ancestors.length - 1].name}" is already running.`
             );
         }
 
-        // An already-cancelled run must not start: check before pushing anything.
+        // An already-cancelled run must not start: check before queueing.
         signal?.throwIfAborted();
 
-        const previousSignal = runSignal;
-        runSignal = signal;
-        runStack.push(brain);
+        // Wait for this agent's actor. A queued run is not "started" until it owns
+        // the actor, so an abort while waiting rejects without touching history.
+        // The free path returns synchronously (no microtask before `start`).
+        const acquired = acquireAgent(brain.name, signal);
+        const releaseAgent = typeof acquired === 'function' ? acquired : await acquired;
 
         try {
-            return await runAgentCore(brain, input, signal);
+            signal?.throwIfAborted();
+
+            const id = ++runSequence;
+            const run: RunState = {
+                id,
+                scope: String(id),
+                agent: brain,
+                signal,
+                lineage: [...ancestors, brain],
+                parent,
+                active: true,
+                aborted: false,
+                iteration: 0,
+                dirty: false,
+                waiters: []
+            };
+
+            // A run-level abort wakes a paused loop so the next iteration observes
+            // it and rolls back. Every in-flight controller is linked by the
+            // scheduler.
+            const onAbort = (): void => {
+                run.aborted = true;
+                markRunDirty(run);
+            };
+
+            if (signal) {
+                if (signal.aborted) onAbort();
+                else signal.addEventListener('abort', onAbort, { once: true });
+            }
+
+            runs.add(run);
+            activeRuns++;
+
+            try {
+                return await runAgentCore(run, input);
+            } finally {
+                run.active = false;
+                runs.delete(run);
+                activeRuns--;
+                // Idempotent: the catch path already drained; a successful run has
+                // nothing left. This also handles an unexpected throw outside the
+                // loop's own catch.
+                scheduler.abandonScope(run.scope);
+                if (signal) signal.removeEventListener('abort', onAbort);
+            }
         } finally {
-            // Pop in a finally so a failed or aborted run leaves the stack and the
-            // signal binding clean for the next call. The run itself is always
-            // awaited to completion (see the abort boundary): this releases
-            // exclusivity only after the last tool has actually settled.
-            runStack.pop();
-            runSignal = previousSignal;
+            releaseAgent();
         }
     };
 
@@ -1174,7 +2094,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     const restore = (value: HarnessSnapshot): void => {
-        if (runStack.length > 0) {
+        if (activeRuns > 0) {
             throw new HarnessError(
                 'Cannot restore while an agent run is in progress; wait for the run to settle.'
             );
@@ -1369,6 +2289,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // still enforced by runAgent.
                 agent: primary,
                 agents,
+                // A manual call is a top-level action (depth 1), exactly like a
+                // harness invocation; delegation and the depth rule see it that
+                // way.
+                runDepth: 1,
                 run: (agentName: string, input: string) => {
                     const target = agents[agentName];
                     if (!target) {

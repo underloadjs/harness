@@ -394,13 +394,22 @@ describe('presets inside a harness', () => {
         const message = await writer('read the file');
 
         expect(message.content).toBe('read it');
-        // user -> fileRead call -> result -> answer: no toolRequest round.
+        // user -> fileRead call -> result -> pause -> answer: no toolRequest round.
+        // IMMEDIATE CONTINUATION (R1): fileRead does real fs I/O, so it is still
+        // pending when the harness takes the next turn. The scripted answer is
+        // therefore committed as a PAUSE (index 3), the real result is inserted at
+        // its original call position (index 2), and the model is re-requested once
+        // the read lands. The scripted transport has no further turn left, so it
+        // repeats its last answer for that final request (index 4).
         expect(entry.messages.map((item) => item.role)).toEqual([
             'user',
             'assistant',
             'tool',
+            'assistant',
             'assistant'
         ]);
+        expect((entry.messages[3] as { content: string }).content).toBe('read it');
+        expect((entry.messages[4] as { content: string }).content).toBe('read it');
         // The single-property rule unwrapped the model's {"paths":[...]} to the
         // array, and the result serialized as the bounded batch object.
         expect(JSON.parse((entry.messages[2] as { content: string }).content)).toEqual({

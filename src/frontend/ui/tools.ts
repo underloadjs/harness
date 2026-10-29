@@ -1,10 +1,18 @@
 // Collapsible tool-call cards.
 //
 // Every harness tool call arrives as two SSE events — `tool_call` (name +
-// arguments) and later `tool_result` (name + content + isError) — and neither
-// shares a call id with the other on the wire. This module owns one card per
-// call, keeps its status in sync, and exposes the status in *text* so the colour
-// is decoration rather than the only signal.
+// arguments) and later `tool_result` (name + content + isError) — and the result
+// names the call it answers when the server sends `callId` (name+order is the
+// documented fallback for an older server). This module owns one card per call,
+// keeps its status in sync, and exposes the status in *text* so the colour is
+// decoration rather than the only signal.
+//
+// Concurrency (R6): calls are scheduled concurrently, so a card can stay
+// `running` after its agent has already answered (`done` with a non-empty
+// `pending` list). Such a card is NOT an error: it keeps ticking until its own
+// `tool_result` arrives. Only a terminal turn or an explicit cancel closes it,
+// through `abandon()`: pending work is interrupted on cancel/restart, never
+// resumed, so a settled tile must not leave a live-looking call behind.
 //
 // Semantics: `details/summary` gives collapse/expand, keyboard support and
 // screen-reader semantics for free. Nothing is auto-opened: a log with fifty
@@ -28,7 +36,7 @@
 import { highlightCode, looksLikeJson, prettyJson } from './markdown';
 import { formatDuration } from './time';
 
-export type ToolState = 'running' | 'ok' | 'error';
+export type ToolState = 'running' | 'ok' | 'error' | 'cancelled';
 
 // Timing for one call:
 //   - `callId` comes from `tool_call.call.id` and is what a server that sends
@@ -58,6 +66,12 @@ export type ToolCallCard = {
     // same call is ignored instead of overwriting the first answer. `durationMs`
     // overrides the local measurement (used when replaying `eventTimes`).
     resolve: (content: string, isError: boolean, durationMs?: number) => void;
+    // Close a call that will never produce a result — the turn was cancelled,
+    // failed, or ended while the call was still running (R6: pending work is
+    // INTERRUPTED, never resumed). Without this the card kept saying `running`
+    // and "Waiting for the harness…" on a settled tile, which was a lie.
+    // Idempotent, and a no-op on a card that already resolved.
+    abandon: (reason?: string) => void;
     // Stop the live timer. Called when the owning turn is cleared or the page is
     // hidden; a resolved card also stops it itself.
     destroy: () => void;
@@ -89,7 +103,8 @@ const previewArguments = (raw: string, limit = 96): string => {
 const STATE_TEXT: Readonly<Record<ToolState, string>> = {
     running: 'running',
     ok: 'ok',
-    error: 'error'
+    error: 'error',
+    cancelled: 'cancelled'
 };
 
 // The collapsed chip hides the visible state word (styles.css `.tool:not([open])`),
@@ -102,7 +117,10 @@ const summaryLabel = (name: string, state: ToolState): string => `${name}: ${STA
 const STATE_GLYPH: Readonly<Record<ToolState, string>> = {
     running: '→',
     ok: '✓',
-    error: '✕'
+    error: '✕',
+    // A call that was cut off: neither success nor tool failure, so it gets its
+    // own muted glyph instead of borrowing the red error mark.
+    cancelled: '⊘'
 };
 
 const createCodeBlock = (code: string, language: string | undefined): HTMLElement => {
@@ -261,6 +279,38 @@ export const createToolCallCard = (
             : `${previewArguments(rawArguments)} · ${text.length.toLocaleString()} chars`;
     };
 
+    // Interrupted call: freeze whatever span the card measured, then state WHY
+    // there is no result. No server duration exists for a call that never
+    // returned, so an unknown span stays hidden instead of becoming 0ms.
+    const abandon = (reason = 'Interrupted before the call returned.'): void => {
+        if (settled) return;
+        settled = true;
+
+        measured =
+            timing.startedAt === undefined ? undefined : Math.max(0, Date.now() - timing.startedAt);
+
+        stopTicker();
+        paintDuration();
+
+        current = 'cancelled';
+        element.dataset.state = current;
+        glyph.textContent = STATE_GLYPH[current];
+        state.textContent = STATE_TEXT[current];
+        // The collapsed chip hides the state word, so the accessible label carries
+        // it (same rule as resolve).
+        summary.setAttribute('aria-label', summaryLabel(name, current));
+        resultLabel.textContent = 'result · cancelled';
+
+        // Replace the "Waiting for the harness to run this call…" placeholder: a
+        // card on a settled tile must not claim the harness may still run it.
+        const note = document.createElement('p');
+        note.className = 'tool-pending';
+        note.textContent = reason;
+        resultHolder.replaceChildren(note);
+
+        peek.textContent = `${previewArguments(rawArguments)} · cancelled`;
+    };
+
     return {
         element,
         name,
@@ -268,6 +318,7 @@ export const createToolCallCard = (
         state: () => current,
         durationMs: () => measured,
         resolve,
+        abandon,
         destroy: stopTicker
     };
 };

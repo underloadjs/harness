@@ -58,6 +58,12 @@ export const PROFILE_MANAGE_NAME = 'profileManage';
 export const CHAPTER_MANAGE_NAME = 'chapterManage';
 export const LOCATION_MANAGE_NAME = 'locationManage';
 export const AGENT_DELEGATE_NAME = 'agentDelegate';
+// Targeted cancellation for background tool calls (T3/R4). Not part of
+// coreToolMetadata(): it is declared to the model ONLY while that agent actually
+// has calls in flight, so it costs no context on ordinary requests and a server
+// catalogue that lists standing capabilities does not advertise a control that
+// has nothing to cancel.
+export const TOOL_CANCEL_NAME = 'toolCancel';
 
 // One core tool's declarative half: everything a request declaration or a server
 // catalogue needs, and nothing that could execute.
@@ -431,3 +437,28 @@ export const coreToolMetadata = (): CoreToolMetadata[] => [
     CHAPTER_MANAGE_METADATA,
     LOCATION_MANAGE_METADATA
 ];
+
+// Targeted cancellation (T3/R4). The harness declares this ONLY while the calling
+// agent has a background call pending, which is exactly when it can succeed, so
+// the description is written for that moment: it explains that the call keeps
+// running unless it observes its abort signal, and that the harness stops waiting
+// either way. `callId` is the id from the `tool_call` event / pending list.
+export const TOOL_CANCEL_METADATA: CoreToolMetadata = {
+    name: TOOL_CANCEL_NAME,
+    description:
+        'Cancel one background tool call you started. Pass the callId shown in the pending list (tool_call events, tool_result.pending, or a wakeup). The harness releases the call immediately and ignores any later result, so you can continue without waiting for it. A tool that watches its abort signal also stops its own work; JavaScript cannot be preempted, so a tool that ignores the signal may still finish in the background. Cancelling an id that is not pending is an error.',
+    tags: ['tool', 'tools', 'cancel', 'background', 'abort'],
+    visibility: 'core',
+    parameters: {
+        type: 'object',
+        properties: {
+            callId: {
+                type: 'string',
+                minLength: 1,
+                description: 'The callId of the pending tool call to cancel.'
+            }
+        },
+        required: ['callId'],
+        additionalProperties: false
+    }
+};

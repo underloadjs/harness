@@ -280,15 +280,6 @@ const copyDescriptor = (descriptor: HarnessDescriptor): HarnessDescriptor =>
 
 const copyTurns = (turns: readonly SessionTurn[]): SessionTurn[] => turns.map(copyTurn);
 
-const safeEmit = async (emit: Emit, item: SessionStreamItem): Promise<void> => {
-    try {
-        await emit(item);
-    } catch {
-        // The stream is gone. The run is aborted through the response's close
-        // handler, so there is nothing else to do here.
-    }
-};
-
 // Trim + bound a task input. Shared by the legacy run() and the queue enqueue()
 // so the two submit surfaces cannot disagree about what a valid task is. Throws
 // BEFORE any mutation, which is what makes a rejected submit safe to retry.
@@ -321,6 +312,20 @@ export class SessionStore {
     // `restore` state changes, and writing the file back mid-load would be a
     // pointless (and possibly partial) round trip.
     private loading = false;
+    // Shutdown guards (T13 / P1-B). `closing` is set by dispose() AFTER the one
+    // graceful save and BEFORE any session is aborted or the map is cleared;
+    // `closed` is permanent and set once the map is empty. Both block every
+    // background save, and persistOrThrow refuses outright: after the map was
+    // cleared a write would serialize `sessions: []` over the good document —
+    // exactly the data loss reproduced by Temp/T10/probe-dispose.ts.
+    private closing = false;
+    private closed = false;
+
+    // True once dispose() started tearing the store down. Every writer checks it,
+    // because a store with an empty map must never be the source of a save.
+    private get shuttingDown(): boolean {
+        return this.closing || this.closed;
+    }
 
     // `registry` defaults to a fresh in-memory registry over the shipped presets.
     // It is injectable so tests can run scripted harnesses (including subagents and
@@ -521,8 +526,18 @@ export class SessionStore {
     // Structural mutations use this: the caller's result is only returned after the
     // document (including this mutation) is durable. Failure becomes a 500 with the
     // underlying message; each caller rolls back what it can.
+    //
+    // Post-shutdown it refuses instead of writing: the in-memory map was cleared by
+    // dispose(), so the document this method would build no longer describes the
+    // store, and saving it would destroy the graceful shutdown document. A 503 is
+    // the honest answer to a request that raced the shutdown (the caller's rollback
+    // then leaves in-memory state exactly as it found it).
     private persistOrThrow(): void {
         if (this.persistence === undefined) return;
+
+        if (this.shuttingDown) {
+            throw new SessionError(503, 'The harness database is closed; nothing was saved.');
+        }
 
         try {
             this.persistence.save(this.databaseRecord());
@@ -536,8 +551,16 @@ export class SessionStore {
     // Background transitions use this: a completed run is no longer allowed to
     // change its outcome because the disk is full, but the failure is recorded and
     // reported so it cannot vanish silently.
+    //
+    // Suppressed while shutting down (P1-B). The aborted run settles only AFTER
+    // dispose() cleared the session map, so its terminal save would otherwise
+    // rewrite the file with `sessions: []` and lose every session it just
+    // committed. Background work may legitimately race a shutdown; it may never
+    // overwrite the shutdown document.
     private persistBestEffort(): void {
         if (this.persistence === undefined) return;
+
+        if (this.shuttingDown) return;
 
         try {
             this.persistence.save(this.databaseRecord());
@@ -577,7 +600,10 @@ export class SessionStore {
     // swallows them anyway; write failures go through notePersistenceError so they
     // stay observable.
     private noteStateChange(session: Session, _event: HarnessStateChangeEvent): void {
-        if (this.loading || session.disposed) return;
+        // A disposed session and a closing store are both dead ends: taking the
+        // snapshot would be wasted work and the save must not happen at all (the
+        // map no longer contains it, so the document would be a lie).
+        if (this.loading || session.disposed || this.shuttingDown) return;
 
         try {
             session.core = session.harness.snapshot();
@@ -1262,6 +1288,42 @@ export class SessionStore {
 
         let failure: string | undefined;
 
+        // P3: ONE serial write chain for THIS turn's legacy SSE frames.
+        //
+        // The harness awaits the progress it emits from its main loop, but
+        // BACKGROUND deliveries (scheduler wake / tool-completion mailboxes, see
+        // harness.ts enqueueMailbox) call the same sink concurrently, and neither
+        // adapter serializes an emitter — handler.ts createSseWriter and
+        // service.ts write both suspend on backpressure, so two concurrent frames
+        // could be flushed out of order. Queuing each frame behind the previous
+        // one keeps wire order exact under backpressure: nothing is reordered and
+        // nothing is dropped. The /events route already guarantees this with its
+        // own `tail` chain (api.ts watchSessionRoute); this is the same rule for
+        // the legacy stream. The chain is per turn, so a finished turn can never
+        // delay the next one (a legacy response carries exactly one run).
+        let legacyChain: Promise<void> = Promise.resolve();
+
+        // Queue one legacy frame. The returned promise rejects for THIS frame only
+        // (the caller decides: a dead stream aborts the run, the old contract),
+        // while `legacyChain` stays alive so one rejected write cannot wedge the
+        // frames behind it — and the rejection is handled here, so it can never
+        // surface as an unhandled rejection. A queue turn (no legacy emitter)
+        // resolves without writing.
+        const writeLegacy = (item: SessionStreamItem): Promise<void> => {
+            const write = legacyEmit;
+
+            const written: Promise<void> = legacyChain.then(() =>
+                write === undefined ? undefined : write(item)
+            );
+
+            legacyChain = written.then(
+                () => undefined,
+                () => undefined
+            );
+
+            return written;
+        };
+
         try {
             const startedAt = Date.now();
 
@@ -1323,13 +1385,16 @@ export class SessionStore {
                 if (controller.signal.aborted) return;
 
                 // LEGACY stream first: a failed write aborts the run (old contract).
+                // Queued on the per-turn chain, so concurrent deliveries keep wire
+                // order (P3); a failed legacy write (or a dead stream) still aborts
+                // this run instead of keeping provider time running for nobody.
                 if (legacyEmit !== undefined) {
                     try {
                         // The emitted frame is another copy so a stream listener cannot
                         // mutate the record the snapshot will hand to the next client.
                         // The running tally rides along (when there is one) so a live
                         // tile never has to accumulate usage itself.
-                        await legacyEmit({
+                        await writeLegacy({
                             type: 'event',
                             turnId: turn.id,
                             event: copyEvent(record),
@@ -1362,7 +1427,7 @@ export class SessionStore {
 
             if (legacyEmit !== undefined) {
                 try {
-                    await legacyEmit(opening());
+                    await writeLegacy(opening());
                 } catch {
                     session.cancelled = true;
                     controller.abort();
@@ -1406,14 +1471,23 @@ export class SessionStore {
         // The run has settled (runStack is empty), so this is the first point where
         // a fresh core snapshot is legal: capture the completed tool/discovery/
         // record state, then save before any terminal frame is sent.
-        try {
-            session.core = session.harness.snapshot();
-        } catch {
-            // Defensive: a run that somehow still owns the harness keeps the last
-            // committed snapshot. The turn is terminal either way.
-        }
+        //
+        // SKIPPED for a disposed session or a closing store (P1-B): the run was
+        // aborted by remove()/dispose(), so this continuation lands after the
+        // session left the map. Its save would serialize an empty (or
+        // session-less) document and destroy the graceful shutdown file. The
+        // publish() below is already a no-op for a disposed session, and the
+        // settler must still resolve (asserted by the shutdown contracts).
+        if (!session.disposed && !this.shuttingDown) {
+            try {
+                session.core = session.harness.snapshot();
+            } catch {
+                // Defensive: a run that somehow still owns the harness keeps the last
+                // committed snapshot. The turn is terminal either way.
+            }
 
-        this.persistBestEffort();
+            this.persistBestEffort();
+        }
 
         this.publish(session, { type: 'turn', turn: copyTurn(turn) });
         this.settle(turn, session);
@@ -1421,18 +1495,23 @@ export class SessionStore {
         // Legacy terminal frame: `failed` for an error/cancel, `snapshot` on
         // success. Both carry the complete session, so the last frame a response
         // sees is self-sufficient.
+        //
+        // Queued on the same per-turn chain (P3) so a terminal frame can never
+        // overtake an event frame that is still waiting on backpressure, and a
+        // failed write is swallowed exactly like the previous safeEmit helper
+        // (the stream is already gone; the run is over either way).
         if (legacyEmit === undefined) return;
 
         if (failure !== undefined) {
-            await safeEmit(legacyEmit, {
+            await writeLegacy({
                 type: 'failed',
                 error: { message: failure },
                 session: this.snapshot(session)
-            });
+            }).catch(() => {});
             return;
         }
 
-        await safeEmit(legacyEmit, { type: 'snapshot', session: this.snapshot(session) });
+        await writeLegacy({ type: 'snapshot', session: this.snapshot(session) }).catch(() => {});
     }
 
     // Cancel work in a session.
@@ -1567,25 +1646,47 @@ export class SessionStore {
     }
 
     dispose(): void {
-        // Commit BEFORE tearing sessions down: disposeSession drops the accepted
-        // backlog (appropriate for remove(), not for a graceful shutdown). Saving
-        // first preserves queued prompts and the active turn as an interrupted
-        // record; the aborted/cleared state afterwards is intentionally not saved.
+        // Idempotent: once the store is closing/closed the map is empty and the
+        // graceful document is already on disk, so a second call must not save.
+        if (this.shuttingDown) return;
+
+        // 1. Commit BEFORE the guard is raised: disposeSession drops the accepted
+        //    backlog (appropriate for remove(), not for a graceful shutdown), so
+        //    saving first is what preserves queued prompts and the active turn as
+        //    an interrupted record. This is the ONLY write dispose() performs.
         this.persistBestEffort();
 
+        // 2. Close the store to further saves BEFORE aborting anything (P1-B).
+        //    The abort below settles asynchronously, so the aborted run's sink
+        //    (~sink persistBestEffort) and its post-finally save would otherwise
+        //    serialize `sessions: []` over the document just written and destroy
+        //    the database (repro: Temp/T10/probe-dispose.ts).
+        this.closing = true;
+
+        // 3. Tear down: abort active runs, discard accepted work, end watchers.
+        //    Nothing here waits for an uncooperative harness; the guards above
+        //    make its late continuations harmless.
         for (const session of this.sessions.values()) {
             this.disposeSession(session);
         }
 
         this.sessions.clear();
+        this.closed = true;
     }
 
     // Shared teardown for remove()/dispose(): stop execution, drop accepted work,
-    // and end every watcher. Idempotent: a second call finds empty collections.
+    // release every waiter, and end every watcher. Idempotent: a second call finds
+    // empty collections.
     private disposeSession(session: Session): void {
         // Set BEFORE aborting: the aborted run's terminal publish is then
         // suppressed (the session no longer exists for any client).
         session.disposed = true;
+
+        // Detach the sink with the session. A provider that ignores its abort
+        // signal can still yield progress frames; with no sink they are dropped
+        // instead of being recorded into a turn nobody will ever read (and asking
+        // for a save the store now refuses anyway).
+        session.sink = undefined;
 
         if (session.status === 'running') {
             session.cancelled = true;
@@ -1597,6 +1698,14 @@ export class SessionStore {
         for (const turn of session.queue.splice(0)) {
             this.settle(turn, session);
         }
+
+        // The ACTIVE turn (never in `queue`) is released here too: this session can
+        // no longer publish a terminal state, so its logical work is over now
+        // rather than whenever — or whether — the harness finally settles. Any
+        // later settle() for the same turn is a no-op (the map lookup fails).
+        const settlers = [...session.settlers.values()];
+        session.settlers.clear();
+        for (const resolve of settlers) resolve();
 
         const watchers = [...session.watchers];
         session.watchers.clear();

@@ -1552,6 +1552,34 @@ button {
     letter-spacing: 0.09em;
 }
 
+/* Concurrent-tool wakeup (R6): the agent resumed because background calls
+   progressed. A quiet rule in the same mono register as the meta line - it is a
+   status marker, not an answer, so it never competes with agent prose. */
+.agent-wakeup {
+    display: flex;
+    gap: 8px;
+    padding: 3px 0 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.agent-wakeup-label {
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+}
+
+/* Calls still running while the response is already visible. The span is the
+   server-reported elapsed time from the last `pending` frame: a static snapshot
+   that changes only when a new event arrives, not a locally ticking clock. */
+.agent-pending {
+    color: var(--warn);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+}
+
 /* Reasoning: available, never shouting. Collapsed by default; the summary counts
    characters so it is obvious the model said something. */
 .thinking {
@@ -1615,6 +1643,12 @@ button {
     border-color: rgba(248, 113, 113, 0.4);
 }
 
+/* An interrupted call is not a tool failure: muted, like a cancelled turn, so a
+   settled tile never paints it red and never leaves it looking active. */
+.tool[data-state='cancelled'] {
+    border-color: var(--border);
+}
+
 .tool-summary {
     display: flex;
     align-items: center;
@@ -1673,6 +1707,10 @@ button {
     color: var(--danger);
 }
 
+.tool[data-state='cancelled'] .tool-glyph {
+    color: var(--muted);
+}
+
 /* Tool-call chip name. Success turns the name green and failure red, so the
    collapsed row is scannable without expanding anything. Running stays the
    existing neutral text colour with the amber arrow. */
@@ -1694,6 +1732,12 @@ button {
     color: var(--danger);
 }
 
+/* Interrupted: the chip is history, so it drops to the muted colour instead of
+   advertising success or failure. */
+.tool[data-state='cancelled'] .tool-name {
+    color: var(--muted);
+}
+
 /* The expanded card has a whole row, so a long tool name is no longer clipped. */
 .tool[open] .tool-name {
     max-width: none;
@@ -1709,6 +1753,10 @@ button {
 
 .tool[data-state='error'] .tool-state {
     color: var(--danger);
+}
+
+.tool[data-state='cancelled'] .tool-state {
+    color: var(--muted);
 }
 
 /* Elapsed/final call duration, e.g. `running 1.2s`, `ok 812ms`. */

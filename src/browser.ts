@@ -16,3 +16,7 @@
 export * from './harness';
 export * from './shared';
 export * from './frontend';
+// Same explicit alias as ./index.ts: the runtime's HarnessPendingTool is the
+// canonical shape, the client's structural copy keeps its own local name for
+// internal use.
+export type { HarnessPendingTool } from './harness';

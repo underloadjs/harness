@@ -26,6 +26,11 @@ export type HarnessRole = 'system' | 'user' | 'assistant' | 'tool';
 // A tool invocation requested by the model. `arguments` stays a raw JSON string
 // because that is what the wire protocol delivers, and because malformed JSON is
 // the harness's problem to report back to the model rather than a parse crash.
+//
+// `id` must be unique across the whole CONVERSATION, not just the turn: the harness
+// keys scheduled work and paired tool results by it. A turn that repeats an id, or
+// reuses one already committed, is rejected before any call executes (the run rolls
+// back) rather than letting one result silently alias another.
 export type HarnessToolCall = {
     id: string;
     name: string;
@@ -72,6 +77,20 @@ export type HarnessAssistantMessage = {
 // Why generation ended. `tool_calls` means the model wants tools run and the
 // turn is not finished; the other two are terminal.
 export type HarnessStopReason = 'stop' | 'length' | 'tool_calls';
+
+// One background tool call that is still running when a model request is made or
+// a run pauses. This is the PUBLIC, wire-safe view of in-flight work: ids plus a
+// monotonic elapsed time, never a promise, controller, or tool implementation.
+//
+// `elapsedMs` is measured from the moment the call was LAUNCHED (not from the
+// model request), so a client can render "running for 12s" without keeping a
+// clock of its own. The harness supplies it on `tool_result.pending`,
+// `done.pending`, and the `wakeup` event.
+export type HarnessPendingTool = {
+    callId: string;
+    name: string;
+    elapsedMs: number;
+};
 
 // Token accounting, normalized from the provider's `usage` block.
 export type HarnessUsage = {
@@ -190,6 +209,25 @@ export type AgentStreamOptions = {
     // and write the execution loop themselves; the harness supplies its whole
     // registry automatically.
     tools?: HarnessStreamTool[];
+    // Provider-safe transcript projection (background tools). When present, this
+    // REPLACES the agent's committed messages for THIS request only; the assistant
+    // message still commits to the agent's canonical history. The harness uses it
+    // to answer tool calls that are still running with placeholder results without
+    // making those placeholders part of the transcript (and therefore without
+    // persisting them or pairing them with a later real result).
+    //
+    // Standalone callers never need this: omit it and the request uses history.
+    transcript?: HarnessMessage[];
+    // Harness-internal commit guard. Invoked immediately before this turn's
+    // assistant message is appended to the canonical history; throwing aborts the
+    // turn with NO commit. The harness uses it to make cancellation preemptive: a
+    // transport that ignores its abort signal may finish later, but a run that no
+    // longer owns the actor (aborted/released) must not mutate the transcript a
+    // later run is using.
+    //
+    // Standalone callers omit it; `agent.turn`/`agent.stream` keep their historical
+    // behaviour.
+    precommit?: () => void;
 };
 
 // Events yielded by Agent.stream / Agent.turn. `error` is yielded by stream()
@@ -668,15 +706,26 @@ export type ToolContext<TParameters = any> = {
     // inside a harness.
     run?: (agentName: string, input: string) => Promise<HarnessAssistantMessage>;
     // Cancellation for the run that invoked this tool (R10), forwarded from
-    // `HarnessRunOptions.signal`. Present only when a run supplied one.
+    // `HarnessRunOptions.signal`. Present for every HARNESS invocation (a direct
+    // standalone call has none).
+    //
+    // BACKGROUND TOOLS (T3): this is a PER-CALL controller linked to the run's
+    // signal, not the run signal itself. Aborting it cancels just this call (the
+    // model's `toolCancel`), while a run-level abort still reaches every call.
+    // The harness releases a cancelled call logically even if the implementation
+    // ignores the signal; a late result is discarded.
     //
     // A tool SHOULD observe it (pass it to fetch/spawn, or call throwIfAborted()
-    // between steps): the harness only checks it BEFORE starting a tool call, so
-    // a tool that ignores it keeps running to completion after a cancel. That is
+    // between steps): the harness cannot preempt arbitrary JavaScript, so a tool
+    // that ignores it keeps running to completion after a cancel. That is
     // deliberate — the harness never claims to have stopped side effects it does
-    // not control, and it keeps awaiting the call rather than releasing the run
-    // while the process may still be mutating.
+    // not control.
     signal?: AbortSignal;
+    // How deep the calling run is: 1 = a top-level run, 2 = a delegated/ctx.run
+    // child. Present for every harness invocation. The model-facing agentDelegate
+    // tool uses it to keep delegation one level deep even when the primary agent
+    // is itself being driven as somebody else's subagent.
+    runDepth?: number;
 };
 
 // A tool definition. `name` is optional: inside a harness the registry key names
@@ -816,16 +865,48 @@ export type HarnessEvent =
           // sees this field: it is presentation data for the client only. Absent
           // for every ordinary tool, so recorded events keep their old shape.
           ui?: ToolUiPanel[];
+          // Wall-clock duration of the call, measured from launch to delivery.
+          // Present for every EXECUTED call (including one that settled in the same
+          // turn; an inline call is a real sub-millisecond measurement, not a
+          // different kind of call). An immediate validation failure never reached
+          // execution and has no duration; a control result such as toolCancel
+          // reports its zero span explicitly.
+          durationMs?: number;
+          // Tool calls that were STILL RUNNING for this agent when this result was
+          // delivered. Absent when none remain, so a run with no background work
+          // keeps its historical event shape. Elapsed times let a UI show progress
+          // without polling.
+          pending?: HarnessPendingTool[];
       }
     // Per-request token accounting, emitted once for EVERY model request a run
-    // makes — including the tool rounds that keep the loop going. `done` only
-    // ever reports the FINAL request of an agent run, so without this event a
-    // client can only see the last step's tokens, never the cost of the run.
-    // Absent entirely when the provider reported no usage for that request (a
-    // gateway that sends no `usage` block); a run may therefore report some
-    // requests and not others.
+    // makes - including the tool rounds, pauses with pending work, and wake-driven
+    // turns that keep the loop going. `done` reports the response too, but it may be
+    // a PAUSED response (`pending` non-empty) or be omitted for a superseded one, so
+    // the usage events - not `done` - are the complete cost record. Absent entirely
+    // when the provider reported no usage for that request (a gateway that sends no
+    // `usage` block); a run may therefore report some requests and not others.
     | { type: 'usage'; agent: string; usage: HarnessUsage }
-    | { type: 'done'; agent: string; message: HarnessAssistantMessage }
+    // A model response. `pending` non-empty means the run is NOT terminal: those
+    // calls are still running, the harness stays open, and their completions will
+    // drive further turns. Absent when the response has no background work left,
+    // so an ordinary answer keeps its old shape and its old meaning.
+    //
+    // A response that is immediately superseded by a completion which arrived
+    // while its request was in flight emits no `done` at all (it was an
+    // intermediate turn, like a tool-call turn), so `done` always describes a
+    // response the consumer is meant to see.
+    | { type: 'done'; agent: string; message: HarnessAssistantMessage; pending?: HarnessPendingTool[] }
+    // Recurring heartbeat while background calls are pending (R4): the configured
+    // wake interval (default 600000 ms = 10 minutes) has elapsed. The run is
+    // re-requested with the current pending list, so the model can inspect
+    // elapsed times and cancel a hung call through `toolCancel`. This is a
+    // PROGRESS event, not a transcript entry.
+    | {
+          type: 'wakeup';
+          agent: string;
+          reason: 'pending-tools';
+          pending: HarnessPendingTool[];
+      }
     | { type: 'error'; agent: string; error: HarnessErrorInfo };
 
 export type HarnessProgress = (event: HarnessEvent) => void | Promise<void>;
@@ -870,16 +951,16 @@ export type HarnessStateChangeEvent = {
 
 export type HarnessRunOptions = {
     // Cancellation for this run. Forwarded to every model request, into each
-    // tool's `ToolContext.signal`, and to every run it causes (ctx.run and
-    // agentDelegate) so a cancel reaches subagents too (R10).
+    // tool's `ToolContext.signal` (a per-call controller linked to this one), and
+    // to every run it causes (ctx.run and agentDelegate) so a cancel reaches
+    // subagents too (R10).
     //
     // The harness checks it BEFORE each model turn and before each tool call, so
-    // an aborted run starts no new side effects. A tool that is ALREADY running is
-    // awaited to completion even when it ignores the signal: the harness never
-    // claims to have stopped work it does not control, and it does not release the
-    // run (or the server's single-flight gate) while that work may still be
-    // mutating. The run then fails, history is truncated back to where the call
-    // started, and the error propagates.
+    // an aborted run starts no new side effects. Background calls in flight are
+    // aborted through their controllers; a tool that ignores the signal may keep
+    // running, but its late result is discarded. The run fails, every actor's
+    // history is truncated back to where its call started, and the error
+    // propagates.
     signal?: AbortSignal;
 };
 
@@ -970,14 +1051,20 @@ export type HarnessConfiguration = {
     // delegation is one level deep by construction.
     subagents?: readonly string[];
 
-    // Maximum number of tool rounds one agent run may take before the harness
-    // treats it as a runaway loop: history is truncated back to the start of the
-    // call and the harness throws. Defaults to 16, the library guard. Must be a
-    // positive safe integer; validated at construction so a typo fails before a
-    // long run. There is no "unlimited" value. The same bound applies to every run
+    // Maximum number of MODEL REQUESTS (turns) one agent run may make before the
+    // harness treats it as a runaway loop: history is truncated back to the start
+    // of the call and the harness throws. Defaults to 16, the library guard. Must
+    // be a positive safe integer; validated at construction so a typo fails before
+    // a long run. There is no "unlimited" value. The same bound applies to every run
     // in this harness (entry, ctx.run, and delegated subagents); each run gets its
-    // own budget. The bundled application presets set 1000 for real work — see
-    // harnesses/presets.ts.
+    // own budget.
+    //
+    // With background tool calls this counts EVERY request, not just tool rounds:
+    // a pause (`done` with pending work) and a wake-driven request each consume
+    // one. A run that never answers and keeps spawning work is still bounded; on
+    // exhaustion the pending work is aborted and the transcript rolled back rather
+    // than left orphaned. The bundled application presets set 1000 for real work -
+    // see harnesses/presets.ts.
     maxIterations?: number;
 
     // Who may create tools at runtime (R12). Defaults to 'all', the historical
@@ -992,6 +1079,13 @@ export type HarnessConfiguration = {
     //                 not a model privilege.
     // The lifetime creation budget (`maxCreatedTools`) still applies either way.
     toolCreation?: ToolCreationPolicy;
+
+    // How often (milliseconds) a run with background tool calls emits a `wakeup`
+    // and gets another model turn so it can inspect pending elapsed times and may
+    // cancel a hung call (R4). Defaults to 600000 (10 minutes). Configurable so
+    // tests need not wait ten minutes; must be a positive safe integer. The timer
+    // exists ONLY while calls are pending and is cleared on every exit path.
+    wakeIntervalMs?: number;
 
     // How many tools this harness instance may create over its LIFETIME.
     // Defaults to 32 (DEFAULT_CREATED_TOOLS_LIMIT in core/creation.ts).

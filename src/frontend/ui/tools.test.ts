@@ -151,4 +151,70 @@ describe('createToolCallCard', () => {
         expect(card.element.querySelector('.tool-duration')?.textContent).toBe('1.0s');
         vi.useRealTimers();
     });
+
+    // R6: pending work is interrupted on cancel/restart, never resumed. A card on
+    // a settled tile must stop claiming the harness may still run it.
+    it('abandons an interrupted call with a reason and freezes its span', () => {
+        const T = 1_700_000_000_000;
+        vi.useFakeTimers();
+        vi.setSystemTime(new Date(T));
+
+        const card = createToolCallCard('commandRun', '{"command":"slow"}', { startedAt: T });
+        vi.advanceTimersByTime(1500);
+
+        card.abandon('Cancelled before the call returned.');
+
+        expect(card.state()).toBe('cancelled');
+        expect(card.element.getAttribute('data-state')).toBe('cancelled');
+        expect(card.element.querySelector('.tool-state')?.textContent).toBe('cancelled');
+        expect(card.element.querySelector('.tool-summary')?.getAttribute('aria-label')).toBe(
+            'commandRun: cancelled'
+        );
+        expect(card.element.querySelectorAll('.tool-label')[1]?.textContent).toBe('result · cancelled');
+        expect(card.element.querySelector('.tool-pending')?.textContent).toBe(
+            'Cancelled before the call returned.'
+        );
+        expect(card.element.querySelector('.tool-peek')?.textContent).toBe(
+            '{"command":"slow"} · cancelled'
+        );
+        expect(card.durationMs()).toBe(1500);
+        expect(card.element.querySelector('.tool-duration')?.textContent).toBe('1.5s');
+
+        // Frozen: the ticker is stopped, so the abandoned span cannot keep growing.
+        vi.advanceTimersByTime(10_000);
+        expect(card.durationMs()).toBe(1500);
+        expect(card.element.querySelector('.tool-duration')?.textContent).toBe('1.5s');
+        vi.useRealTimers();
+    });
+
+    it('keeps an unknown span hidden when abandoning a card with no start stamp', () => {
+        const card = createToolCallCard('fileRead', '{}');
+        card.abandon();
+
+        expect(card.state()).toBe('cancelled');
+        expect(card.durationMs()).toBeUndefined();
+        expect(card.element.querySelector<HTMLElement>('.tool-duration')?.hidden).toBe(true);
+        expect(card.element.querySelector('.tool-pending')?.textContent).toBe(
+            'Interrupted before the call returned.'
+        );
+    });
+
+    it('never overwrites a resolved card and is idempotent', () => {
+        const card = createToolCallCard('fileRead', '{}');
+        card.resolve('{"ok":true}', false);
+
+        const settled = card.element.querySelector('.tool-result')?.innerHTML;
+        card.abandon('too late');
+
+        expect(card.state()).toBe('ok');
+        expect(card.element.querySelector('.tool-pending')).toBeNull();
+        expect(card.element.querySelector('.tool-result')?.innerHTML).toBe(settled);
+
+        // A second abandon keeps the FIRST reason (settled is final either way).
+        const pending = createToolCallCard('fileRead', '{}');
+        pending.abandon('first reason');
+        pending.abandon('second reason');
+        expect(pending.state()).toBe('cancelled');
+        expect(pending.element.querySelector('.tool-pending')?.textContent).toBe('first reason');
+    });
 });

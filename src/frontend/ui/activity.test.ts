@@ -4,7 +4,10 @@
 // pin the accept/reject rules as exact sets:
 //   - start activates; text/reasoning/tool/usage events reactivate (a `usage`
 //     report arrives mid-run, before the tools the agent asked for have run);
-//   - done/error remove ONLY that agent (delegated siblings keep spinning);
+//   - done/error remove ONLY that agent (delegated siblings keep spinning) —
+//     except a done with calls still in flight, which keeps the agent lit (R6);
+//   - a wakeup reactivates the agent that resumed because background work
+//     progressed;
 //   - only a RUNNING recorded turn contributes activity, so replaying history can
 //     never light an old tile;
 //   - renderAgents rebuilds read the live set, and painting sets/removes both
@@ -49,6 +52,20 @@ const usage = (agent: string): HarnessEvent => ({
     agent,
     usage: { input: 10, output: 5, total: 15 }
 });
+
+// R6 additive frames. A response can complete while its own calls still run, and a
+// `wakeup` resumes the agent; both must be readable before the `HarnessEvent` union
+// re-exports them, hence the `unknown` cast.
+const doneWithPending = (agent: string, pending: unknown[]): HarnessEvent =>
+    ({
+        type: 'done',
+        agent,
+        message: { role: 'assistant', content: '', reasoning: '', toolCalls: [], model: 'm1', stopReason: 'stop' },
+        pending
+    }) as unknown as HarnessEvent;
+
+const wakeup = (agent: string, pending: unknown[] = []): HarnessEvent =>
+    ({ type: 'wakeup', agent, reason: 'pending-tools', pending }) as unknown as HarnessEvent;
 
 const turn = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
     id: 't1',
@@ -109,6 +126,31 @@ describe('applyActivity', () => {
         applyActivity(active, usage('instruct'));
         applyActivity(active, done('instruct'));
         expect(active).toEqual(new Set(['helper']));
+    });
+
+    it('keeps an agent active when its done still has calls in flight', () => {
+        expect(
+            reduce([
+                start('instruct'),
+                toolCall('instruct'),
+                doneWithPending('instruct', [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }])
+            ])
+        ).toEqual(['instruct']);
+
+        // A present-but-empty list IS an idle agent: the response ended the work.
+        expect(reduce([start('instruct'), doneWithPending('instruct', [])])).toEqual([]);
+    });
+
+    it('activates an agent on a wakeup frame', () => {
+        expect(reduce([wakeup('instruct')])).toEqual(['instruct']);
+        // The ring comes back after the interim done, without a new start/text event.
+        expect(
+            reduce([
+                start('instruct'),
+                doneWithPending('instruct', [{ callId: 'c1', name: 'fileRead', elapsedMs: 1 }]),
+                wakeup('instruct', [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }])
+            ])
+        ).toEqual(['instruct']);
     });
 });
 

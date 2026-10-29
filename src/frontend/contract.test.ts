@@ -25,10 +25,13 @@ import {
     frozenDefinitionOf,
     membersOf,
     modelsForMembers,
+    pendingOf,
     primaryOf,
     subagentsOf,
+    toolDurationOf,
     uniqueNames,
-    usageOf
+    usageOf,
+    wakeupOf
 } from './contract';
 
 const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor =>
@@ -323,5 +326,125 @@ describe('token tallies', () => {
         expect(frameUsageOf(frame({ usage: { input: 3 } }))).toBeUndefined();
         expect(frameUsageOf({ type: 'turn', turn: recorded })).toBeUndefined();
         expect(frameUsageOf({ type: 'snapshot', session })).toBeUndefined();
+    });
+});
+
+// --- Background/concurrent tool fields (R6) ---------------------------------
+//
+// The canonical members now live in the `HarnessEvent` union. These helpers still
+// cast: the tests deliberately feed MALFORMED/LEGACY payloads (missing fields, wrong
+// value types) that the runtime would not send but persisted data can contain, and
+// the accessors must degrade instead of throwing.
+const pendingTools = [
+    { callId: 'c1', name: 'fileRead', elapsedMs: 1200 },
+    { callId: 'c2', name: 'webSearch', elapsedMs: 900 }
+];
+
+const resultWith = (fields: Record<string, unknown>): HarnessEvent =>
+    ({
+        type: 'tool_result',
+        agent: 'writer',
+        name: 'fileRead',
+        content: 'ok',
+        isError: false,
+        ...fields
+    }) as unknown as HarnessEvent;
+
+const doneWith = (fields: Record<string, unknown>): HarnessEvent =>
+    ({
+        type: 'done',
+        agent: 'writer',
+        message: {
+            role: 'assistant',
+            content: 'answer',
+            reasoning: '',
+            toolCalls: [],
+            model: 'writer-model',
+            stopReason: 'stop'
+        },
+        ...fields
+    }) as unknown as HarnessEvent;
+
+const wakeupWith = (fields: Record<string, unknown>): HarnessEvent =>
+    ({
+        type: 'wakeup',
+        agent: 'writer',
+        reason: 'pending-tools',
+        pending: [],
+        ...fields
+    }) as unknown as HarnessEvent;
+
+describe('background tool fields (R6)', () => {
+    it('reads a pending list from a tool result, and keeps absence distinct from empty', () => {
+        expect(pendingOf(resultWith({ pending: pendingTools }))).toEqual(pendingTools);
+        expect(pendingOf(resultWith({ pending: [] }))).toEqual([]);
+        // Absent field: undefined, NOT [] — only a present array may clear a
+        // pending line the UI is already showing.
+        expect(pendingOf(resultWith({}))).toBeUndefined();
+    });
+
+    it('reads a pending list from a done event', () => {
+        expect(pendingOf(doneWith({ pending: [pendingTools[0]] }))).toEqual([pendingTools[0]]);
+        expect(pendingOf(doneWith({}))).toBeUndefined();
+    });
+
+    it('drops malformed pending entries instead of rendering them', () => {
+        expect(
+            pendingOf(
+                resultWith({
+                    pending: [
+                        { callId: '', name: 'x', elapsedMs: 1 },
+                        { callId: 'c1', name: '', elapsedMs: 1 },
+                        { callId: 'c2', name: 'y', elapsedMs: -1 },
+                        { callId: 'c3', name: 'z', elapsedMs: 'soon' },
+                        null,
+                        'nope',
+                        { callId: 'c4', name: 'kept', elapsedMs: 0 }
+                    ]
+                })
+            )
+        ).toEqual([{ callId: 'c4', name: 'kept', elapsedMs: 0 }]);
+    });
+
+    it('ignores a pending list on an event that cannot carry one', () => {
+        expect(pendingOf({ type: 'text', agent: 'writer', delta: 'x' })).toBeUndefined();
+    });
+
+    it('reads the authoritative tool duration only where it exists', () => {
+        expect(toolDurationOf(resultWith({ durationMs: 1500 }))).toBe(1500);
+        expect(toolDurationOf(resultWith({ durationMs: 0 }))).toBe(0);
+        expect(toolDurationOf(resultWith({}))).toBeUndefined();
+        expect(toolDurationOf(resultWith({ durationMs: -5 }))).toBeUndefined();
+        expect(toolDurationOf(resultWith({ durationMs: 'soon' }))).toBeUndefined();
+        // `done` carries no per-call duration.
+        expect(toolDurationOf(doneWith({ durationMs: 1500 }))).toBeUndefined();
+    });
+
+    it('accepts a wakeup only when its required pending list is usable', () => {
+        expect(wakeupOf(wakeupWith({ pending: [pendingTools[0]] }))).toEqual({
+            type: 'wakeup',
+            agent: 'writer',
+            reason: 'pending-tools',
+            pending: [pendingTools[0]]
+        });
+
+        // A present-but-empty list IS a valid "everything settled" wake.
+        expect(wakeupOf(wakeupWith({ pending: [] }))).toEqual({
+            type: 'wakeup',
+            agent: 'writer',
+            reason: 'pending-tools',
+            pending: []
+        });
+
+        // `pending` is REQUIRED: absence is malformed and must be NO UPDATE, never
+        // normalised to [] (which would clear a line and claim completion).
+        expect(wakeupOf(wakeupWith({ pending: undefined }))).toBeUndefined();
+
+        // A non-empty array with no valid entry is malformed too.
+        expect(wakeupOf(wakeupWith({ pending: [{ callId: '', name: '', elapsedMs: -1 }] }))).toBeUndefined();
+
+        // Malformed: no agent means the frame cannot be attributed to a section.
+        expect(wakeupOf(wakeupWith({ agent: '' }))).toBeUndefined();
+        expect(wakeupOf(resultWith({}))).toBeUndefined();
     });
 });

@@ -755,7 +755,7 @@ const writer = harness({
 | `agents` | Every brain, keyed by name. **The first key is the entry point** unless `primary` names another one. |
 | `primary` | Which agent the callable runs. Optional; must name a registered agent. Use it in multi-agent configs so routing is explicit. |
 | `subagents` | Allowlist the primary may delegate to. Optional; defaults to every agent except the primary. Empty (or a one-agent config) means no `agentDelegate` tool at all. Must not contain the primary or an unknown name. |
-| `maxIterations` | Tool rounds one agent run may take before the harness throws. **Default 16** — the library's runaway guard. Must be a positive safe integer (validated at construction); there is no unlimited value. The app presets set 1000. |
+| `maxIterations` | Model requests one agent run may make before the harness throws. Every request counts: the first answer, each immediate tool continuation, a pause turn, and every completion or timed wake. **Default 16** — the library's runaway guard. Must be a positive safe integer (validated at construction); there is no unlimited value. The app presets set 1000. |
 | `tools` | Extra tools, keyed by the name the model calls. A configured tool replaces a preloaded preset of the same name. |
 | `presets` | Preload `presetTools` into the registry. **True by default**; `false` starts from `tools` alone. |
 | `report.progress` | Awaited for every step — a UI or `console.log`. |
@@ -870,16 +870,57 @@ repeat:
     turn()                 -> assistant message (+ tool calls)
     declare                -> core tools + everything toolRequest enabled
     no tool calls?         -> report done, return the message
-    run each tool          -> append a tool message
-    (loop again)
+    schedule each call     -> CONCURRENT async work, not a serial loop
+    results stream back    -> each `tool_result` carries its own duration
+    wake                   -> `wakeup` once pending work progressed
+    append settled results -> then turn() again
 ```
+
+Tool calls are **scheduled concurrently**. The model stream stays serialized per
+agent (one request at a time); calls execute as async work and their results are
+appended as they settle. This changes three things a caller must know:
+
+- **The top-level promise is the drain point.** `await writer(input)` resolves only
+  when the entry agent's response is complete AND every pending call — delegated
+  child runs included — has finished. A per-agent `done` event is one response, not
+  terminal session work: it can arrive while that agent's own calls are still
+  running (listed in the event's `pending`), and the agent is woken when outcomes
+  land (`wakeup`).
+- **A periodic wake keeps a turn honest.** While calls are pending the runtime also
+  wakes the agent on a timer (default **600000 ms**), so a hung call is visible and
+  can be killed instead of blocking forever. There is **no automatic hard tool
+  timeout**: pending calls are interrupted, not resumed, on restart, and a hanging
+  call ends only through an explicit cancel (or the tool's own configured timeout).
+- **Ordering is completion order.** Concurrent side effects are not ordered: two
+  file writes or two commands may interleave, and results come back in the order
+  they finish, not the order the model asked for them. Tools are async promises
+  inside one Node process — **no OS worker or CPU isolation**, so CPU-bound
+  JavaScript still blocks the event loop.
+
+Cancellation follows the same model. A run's signal (and `toolCancel({ callId })`
+for one call) reaches every running tool; `commandRun` honours it and kills its
+process tree. `toolCancel` logically settles/aborts that call's own task: its late
+result is ignored. Arbitrary JavaScript cannot be preempted — a created tool keeps
+its CPU until it yields. A whole-run abort does more than flip the signal: it
+preempts an uncooperative provider request, releases the child actor/restore slot
+immediately, and rolls back the cancelled turn's in-flight prompt state without
+waiting for the provider. A provider socket/generator that never returns may stay
+in memory, but it no longer blocks the actor or re-delegation; a late provider
+commit is guarded by the core precommit check. One host-side caveat: a
+`report.progress` reporter that hangs can still stall the mailbox (and therefore
+cancellation); there is no guaranteed reporter watchdog.
+
+Delegation is the same mechanism: an `agentDelegate` call stays **pending** until
+the child fully completes, and the parent's `pending` list names it. Calling the
+same child again queues a follow-up on that child's existing transcript instead of
+starting a fresh conversation.
 
 Failures split in two:
 
 - **Recoverable** — unknown tool, undiscovered tool, malformed JSON arguments, or a
   throwing tool. Each becomes a tool result the model sees, so it can correct
   itself.
-- **Terminal** — a transport failure or more than `maxIterations` tool rounds
+- **Terminal** — a transport failure or more than `maxIterations` model requests
   (default 16; the bundled live presets pass 1000). History is truncated back to
   where the call started and the harness throws, so a failed call is never
   replayed on the next attempt.
@@ -956,12 +997,37 @@ try {
 | `reasoning` | `agent`, `delta` |
 | `text` | `agent`, `delta` |
 | `tool_call` | `agent`, `call` (`id`, `name`, `arguments`) |
-| `tool_result` | `agent`, `name`, `content`, `isError`, optional `ui` (declarative panels) |
+| `tool_result` | `agent`, `name`, `content`, `isError`, optional `durationMs`, optional `pending`, optional `ui` (declarative panels) |
 | `usage` | `agent`, `usage` (`input`, `output`, `total`, optional `cached`) — one per model request, tool rounds included |
-| `done` | `agent`, `message` |
+| `done` | `agent`, `message`, optional `pending` |
+| `wakeup` | `agent`, `reason: 'pending-tools'`, `pending` |
 | `error` | `agent`, `error: { message }` |
 
 Every event names its agent, so multi-agent runs stay readable in one stream.
+
+With concurrent tools the stream needs three additive fields (all optional on an
+older record, so a client must render its pre-concurrency view when they are
+absent):
+
+- `tool_result.durationMs` — the authoritative span of the call that just ended,
+  measured by the harness rather than inferred from frame arrival (a call may have
+  waited behind other work). Every **executed** call reports one, inline/direct
+  calls included; a call rejected by argument validation never executes and may
+  omit it.
+- `pending` — the calls still running at the moment the frame was produced, each as
+  `{ callId, name, elapsedMs }`. On `tool_result` it is the remainder after that
+  call; on `done` it says the response is complete **while its own calls are not**.
+  A `done` with a non-empty `pending` is an interim response: the agent is woken
+  later, not finished. The field is **omitted when nothing remains**, so absence
+  means "no new information", not "the queue drained".
+- `wakeup` — the agent resumed because pending work progressed. It is a resume
+  signal, never a result: no tool is resolved by it. Its `pending` list is
+  **required**; a frame without one is malformed and must be ignored.
+
+`tool_result.callId` pairs a result with the call it answers; with concurrent calls
+the same-name/oldest-first fallback is no longer positional truth. Call ids must be
+non-empty and **unique for the whole conversation**: a duplicate or reused id is
+rejected before the call is launched, and never reaches persistence.
 
 ### Declarative tool panels (R20.2)
 
@@ -1124,6 +1190,24 @@ they can come from the shell or from the package-root `.env` (see
 [Environment file](#environment-file)). `EXA_API_KEY` or `TAVILY_API_KEY` enables
 the opt-in `webSearch` tool in the live presets (`instruct`, `research`,
 `workspace`); with neither key it is simply absent.
+
+Because tools run concurrently the CLI prints their own timing rather than
+implying a call is the only thing happening:
+
+```
+→ fileRead {"path":"README.md"}
+← fileRead · 1.3s
+  ...
+  pending · webSearch 900ms
+  instruct-model · tool_calls · 1 tool call · 1 tool still running
+~ instruct woke · 1 still running · webSearch 900ms
+```
+
+`← name · 1.3s` is the server's `durationMs`; a `pending · …` line lists calls still
+running and their elapsed spans; `~ agent woke · …` is a `wakeup`. A `done` line
+ending in `N tools still running` is an interim response, not the end of the turn.
+`--json` emits each event verbatim (including `wakeup`), so a consumer sees the
+same fields.
 
 ## Server and UI
 
@@ -1423,6 +1507,18 @@ nobody, which is why a reload or a hidden tab costs nothing.
   minutes), and a reload re-reads the snapshot, reconciles turns by id, and reopens
   the observer when work is still pending. A settled turn never re-animates, and a
   queued task lights nothing.
+- **A turn stays `running` while background work is pending.** `done` is per
+  agent response; the turn settles only when the harness promise resolves, which is
+  after every pending tool call and delegated child has finished. The UI therefore
+  keeps running tool cards across an interim `done` (a non-empty `pending` list),
+  prints `pending · name 1.2s` from the server's own spans, and paints a wake line
+  when a `wakeup` arrives; the agent ring stays lit meanwhile. That pending line is
+  a **static snapshot** of the last frame that reported it, not a ticking clock; a
+  finished call is removed from it by id as its own result arrives, and the
+  `N tools still running` count is visible in the expanded tile's meta (compact
+  rows clip the meta visually, as they do the status word). The periodic wake
+  (600 s) exists so a hung call stays visible and can be killed rather than
+  silently blocking the turn.
 - **The timeline shows state by colour.** One linear vertical timeline: completed
   rows are grey, the single active row is green (amber while a request is on the
   wire), queued rows are neutral, failed rows are red, and cancelled rows are
@@ -1457,15 +1553,24 @@ shows whether this server has `EXA_API_KEY`/`TAVILY_API_KEY`; an unconfigured en
 keeps its schema and example arguments visible but disables **Call tool** and prints
 the server's hint, so it never looks like a working tool.
 
-**Cancellation is cooperative.** Aborting a run (`POST /sessions/:id/cancel`,
-`DELETE /sessions/:id`, or a closed legacy stream) signals the harness, which stops
-BEFORE the next tool call and forwards the signal to the tool context
-(`ToolContext.signal`). A tool that ignores it — a long `commandRun`, a scripted
-created tool — keeps running to completion, and the session stays `busy` (so manual
-calls still answer `409`) for exactly as long as it does. The server never reports a
-cancel it did not achieve and never releases the gate while a tool might still be
-mutating state. A manual call has no turn/controller, so `cancel()` does not abort
-it; only its own completion releases the gate.
+**Cancellation is cooperative and signal-based.** Aborting a run
+(`POST /sessions/:id/cancel`, `DELETE /sessions/:id`, or a closed legacy stream)
+signals every call that is running, and `toolCancel({ callId })` targets one call.
+`toolCancel` logically settles/aborts that call's own task; its late result is
+ignored. `commandRun` honours the abort signal and kills its process tree, and
+`ToolContext.signal` is the same signal a tool can watch. Arbitrary JavaScript
+cannot be preempted: a created tool keeps its CPU until it yields. A **whole-run
+abort** additionally preempts an uncooperative provider request, releases the
+child actor/restore slot and rolls back the cancelled turn's in-flight prompt
+state immediately, so re-delegation is not blocked. A provider socket/generator
+that never returns can stay in memory, but a late provider commit is rejected by
+the core precommit check. One caveat: a host `report.progress` reporter that hangs
+can still stall the mailbox and therefore cancellation (there is no guaranteed
+reporter watchdog). The server never reports a cancel it did not achieve. A
+settled turn abandons calls that never returned, so a cancelled transcript never
+leaves a card looking like it is still running. A manual call has no
+turn/controller, so `cancel()` does not abort it; only its own completion releases
+the gate.
 
 `--tools` (and `/tools` in an interactive CLI session) uses the same runtime
 catalogue and appends `[unconfigured — …]` to an entry that needs a missing key.
@@ -1566,6 +1671,12 @@ are coalesced into the terminal write. A failed structural write is a 500; a
 failed background write never changes a run's outcome but is observable via
 `SessionStore.persistenceError` (and stderr unless `onPersistenceError` is set).
 
+Session teardown (`dispose()` / process shutdown) saves **at most once**: a
+save-once guard stops a late write from replacing the database with an empty state,
+and legacy event writes are serialized. A failed graceful save is reported through
+`persistenceError` and the log — shutdown still closes rather than waiting or
+retrying forever.
+
 Recovery policy on restart:
 
 - the registry is rebuilt first from the saved metadata (using the same template
@@ -1576,7 +1687,9 @@ Recovery policy on restart:
   sources — recompiled, never executed, todo/profile/chapter/location stores);
 - an in-flight turn is marked `error` and the session reports
   "interrupted by a server restart"; it is **never replayed**, so no tool
-  operation runs twice;
+  operation runs twice. Pending background calls are interrupted, not resumed —
+  even when their external side effects already happened — and a restored client
+  sees them abandoned rather than running;
 - if the snapshot stopped after an assistant tool call but before its result was
   appended, restore keeps every completed result and appends one explicit
   non-success "interrupted" tool result for each unmatched call id (in call order).

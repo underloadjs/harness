@@ -209,9 +209,12 @@ describe('cancellation', () => {
             'stopped by the caller'
         );
 
-        // The SAME signal reached the tool, and the failure is not reported as a
+        // The SAME cancellation reached the tool: each call gets its own
+        // controller linked to the run signal, so the per-call signal is aborted
+        // (and is not the root object itself). The failure is not reported as a
         // recoverable tool result: a cancelled run must not invite a retry.
-        expect(seen).toBe(controller.signal);
+        expect(seen).toBeInstanceOf(AbortSignal);
+        expect(seen?.aborted).toBe(true);
         expect(entry.messages).toEqual([]);
     });
 
@@ -225,6 +228,9 @@ describe('cancellation', () => {
             visibility: 'core',
             execute: ({ signal }) => {
                 seenTools.push(signal);
+                // Cancel WHILE the subagent's tool is running: the derived
+                // per-call controllers must already be linked at this point.
+                controller.abort();
                 return 'ok';
             }
         });
@@ -241,12 +247,19 @@ describe('cancellation', () => {
             presets: false
         });
 
-        await writer('go', { signal: controller.signal });
+        await expect(writer('go', { signal: controller.signal })).rejects.toThrow(
+            'This operation was aborted'
+        );
 
-        // The subagent's request carries the run's signal ...
-        expect(seenResearcher[0].signal).toBe(controller.signal);
+        // The subagent's request carries a cancellation signal derived from the
+        // run's (not the run object itself, because the delegation call owns its
+        // own controller) ...
+        expect(seenResearcher[0].signal).toBeInstanceOf(AbortSignal);
+        expect(seenResearcher[0].signal?.aborted).toBe(true);
         // ... and so does the tool the subagent then calls.
-        expect(seenTools).toEqual([controller.signal]);
+        expect(seenTools).toHaveLength(1);
+        expect(seenTools[0]).toBeInstanceOf(AbortSignal);
+        expect(seenTools[0]?.aborted).toBe(true);
     });
 
     it('reaches the tools of an agent started through ctx.run', async () => {
@@ -259,6 +272,7 @@ describe('cancellation', () => {
             visibility: 'core',
             execute: ({ signal }) => {
                 seenTools.push(signal);
+                controller.abort();
                 return 'ok';
             }
         });
@@ -277,8 +291,12 @@ describe('cancellation', () => {
             presets: false
         });
 
-        await writer('go', { signal: controller.signal });
+        await expect(writer('go', { signal: controller.signal })).rejects.toThrow(
+            'This operation was aborted'
+        );
 
-        expect(seenTools).toEqual([controller.signal]);
+        expect(seenTools).toHaveLength(1);
+        expect(seenTools[0]).toBeInstanceOf(AbortSignal);
+        expect(seenTools[0]?.aborted).toBe(true);
     });
 });

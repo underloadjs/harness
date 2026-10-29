@@ -139,7 +139,14 @@ export const agent = (configuration: AgentConfiguration): Agent => {
 
         // Copy the transcript: a transport must never see a live array it could
         // mutate, and later appends must not appear mid-request.
-        const transcript = messages.map((message) => ({ ...message }));
+        //
+        // A `transcript` override (background tools) replaces the COMMITTED
+        // history for this request only. It is already a projection the harness
+        // built; copying again keeps the transport from mutating the projection
+        // the harness may reuse. The assistant message still commits below to the
+        // canonical `messages` array, never to the projection.
+        const source = options?.transcript ?? messages;
+        const transcript = source.map((message) => ({ ...message }));
 
         for await (const event of transport({
             model: requestModel,
@@ -170,6 +177,13 @@ export const agent = (configuration: AgentConfiguration): Agent => {
             }
         }
 
+        // Pre-commit guard (harness ownership/cancellation). This is the ONLY
+        // synchronous mutation point of a turn, so a caller that lost ownership
+        // while the transport was in flight can stop here without a partial
+        // commit. A throw propagates exactly like a transport error; stream()
+        // rolls its own user message back.
+        options?.precommit?.();
+
         const message: HarnessAssistantMessage = {
             role: 'assistant',
             content,
@@ -194,7 +208,9 @@ export const agent = (configuration: AgentConfiguration): Agent => {
         yield { type: 'done', message };
     };
 
-    // Low-level: one turn against the current history. Throws on failure.
+    // Low-level: one turn against the current history. Throws on failure. The
+    // `transcript` option is the harness's provider-safe projection; standalone
+    // callers omit it and the committed history is used.
     const turn = async function* (options?: AgentStreamOptions): AsyncGenerator<AgentStreamEvent> {
         yield* request(options);
     };

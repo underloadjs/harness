@@ -77,10 +77,23 @@ export {
     toolUiOf
 } from './tool-ui';
 export type { ToolUiExtraction } from './tool-ui';
+// Background tool scheduling (T3): one board per harness. Internal to the
+// package surface (the harness is the only owner), exported here so the harness
+// module and focused tests share one implementation.
+export { createTaskScheduler } from './scheduler';
+export type {
+    ScheduledTask,
+    ScheduledTaskStatus,
+    ScheduleSpec,
+    TaskScheduler,
+    TaskSchedulerOptions
+} from './scheduler';
 export {
     TOOL_CREATE_METADATA,
     TOOL_CREATE_NAME,
     AGENT_DELEGATE_NAME,
+    TOOL_CANCEL_METADATA,
+    TOOL_CANCEL_NAME,
     TOOL_REQUEST_METADATA,
     TOOL_REQUEST_NAME,
     TODO_MANAGE_METADATA,

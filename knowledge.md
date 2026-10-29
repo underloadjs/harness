@@ -958,6 +958,11 @@ const team = harness({
 - `ctx.run(name, input)` inside a tool still runs a full sibling turn; it is the
   tool-side path (used by the `textSummarize` harness tool) and is not model-visible
   delegation.
+- **A delegation is a pending tool.** The parent's `agentDelegate` call stays in
+  flight until the child fully completes, so it can appear in the parent's
+  `done.pending` list and the resume arrives as a `wakeup`. Calling the same child
+  again queues a follow-up on that child's EXISTING transcript (it does not restart
+  and does not lose history).
 
 ### Shipped roles and their teams (T3)
 
@@ -1002,7 +1007,21 @@ const writer = harness({
 await writer('tell me about new year');
 ```
 
-- **Callable.** `writer(input)` runs the entry agent to completion.
+- **Callable.** `writer(input)` runs the entry agent to completion. With concurrent
+  tools that also means it drains: it resolves only after the response is complete
+  AND every pending call — delegated child runs included — has finished.
+- **Concurrency lives in the runtime, not in the provider stream.** Each agent has
+  one serialized model stream; its tool calls are async work scheduled together.
+  An agent's `done` event is one RESPONSE: it may list `pending` calls still running
+  and the agent is woken (`wakeup`) when outcomes land. A periodic wake
+  (**600000 ms** default) keeps a hung call visible so it can be killed; there is
+  **no automatic hard tool timeout**. Pending work is interrupted, not resumed,
+  across a restart, and a hung call ends only through an explicit cancel (or the
+  tool's own configured timeout).
+- **Ordering is completion order.** Concurrent calls can interleave side effects
+  (two writes/commands), and results are appended as they settle rather than in
+  call order. Tools are async promises in ONE Node process: there are no OS worker
+  threads and no CPU isolation, so CPU-bound JavaScript blocks the event loop.
 - **The entry agent is explicit or first.** `primary` names it; without one, the
   first `agents` key wins, so a single-agent config needs nothing. An unknown name
   throws at construction.
@@ -1057,9 +1076,16 @@ append user input
 repeat:
     turn()                 -> assistant message (+ tool calls)
     no tool calls?         -> report done, return the message
-    run each tool          -> append a tool message
-    (loop again)
+    schedule each tool     -> concurrently (one async actor per call)
+    results arrive         -> a tool message per settled call, in completion order
+    (loop again, waking on pending outcomes)
 ```
+
+Multi-tool turns are **scheduled concurrently**, not run one after another. The
+model stream stays serialized per agent (one request at a time), and every call
+still gets a matching `tool` message with the id the model used, so strict
+providers never see a dangling `tool_calls` id. The harness promise resolves only
+when the response is complete and all pending work (delegates included) drains.
 
 The tool declarations sent with each `turn()` are the core set plus the tools
 toolRequest has enabled — that is how a discovery round changes the next request
@@ -1075,15 +1101,30 @@ Recoverable failures become tool results the model can read:
 Terminal failures truncate history to the pre-call length, emit `error`, and
 throw:
 - transport failure;
-- more than **maxIterations** tool rounds without an answer. Defaults to **16**
-  (the library guard); `harness({ maxIterations })` raises or lowers it and is
-  validated at construction as a positive safe integer. The application presets
-  pass 1000 for real sessions; the offline `demo` keeps the library default of 16.
-  The bound is per agent run, so a delegated subagent gets its own budget.
+- more than **maxIterations** model requests without an answer. Every request
+  counts, including an immediate tool continuation, a pause turn, and every
+  completion or timed wake. Defaults to **16** (the library guard);
+  `harness({ maxIterations })` raises or lowers it and is validated at construction
+  as a positive safe integer. The application presets pass 1000 for real sessions;
+  the offline `demo` keeps the library default of 16. The bound is per agent run,
+  so a delegated subagent gets its own budget.
 
-Multi-tool turns are executed **sequentially in model order**, and every call
-gets a matching `tool` message so strict providers never see a dangling
-`tool_calls` id.
+Multi-tool turns are **scheduled concurrently**, and every call gets a matching
+`tool` message so strict providers never see a dangling `tool_calls` id. The
+agent's `done` is a response boundary, not a turn boundary: with concurrent calls
+it may arrive while its own calls are still running (`pending`), and the runtime
+wakes the agent (`wakeup`) as outcomes land. Cancellation signals every running
+call (`toolCancel({ callId })` targets one): `toolCancel` logically settles/aborts
+that call's own task and its late result is ignored; command tools honour the abort
+and kill their process tree, but arbitrary JavaScript cannot be preempted. A
+whole-run abort preempts an uncooperative provider request, releases the child
+actor/restore slot and rolls back the cancelled turn's in-flight prompt state
+immediately; a late provider commit is rejected by the core precommit check. A
+provider socket/generator that never returns can remain in memory without blocking
+the actor or re-delegation, but a host `report.progress` reporter that hangs can
+still stall the mailbox and therefore cancellation (no guaranteed reporter
+watchdog). Because calls share one Node process there is no thread or CPU
+isolation, and side effects are ordered by completion rather than by call order.
 
 ---
 
@@ -1154,18 +1195,40 @@ const ids = await listModels({ baseURL, apiKey, headers?, signal? });
 | { type: 'text';        agent: string; delta: string }
 | { type: 'reasoning';   agent: string; delta: string }
 | { type: 'tool_call';   agent: string; call: HarnessToolCall }
-| { type: 'tool_result'; agent: string; name: string; callId?: string; content: string; isError: boolean; ui?: ToolUiPanel[] }
+| { type: 'tool_result'; agent: string; name: string; callId?: string; content: string; isError: boolean; durationMs?: number; pending?: HarnessPendingTool[]; ui?: ToolUiPanel[] }
 | { type: 'usage';      agent: string; usage: HarnessUsage }
-| { type: 'done';        agent: string; message: HarnessAssistantMessage }
+| { type: 'done';        agent: string; message: HarnessAssistantMessage; pending?: HarnessPendingTool[] }
+| { type: 'wakeup';      agent: string; reason: 'pending-tools'; pending: HarnessPendingTool[] }
 | { type: 'error';       agent: string; error: { message: string } }
+
+// HarnessPendingTool = { callId: string; name: string; elapsedMs: number }
 ```
 
 Delivered through `report.progress`, which is **awaited** for every step, so a
 slow reporter paces the run. Every event names its agent. `tool_result.callId` is
 optional for compatibility and is always populated by the harness: it is the id of
 the `tool_call` the result answers, which lets a client pair two same-name calls
-exactly instead of positionally. `ui` is the optional declarative panel list from
+exactly instead of positionally — the only safe pairing once calls run
+concurrently. A tool-call id must be non-empty and **unique for the whole
+conversation**; a duplicate/reused id is rejected before the call is launched and
+never reaches persistence. `ui` is the optional declarative panel list from
 `toolUi()` (see “Declarative tool panels” below); the model never sees it.
+
+The three concurrency fields are additive, and a client must fall back to its
+pre-concurrency rendering when they are absent (old persisted turns):
+
+- `durationMs` is the server-measured span of the call that just ended, not the gap
+  between frame arrivals (concurrent calls wait behind each other). Every
+  **executed** call reports one — inline/direct calls included; a call rejected by
+  argument validation never executed and may omit it.
+- `pending` is the set of calls still running. On `done` it means the agent's
+  response is complete while its own calls are not: an interim response, not the
+  end of the turn. The UI keeps those cards alive and prints their spans; a client
+  must not close them on such a `done`. The field is omitted when nothing remains,
+  so absence is not a drain signal; a UI prunes a settled `callId` itself.
+- `wakeup` is a RESUME. It resolves no tool and ends nothing; it says background
+  work progressed and the agent continued. Its `pending` list is required: a wake
+  without one is malformed and produces no update.
 
 `usage` is emitted once per **model request**, including the tool rounds that keep
 a run going — `done` only ever reports the final request, so this is the only
@@ -1187,7 +1250,9 @@ other metrics.
 ```
 
 `HarnessToolCall` is `{ id, name, arguments }` where `arguments` stays a raw JSON
-string — malformed JSON is the harness's problem to report, not a parse crash.
+string — malformed JSON is the harness's problem to report, not a parse crash. The
+`id` is non-empty and unique across the conversation; the runtime rejects a
+duplicate/reused id before it launches or persists the call.
 
 ## HarnessAssistantMessage
 
@@ -1363,8 +1428,11 @@ as their own entries.
 
 - **CLI (`src/server/cli/`)** runs a preset in-process: one-shot from argv/stdin, or an
   interactive session on a TTY. It renders `HarnessEvent`s directly with
-  `src/server/cli/render.ts`, or emits one JSON object per line with `--json`. `--serve`
-  switches to the HTTP server. The CLI never imports the UI.
+  `src/server/cli/render.ts`, or emits one JSON object per line with `--json`. With
+  concurrent tools the terminal also shows the server's `durationMs`
+  (`← fileRead · 1.3s`), a `pending · name 1.2s` line for calls still running, and a
+  `~ agent woke · …` wake line, so background work is never invisible in a CLI.
+  `--serve` switches to the HTTP server. The CLI never imports the UI.
 - **Environment (`src/server/environment.ts`)** loads the package-root `.env` from
   `src/server/cli/index.ts` (before `settingsFrom`) and from the top of
   `startHarnessServer()` (used by `src/server/dev.ts` and the service runtime), via `dotenv` as a
@@ -1403,7 +1471,9 @@ as their own entries.
   handler selects a runtime keyed by that resolved root, and the runtime writes
   `<root>/harness/state.json` (see persistence.ts); restoring rebuilds the registry
   first, then each session's frozen harness, then its core snapshot. A running turn
-  is marked interrupted and never replayed; queued prompts are preserved but stay
+  is marked interrupted and never replayed; pending background calls are
+  interrupted, not resumed (a restored UI shows them abandoned, not running);
+  queued prompts are preserved but stay
   paused until an explicit submit or a cancel-all. When the snapshot ended between
   an assistant tool call and its result, restore appends explicit interrupted tool
   results for the unmatched ids (no re-execution), so the next provider request is
@@ -1613,7 +1683,14 @@ pairs same-name calls exactly.
 - **Gates.** `reset`, `callTool`, and the legacy `/messages` reject while `busy` or
   while the queue is non-empty (`409`); Delete/`dispose()` aborts the active run,
   discards pending work, settles its `enqueue()` completions, and closes watchers
-  without waiting. `PATCH /sessions/:id` stays the exception: it is accepted while
+  without waiting. The abort preempts the provider request, releases the child
+  actor/restore slot and rolls back the cancelled turn's in-flight prompt state
+  immediately (a late provider commit is rejected by the core precommit check), so
+  the logical cancel never waits on a socket that never returns. Shutdown saves at
+  most once: a save-once guard stops a late write from replacing the database with
+  an empty state, legacy event writes are serialized, and a failed graceful save is
+  reported through `persistenceError`/the log while shutdown still closes.
+  `PATCH /sessions/:id` stays the exception: it is accepted while
   busy, aborts nothing, and applies to the next request of that agent — including a
   queued task's request, which reads the model when it starts.
 - **Recovery.** The UI keeps one `GET /events` observer for the selected session
@@ -1634,6 +1711,27 @@ pairs same-name calls exactly.
   core plus a registered language subset (aliases resolve; an unknown fence stays
   escaped text), a CSS language caption, and accent typography/inline code. No
   browser verification was performed for this documentation pass.
+- **Background work (R6).** Concurrent tools mean a turn is `running` until the
+  harness promise drains, while an agent `done` can be interim. The UI reconciles
+  the same way (by turn id, never rebuilding) and, for the additive frames:
+  - `tool_result.durationMs` replaces the browser's frame-gap measurement;
+  - a present `pending` array replaces `.agent-pending` (`pending · name 1.2s`, a
+    static snapshot of the server's spans, never a local tick) and the summed
+    `N tools still running` count in the tile meta (visible when expanded; clipped
+    sr-only on compact rows). A settled call is pruned from that snapshot by its
+    `callId` even when the frame omits `pending` (the runtime omits it when nothing
+    remains), so absence is never read as a global drain. The array never resolves
+    or abandons a card;
+  - a `wakeup` appends `.agent-wakeup` and keeps the agent's ring lit; it is a
+    resume, so it does not settle the tile or close a card. A wake frame without a
+    usable `pending` list is malformed and produces no update;
+  - on a terminal `cancelled`/`error`/`done` turn, any card still running is
+    `abandon()`-ed with a reason (`Cancelled before the call returned.`, etc.)
+    instead of being left as a live-looking chip — pending work is interrupted, not
+    resumed. A result id already settled (resolved or abandoned) is a duplicate and
+    is ignored, so a retried/late frame cannot add a second card. The CLI mirrors
+    the duration/pending/wake/done **lines** in `src/server/cli/render.ts`; card
+    closure is a browser-only state.
 
 ### Agents and the harness registry
 
@@ -1811,8 +1909,11 @@ In the order they are expected:
 2. **compaction** — history pruning before context limits.
 3. **per-agent tool scoping** — searchable tools are catalogued once; every agent
    can discover every searchable tool (only `agentDelegate` is primary-only).
-4. **parallel tool execution** — calls run sequentially today.
-5. **sandboxed presets and created tools** — the file and command tools, and any
+4. **sandboxed presets and created tools** — the file and command tools, and any
    `toolCreate` body, run with host permissions; a `root`-scoped/fenced variant
    would be the natural next step.
-6. **more presets** — `fetchUrl` and a patch/multi-edit tool are the obvious gaps.
+5. **more presets** — `fetchUrl` and a patch/multi-edit tool are the obvious gaps.
+
+Parallel tool execution is no longer on this list: calls are scheduled
+concurrently (see “The loop”). There is no thread/CPU isolation and no ordered
+side-effect guarantee — that limitation is documented, not planned away.

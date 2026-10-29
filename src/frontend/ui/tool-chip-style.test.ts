@@ -67,3 +67,12 @@ it('colours the tool name by state, keeping running neutral', () => {
     // A long name is ellipsized in the chip but shown in full once expanded.
     expect(blockOf('.tool[open] .tool-name {')).toContain('max-width: none');
 });
+
+it('mutes an interrupted call instead of painting it as success or failure', () => {
+    // R6: pending work is interrupted, not failed. The chip and its state word drop
+    // to the muted colour so a settled tile never reads as red (tool error) or as a
+    // live call (the default running style).
+    expect(blockOf(".tool[data-state='cancelled'] .tool-name {")).toContain('color: var(--muted)');
+    expect(blockOf(".tool[data-state='cancelled'] .tool-state {")).toContain('color: var(--muted)');
+    expect(blockOf(".tool[data-state='cancelled'] .tool-glyph {")).toContain('color: var(--muted)');
+});

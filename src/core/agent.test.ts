@@ -336,6 +336,38 @@ describe('agent', () => {
         ]);
     });
 
+    // Harness ownership guard (T15): a turn that lost its owner while the
+    // transport was in flight must not commit. This is the only synchronous
+    // history mutation point, so throwing here leaves the transcript untouched.
+    it('refuses to commit when precommit throws', async () => {
+        const brain = agent({
+            model: 'm',
+            instruction: 'You are a writer.',
+            stream: fakeStream([{ type: 'text', delta: 'late' }, done()])
+        });
+
+        await expect(
+            collect(
+                brain.turn({
+                    precommit: () => {
+                        throw new Error('ownership lost');
+                    }
+                })
+            )
+        ).rejects.toThrow('ownership lost');
+
+        // No assistant message was appended by the refused turn.
+        expect(brain.messages).toEqual([{ role: 'system', content: 'You are a writer.' }]);
+
+        // A later owned turn commits normally.
+        const events = await collect(brain.turn());
+        expect(events.at(-1)).toMatchObject({ type: 'done', message: { content: 'late' } });
+        expect(brain.messages).toEqual([
+            { role: 'system', content: 'You are a writer.' },
+            { role: 'assistant', content: 'late' }
+        ]);
+    });
+
     it('requires a model', () => {
         expect(() => agent({ model: '', stream: transport })).toThrow('An agent requires a model.');
     });
