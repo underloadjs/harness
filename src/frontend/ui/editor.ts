@@ -275,6 +275,11 @@ const offsetOfPoint = (parts: readonly EditorPart[], node: Node, offset: number)
 
         if (part.type === 'chip') {
             if (part.node === node) return part.start;
+            // A caret that a browser placed INSIDE the non-editable island (a click
+            // on the label can do that) belongs after the token. Without this, the
+            // point would fall through to the end of the whole draft and Backspace
+            // would target the wrong chip.
+            if (part.node.contains(node)) return part.end;
             if (part.node.parentNode === node) {
                 const position = Array.from(part.node.parentNode.childNodes).indexOf(part.node);
                 if (position < offset) return part.end;
@@ -471,8 +476,9 @@ const trimAdjacentSpace = (chip: HTMLElement): void => {
     const next = chip.nextSibling;
     const previousText = previous !== null && previous.nodeType === Node.TEXT_NODE ? (previous as Text) : undefined;
     const nextText = next !== null && next.nodeType === Node.TEXT_NODE ? (next as Text) : undefined;
-    const leftSpace = previousText !== undefined && previousText.data.endsWith(' ');
-    const rightSpace = nextText !== undefined && nextText.data.startsWith(' ');
+    // A browser may have stored the separator as NBSP: it is still one space.
+    const leftSpace = previousText !== undefined && isGapSpace(previousText.data.charAt(previousText.data.length - 1));
+    const rightSpace = nextText !== undefined && isGapSpace(nextText.data.charAt(0));
 
     // Mirrors removeAttachmentMarker: collapse the separator pair, and undo the
     // single lead/trail space the insert added at either edge.
@@ -519,6 +525,226 @@ export const editorSetAttachmentState = (root: HTMLElement, id: string, state?: 
 
     if (state === undefined) delete chip.dataset.state;
     else chip.dataset.state = state;
+};
+
+// --- atomic chip deletion (Backspace / Delete) ------------------------------
+//
+// A chip is an inline `contenteditable=false` island. Chromium/WebKit do NOT
+// delete such an island reliably with the native Backspace/Delete key: the caret
+// can sit next to it while the key handler deletes the neighbouring TEXT character
+// instead (the classic `user-select: none` skip), so the reader had to click the
+// chip's × to get rid of a pasted image. The editor therefore OWNS the boundary
+// keystroke: `editorDeleteChips` recognises a chip exactly at the caret (or any
+// chip inside a non-empty selection), removes it atomically and reports the caret
+// so the caller can drop the matching draft bytes/object URL.
+//
+// Everything here works in TEXT OFFSET space (editorParts), never in raw DOM
+// siblings, so it behaves identically with a live DOM selection and with the
+// stored selection the accessors use when the field is unfocused (jsdom).
+
+// Which side of the caret one keystroke consumes.
+export type EditorChipDirection = 'backward' | 'forward';
+
+// Result of an atomic deletion. `ids` are chip ids in document order (one chip for
+// a collapsed caret, every chip the selection spanned otherwise) and `caret` is
+// the restored offset in the NEW text.
+export type EditorChipDeletion = {
+    ids: string[];
+    caret: number;
+};
+
+// Text between the caret and a chip that carries no character at all: an empty
+// text node (browsers leave those behind) or a zero-width space. Such a node must
+// never hide the chip from the adjacency test.
+//
+// An NBSP is deliberately NOT invisible: it is a visible space the reader can
+// delete first (one Backspace removes the space, the next removes the chip).
+const INVISIBLE_CHARS = /[\u200b\ufeff]/g;
+
+// Serialized characters only: zero-width artifacts contribute no offset. Chips,
+// breaks and virtual newlines are always one visible token, so their `text` is
+// used verbatim.
+const visibleText = (value: string): string => value.replace(INVISIBLE_CHARS, '');
+
+const visibleLength = (part: EditorPart): number =>
+    part.type === 'text' ? visibleText(part.text).length : part.text.length;
+
+// A gap character that the marker grammar treats as whitespace. Mirrors the
+// removeAttachmentMarker rules in ui/attachments.ts (regular space and the NBSP a
+// browser substitutes for a trailing space).
+const isGapSpace = (char: string): boolean => char === ' ' || char === '\u00a0';
+
+// Delete one text span [start, end) through a DOM range so a trim can never split
+// a chip or an element boundary in the wrong place.
+const deleteTextSpan = (root: HTMLElement, start: number, end: number): void => {
+    const { parts } = editorParts(root);
+    rangeOf(parts, { start, end }, root).deleteContents();
+};
+
+// Collapse the separator whitespace a removed chip left at `caret`, using the same
+// result as removeAttachmentMarker (ui/attachments.ts):
+//   - whitespace on BOTH sides -> collapse the pair to one;
+//   - chip was at the start      -> drop the single leading separator;
+//   - chip was at the end        -> drop the single trailing separator.
+// The caret is the token's start offset and stays there: in the middle case the
+// separator AFTER it is removed (the string is identical either way, but this keeps
+// typing exactly where the chip stood).
+// Returns the caret after the trim.
+const collapseChipGapText = (root: HTMLElement, caret: number): number => {
+    const { text } = editorParts(root);
+    const at = clampOffset(caret, text.length);
+    const left = at > 0 ? text.charAt(at - 1) : '';
+    const right = at < text.length ? text.charAt(at) : '';
+
+    if (at > 0 && at < text.length && isGapSpace(left) && isGapSpace(right)) {
+        deleteTextSpan(root, at, at + 1);
+        return at;
+    }
+
+    if (at === 0 && isGapSpace(right)) {
+        deleteTextSpan(root, 0, 1);
+        return 0;
+    }
+
+    if (at === text.length && isGapSpace(left)) {
+        deleteTextSpan(root, at - 1, at);
+        return at - 1;
+    }
+
+    return at;
+};
+
+// Delete every chip the keystroke consumes and restore the caret. Returns
+// `undefined` when no chip is involved: the caller must then leave the key alone
+// so ordinary text editing (typing, multiline, word delete) is untouched.
+//
+// Chips of EVERY kind are consumed (attachment, file, reference). They are the
+// same atomic DOM construct, and the attachment cleanup in the caller is matched
+// by id, so a file mention or block reference backspace stays atomic too.
+export const editorDeleteChips = (
+    root: HTMLElement,
+    direction: EditorChipDirection
+): EditorChipDeletion | undefined => {
+    const { parts, text } = editorParts(root);
+    const selection = editorSelection(root);
+    const start = clampOffset(selection.start, text.length);
+    const end = Math.max(start, clampOffset(selection.end, text.length));
+
+    const targets: HTMLElement[] = [];
+    // Zero-width text nodes the caret walks over to reach a chip. They are removed
+    // together with it, so a browser artifact can never end up in the prompt.
+    const invisible: EditorPart[] = [];
+    // Caret offset after a collapsed deletion: the token's start for Backspace,
+    // the original caret for Delete (removing characters AFTER the caret cannot
+    // move it).
+    let anchor: number = start;
+
+    if (start !== end) {
+        // A non-empty selection deletes the whole range (text + atoms). Every chip
+        // it intersects goes with it, even when the browser would have skipped a
+        // `user-select: none` island.
+        for (const part of parts) {
+            if (part.type !== 'chip') continue;
+            if (part.end <= start || part.start >= end) continue;
+            if (readEditorChip(part.node) === null) continue;
+            targets.push(part.node);
+        }
+    } else {
+        // Visible-offset map: zero-width artifacts contribute no offset, so a chip
+        // is adjacent to the caret through them but an NBSP still counts as one
+        // character. Real offsets stay available on `part`.
+        let effective = 0;
+        const mapped = parts.map((part) => {
+            const from = effective;
+            effective += visibleLength(part);
+            return { part, start: from, end: effective };
+        });
+        const caretAt = visibleText(text.slice(0, start)).length;
+
+        // A caret that somehow landed INSIDE a chip still consumes it: no
+        // keystroke may split a token.
+        for (const entry of mapped) {
+            if (entry.part.type !== 'chip') continue;
+            if (entry.start < caretAt && entry.end > caretAt) {
+                if (readEditorChip(entry.part.node) === null) continue;
+                targets.push(entry.part.node);
+                anchor = entry.part.start;
+            }
+        }
+
+        if (targets.length === 0 && direction === 'backward') {
+            // The last part whose visible text ENDS at the caret holds the character
+            // immediately before it.
+            for (let index = mapped.length - 1; index >= 0; index -= 1) {
+                const entry = mapped[index]!;
+
+                if (entry.end > caretAt) continue;
+                if (entry.end < caretAt) break;
+
+                if (entry.end === entry.start) {
+                    invisible.push(entry.part);
+                    continue;
+                }
+
+                if (entry.part.type === 'chip' && readEditorChip(entry.part.node) !== null) {
+                    targets.push(entry.part.node);
+                    anchor = entry.part.start;
+                }
+                break;
+            }
+        }
+
+        if (targets.length === 0 && direction === 'forward') {
+            // The first part whose visible text STARTS at the caret holds the
+            // character immediately after it.
+            for (let index = 0; index < mapped.length; index += 1) {
+                const entry = mapped[index]!;
+
+                if (entry.start < caretAt) continue;
+                if (entry.start > caretAt) break;
+
+                if (entry.end === entry.start) {
+                    invisible.push(entry.part);
+                    continue;
+                }
+
+                if (entry.part.type === 'chip' && readEditorChip(entry.part.node) !== null) {
+                    targets.push(entry.part.node);
+                    // The original caret already sits before the artifacts and the
+                    // token, so it is the post-delete offset.
+                    anchor = start;
+                }
+                break;
+            }
+        }
+    }
+
+    if (targets.length === 0) return undefined;
+
+    if (end > start) {
+        // Range deletion removes the selected text AND the chips it contains.
+        rangeOf(parts, { start, end }, root).deleteContents();
+    } else {
+        // Collapsed caret: strip the zero-width artifacts and remove the adjacent
+        // chip node itself.
+        for (const part of invisible) {
+            if (part.type !== 'text') continue;
+            part.node.data = part.node.data.replace(INVISIBLE_CHARS, '');
+        }
+
+        for (const node of targets) node.remove();
+    }
+
+    // Same observable result as the × button (removeDraftAttachment ->
+    // editorRemoveAttachment): the marker disappears together with its separator.
+    const base = end > start ? start : anchor;
+    const caret = collapseChipGapText(root, Math.min(base, editorText(root).length));
+    editorSetSelection(root, { start: caret, end: caret });
+
+    return {
+        ids: targets.map((node) => node.dataset.chipId ?? ''),
+        caret
+    };
 };
 
 // --- textarea-compatible accessors ------------------------------------------
@@ -583,25 +809,49 @@ export const editorRestore = (root: HTMLElement, nodes: readonly Node[]): void =
 // browser's editing machinery, not in our handlers):
 //   - two spaces around the gap collapse to one;
 //   - a chip at the start/end keeps the single original separator only.
+//
+// The sibling passed by the MutationRecord is often an EMPTY text node the browser
+// left behind, not the text that actually borders the gap, so the nearest non-empty
+// text sibling is used. NBSP counts as whitespace because a browser stores a
+// trailing space as `\u00a0`.
+const nearestGapText = (node: Node | null, direction: 'previous' | 'next'): Text | undefined => {
+    let current: Node | null = node;
+
+    while (current !== null) {
+        if (current.nodeType === Node.TEXT_NODE) {
+            const text = current as Text;
+            // An empty text node carries no character: keep looking outward.
+            if (text.data.length > 0) return text;
+        } else {
+            // A real element boundary: the chip was not sitting between text.
+            return undefined;
+        }
+
+        current = direction === 'previous' ? current.previousSibling : current.nextSibling;
+    }
+
+    return undefined;
+};
+
 export const editorCollapseChipGap = (
     previous: Node | null,
     next: Node | null
 ): void => {
-    const previousText = previous !== null && previous.nodeType === Node.TEXT_NODE ? (previous as Text) : undefined;
-    const nextText = next !== null && next.nodeType === Node.TEXT_NODE ? (next as Text) : undefined;
+    const previousText = nearestGapText(previous, 'previous');
+    const nextText = nearestGapText(next, 'next');
 
     if (previousText === undefined && nextText !== undefined) {
-        nextText.data = nextText.data.replace(/^ +/, '');
+        nextText.data = nextText.data.replace(/^[ \u00a0]+/, '');
         return;
     }
 
     if (previousText !== undefined && nextText === undefined) {
-        previousText.data = previousText.data.replace(/ +$/, '');
+        previousText.data = previousText.data.replace(/[ \u00a0]+$/, '');
         return;
     }
 
     if (previousText !== undefined && nextText !== undefined) {
-        if (previousText.data.endsWith(' ') && nextText.data.startsWith(' ')) {
+        if (isGapSpace(previousText.data.charAt(previousText.data.length - 1)) && isGapSpace(nextText.data.charAt(0))) {
             previousText.data = previousText.data.slice(0, -1);
         }
     }

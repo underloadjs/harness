@@ -254,6 +254,102 @@ it('takes clipboard files in items order and attaches each one exactly once', ()
     expect(clipboardFilesOf({ files: [second] }).map((file) => file.name)).toEqual(['b.mp4']);
 });
 
+it('dedupes one clipboard entry across representations without dropping distinct files', () => {
+    const stamp = 1_700_000_000_000;
+    const make = (name: string, type: string): File =>
+        new File([new Uint8Array([1, 2, 3])], name, { type, lastModified: stamp });
+
+    // Chromium shape: `getAsFile()` and `files[i]` are DIFFERENT File objects for
+    // the same clipboard entry (a fresh wrapper per access). Identity dedupe
+    // attached one pasted image twice.
+    const fromItem = make('image.png', 'image/png');
+    const fromFiles = make('image.png', 'image/png');
+    expect(fromItem).not.toBe(fromFiles);
+
+    expect(
+        clipboardFilesOf({
+            items: [{ kind: 'file', getAsFile: () => fromItem }],
+            files: [fromFiles]
+        }).map((file) => file.name)
+    ).toEqual(['image.png']);
+
+    // Two genuinely distinct files that happen to share every fact still survive:
+    // the item budget is a multiset, not a set.
+    expect(
+        clipboardFilesOf({
+            items: [
+                { kind: 'file', getAsFile: () => make('same.png', 'image/png') },
+                { kind: 'file', getAsFile: () => make('same.png', 'image/png') }
+            ],
+            files: [make('same.png', 'image/png'), make('same.png', 'image/png')]
+        }).map((file) => file.name)
+    ).toEqual(['same.png', 'same.png']);
+
+    // A `files` entry no item represents is a real additional file.
+    expect(
+        clipboardFilesOf({
+            items: [{ kind: 'file', getAsFile: () => fromItem }],
+            files: [fromFiles, make('notes.txt', 'text/plain')]
+        }).map((file) => file.name)
+    ).toEqual(['image.png', 'notes.txt']);
+
+    // The dedupe scope is ONE clipboard payload: two paste gestures of the same
+    // image are two intentional attachments.
+    const payload = (): File[] =>
+        clipboardFilesOf({
+            items: [{ kind: 'file', getAsFile: () => make('image.png', 'image/png') }],
+            files: [make('image.png', 'image/png')]
+        });
+    expect(payload().map((file) => file.name)).toEqual(['image.png']);
+    expect(payload().map((file) => file.name)).toEqual(['image.png']);
+});
+
+it('collapses one clipboard entry whose representations disagree on lastModified', () => {
+    // Chromium synthesizes 0 for an item copy and reports the real timestamp for the
+    // `files` copy. A timestamp in the key made the budget miss and attached the
+    // image twice; the key is name+MIME+size only.
+    const synthesized = new File([new Uint8Array([1, 2, 3])], 'image.png', {
+        type: 'image/png',
+        lastModified: 0
+    });
+    const stamped = new File([new Uint8Array([1, 2, 3])], 'image.png', {
+        type: 'image/png',
+        lastModified: 1_700_000_000_000
+    });
+
+    expect(synthesized.lastModified).toBe(0);
+    expect(stamped.lastModified).toBe(1_700_000_000_000);
+    expect(
+        clipboardFilesOf({
+            items: [{ kind: 'file', getAsFile: () => synthesized }],
+            files: [stamped]
+        }).map((file) => file.name)
+    ).toEqual(['image.png']);
+
+    // Distinct entries that share every kept fact (and differ only in timestamps)
+    // are still two attachments: the budget counts the item occurrences.
+    expect(
+        clipboardFilesOf({
+            items: [
+                { kind: 'file', getAsFile: () => new File([new Uint8Array([1])], 'copy.png', { type: 'image/png', lastModified: 1 }) },
+                { kind: 'file', getAsFile: () => new File([new Uint8Array([1])], 'copy.png', { type: 'image/png', lastModified: 1 }) }
+            ],
+            files: [
+                new File([new Uint8Array([1])], 'copy.png', { type: 'image/png', lastModified: 2 }),
+                new File([new Uint8Array([1])], 'copy.png', { type: 'image/png', lastModified: 2 })
+            ]
+        }).map((file) => file.name)
+    ).toEqual(['copy.png', 'copy.png']);
+
+    // A same-named file with a different size stays a distinct attachment.
+    expect(
+        clipboardFilesOf({
+            items: [{ kind: 'file', getAsFile: () => synthesized }],
+            files: [stamped, new File([new Uint8Array([1, 2, 3, 4])], 'image.png', { type: 'image/png' })]
+        }).map((file) => file.size)
+    ).toEqual([3, 4]);
+});
+
 it('builds a chip whose visible label is the filename and whose remove control is not nested', () => {
     const removals: string[] = [];
     const chip = attachmentChipElement(

@@ -157,6 +157,71 @@ const stubServer = (restored?: SessionSnapshot, taskError?: string): Call[] => {
     return calls;
 };
 
+// A server whose FIRST POST /tasks stays open until the test releases it, so the
+// short enqueue freeze (`submitting`) is observable deterministically. Later task
+// POSTs answer immediately so a retry / next message can be asserted.
+const gatedServer = (): { calls: Call[]; release: (response: Response) => void } => {
+    const calls: Call[] = [];
+    const state: { gated: boolean; release?: (response: Response) => void } = { gated: false };
+
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+            const method = init?.method;
+            const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
+            calls.push({ url, method, body });
+
+            if (url === '/api') return json(bootstrap());
+            if (url === '/api/models') return json({ models: ['m1'] });
+            if (url === '/api/sessions' && method === 'POST') return json({ session: snapshot() }, 201);
+
+            if (url === '/api/sessions/s1/tasks' && method === 'POST') {
+                const request = body as { input: string; attachments?: HarnessAttachment[] };
+                const opening = turn({
+                    prompt: request.input,
+                    ...(request.attachments === undefined ? {} : { attachments: request.attachments })
+                });
+                const answer = (): Response =>
+                    json({ session: snapshot({ status: 'running', turns: [opening] }), turn: opening }, 202);
+
+                if (!state.gated) {
+                    state.gated = true;
+                    return new Promise<Response>((resolve) => {
+                        state.release = resolve;
+                    });
+                }
+
+                return answer();
+            }
+
+            if (url === '/api/sessions/s1/events') {
+                return new Response(
+                    new ReadableStream<Uint8Array>({
+                        start() {
+                            // Never emits: the POST answer owns the pending state.
+                        }
+                    }),
+                    { status: 200, headers: { 'Content-Type': 'text/event-stream' } }
+                );
+            }
+
+            if (url === '/api/sessions/s1' && method === undefined) {
+                return json({ session: snapshot({ status: 'running', turns: [turn()] }) });
+            }
+
+            if (url === '/api/sessions' && method === undefined) return json({ sessions: [] });
+
+            throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
+        })
+    );
+
+    return {
+        calls,
+        release: (response) => state.release?.(response)
+    };
+};
+
 const mount = async (): Promise<void> => {
     await import('./main');
     await flush();
@@ -187,6 +252,68 @@ const composerChips = (): HTMLElement[] => [
     ...document.querySelectorAll<HTMLElement>('.composer-input [data-chip="attachment"]')
 ];
 
+// Chromium hands out a FRESH File object from `getAsFile()` and from `files` for
+// the SAME clipboard entry. The old helper above reuses one object on both sides,
+// which hid the duplicate; these helpers use two distinct objects with identical
+// facts (name/MIME/size/lastModified), exactly like a real browser clipboard.
+const CLIPBOARD_STAMP = 1_700_000_000_000;
+
+const clipboardFile = (name: string, type: string): File =>
+    new File([PNG_BYTES], name, { type, lastModified: CLIPBOARD_STAMP });
+
+const pasteClipboard = (input: HTMLElement, items: File[], files: File[]): Event => {
+    const event = new Event('paste', { bubbles: true, cancelable: true });
+    Object.defineProperty(event, 'clipboardData', {
+        value: {
+            items: items.map((file) => ({ kind: 'file', getAsFile: () => file })),
+            files
+        }
+    });
+    input.dispatchEvent(event);
+    return event;
+};
+
+const pressDelete = (input: HTMLElement, key: 'Backspace' | 'Delete'): KeyboardEvent => {
+    const event = new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true });
+    input.dispatchEvent(event);
+    return event;
+};
+
+// The composer field is a contentEditable <div>; ui/editor.ts installs the
+// textarea-compatible accessors (`value`, `selectionStart/End`,
+// `setSelectionRange`) this contract is written against.
+type ComposerField = HTMLDivElement & {
+    value: string;
+    selectionStart: number;
+    selectionEnd: number;
+    setSelectionRange: (start: number, end?: number) => void;
+};
+
+const composerField = (): ComposerField => {
+    const element = byClass('.composer-input', 'div') as ComposerField;
+    return element;
+};
+
+// The preview object URL is created from a `File`, so the test owns both halves of
+// the lifecycle. Originals are restored in afterEach.
+const originalCreateObjectURL = URL.createObjectURL;
+const originalRevokeObjectURL = URL.revokeObjectURL;
+
+const stubObjectUrls = (): string[] => {
+    const revoked: string[] = [];
+    let created = 0;
+
+    URL.createObjectURL = () => {
+        created += 1;
+        return `blob:preview-${created}`;
+    };
+    URL.revokeObjectURL = (url: string) => {
+        revoked.push(url);
+    };
+
+    return revoked;
+};
+
 beforeEach(() => {
     vi.resetModules();
     localStorage.clear();
@@ -196,6 +323,12 @@ beforeEach(() => {
 afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    // `URL.createObjectURL` does not exist in jsdom by default: delete whatever is
+    // left rather than restoring a method that was never there.
+    if (originalCreateObjectURL === undefined) Reflect.deleteProperty(URL, 'createObjectURL');
+    else URL.createObjectURL = originalCreateObjectURL;
+    if (originalRevokeObjectURL === undefined) Reflect.deleteProperty(URL, 'revokeObjectURL');
+    else URL.revokeObjectURL = originalRevokeObjectURL;
 });
 
 it('inserts "[Image 1]" at the caret on paste and sends the bytes separately', async () => {
@@ -345,7 +478,7 @@ it('sends an attachment-only turn with an empty prompt', async () => {
     const calls = stubServer();
     await mount();
 
-    const input = byClass('.composer-input', 'div');
+    const input = composerField();
     pasteFiles(input, [new File([PNG_BYTES], 'shot.png', { type: 'image/png' })]);
     await flush();
 
@@ -516,7 +649,7 @@ it('synchronizes the draft when an inline chip is deleted atomically', async () 
     const calls = stubServer();
     await mount();
 
-    const input = byClass('.composer-input', 'div');
+    const input = composerField();
     pasteFiles(input, [new File([PNG_BYTES], 'gone.png', { type: 'image/png' })]);
     await flush();
 
@@ -614,4 +747,446 @@ it('renders the ack record attachments once, without duplicating the strip', asy
     expect(hosts[0]?.querySelectorAll('.attachment-chip')).toHaveLength(1);
     expect(hosts[0]?.querySelector('.attachment-remove')).toBeNull();
     expect(hosts[0]?.querySelector('.attachment-name')?.textContent).toBe('shot.png');
+});
+
+// --- R4/R5: one image = one chip, and Backspace/Delete are atomic ------------
+//
+// The mock helper above reuses one File object on both clipboard paths, which is
+// what a browser does NOT do; the realistic payload has two distinct objects for
+// one clipboard entry (see `pasteClipboard`).
+
+it('attaches a real browser clipboard image exactly once', async () => {
+    const calls = stubServer();
+    await mount();
+
+    const input = composerField();
+    const event = pasteClipboard(
+        input,
+        [clipboardFile('image.png', 'image/png')],
+        [clipboardFile('image.png', 'image/png')]
+    );
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(input.value).toBe('[Image 1]');
+    expect(composerChips()).toHaveLength(1);
+    expect(composerChips()[0]?.dataset.chipLabel).toBe('[Image 1]');
+
+    await flush();
+    submit();
+    await flush();
+
+    expect(taskBodies(calls)).toEqual([
+        {
+            input: '[Image 1]',
+            attachments: [
+                {
+                    id: 'attach-1',
+                    kind: 'image',
+                    marker: '[Image 1]',
+                    name: 'image.png',
+                    mime: 'image/png',
+                    size: 12,
+                    data: PNG_BASE64
+                }
+            ]
+        }
+    ]);
+});
+
+it('keeps distinct files while deduping the repeated clipboard representation', async () => {
+    stubServer();
+    await mount();
+
+    const input = composerField();
+    pasteClipboard(
+        input,
+        [clipboardFile('one.png', 'image/png'), clipboardFile('two.png', 'image/png')],
+        [
+            clipboardFile('one.png', 'image/png'),
+            clipboardFile('two.png', 'image/png'),
+            clipboardFile('notes.txt', 'text/plain')
+        ]
+    );
+
+    // Clipboard order: the two item entries, then the files-only attachment.
+    expect(input.value).toBe('[Image 1] [Image 2] [File 1]');
+    expect(composerChips().map((chip) => chip.dataset.attachmentName)).toEqual([
+        'one.png',
+        'two.png',
+        'notes.txt'
+    ]);
+
+    await flush();
+});
+
+it('removes a chip with Backspace, including its preview URL and payload', async () => {
+    const calls = stubServer();
+    const revoked = stubObjectUrls();
+    await mount();
+
+    const input = composerField();
+    pasteClipboard(
+        input,
+        [clipboardFile('image.png', 'image/png')],
+        [clipboardFile('image.png', 'image/png')]
+    );
+    await flush();
+
+    expect(composerChips()).toHaveLength(1);
+    expect(composerChips()[0]?.querySelector('img')?.getAttribute('src')).toBe('blob:preview-1');
+
+    // Caret sits after the freshly inserted chip: Backspace must remove the token
+    // atomically instead of deleting a neighbouring text character.
+    const event = pressDelete(input, 'Backspace');
+    expect(event.defaultPrevented).toBe(true);
+    expect(input.value).toBe('');
+    expect(composerChips()).toEqual([]);
+    expect(revoked).toEqual(['blob:preview-1']);
+    expect(byClass('.composer-action', 'button').hidden).toBe(true);
+
+    // No stale bytes can leave with a later text-only submit.
+    input.value = 'text only';
+    submit();
+    await flush();
+    expect(taskBodies(calls)).toEqual([{ input: 'text only' }]);
+});
+
+it('removes a chip covered by a selection on one keystroke', async () => {
+    stubServer();
+    await mount();
+
+    const input = composerField();
+    input.value = 'a b';
+    input.setSelectionRange(2, 2);
+    pasteClipboard(
+        input,
+        [clipboardFile('image.png', 'image/png')],
+        [clipboardFile('image.png', 'image/png')]
+    );
+    await flush();
+    expect(input.value).toBe('a [Image 1] b');
+
+    // Select exactly the chip, then delete the selection.
+    input.setSelectionRange(2, 11);
+    const event = pressDelete(input, 'Backspace');
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(input.value).toBe('a b');
+    expect(composerChips()).toEqual([]);
+});
+
+it('never resurrects a chip deleted while its read is still in flight', async () => {
+    stubServer();
+    await mount();
+
+    const releases: Array<() => void> = [];
+
+    class SlowFileReader {
+        result: string | null = null;
+        error: Error | null = null;
+        onload: (() => void) | null = null;
+        onerror: (() => void) | null = null;
+
+        readAsDataURL(file: File): void {
+            releases.push(() => {
+                this.result = `data:${file.type};base64,${PNG_BASE64}`;
+                this.onload?.();
+            });
+        }
+    }
+
+    vi.stubGlobal('FileReader', SlowFileReader);
+
+    const input = composerField();
+    pasteClipboard(
+        input,
+        [clipboardFile('slow.png', 'image/png')],
+        [clipboardFile('slow.png', 'image/png')]
+    );
+
+    expect(composerChips()).toHaveLength(1);
+    expect(composerChips()[0]?.dataset.state).toBe('reading');
+
+    // Deleted while reading: the late read completion must not repaint a chip.
+    expect(pressDelete(input, 'Backspace').defaultPrevented).toBe(true);
+    expect(composerChips()).toEqual([]);
+
+    releases[0]?.();
+    await flush();
+
+    expect(composerChips()).toEqual([]);
+    expect(input.value).toBe('');
+    expect(byClass('.composer-action', 'button').hidden).toBe(true);
+    expect(byClass('.composer-attachment-error', 'p').hidden).toBe(true);
+});
+
+it('treats two separate pastes of the same image as two attachments', async () => {
+    stubServer();
+    await mount();
+
+    const input = composerField();
+    pasteClipboard(
+        input,
+        [clipboardFile('image.png', 'image/png')],
+        [clipboardFile('image.png', 'image/png')]
+    );
+    pasteClipboard(
+        input,
+        [clipboardFile('image.png', 'image/png')],
+        [clipboardFile('image.png', 'image/png')]
+    );
+
+    expect(input.value).toBe('[Image 1] [Image 2]');
+    expect(composerChips().map((chip) => chip.dataset.chipLabel)).toEqual([
+        '[Image 1]',
+        '[Image 2]'
+    ]);
+
+    await flush();
+});
+
+// --- freeze-window reconciliation (T14) -------------------------------------
+//
+// While a submit owns the enqueue window (`submitting`), the chooser is disabled
+// and the keydown chip delete / chip observer both skip that state. Anything that
+// could still add or lose a draft entry in that window must therefore be closed
+// here: no new chip may appear, and a failed turn may not leave bytes whose marker
+// is not in the prompt.
+
+it('ignores paste, drop and the file chooser during the submit freeze', async () => {
+    const { calls, release } = gatedServer();
+    await mount();
+
+    const input = composerField();
+    input.value = 'first';
+    pasteClipboard(
+        input,
+        [clipboardFile('one.png', 'image/png')],
+        [clipboardFile('one.png', 'image/png')]
+    );
+    await flush();
+    expect(composerChips()).toHaveLength(1);
+
+    submit();
+    await flush();
+    // Freeze window open: the field was cleared and the POST is still in flight.
+    expect(input.value).toBe('');
+    expect(composerChips()).toEqual([]);
+
+    // Paste: still intercepted (the native paste must never run), but discarded.
+    const paste = pasteClipboard(
+        input,
+        [clipboardFile('two.png', 'image/png')],
+        [clipboardFile('two.png', 'image/png')]
+    );
+    expect(paste.defaultPrevented).toBe(true);
+    expect(input.value).toBe('');
+    expect(composerChips()).toEqual([]);
+
+    // Drop: same contract on the composer.
+    const drop = new Event('drop', { bubbles: true, cancelable: true });
+    Object.defineProperty(drop, 'dataTransfer', {
+        value: {
+            items: [{ kind: 'file', getAsFile: () => clipboardFile('three.png', 'image/png') }],
+            files: [clipboardFile('three.png', 'image/png')]
+        }
+    });
+    byClass('.composer', 'form').dispatchEvent(drop);
+    expect(drop.defaultPrevented).toBe(true);
+    expect(input.value).toBe('');
+    expect(composerChips()).toEqual([]);
+
+    // File chooser: the accessory is disabled, and a stray change is discarded too.
+    const fileInput = byClass('.composer-file', 'input');
+    expect(fileInput.disabled).toBe(true);
+    Object.defineProperty(fileInput, 'files', {
+        configurable: true,
+        value: [clipboardFile('four.png', 'image/png')]
+    });
+    fileInput.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(input.value).toBe('');
+    expect(composerChips()).toEqual([]);
+
+    // Let the enqueue settle: only the sent draft existed, so the next text-only
+    // submit must carry no attachment at all.
+    release(json({ session: snapshot({ status: 'running' }), turn: turn() }, 202));
+    await flush();
+    await flush();
+
+    input.value = 'text only';
+    submit();
+    await flush();
+
+    expect(taskBodies(calls)).toEqual([
+        {
+            input: 'first [Image 1]',
+            attachments: [
+                {
+                    id: 'attach-1',
+                    kind: 'image',
+                    marker: '[Image 1]',
+                    name: 'one.png',
+                    mime: 'image/png',
+                    size: 12,
+                    data: PNG_BASE64
+                }
+            ]
+        },
+        { input: 'text only' }
+    ]);
+});
+
+it('drops the failed turn bytes when the reader typed the next message', async () => {
+    const { calls, release } = gatedServer();
+    const revoked = stubObjectUrls();
+    await mount();
+
+    const input = composerField();
+    input.value = 'keep this prompt';
+    pasteClipboard(
+        input,
+        [clipboardFile('one.png', 'image/png')],
+        [clipboardFile('one.png', 'image/png')]
+    );
+    await flush();
+    expect(composerChips()).toHaveLength(1);
+
+    submit();
+    await flush();
+    expect(input.value).toBe('');
+
+    // The reader starts the next message while the enqueue is still in flight.
+    input.value = 'next message';
+
+    release(json({ error: { message: 'submit rejected' } }, 500));
+    await flush();
+    await flush();
+
+    // The typed message survives (the failed snapshot is NOT restored over it), and
+    // the failed turn's bytes/object URL are gone with its chips.
+    expect(input.value).toBe('next message');
+    expect(composerChips()).toEqual([]);
+    expect(revoked).toEqual(['blob:preview-1']);
+
+    submit();
+    await flush();
+
+    expect(taskBodies(calls)).toEqual([
+        {
+            input: 'keep this prompt [Image 1]',
+            attachments: [
+                {
+                    id: 'attach-1',
+                    kind: 'image',
+                    marker: '[Image 1]',
+                    name: 'one.png',
+                    mime: 'image/png',
+                    size: 12,
+                    data: PNG_BASE64
+                }
+            ]
+        },
+        { input: 'next message' }
+    ]);
+});
+
+it('restores an attachment-only draft when the send itself fails', async () => {
+    const calls = stubServer(undefined, 'submit rejected');
+    await mount();
+
+    const input = composerField();
+    pasteClipboard(
+        input,
+        [clipboardFile('only.png', 'image/png')],
+        [clipboardFile('only.png', 'image/png')]
+    );
+    await flush();
+    expect(input.value).toBe('[Image 1]');
+
+    submit();
+    await flush();
+    await flush();
+
+    // Empty prompt + cleared field: the snapshot (chip + marker) comes back rather
+    // than leaving the bytes stranded without a marker.
+    expect(input.value).toBe('[Image 1]');
+    expect(composerChips()).toHaveLength(1);
+    expect(composerChips()[0]?.dataset.attachmentName).toBe('only.png');
+
+    // A retry therefore sends the same single attachment, still one record.
+    submit();
+    await flush();
+
+    expect(taskBodies(calls)).toEqual([
+        {
+            input: '[Image 1]',
+            attachments: [
+                {
+                    id: 'attach-1',
+                    kind: 'image',
+                    marker: '[Image 1]',
+                    name: 'only.png',
+                    mime: 'image/png',
+                    size: 12,
+                    data: PNG_BASE64
+                }
+            ]
+        },
+        {
+            input: '[Image 1]',
+            attachments: [
+                {
+                    id: 'attach-1',
+                    kind: 'image',
+                    marker: '[Image 1]',
+                    name: 'only.png',
+                    mime: 'image/png',
+                    size: 12,
+                    data: PNG_BASE64
+                }
+            ]
+        }
+    ]);
+});
+
+it('sends the restorable failed draft with its attachment marker exactly once', async () => {
+    const calls = stubServer(undefined, 'submit rejected');
+    await mount();
+
+    const input = composerField();
+    input.value = 'send me ';
+    input.setSelectionRange(8, 8);
+    pasteClipboard(
+        input,
+        [clipboardFile('keep.png', 'image/png')],
+        [clipboardFile('keep.png', 'image/png')]
+    );
+    await flush();
+
+    submit();
+    await flush();
+    await flush();
+    expect(input.value).toBe('send me [Image 1]');
+    expect(composerChips()).toHaveLength(1);
+
+    // The restored draft keeps the same draft entry, so the retry payload is the
+    // identical single record (no duplicate from the failed attempt).
+    submit();
+    await flush();
+
+    const expected = {
+        input: 'send me [Image 1]',
+        attachments: [
+            {
+                id: 'attach-1',
+                kind: 'image',
+                marker: '[Image 1]',
+                name: 'keep.png',
+                mime: 'image/png',
+                size: 12,
+                data: PNG_BASE64
+            }
+        ]
+    };
+    expect(taskBodies(calls)).toEqual([expected, expected]);
 });

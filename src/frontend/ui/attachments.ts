@@ -371,12 +371,37 @@ export const attachmentThumbnailUrl = (attachment: HarnessAttachment): string | 
 
 // Files on a clipboard/drag payload, in deterministic order: DataTransfer.items
 // first (spec order, the order the files were copied), then `files` for any entry
-// the items list did not expose. Identity dedupe means a browser that reports the
-// same File through both paths attaches it once.
+// the items list did not expose.
+//
+// DEDUPE IS BY CLIPBOARD ENTRY, NOT BY OBJECT IDENTITY. A browser is free to hand
+// out a FRESH File object every time the payload is read (Chromium does exactly
+// that: `items[i].getAsFile()` and `files[i]` are different objects wrapping the
+// same clipboard entry). Identity dedupe therefore attached ONE pasted image
+// twice - two chips, "[Image 1] [Image 2]" and two payload records.
+//
+// The rule that keeps distinct files while removing the duplicate:
+//   - every `items` entry is kept (that list is the authoritative clipboard order);
+//   - a `files` entry is skipped only while an UNMATCHED item with the same facts
+//     (name, MIME, size) is still available, and consumes it.
+// The count is a multiset budget, so copying two genuinely distinct files that
+// happen to share those facts yields two attachments, not one.
+//
+// `lastModified` is deliberately NOT part of the key: the two representations of one
+// clipboard entry do not always agree on it (Chromium reports 0 for a synthesized
+// item and a real timestamp for the `files` copy), and a timestamp mismatch made the
+// budget miss - re-attaching one image twice. A timestamp cannot tell two distinct
+// clipboard files apart anyway (a copy keeps the same mtime), while the multiset
+// budget already preserves genuinely distinct entries.
 export type ClipboardPayload = {
     items?: ArrayLike<{ kind?: string; getAsFile?: () => File | null } | null> | null;
     files?: ArrayLike<File> | null;
 };
+
+// Identity of one clipboard entry, readable from both representations. `size`
+// separates same-named files and `type` keeps a browser-converted representation
+// (e.g. image/png vs image/bmp) from being merged with the original.
+const clipboardFileKey = (file: File): string =>
+    [file.name, file.type, String(file.size)].join('\u0000');
 
 export const clipboardFilesOf = (data: ClipboardPayload | null | undefined): File[] => {
     if (data === null || data === undefined) return [];
@@ -386,23 +411,47 @@ export const clipboardFilesOf = (data: ClipboardPayload | null | undefined): Fil
 
     const push = (file: File | null | undefined): void => {
         if (file === null || file === undefined || typeof file !== 'object') return;
+        // The same object twice is still one clipboard entry.
         if (seen.has(file)) return;
 
         seen.add(file);
         files.push(file);
     };
 
+    // Multiset of the item entries' facts: each `files` entry may only consume one
+    // matching item before it counts as an additional, distinct file.
+    const itemBudget = new Map<string, number>();
+
     if (data.items !== null && data.items !== undefined) {
         for (const item of Array.from(data.items)) {
             if (item === null || item === undefined) continue;
             if (item.kind !== 'file') continue;
 
-            push(item.getAsFile?.() ?? null);
+            const file = item.getAsFile?.() ?? null;
+            push(file);
+
+            if (file !== null && file !== undefined && typeof file === 'object') {
+                const key = clipboardFileKey(file);
+                itemBudget.set(key, (itemBudget.get(key) ?? 0) + 1);
+            }
         }
     }
 
     if (data.files !== null && data.files !== undefined) {
-        for (const file of Array.from(data.files)) push(file);
+        for (const file of Array.from(data.files)) {
+            if (file === null || file === undefined || typeof file !== 'object') continue;
+
+            const key = clipboardFileKey(file);
+            const remaining = itemBudget.get(key) ?? 0;
+
+            if (remaining > 0) {
+                // The same clipboard entry, handed over as a second representation.
+                itemBudget.set(key, remaining - 1);
+                continue;
+            }
+
+            push(file);
+        }
     }
 
     return files;

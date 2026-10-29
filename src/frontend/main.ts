@@ -135,6 +135,7 @@ import type { AttachmentCounters, AttachmentKind } from './ui/attachments';
 import {
     editorChips,
     editorCollapseChipGap,
+    editorDeleteChips,
     editorInsertChips,
     editorInsertPlainText,
     editorRemoveAttachment,
@@ -1694,8 +1695,18 @@ const finishAttachmentRead = (draft: DraftAttachment, data: string | Error): voi
 // are read and is ATOMIC: one oversized/invalid file rejects the whole batch with
 // an explicit reason, inserting nothing. A read failure afterwards is partial and
 // per-file (see finishAttachmentRead) because the markers are already in the text.
+//
+// FREEZE: while a submit owns the enqueue window (`submitting`), no new draft entry
+// may appear. The chooser is disabled in that state, and paste/drop are still
+// intercepted by their handlers (the native paste/drop is always prevented), so a
+// payload arriving during the window must be dropped here too. Otherwise the new
+// chip sits in the cleared field while the keydown chip-delete and the chip
+// MutationObserver both skip `submitting`, so a Backspace in that window could
+// remove only the chip and leave bytes behind: an orphan attachment whose marker is
+// not in any prompt.
 const addFiles = (files: File[]): void => {
     if (files.length === 0) return;
+    if (submitting) return;
 
     const plan = planAttachmentBatch(
         files.map((file) => ({ name: file.name, mime: file.type, size: file.size })),
@@ -4535,9 +4546,26 @@ const run = async (): Promise<void> => {
         // The field was cleared optimistically; restoring the DOM snapshot (only
         // when the reader has not started a new message meanwhile) means no input
         // is lost AND reference chips keep their exact turn/thread binding.
-        if (editorText(input).length === 0 && prompt.length > 0) {
+        //
+        // The snapshot carries only the chips; their BYTES still live in
+        // `draftAttachments` because a failure never consumes them. Reconcile the
+        // two sides so a failed turn can never leave an attachment without its
+        // marker:
+        //   - field still empty (nobody typed, or the turn was attachment-only):
+        //     restore the exact snapshot, chips and their draft entries together;
+        //   - the reader started the next message: keep that text, and drop the
+        //     failed turn's drafts (bytes, record, object URL) because its markers
+        //     are gone with the cleared field. Otherwise the next POST would carry
+        //     `attachments` whose markers are nowhere in the prompt.
+        if (editorText(input).length === 0) {
             editorRestore(input, draftSnapshot);
             autoGrow();
+        } else {
+            // Marker counters keep their values (a removed marker is never
+            // renumbered - same rule as the chip × and the chip observer).
+            for (const draft of sentDrafts) forgetDraftAttachment(draft.id);
+            // `finally` repaints once `submitting` is released, so the chip
+            // controls are not painted disabled here.
         }
         // Not a stream failure, and it is NOT painted into the app-scoped header
         // (R1): a run failure must not outlive the session it belongs to.
@@ -4585,6 +4613,54 @@ input.addEventListener('keydown', (event) => {
     if (event.isComposing || event.keyCode === 229) return;
 
     const sending = (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey;
+
+    // R4/R5: the editor owns Backspace/Delete AT an inline chip.
+    //
+    // A chip is a `contenteditable=false` island (plus `user-select: none`), and
+    // Chromium/WebKit do not delete such an island reliably with the native
+    // keystroke: the caret sits next to the chip yet the browser removes the
+    // neighbouring text character instead, so a pasted image could not be
+    // backspaced at all. When the keystroke targets a chip (collapsed caret exactly
+    // beside one, or a selection spanning one) the default is prevented and the
+    // deletion is applied atomically here: chip DOM, draft bytes, object URL and
+    // record leave together.
+    //
+    // Guards:
+    //   - plain key only (Ctrl/Alt/Cmd keep their word/line deletion semantics);
+    //   - not during the frozen enqueue window (`submitting`): the payload was
+    //     captured and a failed submit restores the exact snapshot;
+    //   - never while the chip's × has focus: that keystroke belongs to the button,
+    //     not to the field's caret.
+    const plainDeleteKey =
+        !event.ctrlKey &&
+        !event.metaKey &&
+        !event.altKey &&
+        (event.key === 'Backspace' || event.key === 'Delete');
+
+    if (plainDeleteKey && !submitting) {
+        const fromRemoveButton =
+            event.target instanceof HTMLElement && event.target.closest('[data-chip-remove]') !== null;
+
+        if (!fromRemoveButton) {
+            const deletion = editorDeleteChips(
+                input,
+                event.key === 'Backspace' ? 'backward' : 'forward'
+            );
+
+            if (deletion !== undefined) {
+                event.preventDefault();
+
+                for (const id of deletion.ids) forgetDraftAttachment(id);
+
+                autoGrow();
+                paintAttachments();
+                // A native edit would emit `input`; keep the popup/action/height
+                // observers on the same contract.
+                input.dispatchEvent(new Event('input', { bubbles: true }));
+                return;
+            }
+        }
+    }
 
     if (composerPopupState !== undefined) {
         if (event.key === 'ArrowDown') {
