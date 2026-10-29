@@ -705,14 +705,32 @@ describe('SessionStore turns', () => {
                     arguments: '{"agent":"helper","input":"find it"}'
                 }
             },
-            { type: 'start', agent: 'helper', model: 'scripted/test' },
-            { type: 'text', agent: 'helper', delta: 'helper answer' },
+            {
+                type: 'start',
+                agent: 'helper',
+                model: 'scripted/test',
+                // T3 thread identity: direct child of the root, so no parentId; the
+                // prompt travels on this frame only.
+                thread: { id: '2', callId: 'call_1', input: 'find it' }
+            },
+            {
+                type: 'text',
+                agent: 'helper',
+                delta: 'helper answer',
+                thread: { id: '2', callId: 'call_1' }
+            },
             // Only the helper's stream reports usage here: the lead's two requests
             // have no `usage` on their `done` frames, so they emit no usage event.
-            { type: 'usage', agent: 'helper', usage: { input: 3, output: 2, total: 5 } },
+            {
+                type: 'usage',
+                agent: 'helper',
+                usage: { input: 3, output: 2, total: 5 },
+                thread: { id: '2', callId: 'call_1' }
+            },
             {
                 type: 'done',
                 agent: 'helper',
+                thread: { id: '2', callId: 'call_1' },
                 message: {
                     role: 'assistant',
                     content: 'helper answer',
@@ -758,6 +776,12 @@ describe('SessionStore turns', () => {
         expect(terminal.session.turns).toHaveLength(1);
         expect(terminal.session.turns[0].status).toBe('done');
         expect(terminal.session.turns[0].events).toEqual(events);
+
+        // Persistence roundtrip (R3): a saved turn is the reconstruction source after
+        // a reload, so the thread identity must survive plain JSON unchanged, and a
+        // legacy (root) frame must still carry NO `thread` key at all.
+        expect(JSON.parse(JSON.stringify(terminal.session.turns[0].events))).toEqual(events);
+        expect(Object.keys(events[0]).sort()).toEqual(['agent', 'model', 'type']);
         // The delegated request's spend belongs to the same turn: only the helper
         // reported usage, so the tally is that one request's figures.
         expect(terminal.session.turns[0].usage).toEqual({ input: 3, output: 2, total: 5 });

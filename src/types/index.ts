@@ -842,14 +842,43 @@ export type WebSearchResult = {
 // Harness (the execution loop)
 // ---------------------------------------------------------------------------
 
+// Identity of ONE non-root invocation (T3 UI threads). A client groups every
+// event of one subagent run into a row by `id`, indents it under `parentId`, and
+// anchors it to the tool call that started it (`callId`).
+//
+// Contract (frozen additive shape):
+//   - emitted for NON-ROOT runs only; a root run is the turn itself and its
+//     events keep their historical shape (no `thread`);
+//   - `id` is stable for the whole invocation and unique within the owning
+//     SessionTurn (the run sequence is monotonic), so two sequential
+//     delegations to the SAME agent get different ids;
+//   - `parentId` is omitted for a direct child of the root and set to the
+//     parent invocation's thread id for anything deeper;
+//   - `callId` is the parent tool call that spawned this run;
+//   - `input` (the child prompt, for a row title/body) appears on the `start`
+//     event only; later events carry the identity fields alone.
+export type HarnessThread = {
+    id: string;
+    parentId?: string;
+    callId?: string;
+    input?: string;
+};
+
+// Every event variant carries the SAME optional field (spelled out per variant so
+// `HarnessEvent` stays a plain discriminated union: `Extract<HarnessEvent, {type:
+// 'x'}>` and `event.type` narrowing keep working for clients). Optional because
+// root events and older recorded turns have none, and a hand-written reporter may
+// omit it.
+//
 // Progress events. Every one names its agent so a multi-agent run stays readable
 // in a single console stream. This is the whole reporting surface: a UI or a
-// `console.log` sees exactly the steps below.
+// `console.log` sees exactly the steps below. `thread` is present only for
+// NON-ROOT runs; see HarnessThread.
 export type HarnessEvent =
-    | { type: 'start'; agent: string; model: string }
-    | { type: 'text'; agent: string; delta: string }
-    | { type: 'reasoning'; agent: string; delta: string }
-    | { type: 'tool_call'; agent: string; call: HarnessToolCall }
+    | { type: 'start'; agent: string; model: string; thread?: HarnessThread }
+    | { type: 'text'; agent: string; delta: string; thread?: HarnessThread }
+    | { type: 'reasoning'; agent: string; delta: string; thread?: HarnessThread }
+    | { type: 'tool_call'; agent: string; call: HarnessToolCall; thread?: HarnessThread }
     // `callId` is the id of the tool_call this result answers. Optional so an
     // older recorded event (or a hand-written progress reporter) stays valid, and
     // so a same-name pairing in a UI can be exact instead of positional.
@@ -877,6 +906,8 @@ export type HarnessEvent =
           // keeps its historical event shape. Elapsed times let a UI show progress
           // without polling.
           pending?: HarnessPendingTool[];
+          // Invocation identity of the (non-root) agent whose call this answers.
+          thread?: HarnessThread;
       }
     // Per-request token accounting, emitted once for EVERY model request a run
     // makes - including the tool rounds, pauses with pending work, and wake-driven
@@ -885,7 +916,7 @@ export type HarnessEvent =
     // the usage events - not `done` - are the complete cost record. Absent entirely
     // when the provider reported no usage for that request (a gateway that sends no
     // `usage` block); a run may therefore report some requests and not others.
-    | { type: 'usage'; agent: string; usage: HarnessUsage }
+    | { type: 'usage'; agent: string; usage: HarnessUsage; thread?: HarnessThread }
     // A model response. `pending` non-empty means the run is NOT terminal: those
     // calls are still running, the harness stays open, and their completions will
     // drive further turns. Absent when the response has no background work left,
@@ -895,7 +926,13 @@ export type HarnessEvent =
     // while its request was in flight emits no `done` at all (it was an
     // intermediate turn, like a tool-call turn), so `done` always describes a
     // response the consumer is meant to see.
-    | { type: 'done'; agent: string; message: HarnessAssistantMessage; pending?: HarnessPendingTool[] }
+    | {
+          type: 'done';
+          agent: string;
+          message: HarnessAssistantMessage;
+          pending?: HarnessPendingTool[];
+          thread?: HarnessThread;
+      }
     // Recurring heartbeat while background calls are pending (R4): the configured
     // wake interval (default 600000 ms = 10 minutes) has elapsed. The run is
     // re-requested with the current pending list, so the model can inspect
@@ -906,8 +943,9 @@ export type HarnessEvent =
           agent: string;
           reason: 'pending-tools';
           pending: HarnessPendingTool[];
+          thread?: HarnessThread;
       }
-    | { type: 'error'; agent: string; error: HarnessErrorInfo };
+    | { type: 'error'; agent: string; error: HarnessErrorInfo; thread?: HarnessThread };
 
 export type HarnessProgress = (event: HarnessEvent) => void | Promise<void>;
 

@@ -1466,6 +1466,219 @@ button {
     gap: 10px;
 }
 
+/* Invocation threads --------------------------------------------------- */
+/* One entry per spawned invocation (ui/turns.ts `ThreadEntry`). Structure:
+     .thread-row          ← data-depth (1 = direct child of the turn root)
+       .thread-tile
+         .thread-select   ← button: name · subagent · status, aria-expanded
+         .thread-body     ← input prompt, agent flow, outcome (hidden collapsed)
+       .thread-children   ← this entry's own descendants, in spawn order
+   The children host is OUTSIDE the body, so collapsing a parent never hides
+   descendants and collapsing the turn tile never hides its child rows. The
+   nesting also gives depth-first sibling layout for free. */
+.thread-children {
+    /* ONE indent step per nesting level: depth 2 is two `.thread-children`
+       containers deep, so arbitrary metadata depth indents correctly without
+       enumerating selectors. */
+    --thread-indent: 18px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding-left: var(--thread-indent);
+    margin-top: 4px;
+}
+
+/* An empty host must not add a gap/padding to a leaf entry. */
+.thread-children:empty {
+    display: none;
+}
+
+.thread-row {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    padding-left: 8px;
+    border-left: 2px solid rgba(251, 191, 36, 0.45);
+}
+
+/* Depth is mirrored on the row for styling/assistive context; the visual
+   indentation is the nesting rule above. Deeper than three keeps the base tone. */
+.thread-row[data-depth='2'] {
+    border-left-color: rgba(251, 191, 36, 0.3);
+}
+
+.thread-row[data-depth='3'] {
+    border-left-color: rgba(251, 191, 36, 0.2);
+}
+
+.thread-tile {
+    min-width: 0;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-input);
+    transition: border-color 120ms ease, background 120ms ease;
+}
+
+.thread-tile:hover {
+    border-color: var(--border-strong);
+}
+
+/* Compact entry: one header line plus a single-line task preview. */
+.thread-select {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    width: 100%;
+    padding: 5px 8px;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+.thread-select:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+
+.thread-top {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+
+.thread-name {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.09em;
+    text-transform: uppercase;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.thread-role {
+    flex: 0 0 auto;
+    padding: 0 5px;
+    border: 1px solid rgba(251, 191, 36, 0.4);
+    border-radius: 999px;
+    color: var(--warn);
+    font-family: var(--mono);
+    font-size: 9px;
+    line-height: 14px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+/* Status is TEXT (never colour-only); colour only reinforces it. */
+.thread-status {
+    flex: 0 0 auto;
+    margin-left: auto;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    white-space: nowrap;
+}
+
+.thread-row[data-state='streaming'] .thread-status {
+    color: var(--ok);
+}
+
+.thread-row[data-state='error'] .thread-status {
+    color: var(--danger);
+}
+
+.thread-row[data-state='error'] .thread-tile {
+    border-color: rgba(248, 113, 113, 0.5);
+}
+
+.thread-preview {
+    display: block;
+    overflow: hidden;
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.4;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+}
+
+/* Expanded: the body renders the task as Markdown, so the header preview would
+   duplicate it. */
+.thread-row.is-expanded .thread-preview {
+    display: none;
+}
+
+.thread-body {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 8px 10px 10px;
+    border-top: 1px solid var(--border);
+}
+
+/* Collapsed entries keep ONLY the header: the body is display:none, exactly like
+   a compact turn tile. Descendants are outside this element, so they stay. */
+.thread-row:not(.is-expanded) .thread-body {
+    display: none;
+}
+
+.thread-prompt {
+    padding: 7px 9px;
+    border-left: 2px solid var(--accent);
+    border-radius: 0 6px 6px 0;
+    background: var(--accent-soft);
+    font-size: 12.5px;
+}
+
+.thread-flow {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.thread-flow > .agent:first-child {
+    padding-top: 0;
+    border-top: 0;
+}
+
+/* The row header already names the agent and states the role, so the nested
+   agent section contributes CONTENT only. */
+.thread-flow .agent-head {
+    display: none;
+}
+
+.thread-outcome {
+    padding: 5px 0 0 8px;
+    border-left: 2px solid var(--border-strong);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+}
+
+.thread-outcome[data-tone='error'] {
+    border-left-color: rgba(248, 113, 113, 0.6);
+    color: var(--danger);
+}
+
+/* Narrow screens: the transcript already loses width at the turn row, so a
+   smaller indent keeps depth 2 readable instead of clamping the content. */
+@media (max-width: 600px) {
+    .thread-children {
+        --thread-indent: 10px;
+    }
+
+    .thread-row {
+        padding-left: 4px;
+    }
+}
+
 /* Agent sections -------------------------------------------------------- */
 
 .agent {

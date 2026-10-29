@@ -121,6 +121,16 @@ src/frontend/
   index.html            the app entry document
 ```
 
+The transcript is one compact row per user turn. A delegated agent adds an ENTRY
+of its own under the invocation that spawned it: a compact thread row at depth 1
+(its own children at depth 2, and so on), placed inside the turn row but outside
+every collapsible body — collapsing a parent tile or a parent entry never hides
+it. Each entry expands independently and owns its input, streamed text, tool
+calls, status and outcome; two calls to the same agent are two entries. A saved
+session that predates the `thread` metadata is replayed from its `agentDelegate`
+calls, and a stream that cannot be attributed keeps the old flat agent section
+instead of inventing ancestry.
+
 Imports resolve by environment as well as by name, so a browser never loads a
 `node:http` graph and a Node host still gets the server API from the root:
 

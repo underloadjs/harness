@@ -166,9 +166,24 @@ src/frontend/
   vite.config.ts        Vite dev/build/preview; /api proxy to the service on :5000
   api.ts                root resolution (query/injected/build/api) + fetch + SSE parser
   contract.ts           wire validation/presentation helpers
-  ui/turns.ts           linear turn timeline: completed grey, active green, queued neutral
+  ui/turns.ts           linear turn timeline: completed grey, active green, queued neutral;
+                        one independently expandable entry per delegated invocation,
+                        nested depth-first outside every collapsible body
   ui/markdown.ts        safe GFM (marked + DOMPurify) + highlight.js fenced code (R5)
 ```
+
+**Transcript threads.** One `.turn-row` per server turn: a `.tile` (compact header,
+collapsible `.tile-body`) plus a `.thread-children` host that sits outside the body.
+Each delegated invocation appends a `.thread-row` there (`data-depth` 1 for a child
+of the turn root, 2 for a grandchild, …), and that row owns its own body and its own
+children host. The nesting rule (`.thread-children { padding-left }`) gives one
+indent step per level and depth-first sibling order; because descendants live
+outside the parent body, neither tile collapse nor entry collapse can hide them.
+Every entry is tracked by invocation id (runtime `thread.id`, or a synthesized
+`call:<callId>` for legacy records), and only the parent's `tool_result` for the
+spawning `callId` — or the root turn's terminal status — closes it for good;
+`done.pending` is a pause, not a finish. The layout is pure DOM/CSS, so the
+`main.ts` stream/snapshot routing needs no per-agent case.
 
 `src/server` and `src/server/cli` import `src/harness.ts` relatively (they are
 inside the package) and re-use the public harness surface. `src/frontend` imports

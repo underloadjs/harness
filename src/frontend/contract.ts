@@ -19,6 +19,7 @@ import type {
     AgentDescriptor,
     HarnessDescriptor,
     HarnessEvent,
+    HarnessThread,
     HarnessUsage,
     SessionSnapshot,
     SessionStreamItem,
@@ -226,6 +227,61 @@ export const frameUsageOf = (item: SessionStreamItem): HarnessUsage | undefined 
 export const callIdOf = (event: HarnessEvent): string | undefined => {
     if (event.type !== 'tool_result') return undefined;
     return typeof event.callId === 'string' && event.callId.length > 0 ? event.callId : undefined;
+};
+
+// --- Invocation threads (frozen runtime contract) ---------------------------
+//
+// Every HarnessEvent may carry an optional `thread`; the runtime emits it for
+// NON-ROOT events only. A child's `start` carries the full record:
+//
+//   { id, parentId?, callId?, input? }
+//
+//   - `id`        the invocation id (stable for the whole invocation);
+//   - `parentId`  the SPAWNING invocation's id. OMITTED when the parent is the
+//                 turn's root invocation (the root has no thread id);
+//   - `callId`    the tool call that spawned it (the parent's agentDelegate call);
+//   - `input`     the child's prompt.
+//
+// Subsequent events of the same invocation may carry only `{ id }`, so every
+// consumer has to remember the earlier full record (see ui/turns.ts `entryFor`).
+// A root invocation emits NO metadata: its shape is exactly the pre-thread one.
+//
+// This accessor is deliberately structural (`unknown` input): the field is
+// additive on the wire, and the browser must keep working against a server that
+// predates it (undefined) as well as one that sends a malformed block. Validation
+// never throws and never invents a field: a missing/blank id means "no metadata",
+// which is what routes the event down the legacy-by-agent path.
+//
+// The shape is the runtime's canonical `HarnessThread` (server/protocol re-exports
+// it) so this module and the wire contract cannot drift; the local alias exists
+// only because the frontend barrel already exports the canonical name from other
+// modules and a duplicate export would be ambiguous.
+export type HarnessThreadInfo = HarnessThread;
+
+export const threadOf = (source: unknown): HarnessThreadInfo | undefined => {
+    if (source === null || typeof source !== 'object') return undefined;
+
+    const raw = (source as { thread?: unknown }).thread;
+    if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) return undefined;
+
+    const candidate = raw as { id?: unknown; parentId?: unknown; callId?: unknown; input?: unknown };
+    if (typeof candidate.id !== 'string' || candidate.id.length === 0) return undefined;
+
+    const result: HarnessThreadInfo = { id: candidate.id };
+
+    // A self-referencing parent is not ancestry; dropping it keeps the UI's
+    // depth walk finite instead of re-parenting a row under itself.
+    if (
+        typeof candidate.parentId === 'string' &&
+        candidate.parentId.length > 0 &&
+        candidate.parentId !== candidate.id
+    ) {
+        result.parentId = candidate.parentId;
+    }
+    if (typeof candidate.callId === 'string' && candidate.callId.length > 0) result.callId = candidate.callId;
+    if (typeof candidate.input === 'string') result.input = candidate.input;
+
+    return result;
 };
 
 export const finiteOf = (value: unknown): number | undefined =>

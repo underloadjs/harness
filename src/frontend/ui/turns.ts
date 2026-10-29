@@ -32,6 +32,26 @@
 // Delegation — one agent calling another — shows up as extra agents inside the
 // same turn (each event names its agent) and is labelled as a subagent.
 //
+// Invocation threads (R1/R2/R3). A delegated agent is its own ENTRY, not just an
+// extra flat agent section: the spawned invocation gets a `.thread-row` appended
+// to the spawning invocation's children host, which sits INSIDE the parent
+// `.turn-row` but OUTSIDE both the parent tile body and the parent's own thread
+// body. Consequences that the layout depends on:
+//
+//   - collapsing the parent tile hides only `.tile-body`, so the child entry is
+//     still visible, and equally collapsing a child hides only that child's body;
+//   - children are appended to their parent's host in spawn order, and a
+//     grandchild's host lives inside its parent's row, so DOM order is exactly
+//     depth-first sibling order (C1, C1's children, C2, …);
+//   - nesting, not a flat list, means an arbitrary depth works without the UI
+//     enumerating levels (styles.css indents one step per `.thread-children`).
+//
+// Identity is per INVOCATION, never per agent name: two `agentDelegate` calls to
+// the same agent are two entries, each with its own content, tools, status and
+// outcome. `thread` metadata (src/frontend/contract.ts `threadOf`, frozen
+// contract) is authoritative. A saved session that predates it is replayed with
+// the legacy inference below instead of being left as invisible rows.
+//
 // Concurrency (R6): tools are scheduled concurrently and the agent's response can
 // finish while its own calls are still running. Three additive frames drive this
 // view, none of them a new tile state:
@@ -66,11 +86,12 @@ import {
     eventTimesOf,
     finiteOf,
     pendingOf,
+    threadOf,
     toolDurationOf,
     usageOf,
     wakeupOf
 } from '../contract';
-import type { HarnessPendingTool } from '../contract';
+import type { HarnessPendingTool, HarnessThreadInfo } from '../contract';
 import { markdownFragment, plainPreview } from './markdown';
 import { elapsedBetween, formatDuration } from './time';
 import { formatTokens } from './tokens';
@@ -302,6 +323,62 @@ type AgentSection = {
     pendingCalls: Map<string, HarnessPendingTool>;
 };
 
+// Lifecycle of one INVOCATION (a thread entry). It is deliberately smaller than
+// `TurnState`: only a top-level turn can be `waiting` for the server. A child is
+// `queued` from the moment its spawning tool call is seen (placeholder until its
+// `start`), then `streaming`; `done`/`error`/`cancelled` are terminal.
+//
+// `done.pending` non-empty is NOT terminal (R6): the runtime omits `done` for an
+// immediately-superseded response, and a paused response can still be woken, so
+// the entry stays `streaming` until a `done` with no pending work or until the
+// parent's tool_result names its spawning `callId` (the authoritative outcome).
+type ThreadState = 'queued' | 'streaming' | 'done' | 'error' | 'cancelled';
+
+// One invocation rendered as a thread entry. The ROOT invocation has a section
+// but no row: its content is the tile body itself (depth 0). Every non-root
+// invocation gets `.thread-row` → `.thread-tile` (header + collapsible body) and
+// a `.thread-children` host for its own descendants.
+//
+// `key` is the canonical identity inside this turn: the runtime's explicit
+// `thread.id` once known, otherwise a synthesized placeholder key
+// (`call:<callId>`, or `inline:<agent>` for unknown legacy streams). Placeholders
+// are REKEYED on adoption so one invocation never gets two entries.
+type ThreadEntry = {
+    key: string;
+    agent: string;
+    input: string | undefined;
+    callId: string | undefined;
+    // Parent invocation key. Undefined means "child of the turn root" — the
+    // frozen contract omits `parentId` for a root-parented child.
+    parentKey: string | undefined;
+    depth: number;
+    // Runtime-provided id once a `thread` record named this invocation. Used to
+    // distinguish a synthesized placeholder from an explicitly identified entry.
+    explicitId: string | undefined;
+    started: boolean;
+    state: ThreadState;
+    section: AgentSection;
+    // DOM (undefined for the root/inline sections, which live in the tile flow).
+    row: HTMLElement | undefined;
+    body: HTMLElement | undefined;
+    select: HTMLButtonElement | undefined;
+    status: HTMLElement | undefined;
+    preview: HTMLElement | undefined;
+    prompt: HTMLElement | undefined;
+    outcome: HTMLElement | undefined;
+    childrenHost: HTMLElement | undefined;
+    expanded: boolean;
+};
+
+// Root invocation key. It never collides with a runtime id because it is not a
+// wire value; the map keys are otherwise the runtime ids or synthesized keys.
+const ROOT_KEY = 'root';
+
+// Terminal test for an invocation. A queued placeholder is not terminal: its
+// child has not answered yet.
+const isTerminalThread = (state: ThreadState): boolean =>
+    state === 'done' || state === 'error' || state === 'cancelled';
+
 // One unresolved tool call. `callId` is the authoritative match. A server that
 // sends `tool_result` without a call id (legacy) is matched by name, oldest first;
 // with concurrent calls that fallback is only used when no id is present, because
@@ -368,9 +445,14 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         // decoration. It stays a wrapper (rather than appending the card directly)
         // so `clear()`/`reconcile()` can remove a row without ever touching
         // `.turns` itself, and it mirrors the tile state for CSS (styles.css).
+        //
+        // `threadHost` is appended AFTER the tile and is intentionally OUTSIDE
+        // `.tile-body`: a collapsed parent (`display:none` on its body) must not
+        // hide the invocation entries that live here (R1).
         const row = el('div', 'turn-row');
         row.dataset.state = 'queued';
-        row.append(card);
+        const threadHost = el('div', 'thread-children');
+        row.append(card, threadHost);
 
         const select = el('button', 'tile-select');
         select.type = 'button';
@@ -552,7 +634,12 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             paintTokens();
         };
 
-        const sections = new Map<string, AgentSection>();
+        // One entry per INVOCATION in this turn. The map is keyed by the canonical
+        // invocation key (runtime `thread.id`, synthesized placeholder key, or
+        // `inline:<agent>` for a legacy stream the UI cannot attribute). Keys never
+        // merge two known invocations: adoption REKEYS a placeholder, it does not
+        // append a duplicate.
+        const threads = new Map<string, ThreadEntry>();
         // Calls whose result has not arrived yet.
         const pendingTools: PendingTool[] = [];
         // Call ids already settled on this tile — a result applied, or a card
@@ -566,15 +653,17 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             const live = isLive(state);
             const parts: string[] = [];
 
-            if (sections.size > 0) parts.push(`${sections.size} agent${sections.size === 1 ? '' : 's'}`);
+            // One count per invocation (R3): repeated same-agent delegations are
+            // separate entries, so the count answers "how many agents ran?" truthfully.
+            if (threads.size > 0) parts.push(`${threads.size} agent${threads.size === 1 ? '' : 's'}`);
             if (toolCount > 0) parts.push(`${toolCount} tool call${toolCount === 1 ? '' : 's'}`);
             // A completed response may still wait on background calls. The count is
-            // summed across sections because a delegated child can be pending on its
+            // summed across entries because a delegated child can be pending on its
             // own. NOTE: on a compact row the meta line is visually clipped (sr-only,
             // styles.css `.tile:not(.is-expanded) .tile-meta`); it is read out and
             // shown in full only when the tile is expanded.
-            const pendingTotal = [...sections.values()].reduce(
-                (total, section) => total + section.pendingCalls.size,
+            const pendingTotal = [...threads.values()].reduce(
+                (total, entry) => total + entry.section.pendingCalls.size,
                 0
             );
             if (pendingTotal > 0) {
@@ -602,9 +691,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 // waiting line first (R6). A call left unsettled is INTERRUPTED —
                 // cancel/restart never resumes it — so it is abandoned with a reason
                 // instead of being frozen as a live-looking `running` card.
-                for (const section of sections.values()) {
-                    paintPending(section, []);
-                    for (const tool of section.tools) {
+                for (const entry of threads.values()) {
+                    paintPending(entry.section, []);
+                    for (const tool of entry.section.tools) {
                         if (tool.state() !== 'running') continue;
 
                         tool.abandon(
@@ -619,6 +708,22 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                         // instead of producing a second, resolved card.
                         if (tool.callId !== undefined) settledCalls.add(tool.callId);
                     }
+                }
+
+                // A root terminal status also closes every unfinished DESCENDANT
+                // (R3/R4 cleanup): the server will not send another event for them,
+                // and a child left `streaming` would claim work is still running.
+                // The reason mirrors the card-abandon wording so the row's outcome
+                // and its tools tell the same story.
+                const reason =
+                    next === 'cancelled'
+                        ? 'outcome · cancelled before the child returned.'
+                        : next === 'error'
+                          ? 'outcome · interrupted when the turn failed.'
+                          : 'outcome · interrupted when the turn ended without a result.';
+                for (const entry of threads.values()) {
+                    if (entry.row === undefined || isTerminalThread(entry.state)) continue;
+                    completeThread(entry, next, reason);
                 }
             } else if (!recordedTiming) {
                 endedAt = undefined;
@@ -641,40 +746,45 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             updateMeta();
         };
 
-        const ensureSection = (agentName: string): AgentSection => {
-            const existing = sections.get(agentName);
-            if (existing !== undefined) return existing;
+        // --- invocation entries -------------------------------------------
+        //
+        // The flat per-agent section from earlier revisions is now per INVOCATION:
+        // the root invocation's section lives in `.tile-flow`; every delegated
+        // invocation gets its own `.thread-row` entry. Legacy events with no
+        // metadata (and no inferable delegate call) keep the old flat section so a
+        // saved transcript stays readable instead of inventing ancestry.
 
-            // The first agent to emit anything in this turn is the primary one;
-            // every other agent is a delegated subagent. This is inferred from
-            // the event stream (the descriptor's agent order need not match the
-            // configured primary), and only when the data actually says so.
-            if (primaryAgent === undefined) primaryAgent = agentName;
-
+        // Build one agent content section inside `container`. The role is decided by
+        // the caller: the root invocation is `primary`, every delegated entry is
+        // `subagent` (the row header is what spells out the invocation).
+        const createSection = (
+            container: HTMLElement,
+            agentName: string,
+            role: 'primary' | 'subagent'
+        ): AgentSection => {
             const root = el('section', 'agent');
             root.dataset.agent = agentName;
-            const isPrimary = agentName === primaryAgent;
-            root.dataset.role = isPrimary ? 'primary' : 'subagent';
+            root.dataset.role = role;
 
             const head = el('header', 'agent-head');
             head.append(el('span', 'agent-name', agentName));
-            const role = el('span', 'agent-role', isPrimary ? 'primary' : 'subagent');
+            const roleLabel = el('span', 'agent-role', role);
             // A single-agent turn needs no role badge; it is added to the DOM
             // anyway so a later delegation can label an existing section without
             // rebuilding it.
-            head.append(role);
+            head.append(roleLabel);
 
             const sectionFlow = el('div', 'agent-flow');
             const agentMeta = el('div', 'agent-meta');
 
             root.append(head, sectionFlow, agentMeta);
-            flow.append(root);
+            container.append(root);
 
-            const section: AgentSection = {
+            return {
                 root,
                 flow: sectionFlow,
                 meta: agentMeta,
-                role,
+                role: roleLabel,
                 text: undefined,
                 reasoning: undefined,
                 tools: [],
@@ -682,11 +792,454 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 pending: undefined,
                 pendingCalls: new Map()
             };
+        };
 
-            sections.set(agentName, section);
+        // Collapse/expand one entry. Independent of the board's single expanded
+        // TURN: a reader can open a child while the parent tile is collapsed, and
+        // opening one child never closes another.
+        const setThreadExpanded = (entry: ThreadEntry, expanded: boolean): void => {
+            if (entry.row === undefined) return;
+
+            entry.expanded = expanded;
+            entry.row.classList.toggle('is-expanded', expanded);
+            entry.select?.setAttribute('aria-expanded', String(expanded));
+        };
+
+        // Where a child row belongs. A parent with a row has a children host AFTER
+        // its body, so grandchildren are visible even when the parent entry is
+        // collapsed. The turn root (and an inline legacy section) has no row: its
+        // children attach to the turn-level host at depth 1.
+        const threadRowOf = (parentKey: string | undefined): { host: HTMLElement; depth: number } => {
+            const parent = parentKey === undefined ? undefined : threads.get(parentKey);
+            if (parent?.childrenHost !== undefined) {
+                return { host: parent.childrenHost, depth: parent.depth + 1 };
+            }
+
+            return { host: threadHost, depth: 1 };
+        };
+
+        // Recompute depth for an entry and its descendants. Needed when explicit
+        // metadata re-parents an adopted placeholder; DOM nesting does the visual
+        // indentation, `data-depth` keeps the accessible/test-visible level true.
+        // `seen` makes a corrupt/cyclic parent chain terminate instead of recursing.
+        const setThreadDepth = (entry: ThreadEntry, depth: number, seen = new Set<string>()): void => {
+            if (seen.has(entry.key)) return;
+            seen.add(entry.key);
+
+            entry.depth = depth;
+            entry.row?.setAttribute('data-depth', String(depth));
+
+            for (const child of threads.values()) {
+                if (child.parentKey !== entry.key) continue;
+                setThreadDepth(child, depth + 1, seen);
+            }
+        };
+
+        // Would making `parentKey` this entry's parent create a cycle? A recorded
+        // payload is untrusted enough that a self/descendant parent must not throw
+        // a DOM `HierarchyRequestError` by appending a row inside itself.
+        const canReparent = (entry: ThreadEntry, parentKey: string | undefined): boolean => {
+            let cursor = parentKey;
+            const seen = new Set<string>();
+
+            while (cursor !== undefined) {
+                if (cursor === entry.key || seen.has(cursor)) return false;
+                seen.add(cursor);
+                cursor = threads.get(cursor)?.parentKey;
+            }
+
+            return true;
+        };
+
+        // A thread row's prompt is the child's own task. Re-rendered as Markdown
+        // (same sanitizer as the turn prompt) so pasted code fences survive.
+        const renderThreadPrompt = (entry: ThreadEntry, input: string): void => {
+            if (entry.body === undefined) return;
+
+            if (entry.prompt === undefined) {
+                const block = el('div', 'thread-prompt markdown');
+                entry.body.prepend(block);
+                entry.prompt = block;
+            }
+
+            entry.prompt.replaceChildren(markdownFragment(input));
+        };
+
+        const setThreadInput = (entry: ThreadEntry, input: string | undefined): void => {
+            if (input === undefined) return;
+
+            entry.input = input;
+            if (entry.preview !== undefined) entry.preview.textContent = plainPreview(input, 160);
+            renderThreadPrompt(entry, input);
+        };
+
+        const setThreadState = (entry: ThreadEntry, state: ThreadState): void => {
+            entry.state = state;
+
+            if (entry.row === undefined) return;
+
+            entry.row.dataset.state = state;
+            if (entry.status !== undefined) entry.status.textContent = STATE_TEXT[state];
+        };
+
+        // Outcome line for one invocation. FIRST outcome wins: a replay can deliver
+        // the same parent result twice, and a root-terminal interruption already
+        // told the reader why the child stopped. Text only — the result is
+        // model-written, so it is previewed as plain text (never HTML).
+        const paintThreadOutcome = (entry: ThreadEntry, text: string, tone: 'info' | 'error'): void => {
+            if (entry.outcome === undefined) return;
+            if (!entry.outcome.hidden) return;
+
+            entry.outcome.hidden = false;
+            entry.outcome.dataset.tone = tone;
+            entry.outcome.textContent = text;
+        };
+
+        // Terminal transition for an invocation. Idempotent: an already-terminal
+        // entry still accepts an outcome (the parent's tool_result arrives AFTER the
+        // child's final `done` on the wire), but its state is never reopened.
+        const completeThread = (entry: ThreadEntry, state: ThreadState, outcome?: string): void => {
+            if (outcome !== undefined) paintThreadOutcome(entry, outcome, state === 'error' ? 'error' : 'info');
+            if (isTerminalThread(entry.state)) return;
+
+            setThreadState(entry, state);
+        };
+
+        // The placeholder created when an `agentDelegate` tool call was observed,
+        // matched by its spawning call id. Explicit metadata uses it to adopt (never
+        // duplicate) the entry the user is already looking at.
+        const findThreadByCallId = (callId: string): ThreadEntry | undefined => {
+            for (const entry of threads.values()) {
+                if (entry.row !== undefined && entry.callId === callId) return entry;
+            }
+
+            return undefined;
+        };
+
+        // Oldest not-yet-started placeholder for an agent. Legacy child `start`
+        // events carry no metadata, so FIFO adoption is the truthful association
+        // under the runtime's serialized-per-agent invariant; two queued delegates
+        // to the SAME agent therefore become two separate entries in call order.
+        const findQueuedPlaceholder = (agentName: string): ThreadEntry | undefined => {
+            for (const entry of threads.values()) {
+                if (entry.row === undefined) continue;
+                if (entry.agent !== agentName || entry.started) continue;
+                return entry;
+            }
+
+            return undefined;
+        };
+
+        // Build a thread entry (row + body + its own children host). The row is
+        // appended to the parent's children host; `.turn-row` is never touched, so a
+        // turn reorder/remove moves the whole invocation subtree atomically.
+        const createThread = (options: {
+            key: string;
+            agent: string;
+            input: string | undefined;
+            callId: string | undefined;
+            parentKey: string | undefined;
+            explicitId: string | undefined;
+            started: boolean;
+            state: ThreadState;
+        }): ThreadEntry => {
+            const existing = threads.get(options.key);
+            if (existing !== undefined) return existing;
+
+            const place = threadRowOf(options.parentKey);
+            const bodyId = `thread-${++nextId}-body`;
+
+            const threadRow = el('div', 'thread-row');
+            threadRow.dataset.depth = String(place.depth);
+            threadRow.dataset.threadId = options.key;
+            threadRow.dataset.agent = options.agent;
+            threadRow.dataset.state = options.state;
+
+            const tile = el('article', 'thread-tile');
+
+            // A real <button> owns collapse/expand: Enter/Space work natively and
+            // `aria-expanded`/`aria-controls` describe the controlled body.
+            const select = el('button', 'thread-select');
+            select.type = 'button';
+            select.setAttribute('aria-expanded', 'false');
+            select.setAttribute('aria-controls', bodyId);
+
+            const top = el('span', 'thread-top');
+            const name = el('span', 'thread-name', options.agent);
+            const roleLabel = el('span', 'thread-role', 'subagent');
+            const status = el('span', 'thread-status', STATE_TEXT[options.state]);
+            top.append(name, roleLabel, status);
+
+            const preview = el(
+                'span',
+                'thread-preview',
+                options.input === undefined || options.input.length === 0
+                    ? 'delegated task'
+                    : plainPreview(options.input, 160)
+            );
+            select.append(top, preview);
+
+            const body = el('div', 'thread-body');
+            body.id = bodyId;
+
+            const threadFlow = el('div', 'thread-flow');
+            body.append(threadFlow);
+
+            const outcome = el('div', 'thread-outcome');
+            outcome.hidden = true;
+            body.append(outcome);
+
+            tile.append(select, body);
+
+            // Children live outside the body so collapsing THIS entry never hides
+            // its descendants (R2).
+            const childrenHost = el('div', 'thread-children');
+            threadRow.append(tile, childrenHost);
+            place.host.append(threadRow);
+
+            const entry: ThreadEntry = {
+                key: options.key,
+                agent: options.agent,
+                input: options.input,
+                callId: options.callId,
+                parentKey: options.parentKey,
+                depth: place.depth,
+                explicitId: options.explicitId,
+                started: options.started,
+                state: options.state,
+                section: createSection(threadFlow, options.agent, 'subagent'),
+                row: threadRow,
+                body,
+                select,
+                status,
+                preview,
+                prompt: undefined,
+                outcome,
+                childrenHost,
+                expanded: false
+            };
+
+            select.addEventListener('click', () => setThreadExpanded(entry, !entry.expanded));
+
+            if (options.input !== undefined) renderThreadPrompt(entry, options.input);
+
+            threads.set(options.key, entry);
+            updateMeta();
+            return entry;
+        };
+
+        // The root invocation's section (depth 0). It has no row: the tile body IS
+        // its content surface, which keeps the one authoritative TurnHandle.
+        const rootSection = (agentName: string): AgentSection => {
+            const existing = threads.get(ROOT_KEY);
+            if (existing !== undefined) return existing.section;
+
+            // The first agent to emit anything in the turn is the primary one;
+            // every other agent is a delegated subagent. Inferred from the event
+            // stream (the descriptor's agent order need not match the configured
+            // primary), and only when the data actually says so.
+            if (primaryAgent === undefined) primaryAgent = agentName;
+
+            const section = createSection(flow, agentName, 'primary');
+            threads.set(ROOT_KEY, {
+                key: ROOT_KEY,
+                agent: agentName,
+                input: undefined,
+                callId: undefined,
+                parentKey: undefined,
+                depth: 0,
+                explicitId: undefined,
+                started: true,
+                state: 'streaming',
+                section,
+                row: undefined,
+                body: undefined,
+                select: undefined,
+                status: undefined,
+                preview: undefined,
+                prompt: undefined,
+                outcome: undefined,
+                childrenHost: undefined,
+                expanded: false
+            });
+
             updateMeta();
             return section;
         };
+
+        // The pre-thread rendering, kept for legacy data the UI cannot attribute to
+        // a known invocation (an old ctx.run child, or an ambiguous agent stream).
+        // It is flat and keyed by agent, exactly like the old board: truthful about
+        // what the record says instead of guessing ancestry.
+        const inlineSection = (agentName: string): AgentSection => {
+            const key = `inline:${agentName}`;
+            const existing = threads.get(key);
+            if (existing !== undefined) return existing.section;
+
+            // The first flat agent of an unknown stream with no root yet is the
+            // entry agent (the pre-thread behaviour).
+            if (threads.get(ROOT_KEY) === undefined && primaryAgent === undefined) {
+                return rootSection(agentName);
+            }
+
+            const section = createSection(flow, agentName, 'subagent');
+            threads.set(key, {
+                key,
+                agent: agentName,
+                input: undefined,
+                callId: undefined,
+                parentKey: undefined,
+                depth: 0,
+                explicitId: undefined,
+                started: true,
+                state: 'streaming',
+                section,
+                row: undefined,
+                body: undefined,
+                select: undefined,
+                status: undefined,
+                preview: undefined,
+                prompt: undefined,
+                outcome: undefined,
+                childrenHost: undefined,
+                expanded: false
+            });
+
+            updateMeta();
+            return section;
+        };
+
+        // Move one entry (and its subtree) under a new parent host. A parent that is
+        // this entry or one of its descendants is rejected: the metadata would be
+        // corrupt, and the DOM cannot nest a node inside itself.
+        const reparentThread = (entry: ThreadEntry, parentKey: string | undefined): void => {
+            if (entry.row === undefined) return;
+            if (!canReparent(entry, parentKey)) return;
+
+            const place = threadRowOf(parentKey);
+            entry.parentKey = parentKey;
+            place.host.append(entry.row);
+            setThreadDepth(entry, place.depth);
+        };
+
+        // Adopt a placeholder when the runtime's explicit identity for the SAME
+        // spawning call arrives. The synthesized key is replaced by the canonical
+        // id, so no duplicate entry survives; the placeholder's position in the
+        // list is kept (no reorder) unless the explicit metadata names a different
+        // parent (explicit metadata wins).
+        const adoptPlaceholder = (entry: ThreadEntry, meta: HarnessThreadInfo): void => {
+            const previousKey = entry.key;
+            threads.delete(previousKey);
+            entry.key = meta.id;
+            entry.explicitId = meta.id;
+            entry.row?.setAttribute('data-thread-id', meta.id);
+            threads.set(meta.id, entry);
+
+            // Descendants (synthetic nested metadata, or a grandchild that started
+            // before the parent's explicit record) follow the rekey so depth
+            // recomputation and future nesting keep pointing at this entry.
+            for (const child of threads.values()) {
+                if (child.parentKey === previousKey) child.parentKey = meta.id;
+            }
+
+            if (meta.callId !== undefined) entry.callId = meta.callId;
+            setThreadInput(entry, meta.input);
+            if (meta.parentId !== entry.parentKey) reparentThread(entry, meta.parentId);
+
+            entry.started = true;
+            setThreadState(entry, 'streaming');
+        };
+
+        // Resolve an explicit `thread` record to its entry. The first record for an
+        // id is the child `start` (full record); later events may carry only `id`,
+        // so an unknown id is created defensively instead of dropping content.
+        const entryForMeta = (meta: HarnessThreadInfo, event: HarnessEvent): ThreadEntry => {
+            const existing = threads.get(meta.id);
+            if (existing !== undefined) return existing;
+
+            // A placeholder for this spawning call is the entry the user already
+            // sees: adopt it rather than adding a second row (R3, no duplicates).
+            if (meta.callId !== undefined) {
+                const placeholder = findThreadByCallId(meta.callId);
+                if (placeholder !== undefined && placeholder.explicitId === undefined) {
+                    adoptPlaceholder(placeholder, meta);
+                    return placeholder;
+                }
+            }
+
+            return createThread({
+                key: meta.id,
+                agent: event.agent,
+                input: meta.input,
+                callId: meta.callId,
+                parentKey: meta.parentId,
+                explicitId: meta.id,
+                started: true,
+                state: 'streaming'
+            });
+        };
+
+        // Legacy (no metadata) routing. In order:
+        //   1. the root invocation owns every event from the entry agent;
+        //   2. a child `start` adopts the oldest queued delegate placeholder;
+        //   3. any other event routes to the single STARTED, non-terminal entry for
+        //      that agent (the runtime serializes one invocation per agent);
+        //   4. everything else — no candidate, or MORE THAN ONE (ambiguous) — keeps
+        //      the flat inline section. Distinct known invocations are never merged.
+        const entryForLegacy = (event: HarnessEvent): ThreadEntry => {
+            const root = threads.get(ROOT_KEY);
+            if (root !== undefined && event.agent === root.agent) return root;
+
+            if (event.type === 'start') {
+                const queued = findQueuedPlaceholder(event.agent);
+                if (queued !== undefined) {
+                    queued.started = true;
+                    setThreadState(queued, 'streaming');
+                    return queued;
+                }
+
+                return threads.get(`inline:${event.agent}`) ?? inlineEntry(event.agent);
+            }
+
+            let active: ThreadEntry | undefined;
+            let activeCount = 0;
+            for (const entry of threads.values()) {
+                if (entry.row === undefined) continue;
+                if (entry.agent !== event.agent || !entry.started) continue;
+                if (isTerminalThread(entry.state)) continue;
+                active = entry;
+                activeCount += 1;
+            }
+
+            if (activeCount === 1 && active !== undefined) return active;
+
+            const inline = threads.get(`inline:${event.agent}`);
+            return inline ?? inlineEntry(event.agent);
+        };
+
+        // `inlineSection` returns the section; routing also needs the entry (to own
+        // tool calls and pending state). This resolves the entry for the same key.
+        const inlineEntry = (agentName: string): ThreadEntry => {
+            inlineSection(agentName);
+
+            const entry = threads.get(`inline:${agentName}`) ?? threads.get(ROOT_KEY);
+            if (entry !== undefined) return entry;
+
+            // Unreachable: `inlineSection` always seeds one of the two keys. The
+            // fallback keeps the return type total rather than throwing mid-stream.
+            rootSection(agentName);
+            return threads.get(ROOT_KEY) as ThreadEntry;
+        };
+
+        const entryFor = (event: HarnessEvent): ThreadEntry => {
+            // Explicit metadata is authoritative (frozen runtime contract).
+            const meta = threadOf(event);
+            if (meta !== undefined) return entryForMeta(meta, event);
+
+            return entryForLegacy(event);
+        };
+
+        const sectionFor = (event: HarnessEvent): AgentSection => entryFor(event).section;
 
         const renderText = (block: TextBlock): void => {
             block.node.replaceChildren(markdownFragment(block.buffer));
@@ -837,14 +1390,41 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             block.summary.textContent = `reasoning · ${block.buffer.length.toLocaleString()} chars`;
         };
 
+        // Parse an `agentDelegate` call's arguments for the legacy fallback: without
+        // the frozen `thread` metadata, the spawning call is the ONLY evidence that
+        // an invocation exists and what its prompt was. Only a complete {agent,
+        // input} pair is usable; anything else leaves the old flat rendering.
+        const delegateOf = (
+            rawArguments: string,
+            callId: string | undefined
+        ): { agent: string; input: string } | undefined => {
+            if (callId === undefined) return undefined;
+
+            try {
+                const parsed = JSON.parse(rawArguments) as unknown;
+                if (parsed === null || typeof parsed !== 'object') return undefined;
+
+                const agent = (parsed as { agent?: unknown }).agent;
+                const input = (parsed as { input?: unknown }).input;
+                if (typeof agent !== 'string' || agent.length === 0) return undefined;
+                if (typeof input !== 'string') return undefined;
+
+                return { agent, input };
+            } catch {
+                return undefined;
+            }
+        };
+
         const appendTool = (
-            section: AgentSection,
+            entry: ThreadEntry,
             name: string,
             rawArguments: string,
             callId: string | undefined,
             at: number | undefined,
             origin: ApplyOrigin
         ): void => {
+            const section = entry.section;
+
             // Text written before a tool call is finished text: close it so the
             // card lands *after* it, and so post-tool prose starts a new block.
             closeText(section);
@@ -863,6 +1443,32 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             if (section.pending !== undefined) section.flow.append(section.pending);
             pendingTools.push({ card, section, name, callId, startedAt });
             toolCount += 1;
+
+            // Queued delegation placeholder (legacy fallback, R3): the entry appears
+            // WHEN the call is made, under the invocation that made it, and is
+            // adopted by its child `start` (or resolved by the parent's result when
+            // the delegation is cancelled before the child starts). The key is the
+            // spawning call id, which is stable for the whole turn, so a repeated
+            // same-agent delegate still yields two distinct entries.
+            if (name === 'agentDelegate') {
+                const delegate = delegateOf(rawArguments, callId);
+                if (delegate !== undefined && callId !== undefined) {
+                    const key = `call:${callId}`;
+                    if (!threads.has(key)) {
+                        createThread({
+                            key,
+                            agent: delegate.agent,
+                            input: delegate.input,
+                            callId,
+                            parentKey: entry.key,
+                            explicitId: undefined,
+                            started: false,
+                            state: 'queued'
+                        });
+                    }
+                }
+            }
+
             updateMeta();
         };
 
@@ -926,8 +1532,9 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
 
             // Genuine legacy result-only frame during a live turn (a protocol that
             // reports results without calls, or a missed tool_call): show it rather
-            // than dropping information.
-            const section = sections.get(primaryAgent ?? 'unknown') ?? ensureSection('unknown');
+            // than dropping information. It belongs to the root invocation when one
+            // emitted, otherwise to a truthful flat section for that agent name.
+            const section = threads.get(ROOT_KEY)?.section ?? inlineSection(primaryAgent ?? 'unknown');
             const card = createToolCallCard(name, '');
             card.resolve(content, isError);
             toolGroupOf(section).append(card.element);
@@ -937,25 +1544,23 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             return { section, callId: undefined };
         };
 
-        const appendAgentMeta = (agentName: string, text: string): void => {
-            const section = ensureSection(agentName);
-            section.meta.textContent = text;
-        };
-
         // Discard everything the browser rendered from a now-superseded event
         // stream. Used only when a server record's event prefix DISAGREES with what
         // the tile applied (the record wins), never on a normal reconnect where the
         // prefix matches and only the remainder is appended.
         const resetProjection = (): void => {
-            for (const section of sections.values()) {
-                if (section.text !== undefined) cancel(section.text);
-                for (const tool of section.tools) tool.destroy();
+            for (const entry of threads.values()) {
+                if (entry.section.text !== undefined) cancel(entry.section.text);
+                for (const tool of entry.section.tools) tool.destroy();
             }
 
-            sections.clear();
+            threads.clear();
             pendingTools.length = 0;
             settledCalls.clear();
             flow.replaceChildren();
+            // Invocation rows live OUTSIDE the tile flow, so clearing the flow alone
+            // would leave orphan entries after a superseding record arrives.
+            threadHost.replaceChildren();
             primaryAgent = undefined;
             toolCount = 0;
             appliedCount = 0;
@@ -988,35 +1593,46 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             // (absence must not claim "everything settled").
             const wakeup = wakeupOf(event);
             if (wakeup !== undefined) {
-                const section = ensureSection(wakeup.agent);
-                appendWakeup(section, wakeup.pending);
-                paintPending(section, wakeup.pending);
+                const entry = entryFor(event);
+                appendWakeup(entry.section, wakeup.pending);
+                paintPending(entry.section, wakeup.pending);
                 updateMeta();
                 return;
             }
 
             switch (event.type) {
                 case 'start': {
-                    const section = ensureSection(event.agent);
+                    const entry = entryFor(event);
+                    const section = entry.section;
+                    section.root.dataset.model = event.model;
+
+                    if (entry.row !== undefined) {
+                        // A child's first event is its own `start`; the placeholder
+                        // (or explicit entry) is now visibly running. A repeated
+                        // start frame never reopens a settled invocation.
+                        entry.started = true;
+                        if (!isTerminalThread(entry.state)) setThreadState(entry, 'streaming');
+                        break;
+                    }
+
                     // A second agent in the same turn is a delegation; relabel
                     // rather than guess up front.
                     section.root.dataset.role = event.agent === primaryAgent ? 'primary' : 'subagent';
                     section.role.textContent = event.agent === primaryAgent ? 'primary' : 'subagent';
-                    section.root.dataset.model = event.model;
                     break;
                 }
 
                 case 'reasoning':
-                    appendReasoning(ensureSection(event.agent), event.delta);
+                    appendReasoning(sectionFor(event), event.delta);
                     break;
 
                 case 'text':
-                    appendText(ensureSection(event.agent), event.delta);
+                    appendText(sectionFor(event), event.delta);
                     break;
 
                 case 'tool_call':
                     appendTool(
-                        ensureSection(event.agent),
+                        entryFor(event),
                         event.call.name,
                         event.call.arguments,
                         event.call.id,
@@ -1026,11 +1642,12 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     break;
 
                 case 'tool_result': {
+                    const callId = callIdOf(event);
                     const outcome = resolveTool(
                         event.name,
                         event.content,
                         event.isError,
-                        callIdOf(event),
+                        callId,
                         at,
                         origin,
                         toolDurationOf(event)
@@ -1046,6 +1663,24 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                         if (pending !== undefined) paintPending(outcome.section, pending);
                         else if (outcome.callId !== undefined) {
                             noteSettled(outcome.section, outcome.callId);
+                        }
+                    }
+
+                    // The parent's result for the spawning call is the AUTHORITATIVE
+                    // completion of that invocation (R3): an interim child `done`
+                    // with pending work is not terminal, and a delegation cancelled
+                    // before the child ever started still resolves its placeholder
+                    // here. Matching is by callId, so same-agent siblings settle the
+                    // right entry.
+                    if (callId !== undefined) {
+                        const child = findThreadByCallId(callId);
+                        if (child !== undefined) {
+                            const preview = plainPreview(event.content, 200);
+                            completeThread(
+                                child,
+                                event.isError ? 'error' : 'done',
+                                `${event.isError ? 'error' : 'outcome'} · ${preview.length === 0 ? 'no output' : preview}`
+                            );
                         }
                     }
                     break;
@@ -1074,7 +1709,8 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                 }
 
                 case 'done': {
-                    const section = ensureSection(event.agent);
+                    const entry = entryFor(event);
+                    const section = entry.section;
                     closeText(section);
                     // The agent turn is over: a later call in a new turn gets its
                     // own row rather than joining calls from the finished turn.
@@ -1108,11 +1744,21 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     }
 
                     section.meta.textContent = parts.join(' · ');
+
+                    // Invocation status (R3). An interim response (pending work
+                    // still running) stays `streaming`; a final one settles this
+                    // entry only — the parent tile and every other invocation keep
+                    // their own state. A parent tool_result that arrives later may
+                    // still attach its outcome (see `completeThread`).
+                    if (entry.row !== undefined && (pending === undefined || pending.length === 0)) {
+                        completeThread(entry, 'done');
+                    }
                     break;
                 }
 
                 case 'error': {
-                    const section = ensureSection(event.agent);
+                    const entry = entryFor(event);
+                    const section = entry.section;
                     closeText(section);
                     // The error notice is not a chip, so the next call starts a
                     // fresh row below it.
@@ -1120,6 +1766,12 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
                     const error = el('div', 'agent-error');
                     error.append(el('span', 'agent-error-label', 'error'), el('span', 'agent-error-text', event.error.message));
                     section.flow.append(error);
+
+                    // A child that reported its own failure is terminal; the parent's
+                    // tool_result (if any) only confirms it.
+                    if (entry.row !== undefined) {
+                        completeThread(entry, 'error', `error · ${event.error.message}`);
+                    }
                     break;
                 }
 
@@ -1134,7 +1786,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         };
 
         const flush = (): void => {
-            for (const section of sections.values()) flushText(section);
+            for (const entry of threads.values()) flushText(entry.section);
         };
 
         // Attach the server identity. `index` is 0-based on the wire; tiles are
@@ -1226,13 +1878,15 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
         });
 
         // Stop every timer this tile owns. Tool cards hold their own live label;
-        // a cleared board or a hidden page must not keep ticking.
+        // a cleared board or a hidden page must not keep ticking. Invocation
+        // entries share the same mechanism: their text blocks and tool cards are
+        // owned by their sections, so stopping every section stops every child.
         const destroy = (): void => {
             stopElapsed();
 
-            for (const section of sections.values()) {
-                if (section.text !== undefined) cancel(section.text);
-                for (const tool of section.tools) tool.destroy();
+            for (const entry of threads.values()) {
+                if (entry.section.text !== undefined) cancel(entry.section.text);
+                for (const tool of entry.section.tools) tool.destroy();
             }
         };
 
@@ -1251,7 +1905,7 @@ export const createTurnBoard = (options: { empty?: HTMLElement } = {}): TurnBoar
             elapsed: () => elapsedLabel.textContent ?? '',
             tokens: () => tokensLabel.textContent ?? '',
             setUsage,
-            summary: () => ({ agents: sections.size, tools: toolCount, primary: primaryAgent }),
+            summary: () => ({ agents: threads.size, tools: toolCount, primary: primaryAgent }),
             destroy
         };
 

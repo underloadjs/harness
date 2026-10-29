@@ -1297,9 +1297,26 @@ describe('usage reporting', () => {
         ]);
         expect(events.filter((event) => event.type === 'usage')).toEqual([
             { type: 'usage', agent: 'lead', usage: leadFirst },
-            { type: 'usage', agent: 'helper', usage: helperUsage },
+            {
+                type: 'usage',
+                agent: 'helper',
+                usage: helperUsage,
+                // T3 thread identity: the helper is a direct child of the root run,
+                // so it carries its invocation id and the spawning call, but no
+                // parentId and no `input` (that travels on `start` only).
+                thread: { id: '2', callId: 'c1' }
+            },
             { type: 'usage', agent: 'lead', usage: leadAnswer }
         ]);
+
+        // The child's start frame is the one event that also carries the prompt, so
+        // a UI can title the row; every later frame keeps just the identity.
+        expect(events.find((event) => event.type === 'start' && event.agent === 'helper')).toEqual({
+            type: 'start',
+            agent: 'helper',
+            model: 'merge/ds4-flash',
+            thread: { id: '2', callId: 'c1', input: 'find it' }
+        });
     });
 });
 

@@ -13,6 +13,7 @@ export type {
     HarnessEvent,
     HarnessMessage,
     HarnessStopReason,
+    HarnessThread,
     HarnessToolCall,
     HarnessUsage,
     ToolUiBlock,

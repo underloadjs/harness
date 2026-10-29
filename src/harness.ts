@@ -238,6 +238,7 @@ import type {
     HarnessSnapshot,
     HarnessStateChangeReason,
     HarnessStreamTool,
+    HarnessThread,
     HarnessToolCall,
     Tool,
     ToolContext,
@@ -908,6 +909,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         id: number;
         scope: string;
         agent: Agent;
+        // Invocation identity reported on every event of a NON-ROOT run (T3 UI
+        // threads); undefined for a root run, whose events keep their historical
+        // shape. Built once in runAgent so every frame of this invocation (start,
+        // text, tool_call/result, usage, done, error) carries the same id.
+        thread?: HarnessThread;
         signal?: AbortSignal;
         lineage: readonly Agent[];
         parent?: RunState;
@@ -1035,11 +1041,38 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return true;
     };
 
+    // Identity fields for a frame AFTER `start`: the thread id plus its lineage
+    // anchors. `input` is deliberately dropped so a long child prompt travels once
+    // (on `start`) instead of on every delta, tool result, and done frame.
+    const threadIdentity = (thread: HarnessThread): HarnessThread => {
+        const identity: HarnessThread = { id: thread.id };
+        if (thread.parentId !== undefined) identity.parentId = thread.parentId;
+        if (thread.callId !== undefined) identity.callId = thread.callId;
+        return identity;
+    };
+
+    // Attach a run's invocation identity to an event. A ROOT run has no thread, so
+    // its events keep the exact pre-thread shape (recorded fixtures and the server
+    // contract depend on that); only child runs carry `thread`.
+    const withThread = (run: RunState, event: HarnessEvent): HarnessEvent => {
+        if (run.thread === undefined) return event;
+        return {
+            ...event,
+            // A copy on `start` so a reporter that mutates the frame it receives
+            // cannot corrupt the identity every later frame of this run is built from.
+            thread: event.type === 'start' ? { ...run.thread } : threadIdentity(run.thread)
+        } as HarnessEvent;
+    };
+
     // Every streamed event goes through this guard (P2-A). The run's canonical
     // commit/rollback is separate: this only decides whether a frame is reported.
+    //
+    // The invocation identity is attached HERE (T3 UI threads) rather than at each
+    // call site, so no event can escape without its thread and a root run needs no
+    // special case at all.
     const emit = async (run: RunState, event: HarnessEvent): Promise<void> => {
         if (!runOwnsEvents(run)) return;
-        await progress(event);
+        await progress(withThread(run, event));
     };
 
     // Terminal error is the one frame a CANCELLED ROOT still reports (its call
@@ -1059,7 +1092,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             ancestor = ancestor.parent;
         }
 
-        await progress({ type: 'error', agent: run.agent.name, error });
+        await progress(withThread(run, { type: 'error', agent: run.agent.name, error }));
     };
 
     // The one board per harness. It owns the per-call AbortControllers and the
@@ -1084,12 +1117,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 const pending = scheduler.pendingList(agentName);
 
                 try {
-                    await progress({
-                        type: 'wakeup',
-                        agent: agentName,
-                        reason: 'pending-tools',
-                        pending
-                    });
+                    // The wake frames for the run(s) live right now. One agent has at
+                    // most one ACTIVE run (agentQueues serializes them), so the first
+                    // live run is the owner; a root run contributes no thread.
+                    await progress(
+                        withThread(live[0], {
+                            type: 'wakeup',
+                            agent: agentName,
+                            reason: 'pending-tools',
+                            pending
+                        })
+                    );
                 } catch (error) {
                     // A failing reporter fails the run(s), as a synchronous event
                     // would. Park the error and wake the loop.
@@ -1530,8 +1568,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                             throw new HarnessError(`Agent "${agentName}" is not registered.`);
                         }
                         // The child inherits THIS call's signal, so cancelling a
-                        // delegation also cancels the work it started.
-                        return runAgent(target, input, signal, run);
+                        // delegation also cancels the work it started. `call.id`
+                        // labels the child's events with the tool call that spawned
+                        // it (T3 UI threads); the runtime guards above are unchanged.
+                        return runAgent(target, input, signal, run, call.id);
                     }
                 };
 
@@ -1940,7 +1980,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         brain: Agent,
         input: string,
         signal?: AbortSignal,
-        parent?: RunState
+        parent?: RunState,
+        // The parent tool call that spawned this run (T3 UI threads). `ctx.run`
+        // and agentDelegate pass their own `call.id`; a host/root invocation passes
+        // nothing. It only labels the child's events — it grants no authority.
+        callId?: string
     ): Promise<HarnessAssistantMessage> => {
         const ancestors = parent?.lineage ?? [];
 
@@ -1984,6 +2028,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 dirty: false,
                 waiters: []
             };
+
+            // Invocation identity (T3 UI threads), built ONCE after the actor is
+            // owned: a queued follow-up therefore gets its id only when it really
+            // starts, and `runSequence` (monotonic per harness) makes that id unique
+            // within the owning SessionTurn — repeated delegation to the SAME agent
+            // produces distinct ids. `parentId` names the parent's THREAD id, so it
+            // is omitted for a direct child of the root (the root has no thread) and
+            // set for anything deeper. `input` travels on `start` only (see
+            // withThread/threadIdentity).
+            if (parent !== undefined) {
+                const thread: HarnessThread = { id: String(id), input };
+                if (parent.thread !== undefined) thread.parentId = parent.thread.id;
+                if (callId !== undefined) thread.callId = callId;
+                run.thread = thread;
+            }
 
             // A run-level abort wakes a paused loop so the next iteration observes
             // it and rolls back. Every in-flight controller is linked by the
