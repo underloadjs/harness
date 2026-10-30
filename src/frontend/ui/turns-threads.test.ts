@@ -1298,7 +1298,9 @@ describe('invocation thread entries', () => {
         ]);
         expect(rootSelect?.querySelector('.tile-agent')?.textContent).toBe('WR1');
         expect([...(rootSelect?.querySelector('.tile-top')?.children ?? [])].map((child) => child.className)).toEqual(
-            ['tile-elapsed', 'tile-tokens', 'tile-status']
+            // R5/R6: the persistent-thread badge leads the cluster. This turn is
+            // built without a runtime thread, so the badge is present but hidden.
+            ['tile-thread', 'tile-elapsed', 'tile-tokens', 'tile-status']
         );
 
         const childSelect = threadRows(turn)[0].querySelector<HTMLElement>('.thread-select');

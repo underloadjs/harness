@@ -14,6 +14,7 @@ import {
     REFERENCED_RESULTS_FOOTER,
     REFERENCED_RESULTS_HEADER,
     boundAgentResultContent,
+    collectAgentLabelCounters,
     composeAgentResultPrompt,
     createAgentLabels,
     findAgentResultBlock,
@@ -647,5 +648,157 @@ describe('label pattern', () => {
         expect(normalizeAgentLabel('intro')).toBeUndefined();
         expect(AGENT_REFERENCE_LABEL_PATTERN.test('IT1')).toBe(true);
         expect(AGENT_REFERENCE_LABEL_PATTERN.test('IT')).toBe(false);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R6 deletion-safe labels + host-thread root routing
+// ---------------------------------------------------------------------------
+
+// One ROOT turn of the `probe` agent (code PE), optionally with recorded seeds.
+const rootTurn = (
+    id: string,
+    content: string,
+    labels?: Readonly<Record<string, number>>
+): AgentResultTurn => ({
+    id,
+    status: 'done',
+    ...(labels === undefined ? {} : { labels }),
+    events: [
+        { type: 'start', agent: 'probe', model: 'scripted/test' },
+        { type: 'text', agent: 'probe', delta: content },
+        { type: 'done', agent: 'probe', message: assistant(content) }
+    ]
+});
+
+describe('deletion-safe label seeds', () => {
+    it('collects the counters a NEXT turn starts from', () => {
+        const turns = [rootTurn('turn-1', 'one'), rootTurn('turn-2', 'two')];
+
+        expect([...collectAgentLabelCounters(turns)]).toEqual([['PE', 2]]);
+        expect([...collectAgentLabelCounters([])]).toEqual([]);
+    });
+
+    it('honours a recorded seed so a surviving turn keeps its label', () => {
+        // Recorded conversation: turn-1 is PE1, turn-2 is PE2 (seed says PE was
+        // already used once when turn-2 started).
+        const survivor = rootTurn('turn-2', 'two', { PE: 1 });
+
+        // Projecting the survivor ALONE (its predecessor was deleted) still calls
+        // it PE2 instead of renumbering it to PE1.
+        expect(listAgentResultBlocks([survivor])).toEqual([
+            { turnId: 'turn-2', label: 'PE2', agent: 'probe', status: 'done', content: 'two' }
+        ]);
+
+        // The identical history with no seed is the pre-deletion behaviour.
+        expect(listAgentResultBlocks([rootTurn('turn-2', 'two')])[0].label).toBe('PE1');
+    });
+
+    it('never lowers an existing occurrence counter when a seed is applied', () => {
+        const labels = createAgentLabels();
+        expect(labels.next('probe')).toBe('PE1');
+        labels.seed(new Map([['PE', 5]]));
+        expect(labels.next('probe')).toBe('PE6');
+        // A late, lower seed is ignored rather than rewinding the namespace.
+        labels.seed(new Map([['PE', 2]]));
+        expect(labels.next('probe')).toBe('PE7');
+    });
+});
+
+describe('host-thread root routing', () => {
+    it('projects a host-thread root identity as the turn ROOT, not a child block', () => {
+        // The runtime attaches invocation identity to every frame of a HOST thread
+        // run (no parent, no spawning call, no branch): it is the turn's own
+        // conversation, so the block is the root (no `threadId`).
+        const turn: AgentResultTurn = {
+            id: 'turn-1',
+            status: 'done',
+            events: [
+                {
+                    type: 'start',
+                    agent: 'probe',
+                    model: 'scripted/test',
+                    thread: { id: '1', input: 'hello' }
+                },
+                { type: 'text', agent: 'probe', delta: 'answer:hello', thread: { id: '1' } },
+                {
+                    type: 'done',
+                    agent: 'probe',
+                    message: assistant('answer:hello'),
+                    thread: { id: '1' }
+                }
+            ]
+        };
+
+        expect(listAgentResultBlocks([turn])).toEqual([
+            {
+                turnId: 'turn-1',
+                label: 'PE1',
+                agent: 'probe',
+                status: 'done',
+                content: 'answer:hello'
+            }
+        ]);
+    });
+
+    it('still projects a delegated child under its invocation id', () => {
+        const turn: AgentResultTurn = {
+            id: 'turn-1',
+            status: 'done',
+            events: [
+                {
+                    type: 'start',
+                    agent: 'probe',
+                    model: 'scripted/test',
+                    thread: { id: '1', input: 'hello' }
+                },
+                {
+                    type: 'tool_call',
+                    agent: 'probe',
+                    call: {
+                        id: 'call_1',
+                        name: 'agentDelegate',
+                        arguments: '{"agent":"research","input":"find it"}'
+                    },
+                    thread: { id: '1' }
+                },
+                {
+                    type: 'start',
+                    agent: 'research',
+                    model: 'scripted/test',
+                    thread: { id: '2', parentId: '1', callId: 'call_1', input: 'find it' }
+                },
+                {
+                    type: 'done',
+                    agent: 'research',
+                    message: assistant('found it'),
+                    thread: { id: '2', parentId: '1', callId: 'call_1' }
+                },
+                {
+                    type: 'done',
+                    agent: 'probe',
+                    message: assistant('answer:hello'),
+                    thread: { id: '1' }
+                }
+            ]
+        };
+
+        expect(listAgentResultBlocks([turn])).toEqual([
+            {
+                turnId: 'turn-1',
+                label: 'PE1',
+                agent: 'probe',
+                status: 'done',
+                content: 'answer:hello'
+            },
+            {
+                turnId: 'turn-1',
+                threadId: '2',
+                label: 'RH1',
+                agent: 'research',
+                status: 'done',
+                content: 'found it'
+            }
+        ]);
     });
 });

@@ -35,7 +35,9 @@ import type { HarnessActionChoice, HarnessAttachment } from '../types';
 import type { HarnessTurnReference } from './ui/references';
 import type {
     AgentDescriptor,
+    CancelThreadResult,
     CreateHarnessRequest,
+    DeleteThreadResult,
     HarnessDescriptor,
     HarnessIndex,
     ModelIndex,
@@ -43,6 +45,7 @@ import type {
     SessionSnapshot,
     SessionStreamItem,
     SessionTurn,
+    SubmitTaskResult,
     ToolCallResult,
     ToolDescriptor,
     ToolIndex,
@@ -404,6 +407,43 @@ export const deleteSession = async (id: string): Promise<void> => {
     await request<{ deleted: boolean }>(`/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
 };
 
+// POST /sessions/:id/threads/:threadId/cancel (R5/R7).
+//
+// Stops ONE persistent runtime thread and everything it owns (the runtime aborts
+// its active work and marks the thread stopped; child threads it owns go with it).
+// Sibling threads keep running — that is the point of independent threads — so this
+// is NOT the session-wide Stop (`cancelSession(id, true)`).
+//
+// The answer is `{ cancelled, session }`, always carrying the post-stop snapshot.
+// Callers reconcile from it rather than assume the thread is stopped:
+// `cancelled: false` means there was nothing to abort (already idle/stopped) and
+// the roster in `session` is still the truth.
+export const cancelSessionThread = async (
+    id: string,
+    threadId: string
+): Promise<CancelThreadResult> =>
+    request<CancelThreadResult>(
+        `/sessions/${encodeURIComponent(id)}/threads/${encodeURIComponent(threadId)}/cancel`,
+        { method: 'POST' }
+    );
+
+// DELETE /sessions/:id/threads/:threadId (R7).
+//
+// Permanently removes one STOPPED/IDLE thread. A running thread answers 409
+// (`request` surfaces that as an Error); the UI never offers delete for a running
+// thread, and this is the server's backstop. The answer carries the authoritative
+// snapshot after the deletion, so the caller reconciles from it: the deleted
+// thread's turns disappear from `turns` and the roster, and any focus/reference that
+// pointed at them is cleared from THAT answer, never from a stale local frame.
+export const deleteSessionThread = async (
+    id: string,
+    threadId: string
+): Promise<DeleteThreadResult> =>
+    request<DeleteThreadResult>(
+        `/sessions/${encodeURIComponent(id)}/threads/${encodeURIComponent(threadId)}`,
+        { method: 'DELETE' }
+    );
+
 export const cancelSession = async (id: string, all = false): Promise<boolean> => {
     // `all: true` is the Stop-all signal: the server aborts the active run AND
     // cancels every retained queued task, so one press drains the queue instead
@@ -456,10 +496,10 @@ export const answerAction = async (
 // fast answer is what keeps the composer usable: the request that submits a task
 // is not the request that runs it. Execution and streaming are observed on the
 // long-lived GET /sessions/:id/events stream below.
-export type EnqueueTaskResult = {
-    session: SessionSnapshot;
-    turn: SessionTurn;
-};
+// `steered: true` is present only when the submit was folded into a RUNNING thread;
+// `turn` is then the turn that OWNS that run (see run() in main.ts: the optimistic
+// steering row is discarded instead of being kept as an unbound queued ghost).
+export type EnqueueTaskResult = SubmitTaskResult;
 
 // Body of POST /sessions/:id/tasks. `attachments` is OPTIONAL and omitted when the
 // draft has none, so a text-only submit stays byte-identical to the pre-attachment
@@ -470,13 +510,25 @@ export type EnqueueTaskResult = {
 // `{ turnId, threadId?, label }`; `undefined` threadId means the turn's root
 // block. It is omitted when empty, so a plain typed `#LABEL` (which the server
 // resolves to the latest matching turn) keeps the old body shape.
+//
+// `threadId` (R5/R6/R7) is the PERSISTENT runtime thread this task targets:
+//   - ABSENT  -> the server opens a NEW standalone thread (or, on a legacy server,
+//                the session's one implicit conversation — identical old body);
+//   - idle/stopped target -> a new turn runs in that SAME conversation;
+//   - running target      -> the input is queued as a STEERING user message at the
+//                            thread's next safe model boundary, and the 202 may
+//                            return the OWNING turn (same id) instead of a new one.
+// The field is omitted when there is no target, so a legacy body is byte-identical.
 export const enqueueTask = async (
     id: string,
     input: string,
     attachments?: readonly HarnessAttachment[],
-    references?: readonly HarnessTurnReference[]
+    references?: readonly HarnessTurnReference[],
+    threadId?: string
 ): Promise<EnqueueTaskResult> => {
     const body: Record<string, unknown> = { input };
+
+    if (threadId !== undefined && threadId.length > 0) body.threadId = threadId;
 
     if (attachments !== undefined && attachments.length > 0) body.attachments = attachments;
     if (references !== undefined && references.length > 0) {

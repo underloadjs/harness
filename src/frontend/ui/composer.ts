@@ -49,6 +49,17 @@ export const composerActionOf = (
     return pending ? 'stop' : 'none';
 };
 
+// Whether the SECOND control — the session-wide STOP-ALL `×` — is visible.
+//
+// R5/R7: with independent threads running, stopping everything must stay reachable
+// even while the reader has a draft in the field. The inline action already does
+// that job when the field is empty (`composerActionOf` returns 'stop'), so the extra
+// button is shown only when the action is NOT already stop: submit + a separate
+// stop. Two stop controls in the same corner would be a misclick waiting to happen,
+// so exactly one of them is ever visible.
+export const composerStopOf = (action: ComposerActionKind, pending: boolean): boolean =>
+    pending && action !== 'stop';
+
 // Compute the inline height for the auto-grown textarea.
 //
 // `scrollHeight` is the content height (padding included, border excluded). Under the

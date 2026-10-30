@@ -308,13 +308,19 @@ describe('fresh server blocks', () => {
             { role: 'user', content: 'second block' }
         ]);
 
-        // The turn record keeps both prompts (server archive), but the live
-        // conversation has only the latest block.
-        expect(store.get(created.id).turns.map((turn) => turn.prompt)).toEqual([
-            'first block',
-            'second block'
-        ]);
-        expect(store.get(created.id).messages.filter((message) => message.role === 'user')).toEqual([
+        // The turn record keeps both prompts (server archive). R1-R6: each unfocused
+        // submit runs in its OWN persistent thread, so the latest block lives in
+        // that thread's transcript while the entry agent's default conversation —
+        // `SessionSnapshot.messages` — stays empty (the legacy `/messages` route is
+        // the surface that still appends there).
+        const snapshot = store.get(created.id);
+        expect(snapshot.turns.map((turn) => turn.prompt)).toEqual(['first block', 'second block']);
+        expect(snapshot.messages.filter((message) => message.role !== 'system')).toEqual([]);
+
+        const latestThread = snapshot.threads!.find(
+            (thread) => thread.id === snapshot.turns[1]!.threadId
+        )!;
+        expect(latestThread.messages.filter((message) => message.role === 'user')).toEqual([
             { role: 'user', content: 'second block' }
         ]);
     });

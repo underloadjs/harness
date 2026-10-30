@@ -278,7 +278,7 @@ const waitUntil = async (condition: () => boolean): Promise<void> => {
 };
 
 describe('SessionStore task queue', () => {
-    it('queues behind the active turn, drains FIFO, and never runs two tasks at once', async () => {
+    it('starts independent thread submits concurrently instead of serializing them', async () => {
         const setClock = pinClock(1_000);
         const fixture = gatedFixture();
         const store = createStore([fixture.preset]);
@@ -301,10 +301,12 @@ describe('SessionStore task queue', () => {
 
         // 202-shaped acceptance: stable id/index, trimmed prompt, queued, and NO
         // startedAt before execution. The queueDepth snapshot counts this turn.
+        // R1-R6: an unfocused submit opens its own host thread; the turn names it.
         expect(first.turn).toEqual({
             id: first.turn.id,
             index: 0,
             prompt: 'first',
+            threadId: 'thread-1',
             status: 'queued',
             updatedAt: 2_000,
             events: [],
@@ -327,6 +329,7 @@ describe('SessionStore task queue', () => {
             id: second.turn.id,
             index: 1,
             prompt: 'second',
+            threadId: 'thread-2',
             status: 'queued',
             updatedAt: 3_000,
             events: [],
@@ -339,21 +342,23 @@ describe('SessionStore task queue', () => {
             '1:queued'
         ]);
 
-        // Still only A has entered the harness.
-        expect(fixture.log).toEqual(['start:first']);
-        expect(fixture.peak()).toBe(1);
-        expect(fixture.started('second').promise).toBe(secondStarted.promise);
+        // F1/RUNTIME READINESS: BOTH plain submits are in flight before either is
+        // released — the independent thread lanes overlap (peak 2), while each
+        // lane's own backlog would stay FIFO.
+        await secondStarted.promise;
+        expect(fixture.log).toEqual(['start:first', 'start:second']);
+        expect(fixture.peak()).toBe(2);
+        expect(store.get(created.id).turns.map((turn) => turn.status)).toEqual([
+            'running',
+            'running'
+        ]);
 
-        // Let A finish; the pump must then start B, in order.
+        // Release A first; B keeps running independently.
         setClock(4_000);
         fixture.gate('first').resolve();
         await first.settled;
-        await secondStarted.promise;
 
-        expect(fixture.log).toEqual(['start:first', 'end:first', 'start:second']);
-        expect(fixture.peak()).toBe(1);
-
-        // B is running now: the queued upsert became a running row.
+        expect(fixture.log).toEqual(['start:first', 'start:second', 'end:first']);
         expect(store.get(created.id).turns.map((turn) => turn.status)).toEqual(['done', 'running']);
 
         setClock(5_000);
@@ -372,12 +377,21 @@ describe('SessionStore task queue', () => {
                 id: first.turn.id,
                 index: 0,
                 prompt: 'first',
+                threadId: 'thread-1',
                 status: 'done',
                 startedAt: 2_000,
                 updatedAt: 4_000,
+                // R1-R6/T3: a root HOST-thread run carries its invocation identity
+                // on every frame (`input` on start only); the first run of a fresh
+                // harness is invocation '1'.
                 events: [
-                    { type: 'start', agent: 'gated', model: 'scripted/test' },
-                    { type: 'text', agent: 'gated', delta: 'answer:first' },
+                    {
+                        type: 'start',
+                        agent: 'gated',
+                        model: 'scripted/test',
+                        thread: { id: '1', input: 'first' }
+                    },
+                    { type: 'text', agent: 'gated', delta: 'answer:first', thread: { id: '1' } },
                     {
                         type: 'done',
                         agent: 'gated',
@@ -388,7 +402,8 @@ describe('SessionStore task queue', () => {
                             toolCalls: [],
                             model: 'scripted/test',
                             stopReason: 'stop'
-                        }
+                        },
+                        thread: { id: '1' }
                     }
                 ],
                 eventTimes: [2_000, 4_000, 4_000]
@@ -397,12 +412,19 @@ describe('SessionStore task queue', () => {
                 id: second.turn.id,
                 index: 1,
                 prompt: 'second',
+                threadId: 'thread-2',
                 status: 'done',
-                startedAt: 4_000,
+                startedAt: 3_000,
                 updatedAt: 5_000,
+                // The second submit opened its own thread; its run is invocation '2'.
                 events: [
-                    { type: 'start', agent: 'gated', model: 'scripted/test' },
-                    { type: 'text', agent: 'gated', delta: 'answer:second' },
+                    {
+                        type: 'start',
+                        agent: 'gated',
+                        model: 'scripted/test',
+                        thread: { id: '2', input: 'second' }
+                    },
+                    { type: 'text', agent: 'gated', delta: 'answer:second', thread: { id: '2' } },
                     {
                         type: 'done',
                         agent: 'gated',
@@ -413,27 +435,27 @@ describe('SessionStore task queue', () => {
                             toolCalls: [],
                             model: 'scripted/test',
                             stopReason: 'stop'
-                        }
+                        },
+                        thread: { id: '2' }
                     }
                 ],
-                eventTimes: [4_000, 5_000, 5_000]
+                eventTimes: [3_000, 5_000, 5_000]
             }
         ]);
 
-        // Frame contract: queued/running/terminal upserts, event frames naming
-        // their turn, one drain snapshot at the end.
+        // Frame contract: queued/running/terminal upserts and event frames naming
+        // their own turn, interleaved by CONCURRENCY; one drain snapshot at the end.
         expect(frames.map(frameKey)).toEqual([
             'turn:queued:first',
             'turn:running:first',
             `event:start:${first.turn.id}`,
-            // B is accepted while A is parked on its gate, so its queued upsert
-            // arrives before A produces any further event.
+            // B is accepted while A is parked on its gate; B starts at once.
             'turn:queued:second',
+            'turn:running:second',
+            `event:start:${second.turn.id}`,
             `event:text:${first.turn.id}`,
             `event:done:${first.turn.id}`,
             'turn:done:first',
-            'turn:running:second',
-            `event:start:${second.turn.id}`,
             `event:text:${second.turn.id}`,
             `event:done:${second.turn.id}`,
             'turn:done:second',
@@ -445,27 +467,44 @@ describe('SessionStore task queue', () => {
 
         // Every event copy names its own turn id.
         const eventFrames = frames.filter((item) => item.type === 'event');
+        // Each event names its OWN turn. The lanes overlap at START (F1); the two
+        // releases are ordered by the test, so each lane's own event subsequence is
+        // exact and deterministic.
         expect(eventFrames.map((item) => item.turnId)).toEqual([
             first.turn.id,
-            first.turn.id,
-            first.turn.id,
             second.turn.id,
+            first.turn.id,
+            first.turn.id,
             second.turn.id,
             second.turn.id
         ]);
+        expect(eventFrames.filter((item) => item.turnId === first.turn.id).map((item) => item.event.type)).toEqual([
+            'start',
+            'text',
+            'done'
+        ]);
+        expect(eventFrames.filter((item) => item.turnId === second.turn.id).map((item) => item.event.type)).toEqual([
+            'start',
+            'text',
+            'done'
+        ]);
     });
 
-    it('records a failed queued task and keeps draining the rest', async () => {
+    it('records a failed task and keeps draining the rest of its thread', async () => {
         pinClock(2_000);
         const store = createStore([failingFixture()]);
         const created = store.create('flaky');
 
+        // Same-thread FIFO: the failure must not stop the queued continuations, and
+        // the serialized order keeps the banner rule deterministic.
         const boom = store.enqueue(created.id, 'boom');
-        const good = store.enqueue(created.id, 'good');
-        const tail = store.enqueue(created.id, 'tail');
-
+        expect(boom.turn.threadId).toBe('thread-1');
         await boom.settled;
+
+        const good = store.enqueue(created.id, 'good', undefined, undefined, 'thread-1');
         await good.settled;
+
+        const tail = store.enqueue(created.id, 'tail', undefined, undefined, 'thread-1');
         await tail.settled;
         await store.waitForIdle(created.id);
 
@@ -492,7 +531,9 @@ describe('SessionStore task queue', () => {
         expect(final.turns[0].events[1]).toEqual({
             type: 'error',
             agent: 'flaky',
-            error: { message: 'provider exploded' }
+            error: { message: 'provider exploded' },
+            // Host-thread root frames carry their invocation identity.
+            thread: { id: '1' }
         });
     });
 
@@ -502,9 +543,12 @@ describe('SessionStore task queue', () => {
         const store = createStore([fixture.preset]);
         const created = store.create('gated');
 
-        const started = fixture.started('hold');
-        store.enqueue(created.id, 'hold');
-        await started.promise;
+        // Park the exclusive gate with a legacy run: every thread lane's pump waits,
+        // so accepted lane work genuinely stays PENDING (F1 keeps separate lanes, so
+        // independent prompts would otherwise run at once).
+        fixture.gate('legacy');
+        void store.run(created.id, 'legacy', async () => {});
+        await fixture.started('legacy').promise;
 
         // Validation order: unknown id (404), empty (400), over-long (413).
         expect(() => store.enqueue('missing', 'x')).toThrow(SessionError);
@@ -540,7 +584,7 @@ describe('SessionStore task queue', () => {
 
         // Stop everything so the fixture cannot leak a parked run.
         store.cancel(created.id, { all: true });
-        fixture.gate('hold').resolve();
+        fixture.gate('legacy').resolve();
         await store.waitForIdle(created.id);
     });
 
@@ -550,9 +594,11 @@ describe('SessionStore task queue', () => {
         const store = createStore([fixture.preset]);
         const created = store.create('gated');
 
-        const started = fixture.started('active');
-        const active = store.enqueue(created.id, 'active');
-        await started.promise;
+        // A legacy run parks every lane pump, so the two later submits are genuinely
+        // PENDING (F1: independent lanes would otherwise start them at once).
+        fixture.gate('legacy');
+        const legacy = store.run(created.id, 'legacy', async () => {});
+        await fixture.started('legacy').promise;
 
         const queued = store.enqueue(created.id, 'queued');
         const later = store.enqueue(created.id, 'later');
@@ -565,7 +611,8 @@ describe('SessionStore task queue', () => {
         // Stop-all drops the two pending turns; they stay as cancelled records.
         expect(store.cancel(created.id, { all: true })).toBe(true);
 
-        await active.settled;
+        fixture.gate('legacy').resolve();
+        await legacy;
         await queued.settled;
         await later.settled;
         await store.waitForIdle(created.id);
@@ -589,7 +636,7 @@ describe('SessionStore task queue', () => {
         expect(final.turns[2].events).toEqual([]);
 
         // Nothing ran after the stop.
-        expect(fixture.log).toEqual(['start:active', 'end:active']);
+        expect(fixture.log).toEqual(['start:legacy', 'end:legacy']);
     });
 
     it('rejects legacy runs, manual tools, and reset while work is queued', async () => {
@@ -598,10 +645,13 @@ describe('SessionStore task queue', () => {
         const store = createStore([fixture.preset, toolFixture()]);
         const created = store.create('gated');
 
-        const started = fixture.started('first');
+        // Two independent lanes, both live (F1): the exclusive paths must refuse.
+        fixture.gate('first');
+        fixture.gate('second');
         store.enqueue(created.id, 'first');
-        await started.promise;
+        await fixture.started('first').promise;
         store.enqueue(created.id, 'second');
+        await fixture.started('second').promise;
 
         await expect(store.run(created.id, 'legacy', async () => {})).rejects.toMatchObject({
             status: 409,
@@ -619,15 +669,16 @@ describe('SessionStore task queue', () => {
             'Cancel the running task before resetting the session.'
         );
 
-        // Nothing above mutated the queue or the records.
-        expect(store.get(created.id).queueDepth).toBe(1);
+        // Nothing above mutated the lanes or the records: both are still running.
+        expect(store.get(created.id).queueDepth).toBeUndefined();
         expect(store.get(created.id).turns.map((turn) => turn.status)).toEqual([
             'running',
-            'queued'
+            'running'
         ]);
 
         store.cancel(created.id, { all: true });
         fixture.gate('first').resolve();
+        fixture.gate('second').resolve();
         await store.waitForIdle(created.id);
     });
 
@@ -820,6 +871,7 @@ describe('queue HTTP contract', () => {
             id: body.turn.id,
             index: 0,
             prompt: 'first',
+            threadId: 'thread-1',
             status: 'queued',
             updatedAt: 2_000,
             events: [],
@@ -870,20 +922,21 @@ describe('queue HTTP contract', () => {
         controller.abort();
         await watched;
 
-        // The watch frame sequence proves upserts, event attribution, and the
-        // drain snapshot. (Queued/running first and its start event predate the
-        // watcher, so they are absent.)
+        // The watch frame sequence proves upserts, event attribution under
+        // CONCURRENCY (F1), and the drain snapshot. (Queued/running first predate the
+        // watcher; its start event is the first frame after the opening snapshot.)
         const turnIds = runtime.store.get(id).turns.map((turn) => turn.id);
         expect(frames.map(frameKey)).toEqual([
             'snapshot',
+            `event:start:${turnIds[0]}`,
             'turn:queued:second',
-            `event:text:${turnIds[0]}`,
-            `event:done:${turnIds[0]}`,
-            'turn:done:first',
             'turn:running:second',
             `event:start:${turnIds[1]}`,
+            `event:text:${turnIds[0]}`,
             `event:text:${turnIds[1]}`,
+            `event:done:${turnIds[0]}`,
             `event:done:${turnIds[1]}`,
+            'turn:done:first',
             'turn:done:second',
             'snapshot'
         ]);
@@ -1065,12 +1118,18 @@ describe('queue HTTP contract', () => {
                 id: final.turns[0].id,
                 index: 0,
                 prompt: 'survivor',
+                threadId: 'thread-1',
                 status: 'done',
                 startedAt: 2_000,
                 updatedAt: 2_000,
                 events: [
-                    { type: 'start', agent: 'gated', model: 'scripted/test' },
-                    { type: 'text', agent: 'gated', delta: 'answer:survivor' },
+                    {
+                        type: 'start',
+                        agent: 'gated',
+                        model: 'scripted/test',
+                        thread: { id: '1', input: 'survivor' }
+                    },
+                    { type: 'text', agent: 'gated', delta: 'answer:survivor', thread: { id: '1' } },
                     {
                         type: 'done',
                         agent: 'gated',
@@ -1081,7 +1140,8 @@ describe('queue HTTP contract', () => {
                             toolCalls: [],
                             model: 'scripted/test',
                             stopReason: 'stop'
-                        }
+                        },
+                        thread: { id: '1' }
                     }
                 ],
                 eventTimes: [2_000, 2_000, 2_000]

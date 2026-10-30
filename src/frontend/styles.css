@@ -4400,3 +4400,311 @@ button {
         outline-offset: -2px;
     }
 }
+
+/* ---------------------------------------------------------------------------
+   Persistent agent threads (R5/R6/R7): the thread strip, the tile badge, the
+   separate stop-all control and the composer's routing line.
+
+   The strip is the ONE visible owner of thread focus. Exactly one row can be
+   `is-focused` because focus IS the single expanded conversation (ui/turns.ts
+   `expand`); the transcript's repeated turns of that thread carry the same
+   `.tile-thread` badge, so they never read as independent conversations.
+--------------------------------------------------------------------------- */
+
+.thread-strip {
+    /* A fixed-height band of the pane column: it never steals height from the
+       scrolling transcript (`flex: 1` on `.log-wrap`). */
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 20px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-elevated);
+}
+
+/* Nothing to show (no threads, no focus): the strip leaves no empty bar. */
+.thread-strip[hidden] {
+    display: none;
+}
+
+.thread-strip-list {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    /* The same desktop cap as `.log`, so the strip lines up with the transcript. */
+    max-width: 1180px;
+    margin: 0 auto;
+    padding: 0;
+    list-style: none;
+}
+
+.thread-strip-row {
+    display: flex;
+    align-items: center;
+    gap: 2px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-input);
+}
+
+.thread-strip-row.is-focused {
+    border-color: var(--accent);
+}
+
+/* The footer holds the unfocus control OUTSIDE the <ul> (a list item must be a
+   thread; the unfocus button is not). */
+.thread-strip-footer {
+    display: flex;
+    width: 100%;
+    max-width: 1180px;
+    margin: 0 auto;
+}
+
+.thread-strip-footer[hidden] {
+    display: none;
+}
+
+/* The whole label surface focuses the thread (pointer + keyboard). */
+.thread-strip-focus {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    max-width: 260px;
+    /* S4: 24px minimum hit target, the same accessibility floor as the terminal
+       action; the visual pill stays compact via the padding below. */
+    min-height: 24px;
+    padding: 3px 8px;
+    border: 0;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-muted);
+    font-family: var(--sans);
+    font-size: 11px;
+    line-height: 1.4;
+    cursor: pointer;
+}
+
+/* Agent token: the conversation's owner, so two threads of one agent read as
+   different conversations (S6). Muted and separated from the thread name. */
+.thread-strip-agent {
+    flex: 0 0 auto;
+    max-width: 90px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-dim);
+    font-family: var(--mono);
+    font-size: 10px;
+    letter-spacing: 0.02em;
+}
+
+.thread-strip-agent::after {
+    content: '·';
+    margin-left: 5px;
+    color: var(--border-strong);
+}
+
+.thread-strip-row.is-focused .thread-strip-focus {
+    color: var(--text);
+}
+
+.thread-strip-focus:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.thread-strip-name {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* State word: the same vocabulary as the tile badge (idle/running/stopped). */
+.thread-strip-status {
+    flex: 0 0 auto;
+    font-size: 10px;
+    letter-spacing: 0.02em;
+    color: var(--text-dim);
+}
+
+.thread-strip-row[data-status='running'] .thread-strip-status {
+    color: var(--accent);
+}
+
+.thread-strip-row[data-status='stopped'] .thread-strip-status {
+    color: var(--warn);
+}
+
+/* Far-right terminal action: STOP while running, DELETE when not. The glyph is
+   the same `x`; the accessible name and the confirmation step differ. */
+.thread-strip-action {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    min-width: 24px;
+    min-height: 24px;
+    margin-right: 2px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-muted);
+    font-family: var(--sans);
+    font-size: 11px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.thread-strip-action:hover:not(:disabled) {
+    border-color: var(--border-strong);
+    color: var(--text);
+}
+
+.thread-strip-action[data-action='stop']:hover:not(:disabled) {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.thread-strip-action[data-action='delete']:hover:not(:disabled),
+.thread-strip-action.is-confirm {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.thread-strip-action:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.thread-strip-action:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+/* Explicit unfocus: the only way back to "next message opens a NEW thread". */
+.thread-strip-unfocus {
+    min-height: 24px;
+    padding: 3px 9px;
+    border: 1px dashed var(--border-strong);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text-muted);
+    font-family: var(--sans);
+    font-size: 11px;
+    line-height: 1.4;
+    cursor: pointer;
+}
+
+.thread-strip-unfocus:hover {
+    color: var(--text);
+    border-color: var(--accent);
+}
+
+.thread-strip-unfocus:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+/* Persistent thread badge in a tile header. It LEADS the right-aligned metadata
+   cluster (identity before measurements), shares the 10px compact register with
+   the clock/tally/status, and is clipped with the rest of the meta line on a
+   compact row (the full id stays in `title`/`data-thread-id`). */
+.tile-thread {
+    flex: 0 0 auto;
+    padding: 0 5px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    color: var(--text-dim);
+    font-size: 10px;
+    line-height: 1.5;
+    letter-spacing: 0.04em;
+}
+
+.tile.is-expanded .tile-thread {
+    color: var(--text-muted);
+}
+
+/* Separate STOP-ALL control (R5/R7). It sits LEFT of the inline action so the
+   submit/send affordance never moves, and it exists only while work is pending
+   and the inline action is not already a stop. */
+.composer-stop {
+    position: absolute;
+    right: 44px;
+    bottom: 8px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.composer-stop[hidden] {
+    display: none;
+}
+
+.composer-stop:hover:not(:disabled) {
+    border-color: var(--danger);
+    color: var(--danger);
+}
+
+.composer-stop:disabled {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+.composer-stop:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* Two circles need the wider gutter; the single-action state keeps the original
+   inset (composer-style.test.ts pins that padding). */
+.composer.has-stop .composer-field .composer-input {
+    padding-right: 76px;
+}
+
+/* Routing line above the field: "New thread" / "New connected thread" /
+   "Continuing T2" / "Steering T2". Low-contrast so it informs without competing
+   with the draft; hidden when there is nothing to distinguish. */
+.composer-target {
+    margin: 0 0 4px;
+    color: var(--text-dim);
+    font-size: 10.5px;
+    line-height: 1.4;
+}
+
+.composer-target[hidden] {
+    display: none;
+}
+
+.composer-target[data-mode='steer'] {
+    color: var(--accent);
+}
+
+.composer-target[data-mode='continue'] {
+    color: var(--text-muted);
+}
+
+@media (forced-colors: active) {
+    .thread-strip-row,
+    .thread-strip-action,
+    .thread-strip-unfocus,
+    .composer-stop {
+        border-color: CanvasText;
+    }
+}

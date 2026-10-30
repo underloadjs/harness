@@ -111,6 +111,28 @@ export type HarnessSessionRecord = {
     turns: SessionTurn[];
     // IDs of the pending (queued) turns, in FIFO order. References into `turns`.
     queue: string[];
+    // R1-R6: the next turn INDEX high-water mark. Turn indices are monotonic and
+    // never reused, so deleting a thread (and its turns) cannot renumber the
+    // survivors. Absent in a pre-thread document; the loader then derives it from
+    // the recorded turns (old files stay readable).
+    threadSequence?: number;
+    // Conversation-scoped result-block label counters AT THE START of each turn,
+    // keyed by turn id. Persisted so a deletion cannot renumber surviving labels
+    // (see shared/agent-results.ts). Absent for a pre-thread document.
+    labelSeeds?: Record<string, Record<string, number>>;
+    // Highest label occurrence ever minted per code (tombstone high-water). Kept
+    // when turns are deleted so a retired textual label is never re-minted for
+    // different content — including after every turn carrying it is gone.
+    labelHighWater?: Record<string, number>;
+    // Invocation id recorded by each THREAD turn's root run, keyed by turn id.
+    // This is the join the snapshot roster exposes as originInvocationId; it lives
+    // beside the turns so a restart keeps the mapping.
+    turnInvocations?: Record<string, string>;
+    // Every invocation observed in a persistent conversation (invocation id → thread
+    // id). Needed so a delete after a restart purges exactly the agent-result records
+    // the runtime removes — including a child conversation's EARLIER runs, which its
+    // single `invocationId` slot no longer names.
+    invocationThreads?: Record<string, string>;
     // Last committed core snapshot. Core permits a synchronous snapshot at each
     // mutation boundary, so an active turn's completed tool/store changes are
     // included as they happen. A tool that is still executing when the process
@@ -371,10 +393,26 @@ const readTurn = (value: unknown, label: string): SessionTurn => {
                   }
               })();
 
+    // R1-R6: the persistent thread that owns this turn. OPTIONAL so every
+    // pre-thread turn keeps its exact recorded shape; a non-empty string when
+    // present (a thread id is opaque but never blank).
+    const threadId =
+        record.threadId === undefined
+            ? undefined
+            : (() => {
+                  const value = requireString(record.threadId, `${label}.threadId`);
+                  if (value.trim().length === 0) {
+                      throw new TypeError(`${label}.threadId must not be blank.`);
+                  }
+
+                  return value;
+              })();
+
     return {
         id: requireString(record.id, `${label}.id`),
         index: requireNumber(record.index, `${label}.index`),
         prompt: requireString(record.prompt, `${label}.prompt`),
+        ...(threadId === undefined ? {} : { threadId }),
         ...(references === undefined ? {} : { references }),
         ...(attachments === undefined ? {} : { attachments }),
         status: status as SessionTurn['status'],
@@ -384,8 +422,79 @@ const readTurn = (value: unknown, label: string): SessionTurn => {
         updatedAt: requireNumber(record.updatedAt, `${label}.updatedAt`),
         events: record.events as SessionTurn['events'],
         ...(eventTimes === undefined ? {} : { eventTimes }),
-        ...(usage === undefined ? {} : { usage })
+        ...(usage === undefined ? {} : { usage }),
+        ...(record.steers === undefined
+            ? {}
+            : { steers: readSteerRecords(record.steers, `${label}.steers`) })
     };
+};
+
+// Optional `{ key: number }` map used by the label-seed record. Values are
+// finite NON-NEGATIVE integers (an occurrence counter); a negative or fractional
+// value is corruption, not something to clamp silently.
+const readCounterMap = (value: unknown, label: string): Record<string, number> => {
+    const record = requireRecord(value, label);
+    const mapped: Record<string, number> = {};
+
+    for (const [key, entry] of Object.entries(record)) {
+        const counter = requireNumber(entry, `${label}.${key}`);
+
+        if (!Number.isInteger(counter) || counter < 0) {
+            throw new TypeError(`${label}.${key} must be a non-negative integer.`);
+        }
+
+        mapped[key] = counter;
+    }
+
+    return mapped;
+};
+
+// Optional `{ key: string }` map (turn id -> invocation id / per-turn counters).
+const readStringMap = (value: unknown, label: string): Record<string, string> => {
+    const record = requireRecord(value, label);
+    const mapped: Record<string, string> = {};
+
+    for (const [key, entry] of Object.entries(record)) {
+        mapped[key] = requireString(entry, `${label}.${key}`);
+    }
+
+    return mapped;
+};
+
+// Steered-submit audit records (R5/F3). Optional; each entry keeps the timestamp,
+// the user-facing text, and the result blocks whose content was injected. Bounded
+// so a long-running turn cannot grow its record without limit.
+const MAX_STEER_RECORDS = 64;
+
+const readSteerRecords = (value: unknown, label: string): SessionTurn['steers'] => {
+    if (!Array.isArray(value)) throw new TypeError(`${label} must be an array.`);
+
+    if (value.length > MAX_STEER_RECORDS) {
+        throw new TypeError(`${label} cannot contain more than ${MAX_STEER_RECORDS} entries.`);
+    }
+
+    return value.map((entry, index) => {
+        const at = `${label}[${index}]`;
+        const record = requireRecord(entry, at);
+        const references =
+            record.references === undefined
+                ? undefined
+                : (() => {
+                      try {
+                          return readAgentResultReferenceList(record.references, `${at}.references`);
+                      } catch (error) {
+                          throw new TypeError(
+                              `${at}.references is invalid: ${error instanceof Error ? error.message : String(error)}`
+                          );
+                      }
+                  })();
+
+        return {
+            at: requireNumber(record.at, `${at}.at`),
+            prompt: requireString(record.prompt, `${at}.prompt`),
+            ...(references === undefined ? {} : { references })
+        };
+    });
 };
 
 const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord => {
@@ -445,6 +554,51 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
                   return mapped;
               })();
 
+    // R1-R6 additive fields. All three are OPTIONAL: a document written before
+    // threads keeps loading, and the store derives the missing high-water mark from
+    // the recorded turn indices.
+    const threadSequence =
+        record.threadSequence === undefined
+            ? undefined
+            : (() => {
+                  const value = requireNumber(record.threadSequence, `${label}.threadSequence`);
+
+                  if (!Number.isInteger(value) || value < 0) {
+                      throw new TypeError(`${label}.threadSequence must be a non-negative integer.`);
+                  }
+
+                  return value;
+              })();
+
+    const labelSeeds =
+        record.labelSeeds === undefined
+            ? undefined
+            : (() => {
+                  const entry = requireRecord(record.labelSeeds, `${label}.labelSeeds`);
+                  const mapped: Record<string, Record<string, number>> = {};
+
+                  for (const [turnId, counters] of Object.entries(entry)) {
+                      mapped[turnId] = readCounterMap(counters, `${label}.labelSeeds.${turnId}`);
+                  }
+
+                  return mapped;
+              })();
+
+    const turnInvocations =
+        record.turnInvocations === undefined
+            ? undefined
+            : readStringMap(record.turnInvocations, `${label}.turnInvocations`);
+
+    const labelHighWater =
+        record.labelHighWater === undefined
+            ? undefined
+            : readCounterMap(record.labelHighWater, `${label}.labelHighWater`);
+
+    const invocationThreads =
+        record.invocationThreads === undefined
+            ? undefined
+            : readStringMap(record.invocationThreads, `${label}.invocationThreads`);
+
     return {
         id: requireString(record.id, `${label}.id`),
         harness: requireString(record.harness, `${label}.harness`),
@@ -460,6 +614,11 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
         ...(lastError === undefined ? {} : { lastError }),
         turns,
         queue,
+        ...(threadSequence === undefined ? {} : { threadSequence }),
+        ...(labelSeeds === undefined ? {} : { labelSeeds }),
+        ...(labelHighWater === undefined ? {} : { labelHighWater }),
+        ...(turnInvocations === undefined ? {} : { turnInvocations }),
+        ...(invocationThreads === undefined ? {} : { invocationThreads }),
         core: core as unknown as HarnessSnapshot,
         ...(agentModels === undefined ? {} : { agentModels })
     };
@@ -604,7 +763,30 @@ export const repairInterruptedToolCalls = (snapshot: HarnessSnapshot): HarnessSn
         agents[name] = { ...agent, messages: [...messages] };
     }
 
-    return changed ? { ...snapshot, agents } : snapshot;
+    // R1-R6: host-thread conversations are persisted beside the agent transcripts
+    // and are resumed the same way, so they need the SAME orphaned-tool-call repair.
+    // A thread left mid-call would otherwise make the next provider request for
+    // that conversation invalid — the agent repair alone does not cover it.
+    let threads = snapshot.threads;
+
+    if (threads !== undefined) {
+        threads = threads.map((thread) => {
+            const messages = repairAgentMessages(thread.messages);
+
+            if (messages === thread.messages) return thread;
+
+            changed = true;
+            return { ...thread, messages: [...messages] };
+        });
+    }
+
+    if (!changed) return snapshot;
+
+    return {
+        ...snapshot,
+        agents,
+        ...(threads === undefined ? {} : { threads })
+    };
 };
 
 // Durable document owner for one resolved root.

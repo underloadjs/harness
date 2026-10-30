@@ -35,3 +35,6 @@ Thumbs.db
 # Editor state
 .idea/
 .vscode/
+
+# Agent scratch space (see root AGENTS.md) - never commit
+/Temp/

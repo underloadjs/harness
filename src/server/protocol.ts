@@ -31,6 +31,9 @@ export type {
     HarnessMessage,
     HarnessStopReason,
     HarnessThread,
+    HarnessThreadOrigin,
+    HarnessThreadRecord,
+    HarnessThreadStatus,
     HarnessToolCall,
     HarnessUsage,
     ToolUiBlock,
@@ -66,6 +69,12 @@ export type SessionTurn = {
     index: number;
     // The trimmed task text the harness received, not the raw request body.
     prompt: string;
+    // R1-R6: the PERSISTENT runtime thread this turn executed in (a host thread
+    // from `harness.createThread`, or a default `agent:<name>` conversation).
+    // Stable for the turn's whole life, so a focused UI can group turns by
+    // conversation. Omitted for a LEGACY `/messages` turn, which keeps the
+    // response-owned fresh-block shape byte-identical.
+    threadId?: string;
     // Result blocks this task was submitted with (R2). A block is referenced by
     // the turn that produced it plus its `threadId` (omitted for the turn's ROOT
     // invocation) and its compact conversation-scoped label. The server binds these
@@ -98,6 +107,25 @@ export type SessionTurn = {
     // server, decide whether usage exists at all: absent means "no request
     // reported any", which is not the same as a zero-spend turn.
     usage?: HarnessUsage;
+    // Focused guidance that was STEERED into this turn's run instead of starting a
+    // separate turn (R5). The runtime applies steered text at the next safe model
+    // boundary and it appears in the conversation transcript, not as a recorded
+    // event here; this is the server's audit record of what was sent, when, and
+    // which result blocks it carried. Optional so every pre-steering turn keeps its
+    // exact shape. Never contains attachments (those are never steered — see
+    // SubmitTaskRequest.threadId).
+    steers?: SessionSteerRecord[];
+};
+
+// One steered submit, recorded on the turn that owned the running thread.
+export type SessionSteerRecord = {
+    // Epoch milliseconds when the server accepted the guidance.
+    at: number;
+    // The user's raw (trimmed) text. The run prompt may also contain the composed
+    // reference section; the audit keeps the user-facing original.
+    prompt: string;
+    // Result blocks whose completed content was injected into the steered text.
+    references?: AgentResultReference[];
 };
 
 // One trusted agent, as the UI needs it to choose a primary/subagent. The text
@@ -206,6 +234,53 @@ export type ToolDescriptor = {
     sessionBound?: boolean;
 };
 
+// One PERSISTENT thread of a session, as the roster exposes it (R1-R6).
+//
+// A thread is one agent-owned conversation with a stable id and its own transcript
+// while sharing the session's memory (tools, todos, record stores, discovery,
+// creation budget). `origin: 'agent'` is the agent's DEFAULT conversation; `host`
+// is an ADDITIONAL independent conversation (opened by the server for an unfocused
+// submit, by the UI, or by a delegated child).
+//
+// The server roster is the join between the runtime record and the recorded turns:
+//   - `invocationId` is the runtime's invocation identity for this thread's LATEST
+//     run, which is what a `HarnessEvent.thread.id` in a child frame maps onto;
+//   - `originTurnId` is the first SessionTurn that ran in this thread (omitted for
+//     a runtime-created child thread, whose work is recorded inside its parent's
+//     turn);
+//   - `originInvocationId` is that first run's invocation id, so the persistent
+//     record can be joined to the events of the turn that started it;
+//   - `references` lists the result blocks this thread's turns consume (the "#"
+//     links), deduplicated, so a client can draw the connection graph without
+//     walking every turn;
+//   - `connectedThreadIds` names the PERSISTENT threads those blocks belong to.
+//     A connection is a REFERENCE EDGE, never ownership: stopping or deleting a
+//     connected source thread does not abort or remove this conversation (only
+//     `ownerThreadId`, set by the runtime for delegation lineage, does that).
+export type SessionThread = {
+    id: string;
+    agent: string;
+    origin: 'agent' | 'host';
+    status: 'idle' | 'running' | 'stopped';
+    // Creation order (monotonic per session; copied from the runtime record).
+    sequence: number;
+    // The persistent parent thread (a delegated child links to its caller).
+    ownerThreadId?: string;
+    label?: string;
+    invocationId?: string;
+    originTurnId?: string;
+    originInvocationId?: string;
+    references?: AgentResultReference[];
+    // Persistent threads referenced by this conversation's result links (a
+    // reference EDGE, not ownership). Derived from the recorded turns and the
+    // roster, so it needs no separate persistence.
+    connectedThreadIds?: string[];
+    // The thread's committed transcript (a detached copy). This is what lets a
+    // focused UI render ONE conversation without filtering the whole turn list;
+    // `turns` stays the legacy projection so an existing renderer still works.
+    messages: HarnessMessage[];
+};
+
 // A conversation held by the server. `messages` is the entry agent's transcript.
 //
 // `turns` is the authoritative renderable record and is always present (an empty
@@ -237,6 +312,23 @@ export type SessionSnapshot = {
     updatedAt: number;
     messages: HarnessMessage[];
     turns: SessionTurn[];
+    // R1-R6: the session's persistent threads. PRESENT ONLY when the session owns
+    // at least one HOST thread, so a session that never opened one keeps its exact
+    // pre-thread snapshot shape. The default `agent:<name>` conversations are
+    // internal plumbing and deliberately omitted.
+    threads?: SessionThread[];
+    // Conversation-scoped label counters AT THE START of each turn, keyed by turn
+    // id (see shared/agent-results.ts). A client that projects result-block labels
+    // seeds its allocator from the entry, so deleting a thread (and its turns)
+    // cannot RENUMBER the surviving blocks' labels. Omitted when no turn recorded
+    // a seed (an empty or legacy session).
+    labelSeeds?: Record<string, Record<string, number>>;
+    // R6 tombstone: the HIGHEST label occurrence ever minted per two-letter code,
+    // maintained across turn deletion. A retired label is never re-minted for
+    // different content, even after every turn carrying it is deleted; the next
+    // turn seeds from the larger of this and the surviving-turn prefix. Content is
+    // never retained — only the counters. Omitted while no label was ever minted.
+    labelHighWater?: Record<string, number>;
     // The configuration this session was built with, captured at creation. A
     // registry change (POST/PATCH) therefore cannot rewrite what an existing
     // session reports: the UI can always render the frozen agents/toolbox/card.
@@ -370,6 +462,75 @@ export type SubmitMessageRequest = {
 // turns/labels, and already-failed/cancelled blocks are a 400 before a turn exists.
 export type SubmitTaskRequest = SubmitMessageRequest & {
     references?: AgentResultReference[];
+    // R1-R6: the persistent thread this input belongs to.
+    //
+    //   - ABSENT — a NEW standalone host thread is opened for the primary agent
+    //     (owned by its default conversation), so unfocused input becomes its own
+    //     conversation without touching any other. When the task references prior
+    //     blocks, the new thread is CONNECTED to the referenced threads: the
+    //     relation is persisted as the turn's `references` and the roster derives
+    //     `connectedThreadIds` from them. It is a reference EDGE, never ownership —
+    //     `ownerThreadId` stays reserved for the runtime's delegation lineage
+    //     (see SessionThread.connectedThreadIds), so stopping or deleting a
+    //     referenced source neither aborts nor purges this new conversation.
+    //   - PRESENT and RUNNING — the text is STEERED into that conversation at its
+    //     next safe model boundary; no new turn record is created and the response
+    //     carries the owning turn (`steered: true`, `steeredThreadId`). `references`
+    //     are expanded into the steered text exactly like a turn prompt — but only
+    //     when every referenced block has already completed; a reference to a turn
+    //     that is still queued/running cannot be expanded, so the submit is deferred
+    //     as a QUEUED CONTINUATION instead (it expands at execution). A steered
+    //     submit is audited on the owning turn (`steers`).
+    //   - PRESENT, RUNNING, WITH ATTACHMENTS — attachments cannot be steered (the
+    //     runtime's steering API carries text only), so the submit becomes a QUEUED
+    //     CONTINUATION in that thread: it keeps its bytes and runs when the active
+    //     turn finishes. The response is the normal accepted turn (no `steered`).
+    //   - PRESENT and IDLE/STOPPED — a continuation turn starts in that thread
+    //     (a stopped thread is revived by this explicit host action), preserving
+    //     its transcript. Other threads keep running concurrently.
+    //
+    // Every new thread gets its OWN execution lane, so two unfocused submits run
+    // concurrently (peak overlap), not through the legacy serialized backlog.
+    //
+    // Unknown/deleted thread ids are 404 before anything mutates.
+    threadId?: string;
+};
+
+// Response body of POST /sessions/:id/tasks: the same `{ session, turn }` envelope
+// as before, plus the steering marker. `steered: true` is present ONLY when the
+// submit was folded into a RUNNING thread: `turn` is then the turn that owns that
+// run (its events will contain the steered text), not a duplicate record.
+// `steeredThreadId` disambiguates `turn` when the owning turn belongs to a parent
+// conversation (a steered delegated child) — it always names the thread the text
+// was delivered to. Attachments are never steered: such a submit becomes a queued
+// continuation turn in that thread instead (it keeps `steered` absent).
+export type SubmitTaskResult = {
+    session: SessionSnapshot;
+    turn: SessionTurn;
+    steered?: true;
+    steeredThreadId?: string;
+};
+
+// Response of POST /sessions/:id/threads/:threadId/cancel (R6 stop-one).
+//
+// `cancelled` is true when a live run was aborted or at least one queued turn of
+// that thread was dropped; a thread that was merely marked stopped (idle, no work)
+// answers false. `session` is the post-stop snapshot so a client can repaint
+// without a second request.
+export type CancelThreadResult = {
+    cancelled: boolean;
+    session: SessionSnapshot;
+};
+
+// Response of DELETE /sessions/:id/threads/:threadId (R6 delete).
+//
+// The thread, its descendants, every owning turn/result reference/transcript, and
+// their persisted copies are removed; `session` is the post-delete snapshot. A
+// running thread (or one with queued work) is rejected with 409 — stop it first —
+// and the default `agent:<name>` conversation is not deletable (400; use reset).
+export type DeleteThreadResult = {
+    deleted: true;
+    session: SessionSnapshot;
 };
 
 // Body of POST /api/sessions/:id/actions/:requestId/answer (N4).

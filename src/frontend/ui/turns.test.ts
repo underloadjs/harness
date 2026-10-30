@@ -1206,7 +1206,9 @@ describe('token tally', () => {
         expect(label?.title).toBe(
             'Latest request context: 150 input tokens · Total cached input sent: 140 tokens'
         );
-        expect(topClasses(turn)).toEqual(['tile-elapsed', 'tile-tokens', 'tile-status']);
+        // R5/R6: the persistent-thread badge leads the metadata cluster and stays
+        // hidden (but present) for a turn with no runtime thread identity.
+        expect(topClasses(turn)).toEqual(['tile-thread', 'tile-elapsed', 'tile-tokens', 'tile-status']);
     });
 
     it('falls back to the cumulative input only when no usage event was recorded', () => {

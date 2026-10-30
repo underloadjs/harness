@@ -208,8 +208,11 @@ it('paints the single in-field action for every state and never renders old cont
     expect(composer.querySelector('.composer-attach')).toBeNull();
     expect(composer.querySelector('.composer-file')).toBeNull();
     expect(composer.querySelector('input[type="file"]')).toBeNull();
-    // The in-field action is the composer's only button; no chooser, no Run/Stop/Reset.
-    expect(composer.querySelectorAll('button')).toHaveLength(1);
+    // R5/R7: the composer has exactly TWO controls — the in-field action and the
+    // separate session-wide stop-all, which is hidden unless work is pending while a
+    // draft exists. No chooser, and no legacy Run/Stop/Reset controls.
+    expect(composer.querySelectorAll('button')).toHaveLength(2);
+    expect(byClass('.composer-stop', 'button').hidden).toBe(true);
     expect(composer.querySelector('.run')).toBeNull();
     expect(composer.querySelector('.stop')).toBeNull();
     expect(composer.querySelector('.reset')).toBeNull();

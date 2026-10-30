@@ -35,10 +35,12 @@ import type {
     HarnessDiscoveryOffsetSnapshot,
     HarnessMessage,
     HarnessSnapshot,
+    HarnessThreadSnapshot,
     HarnessToolCall,
     ToolCreation
 } from '../types';
 import { AGENT_RESULT_RETENTION } from './metadata';
+import { MAX_THREAD_LABEL_CHARS, MAX_THREAD_RECORDS, THREAD_HOST_PREFIX } from './thread';
 import { readChapterStoreState } from './chapter';
 import { readLocationStoreState } from './location';
 import { readProfileStoreState } from './profile';
@@ -341,6 +343,144 @@ const readToolCreation = (value: unknown, label: string): ToolCreation => {
     return creation;
 };
 
+// R2 persistent threads. Only HOST threads are persisted (an agent's default
+// conversation is the agent transcript, and its id derives from the agent name).
+// The reader enforces the whole shape up front: bounded count, unique ids and
+// sequences, a configured owner agent, a durable status, a linked parent that is
+// also present, and a transcript for every record. `threadSequence` must be a
+// high-water mark for the ids it accompanies, so a restore can never mint a
+// colliding id later.
+const readThreads = (
+    value: unknown,
+    label: string,
+    agentNames: ReadonlySet<string>
+): HarnessThreadSnapshot[] => {
+    const entries = readSnapshotArray(value, label);
+
+    if (entries.length > MAX_THREAD_RECORDS) {
+        throw new HarnessError(
+            `${label} contains ${entries.length} records; at most ${MAX_THREAD_RECORDS} can be persisted.`
+        );
+    }
+
+    const records: HarnessThreadSnapshot[] = [];
+    const ids = new Set<string>();
+    const sequences = new Set<number>();
+
+    for (const [index, entry] of entries.entries()) {
+        const entryLabel = `${label}[${index}]`;
+        const record = readSnapshotRecord(entry, entryLabel);
+        readSnapshotKeys(
+            record,
+            [
+                'id',
+                'agent',
+                'status',
+                'sequence',
+                'ownerThreadId',
+                'label',
+                'invocationId',
+                'messages'
+            ],
+            entryLabel,
+            ['ownerThreadId', 'label', 'invocationId']
+        );
+
+        const id = readSnapshotString(record.id, `${entryLabel}.id`, { min: 1 });
+
+        // Host ids only, and in the generated form: a persisted 'agent:<name>'
+        // thread would duplicate the agent transcript this snapshot already
+        // carries, and an arbitrary id could collide with a future mint.
+        if (!new RegExp(`^${THREAD_HOST_PREFIX}[1-9][0-9]*$`).test(id)) {
+            throw new HarnessError(
+                `${entryLabel}.id must be a generated host thread id ("${THREAD_HOST_PREFIX}N"); received "${id}".`
+            );
+        }
+
+        if (ids.has(id)) {
+            throw new HarnessError(`${label} contains the duplicate thread id "${id}".`);
+        }
+
+        const agent = readSnapshotString(record.agent, `${entryLabel}.agent`, { min: 1 });
+
+        if (!agentNames.has(agent)) {
+            throw new HarnessError(
+                `${entryLabel}.agent names "${agent}", which is not present in snapshot.agents.`
+            );
+        }
+
+        const status = readSnapshotString(record.status, `${entryLabel}.status`, { min: 1 });
+
+        if (status !== 'idle' && status !== 'stopped') {
+            throw new HarnessError(
+                `${entryLabel}.status must be one of: idle, stopped (a running thread is not persisted).`
+            );
+        }
+
+        const sequence = readSnapshotInteger(record.sequence, `${entryLabel}.sequence`, { min: 1 });
+
+        if (sequences.has(sequence)) {
+            throw new HarnessError(`${label} contains the duplicate thread sequence ${sequence}.`);
+        }
+
+        const thread: HarnessThreadSnapshot = {
+            id,
+            agent,
+            status,
+            sequence,
+            messages: readHarnessMessages(record.messages, `${entryLabel}.messages`)
+        };
+
+        if (record.ownerThreadId !== undefined) {
+            thread.ownerThreadId = readSnapshotString(record.ownerThreadId, `${entryLabel}.ownerThreadId`, {
+                min: 1
+            });
+        }
+
+        if (record.label !== undefined) {
+            const label = readSnapshotString(record.label, `${entryLabel}.label`, { min: 1 });
+
+            // Same bound as createThread (core/thread.ts): a hand-edited snapshot
+            // must not smuggle an oversized display label into a live record.
+            if (label.length > MAX_THREAD_LABEL_CHARS) {
+                throw new HarnessError(
+                    `${entryLabel}.label is longer than ${MAX_THREAD_LABEL_CHARS} characters.`
+                );
+            }
+
+            thread.label = label;
+        }
+
+        if (record.invocationId !== undefined) {
+            thread.invocationId = readSnapshotString(record.invocationId, `${entryLabel}.invocationId`, {
+                min: 1
+            });
+        }
+
+        ids.add(id);
+        sequences.add(sequence);
+        records.push(thread);
+    }
+
+    // Owner links are resolved AFTER every id is known, so a snapshot may list a
+    // child before its parent without becoming order-dependent.
+    for (const [index, thread] of records.entries()) {
+        if (thread.ownerThreadId === undefined) continue;
+
+        if (thread.ownerThreadId === thread.id) {
+            throw new HarnessError(`${label}[${index}].ownerThreadId must not name the thread itself.`);
+        }
+
+        if (!ids.has(thread.ownerThreadId)) {
+            throw new HarnessError(
+                `${label}[${index}].ownerThreadId names "${thread.ownerThreadId}", which is not present in ${label}.`
+            );
+        }
+    }
+
+    return records;
+};
+
 // Read and validate a complete snapshot, returning a detached copy. This is the
 // pure half of restore: the harness compiles created tools and checks
 // target-specific facts (agent identity, registry collisions, budget) after this
@@ -349,9 +489,19 @@ export const readHarnessSnapshot = (value: unknown): HarnessSnapshot => {
     const root = readSnapshotRecord(value, 'snapshot');
     readSnapshotKeys(
         root,
-        ['version', 'agents', 'discovery', 'createdTools', 'createdToolCount', 'agentResults', 'records'],
+        [
+            'version',
+            'agents',
+            'discovery',
+            'createdTools',
+            'createdToolCount',
+            'agentResults',
+            'threads',
+            'threadSequence',
+            'records'
+        ],
         'snapshot',
-        ['agentResults']
+        ['agentResults', 'threads', 'threadSequence']
     );
 
     const version = readSnapshotInteger(root.version, 'snapshot.version', { min: 1 });
@@ -477,6 +627,39 @@ export const readHarnessSnapshot = (value: unknown): HarnessSnapshot => {
             ? undefined
             : readAgentResults(root.agentResults, 'snapshot.agentResults', new Set(agentNames));
 
+    // R2 persistent threads. OPTIONAL pair: both fields are absent (an implicit
+    // per-agent default conversation only) or both present. `threadSequence` is
+    // the id high-water mark, so it must be at least the largest persisted
+    // sequence.
+    let threads: HarnessThreadSnapshot[] | undefined;
+    let threadSequence: number | undefined;
+
+    if (root.threads !== undefined || root.threadSequence !== undefined) {
+        if (root.threads === undefined || root.threadSequence === undefined) {
+            throw new HarnessError(
+                'snapshot.threads and snapshot.threadSequence must be present together.'
+            );
+        }
+
+        threads = readThreads(root.threads, 'snapshot.threads', new Set(agentNames));
+        threadSequence = readSnapshotInteger(root.threadSequence, 'snapshot.threadSequence', {
+            min: 1
+        });
+
+        // `threadSequence` is the ID high-water mark (independent of creation
+        // order), so it must cover every persisted id's number. An id above the
+        // mark would be minted again after a restart.
+        for (const thread of threads) {
+            const idNumber = Number(thread.id.slice(THREAD_HOST_PREFIX.length));
+
+            if (idNumber > threadSequence) {
+                throw new HarnessError(
+                    `snapshot.threadSequence is ${threadSequence}, but thread "${thread.id}" is numbered ${idNumber}.`
+                );
+            }
+        }
+    }
+
     // Record stores: each reader validates its own bounds and returns copies.
     const records = readSnapshotRecord(root.records, 'snapshot.records');
     readSnapshotKeys(records, ['todos', 'profiles', 'chapters', 'locations'], 'snapshot.records');
@@ -488,6 +671,9 @@ export const readHarnessSnapshot = (value: unknown): HarnessSnapshot => {
         createdTools,
         createdToolCount,
         ...(agentResults === undefined || agentResults.length === 0 ? {} : { agentResults }),
+        ...(threads === undefined || threadSequence === undefined
+            ? {}
+            : { threads, threadSequence }),
         records: {
             todos: readTodoStoreState(records.todos),
             profiles: readProfileStoreState(records.profiles),

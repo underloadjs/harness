@@ -51,6 +51,7 @@ import {
     registerAgentForker
 } from './branch';
 import type { NormalizedForkAgentOptions } from './branch';
+import { registerAgentThreader } from './thread';
 import type {
     Agent,
     AgentConfiguration,
@@ -464,6 +465,33 @@ const createAgent = (
     // Let the runtime create an AUTOANSWER owner fork through the same closure.
     // The registry is a WeakMap, so this adds no field to the public Agent shape.
     registerAgentForker(self, (options) => forkFrom(options));
+
+    // Persistent-thread factory (R2). A thread is an INDEPENDENT conversation of
+    // the same brain: same instructions, seed messages, and resolved transport.
+    // The model here is only the STARTING value: the runtime re-reads the OWNING
+    // agent's current model at every run start and syncs the thread's Agent to it
+    // (harness.ts, the `origin === 'host'` sync before a run), so
+    // `agent.model('…')` reaches every live conversation of that agent on its next
+    // run. A request already in flight keeps the model it started with, because
+    // that run captured `requestModel` above.
+    //
+    // The transcript is seeded from instructions + `configuration.messages` (the
+    // pre-call seed history), NOT from the live source history: a new thread is a
+    // new conversation, while the source's own conversation stays the default
+    // thread (`agent:<name>`, see core/thread.ts).
+    registerAgentThreader(self, () =>
+        createAgent({
+            // The harness rewrites `name` to the registry key after construction,
+            // so the LIVE name (not the original configuration value, which may be
+            // undefined) is what keeps events, invocation records, and the
+            // `agentResult` lookup on the same identity.
+            name: self.name,
+            model,
+            instruction: [...instructions],
+            ...(configuration.messages === undefined ? {} : { messages: configuration.messages }),
+            stream: transport
+        })
+    );
 
     return self;
 };

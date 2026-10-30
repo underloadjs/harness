@@ -75,6 +75,18 @@ export type AgentResultTurn = {
     id: string;
     status: AgentResultStatus;
     events: readonly HarnessEvent[];
+    // R6 deletion: the conversation-scoped label counters AT THE START of this
+    // turn (code -> last occurrence), as recorded when the turn was created (see
+    // `collectAgentLabelCounters`). Optional because a legacy turn (and every
+    // record persisted before threads) has none; such a turn simply continues the
+    // chained allocator, which is the pre-deletion behaviour.
+    //
+    // WHY: occurrence numbering normally continues from every EARLIER turn, so
+    // deleting a thread (and its turns) would renumber the surviving blocks
+    // (`RR2` becoming `RR1`) and break a typed `#LABEL`. Seeding the allocator from
+    // the recorded start state keeps a surviving turn's labels stable, and
+    // `seed()` never lowers a counter, so a normal (undeleted) prefix is unaffected.
+    labels?: Readonly<Record<string, number>>;
 };
 
 // One block plus the content to inject, as composed into a run prompt.
@@ -268,6 +280,12 @@ const blocksOfTurn = (
     turn: AgentResultTurn,
     labels: AgentLabels = createAgentLabels()
 ): ProjectedBlock[] => {
+    // Deletion-safe numbering (R6): continue from THIS turn's recorded start
+    // counters. `seed` only raises a counter, so a live/undeleted prefix (whose
+    // chained allocator is already at or above this state) is unchanged, while a
+    // surviving turn whose earlier turns were deleted keeps its original labels.
+    if (turn.labels !== undefined) labels.seed(new Map(Object.entries(turn.labels)));
+
     const blocks: ReplayBlock[] = [];
     const byThread = new Map<string, ReplayBlock>();
     const byCall = new Map<string, ReplayBlock>();
@@ -386,12 +404,39 @@ const blocksOfTurn = (
     };
 
     const route = (event: HarnessEvent): ReplayBlock => {
-        // A `thread` field is present only for non-root runs, but TypeScript knows
-        // the union variant; a plain property read keeps this simple and honest.
-        const thread = (event as { thread?: { id: string; callId?: string } }).thread;
-        if (thread !== undefined) return blockForThread(event);
+        // A `thread` field is present only for non-root INVOCATIONS, but TypeScript
+        // knows the union variant; a plain property read keeps this simple and
+        // honest.
+        const thread = (
+            event as {
+                thread?: {
+                    id: string;
+                    parentId?: string;
+                    callId?: string;
+                    kind?: string;
+                    branchId?: string;
+                };
+            }
+        ).thread;
+        if (thread === undefined) return blockForLegacy(event);
 
-        return blockForLegacy(event);
+        // R1-R6: a HOST-thread run carries its invocation identity on EVERY frame
+        // (that id maps the persistent thread to its events), but it is still the
+        // turn's own ROOT conversation — not a nested child. Such an identity has
+        // no parent, no spawning call, and no branch marker, so it routes to the
+        // root block exactly like a threadless root event. Without this, the root
+        // would never be allocated and the entry agent's answer would appear as a
+        // child block under an id no reference uses.
+        if (
+            thread.parentId === undefined &&
+            thread.callId === undefined &&
+            thread.kind === undefined &&
+            thread.branchId === undefined
+        ) {
+            return rootBlock(event.agent);
+        }
+
+        return blockForThread(event);
     };
 
     const complete = (block: ReplayBlock, status: AgentResultStatus, content?: string): void => {
@@ -506,6 +551,24 @@ const blocksOfTurn = (
 const publicBlock = (block: ProjectedBlock): AgentResultBlock => {
     const { aliases: _aliases, ...descriptor } = block;
     return descriptor;
+};
+
+// The allocator counters AFTER replaying every given turn, chained in recorded
+// order — i.e. the state the NEXT turn starts from. The server records this as a
+// turn's `labels` at creation, which is what lets a later deletion keep the
+// surviving turns' labels stable (see AgentResultTurn.labels).
+//
+// Pass the conversation PREFIX up to (not including) the turn being created. The
+// caller must supply turns in recorded order; `turns.labels` values already on the
+// list are honoured, so computing a seed over a history that already carries seeds
+// yields the same counters a live replay would.
+export const collectAgentLabelCounters = (
+    turns: readonly AgentResultTurn[]
+): Map<string, number> => {
+    const labels = createAgentLabels();
+    for (const turn of turns) blocksOfTurn(turn, labels);
+
+    return labels.counters();
 };
 
 // List every block across turns, oldest turn first and each turn's blocks in

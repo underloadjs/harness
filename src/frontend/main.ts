@@ -90,7 +90,9 @@ import {
     answerAction,
     callTool,
     cancelSession,
+    cancelSessionThread,
     createHarness,
+    deleteSessionThread,
     createSession,
     deleteSession,
     enqueueTask,
@@ -119,7 +121,12 @@ import {
 } from './contract';
 import { createCreateHarnessPanel } from './ui/create-harness';
 import { createAgentRow } from './ui/agents';
-import { composerActionOf, composerFieldHeight, composerMaxHeight } from './ui/composer';
+import {
+    composerActionOf,
+    composerFieldHeight,
+    composerMaxHeight,
+    composerStopOf
+} from './ui/composer';
 import {
     attachmentFileName,
     attachmentPreviewUrl,
@@ -164,8 +171,19 @@ import { highlightCode, looksLikeJson, prettyJson } from './ui/markdown';
 import { applyPanels, createPanelHost, mediaOfTurns } from './ui/panels';
 import type { PanelMedia } from './ui/panels';
 import type { FilePreviewReader, FilePreviewResult } from './ui/file-preview';
-import { createTurnBoard } from './ui/turns';
+import { createTurnBoard, labelSeedsOf } from './ui/turns';
 import type { AnswerActionInput, TurnHandle } from './ui/turns';
+// Persistent agent threads (R2/R5/R6/R7): roster reading, the routing decision for
+// the next submit and the compact thread strip. See ui/threads.ts for the server
+// contract; every read there is additive (legacy snapshots simply produce no strip).
+import {
+    createThreadStrip,
+    resolveSubmitTarget,
+    sessionThreadsOf,
+    submitTargetLabel,
+    turnThreadIdOf
+} from './ui/threads';
+import type { SessionThreadEntry } from './ui/threads';
 
 // ---------------------------------------------------------------------------
 // Small DOM helpers
@@ -304,7 +322,32 @@ type View = {
     // task is enqueued, so the tile shows `queued` (neutral, no clock) until the
     // server accepts it and advances it to running. Attachments are rendered as
     // chips on the optimistic tile, then replaced by the server record.
-    begin: (prompt: string, attachments?: readonly HarnessAttachment[]) => TurnHandle;
+    //
+    // `threadId` is the persistent thread the submit targets (continue/steer). It is
+    // only the optimistic BADGE — the wire body carries the same id (api.ts
+    // enqueueTask) — so a steering row is labelled with the thread it joins.
+    begin: (
+        prompt: string,
+        attachments?: readonly HarnessAttachment[],
+        threadId?: string
+    ) => TurnHandle;
+    // Drop an optimistic tile the server never accepted as its own turn. Steering a
+    // running thread answers with the OWNING turn, so the temporary row must be
+    // removed instead of lingering as an unbound queued ghost (see run()).
+    discard: (turn: TurnHandle) => void;
+    // Focus controls. Focus IS the expanded conversation (exactly one), and it is
+    // what routes the next submit: continuing an idle/stopped thread or steering a
+    // running one. `undefined` means "no focus": the next message opens a NEW thread.
+    focusedThread: () => string | undefined;
+    focusThread: (threadId: string) => boolean;
+    // Explicitly drop the steering target (deleted thread, session teardown). Unlike
+    // a tile toggle this is never a user intent to open a new thread, but it must
+    // still stop the next submit from targeting the removed id (S3).
+    clearFocus: () => void;
+    // Paint the persistent-thread strip from the authoritative roster. Repeated
+    // turns of one thread share a row here (and a badge in the transcript), so the
+    // conversation is never presented as several independent threads.
+    setThreads: (threads: readonly SessionThreadEntry[]) => void;
     clear: () => void;
     notice: (text: string, tone?: 'info' | 'error') => void;
     // Session-scoped outcome line (a failed/cancelled run's detail), rendered in
@@ -315,12 +358,25 @@ type View = {
     setTranscript: (text: string) => void;
     // Replace the whole transcript with the server's turns. Used on boot and on
     // session selection — the server record always wins over local projection.
-    hydrate: (turns: readonly SessionTurn[], model?: string, keep?: string) => TurnHandle[];
+    // `labelSeeds` is the snapshot's per-turn label counters (`labelSeedsOf`), so a
+    // replay keeps every block label stable even when a deleted thread's turns are
+    // no longer in the list.
+    hydrate: (
+        turns: readonly SessionTurn[],
+        model?: string,
+        keep?: string,
+        labelSeeds?: Record<string, Record<string, number>>
+    ) => TurnHandle[];
     // Reconcile the visible turns with a server snapshot/upsert without rebuilding
     // tiles (R4 queue): same ids are merged in place, new turns adopted, missing
     // ones dropped. This is the live path so streamed text is never duplicated and
     // the reader's expanded tile survives.
-    reconcile: (turns: readonly SessionTurn[], model?: string, keep?: string) => TurnHandle[];
+    reconcile: (
+        turns: readonly SessionTurn[],
+        model?: string,
+        keep?: string,
+        labelSeeds?: Record<string, Record<string, number>>
+    ) => TurnHandle[];
     // Find, or adopt, the tile for one server turn (a `turn` upsert frame).
     upsert: (turn: SessionTurn, model?: string) => TurnHandle;
     // Look up a tile by the server turn id carried on a stream `event` frame.
@@ -333,9 +389,19 @@ type View = {
     dispose: () => void;
 };
 
+// Per-thread terminal actions are injected by the shell (main.ts owns every POST):
+// the view may only OFFER them. A standalone/embedded page omits them, and the
+// strip's `×` then reports that the action is not wired (the buttons stay inert
+// instead of pretending to stop a thread nobody can reach).
+type ThreadActions = {
+    stop: (threadId: string) => void;
+    remove: (threadId: string) => void;
+};
+
 const createView = (
     descriptor: HarnessDescriptor,
-    answer?: (input: AnswerActionInput) => Promise<void>
+    answer?: (input: AnswerActionInput) => Promise<void>,
+    threadActions?: ThreadActions
 ): View => {
     const pane = el('div', 'pane');
     const logWrap = el('div', 'log-wrap');
@@ -356,12 +422,39 @@ const createView = (
     // One tile per user turn. The board owns expansion state (exactly one tile
     // open, newest auto-opened) and keeps every tile's DOM, so reading an older
     // turn is never interrupted by deltas arriving for a newer one.
+    // The roster this view last rendered. Kept here (not in the DOM) so a focus
+    // change can repaint the strip without asking the server again.
+    let lastThreads: readonly SessionThreadEntry[] = [];
+
     const board = createTurnBoard({
         empty,
         // R11: file links in the transcript get the bounded read adapter. Omitted
         // in a standalone/embedded page, where the dialog reports it is unwired.
         readFile: readFileForPreview,
-        ...(answer === undefined ? {} : { answerAction: answer })
+        ...(answer === undefined ? {} : { answerAction: answer }),
+        // Focus follows the single expanded tile. The strip and the composer's
+        // target line repaint from here, so the steering target is visible in the
+        // same tick the reader expands/collapses a conversation.
+        onFocusChange: (threadId) => {
+            strip.render(lastThreads, threadId);
+            // Only the SELECTED view owns the composer; a background harness's
+            // reconcile must not repaint the routing line of another conversation.
+            // Identity is the view's own pane, the one thing available before the
+            // View object exists.
+            if (current?.view.pane === pane) paintComposerTarget();
+        }
+    });
+
+    // R5/R7: one row per PERSISTENT thread. Clicking a row focuses (expands) it;
+    // the far-right `×` STOPS a running thread or (confirmed) DELETES an idle/stopped
+    // one. `New thread` inside the strip is the explicit unfocus control.
+    const strip = createThreadStrip({
+        onFocus: (threadId) => {
+            if (board.focusThread(threadId)) stick(true);
+        },
+        onUnfocus: () => board.collapse(),
+        onStop: (threadId) => threadActions?.stop(threadId),
+        onDelete: (threadId) => threadActions?.remove(threadId)
     });
 
     const log = el('div', 'log');
@@ -387,7 +480,10 @@ const createView = (
     };
 
     logWrap.append(log);
-    pane.append(sessionNote, logWrap, details);
+    // The strip sits between the session outcome line and the transcript: it is the
+    // thread switcher AND the per-thread stop/delete surface, and it hides itself
+    // when the session has no persistent threads (legacy server => no strip at all).
+    pane.append(sessionNote, strip.element, logWrap, details);
 
     // Only follow the stream when the reader has not scrolled away from the
     // bottom. Reading history while a run streams is a legitimate thing to do.
@@ -402,12 +498,25 @@ const createView = (
         bindSession: (sessionId) => {
             board.bindSession(sessionId);
         },
-        begin: (prompt, attachments) => {
-            const turn = board.begin(prompt, attachments);
+        begin: (prompt, attachments, threadId) => {
+            const turn = board.begin(prompt, attachments, threadId);
             // A new turn is the one thing that always scrolls: the user just
             // submitted it.
             stick(true);
             return turn;
+        },
+        discard: (turn) => board.discard(turn),
+        focusedThread: () => board.focusedThread(),
+        focusThread: (threadId) => board.focusThread(threadId),
+        clearFocus: () => board.collapse(),
+        setThreads: (threads) => {
+            lastThreads = threads;
+            // The BOARD gets the roster first: it owns canonical labels (S6), the
+            // persistent-id mapping for child focus (S2) and the roster-only
+            // transcript. It may CLEAR a focus the roster no longer describes, which
+            // reports through `onFocusChange` and repaints the strip below.
+            board.setThreads(threads);
+            strip.render(threads, board.focusedThread());
         },
         clear: () => {
             board.clear();
@@ -421,20 +530,22 @@ const createView = (
         setTranscript: (text) => {
             transcriptBody.textContent = text;
         },
-        hydrate: (turns, model, keep) => {
+        hydrate: (turns, model, keep, labelSeeds) => {
             const follow = pinned();
             const handles = board.hydrate(turns, {
                 ...(model === undefined ? {} : { model }),
-                ...(keep === undefined ? {} : { keep })
+                ...(keep === undefined ? {} : { keep }),
+                ...(labelSeeds === undefined ? {} : { labelSeeds })
             });
             stick(follow);
             return handles;
         },
-        reconcile: (turns, model, keep) => {
+        reconcile: (turns, model, keep, labelSeeds) => {
             const follow = pinned();
             const handles = board.reconcile(turns, {
                 ...(model === undefined ? {} : { model }),
-                ...(keep === undefined ? {} : { keep })
+                ...(keep === undefined ? {} : { keep }),
+                ...(labelSeeds === undefined ? {} : { labelSeeds })
             });
             // A task submitted while the reader is at the bottom should pull the
             // view down to the active row; a reader scrolled up keeps their place.
@@ -459,8 +570,9 @@ const createView = (
                 return claimed;
             }
 
-            // A turn this browser did not submit (another tab, another observer)
-            // is adopted from the server record. `adopt` expands it as the newest.
+            // A turn this browser did not submit (another tab, another observer) is
+            // adopted from the server record. Adoption NEVER moves focus (S1): the
+            // reader keeps whatever conversation they were reading.
             stick(pinned());
             return board.adopt(turn, model);
         },
@@ -1494,6 +1606,15 @@ attachmentError.setAttribute('role', 'status');
 attachmentError.setAttribute('aria-live', 'polite');
 attachmentError.hidden = true;
 
+// Routing line (R5/R6): WHERE the next submit goes — a new thread, a connected new
+// thread (the draft carries `#` references), or the focused thread (continue/steer).
+// It is the visible half of focus: the reader can always see that a focused thread
+// will receive their message before they send it. Not a live region — it changes on
+// every keystroke and must not be announced repeatedly; the focused strip row and
+// this line carry the same state visually.
+const composerTarget = el('p', 'composer-target');
+composerTarget.hidden = true;
+
 // The field is the positioning context for the action, so the button travels with
 // the box as it grows instead of sitting in a separate column.
 const composerField = el('div', 'composer-field');
@@ -1534,8 +1655,19 @@ composerPopup.hidden = true;
 const actionButton = el('button', 'composer-action');
 actionButton.type = 'submit';
 actionButton.hidden = true;
-composerField.append(input, composerPopup, actionButton);
-composerBody.append(attachmentError, composerField);
+// SESSION-WIDE stop-all (R5/R7), separate from the submit action on purpose: with
+// independent threads running, "stop everything" must stay reachable while the
+// reader has a draft in the field. It is painted only when the inline action is not
+// already `stop` (ui/composer.ts `composerStopOf`), so there is never a second stop
+// control in the same corner.
+const stopAllButton = el('button', 'composer-stop');
+stopAllButton.type = 'button';
+stopAllButton.hidden = true;
+stopAllButton.textContent = '×';
+stopAllButton.setAttribute('aria-label', 'Stop all tasks');
+stopAllButton.title = 'Stop all running and queued tasks';
+composerField.append(input, composerPopup, stopAllButton, actionButton);
+composerBody.append(attachmentError, composerTarget, composerField);
 
 // R6: the composer ends at the field column. The old "+" chooser (button + hidden
 // file input) is deliberately gone: paste, drop and @ lookup cover attachments, and
@@ -2183,6 +2315,54 @@ const selectComposerPopup = (index = composerPopupState?.index): boolean => {
 // form's submit button, so clicking it and pressing Ctrl/Cmd+Enter share one path
 // (R10: queuing behavior untouched); a bare Enter stays a native newline (see the
 // keydown contract below). In stop mode it is a plain button wired to `stopRun`.
+// Count draft references whose target turn has not settled yet (queued/running).
+// The server only steers WITH reference context when every target is already `done`
+// (sessions.ts `composeSteerReferences` returns undefined otherwise) — a live target
+// makes the submit a queued continuation in the focused thread. `records` is the
+// authoritative per-turn map (`Instance.records`); an id it does not know is already
+// gone and `purgeStaleReferences`/the submit boundary filter drop it, so it must not
+// inflate this count.
+const unfinishedReferenceCount = (
+    records: ReadonlyMap<string, SessionTurn> | undefined,
+    references: readonly { turnId: string }[]
+): number => {
+    if (records === undefined) return 0;
+
+    return references.filter((reference) => {
+        const record = records.get(reference.turnId);
+
+        return record !== undefined && (record.status === 'queued' || record.status === 'running');
+    }).length;
+};
+
+// Paint the composer's routing line: where this draft will go if sent now. It reads
+// the SAME inputs as `run()` (focus + `#` reference chips + ready attachments)
+// through the same pure helper (`resolveSubmitTarget`), so the promise and the
+// request cannot disagree.
+const paintComposerTarget = (): void => {
+    const instance = current;
+    const references = referencesOfChips(editorChips(input));
+    const target = resolveSubmitTarget({
+        focus: instance?.view.focusedThread(),
+        threads: instance?.threads ?? [],
+        references: references.length,
+        // Attachments are never steered, so their presence already turns a running
+        // target into a queued continuation; the label must say so up front.
+        attachments: draftAttachments.reduce(
+            (count, draft) => count + (draft.data === undefined ? 0 : 1),
+            0
+        ),
+        unfinishedReferences: unfinishedReferenceCount(instance?.records, references)
+    });
+
+    composerTarget.textContent = submitTargetLabel(target);
+    composerTarget.dataset.mode = target.mode;
+    // "New thread" is only worth saying when this session HAS threads to distinguish
+    // from (or when a reference just turned it into a connected thread). A legacy
+    // session therefore shows no extra line at all.
+    composerTarget.hidden = target.mode === 'new' && (instance?.threads.length ?? 0) === 0;
+};
+
 const paintComposer = (): void => {
     const pending = running || current?.pending === true;
     // Only READY attachments count as submittable content; a still-encoding file is
@@ -2192,6 +2372,18 @@ const paintComposer = (): void => {
 
     actionButton.dataset.action = action;
     actionButton.hidden = action === 'none';
+
+    // Stop-all (R5/R7): visible while work is pending UNLESS the inline action is
+    // already the stop `×` (empty field). Typing while threads run therefore swaps to
+    // submit + a separate stop, instead of hiding the only cancellation control.
+    const showStop = composerStopOf(action, pending);
+    stopAllButton.hidden = !showStop;
+    stopAllButton.disabled = !booted;
+    // Two 28px circles need the right gutter; one does not.
+    composer.classList.toggle('has-stop', showStop);
+    // The target line follows the same paint as the action: focus changes and
+    // reference chips both move it.
+    paintComposerTarget();
     // Submit follows the old Run guard exactly (the short enqueue window + boot).
     // A read in flight disables submit: the payload is not complete yet, and the
     // stop state stays live because that state requires pending work.
@@ -2453,6 +2645,17 @@ type Instance = {
     // The latest authoritative turn records for this session, keyed by id. Kept so
     // activity can be recomputed from running records without a full snapshot.
     records: Map<string, SessionTurn>;
+    // The session's PERSISTENT runtime threads (`SessionSnapshot.threads`, additive),
+    // in creation order. Empty for a legacy server and for a session that has only
+    // its implicit conversations: the strip then stays hidden and every pre-thread
+    // behaviour is unchanged.
+    threads: readonly SessionThreadEntry[];
+    // Deletion tombstones (S3). A thread this client deleted — and the descendants
+    // and turns removed with it — must never come back from a late SSE `turn`, a
+    // delayed 202 body, or an in-flight stale snapshot. Session-scoped: reset when
+    // the instance points at a different conversation.
+    threadTombstones: Set<string>;
+    turnTombstones: Set<string>;
     // Watermark of the newest snapshot this instance has applied, tagged with the
     // session it came from. The 202 body of POST /tasks is captured at ENQUEUE time
     // and can resolve after newer observer frames, so its session-level fields
@@ -2618,11 +2821,24 @@ const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
 
     const instance: Instance = {
         descriptor,
-        view: createView(descriptor, (input) => answerActionFor(descriptor.name, input)),
+        view: createView(
+            descriptor,
+            (input) => answerActionFor(descriptor.name, input),
+            {
+                // Per-thread terminal actions. Both are scoped to THIS harness view
+                // and re-check the live session id before the request, so a click
+                // that straddles a session switch cannot hit another conversation.
+                stop: (threadId) => stopThreadFor(descriptor.name, threadId),
+                remove: (threadId) => deleteThreadFor(descriptor.name, threadId)
+            }
+        ),
         activity: new Set<string>(),
         panels: new Map<string, PanelMedia>(),
         pending: false,
-        records: new Map<string, SessionTurn>()
+        records: new Map<string, SessionTurn>(),
+        threads: [],
+        threadTombstones: new Set<string>(),
+        turnTombstones: new Set<string>()
     };
     instances.set(descriptor.name, instance);
     return instance;
@@ -3763,59 +3979,184 @@ const markSnapshot = (instance: Instance, session: SessionSnapshot): void => {
 // suppressed from the pane note: a user's own Stop is not an error to report.
 const CANCELLED_MESSAGE = 'The run was cancelled.';
 
+// Drop `#` reference chips whose turn no longer exists in the authoritative record
+// (R7: deleting a thread deletes its turns). A chip is the ONLY place the exact
+// `{ turnId, threadId?, label }` binding lives; leaving a stale one would make the
+// next submit a 400 for the whole message. Surviving chips are untouched: their
+// labels are allocated by the server and deleting one conversation never renumbers
+// the blocks that remain (`ui/references.ts` contract).
+// `report: false` removes the chips silently: the failed-submit path already owns
+// the reader's attention (`task failed: …`) and must not replace that message with a
+// draft note about a reference it restored and immediately dropped (N3).
+const purgeStaleReferences = (
+    knownTurns: ReadonlySet<string>,
+    options: { report?: boolean } = {}
+): void => {
+    const stale = Array.from(input.querySelectorAll<HTMLElement>('[data-chip="reference"]')).filter(
+        (chip) => {
+            const turnId = chip.dataset.referenceTurn ?? '';
+            return turnId.length === 0 || !knownTurns.has(turnId);
+        }
+    );
+    if (stale.length === 0) return;
+
+    for (const chip of stale) {
+        // Same spacing repair the chip-removal paths use, so the draft reads as if
+        // the reference had never been there.
+        editorCollapseChipGap(chip.previousSibling, chip.nextSibling);
+        chip.remove();
+    }
+
+    autoGrow();
+    paintComposer();
+
+    if (options.report === false) return;
+
+    // Composer-scoped status line (`role=status`), not the session outcome: this is
+    // a draft problem the reader can act on, not a failing run.
+    setAttachmentError('A referenced block was deleted; its # reference was removed from the draft.');
+};
+
+// The turns this client currently holds as live, tombstone-filtered authority. Used
+// when a DRAFT must be validated against the server state that exists NOW (N3).
+const liveTurnIds = (instance: Instance): ReadonlySet<string> =>
+    new Set([...instance.records.keys()].filter((id) => !instance.turnTombstones.has(id)));
+
+// Deletion tombstones (S3).
+//
+// A deletion is authoritative IMMEDIATELY, while observer frames, the 202 body of a
+// submit and in-flight GET answers that were captured BEFORE it can still arrive.
+// Filtering every inbound record through these sets is what stops such a frame from
+// resurrecting a deleted thread/turn (and re-focusing it) after the DELETE answer
+// already reconciled the deletion.
+const threadTombstoned = (instance: Instance, threadId: string | undefined): boolean =>
+    threadId !== undefined && instance.threadTombstones.has(threadId);
+
+const turnTombstoned = (instance: Instance, turn: SessionTurn): boolean =>
+    instance.turnTombstones.has(turn.id) || threadTombstoned(instance, turnThreadIdOf(turn));
+
+// Tombstone a removed thread AND everything it owns: descendant threads (by the
+// roster chain) and every recorded turn that ran in them. A child thread of a
+// deleted owner is removed by the server too, and must not survive locally.
+const tombstoneThread = (
+    instance: Instance,
+    threadId: string,
+    roster: readonly SessionThreadEntry[]
+): void => {
+    if (instance.threadTombstones.has(threadId)) return;
+
+    instance.threadTombstones.add(threadId);
+
+    for (const turn of instance.records.values()) {
+        if (turnThreadIdOf(turn) === threadId) instance.turnTombstones.add(turn.id);
+    }
+
+    for (const entry of roster) {
+        if (entry.ownerThreadId !== threadId) continue;
+        tombstoneThread(instance, entry.id, roster);
+    }
+};
+
 const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     // R8: a snapshot for a session this page deleted must never re-point the card
     // at it. The tombstone covers the observer/poll/resync/openSession/enqueue
     // continuations that were already in flight when the DELETE succeeded.
     if (deletedSessions.has(session.id)) return;
 
+    // N1: once this card points at a conversation, a snapshot for ANOTHER session
+    // is a late answer (an observer/get captured before the switch). It must not
+    // re-point the card, and — critically — must not become the deletion-learning
+    // baseline for the session now on screen. Opening a session sets the id first
+    // (openSession/ensureSession), so the intended path always passes this guard.
+    if (instance.sessionId !== undefined && instance.sessionId !== session.id) return;
+
     instance.sessionId = session.id;
-    // N3: bind before reconciling so every card rendered from this snapshot knows
-    // which session may answer it (and cards from a previous session expire).
+    // Answer routing: bind before reconciling so every card rendered from this
+    // snapshot knows which session may answer it (cards from another one expire).
     instance.view.bindSession(session.id);
 
-    // Snapshot watermark (R2). `session.updatedAt` is monotonic on the server, so a
-    // snapshot stamped BEFORE the newest one already applied is stale: it can only
-    // be the 202 body captured at enqueue time that resolved late. Its session-level
-    // status/queueDepth must not override the observer's newer frames (`turns` are
-    // still reconciled below — each turn carries its OWN `updatedAt` guard).
+    // Snapshot watermark (R2/N2). `session.updatedAt` is monotonic on the server, so
+    // a snapshot stamped before the newest one already applied is stale.
     const stamp = session.updatedAt;
     const mark =
         instance.snapshotMark !== undefined && instance.snapshotMark.sessionId === session.id
             ? instance.snapshotMark.at
             : undefined;
+    // N2 tie policy: only a STRICTLY older stamp is stale. Every new turn bumps the
+    // session's `updatedAt` at enqueue, so a snapshot missing an SSE-delivered turn
+    // necessarily carries an older stamp; an equal stamp describes the same moment
+    // and applying it cannot delete a turn that exists at that moment. Ignoring
+    // equal stamps instead broke the terminal-frame contract (a drain frame may
+    // share its millisecond with the last event), so the strict comparison is the
+    // conservative choice here. The first answer for a session has no mark and is
+    // always applied.
     const stale =
         typeof stamp === 'number' && Number.isFinite(stamp) && mark !== undefined ? stamp < mark : false;
-    if (!stale) markSnapshot(instance, session);
 
-    // A STALE snapshot may not rewrite anything the reader can see and act on:
-    // the frozen team, the live per-agent model map (a delayed 202 would revert a
-    // model PATCH made while it was in flight), discovery, the transcript pane and
-    // the sessions-rail cache all come from the newest snapshot only. What a stale
-    // snapshot MAY still do is reconcile turn records/tiles (each turn carries its
-    // own `updatedAt` guard) and recompute `pending` from those records.
-    if (!stale) {
-        // The frozen definition is the conversation's own team. Assign even when the
-        // server omitted it (legacy): keeping a previous session's frozen team would
-        // describe the wrong chat.
-        instance.frozen = frozenDefinitionOf(session);
+    // N2: a snapshot stamped before the newest one already applied is a LATE answer
+    // (the 202 body captured at enqueue time, or a GET issued before newer frames).
+    // It is authoritative for NOTHING on this path: its turn list can omit a turn a
+    // newer upsert already delivered, so reconciling it would delete that live row
+    // (and its focus), and its roster would regress the strip. Ignore it completely.
+    // Records that arrive with a stale answer are still merged by their own
+    // per-turn `updatedAt` guard where they ARE authoritative (`run` merges the 202
+    // record into its tile directly).
+    if (stale) return;
 
-        // The session's LIVE effective per-agent models + the settings model they
-        // inherit from (R2). The frozen `harnessDefinition` above is historical; this
-        // map is not: PATCH /sessions/:id replaces it and the next request uses it.
-        instance.sessionModels = agentModelsOf(session);
-        instance.sessionModel = typeof session.model === 'string' ? session.model : undefined;
-        instance.discovered = Array.isArray(session.discoveredTools)
-            ? [...session.discoveredTools]
-            : undefined;
+    markSnapshot(instance, session);
+
+    // --- deletion tombstones (S3) ---------------------------------------
+    // The sets are session-scoped: they are cleared by `openSession` (switch),
+    // `ensureSession` (new conversation) and `newSession`, and this function refuses
+    // snapshots for any other session id, so an id can never be tombstoned/learned
+    // across a session boundary (N1).
+
+    // Every inbound record is filtered through the tombstones BEFORE anything is
+    // stored or rendered — including a STALE snapshot, which may otherwise still
+    // carry a thread this client already deleted.
+    const incomingTurns = session.turns.filter((turn) => !turnTombstoned(instance, turn));
+    const incomingThreads = sessionThreadsOf(session).filter(
+        (entry) => !instance.threadTombstones.has(entry.id)
+    );
+
+    // Learn deletions from this AUTHORITATIVE snapshot (it passed the stale guard):
+    // whatever the previous roster/records had and this one no longer has is gone,
+    // and its turns/descendants go with it. A stale answer never reaches this code,
+    // so it can neither learn a phantom deletion nor drop a newer turn (N2).
+    const nextThreadIds = new Set(incomingThreads.map((entry) => entry.id));
+    for (const entry of instance.threads) {
+        if (!nextThreadIds.has(entry.id)) tombstoneThread(instance, entry.id, instance.threads);
     }
+
+    const nextTurnIds = new Set(incomingTurns.map((turn) => turn.id));
+    for (const id of instance.records.keys()) {
+        if (!nextTurnIds.has(id)) instance.turnTombstones.add(id);
+    }
+
+    // This snapshot is the newest one this instance has applied, so everything the
+    // reader sees comes from it: the frozen team, the live per-agent model map,
+    // discovery, the transcript pane and the sessions-rail cache.
+    //
+    // The frozen definition is the conversation's own team. Assign even when the
+    // server omitted it (legacy): keeping a previous session's frozen team would
+    // describe the wrong chat.
+    instance.frozen = frozenDefinitionOf(session);
+
+    // The session's LIVE effective per-agent models + the settings model they
+    // inherit from (R2). The frozen `harnessDefinition` above is historical; this
+    // map is not: PATCH /sessions/:id replaces it and the next request uses it.
+    instance.sessionModels = agentModelsOf(session);
+    instance.sessionModel = typeof session.model === 'string' ? session.model : undefined;
+    instance.discovered = Array.isArray(session.discoveredTools)
+        ? [...session.discoveredTools]
+        : undefined;
 
     // Authoritative records: latest snapshot, keyed by the server's stable id.
     // MONOTONIC per id: a stale snapshot may not replace a record this instance
     // already holds in a newer revision, otherwise `pending`/activity would flicker
     // back to a state the observer has already moved past.
     const records = new Map<string, SessionTurn>();
-    for (const turn of session.turns) {
+    for (const turn of incomingTurns) {
         const known = instance.records.get(turn.id);
         const knownAt = known === undefined ? undefined : known.updatedAt;
         records.set(
@@ -3830,15 +4171,14 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     }
     instance.records = records;
 
-    // Pending: a live (running/queued) RECORD is authoritative even when the
-    // snapshot that carried it is stale. The session-level flags are only trusted
-    // from a snapshot that is not stale (a stale `status: running` would leave Stop
-    // enabled after the queue has drained).
+    // Pending: a live (running/queued) RECORD or the session-level flags of this
+    // authoritative snapshot. No stale snapshot can reach here to leave Stop enabled
+    // after the queue drained.
     const liveRecord = [...records.values()].some((turn) => {
         const status = turn.status as string;
         return status === 'running' || status === 'queued';
     });
-    instance.pending = liveRecord || (!stale && (queueDepthOf(session) > 0 || session.status === 'running'));
+    instance.pending = liveRecord || queueDepthOf(session) > 0 || session.status === 'running';
 
     // Activity from a hydrated/polled record: ONLY a still-running turn can make
     // an agent busy. Replaying a settled turn (done/error/cancelled) lights
@@ -3854,35 +4194,51 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     // turn's panels are valid scratch state (they describe work that happened), but
     // they never light an agent ring: activity above only reads a RUNNING turn.
     // Recomputation also means no cross-session leakage: the board is replaced with
-    // exactly what this conversation recorded. A stale snapshot is skipped: its
-    // older turn list would drop panels a newer frame already delivered.
-    if (!stale) instance.panels = mediaOfTurns(session.turns);
+    // exactly what this conversation recorded.
+    instance.panels = mediaOfTurns(incomingTurns);
 
-    // The tile detail line follows the model the instance CURRENTLY runs, not the
-    // one the snapshot was stamped with (a stale 202 predates a model PATCH).
-    instance.view.reconcile(session.turns, stale ? instance.sessionModel : session.model);
+    // `labelSeeds` keeps every surviving turn's block labels identical across a
+    // deletion: a replayed turn seeds its allocator from the counters the server
+    // recorded at ITS start instead of from the (now shorter) surviving list. Read
+    // structurally so a server without the field falls back to the old numbering.
+    // Tombstone-filtered turns and roster: a late 202 body or an in-flight answer
+    // captured before a DELETE can never resurrect the deleted thread or its turns.
+    instance.view.reconcile(incomingTurns, session.model, undefined, labelSeedsOf(session));
 
-    if (!stale) {
-        instance.view.setTranscript(JSON.stringify(session.messages, null, 2));
-        upsertSession(session);
-        renderSessions();
+    // Persistent thread roster (R5/R7). Only an authoritative snapshot repaints the
+    // strip (the stale guard above returns first). The board's own reconcile has
+    // already dropped a deleted thread's turns, so a focused thread that is gone
+    // loses focus there and the unfocus path stays honest.
+    instance.threads = incomingThreads;
+    instance.view.setThreads(instance.threads);
 
-        // Session outcome detail (R1/R2). This is the ONE report of a failed run:
-        // the topbar pill is app-scoped, so a failure can neither leak into another
-        // session's header nor go stale when the reader switches away. The tile's
-        // status word still says `error`/`cancelled`; this line adds the server's
-        // message, which the record's events do not carry. A deliberate stop is
-        // suppressed: the server stores `The run was cancelled.` as `lastError`, and
-        // the tile already reports `cancelled` — repeating it here would present the
-        // user's own Stop as an error.
-        const failure =
-            session.status === 'error'
-                ? session.lastError === CANCELLED_MESSAGE
-                    ? undefined
-                    : (session.lastError ?? 'session error')
-                : undefined;
-        instance.view.setNotice(failure);
-    }
+    // Authoritative deletion reconciliation for the DRAFT (R7). A `#` reference chip
+    // binds a turn that may no longer exist (its thread was deleted): the wire
+    // rejects an unknown turn, so the stale chip is removed from the field NOW and
+    // the reader is told, instead of failing the whole submit later. Labels stay
+    // untouched for every surviving chip: the server owns allocation and a deletion
+    // never renumbers the blocks that remain. Only the SELECTED instance owns the
+    // composer, so another harness's snapshot cannot mutate it.
+    if (instance === current) purgeStaleReferences(new Set(incomingTurns.map((turn) => turn.id)));
+
+    instance.view.setTranscript(JSON.stringify(session.messages, null, 2));
+    upsertSession(session);
+    renderSessions();
+
+    // Session outcome detail (R1/R2). This is the ONE report of a failed run: the
+    // topbar pill is app-scoped, so a failure can neither leak into another session's
+    // header nor go stale when the reader switches away. The tile's status word still
+    // says `error`/`cancelled`; this line adds the server's message, which the
+    // record's events do not carry. A deliberate stop is suppressed: the server
+    // stores `The run was cancelled.` as `lastError`, and the tile already reports
+    // `cancelled` — repeating it here would present the user's own Stop as an error.
+    const failure =
+        session.status === 'error'
+            ? session.lastError === CANCELLED_MESSAGE
+                ? undefined
+                : (session.lastError ?? 'session error')
+            : undefined;
+    instance.view.setNotice(failure);
 
     if (current !== instance) return;
 
@@ -3968,6 +4324,11 @@ const onStreamItem = (
     if (watch === undefined || watch.controller !== controller) return;
 
     if (item.type === 'turn') {
+        // S3: a DELETED thread (or a turn removed with it) must never come back. An
+        // upsert can be in flight while the DELETE answer lands, so the tombstone —
+        // not arrival order — decides. The tile is not adopted and no focus moves.
+        if (turnTombstoned(instance, item.turn)) return;
+
         // UPSERT the record and the tile. A queued turn is retained behind the
         // active one; a running turn starts the clock/ring; a terminal one settles.
         instance.records.set(item.turn.id, item.turn);
@@ -3985,6 +4346,10 @@ const onStreamItem = (
     }
 
     if (item.type === 'event') {
+        // A late event for a deleted turn is dropped for the same reason as a late
+        // upsert (S3): it would repaint a conversation the server already removed.
+        if (instance.turnTombstones.has(item.turnId)) return;
+
         // Route by explicit turn id. The `turn` upsert precedes its events, so a
         // missing tile means this frame is for a turn this view does not hold
         // (another tab, a stale frame): the terminal snapshot reconciles it.
@@ -4043,6 +4408,70 @@ const resyncSession = async (instance: Instance, sessionId: string): Promise<voi
         // reports its own trouble. The task is unaffected either way.
         pollSession(instance, sessionId);
     }
+};
+
+// Stop ONE persistent thread (R5/R7) — the far-right `×` on a running thread row.
+//
+// This is deliberately NOT `stopRun`: siblings keep running, the queue is untouched,
+// and the observer stays subscribed (the stop arrives as a turn update/snapshot on
+// the stream already open). The answer carries the post-stop snapshot, which is
+// authoritative; a `cancelled: false` (nothing to abort) still reconciles the
+// roster, so the row flips to its delete affordance instead of lying about being
+// stopped.
+const stopThreadFor = (harnessName: string, threadId: string): void => {
+    const instance = instances.get(harnessName);
+    const sessionId = instance?.sessionId;
+    if (instance === undefined || sessionId === undefined) return;
+
+    void cancelSessionThread(sessionId, threadId)
+        .then((answer) => {
+            // The reader may have switched sessions/harnesses while the POST was in
+            // flight; that answer must not paint into another conversation.
+            if (instance.sessionId !== sessionId) return;
+
+            // `cancelled: false` (nothing to abort) still carries the roster: apply
+            // it so the row shows the server's truth either way.
+            applySnapshot(instance, answer.session);
+        })
+        .catch((error: unknown) => {
+            if (instance.sessionId !== sessionId) return;
+            // A refused stop is reported on the conversation it belongs to (R1/R2),
+            // and the roster is re-read so the row reflects the server's truth.
+            instance.view.notice(`Could not stop the thread: ${messageOf(error)}`);
+            void resyncSession(instance, sessionId);
+        });
+};
+
+// Delete ONE idle/stopped persistent thread (R7) — the confirmed `×` on a row that is
+// not running. The server owns the deletion and answers with a complete snapshot:
+// applying THAT is what removes the thread's turns (and any focus/reference aimed at
+// them) without a stale local frame resurrecting the thread a moment later.
+const deleteThreadFor = (harnessName: string, threadId: string): void => {
+    const instance = instances.get(harnessName);
+    const sessionId = instance?.sessionId;
+    if (instance === undefined || sessionId === undefined) return;
+
+    void deleteSessionThread(sessionId, threadId)
+        .then((answer) => {
+            if (instance.sessionId !== sessionId) return;
+
+            // S3: the deletion is authoritative from THIS moment. Remember the
+            // thread (and its descendants/turns) BEFORE applying the answer so an
+            // in-flight 202/SSE/GET captured earlier cannot bring it back, and so a
+            // late frame cannot re-focus it.
+            tombstoneThread(instance, threadId, instance.threads);
+            applySnapshot(instance, answer.session);
+
+            // A focused conversation that was just deleted loses focus immediately;
+            // `applySnapshot` reconciles the board and roster, and this clears the
+            // composer target even if the roster answer is momentarily stale.
+            if (instance.view.focusedThread() === threadId) instance.view.clearFocus();
+        })
+        .catch((error: unknown) => {
+            if (instance.sessionId !== sessionId) return;
+            instance.view.notice(`Could not delete the thread: ${messageOf(error)}`);
+            void resyncSession(instance, sessionId);
+        });
 };
 
 const startWatching = (instance: Instance, sessionId: string): void => {
@@ -4196,6 +4625,23 @@ const openSession = async (id: string): Promise<void> => {
         if (instance !== target && instance.sessionId === id) instance.sessionId = undefined;
     }
 
+    // N1: everything the instance holds about the conversation being LEFT is stale
+    // once a DIFFERENT session is opened. Thread ids are minted per session, so the
+    // previous session's roster/records must not be the baseline for `applySnapshot`
+    // deletion learning — otherwise an id the new session will mint later (e.g.
+    // `thread-2`) is tombstoned on arrival and the new thread can never appear.
+    //
+    // Tombstones are session-scoped by construction: they live on the instance and
+    // are cleared exactly here (and in `ensureSession`/`newSession`), while
+    // `applySnapshot` refuses a snapshot for any other session id.
+    if (target.sessionId !== undefined && target.sessionId !== id) {
+        target.threadTombstones.clear();
+        target.turnTombstones.clear();
+        target.records = new Map<string, SessionTurn>();
+        target.threads = [];
+        target.snapshotMark = undefined;
+    }
+
     target.sessionId = id;
     // N3: an answer card from the conversation being left cannot follow the
     // reader here; binding expires it before the new transcript is drawn.
@@ -4256,6 +4702,13 @@ const newSession = (): void => {
     // that lived only in the browser (R21.3).
     instance.panels.clear();
     clearActivity();
+    // The conversation (and its thread roster) is gone: clearing the board also
+    // drops the focus, and the empty roster hides the strip instead of leaving the
+    // previous session's threads clickable.
+    instance.threads = [];
+    instance.threadTombstones.clear();
+    instance.turnTombstones.clear();
+    instance.view.setThreads(instance.threads);
     instance.view.clear();
     // The conversation (and its failure/stop detail) is gone; an empty session has
     // no outcome to report.
@@ -4383,9 +4836,17 @@ const ensureSession = async (instance: Instance): Promise<string> => {
         ? [...session.discoveredTools]
         : undefined;
     // A fresh session has no turns and no pending work; clear any stale queue state
-    // from the conversation this card used to point at.
+    // from the conversation this card used to point at. Tombstones are per-session,
+    // so the new conversation starts with none (S3).
+    instance.threadTombstones.clear();
+    instance.turnTombstones.clear();
     instance.records = new Map(session.turns.map((turn) => [turn.id, turn]));
     instance.pending = pendingOf(session);
+    // A brand-new session has no persistent threads yet; painting the empty roster
+    // clears any strip and focus left over from the conversation this card used to
+    // point at.
+    instance.threads = sessionThreadsOf(session);
+    instance.view.setThreads(instance.threads);
     // A freshly created session starts with an empty turn list, so recomputing from
     // it both empties the board and guarantees nothing from a previously viewed
     // session survives a New session.
@@ -4452,14 +4913,46 @@ const run = async (): Promise<void> => {
     // Exact # bindings carried by reference chips, plus a DOM snapshot of the
     // whole draft. A failed submit restores the snapshot, so a reference chip keeps
     // its turn/thread binding instead of degrading to plain `#LABEL` text.
-    const references = referencesOfChips(editorChips(input));
+    //
+    // Boundary filter (R7): a chip can name a turn an authoritative snapshot has
+    // already dropped (its thread was deleted between the last paint and this
+    // click). The server rejects the WHOLE body in that case, so the stale binding
+    // is dropped here as a last line of defence; `purgeStaleReferences` normally
+    // removes the chip itself the moment the snapshot arrives.
+    const knownTurns = instance.sessionId === undefined ? undefined : new Set(instance.records.keys());
+    const references = referencesOfChips(editorChips(input)).filter(
+        (reference) => knownTurns === undefined || knownTurns.has(reference.turnId)
+    );
+
+    // WHERE this message goes (R5/R6). Computed from the same focus + reference +
+    // attachment inputs the composer's routing line shows, through the same pure
+    // helper:
+    //   - focused idle/stopped thread -> continue it;
+    //   - focused running thread, text only, every reference settled -> steer it;
+    //   - focused running thread WITH attachments or an unfinished reference -> a
+    //     queued continuation turn in the same thread (label says "Queued in");
+    //   - no focus, # references    -> NEW thread connected through those blocks;
+    //   - no focus, no references   -> NEW standalone thread.
+    // The qualifier is display-only: `threadId` (and therefore the body) is the same
+    // in every focused case, and its absence is the wire's "open a new thread"
+    // signal, so a legacy server sees the exact body it always saw.
+    const target = resolveSubmitTarget({
+        focus: instance.view.focusedThread(),
+        threads: instance.threads,
+        references: references.length,
+        // `validated` is the exact set leaving the browser, so the qualifier cannot
+        // disagree with what the server receives.
+        attachments: validated.length,
+        unfinishedReferences: unfinishedReferenceCount(instance.records, references)
+    });
+
     const draftSnapshot = editorSnapshot(input);
     setAttachmentError(undefined);
 
     // The tile exists before the request does, in submission order, so a second
     // task visibly sits BEHIND the active one from the first frame. It starts
     // `queued` and neutral: no ring, no clock.
-    const turn = instance.view.begin(prompt, validated);
+    const turn = instance.view.begin(prompt, validated, target.threadId);
     // `submitting` is set BEFORE the field is cleared so the chip MutationObserver
     // does not mistake this programmatic clear for a user deletion.
     submitting = true;
@@ -4489,13 +4982,32 @@ const run = async (): Promise<void> => {
             sessionId,
             prompt,
             validated,
-            references.length === 0 ? undefined : references
+            references.length === 0 ? undefined : references,
+            // Absent for a new thread: the server decides the new thread's id and
+            // reports it on the record (and in the roster of the snapshot below).
+            target.threadId
         );
 
-        // Bind the server id/index and mirror the queue position. `merge` applies
-        // only events that are not already on the tile (normally none yet), so a
-        // retried answer can never duplicate a streamed prefix.
-        turn.merge(record, session.model);
+        // Steering answers with the OWNING turn (same id, `steered: true`) instead
+        // of a new record: the optimistic steering row must not survive as an unbound
+        // queued ghost, so it is discarded and the record is merged into the tile
+        // that already represents that conversation. Every other path binds this tile
+        // as usual, and `merge` applies only events the tile has not seen yet (a
+        // retried answer can never duplicate a streamed prefix).
+        //
+        // The id check is kept alongside the marker: it also collapses the (rare)
+        // case of a server that folds the submit without reporting `steered`.
+        const owner = instance.view.turn(record.id);
+        if (owner !== undefined && owner !== turn) {
+            instance.view.discard(turn);
+            owner.merge(record, session.model);
+        } else {
+            turn.merge(record, session.model);
+        }
+
+        // Keep the steering target visible on the conversation that received the
+        // message: continuing/steering must not silently move focus elsewhere.
+        if (target.threadId !== undefined) instance.view.focusThread(target.threadId);
 
         upsertSession(session);
         renderSessions();
@@ -4559,6 +5071,15 @@ const run = async (): Promise<void> => {
         if (editorText(input).length === 0) {
             editorRestore(input, draftSnapshot);
             autoGrow();
+
+            // N3: the restored snapshot was captured BEFORE this request. If a `#`
+            // target was deleted while the submit was in flight (the usual reason a
+            // continue/steer is rejected), restoring its chip would reinstate a
+            // binding the server no longer knows — and the next retry would either
+            // 400 again or resolve the same label to a different block. Filter the
+            // restored chips against the LIVE tombstone-filtered records, silently:
+            // the surviving text, attachments and draft entries stay untouched.
+            purgeStaleReferences(liveTurnIds(instance), { report: false });
         } else {
             // Marker counters keep their values (a removed marker is never
             // renumbered - same rule as the chip × and the chip observer).
@@ -4742,6 +5263,13 @@ const stopRun = (): void => {
 actionButton.addEventListener('click', (event) => {
     if (actionButton.dataset.action !== 'stop') return;
 
+    event.preventDefault();
+    stopRun();
+});
+
+// The separate stop-all control shares `stopRun` exactly (cancelSession(id, true)):
+// one cancellation path, one reconciliation, both from the same `pending` guard.
+stopAllButton.addEventListener('click', (event) => {
     event.preventDefault();
     stopRun();
 });

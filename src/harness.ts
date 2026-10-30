@@ -89,6 +89,45 @@
 //   - agentManage  — list agents and result previews.(every agent, core)
 //   - agentResult  — read one completed result.       (every agent, core)
 //   - agentDelegate — hand a task to a subagent.     (primary agent only, core)
+//   - threadSend   — post a message into another thread. (every agent, core,
+//                    registered once this session owns an independent thread)
+//   - threadList   — list this session's live conversations and ids. (same
+//                    condition; registered with threadSend so ids are observed,
+//                    never invented by the model or injected by the server)
+//
+// TERMINOLOGY (R1). Three levels, kept deliberately distinct:
+//   - HARNESS — this factory and the execution loop. It provides callable agents.
+//   - SESSION — server-controlled shared memory: one harness instance plus the
+//     record stores, agent results, and snapshot/restore.
+//   - THREAD  — one persistent, agent-owned conversation with a stable id and its
+//     own transcript.
+// Every configured agent owns a DEFAULT thread (`agent:<name>`) whose transcript
+// is the registry Agent's history, which is what keeps delegation's historical
+// accumulation. `harness.createThread(agent)` opens an ADDITIONAL independent
+// conversation (a fresh Agent with the same instructions/transport/model), so two
+// threads of one agent run CONCURRENTLY while sharing this session's tools and
+// stores. A delegation/ctx.run child OF A HOST THREAD becomes its own host
+// conversation (own id/transcript, ownerThreadId = caller) instead of reusing the
+// child agent's default conversation, so concurrent siblings never mix and every
+// child is addressable/stopped/deleted through the same host API. A host thread
+// re-reads its owning agent's model at each run start, so a model change reaches
+// every live thread of that agent on its next run.
+// Thread runs are serialized per thread and never overlap inside one
+// thread; `sendThreadInput` resumes, `steerThread` queues guidance for the next
+// safe model boundary, `stopThread`/`stopAllThreads` abort (cascading to owned
+// children), and `deleteThread` purges a terminal host conversation plus its
+// invocation/branch lookups without pretending to erase what other histories
+// already learned from it (its invocation results and every branch materialized
+// from it go with it). `threadSend` lets an agent post into another thread
+// (sender identity is runtime-derived, so it cannot be spoofed) and its paired
+// `threadList` roster exposes the live ids of this session only.
+//
+// Ownership and stop invariants (review corrections): only a HOST thread may own
+// another thread (`agent:<name>` is implicit and cannot be persisted as an owner);
+// a stop invalidates every host turn already queued on the conversation (the stop
+// epoch is captured at submission), so only a NEW host send revives it; steering
+// drained into a run that fails for a non-stop reason is re-queued for the next
+// host turn instead of being lost.
 //
 // toolCreate is the R2b capability: the model can author a JavaScript tool body
 // mid-conversation, and the tool is registered searchable and enabled at once. The
@@ -230,6 +269,18 @@ import {
     createTaskScheduler,
     TOOL_CANCEL_METADATA,
     TOOL_CANCEL_NAME,
+    // R4 cross-thread chat + R2 thread agents. A host thread is backed by a fresh
+    // Agent built from the owner's configuration (core/thread.ts), and the chat
+    // tool is registered lazily once the session owns an independent thread.
+    THREAD_LIST_METADATA,
+    THREAD_LIST_NAME,
+    THREAD_SEND_METADATA,
+    THREAD_SEND_NAME,
+    THREAD_HOST_PREFIX,
+    MAX_THREAD_RECORDS,
+    createThreadAgent,
+    defaultThreadIdOf,
+    normalizeThreadLabel,
     // N6 runtime: branch identity/creation, action-request parsing, fork bounds,
     // and the private metadata of the two branch tools.
     ACTION_REQUEST_METADATA,
@@ -283,6 +334,11 @@ import type {
     HarnessStateChangeReason,
     HarnessStreamTool,
     HarnessThread,
+    HarnessThreadCreateOptions,
+    HarnessThreadMessageResult,
+    HarnessThreadRecord,
+    HarnessThreadRoster,
+    HarnessThreadSteerReceipt,
     HarnessToolCall,
     HarnessToolOutcome,
     Tool,
@@ -434,6 +490,13 @@ const TOOL_CANCEL = TOOL_CANCEL_NAME;
 // to fork or ask from.
 const THREAD_FORK = THREAD_FORK_NAME;
 const ACTION_REQUEST = ACTION_REQUEST_NAME;
+// R4 cross-thread chat. Registered lazily (the first `createThread`), because a
+// session with one conversation per agent has no second thread to talk to and
+// must keep its historical declaration list. The name is reserved all the same.
+const THREAD_SEND = THREAD_SEND_NAME;
+// R4 roster: the discoverable source of the ids `threadSend` accepts, so neither a
+// model nor the server has to invent or inject them. Registered with threadSend.
+const THREAD_LIST = THREAD_LIST_NAME;
 
 // Names no configured, preset, plugin, or model-created tool may take. Keeping
 // the whole list in one place is what makes the reservation check exhaustive.
@@ -452,7 +515,9 @@ const RESERVED_TOOL_NAMES = [
     AGENT_DELEGATE,
     TOOL_CANCEL,
     THREAD_FORK,
-    ACTION_REQUEST
+    ACTION_REQUEST,
+    THREAD_SEND,
+    THREAD_LIST
 ] as const;
 
 // Budget for toolCreate: registration is cheap but not free, and an unbounded
@@ -972,6 +1037,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         content: string;
         // Failure/cancellation message (never a transcript or tool body).
         error?: string;
+        // R2: the persistent thread that owns this invocation. Internal only; it
+        // exists so `deleteThread` can purge every lookup scoped to the removed
+        // conversation (the persisted agent-result schema is unchanged).
+        threadId?: string;
     };
 
     const invocationRecords = new Map<string, AgentInvocationRecord>();
@@ -1010,7 +1079,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             kind: invocationKindOf(run),
             status: 'running',
             content: '',
-            completedOrder: 0
+            completedOrder: 0,
+            ...(run.threadId === undefined ? {} : { threadId: run.threadId })
         });
 
         pruneInvocationRecords();
@@ -1476,6 +1546,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // shape. Built once in runAgent so every frame of this invocation (start,
         // text, tool_call/result, usage, done, error) carries the same id.
         thread?: HarnessThread;
+        // R2: the PERSISTENT thread this run executes in. Every ordinary run has
+        // one (root = the primary's default conversation, delegation = the
+        // child's default conversation, host call = the created thread); a
+        // fork/autoanswer branch owns an ephemeral transcript instead and has
+        // none.
+        threadState?: ThreadState;
+        // The persistent thread id, carried to ToolContext (sender identity) and
+        // to the invocation record (delete-thread purge). Distinct from
+        // `thread.id`, which is the per-RUN invocation id.
+        threadId?: string;
         signal?: AbortSignal;
         lineage: readonly Agent[];
         parent?: RunState;
@@ -1507,6 +1587,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // last substantive tool-free response below and may resolve to it instead
         // of a whitespace-only terminal turn.
         delegateAnswer: boolean;
+        // Steering drained from the thread queue INTO this run. A successful run
+        // consumes it; a failed run rolls the appended messages back with the
+        // transcript, so the text is re-queued for the next host turn (a stop
+        // discards it by contract). Order is preserved either way.
+        steering: string[];
         // The latest substantive response THIS run produced: no tool calls, a
         // normal stop, and non-blank text. Captured on the run itself so the
         // fallback never rescans agent history after the run returns — the agent
@@ -1539,6 +1624,522 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // (launchToolCall) and the manual path (executeTool) opt into identical
     // semantics.
     const DELEGATE_ANSWER: RunInternals = { delegateAnswer: true };
+
+    // -----------------------------------------------------------------------
+    // R2 persistent threads
+    // -----------------------------------------------------------------------
+    //
+    // A THREAD is one persistent, agent-owned conversation. The session (one
+    // harness) owns the shared memory — tools, todo list, profiles, chapters,
+    // locations, discovery, creation budget — and every thread shares it; only
+    // the TRANSCRIPT and the execution slot are per thread.
+    //
+    //   'agent' — the agent's default conversation. Its Agent is the registry
+    //             instance, so delegation/ctx.run/host calls keep writing to the
+    //             historical transcript. Id: `agent:<name>`, derived (never
+    //             persisted), which is why snapshot v1 can omit it.
+    //   'host'  — an additional conversation from `harness.createThread`, backed
+    //             by a FRESH Agent instance with the same instructions, seed
+    //             messages, transport, and current model. Two host threads of one
+    //             agent run concurrently because their actor keys differ.
+    //
+    // Steering and cross-thread chat are queued here and drained by the run loop
+    // at the next safe model boundary (never inside an in-flight request).
+    type ThreadState = {
+        // Internal and mutable; every public read returns a copy.
+        record: HarnessThreadRecord;
+        agent: Agent;
+        // Text queued for the next model boundary, in arrival order. A message
+        // queued while the thread is idle is appended directly instead, so this
+        // only holds input for a RUNNING thread.
+        queue: string[];
+        // The active run (at most one per thread; `acquireAgent` serializes).
+        run?: RunState;
+        // Cancellation for the active run. Linked to the caller's signal, so a
+        // host abort, `stopThread`, and an owner's stop all reach the same work.
+        controller?: AbortController;
+        // Stop epoch (M1). Every stop bumps this, and a submission captures it at
+        // call time; a queued run whose epoch is stale is REJECTED instead of
+        // running (a stop must cancel work that was already queued, not only the
+        // active request). A NEW host send after the stop captures the new epoch
+        // and is therefore the one legal revival path.
+        generation: number;
+    };
+
+    const threadStates = new Map<string, ThreadState>();
+
+    // Creation-order sequence for records (defaults first, then host threads). It
+    // is the public `sequence` field and the deterministic sort key.
+    let threadSequence = 0;
+    // Host-thread id high-water mark (`thread-<N>`). Separate from the ordering
+    // sequence so the first host thread is `thread-1` even though the configured
+    // agents already occupy sequence slots. Persisted as `threadSequence`, so a
+    // restart can never reuse a deleted thread's id.
+    let threadIdSequence = 0;
+
+    // A thread record is copied on every read: a caller must never mutate live
+    // scheduling/ownership state through the handle.
+    const threadRecordCopy = (record: HarnessThreadRecord): HarnessThreadRecord => ({ ...record });
+
+    const threadStateOf = (threadId: string): ThreadState => {
+        const state = threadStates.get(threadId);
+
+        if (state === undefined) {
+            throw new HarnessError(
+                `Thread "${threadId}" is not available in this harness; it was never created, or it was deleted.`
+            );
+        }
+
+        return state;
+    };
+
+    // The default conversation of a REGISTRY agent. A branch/fork/thread Agent is
+    // not a registry entry, so it has no default thread of its own.
+    const defaultThreadOf = (brain: Agent): ThreadState | undefined => {
+        if (agents[brain.name] !== brain) return undefined;
+        return threadStates.get(defaultThreadIdOf(brain.name));
+    };
+
+    // Default conversations are derived state: one idle record per configured
+    // agent, in configuration order, with deterministic sequence numbers. They are
+    // created BEFORE any run, so `threads()`/`sendThreadInput` always resolve.
+    for (const name of Object.keys(agents)) {
+        threadStates.set(defaultThreadIdOf(name), {
+            record: {
+                id: defaultThreadIdOf(name),
+                agent: name,
+                origin: 'agent',
+                status: 'idle',
+                sequence: ++threadSequence
+            },
+            agent: agents[name],
+            queue: [],
+            generation: 0
+        });
+    }
+
+    // The live conversations of this session, newest last, as detached records.
+    // Shared by the host-facing `threads()` and the model-facing `threadList`
+    // tool, so both read exactly the same roster (deleted threads are already
+    // absent from the map). `currentThreadId` comes from the RUN, never from a
+    // tool argument.
+    const threadRoster = (currentThreadId?: string): HarnessThreadRoster => ({
+        ...(currentThreadId === undefined ? {} : { currentThreadId }),
+        threads: [...threadStates.values()]
+            .sort((left, right) => left.record.sequence - right.record.sequence)
+            .map((state) => threadRecordCopy(state.record))
+    });
+
+    // Cross-thread chat + roster are CONDITIONAL core tools (core/metadata.ts):
+    // a session with one conversation per agent pays no context for them, and the
+    // historical declaration list of a harness that never opens a thread is
+    // unchanged. Registration is idempotent; once registered they stay (deleting
+    // the last host thread must not yank a tool between two model turns).
+    //
+    // They are registered TOGETHER: an id is only useful if it can be discovered,
+    // so exposing threadSend without its roster would force the server (or the
+    // model) to invent targets.
+    const registerThreadTools = (): void => {
+        if (tools[THREAD_LIST] === undefined) {
+            tools[THREAD_LIST] = defineTool<Record<string, never>, HarnessThreadRoster>({
+                ...THREAD_LIST_METADATA,
+                execute: ({ threadId }) => threadRoster(threadId)
+            });
+        }
+
+        if (tools[THREAD_SEND] !== undefined) return;
+
+        tools[THREAD_SEND] = defineTool<{ thread: string; message: string }, HarnessThreadMessageResult>({
+            ...THREAD_SEND_METADATA,
+            execute: ({ agent: caller, threadId, parameters }) => {
+                const target = typeof parameters?.thread === 'string' ? parameters.thread.trim() : '';
+                const message = typeof parameters?.message === 'string' ? parameters.message : '';
+
+                if (target.length === 0) {
+                    throw new HarnessError('threadSend requires a non-empty target thread id.');
+                }
+
+                if (message.trim().length === 0) {
+                    throw new HarnessError('threadSend requires a non-empty message.');
+                }
+
+                // SENDER IDENTITY (R4): derived from the runtime context, never
+                // from a tool argument. A manual executeTool call has no
+                // `threadId` and runs as the primary agent (an operator action).
+                return postThreadMessage(
+                    {
+                        agent: caller?.name ?? primaryName,
+                        ...(threadId === undefined ? {} : { threadId })
+                    },
+                    target,
+                    message
+                );
+            }
+        });
+    };
+
+    // Deliver one cross-thread message. The text is attributed explicitly, so the
+    // receiving model can tell another conversation's data from its own owner's
+    // instructions.
+    const postThreadMessage = (
+        sender: { agent: string; threadId?: string },
+        targetThreadId: string,
+        message: string
+    ): HarnessThreadMessageResult => {
+        const target = threadStateOf(targetThreadId);
+        const receipt: HarnessThreadMessageResult = {
+            threadId: targetThreadId,
+            delivered: target.record.status === 'running' ? 'queued' : 'appended',
+            sender: sender.agent,
+            ...(sender.threadId === undefined ? {} : { senderThreadId: sender.threadId })
+        };
+
+        if (target.record.status === 'stopped') {
+            throw new HarnessError(
+                `Thread "${targetThreadId}" is stopped; it cannot receive messages until a host resumes or deletes it.`
+            );
+        }
+
+        const content = `from agent "${sender.agent}"${
+            sender.threadId === undefined ? '' : ` (thread ${sender.threadId})`
+        }:\n${message}`;
+
+        if (target.record.status === 'running' && target.run !== undefined) {
+            // Running: land at the next model boundary, never inside the request
+            // that is already in flight (R5 ordering guarantee).
+            target.queue.push(content);
+            notifyStateChange('thread');
+            markRunDirty(target.run);
+            return receipt;
+        }
+
+        // Idle: append immediately. Nothing is executing, so the message is
+        // visible on the thread's next run without any scheduling work.
+        target.agent.user(content);
+        notifyStateChange('agent_message', { agent: target.agent.name });
+        return receipt;
+    };
+
+    // Create one host thread and return its LIVE state. Shared by the public
+    // `createThread` and the runtime's host-parent delegation (R4), so both paths
+    // enforce the same agent/owner/label/cap rules and both produce a persistable
+    // record. `notify` lets the runtime skip a redundant save signal mid-run (the
+    // run itself already emits agent/thread state changes).
+    const createThreadState = (
+        agentName: string,
+        options?: HarnessThreadCreateOptions,
+        notify = true
+    ): ThreadState => {
+        if (!Object.prototype.hasOwnProperty.call(agents, agentName)) {
+            throw new HarnessError(
+                `Agent "${String(agentName)}" is not registered. Configured agents: ${Object.keys(agents).join(', ')}.`
+            );
+        }
+
+        // Bound the persisted set: snapshot v1 refuses more than
+        // MAX_THREAD_RECORDS host threads, and a harness must never emit a
+        // snapshot its own restore rejects. Deleting a terminal thread frees a
+        // slot; the id high-water mark does not move.
+        const hostThreadCount = [...threadStates.values()].filter(
+            (state) => state.record.origin === 'host'
+        ).length;
+
+        if (hostThreadCount >= MAX_THREAD_RECORDS) {
+            throw new HarnessError(
+                `This session already has ${hostThreadCount} independent threads; delete a terminal one before creating another (maximum ${MAX_THREAD_RECORDS}).`
+            );
+        }
+
+        const label = normalizeThreadLabel(options?.label);
+        const ownerThreadId = options?.ownerThreadId;
+
+        if (ownerThreadId !== undefined) {
+            // Validate the link before minting an id: a bad owner must not leave a
+            // half-created record behind.
+            const owner = threadStateOf(ownerThreadId);
+
+            // H1: only an INDEPENDENT host thread may own another thread. A default
+            // conversation (`agent:<name>`) is implicit and never persisted as a
+            // thread record, so a child pointing at it could not be restored (the
+            // persisted owner link would name a record the snapshot omits). Reject
+            // it at creation instead of emitting a self-incompatible snapshot.
+            // Runtime-created delegation children always use a HOST parent thread.
+            if (owner.record.origin !== 'host') {
+                throw new HarnessError(
+                    `Thread "${ownerThreadId}" is an agent's default conversation; only an independent host thread can own another thread.`
+                );
+            }
+        }
+
+        const id = `${THREAD_HOST_PREFIX}${++threadIdSequence}`;
+        const source = agents[agentName];
+        const threadAgent = createThreadAgent(source);
+
+        // Scheduling identity and role travel with the fresh Agent, so a thread of
+        // the primary keeps primary tools while never queueing behind the default
+        // conversation (and vice versa).
+        actorRoles.set(threadAgent, roleOf(source));
+        actorKeys.set(threadAgent, `thread:${id}`);
+
+        const state: ThreadState = {
+            record: {
+                id,
+                agent: agentName,
+                origin: 'host',
+                status: 'idle',
+                sequence: ++threadSequence,
+                ...(ownerThreadId === undefined ? {} : { ownerThreadId }),
+                ...(label === undefined ? {} : { label })
+            },
+            agent: threadAgent,
+            queue: [],
+            generation: 0
+        };
+
+        threadStates.set(id, state);
+        registerThreadTools();
+        if (notify) notifyStateChange('thread');
+        return state;
+    };
+
+    const createThread = (
+        agentName: string,
+        options?: HarnessThreadCreateOptions
+    ): HarnessThreadRecord => threadRecordCopy(createThreadState(agentName, options).record);
+
+    // Every persistent parent above `state`, nearest first. A corrupt/cyclic link
+    // (only possible after a hand-edited snapshot) terminates instead of looping.
+    const ownersOf = (state: ThreadState): ThreadState[] => {
+        const chain: ThreadState[] = [];
+        const seen = new Set<string>([state.record.id]);
+        let current = state.record.ownerThreadId;
+
+        while (current !== undefined && !seen.has(current)) {
+            seen.add(current);
+            const owner = threadStates.get(current);
+            if (owner === undefined) break;
+            chain.push(owner);
+            current = owner.record.ownerThreadId;
+        }
+
+        return chain;
+    };
+
+    // Mark one thread stopped and abort its run, if any. Returns whether a live run
+    // was actually aborted (a thread with no active work is still marked stopped).
+    const stopThreadState = (state: ThreadState, reason: HarnessError): boolean => {
+        state.record.status = 'stopped';
+        // M1: invalidate every submission that existed before this stop. A queued
+        // `sendThreadInput` carries the epoch it observed at call time; after the
+        // bump it refuses to run, so "stopped" cannot be rewritten to running by
+        // work that was already waiting. A NEW host send captures the new epoch,
+        // which is the only legal revival path.
+        state.generation += 1;
+        // Guidance queued for a conversation that is being stopped is discarded:
+        // a later host revive starts from the host's new input, not from stale
+        // steering the aborted run never consumed.
+        state.queue.length = 0;
+
+        if (state.run === undefined || !state.run.active || state.controller === undefined) {
+            return false;
+        }
+
+        // Abort reaches the model request, every tool controller, and every child
+        // run linked to this run's signal (delegation inherits it).
+        state.controller.abort(reason);
+        return true;
+    };
+
+    const stopThread = (threadId: string, reason?: string): boolean => {
+        const state = threadStateOf(threadId);
+        const error = new HarnessError(reason ?? `Thread "${threadId}" was stopped.`);
+
+        let aborted = stopThreadState(state, error);
+
+        for (const other of threadStates.values()) {
+            if (other === state) continue;
+            if (!ownersOf(other).some((owner) => owner.record.id === threadId)) continue;
+            if (stopThreadState(other, error)) aborted = true;
+        }
+
+        notifyStateChange('thread');
+        return aborted;
+    };
+
+    const stopAllThreads = (reason?: string): number => {
+        const error = new HarnessError(reason ?? 'All threads were stopped.');
+        let aborted = 0;
+
+        for (const state of threadStates.values()) {
+            if (stopThreadState(state, error)) aborted++;
+        }
+
+        notifyStateChange('thread');
+        return aborted;
+    };
+
+    // Drop one thread state and every LOOKUP that pointed at it. Shared by
+    // deleteThread (invocation/branch purge) and restore (replacing the persisted
+    // set), so both paths cannot drift. It never touches an agent transcript the
+    // thread shares with anyone else: the caller's content purge is the thread's
+    // own Agent, which becomes unreachable here.
+    const purgeThread = (state: ThreadState): void => {
+        const threadId = state.record.id;
+        threadStates.delete(threadId);
+
+        // Invocation lookups owned by THIS conversation. Branch runs inherit the
+        // persistent owner, so a fork's/autoanswer's result is scoped here too.
+        const ownedInvocations = new Set<string>();
+
+        for (const [key, record] of invocationRecords) {
+            if (record.threadId === threadId || record.invocationId === state.record.invocationId) {
+                ownedInvocations.add(record.invocationId);
+                invocationRecords.delete(key);
+            }
+        }
+
+        // M2: purge branches by their PERSISTENT owner (`record.threadId`).
+        // `sourceThreadId` is an INVOCATION id, so comparing it to the thread id
+        // never matched; it is retained only as a defensive fallback through the
+        // invocation ids this thread owned (nested forks and autoanswer branches
+        // carry the owner too, so the primary predicate covers them).
+        const removed = branchRecords.filter(
+            (record) =>
+                record.threadId === threadId ||
+                record.branchId === threadId ||
+                ownedInvocations.has(record.branchId) ||
+                (record.sourceThreadId !== undefined && ownedInvocations.has(record.sourceThreadId))
+        );
+
+        if (removed.length > 0) {
+            const removedIds = new Set(removed.map((record) => record.branchId));
+            branchRecords = branchRecords.filter((record) => !removedIds.has(record.branchId));
+
+            // A purged branch cannot hold a concurrency slot or a scope mapping.
+            for (const branchId of removedIds) {
+                activeBranches.delete(branchId);
+                branchScopes.delete(branchId);
+            }
+        }
+    };
+
+    // Remove a terminal host thread and every lookup scoped to it. Content that
+    // was already copied into another transcript (a delegated answer, a delivered
+    // chat message) is NOT recalled: deletion is a purge of THIS conversation, not
+    // a promise of forgetting what other histories learned from it.
+    const deleteThread = (threadId: string): void => {
+        const state = threadStateOf(threadId);
+
+        if (state.record.origin === 'agent') {
+            throw new HarnessError(
+                `Thread "${threadId}" is the agent's own conversation and cannot be deleted; use reset() to clear the session.`
+            );
+        }
+
+        if (state.record.status === 'running' || state.run !== undefined) {
+            throw new HarnessError(`Thread "${threadId}" is running; stop it before deleting it.`);
+        }
+
+        // A linked child cannot outlive the conversation that owns it. Collect
+        // EVERY descendant first and refuse the whole delete if any of them is
+        // running, so a partial removal is impossible (recursive deletion could
+        // otherwise drop earlier children before hitting the live one).
+        const descendants: ThreadState[] = [];
+        const seen = new Set<string>([threadId]);
+        const pending: ThreadState[] = [state];
+
+        while (pending.length > 0) {
+            const current = pending.pop()!;
+
+            for (const candidate of threadStates.values()) {
+                if (candidate.record.ownerThreadId !== current.record.id) continue;
+                if (seen.has(candidate.record.id)) continue;
+
+                seen.add(candidate.record.id);
+                descendants.push(candidate);
+                pending.push(candidate);
+            }
+        }
+
+        for (const child of descendants) {
+            if (child.record.status === 'running' || child.run !== undefined) {
+                throw new HarnessError(
+                    `Thread "${child.record.id}" is running; stop it before deleting "${threadId}".`
+                );
+            }
+        }
+
+        purgeThread(state);
+        for (const child of descendants) purgeThread(child);
+        notifyStateChange('thread');
+    };
+
+    const steerThread = (threadId: string, input: string): HarnessThreadSteerReceipt => {
+        const state = threadStateOf(threadId);
+
+        if (typeof input !== 'string' || input.trim().length === 0) {
+            throw new HarnessError('Steering requires non-empty text.');
+        }
+
+        if (state.record.status === 'stopped') {
+            return {
+                threadId,
+                queued: false,
+                reason: `Thread "${threadId}" is stopped; a host must resume it before steering.`
+            };
+        }
+
+        if (state.record.status !== 'running' || state.run === undefined) {
+            return {
+                threadId,
+                queued: false,
+                reason: `Thread "${threadId}" is idle; use sendThreadInput to start a turn.`
+            };
+        }
+
+        state.queue.push(input);
+        notifyStateChange('thread');
+        // A paused run (background work pending) must wake to reach its boundary;
+        // a run inside a request drains this at the next loop iteration.
+        markRunDirty(state.run);
+
+        return { threadId, queued: true };
+    };
+
+    const sendThreadInput = async (
+        threadId: string,
+        input: string,
+        options?: HarnessRunOptions
+    ): Promise<HarnessAssistantMessage> => {
+        const state = threadStateOf(threadId);
+
+        if (typeof input !== 'string' || input.trim().length === 0) {
+            throw new HarnessError('Thread input must be non-empty text.');
+        }
+
+        // An explicit HOST turn revives a stopped conversation. Model-driven
+        // paths (delegation, threadSend, steering) do not: "stopped" must mean
+        // stopped for agents.
+        if (state.record.status === 'stopped') {
+            state.record.status = 'idle';
+            notifyStateChange('thread');
+        }
+
+        return runAgent(
+            state.agent,
+            input,
+            options?.signal,
+            undefined,
+            undefined,
+            undefined,
+            options?.attachments,
+            undefined,
+            state
+        );
+    };
+
+    const threadMessages = (threadId: string): HarnessMessage[] =>
+        cloneMessages(threadStateOf(threadId).agent.messages);
 
     // Every live run, so a scheduler wake can mark the right runs dirty. Runs are
     // removed in runAgent's finally.
@@ -2328,6 +2929,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // Always present now: a background call is always cancelable.
                     signal,
                     runDepth: run.depth,
+                    // R2/R4: the persistent conversation this call belongs to. The
+                    // runtime supplies it (never a tool argument), so threadSend can
+                    // attribute the sender honestly.
+                    ...(run.threadId === undefined ? {} : { threadId: run.threadId }),
                     run: (agentName: string, input: string) => {
                         const target = agents[agentName];
                         if (!target) {
@@ -2706,6 +3311,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             ...(metadata.sourceThreadId !== undefined
                 ? { sourceThreadId: metadata.sourceThreadId }
                 : {}),
+            // M2: the PERSISTENT owner (the conversation the requester runs in),
+            // which is what `deleteThread` purges against.
+            ...(run.threadId === undefined ? {} : { threadId: run.threadId }),
             callId: call.id,
             forkDepth: metadata.forkDepth,
             model: metadata.model,
@@ -2961,6 +3569,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     ...(created.sourceThreadId !== undefined
                         ? { sourceThreadId: created.sourceThreadId }
                         : {}),
+                    // M2: the OWNER conversation owns the answer branch, so
+                    // deleting that conversation removes this record too.
+                    ...(ownerRun.threadId === undefined ? {} : { threadId: ownerRun.threadId }),
                     callId: call.id,
                     requestId,
                     forkDepth: created.forkDepth,
@@ -3356,6 +3967,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return run.answer ?? message;
     };
 
+    // R5 STEERING BOUNDARY. Thread input (a host steer or a cross-thread chat
+    // message) is queued rather than inserted, so it can never land in the middle
+    // of an in-flight model request or between an assistant tool-call block and
+    // its results. This drains the queue as ordinary user messages at the loop's
+    // safe boundary and reports whether anything was appended (which means the
+    // run owes the model another turn).
+    //
+    // Ordering: queue order is transcript order, so two steers keep the order of
+    // their receipts even when the run takes several turns to observe them.
+    const drainThreadQueue = (run: RunState): boolean => {
+        const state = run.threadState;
+        if (state === undefined || state.queue.length === 0) return false;
+
+        const queued = state.queue.splice(0);
+        for (const content of queued) run.agent.user(content);
+        // Track what this run consumed so a NON-STOP failure can preserve it for
+        // the next host turn (the rollback below removes the appended messages).
+        run.steering.push(...queued);
+        notifyRunStateChange(run, 'agent_message', { agent: run.agent.name });
+        notifyStateChange('thread');
+        return true;
+    };
+
     // Run one agent until it has answered AND nothing it started is still
     // running. `maxIterations` bounds model turns; exhaustion cancels the pending
     // work before throwing so no orphan task survives a rolled-back run.
@@ -3406,6 +4040,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // outcome from `changedDuringRequest` below.
                 await drainMailbox(run.actorKey);
                 run.dirty = false;
+
+                // R5: apply queued steering/chat BEFORE building this request, so
+                // the model sees the fresh guidance on the very next turn instead
+                // of one round late.
+                drainThreadQueue(run);
 
                 const message = await requestTurn(run);
 
@@ -3490,6 +4129,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // that raced it must still fail/roll back rather than resolve.
                     await drainMailbox(run.actorKey);
                     if (run.dirty) continue;
+
+                    // R5: guidance that arrived WHILE this final turn was in flight
+                    // must not be swallowed by the return — it buys one more turn.
+                    if (drainThreadQueue(run)) continue;
                     throwIfAborted(run);
 
                     await emit(run, { type: 'done', agent: brain.name, message });
@@ -3523,6 +4166,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             run.active = false;
             run.aborted = run.signal?.aborted === true;
             scheduler.abandonScope(run.scope);
+
+            // R5 preservation: steering this run drained is rolled back with the
+            // transcript, so hand it to the NEXT host turn in its original order.
+            // A stop is different by contract: the host stopped the conversation,
+            // and stopThread already cleared the queue (and bumped the epoch), so
+            // the guidance is discarded instead of resurrected.
+            if (run.threadState !== undefined && run.steering.length > 0) {
+                if (!run.aborted && run.threadState.record.status !== 'stopped') {
+                    run.threadState.queue.unshift(...run.steering);
+                    notifyStateChange('thread');
+                }
+                run.steering = [];
+            }
 
             brain.messages.splice(commitIndex);
             notifyRunStateChange(run, 'agent_message', { agent: brain.name });
@@ -3638,7 +4294,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // N6 branch internals, passed only by the runtime's fork/autoanswer
         // launches. Kept separate from `internals` so an arbitrary ctx.run cannot
         // claim to be a branch through the public tool context.
-        branchInternals?: RunInternals
+        branchInternals?: RunInternals,
+        // R2: the persistent thread this run executes in. Host calls pass the
+        // created thread; everything else is resolved below (root -> the
+        // primary's default conversation, delegation -> the child agent's default
+        // conversation). A fork/autoanswer branch never binds to a thread.
+        threadState?: ThreadState
     ): Promise<HarnessAssistantMessage> => {
         // Validation is the first side-effect-free step: a malformed attachment
         // rejects the run with nothing appended, nothing emitted, and no queued
@@ -3667,36 +4328,162 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             );
         }
 
-        // An already-cancelled run must not start: check before queueing.
+        // An already-cancelled run must not create a conversation (the child-thread
+        // path below mints one). The later checks stay: this one only protects the
+        // side effect that happens before the actor queue.
         signal?.throwIfAborted();
+
+        // R2/R4 PERSISTENT THREAD BINDING. A branch keeps its ephemeral transcript
+        // (below); every ordinary run belongs to a conversation:
+        //   - an explicit host thread (sendThreadInput);
+        //   - a NEW host thread when the CALLER is a host conversation. A host
+        //     thread's delegation/ctx.run child is its own independent conversation
+        //     (fresh Agent, own id, ownerThreadId = caller) — siblings never share
+        //     a transcript, even when they target the same agent. This is what makes
+        //     R4 "linked subagents" real instead of inheriting the agent's default
+        //     conversation;
+        //   - the target agent's DEFAULT conversation for a legacy/root delegation;
+        //   - the primary's default conversation for the callable root.
+        const resolvedThread = ((): ThreadState | undefined => {
+            if (branchRun !== undefined) return undefined;
+            if (threadState !== undefined) return threadState;
+
+            if (parent !== undefined && parent.threadState?.record.origin === 'host') {
+                // `ctx.run`/agentDelegate resolve a registry agent by name; a brain
+                // outside the registry cannot be re-created as a thread, so it falls
+                // back to its own default conversation (never a host's transcript).
+                if (agents[brain.name] !== brain) return defaultThreadOf(brain);
+
+                return createThreadState(
+                    brain.name,
+                    parent.threadId === undefined ? undefined : { ownerThreadId: parent.threadId },
+                    true
+                );
+            }
+
+            return defaultThreadOf(brain);
+        })();
+
+        // The BRAIN that actually runs. A registry brain arrives from the
+        // callable/ctx.run/agentDelegate; when the run is bound to a host thread,
+        // that thread's own Agent instance is the actor: its transcript, its actor
+        // key, and its events. Without this the child of a host thread would still
+        // write into `agent:<name>` (and queue behind it), which is exactly the
+        // sharing R4 forbids.
+        const runBrain = resolvedThread === undefined ? brain : resolvedThread.agent;
+
+        // Model selection is a property of the OWNING agent. A host thread was
+        // created with the model value of that moment; re-reading it at every run
+        // start makes `agents[name].model('…')` propagate predictably to every live
+        // conversation of that agent on its NEXT run (a request already in flight
+        // keeps the model it started with, as before).
+        if (resolvedThread !== undefined && resolvedThread.record.origin === 'host') {
+            const ownerAgent = agents[resolvedThread.record.agent];
+            if (ownerAgent !== undefined && resolvedThread.agent.model() !== ownerAgent.model()) {
+                resolvedThread.agent.model(ownerAgent.model());
+            }
+        }
+
+        // A stopped conversation refuses MODEL-DRIVEN work (delegation, ctx.run).
+        // The host owns the stop, so an explicit root call revives it; an explicit
+        // sendThreadInput already revived it before calling here.
+        if (resolvedThread !== undefined && resolvedThread.record.status === 'stopped') {
+            if (parent === undefined && threadState === undefined) {
+                resolvedThread.record.status = 'idle';
+                notifyStateChange('thread');
+            } else {
+                throw new HarnessError(
+                    `Thread "${resolvedThread.record.id}" is stopped; a host must resume it before it can run.`
+                );
+            }
+        }
+
+        // M1: the stop epoch observed at submission time. Captured AFTER the
+        // revival above, so a host call made after a stop is legal; every run
+        // already queued when the stop lands carries the old epoch and is refused
+        // below.
+        const threadGeneration = resolvedThread?.generation;
+
+        // M2: the PERSISTENT conversation this run belongs to. A branch run keeps
+        // its ephemeral transcript (resolvedThread stays undefined) but still
+        // belongs to the conversation that spawned it, so a nested fork or an
+        // autoanswer branch can be purged with that thread and its invocation
+        // result is scoped the same way.
+        const runThreadId =
+            resolvedThread?.record.id ?? (branchRun === undefined ? undefined : parent?.threadId);
+
+        // A thread run gets its OWN controller, linked to the caller's signal, so
+        // stopThread can abort exactly this conversation while a host abort still
+        // reaches every run it started (including delegated children).
+        const threadController = resolvedThread === undefined ? undefined : new AbortController();
+        let unlinkThreadAbort: (() => void) | undefined;
+
+        if (threadController !== undefined && signal !== undefined) {
+            const forwardAbort = (): void => threadController.abort(abortErrorOf(signal));
+
+            if (signal.aborted) forwardAbort();
+            else {
+                signal.addEventListener('abort', forwardAbort, { once: true });
+                unlinkThreadAbort = () => signal.removeEventListener('abort', forwardAbort);
+            }
+        }
+
+        // The signal every downstream boundary checks: the thread controller when
+        // one exists, otherwise the caller's signal (historical behaviour).
+        const runSignal = threadController?.signal ?? signal;
+
+        // An already-cancelled run must not start: check before queueing.
+        runSignal?.throwIfAborted();
 
         // Wait for this actor. A queued run is not "started" until it owns the
         // actor, so an abort while waiting rejects without touching history. The
         // free path returns synchronously (no microtask before `start`). The key is
-        // the ACTOR key: a fork never queues behind its source (N6).
-        const acquired = acquireAgent(actorKeyOf(brain), signal);
+        // the ACTOR key: a fork never queues behind its source (N6), and a host
+        // thread of an agent queues only behind ITSELF (`thread:<id>`, set when the
+        // thread was created), never behind the agent's default conversation.
+        const acquired = acquireAgent(actorKeyOf(runBrain), runSignal);
         const releaseAgent = typeof acquired === 'function' ? acquired : await acquired;
 
         try {
-            signal?.throwIfAborted();
+            runSignal?.throwIfAborted();
+
+            // Re-check AFTER owning the actor: a stop that landed while this run
+            // waited in the queue must not let it start afterwards. The EPOCH, not
+            // just the status, is what catches already-queued host submissions
+            // (M1) — revival by a new host send bumps nothing, so its own run is
+            // unaffected, while all older queued runs are refused here.
+            if (resolvedThread !== undefined && resolvedThread.generation !== threadGeneration) {
+                // No run ever started, so release the abort bridge this queued
+                // submission installed before refusing it.
+                unlinkThreadAbort?.();
+                throw new HarnessError(
+                    `Thread "${resolvedThread.record.id}" was stopped while this turn was queued; the turn was not started.`
+                );
+            }
 
             const id = ++runSequence;
             const run: RunState = {
                 id,
                 scope: String(id),
-                agent: brain,
-                actorKey: actorKeyOf(brain),
+                agent: runBrain,
+                actorKey: actorKeyOf(runBrain),
                 depth,
                 autoAnswer: branchRun?.autoAnswer === true,
                 ...(branchRun !== undefined ? { branch: branchRun.metadata } : {}),
-                signal,
-                lineage: [...ancestors, brain],
+                // R2: the run's cancellation is the thread controller when the run
+                // belongs to a conversation, so stopThread and a host abort reach
+                // the same boundaries.
+                signal: runSignal,
+                ...(resolvedThread === undefined ? {} : { threadState: resolvedThread }),
+                ...(runThreadId === undefined ? {} : { threadId: runThreadId }),
+                lineage: [...ancestors, runBrain],
                 parent,
                 active: true,
                 aborted: false,
                 iteration: 0,
                 dirty: false,
                 waiters: [],
+                steering: [],
                 attachments: validatedAttachments,
                 // Delegate-only answer extraction (T2/R1). A host run and an
                 // arbitrary ctx.run leave this false, so their returned message is
@@ -3732,6 +4519,42 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 if (parent.thread !== undefined) thread.parentId = parent.thread.id;
                 if (callId !== undefined) thread.callId = callId;
                 run.thread = thread;
+            } else if (resolvedThread !== undefined && resolvedThread.record.origin === 'host') {
+                // R2: a host thread run is not a child of the callable root, but it
+                // is still a separate conversation that a client must be able to
+                // group, so it carries the ordinary invocation identity (no parent
+                // and no spawning call). Root events keep their historical shape.
+                run.thread = { id: String(id), input };
+            }
+
+            // R2: publish the run on its thread AFTER the invocation id exists, so
+            // `thread.invocationId` always names a real agentResult entry. At most
+            // one run per thread (the actor queue serializes), so a plain assignment
+            // is the whole state machine.
+            if (resolvedThread !== undefined) {
+                resolvedThread.record.status = 'running';
+                resolvedThread.record.invocationId = String(id);
+                resolvedThread.controller = threadController;
+                resolvedThread.run = run;
+
+                // Persistent parent link (R4): the FIRST persistent thread that
+                // spawns work in this conversation owns it. A default conversation
+                // may be delegated to from several places; its history belongs to
+                // the agent, so the link is informational and never reassigned.
+                if (
+                    resolvedThread.record.origin === 'agent' &&
+                    resolvedThread.record.ownerThreadId === undefined &&
+                    parent?.threadId !== undefined &&
+                    parent.threadId !== resolvedThread.record.id
+                ) {
+                    resolvedThread.record.ownerThreadId = parent.threadId;
+                }
+
+                // No state-change notification here on purpose: a run already
+                // emits `agent_message` for every transcript append, and the
+                // thread's status/invocation id are derived from that same run.
+                // Emitting `thread` on every turn would double every save without
+                // recording anything a snapshot of the transcript does not.
             }
 
             // A run-level abort wakes a paused loop so the next iteration observes
@@ -3742,9 +4565,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 markRunDirty(run);
             };
 
-            if (signal) {
-                if (signal.aborted) onAbort();
-                else signal.addEventListener('abort', onAbort, { once: true });
+            if (runSignal) {
+                if (runSignal.aborted) onAbort();
+                else runSignal.addEventListener('abort', onAbort, { once: true });
             }
 
             runs.add(run);
@@ -3777,7 +4600,23 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // the terminal branch_end for an already-emitted branch_start (D1).
                 await releaseBranchesForScope(run);
                 releaseActionRequestsForScope(run.scope);
-                if (signal) signal.removeEventListener('abort', onAbort);
+                if (runSignal) runSignal.removeEventListener('abort', onAbort);
+
+                // R2: release the thread slot. A `stopped` record keeps that status
+                // (the host's intent must survive the abort); an ordinary finish
+                // returns the conversation to idle. The controller and run are
+                // cleared so a later stop cannot abort a run that already ended.
+                if (resolvedThread !== undefined) {
+                    if (resolvedThread.run === run) resolvedThread.run = undefined;
+                    if (resolvedThread.controller === threadController) {
+                        resolvedThread.controller = undefined;
+                    }
+                    if (resolvedThread.record.status === 'running') {
+                        resolvedThread.record.status = 'idle';
+                    }
+                }
+
+                unlinkThreadAbort?.();
             }
         } finally {
             releaseAgent();
@@ -3858,6 +4697,44 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 ...(record.error === undefined ? {} : { error: record.error })
             }));
 
+        // R2: persist HOST threads only. An agent's default conversation is its
+        // registry transcript (already above) with an id derived from the name, so
+        // including it would duplicate state. A running thread is written as idle:
+        // a snapshot must never claim work is live after a restart, and its
+        // committed transcript is still durable.
+        const hostThreads = [...threadStates.values()]
+            .filter((state) => state.record.origin === 'host')
+            .sort((left, right) => left.record.sequence - right.record.sequence)
+            .map((state) => ({
+                id: state.record.id,
+                agent: state.record.agent,
+                status: state.record.status === 'stopped' ? ('stopped' as const) : ('idle' as const),
+                sequence: state.record.sequence,
+                ...(state.record.ownerThreadId === undefined
+                    ? {}
+                    : { ownerThreadId: state.record.ownerThreadId }),
+                ...(state.record.label === undefined ? {} : { label: state.record.label }),
+                // A running invocation has no persisted agentResult, so pointing a
+                // restored record at it would dangle. Status is written as idle for
+                // the same reason.
+                ...(state.record.invocationId === undefined || state.record.status === 'running'
+                    ? {}
+                    : { invocationId: state.record.invocationId }),
+                messages: readHarnessMessages(
+                    state.agent.messages,
+                    `thread "${state.record.id}" messages`
+                )
+            }));
+
+        // The field pair is omitted entirely while only default conversations
+        // exist, so every pre-thread snapshot (and fixture) keeps its shape. The
+        // high-water mark travels with the (possibly empty) list, so a deleted
+        // thread's id is never minted again after a restore.
+        const threadFields =
+            hostThreads.length > 0 || threadIdSequence > 0
+                ? { threads: hostThreads, threadSequence: threadIdSequence }
+                : {};
+
         return {
             version: HARNESS_SNAPSHOT_VERSION,
             agents: agentSnapshots,
@@ -3876,6 +4753,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // Omitted when empty so a snapshot without results (and every older
             // fixture) keeps its exact prior shape.
             ...(agentResults.length === 0 ? {} : { agentResults }),
+            ...threadFields,
             records: {
                 todos: todo.snapshot(),
                 profiles: profile.snapshot(),
@@ -3966,6 +4844,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             }
         }
 
+        // Phase 3b (R2): build the backing Agent for every persisted host thread
+        // BEFORE mutating live state. The owner agents are already validated
+        // above; a factory failure aborts the restore with nothing replaced.
+        const restoredThreads = (next.threads ?? []).map((entry) => {
+            const threadAgent = createThreadAgent(agents[entry.agent]);
+            actorRoles.set(threadAgent, roleOf(agents[entry.agent]));
+            actorKeys.set(threadAgent, `thread:${entry.id}`);
+            return { entry, threadAgent };
+        });
+
         // Phase 4: apply. Everything above succeeded; from here the snapshot is
         // the new state.
         for (const name of [...createdToolRecords.keys()]) delete tools[name];
@@ -4049,6 +4937,72 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             brain.model(agentSnapshot.model);
         }
 
+        // R2: rebuild the thread records to match the snapshot exactly. Default
+        // conversations are derived state, so they are reset to idle here (their
+        // transcript was just replaced above); host threads not in the snapshot are
+        // removed with their lookups, then the persisted ones are re-created.
+        for (const state of [...threadStates.values()]) {
+            // A turn queued on a conversation this restore is replacing must not
+            // start against the old transcript.
+            state.generation += 1;
+
+            if (state.record.origin === 'host') {
+                // No lookup purge here: restore replaces the invocation/branch
+                // registries from the snapshot, so only the record map needs the
+                // old entries removed.
+                threadStates.delete(state.record.id);
+            } else {
+                state.record.status = 'idle';
+                state.queue.length = 0;
+                state.run = undefined;
+                state.controller = undefined;
+                delete state.record.invocationId;
+                // L2: default conversations are implicit, so restore cannot bring
+                // an owner link back; clear it here (a host thread's owner IS
+                // persisted and is re-created below).
+                delete state.record.ownerThreadId;
+            }
+        }
+
+        for (const { entry, threadAgent } of restoredThreads) {
+            threadAgent.messages.length = 0;
+            for (const message of entry.messages) threadAgent.messages.push(message);
+
+            threadStates.set(entry.id, {
+                record: {
+                    id: entry.id,
+                    agent: entry.agent,
+                    origin: 'host',
+                    status: entry.status,
+                    sequence: entry.sequence,
+                    ...(entry.ownerThreadId === undefined
+                        ? {}
+                        : { ownerThreadId: entry.ownerThreadId }),
+                    ...(entry.label === undefined ? {} : { label: entry.label }),
+                    ...(entry.invocationId === undefined
+                        ? {}
+                        : { invocationId: entry.invocationId })
+                },
+                agent: threadAgent,
+                queue: [],
+                generation: 0
+            });
+        }
+
+        // Never lower either counter. `threadSequence` is creation order;
+        // `threadIdSequence` is the `thread-N` high-water mark, so a deleted id is
+        // never minted again after a restart.
+        threadSequence = Math.max(
+            threadSequence,
+            Object.keys(agents).length,
+            ...restoredThreads.map(({ entry }) => entry.sequence)
+        );
+        threadIdSequence = Math.max(threadIdSequence, next.threadSequence ?? 0);
+
+        // The field pair's presence means this session owned host threads at some
+        // point (possibly all deleted), so the conditional chat tool comes back.
+        if (next.threads !== undefined) registerThreadTools();
+
         todo.restore(next.records.todos);
         profile.restore(next.records.profiles);
         chapter.restore(next.records.chapters);
@@ -4067,6 +5021,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             }
             const brain = createAgent({ ...agentConfiguration, name });
             agents[name] = brain;
+            // R2: a plugin-added agent owns a default conversation like every
+            // configured one, so `threads()`/threadSend can address it and
+            // `sendThreadInput('agent:<name>')` resumes it.
+            threadStates.set(defaultThreadIdOf(name), {
+                record: {
+                    id: defaultThreadIdOf(name),
+                    agent: name,
+                    origin: 'agent',
+                    status: 'idle',
+                    sequence: ++threadSequence
+                },
+                agent: brain,
+                queue: [],
+                generation: 0
+            });
             return brain;
         },
         addTool: (name, toolConfiguration) => {
@@ -4207,6 +5176,25 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             const record = retainedBranches().find((entry) => entry.branchId === id);
             return record === undefined ? undefined : cloneBranchRecord(record);
         },
+        // R2 persistent threads. Reads are detached copies (a record or a
+        // transcript), writes are the explicit lifecycle calls below. The default
+        // conversation of every configured agent is always present as
+        // `agent:<name>`; `createThread` adds independent conversations.
+        threads: () =>
+            [...threadStates.values()]
+                .sort((left, right) => left.record.sequence - right.record.sequence)
+                .map((state) => threadRecordCopy(state.record)),
+        thread: (id: string) => {
+            const state = threadStates.get(id);
+            return state === undefined ? undefined : threadRecordCopy(state.record);
+        },
+        threadMessages,
+        createThread,
+        sendThreadInput,
+        steerThread,
+        stopThread,
+        stopAllThreads,
+        deleteThread,
         // R3a persistence. `snapshot` never mutates; `restore` validates fully
         // and recompiles created-tool sources without executing them.
         snapshot,
@@ -4226,6 +5214,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         //     it here would let a session grow the registry without bound one reset
         //     at a time.
         reset: () => {
+            // R2: a reset clears every conversation, so it cannot run underneath
+            // one. Existing harness calls already had no guard (they reset the
+            // transcripts a live run was using); a host thread makes that
+            // unrecoverable, so it is refused explicitly here.
+            for (const state of threadStates.values()) {
+                if (state.record.status === 'running' || state.run !== undefined) {
+                    throw new HarnessError(
+                        `Cannot reset while thread "${state.record.id}" is running; stop it first.`
+                    );
+                }
+            }
+
             for (const brain of Object.values(agents)) brain.reset();
             activeTools.clear();
             discoveryOffsets.clear();
@@ -4234,6 +5234,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             chapter.reset();
             location.reset();
             invocationRecords.clear();
+            // R2: host conversations belong to the session's conversation state,
+            // so they are removed with it. The id high-water mark is NOT restored
+            // (a deleted id stays retired, like the creation budget), and the
+            // threadSend tool stays registered (it is catalogue state).
+            for (const state of [...threadStates.values()]) {
+                // Invalidate any turn still queued on this conversation: reset
+                // clears the history it was going to read.
+                state.generation += 1;
+
+                if (state.record.origin === 'host') threadStates.delete(state.record.id);
+                else {
+                    state.record.status = 'idle';
+                    state.queue.length = 0;
+                    state.run = undefined;
+                    state.controller = undefined;
+                    delete state.record.invocationId;
+                    // L2: the runtime-only owner link of a default conversation is
+                    // part of the conversation being cleared, so a reset must not
+                    // leave a stale `ownerThreadId` (which a restart would not
+                    // reproduce anyway).
+                    delete state.record.ownerThreadId;
+                }
+            }
             // A reset is a snapshot-managed mutation too: a server must persist
             // the cleared transcripts/stores instead of keeping the old file.
             notifyStateChange('reset');
@@ -4312,6 +5335,11 @@ export type { BoundedToolResult, SchemaCheck, ToolArgumentMode } from './core';
 // mirror the core/index.ts exports; todoManage's factory stays internal to keep
 // this change scoped.
 export { createProfileTool, createChapterTool, createLocationTool } from './core';
+// R4 cross-thread chat descriptor. The tool is registered CONDITIONALLY (once a
+// session owns an independent thread), so a server catalogue can quote the same
+// name/description/schema the runtime uses without advertising it up front.
+export { THREAD_LIST_METADATA, THREAD_LIST_NAME, THREAD_SEND_METADATA, THREAD_SEND_NAME } from './core';
+export { MAX_THREAD_LABEL_CHARS, MAX_THREAD_RECORDS, defaultThreadIdOf } from './core';
 // Tool-panel bounds and the normalizer are public too: a client or a host-side
 // tool author can quote the same caps the server enforces (see core/tool-ui.ts).
 export { TOOL_UI_LIMITS, normalizeToolUiPanels } from './core';

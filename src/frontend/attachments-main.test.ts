@@ -386,6 +386,62 @@ it('inserts "[Image 1]" at the caret on paste and sends the bytes separately', a
     expect(composerChips()).toEqual([]);
 });
 
+it('labels a running focused thread as queued once a ready attachment exists', async () => {
+    // The server's steering API is text-only, so an attachment-bearing submit to a
+    // RUNNING thread becomes a queued continuation in that same thread. The routing
+    // line must say that instead of promising an immediate steer.
+    const restored = snapshot({
+        status: 'running',
+        turns: [turn({ id: 't1', index: 0, status: 'running', threadId: 'thread-1' })],
+        threads: [
+            { id: 'thread-1', agent: 'instruct', origin: 'host', status: 'running', sequence: 1, label: 'Running' }
+        ]
+    } as Partial<SessionSnapshot>);
+
+    localStorage.setItem(SESSION_KEY, 's1');
+    const calls = stubServer(restored);
+    await mount();
+
+    const target = byClass('.composer-target', 'p');
+    expect(target.textContent).toBe('Steering Running');
+
+    const input = byClass('.composer-input', 'textarea');
+    input.value = 'look ';
+    input.setSelectionRange(5, 5);
+    pasteFiles(input, [new File([PNG_BYTES], 'shot.png', { type: 'image/png' })]);
+
+    // A still-reading file cannot be submitted, so it must not change the promise.
+    expect(target.textContent).toBe('Steering Running');
+
+    await flush();
+
+    // Ready bytes: the submit is a queued continuation, not a steer.
+    expect(target.textContent).toBe('Queued in Running');
+    expect(target.dataset.mode).toBe('steer');
+
+    submit();
+    await flush();
+
+    // The body keeps the SAME focused thread id (targeting semantics unchanged).
+    expect(taskBodies(calls)).toEqual([
+        {
+            input: 'look [Image 1]',
+            attachments: [
+                {
+                    id: 'attach-1',
+                    kind: 'image',
+                    marker: '[Image 1]',
+                    name: 'shot.png',
+                    mime: 'image/png',
+                    size: 12,
+                    data: PNG_BASE64
+                }
+            ],
+            threadId: 'thread-1'
+        }
+    ]);
+});
+
 it('restores the prompt and keeps the chip when the send itself fails', async () => {
     stubServer(undefined, 'submit rejected');
     await mount();

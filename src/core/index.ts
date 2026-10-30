@@ -118,6 +118,12 @@ export {
     THREAD_FORK_NAME,
     TOOL_CANCEL_METADATA,
     TOOL_CANCEL_NAME,
+    // R4 cross-thread chat + roster (conditional core tools, registered by the
+    // harness once the session owns an independent thread).
+    THREAD_LIST_METADATA,
+    THREAD_LIST_NAME,
+    THREAD_SEND_METADATA,
+    THREAD_SEND_NAME,
     TOOL_REQUEST_METADATA,
     TOOL_REQUEST_NAME,
     TODO_MANAGE_METADATA,
@@ -175,3 +181,16 @@ export type {
     MaterializedBranchHistory,
     NormalizedForkAgentOptions
 } from './branch';
+// R2 persistent threads. The factory registry is internal plumbing (the harness
+// runtime and focused tests are the only callers); the harness's public thread
+// API lives on the handle. See ./thread.ts.
+export {
+    MAX_THREAD_LABEL_CHARS,
+    MAX_THREAD_RECORDS,
+    THREAD_AGENT_PREFIX,
+    THREAD_HOST_PREFIX,
+    createThreadAgent,
+    defaultThreadIdOf,
+    normalizeThreadLabel,
+    registerAgentThreader
+} from './thread';

@@ -393,6 +393,7 @@ describe('queued attachments dispatch and persist', () => {
             id: task.turn.id,
             index: 0,
             prompt: 'Look at [Image 1]',
+            threadId: 'thread-1',
             attachments: [attachment],
             status: 'queued',
             updatedAt: expect.any(Number),
@@ -411,6 +412,7 @@ describe('queued attachments dispatch and persist', () => {
             id: task.turn.id,
             index: 0,
             prompt: 'Look at [Image 1]',
+            threadId: 'thread-1',
             attachments: [attachment],
             status: 'done',
             startedAt: expect.any(Number),
@@ -463,14 +465,19 @@ describe('queued attachments dispatch and persist', () => {
         expect(restored.turns[1]!.attachments).toEqual([attachment]);
         expect(restored.turns[1]!.status).toBe('queued');
 
-        // Starting the pump with a new submit executes the restored turn FIRST,
-        // with its persisted bytes, and only then the new text turn.
-        const kick = second.store.enqueue(created.id, 'after restart');
+        // F1: the paused backlog belongs to its thread's lane, so the kick targets
+        // that SAME conversation; it executes the restored turn FIRST, with its
+        // persisted bytes, then the new text turn.
+        expect(restored.turns[1]!.threadId).toBe('thread-1');
+        const kick = second.store.enqueue(created.id, 'after restart', undefined, undefined, 'thread-1');
         await kick.settled;
 
+        // R1-R6: the blank attachment task runs in its own persistent thread, and a
+        // thread run requires non-empty text, so its submit MARKER is the run text.
+        // The recorded `turn.prompt` stays empty (asserted above).
         expect(seen).toEqual([
             { prompt: 'hold' },
-            { prompt: '', attachments: [attachment] },
+            { prompt: '[Image 1]', attachments: [attachment] },
             { prompt: 'after restart' }
         ]);
         expect(second.store.get(created.id).turns.map((turn) => turn.status)).toEqual([
@@ -499,9 +506,11 @@ describe('attachment validation rejects before mutation', () => {
         expect(runtime.store.get(created.id).turns).toEqual([]);
 
         const task = runtime.store.enqueue(created.id, '   ', [imageAttachment()]);
+        // The user-facing record stays the raw blank prompt; only the RUN text a
+        // persistent thread requires becomes the marker.
         expect(task.turn.prompt).toBe('');
         await task.settled;
-        expect(seen).toEqual([{ prompt: '', attachments: [imageAttachment()] }]);
+        expect(seen).toEqual([{ prompt: '[Image 1]', attachments: [imageAttachment()] }]);
     });
 
     it('maps malformed, wrong-signature, and oversized media to 400/415/413 with nothing queued', async () => {
@@ -625,8 +634,10 @@ describe('submit routes over HTTP', () => {
             body: { input: 'plain text' }
         });
         expect(legacy.status).toBe(202);
+        // R1-R6: every /tasks turn names its persistent thread, so `threadId` is
+        // part of the accepted record (the text-only shape is otherwise unchanged).
         expect(Object.keys((legacy.body as { turn: object }).turn).sort()).toEqual(
-            ['eventTimes', 'events', 'id', 'index', 'prompt', 'status', 'updatedAt'].sort()
+            ['eventTimes', 'events', 'id', 'index', 'prompt', 'status', 'threadId', 'updatedAt'].sort()
         );
 
         // Attachment-only: blank text is valid because a clip carries the task.
@@ -638,6 +649,8 @@ describe('submit routes over HTTP', () => {
             id: expect.any(String),
             index: 1,
             prompt: '',
+            // Every unfocused submit opens its own thread (the second submit here).
+            threadId: 'thread-2',
             attachments: [attachment],
             status: 'queued',
             updatedAt: expect.any(Number),

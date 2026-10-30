@@ -2121,6 +2121,10 @@ pairs same-name calls exactly.
   `pumping`/`busy` are set synchronously, so a second enqueue joins the worker
   instead of starting one. A `watch()` subscriber can never cancel or block it:
   `publish()` neither awaits nor throws and drops a failing watcher.
+  Thread-capable submits do NOT use this one backlog: every thread has its own
+  `ThreadLane` with its own `pumpLane` FIFO, so two threads run concurrently while
+  one lane stays ordered; the loop above survives only for a legacy harness handle
+  that predates the thread API (and the shared `busy` gate still parks every lane).
 - **Status.** `SessionStatus` remains `idle | running | error`; queue state is
   `SessionTurn.status` (`queued | running | done | error | cancelled`) plus
   `SessionSnapshot.queueDepth` (pending turns, active excluded, omitted at zero).
@@ -2178,6 +2182,112 @@ pairs same-name calls exactly.
     is ignored, so a retried/late frame cannot add a second card. The CLI mirrors
     the duration/pending/wake/done **lines** in `src/server/cli/render.ts`; card
     closure is a browser-only state.
+
+### Persistent threads in the UI (T5 / R5-R7)
+
+Two identities exist and must never be conflated:
+
+- `HarnessThread` (`event.thread`, `AgentResultBlock.threadId`) = ONE invocation.
+  Its id changes on every run and it is what a `#` reference binds to.
+- `SessionTurn.threadId` and `SessionSnapshot.threads[]` = ONE persistent runtime
+  conversation. Its id is stable for the thread's life, and repeated turns of it
+  are the same conversation (one badge `T3`, one strip row).
+
+`src/frontend/ui/threads.ts` owns the decisions; `main.ts` owns the POSTs and the
+DOM. The contract it is written against is optional/additive, so a server that does
+not send `threads`/`threadId` renders exactly the old UI (`sessionThreadsOf` → `[]`,
+`turnThreadIdOf` → `undefined`, submit body unchanged).
+
+- **Focus is explicit board state (S1).** `focusedThreadId` + `explicitUnfocus`, not
+  "whichever tile is expanded". `create()` NEVER expands: snapshot adoption, the
+  observer `upsert` and a late record for a failed submit are background events and
+  may not steal the reader's focus or undo an explicit "New thread". `begin`
+  expands the optimistic tile (a submit is a focus choice); `reconcile` keeps a
+  surviving expanded tile, re-focuses the same THREAD when its surface disappears,
+  clears on deletion, and only auto-opens the newest conversation for the FIRST
+  content of an empty board. Reported through `onFocusChange(focusedThreadId)`.
+- **Child conversations (S2).** A runtime child thread has no `SessionTurn` of its
+  own (its work is in the parent's events). `focusThread(id)` resolves in order:
+  a turn with that `threadId` (a continuation creates one) → the nested invocation
+  the roster joins via `invocationId`/`originInvocationId` → a roster-only panel
+  rendered from `SessionThread.messages`. Focusing a child collapses the tile and
+  every other PERSISTENT child entry, so exactly one conversation is expanded;
+  pure invocation details (no roster join) keep their independent expand. Clicking
+  a mapped nested row focuses the child's true id, which the composer then targets.
+- **Routing (`resolveSubmitTarget`).** Focused idle/stopped → `continue` (new turn in
+  the same thread), focused running → `steer`, no focus + `#` references →
+  `connected` (new thread whose turn carries `references`; the roster derives
+  `connectedThreadIds`, a reference EDGE — never `ownerThreadId`, which stays
+  delegation lineage), no focus → `new`. The wire body carries `threadId` ONLY in
+  the first two cases; omitting it is the server's "open a new thread" signal.
+  Unfocused submits run CONCURRENTLY, one lane each; only a legacy pre-thread
+  harness handle keeps the serialized backlog.
+- **A running focus is not always steered.** Steering is text-only and needs
+  terminal reference content, so a draft with attachments (`attachments > 0` in the
+  helper, ready files only) or a `#` reference whose target turn is still
+  `queued`/`running` becomes a QUEUED CONTINUATION turn in that same thread: bytes,
+  reference binding and prompt are kept and run when the active turn settles. The
+  target id (and thus the POST body) is unchanged; only the label changes —
+  `submitTargetLabel` prints `Queued in …` instead of `Steering …` when
+  `target.queued` is set. `main.ts` feeds both the paint path and `run()` the same
+  counters (`draftAttachments` ready count, `unfinishedReferenceCount` over the
+  authoritative `records`), so what the line promises is what the request does.
+- **Capacity.** At most `MAX_THREAD_RECORDS` (256) independent host threads per
+  session, delegated children of host threads included; creating one past the bound
+  is the runtime's "already has N independent threads; delete a terminal one"
+  refusal, mapped to `429` on the server's thread routes. Deleting a terminal
+  thread removes its record and frees the slot again. The UI does NOT auto-prune:
+  reducing thread count is an explicit per-row delete. Deletion purges only that
+  conversation — not what other histories were told, not what it wrote to shared
+  memory (todos/profiles/chapters/locations), and not a result a connected thread
+  already received.
+- **Steering answers with the owner.** A running target may return the OWNING turn
+  (same id), so `run()` discards its optimistic steering tile and merges the record
+  into the existing tile (`view.discard`). Without that, an unbound queued ghost
+  would survive every later snapshot as "pending".
+- **Strip actions.** One row per roster entry in `sequence` order; the label is the
+  server `label` or `T{sequence}`. The far-right `×` is `stop` while running (POST
+  `.../threads/:id/cancel`, single-flight per row) and `delete` when idle/stopped
+  (DELETE, two clicks: the first only arms, with a 4 s window and a distinct
+  `aria-label`). Pending row state clears when the authoritative roster moves on, so
+  a stop never leaves the delete affordance disabled forever.
+- **Delete reconciliation + tombstones (S3, N1, N2).** The DELETE answer carries the
+  full snapshot; applying it drops the turns and the roster row. Deletion is recorded
+  in `Instance.threadTombstones`/`turnTombstones` BEFORE the answer is applied, with
+  descendants and the removed turns. Every inbound record is filtered through them:
+  late SSE `turn`/`event` frames and late GET answers cannot resurrect the thread or
+  re-focus it. The sets are session-scoped: `openSession` (switch), `ensureSession`
+  and `newSession` clear them, and `applySnapshot` REFUSES a snapshot whose id is not
+  the instance's current session (a late answer cannot re-point the card). A switch
+  also drops the previous session's `records`/`threads`/watermark BEFORE applying the
+  new snapshot, so deletion learning cannot compare one session's roster with the
+  next one's ids (N1). A snapshot older than the applied watermark is ignored
+  ENTIRELY — it can neither learn a deletion nor replace records/reconcile an older
+  turn list and delete a live SSE row (N2). Equal stamps are not stale: every new
+  turn bumps `updatedAt`, so only a strictly older snapshot can be missing one.
+  `purgeStaleReferences` removes any `#` chip whose turn is gone (it would 400 the
+  whole submit) on authoritative snapshots and again after a failed submit restores
+  its draft snapshot (N3, silently — the failure notice stays), keeping the surviving
+  text/attachment draft intact; labels of surviving blocks are kept by the snapshot's
+  per-turn `labelSeeds`.
+- **Labels (S6).** `threadLabelOf` is the ONE display identity: the roster's label
+  or `T{sequence}`, `T?` when the roster does not describe the id (never digits
+  parsed from the opaque id). It titles both the strip row and the tile badge, and
+  the badge title carries the agent. The strip lists HOST threads only: an
+  `origin: 'agent'` default conversation gets no stop/delete affordance.
+- **Keyboard (S4).** The strip restores the focused control (focus button, action,
+  or unfocus) across every repaint — including the armed delete button — and its
+  hit targets are at least 24px. The unfocus control lives outside the `<ul>` (S5).
+- **Stop-all.** `composerStopOf(action, pending)` adds the separate `.composer-stop`
+  only when work is pending and the inline action is not already `stop`; it calls
+  the same `stopRun` → `POST /sessions/:id/cancel { all: true }`. A draft in the
+  field therefore never hides the session-wide cancellation control.
+
+Tests: `ui/threads.test.ts` (pure roster/routing/strip), `ui/thread-focus.test.ts`
+(board focus/badge/discard/stop-all matrix), `thread-routing.test.ts` (live shell
+wiring: `threadId` in the body, per-thread stop/delete, steering collision,
+stop-all with a draft), `thread-session-scope.test.ts` (N1 cross-session
+tombstones, N2 stale snapshot vs live turn, N3 failed-submit reference restore).
 
 ### Agents and the harness registry
 

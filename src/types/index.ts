@@ -591,7 +591,15 @@ export type HarnessBranchSummary = {
     agent: string;
     role: 'primary' | 'subagent';
     sourceBranchId?: string;
+    // The INVOCATION identity of the requester (`HarnessThread.id`), i.e. the run
+    // that asked for the fork/answer. Display/audit only.
     sourceThreadId?: string;
+    // M2: the PERSISTENT conversation that owns this branch (a host thread id or
+    // `agent:<name>`). Unlike `sourceThreadId` it is stable across resumptions,
+    // and `deleteThread` purges every branch with this owner — including an
+    // autoanswer branch and a nested fork (a branch run inherits its parent's
+    // persistent owner).
+    threadId?: string;
     callId?: string;
     requestId?: string;
     forkDepth: number;
@@ -964,6 +972,11 @@ export type ToolContext<TParameters = any> = {
     // tool uses it to keep delegation one level deep even when the primary agent
     // is itself being driven as somebody else's subagent.
     runDepth?: number;
+    // The PERSISTENT thread this call belongs to (R2/R4). Set by the runtime from
+    // RunState — never from tool arguments — so the sender identity of a
+    // cross-thread message cannot be spoofed by the model. Absent for a manual
+    // `executeTool` call, which runs as the primary agent outside any thread.
+    threadId?: string;
 };
 
 // A tool definition. `name` is optional: inside a harness the registry key names
@@ -1112,6 +1125,110 @@ export type HarnessThread = {
     // branch events and `harness.branch(id)` use; a thread does not invent a
     // second naming scheme.
     branchId?: string;
+};
+
+// ---------------------------------------------------------------------------
+// Persistent agent threads (R2)
+// ---------------------------------------------------------------------------
+//
+// TERMINOLOGY (R1). `HarnessThread` above is INVOCATION identity: one row per
+// non-root RUN, and its id changes every time an agent is invoked. A
+// `HarnessThreadRecord` is the PERSISTENT conversation that owns those runs:
+//
+//   harness   — provides callable agents (the execution loop);
+//   session   — server-controlled shared memory (one harness + snapshot/restore);
+//   thread    — a persistent, agent-owned conversation with its own transcript,
+//               stable id, and independent execution slot.
+//
+// Every configured agent has a DEFAULT thread (`agent:<name>`) whose transcript
+// is the registry Agent's `messages`; a ROOT delegation keeps writing there, so
+// legacy behaviour is preserved. `createThread` opens an ADDITIONAL independent
+// conversation (a fresh Agent instance) for the same agent, which is what makes
+// same-agent concurrent threads real instead of serialized.
+//
+// R4: a delegation/ctx.run child OF A HOST THREAD is itself a NEW host thread
+// (own transcript and id, `ownerThreadId` = the calling conversation) instead of
+// the child agent's default conversation. Two parents that target the same child
+// agent therefore get two separate child threads with no shared transcript, even
+// when they run concurrently. Such a child is a normal host thread: it is
+// listed, stopped, deleted, and persisted through the same APIs.
+//
+// The id is runtime-generated and opaque; it is stable for the thread's whole
+// life (including across snapshot/restore) and never derived from model input.
+export type HarnessThreadOrigin = 'agent' | 'host';
+
+// 'running' means a run is active in this thread. 'stopped' means the host
+// halted it: no new run is started for it and AGENTS may not post into it until a
+// host resumes it through sendThreadInput (or deletes it).
+export type HarnessThreadStatus = 'idle' | 'running' | 'stopped';
+
+export type HarnessThreadRecord = {
+    id: string;
+    // The registry agent that owns this conversation. Threads never change owner.
+    agent: string;
+    // 'agent' = the agent's default conversation; 'host' = an extra thread opened
+    // with `createThread`.
+    origin: HarnessThreadOrigin;
+    status: HarnessThreadStatus;
+    // Monotonic per harness (creation order). Deliberately not a wall-clock time,
+    // so ordering is deterministic in tests and after a restore.
+    sequence: number;
+    // The persistent parent thread that spawned/owned this one (a delegated child
+    // links to its requester). Absent for a thread created at the top level.
+    ownerThreadId?: string;
+    // Display-only label from createThread. Grants no authority.
+    label?: string;
+    // Invocation id of the LATEST run in this thread, so a client can join the
+    // persistent record to the `HarnessThread.id` carried by its events and to
+    // `agentResult`. Absent until the thread has run once.
+    invocationId?: string;
+};
+
+export type HarnessThreadCreateOptions = {
+    // Optional display label (trimmed, max 120 characters).
+    label?: string;
+    // Persistent parent thread to link as the owner. Must already exist, and it
+    // must be a HOST thread (`createThread`): an agent's default conversation is
+    // implicit and is never persisted as a thread record, so it cannot be an
+    // owner (the resulting snapshot could not be restored). The runtime derives
+    // this link itself for delegated children; a host uses it to attach a thread
+    // it opened on behalf of another conversation.
+    ownerThreadId?: string;
+};
+
+// The answer to a steering attempt. Steering is only meaningful while a run is
+// active: the text is queued and applied at the next safe model boundary (never
+// inside an in-flight request), so `queued: false` explains why nothing happened.
+export type HarnessThreadSteerReceipt = {
+    threadId: string;
+    queued: boolean;
+    reason?: string;
+};
+
+// The result of the `threadList` tool (R4): the live conversations of THIS
+// session, newest last (creation order). Ids are observed here, never invented;
+// a deleted thread is absent by construction. `currentThreadId` is the caller's
+// own persistent thread, supplied by the runtime (undefined for a manual
+// executeTool call).
+export type HarnessThreadRoster = {
+    currentThreadId?: string;
+    threads: HarnessThreadRecord[];
+};
+
+// The result of the `threadSend` tool (cross-thread chat, R4). The SENDER is
+// derived from the calling run's identity by the runtime — the model cannot name
+// itself — while `threadId` is the target conversation.
+export type HarnessThreadMessageResult = {
+    threadId: string;
+    // 'appended' — the target was idle, so the message is already in its
+    // transcript and will be visible on its next run.
+    // 'queued'   — the target is running; the message lands at its next model
+    // boundary.
+    delivered: 'appended' | 'queued';
+    // The agent name the runtime attributed the message to.
+    sender: string;
+    // The sender's persistent thread id, when the sender ran inside one.
+    senderThreadId?: string;
 };
 
 // Every event variant carries the SAME optional field (spelled out per variant so
@@ -1271,6 +1388,9 @@ export type HarnessStateChangeReason =
     | 'agent_message'
     | 'tool_execute'
     | 'tool_create'
+    // R2 thread lifecycle (create/stop/delete/steer) — a persistence observer
+    // must save the thread records, not just the transcripts.
+    | 'thread'
     | 'reset'
     | 'restore';
 
@@ -1368,6 +1488,28 @@ export type HarnessAgentResultSnapshot = {
     error?: string;
 };
 
+// One HOST thread persisted by snapshot v1 (R2). The agent's DEFAULT thread is
+// deliberately absent: its transcript is `agents.<name>.messages`, and its id is
+// derived from the agent name (`agent:<name>`), so persisting it would duplicate
+// state. Only threads opened with `createThread` carry their own transcript.
+//
+// `status` excludes 'running' by construction: a snapshot never claims that a run
+// is live after a restart. 'stopped' is durable (a host stopped this conversation
+// before the snapshot was written).
+export type HarnessThreadSnapshot = {
+    id: string;
+    agent: string;
+    status: 'idle' | 'stopped';
+    sequence: number;
+    ownerThreadId?: string;
+    label?: string;
+    invocationId?: string;
+    // The thread's committed transcript. Required (a host thread's history lives
+    // nowhere else), and restored into a fresh Agent seeded from the owner's
+    // configuration.
+    messages: HarnessMessage[];
+};
+
 // One progressive-discovery cursor (R12). `query` is the opaque normalized query
 // key the harness already uses (JSON [tags, limit]); it is persisted verbatim so
 // repeating a query after a restart continues the same tranche.
@@ -1407,6 +1549,16 @@ export type HarnessSnapshot = {
     // the field so older fixtures/tests keep their exact shape. Running
     // invocations are omitted (never written as a partial/cancelled answer).
     agentResults?: HarnessAgentResultSnapshot[];
+    // R2 persistent threads. OPTIONAL and OMITTED while this harness has only its
+    // implicit per-agent default conversations, so pre-thread snapshots and every
+    // fixture that never called createThread keep their exact prior shape.
+    // Present (possibly empty, after every host thread was deleted) once the
+    // harness has minted at least one host thread id, so `threadSequence` remains
+    // a high-water mark and a restart cannot reuse a deleted thread's id.
+    threads?: HarnessThreadSnapshot[];
+    // High-water mark for generated host thread ids. Present together with
+    // `threads`; restore validates it against the persisted records.
+    threadSequence?: number;
     records: {
         todos: TodoStoreState;
         profiles: ProfileStoreState;
@@ -1596,6 +1748,91 @@ export type Harness = {
     // N3: one branch record by id, or undefined. The returned record is a
     // detached copy, like `branches()`.
     branch: (id: string) => HarnessBranchRecord | undefined;
+
+    // -------------------------------------------------------------------
+    // R2 persistent agent threads
+    // -------------------------------------------------------------------
+    //
+    // A thread is an agent-owned conversation with a stable id and its own
+    // transcript. Every configured agent has a DEFAULT thread
+    // (`agent:<name>`) whose transcript is that agent's registry history;
+    // `createThread` opens an ADDITIONAL independent conversation backed by a
+    // fresh Agent instance. All threads share this harness's tools, todo list,
+    // record stores, discovery state, and creation budget — sharing the SESSION's
+    // memory is the point of threads, while their conversations stay separate.
+    //
+    // Reads are detached copies. Writes are explicit:
+    //   - createThread      — open a new (idle) conversation for an agent;
+    //   - sendThreadInput   — run/resume one thread (serialized per thread,
+    //                         concurrent across threads);
+    //   - steerThread       — queue guidance for the NEXT safe model boundary of
+    //                         a RUNNING thread;
+    //   - stopThread / stopAllThreads — abort active work (and owner-linked
+    //                         children) and mark the thread stopped;
+    //   - deleteThread      — purge a terminal HOST thread, its transcript, and
+    //                         its invocation/branch lookups. It never erases
+    //                         information already copied into another history.
+    //
+    // R4: a delegation/ctx.run child OF A HOST THREAD is itself a NEW host thread
+    // (own transcript/id, ownerThreadId = the caller), so two parents targeting
+    // the same child agent never share a transcript and can run concurrently.
+    // A root delegation keeps using the child agent's default conversation.
+    //
+    // Cross-thread chat is the conditional `threadSend` tool, paired with the
+    // `threadList` roster so ids are OBSERVED rather than invented. The runtime
+    // derives the sender identity from the calling run, so a model cannot
+    // impersonate another agent. Both tools are registered on the first
+    // createThread (or when a restore carries host threads).
+    //
+    // A host thread follows its owning agent's CURRENT model: `agent.model('…')`
+    // applies to every live thread of that agent on its next run. A request in
+    // flight keeps the model it started with.
+    threads: () => HarnessThreadRecord[];
+    thread: (id: string) => HarnessThreadRecord | undefined;
+    // The thread's committed transcript, as a detached copy.
+    threadMessages: (id: string) => HarnessMessage[];
+    // Open an independent conversation owned by `agent`. Throws for an unknown
+    // agent or an invalid/blank label, and when an `ownerThreadId` names no
+    // thread in this harness.
+    createThread: (agent: string, options?: HarnessThreadCreateOptions) => HarnessThreadRecord;
+    // Run one turn (including tool execution) in `threadId` and resolve to its
+    // answer. Concurrent calls on the SAME thread queue in order — there is never
+    // simultaneous execution inside one thread — while different threads run
+    // concurrently. A stopped thread is revived by this explicit host action; a
+    // deleted thread is an error.
+    sendThreadInput: (
+        threadId: string,
+        input: string,
+        options?: HarnessRunOptions
+    ) => Promise<HarnessAssistantMessage>;
+    // Queue text for the next safe model boundary of a RUNNING thread. Steering
+    // never interrupts an in-flight request: the run appends it as a user message
+    // before its next request, so the ordering inside the transcript is the
+    // ordering of the returned receipts. Returns `queued: false` with a reason for
+    // an idle or stopped thread.
+    //
+    // If that run then FAILS (transport error, iteration cap), the drained
+    // steering is rolled back with the transcript and re-queued in its original
+    // order, so the next host turn retries it deterministically. A stop discards
+    // it instead (the host's stop wins).
+    steerThread: (threadId: string, input: string) => HarnessThreadSteerReceipt;
+    // Abort active work in this thread and everything it owns (child threads and
+    // delegated runs), then mark it stopped. A stopped thread accepts no new run
+    // from an agent (delegation/chat are refused) and NO ALREADY-QUEUED host turn
+    // runs either: every turn submitted before the stop is rejected with
+    // "was stopped while this turn was queued". Only a NEW sendThreadInput after
+    // the stop revives the conversation. Returns true when an active run was
+    // aborted.
+    stopThread: (threadId: string, reason?: string) => boolean;
+    // Stop every thread in this session (including already-queued work, which is
+    // rejected rather than started). Returns the number of active runs aborted
+    // (threads without active work are still marked stopped).
+    stopAllThreads: (reason?: string) => number;
+    // Permanently remove a terminal HOST thread: its record, transcript, owned
+    // terminal children, and every invocation/branch lookup scoped to it. Throws
+    // while the thread (or an owned child) is running, and for an agent's default
+    // conversation (use reset() for session memory).
+    deleteThread: (threadId: string) => void;
     // Reset to "start over": EVERY agent's conversation goes back to its seeded
     // instructions (R12 — a subagent kept its old transcript before this), tool
     // discovery is forgotten, and the session todo list and record stores are

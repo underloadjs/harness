@@ -69,6 +69,108 @@ Three things: `agent` is the brain, `tool` is an action, `harness` is the loop.
 `agent` and `tool` live in `core/` and are barrelled from the package root, so
 they work without a harness.
 
+### Sessions, agents, and threads
+
+The runtime has three levels, and the distinction is load-bearing:
+
+- **Harness** — the execution loop. It provides callable agents; it is not itself
+  a session.
+- **Session** — server-controlled shared memory: one harness instance plus the
+  record stores (todos, profiles, chapters, locations), the terminal agent-result
+  archive, and `snapshot()`/`restore()`.
+- **Thread** — one persistent, agent-owned conversation. It has a stable id and
+  its OWN transcript, and shares the session's tools, stores, discovery state,
+  and creation budget.
+
+Every configured agent owns a **default conversation** with id `agent:<name>`.
+Its transcript is the registry `Agent.messages`, so delegation keeps its
+historical behaviour (a subagent accumulates its conversation across calls) and
+`sendThreadInput('agent:<name>', …)` resumes exactly that history. Run events
+keep their existing invocation identity (`HarnessThread`, keyed by run id); the
+persistent thread is a separate record, joined through
+`HarnessThreadRecord.invocationId`.
+
+`createThread` opens an **independent** conversation for the same agent, backed
+by a fresh `Agent` (same instructions, seed messages, transport, and current
+model). Two threads of one agent therefore run concurrently, while turns inside
+one thread are serialized — never simultaneous.
+
+A delegation or `ctx.run` child **of a host thread** is itself a new host thread:
+own transcript, own id, `ownerThreadId` pointing at the calling conversation. Two
+parents that delegate to the same child agent at the same time get two separate
+child conversations with no shared transcript, and each is listed, stopped,
+deleted, and persisted exactly like a `createThread` conversation. Delegation from
+the callable root keeps using the child agent's default conversation, so the
+legacy model is unchanged. A host thread follows its owning agent's current model:
+`agent.model('…')` applies to every live thread of that agent on its next run.
+
+```ts
+const writer = harness({ agents: { writer: agent({ model, provider }) } });
+const research = writer.createThread('writer', { label: 'research' });
+
+await writer.sendThreadInput(research.id, 'draft a plan');   // runs that thread
+writer.thread(research.id)?.status;                          // 'idle' | 'running' | 'stopped'
+writer.threadMessages(research.id);                          // detached transcript copy
+writer.threads();                                            // default + host records
+```
+
+- **Steering** — `steerThread(id, text)` queues guidance for a RUNNING thread.
+  It is appended as a user message at the next safe model boundary, never inside
+  an in-flight request, and receipt order is transcript order. An idle or stopped
+  thread returns `queued: false` with a reason. If the run fails for any reason
+  other than a stop, the steering it had drained is rolled back with the
+  transcript and re-queued in order for the next host turn; a stop discards it.
+  Steering carries TEXT only, so it has two host-side limits: a submit that brings
+  attachments is never steered, and a submit whose `#` reference target has not
+  finished (its result block does not exist yet) cannot be expanded into steering
+  text. The server accepts both as a QUEUED CONTINUATION turn in the same thread
+  instead — the media, the reference binding, and the prompt are preserved and run
+  once the active turn settles.
+- **Capacity** — a session may hold at most `MAX_THREAD_RECORDS` (256) independent
+  host threads, counting delegated children of host threads. Opening one past the
+  bound is the runtime's "already has N independent threads; delete a terminal one"
+  refusal, which the server's thread routes surface as a `429` (no new conversation
+  is created).
+  Deleting a terminal thread removes its record, so it frees a slot again.
+  Unfocused submits each open a new thread, so a long unfocused conversation can
+  reach the bound; continuing ONE thread (submitting its `threadId`) does not.
+  The UI offers no automatic pruning — an operator deletes a row deliberately —
+  and reaching the bound is reported as the server's actionable message, not
+  silently worked around client-side.
+- **Stop** — `stopThread(id, reason?)` aborts that thread's active run (and
+  owner-linked children) and marks it `stopped`; `stopAllThreads()` stops every
+  conversation in the session. A stop also invalidates every host turn already
+  QUEUED on that thread (they reject with "was stopped while this turn was
+  queued" instead of running and flipping the status back to running). Agents
+  cannot run or post into a stopped thread; only a new host `sendThreadInput`
+  revives it, or the host deletes it.
+- **Delete** — `deleteThread(id)` removes a terminal HOST thread: its record,
+  transcript, owned terminal children, its invocation results, and every branch
+  (`threadFork`/autoanswer, including nested ones) materialized from that
+  conversation. The agent's default conversation cannot be deleted (use
+  `reset()`). Deletion purges THIS conversation only: it never promises to forget
+  what other histories were already told, and it does not undo what this thread
+  copied into session-shared memory (todos, profiles, chapters, locations) or what
+  a connected thread already received through a `#` reference.
+
+Threads may only be OWNED by an independent host thread: `ownerThreadId` must
+name a `createThread` record, never an implicit `agent:<name>` conversation
+(its owner link could not be persisted/restored). Delegation children from host
+threads satisfy this automatically.
+- **Cross-thread chat & discovery** — once the session owns a host thread, two
+  conditional core tools are registered: `threadList` returns this session's live
+  conversations (id, agent, origin, status, owner/label) with the caller's own
+  `currentThreadId`, and `threadSend` posts into one of them. Ids are therefore
+  observed, never invented by a model or injected by the server; deleted threads
+  are absent, and only this session is visible. The runtime records the REAL
+  sender (agent + thread from the calling run, not a tool argument). An idle
+  target receives the message immediately; a running target receives it at its
+  next boundary.
+
+Threads persist through snapshot v1 as an optional `threads`/`threadSequence`
+pair (absent while only default conversations exist). See `src/harness.ts` and
+`src/types/index.ts` for the full contract.
+
 ### Layout
 
 Everything the package contains now lives under `src/`: the library, the server
@@ -1677,7 +1779,7 @@ resource paths below `/v1/harness` and adds a bootstrap document at its root; se
 | `GET /api/sessions`, `GET /api/sessions/:id` | List or read sessions |
 | `PATCH /api/sessions/:id` | Retarget models in a live session: body `{ agentModels: { agent: model } }` → `{ session }`. Merges into the live map, validates every key/value, applies all-or-nothing, and is allowed while the session is running (the next request uses the new model; the current one keeps its own). See [Server and UI](#server-and-ui) |
 | `POST /api/sessions/:id/messages` | Legacy submit; response is `text/event-stream`. This response OWNS the run: a disconnect cancels it, and a busy session or a pending queue is a `409`. New clients should prefer `/tasks` + `/events` |
-| `POST /api/sessions/:id/tasks` | Queue a task (`{ input }`) → `202 { session, turn }`. The turn is `queued` with a stable id/index and no `startedAt`; the server pump runs the backlog FIFO (cap 100 pending) and continues after a task fails. In memory only |
+| `POST /api/sessions/:id/tasks` | Queue a task (`{ input, attachments?, references?, threadId? }`) → `202 { session, turn }`. The turn is `queued` with a stable id/index and no `startedAt`; each thread runs its own lane FIFO (cap 100 pending across all lanes, `429`) and continues after a task fails. Omitting `threadId` opens a new thread; a running `threadId` steers, or queues a continuation when attachments/an unfinished reference prevent it. In memory only |
 | `GET /api/sessions/:id/events` | Watch the session: `text/event-stream` opening with one `snapshot`, then `turn` upserts (queued → running → terminal) and `event` frames, then one final `snapshot` when the queue drains. A disconnect only unsubscribes; server-owned tasks keep running |
 | `POST /api/sessions/:id/reset` | Reset every agent and clear discovery, todos, and the three record stores; `409` while a run or queued work is pending |
 | `POST /api/sessions/:id/cancel` | Optional `{ all?: true }` → `{ cancelled }`. Default cancels the active run only; `all: true` (the UI Stop button) also cancels every queued turn, which stays in `turns` as a `cancelled` row |
@@ -1788,10 +1890,76 @@ id, it opens with one `snapshot`, and it ends with one `snapshot` when the queue
 drains. Closing the watcher only unsubscribes; the server pump keeps running for
 nobody, which is why a reload or a hidden tab costs nothing.
 
+### Threads in the browser UI (R5/R6/R7)
+
+The UI exposes the runtime's persistent conversations as **threads**, and the
+composer decides which one a message belongs to. Focus is explicit state: it is
+shown by a pressed row in the thread strip and named in the routing line above the
+field, and a background snapshot, another tab's turn or a late record never moves it.
+
+- **Only one conversation is open, and it is the focused one.** Opening any turn of
+  a conversation (its compact header, or its strip row) focuses that thread; closing
+  it unfocuses. A CHILD conversation (a delegated thread with no turn of its own)
+  can be focused from its strip row or by clicking its nested invocation row: the
+  parent tile collapses, the child's recorded transcript is shown, and the composer
+  targets the child's own id. Repeated turns of one persistent thread share the same
+  canonical label (the server's label, else `T3`) in their headers and in one strip
+  row, so they never read as independent conversations.
+- **Routing.** With a thread focused: idle/stopped → the message CONTINUES that
+  conversation (a new turn in the same thread); running → the message STEERS it
+  (queued as a user message at the thread's next model boundary, possibly answered
+  by the owning turn) — UNLESS the draft carries attachments or a `#` reference to a
+  block that has not finished, because steering is text-only and needs terminal
+  reference content: that submit is accepted as a QUEUED CONTINUATION turn in the
+  same thread that keeps its bytes and runs when the active turn ends. The routing
+  line above the field names the real outcome (`Steering …`, `Queued in …`,
+  `Continuing …`) before you send.
+  With nothing focused, a message opens a NEW thread — and if the draft carries `#`
+  block references, it opens a **connected** new thread: the relation is persisted
+  as the turn's `references` and the roster reports it as `connectedThreadIds`, its
+  run receives those results as context, and the new thread is never OWNED by the
+  referenced one (`ownerThreadId` stays delegation-only), so stopping or deleting
+  the source leaves it intact. Unfocused submits each get their own execution lane
+  and run CONCURRENTLY; only a legacy, pre-thread harness handle keeps the old
+  serialized backlog.
+- **Unfocus** is the strip's `New thread` control: the next message opens a new
+  standalone thread instead of steering the focused one.
+- **Per-thread stop.** The far-right `×` on a RUNNING thread row stops only that
+  thread (and the children it owns); siblings keep running. Once the thread is
+  stopped/idle the same control becomes a DELETE, which needs a second, confirming
+  click — a destructive action can never be mistaken for a stop, and a running
+  thread is never offered delete (the server answers `409`).
+- **Stop everything** stays available while a draft exists: with text in the field
+  the composer paints submit + a separate `×` (`Stop all tasks`), which sends
+  `POST /sessions/:id/cancel { all: true }`. With an empty field the inline action
+  is already that stop, so only one control is shown.
+- **Deletion is authoritative at once.** `DELETE /sessions/:id/threads/:threadId`
+  returns the whole snapshot; the UI applies it, so the thread's turns disappear,
+  its focus is dropped, and any `#` reference chip that pointed at one of those
+  turns is removed from the draft (the reader is told) instead of failing the next
+  submit (a failed submit restores its draft without any dead reference). The
+  deletion is also remembered locally — scoped to its session — so a late snapshot,
+  SSE turn or in-flight answer cannot bring the thread back, re-focus it or delete a
+  newer row. Labels of surviving blocks never change.
+
+Wire additions are optional and additive, so an older server keeps working: a
+snapshot without `threads` renders no strip, a turn without `threadId` renders no
+badge, and a submit with no target omits `threadId` (the pre-thread body).
+
+```
+POST   /sessions/:id/tasks                    { input, attachments?, references?, threadId? }
+POST   /sessions/:id/threads/:threadId/cancel { }                        -> { cancelled, session? }
+DELETE /sessions/:id/threads/:threadId                                  -> { deleted: true, session }
+POST   /sessions/:id/cancel                   { all: true }              -> { cancelled }
+```
+
 ### Task queue, timeline, and message rendering (R4/R5)
 
-- **The queue is server-owned and FIFO.** `POST /tasks` returns `202` immediately;
-  the pump runs one task at a time, in order, and continues after a per-task error.
+- **The queue is server-owned and FIFO per conversation.** `POST /tasks` returns
+  `202` immediately; each thread executes its own lane's tasks one at a time, in
+  order, and continues after a per-task error. Lanes are independent, so two
+  different threads run CONCURRENTLY (only a legacy, pre-thread harness handle
+  keeps one serialized backlog).
   With a database root the backlog is durable and queued prompts survive a restart
   (paused until an explicit submit or a cancel-all); without one it is in memory
   only and a restart loses the sessions, their turns, and any queued work. A

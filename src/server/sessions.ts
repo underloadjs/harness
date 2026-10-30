@@ -25,9 +25,10 @@
 //     response: if its emitter fails the run is aborted, and a busy session is
 //     rejected with 409 before a status line is sent.
 //   - QUEUE: enqueue() backs POST /sessions/:id/tasks. It answers 202 immediately
-//     and the private pump() executes the queue FIFO, so a task keeps running
-//     after the browser disconnects. Watchers (GET /sessions/:id/events) only
-//     unsubscribe on disconnect; nothing aborts a queued task except cancel/remove.
+//     and the private lane pump executes each THREAD's backlog FIFO, so a task
+//     keeps running after the browser disconnects. Watchers
+//     (GET /sessions/:id/events) only unsubscribe on disconnect; nothing aborts an
+//     accepted task except cancel/remove/delete.
 //
 // SINGLE FLIGHT: every operation that mutates a session's harness is mutually
 // exclusive: a queue pump turn, a legacy streaming run, a manual `callTool` (R8),
@@ -38,11 +39,15 @@
 // success, failure, and cancellation. cancel() aborts an active run; a manual call
 // has no controller.
 //
-// FRESH BLOCKS + RESULT REFERENCES (R2): every submitted turn is a NEW block, not
-// a resumed transcript. Before the harness runs, executeTurn reseeds every agent's
-// conversation (`agent.reset()`, NOT `harness.reset()`), so the previous block's
-// user/assistant messages are never inherited while discovery, todos, record
-// stores, created tools, and the session's `turns` archive survive. A task may
+// FRESH BLOCKS + RESULT REFERENCES (R2): a LEGACY `/messages` turn, and each
+// unfocused submit (its own new host thread with an empty transcript), is a NEW
+// block, not a resumed transcript. For the legacy path executeTurn reseeds every
+// agent's conversation (`agent.reset()`, NOT `harness.reset()`), so the previous
+// block's user/assistant messages are never inherited while discovery, todos,
+// record stores, created tools, and the session's `turns` archive survive. A submit
+// that names a thread is a CONTINUATION of that conversation (that is what a
+// persistent thread means), and a submit to a RUNNING thread is steered into it.
+// A task may
 // carry `references` (or type `#LABEL`), which the store binds at enqueue and
 // expands at EXECUTION from the referenced turn's recorded terminal `done`
 // content; the raw `turn.prompt` stays user-facing. See shared/agent-results.ts
@@ -71,16 +76,69 @@
 // 404. After a restart nothing is resumed: every recorded question is expired, and
 // the events remain the source a client renders question cards from.
 //
+// PERSISTENT THREADS (R1-R6): the harness owns persistent agent conversations
+// (`harness.threads()`); the store owns the TURN records and decides which thread
+// an input executes in.
+//
+//   - POST /tasks WITHOUT threadId opens a NEW standalone host thread for the
+//     primary agent. A reference to a prior block is a LINK only (the roster
+//     derives `connectedThreadIds`); `ownerThreadId` is reserved for the runtime's
+//     delegation lineage, so stopping/deleting a referenced source never aborts or
+//     purges the connected conversation.
+//   - POST /tasks WITH threadId runs in that thread's own LANE. EVERY
+//     thread-capable submit (new or addressed) runs in its lane: two plain submits
+//     are CONCURRENT (F1), while one lane's backlog stays FIFO. The legacy
+//     `session.queue` + pump survive only for a harness handle that predates the
+//     thread API. `queueDepth` counts pending work across every lane, and
+//     MAX_PENDING_TASKS spans them all. A legacy run or a manual tool call still
+//     owns the session's exclusive gate and parks every lane.
+//   - A submit to a RUNNING thread is STEERED (`harness.steerThread`) at the next
+//     safe model boundary; no duplicate turn is recorded and the response returns
+//     the owning turn with `steered: true`.
+//   - Stopping one thread aborts its run and drops its queued turns; stopping all
+//     (`/cancel {all:true}`) also stops every host thread and drops every backlog.
+//   - Deleting a terminal thread purges its turns, its descendants' turns, the
+//     result references that pointed at them, and the persisted copies BEFORE the
+//     response. Turn INDICES are monotonic high-water marks and label counters are
+//     recorded per turn, so deletion never renumbers a surviving record.
+//
+// CONSEQUENCES for existing readers (explicit, not silent):
+//   - `SessionSnapshot.messages` stays the ENTRY AGENT's default conversation, so
+//     it is empty for a threaded submit (the conversation lives in the thread; see
+//     `SessionSnapshot.threads[].messages` and the per-turn `threadId`). The legacy
+//     `/messages` route keeps appending to it exactly as before;
+//   - an attachment-only submit (empty prompt) is a valid task, but a thread run
+//     requires non-empty text, so its attachment markers become the run text; the
+//     recorded `turn.prompt` stays the raw (empty) user text;
+//   - each unfocused submit opens its own thread, which is bounded by the runtime's
+//     MAX_THREAD_RECORDS (256). A long unfocused conversation reaches that bound;
+//     the UI path (submitting the returned `threadId`) continues ONE thread instead;
+//   - a harness handle that predates the thread API keeps the legacy behaviour
+//     (see `threadsSupported`): no threads, no roster, fresh blocks on the root.
+//
+// Progress attribution: the runtime exposes ONE progress hook per harness. Its
+// `thread` field is INVOCATION identity (`start` carries the prompt, later frames
+// the id), and the same agent can run in two host threads at once, so the field
+// alone cannot decide which recorded turn an event belongs to. Concurrent runs are
+// therefore routed with AsyncLocalStorage: each run executes inside its own
+// context, so the harness's progress callback (and a background tool completion it
+// schedules) delivers to exactly that run's turn. A single active run remains a
+// safe fallback when a callback escapes the async chain.
+//
 // Cross-references:
-//   - ./protocol.ts — SessionSnapshot.turns, SessionTurn, SessionStreamItem
+//   - ./protocol.ts — SessionSnapshot.turns/threads, SessionTurn, SessionStreamItem
 //   - ./handler.ts  — forwards stream items verbatim; no turn inference there
 //   - ./api.ts      — POST /tasks (202), GET /events (watcher), POST /cancel {all},
+//                     POST/DELETE /sessions/:id/threads/:threadId[/cancel],
 //                     POST /sessions/:id/actions/:requestId/answer
 //   - ./harnesses/registry.ts — the in-memory harness registry
 //   - ./harnesses/descriptor.ts — describeHarness, the frozen definition
 //   - ../shared/agent-results.ts — labels, block projection, reference prompt
 //   - ../core/action.ts — validateActionChoice (the one answer parser)
+//   - ../harness.ts — threads()/createThread()/sendThreadInput()/steerThread()/
+//                     stopThread()/stopAllThreads()/deleteThread()
 
+import { AsyncLocalStorage } from 'node:async_hooks';
 import { randomUUID } from 'node:crypto';
 import type {
     Harness,
@@ -92,11 +150,13 @@ import type {
     HarnessInteractionConfiguration,
     HarnessMessage,
     HarnessSnapshot,
-    HarnessStateChangeEvent
+    HarnessStateChangeEvent,
+    HarnessThreadRecord
 } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { validateAttachments } from '../shared/attachments';
 import {
+    collectAgentLabelCounters,
     composeAgentResultPrompt,
     findAgentResultBlock,
     findLatestAgentResultBlock,
@@ -104,7 +164,7 @@ import {
     parseAgentReferenceLabels,
     readAgentResultReferenceList
 } from '../shared/agent-results';
-import type { AgentResultBlock, AgentResultReference } from '../shared/agent-results';
+import type { AgentResultBlock, AgentResultReference, AgentResultTurn } from '../shared/agent-results';
 import { validateActionChoice } from '../core/action';
 import { describeHarness } from './harnesses/descriptor';
 import {
@@ -121,11 +181,13 @@ import { HarnessPersistenceError } from './persistence';
 import { HARNESS_DATABASE_VERSION, repairInterruptedToolCalls } from './persistence';
 import type { HarnessDatabase, HarnessPersistence, HarnessSessionRecord } from './persistence';
 import type {
+    CancelThreadResult,
     HarnessDescriptor,
     HarnessUsage,
     SessionSnapshot,
     SessionStatus,
     SessionStreamItem,
+    SessionThread,
     SessionTurn
 } from './protocol';
 
@@ -146,6 +208,10 @@ const MAX_PENDING_TASKS = 100;
 // more promise resolvers than a human could ever answer. A fifth request is
 // REJECTED (the model receives a readable tool error); it is never auto-answered.
 const MAX_PENDING_ACTIONS = 4;
+
+// Steered-submit audit bound per turn (F3). Only identity/timing/link metadata is
+// kept — never a second copy of the event transcript.
+const MAX_STEER_RECORDS = 64;
 
 // How many no-longer-answerable request ids a session remembers. `answerAction`
 // uses this to distinguish "expired/already answered" (409) from "never existed"
@@ -170,6 +236,10 @@ const ACTION_DUPLICATE_MESSAGE = 'An action request with this requestId is alrea
 // tool call can finish instead of hanging a turn forever.
 type PendingAction = {
     requestId: string;
+    // R1-R6: the persistent thread whose run asked the question. Stopping or
+    // deleting THAT thread expires only its own questions; a sibling lane's
+    // question stays answerable.
+    threadId?: string;
     // The already-validated request this pending answer belongs to. The answer
     // route re-validates the choice against it, so an option id the model never
     // offered is a 400 rather than an answer the runtime must trust.
@@ -199,6 +269,57 @@ type Emit = (item: SessionStreamItem) => void | Promise<void>;
 type SessionWatcher = {
     emit: Emit;
     close: () => void;
+};
+
+// One host thread's execution lane (R1-R6). Every thread-capable submit runs in a
+// lane (F1); it owns:
+//   - its own FIFO backlog (never mixed with the legacy `session.queue`);
+//   - at most ONE active turn (the harness serializes inside a thread anyway);
+//   - the cancellation state of that run, so stopping THIS thread cannot touch a
+//     sibling lane's work.
+// Independent lanes execute concurrently; the session-level `busy` gate (legacy
+// run or manual tool call) parks every lane's pump, exactly like the legacy queue.
+type ThreadLane = {
+    threadId: string;
+    queue: SessionTurn[];
+    active?: SessionTurn;
+    controller?: AbortController;
+    pumping: boolean;
+    // Set by cancelThread/cancel-all BEFORE aborting: the harness rejects the run
+    // with its own abort error, and this flag is what classifies the turn as
+    // "cancelled" rather than "error" (there is no session-wide flag for lanes).
+    stopRequested: boolean;
+    // Progress recorder of the ACTIVE run. Used only as the fallback when the
+    // AsyncLocalStorage context is unavailable (a callback the runtime scheduled
+    // outside this run's async chain) and exactly one lane is active.
+    sink?: (event: HarnessEvent) => Promise<void>;
+};
+
+// What ONE run's async context carries: the turn its events belong to, the
+// persistent thread, and the recorder that appends/publishes them. The harness's
+// progress hook is global, so this is how two concurrent thread runs keep their
+// recorded events apart.
+type TurnRunContext = {
+    session: Session;
+    turn: SessionTurn;
+    threadId?: string;
+    record: (event: HarnessEvent) => Promise<void>;
+};
+
+// Extra execution knobs for executeTurn. The legacy `/messages` path passes none
+// of this (fresh block, exclusive, response-owned); a queue submit passes the
+// persistent thread it was accepted for.
+type TurnExecutionOptions = {
+    // The persistent thread this turn runs in. Undefined only for a legacy
+    // `/messages` turn (the response-owned fresh block).
+    threadId?: string;
+    // The lane that owns this turn, when it was addressed through a thread lane.
+    lane?: ThreadLane;
+    // Reset every agent conversation before the run. TRUE only for the legacy
+    // `/messages` path, which keeps the historical fresh-block semantics. A host
+    // thread is born with an empty transcript, so it never needs a reset (and a
+    // reset would destroy the continuation a threaded submit asked for).
+    freshBlock?: boolean;
 };
 
 type Session = {
@@ -237,6 +358,36 @@ type Session = {
     // when cancel({ all: true }) drops it. Pending only: the active turn is not
     // here, which is why queueDepth never counts it.
     queue: SessionTurn[];
+    // R1-R6: per-thread execution lanes for turns submitted WITH a threadId (or
+    // whose thread was addressed later). Created lazily; a lane with no queued and
+    // no active turn is kept (cheap) so steering/stop lookups stay simple.
+    lanes: Map<string, ThreadLane>;
+    // Monotonic turn-index high-water mark. A turn index is assigned once and never
+    // reused, so deleting a thread does not renumber surviving turns; a fresh
+    // session starts at 0 and reset() starts a new conversation at 0 again.
+    turnSequence: number;
+    // Conversation-scoped result-label counters AT THE START of each turn, keyed by
+    // turn id (shared/agent-results.ts). Deleting a thread removes its entries but
+    // never rewrites a survivor's, so surviving labels stay stable.
+    labelSeeds: Map<string, Record<string, number>>;
+    // Highest occurrence ever minted per two-letter code (tombstone high-water).
+    // Survives deletion of every turn carrying a label, so a retired textual label
+    // is never re-minted for different content. Only counters are kept — never the
+    // content they described.
+    labelHighWater: Map<string, number>;
+    // Invocation id recorded by each THREAD turn's root run, keyed by turn id. The
+    // roster exposes it as originInvocationId and it survives a restart.
+    turnInvocations: Map<string, string>;
+    // F6: every invocation observed in a persistent conversation, mapped to that
+    // thread (invocation id → persistent thread id). A child conversation can run
+    // many times; the runtime record keeps only the LATEST invocation id, so this
+    // map is what lets deletion purge EVERY persisted agent-result record the
+    // runtime removes. Persisted, because a restart must still purge correctly.
+    invocationThreads: Map<string, string>;
+    // True while a LEGACY /messages run owns this harness. Manual calls set `busy`
+    // without changing `status`, so the aggregate status needs its own flag to know
+    // when a real run is active.
+    legacyRunning: boolean;
     // GET /events subscribers. Only remove()/dispose()/unsubscribe detach one.
     watchers: Set<SessionWatcher>;
     // True while the pump loop owns the queue. Set synchronously before the loop
@@ -316,6 +467,12 @@ export type EnqueuedTask = {
     session: SessionSnapshot;
     turn: SessionTurn;
     settled: Promise<void>;
+    // R1-R6: present only when the submit was folded into a RUNNING thread. `turn`
+    // is then the turn that owns that run, not a newly queued record.
+    steered?: true;
+    // The conversation the guidance was delivered to (F3). Disambiguates `turn`
+    // when the owning turn belongs to a parent conversation.
+    steeredThreadId?: string;
 };
 
 // What watch() hands the /events route: the snapshot captured atomically with
@@ -376,6 +533,9 @@ const copyTurn = (turn: SessionTurn): SessionTurn => ({
     id: turn.id,
     index: turn.index,
     prompt: turn.prompt,
+    // R1-R6: the owning persistent thread, when the turn has one. Absent for a
+    // legacy `/messages` turn, preserving that record's exact shape.
+    ...(turn.threadId === undefined ? {} : { threadId: turn.threadId }),
     // Attachments are copied too (T3): the validated record is plain data and a
     // client/snapshot consumer must never be able to mutate the stored bytes. The
     // key stays absent for a text-only turn, preserving every old shape.
@@ -393,7 +553,20 @@ const copyTurn = (turn: SessionTurn): SessionTurn => ({
     updatedAt: turn.updatedAt,
     events: turn.events.map(copyEvent),
     ...(turn.eventTimes === undefined ? {} : { eventTimes: [...turn.eventTimes] }),
-    ...(turn.usage === undefined ? {} : { usage: { ...turn.usage } })
+    ...(turn.usage === undefined ? {} : { usage: { ...turn.usage } }),
+    // Steered guidance audit (R5). Detached copies for the same reason as the rest:
+    // a client must not be able to rewrite the stored record through a response.
+    ...(turn.steers === undefined
+        ? {}
+        : {
+              steers: turn.steers.map((steer) => ({
+                  at: steer.at,
+                  prompt: steer.prompt,
+                  ...(steer.references === undefined
+                      ? {}
+                      : { references: steer.references.map((reference) => ({ ...reference })) })
+              }))
+          })
 });
 
 // Fold one request's usage into a turn's running tally.
@@ -482,6 +655,11 @@ export const validateAttachmentsForSubmit = (value: unknown): HarnessAttachment[
 
 export class SessionStore {
     private readonly sessions = new Map<string, Session>();
+
+    // Per-run async context (R1-R6). One harness has one progress callback, so
+    // this is what attributes a concurrent thread run's events (and the background
+    // deliveries it schedules) to the right SessionTurn. See buildHarness/progress.
+    private readonly runContexts = new AsyncLocalStorage<TurnRunContext>();
 
     // Durable layer, when the host supplied a database root. All writes are
     // synchronous (whole-document atomic replace), so they are serialized without
@@ -599,6 +777,13 @@ export class SessionStore {
             cancelled: false,
             turns: [],
             queue: [],
+            lanes: new Map(),
+            turnSequence: 0,
+            labelSeeds: new Map(),
+            labelHighWater: new Map(),
+            turnInvocations: new Map(),
+            invocationThreads: new Map(),
+            legacyRunning: false,
             watchers: new Set(),
             pumping: false,
             busyWaiters: [],
@@ -636,7 +821,22 @@ export class SessionStore {
         settings: RunnerSettings,
         current: () => Session | undefined
     ): Harness {
-        const progress = (event: HarnessEvent) => current()?.sink?.(event);
+        // Progress routing (R1-R6). The runtime has ONE progress hook per harness,
+        // so two concurrent root thread runs would otherwise be indistinguishable
+        // (a root event carries no `thread` metadata). The run that emitted this
+        // event is the AsyncLocalStorage store set around its `sendThreadInput`
+        // call; when no store is visible (a callback the runtime scheduled outside
+        // that async chain) fall back to the session's single active recorder.
+        const progress = (event: HarnessEvent) => {
+            const session = current();
+            if (session === undefined) return;
+
+            const scoped = this.runContexts.getStore();
+
+            if (scoped !== undefined && scoped.session === session) return scoped.record(event);
+
+            return this.fallbackRecorder(session)?.(event);
+        };
 
         const stateChange = (event: HarnessStateChangeEvent): void => {
             const session = current();
@@ -710,8 +910,17 @@ export class SessionStore {
             // an HTTP answer and the run's abort.
             let pending: PendingAction;
 
+            // The run that asks is the one whose async context is active right now
+            // (the runtime awaits this handler inside the run's chain), so the
+            // owning thread comes from the environment, never from the request.
+            const scopedThreadId =
+                this.runContexts.getStore()?.session === session
+                    ? this.runContexts.getStore()?.threadId
+                    : undefined;
+
             pending = {
                 requestId: context.requestId,
+                ...(scopedThreadId === undefined ? {} : { threadId: scopedThreadId }),
                 request: context.request,
                 signal,
                 settled: false,
@@ -804,8 +1013,13 @@ export class SessionStore {
     // Fail every unanswered question of this session. Used by cancel(), remove(),
     // dispose(), and the end of a turn, so no runtime await can outlive the work it
     // belongs to. Idempotent via finishActionRequest.
-    private expireActions(session: Session, message: string): void {
+    // `threadId` scopes the expiry to ONE conversation (stopping a thread must not
+    // reject a sibling lane's question); omitted expires every pending question
+    // (cancel-all, remove, dispose, end of a legacy run).
+    private expireActions(session: Session, message: string, threadId?: string): void {
         for (const pending of [...session.pendingActions.values()]) {
+            if (threadId !== undefined && pending.threadId !== threadId) continue;
+
             this.finishActionRequest(session, pending, {
                 ok: false,
                 error: new Error(message)
@@ -820,6 +1034,103 @@ export class SessionStore {
         }
 
         return session;
+    }
+
+    // -----------------------------------------------------------------------
+    // R1-R6: thread lanes and the session-wide gates
+    // -----------------------------------------------------------------------
+
+    // Whether this session's harness exposes the persistent-thread API (R1-R6).
+    //
+    // A preset built by `harness()` always does. A HOST-supplied handle built
+    // before threads existed (the background/recovery fixtures forward only the
+    // historical members) does not, and must keep working exactly as before: its
+    // unfocused submits run on the callable root with a fresh block, its turns
+    // carry no thread id, and its snapshots have no roster. Guarding the capability
+    // keeps the old public surface intact instead of breaking every custom handle.
+    private threadsSupported(session: Session): boolean {
+        const harness = session.harness as Partial<Harness>;
+
+        return (
+            typeof harness.threads === 'function' &&
+            typeof harness.thread === 'function' &&
+            typeof harness.threadMessages === 'function' &&
+            typeof harness.createThread === 'function' &&
+            typeof harness.sendThreadInput === 'function' &&
+            typeof harness.stopThread === 'function' &&
+            typeof harness.stopAllThreads === 'function' &&
+            typeof harness.deleteThread === 'function'
+        );
+    }
+
+    // True while ANY thread lane is executing. Lanes are independent, so this is
+    // an aggregate: the legacy/manual paths use it to keep their exclusive
+    // semantics while lanes still run concurrently with each other.
+    private laneActive(session: Session): boolean {
+        for (const lane of session.lanes.values()) {
+            if (lane.active !== undefined) return true;
+        }
+
+        return false;
+    }
+
+    // Every turn accepted but not yet started, across the legacy backlog and every
+    // lane. This is what MAX_PENDING_TASKS bounds, so a session cannot accumulate
+    // unbounded work by spreading it over threads.
+    private pendingCount(session: Session): number {
+        let count = session.queue.length;
+
+        for (const lane of session.lanes.values()) count += lane.queue.length;
+
+        return count;
+    }
+
+    // The exclusive gate: a legacy streaming run, a manual tool call, or any live
+    // thread run. A manual mutation must not interleave with a thread's shared-store
+    // writes, so it is refused while a lane is active (the previous session-wide
+    // busy rule, widened to threads).
+    private exclusive(session: Session): boolean {
+        return session.busy || this.laneActive(session);
+    }
+
+    // Anything that makes "reset"/"remove-and-ignore" unsafe: a live operation or
+    // accepted-but-unstarted work anywhere in the session.
+    private busyOrPending(session: Session): boolean {
+        return this.exclusive(session) || this.pendingCount(session) > 0;
+    }
+
+    private laneOf(session: Session, threadId: string): ThreadLane {
+        const existing = session.lanes.get(threadId);
+        if (existing !== undefined) return existing;
+
+        const lane: ThreadLane = {
+            threadId,
+            queue: [],
+            pumping: false,
+            stopRequested: false
+        };
+
+        session.lanes.set(threadId, lane);
+        return lane;
+    }
+
+    // The recorder to use when a progress callback runs OUTSIDE any run context.
+    // `session.sink` covers the legacy/exclusive run; a single active lane covers
+    // the common one-thread case. Ambiguity (two lanes, no context) is dropped
+    // rather than attributed to the wrong turn.
+    private fallbackRecorder(session: Session): ((event: HarnessEvent) => Promise<void>) | undefined {
+        if (session.sink !== undefined) return session.sink;
+
+        let found: ((event: HarnessEvent) => Promise<void>) | undefined;
+        let count = 0;
+
+        for (const lane of session.lanes.values()) {
+            if (lane.sink === undefined) continue;
+            found = lane.sink;
+            count += 1;
+        }
+
+        return count === 1 ? found : undefined;
     }
 
     // Registry mutations happen in ./harnesses/registry.ts, outside the store, so
@@ -853,8 +1164,29 @@ export class SessionStore {
             ...(session.lastError === undefined ? {} : { lastError: session.lastError }),
             turns: copyTurns(session.turns),
             // Queue entries must be the same turns; ids keep the document compact
-            // and let the loader re-link them to the (already copied) turns.
-            queue: session.queue.map((turn) => turn.id),
+            // and let the loader re-link them to the (already copied) turns. F1:
+            // EVERY pending turn is included — the legacy queue and each lane's
+            // backlog — ordered by turn index so a restart restores the same paused
+            // work (and its thread association).
+            queue: [...session.queue, ...[...session.lanes.values()].flatMap((lane) => lane.queue)]
+                .sort((left, right) => left.index - right.index)
+                .map((turn) => turn.id),
+            // R1-R6: the index high-water mark and the label/invocation joins.
+            // Recorded only when they carry information, so a session that never
+            // opened a host thread keeps the pre-thread document shape.
+            ...(session.turnSequence === 0 ? {} : { threadSequence: session.turnSequence }),
+            ...(session.labelSeeds.size === 0
+                ? {}
+                : { labelSeeds: Object.fromEntries([...session.labelSeeds].map(([id, seed]) => [id, { ...seed }])) }),
+            ...(session.labelHighWater.size === 0
+                ? {}
+                : { labelHighWater: Object.fromEntries([...session.labelHighWater]) }),
+            ...(session.turnInvocations.size === 0
+                ? {}
+                : { turnInvocations: Object.fromEntries(session.turnInvocations) }),
+            ...(session.invocationThreads.size === 0
+                ? {}
+                : { invocationThreads: Object.fromEntries(session.invocationThreads) }),
             // The last committed snapshot. During an active run this is the latest
             // mutation boundary the observer captured (a completed tool's store
             // writes and tool-result message together), plus the event log above.
@@ -867,12 +1199,17 @@ export class SessionStore {
         };
     }
 
-    private databaseRecord(): HarnessDatabase {
+    // `overrides` replaces one session's projected record, which is how a
+    // destructive mutation (thread deletion) can be made DURABLE before the live
+    // harness is touched: a failed write leaves both memory and disk untouched.
+    private databaseRecord(overrides?: ReadonlyMap<string, HarnessSessionRecord>): HarnessDatabase {
         return {
             version: HARNESS_DATABASE_VERSION,
             savedAt: Date.now(),
             registry: this.registry.list().map(presetToRecord),
-            sessions: [...this.sessions.values()].map((session) => this.sessionRecord(session))
+            sessions: [...this.sessions.values()].map(
+                (session) => overrides?.get(session.id) ?? this.sessionRecord(session)
+            )
         };
     }
 
@@ -885,7 +1222,7 @@ export class SessionStore {
     // store, and saving it would destroy the graceful shutdown document. A 503 is
     // the honest answer to a request that raced the shutdown (the caller's rollback
     // then leaves in-memory state exactly as it found it).
-    private persistOrThrow(): void {
+    private persistOrThrow(overrides?: ReadonlyMap<string, HarnessSessionRecord>): void {
         if (this.persistence === undefined) return;
 
         if (this.shuttingDown) {
@@ -893,7 +1230,7 @@ export class SessionStore {
         }
 
         try {
-            this.persistence.save(this.databaseRecord());
+            this.persistence.save(this.databaseRecord(overrides));
             this.lastPersistenceError = undefined;
         } catch (error) {
             this.notePersistenceError(error);
@@ -1026,6 +1363,12 @@ export class SessionStore {
                 interrupted = true;
             }
 
+            // F1: EVERY accepted-but-unstarted turn is PRESERVED as 'queued' and
+            // paused (the historical backlog policy). After the core restore below
+            // each one is placed in its thread's lane, so the next explicit submit
+            // to that conversation drains it FIFO — it is never auto-started and its
+            // prompt/attachments/thread association are all preserved.
+
             let session: Session | undefined;
             const harness = this.buildHarness(preset, settings, () => session);
 
@@ -1047,6 +1390,34 @@ export class SessionStore {
                 cancelled: false,
                 turns,
                 queue,
+                // R1-R6: lanes are rebuilt lazily; restored turns keep their owning
+                // thread id so their history stays groupable.
+                lanes: new Map(),
+                // Old documents have no high-water mark: derive it from the highest
+                // recorded index so a restored session never reuses an index.
+                turnSequence:
+                    record.threadSequence ??
+                    turns.reduce((highest, turn) => Math.max(highest, turn.index + 1), 0),
+                // Seeds/invocation joins are restored for turns that still exist;
+                // a stale id (from a hand-edited file) is dropped rather than
+                // resurrecting a record nobody can address.
+                labelSeeds: new Map(
+                    Object.entries(record.labelSeeds ?? {}).filter(([turnId]) =>
+                        turns.some((turn) => turn.id === turnId)
+                    )
+                ),
+                // The tombstone high-water is NOT filtered by live turns: its whole
+                // purpose is to remember labels whose turns are gone.
+                labelHighWater: new Map(Object.entries(record.labelHighWater ?? {})),
+                turnInvocations: new Map(
+                    Object.entries(record.turnInvocations ?? {}).filter(([turnId]) =>
+                        turns.some((turn) => turn.id === turnId)
+                    )
+                ),
+                // F6: invocation → conversation, kept across a restart so a later
+                // deletion can purge the runtime's agent-result records exactly.
+                invocationThreads: new Map(Object.entries(record.invocationThreads ?? {})),
+                legacyRunning: false,
                 watchers: new Set(),
                 pumping: false,
                 busyWaiters: [],
@@ -1095,6 +1466,34 @@ export class SessionStore {
                 }
             }
 
+            // F1 distribution: every restored queued turn belongs to the lane of
+            // the thread it names (now that `restore` recreated those threads), or
+            // to the legacy queue when the harness/thread predates the API. No pump
+            // is started: the backlog stays paused until an explicit submit.
+            if (queue.length > 0 && this.threadsSupported(session)) {
+                const legacy: SessionTurn[] = [];
+
+                for (const turn of queue) {
+                    const threadId = turn.threadId;
+
+                    if (threadId !== undefined && harness.thread(threadId) !== undefined) {
+                        let lane = session.lanes.get(threadId);
+
+                        if (lane === undefined) {
+                            lane = { threadId, queue: [], pumping: false, stopRequested: false };
+                            session.lanes.set(threadId, lane);
+                        }
+
+                        lane.queue.push(turn);
+                        continue;
+                    }
+
+                    legacy.push(turn);
+                }
+
+                session.queue = legacy;
+            }
+
             // Now idle: capture the authoritative post-restore snapshot (it also
             // records the model map above) as this session's committed state.
             session.core = harness.snapshot();
@@ -1117,7 +1516,12 @@ export class SessionStore {
     // POST /tasks. Clients that want to submit while work is pending use /tasks.
     assertRunnable(id: string): void {
         const session = this.require(id);
-        if (session.busy || session.queue.length > 0) {
+
+        // R1-R6: a live thread run (or any accepted-but-unstarted work anywhere)
+        // also blocks the legacy response-owned path, which keeps its historical
+        // "one fresh block at a time" semantics. Without a thread this is exactly
+        // the previous busy/queue check.
+        if (this.busyOrPending(session)) {
             throw new SessionError(409, 'A task is already running in this session.');
         }
     }
@@ -1155,7 +1559,7 @@ export class SessionStore {
         // A non-empty QUEUE rejects too: queued tasks are already accepted work for
         // this harness, and a manual mutation would change state they will run
         // against. The pump would otherwise have to interleave two owners.
-        if (session.busy || session.queue.length > 0) {
+        if (this.busyOrPending(session)) {
             throw new SessionError(409, 'A task is running in this session; try again when it finishes.');
         }
 
@@ -1191,14 +1595,85 @@ export class SessionStore {
         }
     }
 
+    // R1-R6 roster: every HOST thread (an agent's default conversation is internal
+    // plumbing and stays out of the wire shape). Each entry joins the runtime
+    // record to the recorded turns:
+    //   - originTurnId/originInvocationId: the first turn that ran in the thread and
+    //     the invocation id its root run reported, so a client can anchor the
+    //     conversation in the legacy turn timeline;
+    //   - references: the result blocks the thread's turns consumed (the "#" links);
+    //   - messages: the thread's own committed transcript, so a focused UI can
+    //     render one conversation without filtering the whole turn list.
+    private threadRoster(session: Session): SessionThread[] {
+        if (!this.threadsSupported(session)) return [];
+
+        const hostThreads = session.harness.threads().filter((record) => record.origin === 'host');
+
+        if (hostThreads.length === 0) return [];
+
+        const ordered = [...session.turns].sort((left, right) => left.index - right.index);
+
+        return hostThreads.map((record: HarnessThreadRecord) => {
+            const owned = ordered.filter((turn) => turn.threadId === record.id);
+            const first = owned[0];
+
+            // Deduplicate the links by (turn, thread, label): the same block
+            // referenced by two turns of this thread is one edge in the graph.
+            const references: AgentResultReference[] = [];
+            const seen = new Set<string>();
+
+            for (const turn of owned) {
+                for (const reference of turn.references ?? []) {
+                    const key = `${reference.turnId}\u0000${reference.threadId ?? ''}\u0000${reference.label}`;
+                    if (seen.has(key)) continue;
+
+                    seen.add(key);
+                    references.push({ ...reference });
+                }
+            }
+
+            const originInvocationId =
+                first === undefined ? undefined : session.turnInvocations.get(first.id);
+
+            // F2: reference EDGES, derived from the recorded turns. A connection is
+            // never ownership, so it names the source conversations without making
+            // this one a child of them.
+            const connectedThreadIds = [
+                ...new Set(
+                    references
+                        .map((reference) =>
+                            session.turns.find((turn) => turn.id === reference.turnId)
+                        )
+                        .map((turn) => turn?.threadId)
+                        .filter((threadId): threadId is string => threadId !== undefined)
+                )
+            ].filter((threadId) => threadId !== record.id);
+
+            return {
+                ...record,
+                ...(first === undefined ? {} : { originTurnId: first.id }),
+                ...(originInvocationId === undefined ? {} : { originInvocationId }),
+                ...(references.length === 0 ? {} : { references }),
+                ...(connectedThreadIds.length === 0 ? {} : { connectedThreadIds }),
+                // Always present (possibly empty): a focused UI can render "no
+                // messages yet" without a second request.
+                messages: session.harness.threadMessages(record.id)
+            };
+        });
+    }
+
     private snapshot(session: Session): SessionSnapshot {
+        const threads = this.threadRoster(session);
+        // Pending backlog across every lane plus the legacy queue (F1). The active
+        // turn is never counted.
+        const pending = this.pendingCount(session);
+
         return {
             id: session.id,
             harness: session.preset.name,
             status: session.status,
-            // Pending backlog only (the active turn is not in `queue`). Omitted
-            // when empty so every pre-queue snapshot keeps its exact shape.
-            ...(session.queue.length === 0 ? {} : { queueDepth: session.queue.length }),
+            // Omitted when empty so a drained session keeps the pre-queue shape.
+            ...(pending === 0 ? {} : { queueDepth: pending }),
             model: session.harness.agent.model(),
             // Per-agent models THIS session runs (R9), frozen with the harness: an
             // override from the preset, otherwise the session's settings.model. A
@@ -1211,6 +1686,21 @@ export class SessionStore {
             updatedAt: session.updatedAt,
             messages: copyMessages(session.harness.agent.messages),
             turns: copyTurns(session.turns),
+            // Omitted entirely when the session owns no host thread, so every
+            // pre-thread snapshot keeps its exact shape.
+            ...(threads.length === 0 ? {} : { threads }),
+            ...(session.labelSeeds.size === 0
+                ? {}
+                : {
+                      labelSeeds: Object.fromEntries(
+                          [...session.labelSeeds].map(([turnId, seed]) => [turnId, { ...seed }])
+                      )
+                  }),
+            // Tombstone counters only (never content): a client can show that a
+            // retired label will not be re-minted after a deletion.
+            ...(session.labelHighWater.size === 0
+                ? {}
+                : { labelHighWater: Object.fromEntries([...session.labelHighWater]) }),
             harnessDefinition: copyDescriptor(session.definition),
             discoveredTools: [...session.harness.discoveredTools],
             ...(session.lastError !== undefined ? { lastError: session.lastError } : {})
@@ -1337,9 +1827,10 @@ export class SessionStore {
         const session = this.require(id);
 
         // A manual tool call holds `busy` too, so chat cannot start while one runs.
-        // A non-empty queue also blocks this path: the pump's work was accepted
-        // first and must keep FIFO order (see assertRunnable).
-        if (session.busy || session.queue.length > 0) {
+        // F1: a live THREAD lane (or any accepted-but-unstarted work in any lane)
+        // also blocks this path — the legacy response-owned run reseeds the shared
+        // agent conversations and must not interleave with thread work.
+        if (this.busyOrPending(session)) {
             throw new SessionError(409, 'A task is already running in this session.');
         }
 
@@ -1352,10 +1843,15 @@ export class SessionStore {
 
         // The turn exists before the harness is called, so the very first progress
         // event already has somewhere to land and the stream can open with it.
-        // `index` is assigned here, once: a turn never moves within the session.
+        // `index` is assigned here, once, from the monotonic high-water mark: a turn
+        // never moves within the session, and a deleted thread never frees an index
+        // for reuse.
+        const index = session.turnSequence;
+        session.turnSequence += 1;
+
         const turn: SessionTurn = {
             id: randomUUID(),
-            index: session.turns.length,
+            index,
             prompt: input,
             // Omitted for a text-only turn so the record keeps its legacy shape.
             ...(validated.length === 0 ? {} : { attachments: validated }),
@@ -1369,7 +1865,9 @@ export class SessionStore {
 
         session.turns.push(turn);
 
-        await this.executeTurn(session, turn, emit, options.signal);
+        // The legacy path keeps the original fresh-block semantics: no thread id,
+        // every agent conversation reseeded before the run.
+        await this.executeTurn(session, turn, emit, options.signal, { freshBlock: true });
     }
 
     // -----------------------------------------------------------------------
@@ -1419,7 +1917,10 @@ export class SessionStore {
 
             // Only PRIOR turns are candidates: a reference points backwards, never
             // at the block being submitted or one queued behind it.
-            const candidates = session.turns.filter((turn) => turn.index < turnIndex);
+            const candidates = this.projectionTurns(
+                session,
+                session.turns.filter((turn) => turn.index < turnIndex)
+            );
             const block = findLatestAgentResultBlock(candidates, label);
 
             if (block === undefined) {
@@ -1468,6 +1969,50 @@ export class SessionStore {
             .sort((left, right) => left.index - right.index);
     }
 
+    // The turn records in RECORDED order, projected for the shared result-block
+    // helpers with each turn's recorded label seed. Passing the seed makes label
+    // numbering deletion-safe: a surviving turn keeps the labels it had before an
+    // earlier thread was deleted (see shared/agent-results.ts).
+    private projectionTurns(session: Session, turns: readonly SessionTurn[]): AgentResultTurn[] {
+        return [...turns]
+            .sort((left, right) => left.index - right.index)
+            .map((turn) => {
+                const seed = session.labelSeeds.get(turn.id);
+                return {
+                    id: turn.id,
+                    status: turn.status,
+                    events: turn.events,
+                    ...(seed === undefined ? {} : { labels: seed })
+                };
+            });
+    }
+
+    // The label counters a NEW turn starts from: one chained allocator over the
+    // conversation prefix, honouring every recorded seed, raised to the tombstone
+    // high-water so a retired textual label is never re-minted after its turns are
+    // deleted. Recorded per turn at creation so deleting an earlier thread cannot
+    // renumber later blocks.
+    private labelSeedOf(session: Session): Record<string, number> | undefined {
+        this.mergeLabelHighWater(session, session.turns);
+
+        const counters: Record<string, number> = Object.fromEntries(session.labelHighWater);
+
+        for (const [code, used] of collectAgentLabelCounters(this.projectionTurns(session, session.turns))) {
+            counters[code] = Math.max(counters[code] ?? 0, used);
+        }
+
+        return Object.keys(counters).length === 0 ? undefined : counters;
+    }
+
+    // Raise the per-code tombstone high-water from the given turn records. Only
+    // counters are recorded; the turns' content is never copied here, so deleting
+    // a conversation leaves no recoverable content in the metadata.
+    private mergeLabelHighWater(session: Session, turns: readonly SessionTurn[]): void {
+        for (const [code, used] of collectAgentLabelCounters(this.projectionTurns(session, turns))) {
+            session.labelHighWater.set(code, Math.max(session.labelHighWater.get(code) ?? 0, used));
+        }
+    }
+
     // Bind one explicit reference against the session record. Returns the exact
     // normalised reference to store. See normalizeReferences for the status rules.
     private bindReference(
@@ -1502,8 +2047,12 @@ export class SessionStore {
             return { ...reference };
         }
 
-        // Conversation prefix (not just `[target]`): see `turnsThrough`.
-        const block = findAgentResultBlock(this.turnsThrough(session, target.index), reference);
+        // Conversation prefix (not just `[target]`): see `turnsThrough`. The
+        // recorded seeds keep a surviving turn's labels stable after a deletion.
+        const block = findAgentResultBlock(
+            this.projectionTurns(session, this.turnsThrough(session, target.index)),
+            reference
+        );
 
         if (block === undefined) {
             throw new SessionError(
@@ -1547,9 +2096,19 @@ export class SessionStore {
     //   - a target that failed/cancelled after binding rejects THIS turn clearly
     //     instead of injecting nothing and silently running.
     private async expandReferences(session: Session, turn: SessionTurn): Promise<string> {
-        const references = turn.references;
+        return this.composeReferences(session, turn.prompt, turn.references);
+    }
 
-        if (references === undefined || references.length === 0) return turn.prompt;
+    // The shared composer: wait for every referenced target to settle, resolve its
+    // recorded block, and inject the terminal `done` content. Used by BOTH an
+    // executing turn and a steered submit (F3), so focused guidance carries exactly
+    // the same reference context as a normal prompt.
+    private async composeReferences(
+        session: Session,
+        prompt: string,
+        references: readonly AgentResultReference[] | undefined
+    ): Promise<string> {
+        if (references === undefined || references.length === 0) return prompt;
 
         const entries: { block: AgentResultBlock; content: string }[] = [];
 
@@ -1571,8 +2130,12 @@ export class SessionStore {
                 throw new Error('The session was removed while waiting for a referenced block.');
             }
 
-            // Conversation prefix (not just `[target]`): see `turnsThrough`.
-        const block = findAgentResultBlock(this.turnsThrough(session, target.index), reference);
+            // Conversation prefix (not just `[target]`): see `turnsThrough`. The
+        // recorded seeds keep a surviving turn's labels stable after a deletion.
+        const block = findAgentResultBlock(
+            this.projectionTurns(session, this.turnsThrough(session, target.index)),
+            reference
+        );
 
             if (block === undefined) {
                 throw new Error(
@@ -1595,7 +2158,45 @@ export class SessionStore {
             entries.push({ block, content: block.content });
         }
 
-        return composeAgentResultPrompt(turn.prompt, entries);
+        return composeAgentResultPrompt(prompt, entries);
+    }
+
+    // Synchronous variant for a STEERED submit (F3): the runtime's steering API is
+    // synchronous and the caller (enqueue) is synchronous too. It returns undefined
+    // when any referenced target is not terminal yet, which makes the caller queue a
+    // continuation turn instead of steering without its context.
+    private composeSteerReferences(
+        session: Session,
+        prompt: string,
+        references: readonly AgentResultReference[]
+    ): string | undefined {
+        if (references.length === 0) return prompt;
+
+        const entries: { block: AgentResultBlock; content: string }[] = [];
+
+        for (const reference of references) {
+            const target = session.turns.find((candidate) => candidate.id === reference.turnId);
+            if (target === undefined || target.status !== 'done') return undefined;
+
+            const block = findAgentResultBlock(
+                this.projectionTurns(session, this.turnsThrough(session, target.index)),
+                reference
+            );
+
+            if (block === undefined || block.status !== 'done' || block.content === undefined) {
+                return undefined;
+            }
+
+            entries.push({ block, content: block.content });
+        }
+
+        try {
+            return composeAgentResultPrompt(prompt, entries);
+        } catch {
+            // Over-budget context: a continuation turn fails readably at execution;
+            // steering without the context would silently drop it.
+            return undefined;
+        }
     }
 
     // Park until one turn is no longer queued/running. `turnWaiters` is woken by
@@ -1630,44 +2231,88 @@ export class SessionStore {
     // before the pending-count check and before any mutation, and the accepted
     // copies are persisted with the queued turn so a restart still has the real
     // bytes and the bound reference list.
+    //
+    // `threadId` is the FINAL trailing parameter (R1-R6). Absent opens a new
+    // standalone host thread (this submit's block); a running thread is STEERED; an
+    // idle/stopped thread gets a continuation turn. See SubmitTaskRequest.
     enqueue(
         id: string,
         rawInput: string,
         attachments?: unknown,
-        references?: unknown
+        references?: unknown,
+        threadId?: unknown
     ): EnqueuedTask {
         const session = this.require(id);
         const validated = validateAttachmentsForSubmit(attachments);
         const input = validateInput(rawInput, validated.length);
+        const wantedThread = this.normalizeThreadId(threadId);
+
         // BIND now (R2): the referenced turn/block must exist and be a PRIOR
         // completion target, so a bad reference is a 400 before a turn exists.
         // Content is deliberately NOT read here: a still-running target is queued
         // and expanded at EXECUTION (see expandReferences) after it completes.
+        // The prospective index is the monotonic high-water mark (not the array
+        // length), so a deletion never lets a new turn sort before a survivor.
         const boundReferences = this.normalizeReferences(
             session,
-            session.turns.length,
+            session.turnSequence,
             input,
             references
         );
 
-        // Pending only. The active turn is not in `queue`, so one task can run
-        // while this many wait; that keeps the cap a true backlog bound.
-        if (session.queue.length >= MAX_PENDING_TASKS) {
+        // Pending only. The active turn is not in a queue, so one task per lane can
+        // run while this many wait; the cap spans every lane so spreading work over
+        // threads cannot bypass the backlog bound.
+        if (this.pendingCount(session) >= MAX_PENDING_TASKS) {
             throw new SessionError(
                 429,
                 `A session cannot queue more than ${MAX_PENDING_TASKS} pending tasks.`
             );
         }
 
+        // STEERING (R5/F3): a submit addressed to a RUNNING thread lands at its next
+        // safe model boundary. No new turn is recorded — the response names the turn
+        // that owns the run — so a focused follow-up cannot duplicate the transcript.
+        // Reference context is expanded into the steered text (the audit keeps the
+        // user's prompt and the bound blocks); ATTACHMENTS are never steered (the
+        // runtime's steer API is text-only), so such a submit falls through to a
+        // queued continuation that keeps its bytes.
+        if (wantedThread !== undefined) {
+            const steered = this.steerIntoThread(
+                session,
+                wantedThread,
+                input,
+                validated,
+                boundReferences
+            );
+            if (steered !== undefined) return steered;
+        }
+
+        // Resolve the execution thread. An explicit id is used as-is (a stopped
+        // thread is revived by the explicit host action); an unfocused submit opens
+        // a NEW standalone host thread. A reference is a LINK, not ownership: the
+        // new conversation is never owned by the thread it references, so stopping
+        // or deleting that source cannot destroy it (see SessionThread).
+        let createdThreadId: string | undefined;
+        const targetThread =
+            wantedThread ??
+            (this.threadsSupported(session)
+                ? (createdThreadId = this.createSubmitThread(session))
+                : undefined);
+
         const now = Date.now();
+        const index = session.turnSequence;
+        session.turnSequence += 1;
+        const seed = this.labelSeedOf(session);
 
         // `status: 'queued'` and no `startedAt`: this record is complete and
         // renderable before any execution, which is what lets a reload show the
         // backlog. `events`/`eventTimes` start empty and are filled by the pump.
         const turn: SessionTurn = {
             id: randomUUID(),
-            index: session.turns.length,
+            index,
             prompt: input,
+            threadId: targetThread,
             // Omitted when nothing was referenced, so a plain task keeps the exact
             // legacy record shape. The bound list is persisted and expanded later.
             ...(boundReferences.length === 0 ? {} : { references: boundReferences }),
@@ -1680,8 +2325,16 @@ export class SessionStore {
             eventTimes: []
         };
 
+        if (seed !== undefined) session.labelSeeds.set(turn.id, seed);
+
         session.turns.push(turn);
-        session.queue.push(turn);
+        // F1: EVERY thread-capable submit runs in its thread's own LANE, so two
+        // plain submits are concurrent instead of serialized through the legacy
+        // queue (the legacy queue survives only for a harness handle without the
+        // thread API). Within one lane the pump stays strictly FIFO.
+        const lane =
+            targetThread === undefined ? undefined : this.laneOf(session, targetThread);
+        (lane?.queue ?? session.queue).push(turn);
         session.updatedAt = now;
 
         // Completion for callers that want to await THIS turn (tests, tools). The
@@ -1695,17 +2348,29 @@ export class SessionStore {
 
         // Persist the accepted backlog before the 202: a queued prompt is user work
         // that a restart must preserve. Roll back the in-memory entry on failure so
-        // a retry cannot duplicate it.
+        // a retry cannot duplicate it (including the host thread this submit opened).
         try {
             this.persistOrThrow();
         } catch (error) {
-            const index = session.turns.indexOf(turn);
-            if (index !== -1) session.turns.splice(index, 1);
+            const at = session.turns.indexOf(turn);
+            if (at !== -1) session.turns.splice(at, 1);
 
-            const queued = session.queue.indexOf(turn);
-            if (queued !== -1) session.queue.splice(queued, 1);
+            const queued = (lane?.queue ?? session.queue).indexOf(turn);
+            if (queued !== -1) (lane?.queue ?? session.queue).splice(queued, 1);
 
+            session.labelSeeds.delete(turn.id);
             session.settlers.delete(turn.id);
+
+            // The new thread was created for this submit only; a failed write must
+            // not leave an empty conversation behind.
+            if (createdThreadId !== undefined) {
+                try {
+                    session.harness.deleteThread(createdThreadId);
+                } catch {
+                    // Already refused/absent: the submit's rollback is complete.
+                }
+            }
+
             throw error;
         }
 
@@ -1719,9 +2384,188 @@ export class SessionStore {
         // as queued. Then start (or join) the pump, which is decoupled from any
         // response: `void` on purpose, nothing here waits for execution.
         this.publish(session, { type: 'turn', turn: copyTurn(turn) });
-        void this.pump(session);
+
+        if (lane === undefined) void this.pump(session);
+        else void this.pumpLane(session, lane);
 
         return { session: snapshot, turn: queuedTurn, settled };
+    }
+
+    // Validate the optional `threadId` submit field. A non-string or blank value is
+    // a 400 BEFORE any mutation; an unknown/deleted id is a 404 (an honest "no such
+    // conversation" rather than silently opening a new thread).
+    private normalizeThreadId(value: unknown): string | undefined {
+        if (value === undefined) return undefined;
+
+        if (typeof value !== 'string' || value.trim().length === 0) {
+            throw new SessionError(400, '`threadId` must be a non-empty string when present.');
+        }
+
+        return value.trim();
+    }
+
+    // STEER a running thread, or return undefined when it is not running (the
+    // caller then enqueues a continuation). The owning turn is returned rather
+    // than a duplicate record: its event log is where the steered text lands.
+    private steerIntoThread(
+        session: Session,
+        threadId: string,
+        input: string,
+        attachments: readonly HarnessAttachment[],
+        references: readonly AgentResultReference[]
+    ): EnqueuedTask | undefined {
+        if (!this.threadsSupported(session)) {
+            throw new SessionError(400, 'This session does not support persistent threads.');
+        }
+
+        const record = session.harness.thread(threadId);
+
+        if (record === undefined) {
+            throw new SessionError(404, `Unknown thread "${threadId}".`);
+        }
+
+        const lane = session.lanes.get(threadId);
+        const running = record.status === 'running' || lane?.active !== undefined;
+        if (!running) return undefined;
+
+        // F3: the runtime's steering API carries TEXT only. An attachment-only (or
+        // attachment-bearing) focused submit must never pretend its bytes were
+        // delivered, so it becomes a queued continuation in the same thread and
+        // keeps them.
+        if (attachments.length > 0) return undefined;
+
+        // Reference context is part of the steered text: a focused follow-up gets
+        // exactly what a normal turn prompt would (block content inside the shared
+        // delimiters). A target that is not terminal yet cannot be injected safely,
+        // so the submit becomes a queued CONTINUATION instead (it expands at
+        // execution like any other turn) rather than steering without its context.
+        const steeredText = this.composeSteerReferences(session, input, references);
+        if (steeredText === undefined) return undefined;
+
+        let receipt;
+        try {
+            receipt = session.harness.steerThread(threadId, steeredText);
+        } catch (error) {
+            // A runtime refusal is a client/lifecycle error (400/429), never a 500.
+            throw this.threadError(error, 'Could not steer the thread');
+        }
+
+        if (!receipt.queued) return undefined;
+
+        const owning = this.owningTurnOf(session, threadId);
+
+        if (owning === undefined) {
+            // A runtime-driven child run (a delegation) can be running without a
+            // server turn of its own; its steering target is the parent turn, which
+            // is found through the owner chain. Reaching here means no recorded turn
+            // owns the conversation, so there is nothing to report as the accepting
+            // record.
+            throw new SessionError(
+                409,
+                `Thread "${threadId}" is running but no recorded turn owns it; stop it before submitting.`
+            );
+        }
+
+        // Audit WITHOUT duplicating the event transcript: the guidance itself
+        // appears in the conversation at the next model boundary; the owning turn
+        // keeps what was sent, when, and which blocks it carried.
+        const at = Date.now();
+        owning.steers = [
+            ...(owning.steers ?? []),
+            {
+                at,
+                prompt: input,
+                ...(references.length === 0
+                    ? {}
+                    : { references: references.map((reference) => ({ ...reference })) })
+            }
+        ].slice(-MAX_STEER_RECORDS) as SessionTurn['steers'];
+
+        session.updatedAt = at;
+        // Steering is delivered to a LIVE run and is lost on restart by definition
+        // (the run is interrupted). The audit record is durable, but a write failure
+        // must not claim the guidance was rejected: it IS queued in the runtime, so
+        // report the real outcome and surface the write error separately.
+        this.persistBestEffort();
+
+        return {
+            session: this.snapshot(session),
+            turn: copyTurn(owning),
+            // Nothing to await: the text is folded into the run already in flight.
+            settled: Promise.resolve(),
+            steered: true,
+            steeredThreadId: threadId
+        };
+    }
+
+    // The recorded turn that owns a running thread: its own lane, an ancestor
+    // lane's turn (a delegated child runs inside its parent), else the newest
+    // running turn (a legacy-pump thread turn). Undefined only for runtime-driven
+    // work no server turn recorded.
+    private owningTurnOf(session: Session, threadId: string): SessionTurn | undefined {
+        const own = session.lanes.get(threadId)?.active;
+        if (own !== undefined) return own;
+
+        if (!this.threadsSupported(session)) return undefined;
+
+        const records = new Map(session.harness.threads().map((record) => [record.id, record]));
+        const seen = new Set<string>([threadId]);
+        let current = records.get(threadId)?.ownerThreadId;
+
+        while (current !== undefined && !seen.has(current)) {
+            seen.add(current);
+
+            const ancestor = session.lanes.get(current)?.active;
+            if (ancestor !== undefined) return ancestor;
+
+            current = records.get(current)?.ownerThreadId;
+        }
+
+        const byThread = [...session.turns]
+            .sort((left, right) => left.index - right.index)
+            .filter((turn) => turn.threadId === threadId && turn.status === 'running')
+            .pop();
+        if (byThread !== undefined) return byThread;
+
+        return [...session.turns]
+            .sort((left, right) => left.index - right.index)
+            .filter((turn) => turn.status === 'running')
+            .pop();
+    }
+
+    // Open the STANDALONE host thread for an unfocused submit (R1-R6).
+    //
+    // F2: a reference is NOT ownership. `ownerThreadId` is reserved for the
+    // runtime's delegation lineage (a child conversation). A "# connected" submit
+    // records the relation on the TURN (`references`) and the roster derives
+    // `connectedThreadIds` from those links, so stopping/deleting a referenced
+    // source can never abort or purge this new conversation.
+    //
+    // F8: the runtime's host-thread bound is a lifecycle failure, not a server bug.
+    // It becomes an actionable 429; any other harness refusal is a 400.
+    private createSubmitThread(session: Session): string {
+        try {
+            return session.harness.createThread(session.preset.primary).id;
+        } catch (error) {
+            throw this.threadError(error, 'Could not open a new thread');
+        }
+    }
+
+    // Map a runtime thread error onto a client status. Capacity ("already has N
+    // independent threads … delete a terminal one") is a 429; everything else the
+    // runtime refuses about a thread operation (unknown agent, blank/oversized
+    // label, …) is a 400. The message stays the runtime's actionable text.
+    private threadError(error: unknown, context: string): SessionError {
+        const message = messageOf(error);
+
+        if (/already has \d+ independent threads|delete a terminal one/i.test(message)) {
+            return new SessionError(
+                429,
+                `${context}: ${message}`
+            );
+        }
+
+        return new SessionError(400, `${context}: ${message}`);
     }
 
     // Drain the queue strictly FIFO, one turn at a time (R4).
@@ -1756,7 +2600,18 @@ export class SessionStore {
                 session.queue.shift();
 
                 try {
-                    await this.executeTurn(session, head);
+                    // An unfocused submit runs inside the host thread it opened; its
+                    // transcript is empty, so no fresh-block reset is needed. The
+                    // legacy `/messages` path (threadId undefined) keeps the reset.
+                    await this.executeTurn(
+                        session,
+                        head,
+                        undefined,
+                        undefined,
+                        head.threadId === undefined
+                            ? { freshBlock: true }
+                            : { threadId: head.threadId }
+                    );
                 } catch (error) {
                     // executeTurn absorbs harness failures itself; this is the
                     // last-resort guard so an unexpected internal throw can never
@@ -1768,6 +2623,7 @@ export class SessionStore {
                     head.updatedAt = Date.now();
                     this.publish(session, { type: 'turn', turn: copyTurn(head) });
                     this.settle(head, session);
+                    this.releaseDrain(session);
                 }
             }
         } finally {
@@ -1782,6 +2638,71 @@ export class SessionStore {
 
             this.releaseDrain(session);
         }
+    }
+
+    // Drain ONE thread lane, strictly FIFO, while sibling lanes keep running (R1-R6).
+    //
+    // The harness already serializes inside a thread, but the server keeps its own
+    // backlog so a queued continuation is a recorded turn the client can address
+    // before it starts. The session's exclusive gate (a legacy run or a manual call)
+    // parks this lane exactly like the legacy pump, so a shared-store mutation never
+    // interleaves with a thread's run; lanes never block EACH OTHER.
+    private async pumpLane(session: Session, lane: ThreadLane): Promise<void> {
+        if (lane.pumping) return;
+        lane.pumping = true;
+
+        try {
+            while (!session.disposed) {
+                const head = lane.queue[0];
+                if (head === undefined) break;
+
+                if (session.busy) {
+                    await this.waitForBusy(session);
+                    continue;
+                }
+
+                lane.queue.shift();
+
+                try {
+                    await this.executeTurn(session, head, undefined, undefined, {
+                        threadId: lane.threadId,
+                        lane
+                    });
+                } catch (error) {
+                    // Same last-resort guard as the legacy pump: never leave the
+                    // lane parked with a stuck flag.
+                    session.status = 'error';
+                    session.lastError = messageOf(error);
+                    head.status = 'error';
+                    head.updatedAt = Date.now();
+                    this.publish(session, { type: 'turn', turn: copyTurn(head) });
+                    this.settle(head, session);
+                    this.releaseDrain(session);
+                }
+            }
+        } finally {
+            lane.pumping = false;
+
+            // Drain frame: only when the WHOLE session is idle, so a sibling lane
+            // that is still executing does not get a premature "everything done".
+            if (!session.disposed && this.isIdle(session)) {
+                this.publish(session, { type: 'snapshot', session: this.snapshot(session) });
+            }
+
+            this.releaseDrain(session);
+        }
+    }
+
+    // No accepted-but-unstarted work and no live run anywhere in the session.
+    private isIdle(session: Session): boolean {
+        if (session.pumping || this.pendingCount(session) > 0) return false;
+        if (this.laneActive(session)) return false;
+
+        for (const lane of session.lanes.values()) {
+            if (lane.pumping) return false;
+        }
+
+        return true;
     }
 
     // Attach an SSE watcher to a session's queue stream.
@@ -1810,16 +2731,17 @@ export class SessionStore {
     // Resolves once the queue has drained (no pending turns, no pump work). Used
     // by tests and tools that want to wait out a submitted backlog; the HTTP
     // contract never blocks on it.
-    waitForIdle(id: string): Promise<void> {
+    async waitForIdle(id: string): Promise<void> {
         const session = this.require(id);
 
-        if (!session.pumping && session.queue.length === 0) {
-            return Promise.resolve();
+        // Wait until EVERY source of work has settled: the legacy pump, every lane
+        // pump, its backlog, and any active run. A wake for one lane is harmless —
+        // the loop re-checks the whole session.
+        while (!session.disposed && !this.isIdle(session)) {
+            await new Promise<void>((resolve) => {
+                session.drainWaiters.push(resolve);
+            });
         }
-
-        return new Promise<void>((resolve) => {
-            session.drainWaiters.push(resolve);
-        });
     }
 
     // Park until the single-flight gate is released. Resolving early (busy went
@@ -1924,14 +2846,29 @@ export class SessionStore {
         session: Session,
         turn: SessionTurn,
         legacyEmit?: Emit,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        execution: TurnExecutionOptions = {}
     ): Promise<void> {
-        // Take the gate BEFORE the first await. Everything after this line runs
-        // inside the try/finally below, so even an exceptional setup cannot leave
-        // `busy` held (which would reject every later operation) or park the pump.
-        session.busy = true;
+        const lane = execution.lane;
+        const threadId = execution.threadId;
+        const freshBlock = execution.freshBlock === true;
 
+        // Claim the execution slot BEFORE the first await. A LANE turn takes its own
+        // lane slot (so sibling lanes keep running). Every other turn — a legacy
+        // `/messages` run and an unfocused queued turn — takes the session's
+        // exclusive gate, which is what serializes real runs against manual tool
+        // calls and each other. Everything below runs inside the try/finally, so no
+        // exceptional setup can leave a flag stuck.
         const controller = new AbortController();
+
+        if (lane === undefined) {
+            session.busy = true;
+            session.legacyRunning = true;
+        } else {
+            lane.active = turn;
+            lane.controller = controller;
+            lane.stopRequested = false;
+        }
 
         const usageField = (): { usage?: HarnessUsage } =>
             turn.usage === undefined ? {} : { usage: { ...turn.usage } };
@@ -1944,6 +2881,13 @@ export class SessionStore {
             session.cancelled = true;
             controller.abort();
         };
+
+        // A run is cancelled when the store asked THIS run to stop (lane) or the
+        // legacy session flag is set, or when its own controller aborted. A lane
+        // classification must never inherit a sibling's cancel.
+        const wasCancelled = (): boolean =>
+            (lane === undefined ? session.cancelled : lane.stopRequested) ||
+            controller.signal.aborted;
 
         let failure: string | undefined;
 
@@ -1992,11 +2936,18 @@ export class SessionStore {
             turn.startedAt = startedAt;
             turn.updatedAt = startedAt;
 
+            // Aggregate status: any live run reports 'running'. A run only clears
+            // the error banner when nothing else is executing, so a sibling's
+            // failure is not erased by a later start.
+            const othersActive = lane === undefined ? this.laneActive(session) : session.legacyRunning;
+
             session.status = 'running';
-            session.cancelled = false;
-            session.lastError = undefined;
+            if (!othersActive) session.lastError = undefined;
+            if (lane === undefined) {
+                session.cancelled = false;
+                session.controller = controller;
+            }
             session.updatedAt = startedAt;
-            session.controller = controller;
 
             // Durability at the turn-start transition: the running row exists before
             // any provider work, so a crash mid-run leaves an explicit interrupted
@@ -2012,7 +2963,11 @@ export class SessionStore {
                 if (signal.aborted) forwardAbort();
             }
 
-            session.sink = async (event) => {
+            // ONE recorder for THIS run: it appends to this turn and fans the frame
+            // out. It is published on the session (legacy run) or on the lane and is
+            // bound into the run's async context, so concurrent thread runs never
+            // record into each other (see buildHarness/progress).
+            const record = async (event: HarnessEvent): Promise<void> => {
                 // Record first: the server's turn is authoritative even when the client
                 // that opened the stream disappeared (a reload, a cancel by disconnect).
                 // `at` is the one server timestamp shared by the frame and the parallel
@@ -2021,6 +2976,19 @@ export class SessionStore {
                 const at = Date.now();
                 turn.events.push(record);
                 turn.eventTimes?.push(at);
+
+                // F6: remember which persistent conversation each invocation ran in.
+                // The START frame of a root host run or a delegated child names the
+                // invocation; the runtime roster maps it to the conversation. Branch
+                // frames are transcript-ephemeral and deliberately skipped.
+                if (
+                    record.type === 'start' &&
+                    record.thread !== undefined &&
+                    record.thread.kind === undefined &&
+                    record.thread.branchId === undefined
+                ) {
+                    this.noteInvocationThread(session, record.thread.id);
+                }
 
                 // Token tally, accumulated here so every client reads the SERVER's
                 // figure. Only the per-request `usage` event counts: the harness also
@@ -2079,6 +3047,9 @@ export class SessionStore {
                 });
             };
 
+            if (lane === undefined) session.sink = record;
+            else lane.sink = record;
+
             // Open the turn frame before the harness emits anything, so a client never
             // sees an event it cannot attribute. A failed legacy write means the stream
             // is already gone: abort rather than run for nobody.
@@ -2096,19 +3067,23 @@ export class SessionStore {
             // Watchers get the SAME shape as an upsert (the turn just became running).
             this.publish(session, opening());
 
-            // R2 FRESH BLOCK. Every submitted turn is a NEW conversation: the
-            // previous block's user/assistant transcript must not be inherited (its
-            // results stay available through the SESSION turn record and the
+            // R2 FRESH BLOCK — LEGACY PATH ONLY. A `/messages` turn is a new block:
+            // the previous block's user/assistant transcript must not be inherited
+            // (its results stay available through the SESSION turn record and the
             // reference expansion below). `agent.reset()` reseeds only the
             // conversation from the agent's instructions — it deliberately leaves
             // discovery, the todo list, record stores, created tools, and the
             // session's `turns` archive untouched, so historical results are not
             // discarded. This is why `harness.reset()` is NOT used here.
-            this.resetConversations(session);
+            //
+            // A THREAD turn never resets: a host thread is born with an empty
+            // transcript (a fresh block by construction), and a further submit to
+            // the same thread is a CONTINUATION that must keep its history.
+            if (freshBlock) this.resetConversations(session);
 
-            // Commit the fresh transcript as the active state. A crash during this
-            // block then restores a coherent empty+partial conversation rather than
-            // replaying the previous block's history into it.
+            // Commit the transcript as the active state. A crash during this block
+            // then restores a coherent conversation rather than replaying the
+            // previous block's history into it.
             try {
                 session.core = session.harness.snapshot();
             } catch {
@@ -2120,50 +3095,125 @@ export class SessionStore {
             // Expand AFTER the reset and only once every referenced turn is
             // terminal, so the injected text is the recorded `done` content. With
             // no references this is the user's prompt by identity.
-            const runPrompt = await this.expandReferences(session, turn);
+            const composed = await this.expandReferences(session, turn);
+
+            // An attachment-only task has an EMPTY prompt, which the legacy root
+            // call accepts (the media parts travel separately). A persistent thread
+            // run requires non-empty text, so its submit markers become the run text
+            // — the same labels the composer would insert. The recorded
+            // `turn.prompt` stays the user's raw (empty) text.
+            const runPrompt =
+                threadId !== undefined &&
+                composed.trim().length === 0 &&
+                turn.attachments !== undefined &&
+                turn.attachments.length > 0
+                    ? turn.attachments.map((attachment) => attachment.marker).join(' ')
+                    : composed;
 
             // Root prompt + its composer attachments (T3). The attachments ride
             // ONLY on this run's root user message; core validates them once more
             // before appending history (so a corrupted restored record is rejected
             // without mutating the transcript). A text-only turn passes no key.
-            await session.harness(runPrompt, {
+            const options = {
                 signal: controller.signal,
                 ...(turn.attachments === undefined ? {} : { attachments: turn.attachments })
-            });
-            session.status = 'idle';
-            turn.status = 'done';
+            };
+
+            // R1-R6: a turn that names a persistent thread runs IN that thread
+            // (`sendThreadInput`), so its transcript, steering, and stop/delete are
+            // the runtime's; the legacy `/messages` turn keeps the callable root.
+            //
+            // The async context is what attributes this run's progress events when
+            // a sibling lane is emitting at the same time (see buildHarness).
+            if (threadId === undefined) {
+                await this.runContexts.run({ session, turn, record }, () =>
+                    session.harness(runPrompt, options)
+                );
+            } else {
+                await this.runContexts.run({ session, turn, threadId, record }, () =>
+                    session.harness.sendThreadInput(threadId, runPrompt, options)
+                );
+            }
+
+            // Record the run's invocation identity for the roster join. A root run
+            // may report none; the thread record's latest invocation id is the
+            // fallback the roster already exposes.
+            if (threadId !== undefined) {
+                const invocationId = session.harness.thread(threadId)?.invocationId;
+                if (invocationId !== undefined) session.turnInvocations.set(turn.id, invocationId);
+            }
+
+            // A run that settled as an abort is terminal as `cancelled` even if the
+            // transport returned instead of throwing.
+            if (wasCancelled()) {
+                failure = 'The run was cancelled.';
+                turn.status = 'cancelled';
+            } else {
+                turn.status = 'done';
+            }
         } catch (error) {
             // A cancelled turn is terminal as `cancelled`, even though the session
             // keeps its existing error/lastError contract for the UI banner. A setup
             // failure lands here too: the finally below still releases the gate.
-            failure = session.cancelled ? 'The run was cancelled.' : messageOf(error);
-            session.status = 'error';
+            const cancelled = wasCancelled();
+            failure = cancelled ? 'The run was cancelled.' : messageOf(error);
             session.lastError = failure;
-            turn.status = session.cancelled ? 'cancelled' : 'error';
+            turn.status = cancelled ? 'cancelled' : 'error';
         } finally {
             // Remove the legacy forwarder BEFORE the gate is released, so the next
             // queued turn can never inherit this response's abort signal.
             signal?.removeEventListener('abort', forwardAbort);
 
-            session.sink = undefined;
-            session.controller = undefined;
+            // The slot is released exactly once, in this run's finally: no other run
+            // could have replaced the recorder/controller while this one held the
+            // exclusive gate or its lane.
+            if (lane === undefined) {
+                session.sink = undefined;
+                session.controller = undefined;
+                session.busy = false;
+                session.legacyRunning = false;
+            } else {
+                lane.sink = undefined;
+                lane.active = undefined;
+                lane.controller = undefined;
+                lane.stopRequested = false;
+            }
+
             // N4: an unanswered question cannot outlive its run. The runtime
             // normally resolves or aborts every handler it awaits, so this is a
             // backstop; finishActionRequest makes it a no-op when there is nothing
-            // left. Rejecting here also releases the pending map before the gate
-            // opens, so the next queued turn starts with a clean slate.
-            this.expireActions(session, ACTION_RUN_ENDED_MESSAGE);
+            // left. Scoped to THIS conversation, so a sibling lane's question stays
+            // answerable.
+            this.expireActions(session, ACTION_RUN_ENDED_MESSAGE, threadId);
 
-            // Release the single-flight gate on success, failure, and cancellation
-            // alike: a stuck gate would reject every later chat/reset/manual call
-            // and park the queue pump forever.
-            session.busy = false;
+            // Release the gate on success, failure, and cancellation alike: a stuck
+            // gate would reject every later chat/reset/manual call and park every
+            // pump forever.
             session.updatedAt = Date.now();
             turn.updatedAt = session.updatedAt;
+
+            // Aggregate session status: only the LAST live run decides idle/error.
+            const others = this.laneActive(session) || session.legacyRunning;
+
+            // The historical banner contract: a successful run leaves the session
+            // idle, while failure AND cancellation report an error with lastError
+            // (the turn itself still records 'cancelled'). With concurrent lanes the
+            // LAST settled run decides, and a success clears a sibling's banner —
+            // the same "later success resets the banner" rule as before.
+            if (others) {
+                session.status = 'running';
+            } else if (turn.status === 'done') {
+                session.status = 'idle';
+                session.lastError = undefined;
+            } else {
+                session.status = 'error';
+            }
+
             // The turn's terminal status is now visible; a turn parked while
             // referencing it may continue (and re-check) on its next tick.
             this.releaseTurnWaiters(session);
             this.releaseBusy(session);
+            this.releaseDrain(session);
         }
 
         // One terminal upsert replaces the running row for every watcher, whatever
@@ -2183,6 +3233,9 @@ export class SessionStore {
         if (!session.disposed && !this.shuttingDown) {
             try {
                 session.core = session.harness.snapshot();
+                // Remember the label occurrences this turn minted, so deleting it
+                // later cannot make a NEW turn re-mint the same textual label.
+                this.mergeLabelHighWater(session, session.turns);
             } catch {
                 // Defensive: a run that somehow still owns the harness keeps the last
                 // committed snapshot. The turn is terminal either way.
@@ -2236,13 +3289,29 @@ export class SessionStore {
 
         let cancelled = false;
 
-        if (session.status === 'running') {
+        // The LEGACY active run (response-owned `/messages` or an unfocused queued
+        // turn). Its controller is the session's.
+        if (session.status === 'running' && session.controller !== undefined) {
             session.cancelled = true;
-            session.controller?.abort();
+            session.controller.abort();
             // N4: a cancelled run can no longer receive an owner answer. Reject
             // the awaited promise now (the abort signal also reaches it, but this
             // makes the outcome explicit and settles exactly once).
             this.expireActions(session, ACTION_CANCELLED_MESSAGE);
+            cancelled = true;
+        }
+
+        // Every live THREAD lane. Stopping the active run is the default cancel
+        // contract; marking the threads themselves stopped is reserved for `all`.
+        // A stop-all also flags IDLE lanes, so a pump parked on the exclusive gate
+        // cannot start a conversation that is being stopped.
+        for (const lane of session.lanes.values()) {
+            if (options.all === true) lane.stopRequested = true;
+            if (lane.active === undefined) continue;
+
+            lane.stopRequested = true;
+            lane.controller?.abort();
+            this.expireActions(session, ACTION_CANCELLED_MESSAGE, lane.threadId);
             cancelled = true;
         }
 
@@ -2253,8 +3322,8 @@ export class SessionStore {
             return cancelled;
         }
 
-        const dropped = session.queue.splice(0);
         const now = Date.now();
+        const dropped = session.queue.splice(0);
 
         for (const turn of dropped) {
             turn.status = 'cancelled';
@@ -2266,8 +3335,37 @@ export class SessionStore {
             this.settle(turn, session);
         }
 
-        if (dropped.length > 0) {
-            cancelled = true;
+        // STOP-ALL (R6): mark every HOST thread stopped and drop every lane backlog.
+        // The default `agent:<name>` conversations are internal plumbing — a legacy
+        // root call and delegation keep using them — so they are left usable; the
+        // host threads are exactly what the roster exposes and what a user can
+        // resume/delete.
+        let stopped = 0;
+        if (this.threadsSupported(session)) {
+            for (const record of session.harness.threads()) {
+                if (record.origin !== 'host') continue;
+
+                try {
+                    if (session.harness.stopThread(record.id, 'All threads were stopped.')) stopped += 1;
+                } catch {
+                    // Already stopped/deleted: nothing to abort for it.
+                }
+            }
+        }
+
+        for (const lane of session.lanes.values()) {
+            for (const turn of lane.queue.splice(0)) {
+                turn.status = 'cancelled';
+                turn.updatedAt = now;
+                this.publish(session, { type: 'turn', turn: copyTurn(turn) });
+                this.settle(turn, session);
+                cancelled = true;
+            }
+        }
+
+        if (stopped > 0) cancelled = true;
+
+        if (cancelled) {
             session.updatedAt = now;
             // Dropped turns are terminal without an executeTurn finally, so wake
             // reference waiters here too.
@@ -2275,7 +3373,7 @@ export class SessionStore {
 
             // With nothing executing, no pump is left to publish the drain
             // snapshot, so send it here. When a turn IS active the pump sends it.
-            if (!session.busy && !session.pumping) {
+            if (this.isIdle(session)) {
                 this.publish(session, { type: 'snapshot', session: this.snapshot(session) });
             }
         }
@@ -2287,6 +3385,525 @@ export class SessionStore {
         return cancelled;
     }
 
+    // STOP ONE THREAD (R6, POST /sessions/:id/threads/:threadId/cancel).
+    //
+    // Aborts that thread's live run, drops its queued turns (they can never run
+    // now), marks it stopped, and cascades to any thread it owns. A sibling lane is
+    // untouched. `cancelled` reports whether live work was aborted or a queued turn
+    // dropped; an idle thread is still marked stopped and answers false.
+    cancelThread(id: string, threadId: string, reason?: string): CancelThreadResult {
+        const session = this.require(id);
+
+        if (!this.threadsSupported(session)) {
+            throw new SessionError(404, `Unknown thread "${threadId}".`);
+        }
+
+        const record = session.harness.thread(threadId);
+
+        if (record === undefined) {
+            throw new SessionError(404, `Unknown thread "${threadId}".`);
+        }
+
+        const lane = session.lanes.get(threadId);
+        let cancelled = false;
+
+        // The thread itself plus every conversation it owns: the runtime's stop
+        // cascades, and the server drops the matching backlogs.
+        const stoppedThreads = new Set<string>([threadId]);
+        for (const child of session.harness.threads()) {
+            if (this.isDescendantThread(session, child.id, threadId)) stoppedThreads.add(child.id);
+        }
+
+        // Signal OUR classification BEFORE aborting (F7): the runtime rejects the
+        // run with its own abort error, and this flag is what records the turn as
+        // "cancelled" instead of "error". Set it on EVERY lane the runtime stop
+        // cascades to (the thread and its owner-linked children), so a cascaded
+        // child run is never misclassified. An idle lane needs no flag.
+        for (const targetId of stoppedThreads) {
+            const target = session.lanes.get(targetId);
+            if (target !== undefined && target.active !== undefined) target.stopRequested = true;
+        }
+
+        try {
+            if (session.harness.stopThread(threadId, reason)) cancelled = true;
+        } catch (error) {
+            throw new SessionError(400, messageOf(error));
+        }
+
+        // An UNFOCUSED submit runs on the session's exclusive gate (no lane). When
+        // the turn being aborted is the one for a stopped thread, the legacy flag
+        // and controller are what classify/abort it.
+        if (session.status === 'running' && session.controller !== undefined) {
+            const active = [...session.turns]
+                .sort((left, right) => left.index - right.index)
+                .filter((turn) => turn.status === 'running')
+                .pop();
+
+            if (active?.threadId !== undefined && stoppedThreads.has(active.threadId)) {
+                session.cancelled = true;
+                session.controller.abort();
+                cancelled = true;
+            }
+        }
+
+        const now = Date.now();
+        for (const targetId of stoppedThreads) {
+            // A lane's own backlog.
+            const target = session.lanes.get(targetId);
+            if (target !== undefined) {
+                for (const turn of target.queue.splice(0)) {
+                    turn.status = 'cancelled';
+                    turn.updatedAt = now;
+                    this.publish(session, { type: 'turn', turn: copyTurn(turn) });
+                    this.settle(turn, session);
+                    cancelled = true;
+                }
+            }
+
+            // The LEGACY serialized backlog: only a harness handle that predates
+            // the thread API parks thread turns there (`threadsSupported` false).
+            // A thread-capable session queues per lane instead (see the lane loop
+            // above), but a legacy handle's backlog is still addressable, so a
+            // stop must drop its turns too.
+            const legacyQueued = session.queue.filter(
+                (turn) => turn.threadId !== undefined && stoppedThreads.has(turn.threadId)
+            );
+
+            for (const turn of legacyQueued) {
+                const at = session.queue.indexOf(turn);
+                if (at === -1) continue;
+
+                session.queue.splice(at, 1);
+                turn.status = 'cancelled';
+                turn.updatedAt = now;
+                this.publish(session, { type: 'turn', turn: copyTurn(turn) });
+                this.settle(turn, session);
+                cancelled = true;
+            }
+        }
+
+        // Only THIS conversation's questions expire; a sibling lane may still be
+        // waiting for its owner's answer.
+        for (const targetId of stoppedThreads) {
+            this.expireActions(session, ACTION_CANCELLED_MESSAGE, targetId);
+        }
+
+        // A run whose thread is stopped but that has not settled yet keeps the
+        // session 'running' until its abort lands; the terminal frame then fixes it.
+        session.updatedAt = now;
+        // Dropped turns are terminal without an executeTurn finally: wake reference
+        // waiters and any waitForIdle() caller here too.
+        this.releaseTurnWaiters(session);
+        this.releaseDrain(session);
+        this.persistOrThrow();
+        this.publish(session, { type: 'snapshot', session: this.snapshot(session) });
+
+        return { cancelled, session: this.snapshot(session) };
+    }
+
+    // True when `candidate` is (transitively) owned by `ancestor` in the runtime
+    // roster. Used to cascade a stop/drop over a deleted owner's children; a cyclic
+    // hand-edited link terminates instead of looping.
+    private isDescendantThread(session: Session, candidate: string, ancestor: string): boolean {
+        if (!this.threadsSupported(session)) return false;
+
+        const records = new Map(session.harness.threads().map((record) => [record.id, record]));
+        const seen = new Set<string>([candidate]);
+        let current = records.get(candidate)?.ownerThreadId;
+
+        while (current !== undefined && !seen.has(current)) {
+            if (current === ancestor) return true;
+
+            seen.add(current);
+            current = records.get(current)?.ownerThreadId;
+        }
+
+        return false;
+    }
+
+    // Record invocation → persistent conversation for the F6 purge. The runtime sets
+    // the thread record's `invocationId` before the run emits `start`, so a lookup at
+    // that moment is exact; an invocation already mapped is left alone (ids are
+    // unique and never reused).
+    private noteInvocationThread(session: Session, invocationId: string): void {
+        if (!this.threadsSupported(session)) return;
+        if (session.invocationThreads.has(invocationId)) return;
+
+        for (const record of session.harness.threads()) {
+            if (record.invocationId !== invocationId) continue;
+
+            session.invocationThreads.set(invocationId, record.id);
+            return;
+        }
+    }
+
+    // Invocation ids whose persisted agent-result records belong to the doomed
+    // conversations (F6). Reconstructed from the server's own records because the
+    // persisted snapshot carries no thread id per result:
+    //   - each doomed thread's latest runtime invocation;
+    //   - every ROOT invocation recorded for a doomed thread's turn;
+    //   - every non-branch invocation that appeared in those turns' events (a
+    //     delegated child's runs are recorded inside its parent turn).
+    // `removedIds` scopes the turn scan to the turns this deletion actually removes
+    // (a survivor's invocation must keep its results), so it is load-bearing, not
+    // decorative.
+    private doomedInvocationIds(
+        session: Session,
+        doomed: ReadonlySet<string>,
+        removedIds: ReadonlySet<string>
+    ): Set<string> {
+        const ids = new Set<string>();
+
+        if (!this.threadsSupported(session)) return ids;
+
+        // Every invocation this server observed in a doomed conversation — including
+        // a child's EARLIER runs, which the roster's single slot no longer names.
+        for (const [invocationId, threadId] of session.invocationThreads) {
+            if (doomed.has(threadId)) ids.add(invocationId);
+        }
+
+        for (const record of session.harness.threads()) {
+            if (!doomed.has(record.id)) continue;
+            if (record.invocationId !== undefined) ids.add(record.invocationId);
+        }
+
+        for (const turn of session.turns) {
+            if (turn.threadId === undefined || !doomed.has(turn.threadId)) continue;
+            if (!removedIds.has(turn.id)) continue;
+
+            const rootInvocation = session.turnInvocations.get(turn.id);
+            if (rootInvocation !== undefined) ids.add(rootInvocation);
+
+            for (const event of turn.events) {
+                const thread = (event as { thread?: { id?: string; kind?: string; branchId?: string } })
+                    .thread;
+
+                // Branch results are not scoped to a persistent conversation, so the
+                // runtime keeps them; removing them here would make disk and runtime
+                // disagree.
+                if (thread?.id === undefined) continue;
+                if (thread.kind !== undefined || thread.branchId !== undefined) continue;
+
+                ids.add(thread.id);
+            }
+        }
+
+        return ids;
+    }
+
+    // DELETE ONE THREAD (R6, DELETE /sessions/:id/threads/:threadId).
+    //
+    // Removes the thread, its descendants, every owning turn, every result
+    // reference that pointed at those turns, and their persisted copies. A running
+    // thread (or one with queued work) is a 409 — stop it first. The default
+    // `agent:<name>` conversation is a 400 (use reset).
+    //
+    // ORDERING: the new document is written BEFORE the live harness is touched, so
+    // a failed write rolls back cleanly with nothing lost (the in-memory state and
+    // the disk still describe the same session).
+    deleteThread(id: string, threadId: string): SessionSnapshot {
+        const session = this.require(id);
+
+        if (!this.threadsSupported(session)) {
+            throw new SessionError(404, `Unknown thread "${threadId}".`);
+        }
+
+        const record = session.harness.thread(threadId);
+
+        if (record === undefined) {
+            throw new SessionError(404, `Unknown thread "${threadId}".`);
+        }
+
+        if (record.origin === 'agent') {
+            throw new SessionError(
+                400,
+                `Thread "${threadId}" is the agent's own conversation and cannot be deleted; use reset to clear the session.`
+            );
+        }
+
+        // The conversation plus every conversation it OWNS (delegation lineage).
+        const doomed = new Set<string>([threadId]);
+        for (const candidate of session.harness.threads()) {
+            if (this.isDescendantThread(session, candidate.id, threadId)) doomed.add(candidate.id);
+        }
+
+        // F4: a STOPPED-but-still-unwinding run (an abort-ignoring transport) is a
+        // live run. Deleting it now would leave the durable file purged while the
+        // runtime still owns the conversation. Every such turn is a 409, whether it
+        // runs in a lane or on the exclusive gate (the runtime's `status` may
+        // already read 'stopped', which is why the TURN is authoritative here).
+        for (const turn of session.turns) {
+            if (turn.threadId === undefined || !doomed.has(turn.threadId)) continue;
+            if (turn.status !== 'running' && turn.status !== 'queued') continue;
+
+            throw new SessionError(
+                409,
+                `Thread "${threadId}" still has live work; wait for it to stop before deleting it.`
+            );
+        }
+
+        // A conversation the runtime still reports as running (for example one a
+        // `threadSend` revived without a server turn) is live too.
+        if (record.status === 'running') {
+            throw new SessionError(
+                409,
+                `Thread "${threadId}" still has live work; wait for it to stop before deleting it.`
+            );
+        }
+
+        // The runtime refuses a partial delete when a linked child is live; make
+        // that a 409 with the same meaning instead of a generic harness error.
+        for (const candidate of session.harness.threads()) {
+            if (candidate.id === threadId) continue;
+            if (!this.isDescendantThread(session, candidate.id, threadId)) continue;
+
+            if (candidate.status === 'running' || session.lanes.get(candidate.id)?.active !== undefined) {
+                throw new SessionError(
+                    409,
+                    `Thread "${candidate.id}" is running; stop it before deleting "${threadId}".`
+                );
+            }
+        }
+
+        // Queued work in EITHER backlog counts: a lane's own queue and the legacy
+        // serialized queue (used only by a harness handle that predates the thread
+        // API — a thread-capable session queues per lane). Deleting accepted
+        // prompts would discard user work silently.
+        for (const targetId of doomed) {
+            const laneQueued = session.lanes.get(targetId)?.queue.length ?? 0;
+            const legacyQueued = session.queue.filter((turn) => turn.threadId === targetId).length;
+
+            if (laneQueued + legacyQueued > 0) {
+                throw new SessionError(
+                    409,
+                    `Thread "${targetId}" still has queued work; stop it before deleting "${threadId}".`
+                );
+            }
+        }
+
+        // A LIVE task in another thread that is waiting for (or about to expand) a
+        // doomed turn would hang once that turn disappears — its waiter would never
+        // be signalled. Refuse until that task settles.
+        for (const turn of session.turns) {
+            if (turn.threadId !== undefined && doomed.has(turn.threadId)) continue;
+            if (turn.status !== 'queued' && turn.status !== 'running') continue;
+            if (turn.references === undefined) continue;
+
+            const waitsOnDoomed = turn.references.some((reference) => {
+                const target = session.turns.find((candidate) => candidate.id === reference.turnId);
+                return (
+                    target !== undefined &&
+                    target.threadId !== undefined &&
+                    doomed.has(target.threadId)
+                );
+            });
+
+            if (waitsOnDoomed) {
+                throw new SessionError(
+                    409,
+                    `Thread "${threadId}" is referenced by a live task; stop that work before deleting it.`
+                );
+            }
+        }
+
+        // F4: a STOPPED-but-still-unwinding run (an abort-ignoring transport) is a
+        // live run. Deleting it now would leave the durable file purged while the
+        // runtime still owns the conversation. Every such turn is a 409, whether it
+        // runs in a lane, the legacy gate, or a conversation the caller just
+        // stopped (the runtime's `status` may already read 'stopped').
+        for (const turn of session.turns) {
+            if (turn.threadId === undefined || !doomed.has(turn.threadId)) continue;
+            if (turn.status !== 'running' && turn.status !== 'queued') continue;
+
+            throw new SessionError(
+                409,
+                `Thread "${threadId}" still has live work; wait for it to stop before deleting it.`
+            );
+        }
+        if (session.status === 'running' && session.controller !== undefined) {
+            const active = [...session.turns]
+                .sort((left, right) => left.index - right.index)
+                .filter((turn) => turn.status === 'running')
+                .pop();
+
+            if (active?.threadId !== undefined && doomed.has(active.threadId)) {
+                throw new SessionError(
+                    409,
+                    `Thread "${threadId}" still has live work; wait for it to stop before deleting it.`
+                );
+            }
+        }
+
+        // Retire the labels this deletion removes BEFORE the content goes: only the
+        // counters survive, never the text they described (R6 tombstone).
+        this.mergeLabelHighWater(
+            session,
+            session.turns.filter(
+                (turn) => turn.threadId !== undefined && doomed.has(turn.threadId)
+            )
+        );
+
+        // Persist the post-delete document FIRST. `sessionRecord` is projected as if
+        // the deletion had already happened, so a write failure changes nothing.
+        const survivors = session.turns.filter(
+            (turn) => turn.threadId === undefined || !doomed.has(turn.threadId)
+        );
+        const removedIds = new Set(
+            session.turns
+                .filter((turn) => turn.threadId !== undefined && doomed.has(turn.threadId))
+                .map((turn) => turn.id)
+        );
+
+        const projectedTurns = survivors.map((turn) => {
+            const copy = copyTurn(turn);
+
+            if (turn.references === undefined) return copy;
+
+            const kept = turn.references.filter((reference) => !removedIds.has(reference.turnId));
+
+            // A link to a deleted turn is dropped from the persisted copy too: the
+            // record must not promise a target that no longer exists.
+            if (kept.length === 0) delete copy.references;
+            else copy.references = kept.map((reference) => ({ ...reference }));
+
+            return copy;
+        });
+
+        // F6: the durable agent-result registry must lose exactly what the runtime
+        // purge removes. The snapshot does not expose a result's thread, so the
+        // doomed invocation ids are reconstructed from what the server recorded:
+        // every root invocation of a doomed thread's turn, every invocation that
+        // appeared in its events (delegated children included), and each doomed
+        // thread's latest invocation. Branch invocations are NOT thread-scoped and
+        // are deliberately left alone.
+        const doomedInvocations = this.doomedInvocationIds(session, doomed, removedIds);
+
+        const projectedCore = ((): HarnessSnapshot => {
+            // Project from the LIVE snapshot, not the cached one: the answer must be
+            // exactly what the runtime will return after the purge.
+            const core = JSON.parse(JSON.stringify(session.harness.snapshot())) as HarnessSnapshot;
+
+            if (core.threads !== undefined) {
+                core.threads = core.threads.filter((thread) => !doomed.has(thread.id));
+                // F5: KEEP the id high-water even with zero records. The runtime
+                // persists `threads: []` + `threadSequence` once any host thread was
+                // ever minted; dropping them here would let a restart reuse
+                // `thread-1`.
+            }
+
+            if (core.agentResults !== undefined) {
+                const kept = core.agentResults.filter(
+                    (result) => !doomedInvocations.has(result.invocationId)
+                );
+
+                if (kept.length === 0) delete core.agentResults;
+                else core.agentResults = kept;
+            }
+
+            return core;
+        })();
+
+        const seedEntries = [...session.labelSeeds].filter(([turnId]) => !removedIds.has(turnId));
+        const invocationEntries = [...session.turnInvocations].filter(
+            ([turnId]) => !removedIds.has(turnId)
+        );
+        const highWaterEntries = [...session.labelHighWater];
+
+        const previous = this.sessionRecord(session);
+
+        const projected: HarnessSessionRecord = {
+            ...previous,
+            turns: projectedTurns,
+            queue: session.queue.map((turn) => turn.id).filter((turnId) => !removedIds.has(turnId)),
+            core: projectedCore,
+            ...(seedEntries.length === 0 ? {} : { labelSeeds: Object.fromEntries(seedEntries) }),
+            ...(invocationEntries.length === 0
+                ? {}
+                : { turnInvocations: Object.fromEntries(invocationEntries) }),
+            ...(highWaterEntries.length === 0
+                ? {}
+                : { labelHighWater: Object.fromEntries(highWaterEntries) })
+        };
+
+        // Drop the stale keys from the override when they are absent in the
+        // projection (sessionRecord may have included them above).
+        if (seedEntries.length === 0) delete projected.labelSeeds;
+        if (invocationEntries.length === 0) delete projected.turnInvocations;
+        if (highWaterEntries.length === 0) delete projected.labelHighWater;
+
+        this.persistOrThrow(new Map([[session.id, projected]]));
+
+        // Durable: now change the runtime. Preflight above rejects every live or
+        // queued conversation, so this call has nothing left to refuse. If the
+        // runtime still fails (a future/core contract change), ROLL THE FILE BACK to
+        // the document it had before this call: memory and disk then both describe
+        // the pre-delete state, and the caller gets an honest 500.
+        try {
+            session.harness.deleteThread(threadId);
+        } catch (error) {
+            try {
+                this.persistOrThrow(new Map([[session.id, previous]]));
+            } catch {
+                // The rollback write failed; report the original refusal.
+            }
+
+            throw new SessionError(500, `Could not delete thread "${threadId}": ${messageOf(error)}`);
+        }
+
+        // Purge the owning turns and every link that pointed at them.
+        session.turns = survivors;
+        for (const turn of survivors) {
+            if (turn.references === undefined) continue;
+
+            const kept = turn.references.filter((reference) => !removedIds.has(reference.turnId));
+            if (kept.length === turn.references.length) continue;
+
+            if (kept.length === 0) delete turn.references;
+            else turn.references = kept;
+        }
+
+        for (const removed of removedIds) {
+            session.labelSeeds.delete(removed);
+            session.turnInvocations.delete(removed);
+
+            // Release anyone awaiting a removed turn's completion (nothing else
+            // will settle it) and forget its cached settler.
+            const settle = session.settlers.get(removed);
+            if (settle !== undefined) {
+                session.settlers.delete(removed);
+                settle();
+            }
+        }
+
+        // Forget every lane of the deleted conversations. Its queued turns were
+        // refused above (409), so the queue is empty by construction.
+        for (const targetId of doomed) session.lanes.delete(targetId);
+
+        // The invocation joins of a deleted conversation have no remaining target.
+        for (const [invocationId, threadId] of session.invocationThreads) {
+            if (doomed.has(threadId)) session.invocationThreads.delete(invocationId);
+        }
+
+        session.queue = session.queue.filter((turn) => !removedIds.has(turn.id));
+        session.updatedAt = Date.now();
+        session.core = session.harness.snapshot();
+
+        // F6 consistency guard: the durable projection and the runtime's post-purge
+        // snapshot must describe the same core state (threads, high-water, agent
+        // results). If they ever differ, persist the runtime's answer so a restart
+        // cannot resurrect a lookup the live session already lost.
+        if (JSON.stringify(session.core) !== JSON.stringify(projectedCore)) this.persistBestEffort();
+
+        // Nothing is executing for a deleted thread; wake parked waiters so a
+        // `waitForIdle`/reset request can observe the new state.
+        this.releaseTurnWaiters(session);
+        this.releaseDrain(session);
+
+        this.publish(session, { type: 'snapshot', session: this.snapshot(session) });
+
+        return this.snapshot(session);
+    }
+
     reset(id: string): SessionSnapshot {
         const session = this.require(id);
 
@@ -2295,7 +3912,10 @@ export class SessionStore {
         // state the tool is still mutating. A pending queue is also refused: those
         // tasks were accepted against this harness, so the caller must stop them
         // first (cancel { all: true }) rather than silently discarding them.
-        if (session.busy || session.queue.length > 0) {
+        // A live LANE run or a lane backlog is refused for the same reason: those
+        // tasks were accepted against this harness, so the caller must stop them
+        // first (cancel { all: true }).
+        if (this.busyOrPending(session)) {
             throw new SessionError(409, 'Cancel the running task before resetting the session.');
         }
 
@@ -2311,6 +3931,17 @@ export class SessionStore {
         // harness reset above, and the turns belong to the same conversation, so
         // keeping them would make the UI show prompts history no longer contains.
         session.turns = [];
+        // R1-R6: `harness.reset()` removed every HOST thread, so their lanes and
+        // joins go with them. Turn indices and label numbering restart with the new
+        // conversation (a reset is a new record, not a deletion).
+        session.lanes.clear();
+        session.turnSequence = 0;
+        session.labelSeeds.clear();
+        // A reset starts a NEW conversation, so retired labels are forgotten with it
+        // (unlike deletion, which keeps the tombstone counters).
+        session.labelHighWater.clear();
+        session.turnInvocations.clear();
+        session.invocationThreads.clear();
         // N4: a reset forgets the conversation, so a question from it is no longer
         // answerable. No pending entry exists here (reset refuses a busy session,
         // and a run expires its own questions), but the bounded history is cleared
@@ -2413,10 +4044,24 @@ export class SessionStore {
             session.controller?.abort();
         }
 
+        // R1-R6: every live lane is aborted too. Each lane's recorder is detached
+        // (its sink would otherwise keep recording into a turn nobody reads), and
+        // the request to stop is recorded so the terminal frame cannot claim a
+        // plain failure.
+        for (const lane of session.lanes.values()) {
+            lane.sink = undefined;
+            lane.stopRequested = true;
+            lane.controller?.abort();
+        }
+
         // Discard pending work instead of running it, but release any enqueue()
         // completion so a caller awaiting `settled` does not hang.
         for (const turn of session.queue.splice(0)) {
             this.settle(turn, session);
+        }
+
+        for (const lane of session.lanes.values()) {
+            for (const turn of lane.queue.splice(0)) this.settle(turn, session);
         }
 
         // The ACTIVE turn (never in `queue`) is released here too: this session can

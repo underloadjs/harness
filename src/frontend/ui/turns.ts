@@ -100,7 +100,17 @@
 // space, not user-facing prose, and re-parsing it as Markdown would be wasted
 // work for every delta.
 //
+// Persistent runtime threads (R5/R6/R7). A tile carries the PERSISTENT thread its
+// turn belongs to (`SessionTurn.threadId`, additive) as a compact badge and as
+// `data-thread-id`; repeated turns of one thread share that badge, so the transcript
+// never presents them as independent conversations. Expansion IS focus: only one
+// tile is ever expanded, and `focusedThread()` is that tile's runtime thread — the
+// composer's steering/continue target (see src/frontend/ui/threads.ts). Do NOT join
+// this identity to the invocation ids in `blocks()`: those are `#` reference
+// bindings for ONE run and are a different namespace.
+//
 // Cross-references:
+//   - persistent threads (roster, routing, strip): src/frontend/ui/threads.ts
 //   - tool cards: src/frontend/ui/tools.ts
 //   - attachment chips (composer + replay): src/frontend/ui/attachments.ts
 //   - attachment/image preview dialogs: src/frontend/ui/preview.ts
@@ -160,6 +170,12 @@ import { elapsedBetween, formatDuration } from './time';
 import { formatTokens } from './tokens';
 import { createToolCallCard } from './tools';
 import type { ToolCallCard, ToolState } from './tools';
+// Persistent (runtime) thread identity. This is NOT the invocation identity used by
+// `#` references: `SessionTurn.threadId` names the stable conversation a turn
+// belongs to, while `AgentBlockDescriptor.threadId` names one invocation. The two
+// must never be joined — see ui/threads.ts for both contracts.
+import { threadLabelOf, threadNameOf, threadTitleOf, turnThreadIdOf } from './threads';
+import type { SessionThreadEntry } from './threads';
 
 // Lifecycle of one user turn. `queued` and `waiting` are distinct on purpose:
 // `queued` means the task is retained by the server behind other work (or the
@@ -269,6 +285,26 @@ export type TurnHandle = {
     // Number of agent sections, tool cards and the primary agent name. Exposed
     // for tests and for the tile's meta line.
     summary: () => { agents: number; tools: number; primary?: string };
+    // Persistent runtime thread this turn belongs to (`SessionTurn.threadId`,
+    // additive). Undefined for a legacy record and for an optimistic tile that has
+    // not been told a target yet. This — not the invocation ids in `blocks()` — is
+    // what the composer focuses, continues and steers (ui/threads.ts).
+    threadId: () => string | undefined;
+    // Repaint everything roster-derived on this tile: the compact badge (S6) and the
+    // persistent markers on its child rows (S2). Called when the roster arrives or
+    // changes, so a tile and the strip always agree on the conversation's name.
+    refreshThreadRoster: () => void;
+    // Does a nested invocation of THIS turn belong to `threadId`? (S2 tie-break for
+    // the board's focus resolution.)
+    knowsThread: (threadId: string) => boolean;
+    // Focus the nested invocation belonging to `threadId` (S2). Expands exactly that
+    // child conversation, collapses every other PERSISTENT child conversation on the
+    // tile (ephemeral invocation details stay independent) and the tile body, and
+    // marks the row as the focused conversation. False when this tile has no match.
+    focusChildThread: (threadId: string) => boolean;
+    // Collapse persistent child conversations and clear their focus markers. Called
+    // when focus moves to a tile / panel, or when the focused child is deleted.
+    clearThreadFocus: () => void;
     // Attachments recorded for this turn (empty for a text-only turn). A tile
     // created by `begin` carries the draft's attachments until the server record
     // replaces them, so the optimistic and replayed renderings agree.
@@ -301,6 +337,35 @@ export type HydrateOptions = {
     // Server turn id to keep expanded across the rebuild. Defaults to whichever
     // tile was expanded before `hydrate` cleared the board.
     keep?: string;
+    // `SessionSnapshot.labelSeeds`: conversation-scoped label counters AT THE START
+    // of each turn, keyed by turn id. A tile adopted with its own recorded seed keeps
+    // the labels it originally allocated even when an EARLIER turn (a deleted
+    // thread's) is no longer in the list — which is what stops a deletion from
+    // renumbering the surviving blocks and orphaning every `#` reference.
+    labelSeeds?: Record<string, Record<string, number>>;
+};
+
+// Read the optional per-turn label seeds structurally (additive protocol field).
+// Malformed entries are ignored: a missing seed only means "continue from the
+// conversation counters", the pre-seed behaviour.
+export const labelSeedsOf = (session: unknown): Record<string, Record<string, number>> | undefined => {
+    if (typeof session !== 'object' || session === null) return undefined;
+
+    const value = (session as { labelSeeds?: unknown }).labelSeeds;
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) return undefined;
+
+    const seeds: Record<string, Record<string, number>> = {};
+    for (const [turnId, counters] of Object.entries(value as Record<string, unknown>)) {
+        if (typeof counters !== 'object' || counters === null || Array.isArray(counters)) continue;
+
+        const clean: Record<string, number> = {};
+        for (const [code, used] of Object.entries(counters as Record<string, unknown>)) {
+            if (typeof used === 'number' && Number.isFinite(used) && used >= 0) clean[code] = used;
+        }
+        seeds[turnId] = clean;
+    }
+
+    return Object.keys(seeds).length === 0 ? undefined : seeds;
 };
 
 // N3 answer routing. The board resolves the CLICK to a request+choice; it must not
@@ -324,6 +389,11 @@ export type TurnBoardOptions = {
     // layer owns no network code. Omitted in standalone use: clicking a file link
     // still opens the dialog, which reports that reading is not wired.
     readFile?: FilePreviewReader;
+    // Focus is DERIVED from expansion (exactly one tile is expanded at a time), so
+    // the board reports every change here. The shell repaints the thread strip and
+    // the composer's routing line from it; nothing is sent to the server until a
+    // submit targets the focused thread (ui/threads.ts `resolveSubmitTarget`).
+    onFocusChange?: (threadId: string | undefined) => void;
 };
 
 export type TurnBoard = {
@@ -335,13 +405,44 @@ export type TurnBoard = {
     // `attachments` is the optional draft payload already validated by the
     // composer. It is rendered immediately (optimistic tile) and replaced by the
     // server record on `merge`; omitting it keeps the text-only path identical.
-    begin: (prompt: string, attachments?: readonly HarnessAttachment[]) => TurnHandle;
+    //
+    // `threadId` is the persistent thread the submit targets (continue/steer). The
+    // optimistic tile carries the badge for it before the server answers; a NEW
+    // thread omits it and gains its identity from the record's `threadId`.
+    begin: (
+        prompt: string,
+        attachments?: readonly HarnessAttachment[],
+        threadId?: string
+    ) => TurnHandle;
     notice: (text: string, tone?: 'info' | 'error') => HTMLElement;
     clear: () => void;
     expand: (turn: TurnHandle) => void;
     collapse: () => void;
     expanded: () => TurnHandle | undefined;
     turns: () => readonly TurnHandle[];
+    // Persistent thread id that is the steering target (S1). This is EXPLICIT state,
+    // not merely "the expanded tile's thread": a focused CHILD conversation has no
+    // tile of its own (S2), an optimistic follow-up tile is unbound for a while, and
+    // a background adoption must never rewrite it. Undefined = deliberately
+    // unfocused (the next submit opens a new thread).
+    focusedThread: () => string | undefined;
+    // Focus one persistent thread (S2), in this order:
+    //   1. a visible turn of that thread -> expand its NEWEST turn;
+    //   2. a nested invocation entry whose runtime identity matches the roster
+    //      (`invocationId`/`originInvocationId`) -> show that child conversation,
+    //      collapsing every other PERSISTENT child conversation;
+    //   3. roster-only (a runtime child with no turn yet) -> show its recorded
+    //      transcript from `SessionThread.messages`.
+    // Returns false only when the id is unknown to both the turns and the roster.
+    focusThread: (threadId: string) => boolean;
+    // Authoritative roster (`SessionSnapshot.threads`). The board uses it to label
+    // tiles with the SAME canonical name/sequence as the strip (S6), to resolve a
+    // child's persistent identity, and to render a roster-only child transcript.
+    setThreads: (threads: readonly SessionThreadEntry[]) => void;
+    // Drop one tile without applying anything: used by the submit path when a
+    // server answer describes a turn this browser already has (steering returns the
+    // OWNING turn), so the optimistic steering row must not linger unbound.
+    discard: (turn: TurnHandle) => void;
     // Find a tile by server turn id. This is how a stream `event` frame with an
     // explicit `turnId` finds its tile without guessing from stream order.
     find: (id: string) => TurnHandle | undefined;
@@ -839,6 +940,111 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // an extra subscription.
     const blocks = (): AgentBlockDescriptor[] => turns.flatMap((turn) => turn.blocks());
     let expandedTurn: TurnHandle | undefined;
+    // S1: focus is EXPLICIT state, not a function of whichever tile happens to be
+    // expanded. A background adoption (another tab's turn, a snapshot arriving
+    // during a submit, a late upsert) may never move it; only `begin`/`focusThread`/
+    // an explicit tile click do. `explicitUnfocus` records a deliberate "New thread",
+    // which also suppresses the first-content auto-selection after it.
+    let focusedThreadId: string | undefined;
+    let explicitUnfocus = false;
+    // A session SWITCH keeps the tiles of the conversation being left until the new
+    // snapshot reconciles them away, so "first content of an empty board" cannot be
+    // detected by count alone. This flag (set by `bindSession` on a real change)
+    // lets the incoming session open its newest conversation exactly once.
+    let pendingFirstFocus = false;
+    // Authoritative roster (S2/S6). Used for canonical labels, for resolving a
+    // child invocation to its persistent id, and for a roster-only transcript.
+    let roster: readonly SessionThreadEntry[] = [];
+    // The roster-only conversation surface (a runtime child with no turn of its own).
+    let focusPanel: HTMLElement | undefined;
+
+    const notifyFocus = (): void => options.onFocusChange?.(focusedThreadId);
+
+    // Detach the expanded TILE without touching focus state (used when focus moves
+    // to a child conversation or to a roster-only panel: only ONE persistent
+    // conversation may be open at a time).
+    const detachTileExpansion = (): void => {
+        if (expandedTurn === undefined) return;
+
+        expandedTurn.element.classList.remove('is-expanded');
+        expandedTurn.element
+            .querySelector<HTMLButtonElement>('.tile-select')
+            ?.setAttribute('aria-expanded', 'false');
+        expandedTurn = undefined;
+    };
+
+    // The roster-only/child conversation panel. Rendering from `SessionThread.messages`
+    // is what lets a child conversation (whose work is recorded INSIDE its parent's
+    // turn and which has no `SessionTurn` of its own) be read and steered.
+    const hideFocusPanel = (): void => {
+        focusPanel?.remove();
+        focusPanel = undefined;
+    };
+
+    const showFocusPanel = (entry: SessionThreadEntry): void => {
+        hideFocusPanel();
+
+        const name = threadNameOf(entry);
+        const panel = el('section', 'thread-focus-panel');
+        panel.dataset.threadId = entry.id;
+        panel.dataset.agent = entry.agent;
+        panel.setAttribute('aria-label', `Focused thread ${name} of ${entry.agent}`);
+
+        const head = el('header', 'thread-focus-head');
+        head.append(
+            el('span', 'thread-focus-agent', entry.agent),
+            el('span', 'thread-focus-name', name),
+            el('span', 'thread-focus-status', entry.status)
+        );
+        if (entry.ownerThreadId !== undefined) {
+            const owner = roster.find((candidate) => candidate.id === entry.ownerThreadId);
+            head.append(
+                el(
+                    'span',
+                    'thread-focus-owner',
+                    owner === undefined ? `owned by ${entry.ownerThreadId}` : `owned by ${threadNameOf(owner)}`
+                )
+            );
+        }
+
+        const transcript = el('div', 'thread-focus-messages');
+        const messages = Array.isArray(entry.messages) ? entry.messages : [];
+        if (messages.length === 0) {
+            transcript.append(el('p', 'thread-focus-empty', 'No messages recorded in this thread yet.'));
+        }
+        for (const message of messages) {
+            const source = message as { role?: unknown; content?: unknown };
+            const content = typeof source.content === 'string' ? source.content : '';
+            if (content.length === 0) continue;
+
+            const row = el('div', 'thread-focus-message');
+            row.dataset.role = typeof source.role === 'string' ? source.role : 'message';
+            row.append(el('span', 'thread-focus-role', row.dataset.role));
+            const body = el('div', 'thread-focus-text markdown');
+            body.append(markdownFragment(content));
+            row.append(body);
+            transcript.append(row);
+        }
+
+        panel.append(head, transcript);
+        // First child of the board: the focused conversation reads at the top of the
+        // transcript while the compact turn rows below stay navigable.
+        element.prepend(panel);
+        focusPanel = panel;
+    };
+
+    const threadKnown = (threadId: string): boolean =>
+        roster.some((entry) => entry.id === threadId) ||
+        turns.some((turn) => turn.threadId() === threadId || turn.knowsThread(threadId));
+
+    // Clear a persistent/roster focus without treating it as a user "unfocus" of a
+    // follow-up submit: used when the focused conversation was deleted.
+    const dropFocusState = (): void => {
+        detachTileExpansion();
+        for (const turn of turns) turn.clearThreadFocus();
+        hideFocusPanel();
+        focusedThreadId = undefined;
+    };
     // N3 session binding for answer routing. Cards capture this value when created
     // (see create/action handler), never read it at click time, so a switch cannot
     // retarget an answer that was rendered for another conversation.
@@ -862,36 +1068,103 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     if (empty !== undefined) element.append(empty);
 
     const expand = (turn: TurnHandle): void => {
-        if (expandedTurn === turn) return;
-
-        if (expandedTurn !== undefined) {
-            expandedTurn.element.classList.remove('is-expanded');
-            expandedTurn.element
-                .querySelector<HTMLButtonElement>('.tile-select')
-                ?.setAttribute('aria-expanded', 'false');
+        // Open exactly ONE persistent conversation: a tile and a roster-only panel
+        // never coexist, and focusing a tile ends any child-conversation focus.
+        hideFocusPanel();
+        for (const candidate of turns) {
+            if (candidate !== turn) candidate.clearThreadFocus();
         }
 
-        expandedTurn = turn;
+        if (expandedTurn !== turn) {
+            detachTileExpansion();
+            expandedTurn = turn;
+        }
         turn.element.classList.add('is-expanded');
         turn.element.querySelector<HTMLButtonElement>('.tile-select')?.setAttribute('aria-expanded', 'true');
+        // The tile's PERSISTENT thread is the steering target (or undefined for a
+        // legacy turn / an unbound new-thread tile, which becomes known on merge).
+        focusedThreadId = turn.threadId();
+        explicitUnfocus = false;
+        notifyFocus();
     };
 
     const collapse = (): void => {
-        if (expandedTurn === undefined) return;
-
-        expandedTurn.element.classList.remove('is-expanded');
-        expandedTurn.element.querySelector<HTMLButtonElement>('.tile-select')?.setAttribute('aria-expanded', 'false');
-        expandedTurn = undefined;
+        dropFocusState();
+        // Unfocused = the next submit opens a NEW standalone thread. The flag also
+        // stops a later background adoption from claiming the empty slot.
+        explicitUnfocus = true;
+        notifyFocus();
     };
 
-    const begin = (prompt: string, attachments: readonly HarnessAttachment[] = []): TurnHandle =>
-        create(prompt, attachments);
+    // Focus one persistent thread (S2). Tile first (a continuation turn lives
+    // there), then the nested invocation whose runtime identity matches, then a
+    // roster-only transcript. Returns false only for an id nobody knows.
+    const focusThread = (threadId: string): boolean => {
+        // 1. A turn of this conversation: the normal case, including a child thread
+        //    that was continued (the continuation creates a host turn with its id).
+        for (let position = turns.length - 1; position >= 0; position -= 1) {
+            const candidate = turns[position];
+            if (candidate.threadId() !== threadId) continue;
+
+            expand(candidate);
+            return true;
+        }
+
+        // 2. A delegated/forked child has no turn of its own: its work is recorded
+        //    inside the parent's events. Focus it by the runtime identity the roster
+        //    joins (`invocationId`/`originInvocationId`). The board is only touched
+        //    once a match exists: an unknown id must be a NO-OP, never a collapse.
+        for (const candidate of turns) {
+            if (!candidate.knowsThread(threadId)) continue;
+
+            hideFocusPanel();
+            detachTileExpansion();
+            for (const other of turns) other.clearThreadFocus();
+            if (!candidate.focusChildThread(threadId)) continue;
+
+            focusedThreadId = threadId;
+            explicitUnfocus = false;
+            notifyFocus();
+            return true;
+        }
+
+        // 3. Roster-only conversation (no invocation has reported yet): render its
+        //    recorded transcript so it can be read and steered.
+        const entry = roster.find((candidate) => candidate.id === threadId);
+        if (entry === undefined) return false;
+
+        hideFocusPanel();
+        detachTileExpansion();
+        for (const candidate of turns) candidate.clearThreadFocus();
+        showFocusPanel(entry);
+        focusedThreadId = threadId;
+        explicitUnfocus = false;
+        notifyFocus();
+        return true;
+    };
+
+    const begin = (
+        prompt: string,
+        attachments: readonly HarnessAttachment[] = [],
+        threadId?: string
+    ): TurnHandle => {
+        const turn = create(prompt, attachments, threadId);
+        // A submit is an explicit focus choice: the tile the user just created is
+        // the conversation they are looking at, even if they had unfocused before.
+        expand(turn);
+        return turn;
+    };
 
     // One tile, shared by the optimistic `begin` path and server adoption. R3: the
     // tile no longer paints a `#position` ordinal; the server's `index` still binds
     // (protocol/ordering) but is never displayed. The agent identity in the header
     // is the compact conversation-scoped label (`RH1`), not a raw agent id.
-    const create = (prompt: string, initialAttachments: readonly HarnessAttachment[] = []): TurnHandle => {
+    const create = (
+        prompt: string,
+        initialAttachments: readonly HarnessAttachment[] = [],
+        initialThreadId?: string,
+        initialLabelSeed?: Record<string, number>
+    ): TurnHandle => {
         empty?.remove();
 
         const id = `turn-${++nextId}`;
@@ -942,10 +1215,19 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // identity.
         const tileAgent = el('span', 'tile-agent');
         tileAgent.hidden = true;
+        // Persistent thread badge (R5/R6). Repeated turns of ONE runtime thread show
+        // the same badge, so the transcript never presents them as independent
+        // threads; the badge and the thread strip name the same conversation. Hidden
+        // for a legacy turn (no `threadId`) and for an optimistic new thread until
+        // the server assigns the id. The full id stays in `data-thread-id`/`title`.
+        const threadBadge = el('span', 'tile-thread');
+        threadBadge.hidden = true;
         // R3: no `#ordinal` span. The header group is the metadata cluster
-        // (`elapsed | tokens | status`) only; the turn's protocol `index` is bound
-        // for ordering/identity but never displayed.
-        top.append(blockMeta.elapsed, blockMeta.tokens, badge);
+        // (`thread | elapsed | tokens | status`); the turn's protocol `index` is
+        // bound for ordering/identity but never displayed. The thread badge leads
+        // the cluster (it is identity, not a measurement) and is hidden whenever the
+        // turn has no persistent thread.
+        top.append(threadBadge, blockMeta.elapsed, blockMeta.tokens, badge);
         select.append(tileAgent, top, promptPreview, meta);
 
         const body = el('div', 'tile-body');
@@ -1015,6 +1297,49 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         let toolCount = 0;
         // Server identity for this tile. Absent until `bind()` or a snapshot.
         let serverId: string | undefined;
+        // Persistent runtime thread this tile belongs to. An optimistic tile gets it
+        // from the submit target (continue/steer); a new thread gets it from the
+        // first record that carries `threadId`. A record WITHOUT the field never
+        // clears a known id (legacy fallback): the tile keeps the identity the
+        // submit already told the server about.
+        let runtimeThreadId = turnThreadIdOf({ threadId: initialThreadId });
+        // S6: ONE canonical display identity, shared with the strip. The roster's
+        // label/sequence wins; an id the roster does not describe (yet) reads `T?`
+        // rather than a digit invented from the opaque id. The full id and the agent
+        // stay in `title`/`data-thread-id`.
+        const paintThreadBadge = (): void => {
+            if (runtimeThreadId === undefined) {
+                threadBadge.hidden = true;
+                threadBadge.textContent = '';
+                threadBadge.title = '';
+                delete card.dataset.threadId;
+                return;
+            }
+
+            threadBadge.hidden = false;
+            threadBadge.textContent = threadLabelOf(runtimeThreadId, roster) ?? '';
+            threadBadge.title = threadTitleOf(runtimeThreadId, roster) ?? '';
+            card.dataset.threadId = runtimeThreadId;
+        };
+        const setThreadId = (value: string | undefined): void => {
+            if (value !== undefined && value.length > 0) {
+                const changed = runtimeThreadId !== value;
+                runtimeThreadId = value;
+                // A tile adopted from a record learns its thread AFTER `create` has
+                // already expanded it, so the focus report has to happen here too —
+                // otherwise the strip/composer would still say "no focus" for a
+                // conversation the reader is looking at. Only a CHANGE is reported:
+                // every snapshot re-merges the expanded tile and the strip must not
+                // repaint on an unchanged identity.
+                if (changed && expandedTurn?.element === card) {
+                    focusedThreadId = value;
+                    notifyFocus();
+                }
+            }
+
+            paintThreadBadge();
+        };
+        setThreadId(undefined);
         // How many of the server turn's `events` this tile has applied. Live
         // frames and replayed records both count, so `merge()` can skip the
         // prefix it already rendered instead of appending it twice.
@@ -1088,6 +1413,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // afterwards continue the sequence.
         const labels = createAgentLabels();
         let labelSeed: Map<string, number> | undefined;
+        // A REPLAYED turn may arrive with the counters the server recorded at its
+        // start (snapshot `labelSeeds`). That recorded base is authoritative: seeding
+        // from the surviving board counters instead would renumber this turn after an
+        // earlier, deleted turn's allocations disappeared.
+        if (initialLabelSeed !== undefined) {
+            labelSeed = new Map(Object.entries(initialLabelSeed));
+            labels.seed(labelSeed);
+        }
         const nextLabel = (agent: string | undefined): string => {
             // First allocation of THIS tile: freeze the base it continues from.
             if (labelSeed === undefined) {
@@ -1329,6 +1662,88 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // can restore it (the entry objects are recreated, the keys are stable).
             if (expanded) expandedThreads.add(entry.key);
             else expandedThreads.delete(entry.key);
+        };
+
+        // --- persistent child conversations (S2) ---------------------------
+        //
+        // A delegated/forked child is an INVOCATION entry keyed by the runtime
+        // `event.thread.id`. Its persistent conversation id is a different value,
+        // joined through the roster (`invocationId`/`originInvocationId`). Only an
+        // entry with that join is a real, steerable conversation; an entry without
+        // one is ephemeral invocation detail and keeps the old independent expand.
+        let focusedChildKey: string | undefined;
+
+        const persistentIdOf = (entry: ThreadEntry): string | undefined => {
+            const match = roster.find(
+                (candidate) =>
+                    candidate.id === entry.key ||
+                    candidate.invocationId === entry.key ||
+                    candidate.originInvocationId === entry.key
+            );
+
+            return match?.id;
+        };
+
+        const paintPersistentMarkers = (): void => {
+            for (const entry of threads.values()) {
+                // The ROOT invocation has no row (its surface is the tile body), so
+                // it has nothing to mark.
+                if (entry.row === undefined) continue;
+
+                const persistent = persistentIdOf(entry);
+                if (persistent === undefined) {
+                    delete entry.row.dataset.persistentThread;
+                    entry.row.classList.remove('is-persistent-focused');
+                    continue;
+                }
+
+                entry.row.dataset.persistentThread = persistent;
+                const match = roster.find((candidate) => candidate.id === persistent);
+                entry.row.title = match === undefined ? `Thread ${persistent}` : `${threadNameOf(match)} · ${match.agent}`;
+            }
+        };
+
+        // Collapse persistent child conversations and clear the focused marker. A
+        // focused child that the roster no longer describes (deleted thread) is
+        // collapsed too, so a deletion can never leave a stale open conversation.
+        const clearThreadFocus = (): void => {
+            if (focusedChildKey !== undefined) {
+                const entry = threads.get(focusedChildKey);
+                if (entry !== undefined) setThreadExpanded(entry, false);
+            }
+            focusedChildKey = undefined;
+            for (const entry of threads.values()) entry.row?.classList.remove('is-persistent-focused');
+        };
+
+        const knowsThread = (threadId: string): boolean => {
+            for (const entry of threads.values()) {
+                if (persistentIdOf(entry) === threadId) return true;
+            }
+            return false;
+        };
+
+        // Focus the child conversation. The tile body is collapsed so only ONE
+        // persistent conversation (this child) is open; other PERSISTENT child
+        // entries are collapsed, while pure invocation details are left alone.
+        const focusChildThread = (threadId: string): boolean => {
+            for (const entry of threads.values()) {
+                if (entry.row === undefined) continue;
+                if (persistentIdOf(entry) !== threadId) continue;
+
+                for (const other of threads.values()) {
+                    if (other === entry) continue;
+                    if (persistentIdOf(other) !== undefined && other.expanded) setThreadExpanded(other, false);
+                }
+
+                detachTileExpansion();
+                setThreadExpanded(entry, true);
+                entry.row.classList.add('is-persistent-focused');
+                focusedChildKey = entry.key;
+                entry.row.scrollIntoView?.({ block: 'nearest' });
+                return true;
+            }
+
+            return false;
         };
 
         // Where a child row belongs. A parent with a row has a children host AFTER
@@ -1662,13 +2077,29 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 expanded: false
             };
 
-            select.addEventListener('click', () => setThreadExpanded(entry, !entry.expanded));
+            // S2: clicking a child that maps to a PERSISTENT conversation focuses
+            // that conversation (the composer then targets the child's true id), not
+            // merely an ephemeral detail expansion. An unmapped entry keeps the old
+            // independent expand/collapse behaviour.
+            select.addEventListener('click', () => {
+                const persistent = persistentIdOf(entry);
+                if (persistent !== undefined) {
+                    focusThread(persistent);
+                    return;
+                }
+
+                setThreadExpanded(entry, !entry.expanded);
+            });
 
             if (options.input !== undefined) renderThreadPrompt(entry, options.input);
 
             threads.set(options.key, entry);
             // R1: restore the reader's expansion across a rebuilt projection.
             if (expandedThreads.has(options.key)) setThreadExpanded(entry, true);
+            // The roster may already know this invocation (a snapshot delivered the
+            // roster before this turn was replayed), so mark the persistent identity
+            // immediately instead of waiting for the next `setThreads`.
+            paintPersistentMarkers();
             updateMeta();
             return entry;
         };
@@ -2819,6 +3250,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             recordStatus = source.status;
 
             bind(source);
+            // Adopt the record's persistent thread identity (additive field). A
+            // record without it leaves the optimistic target in place.
+            setThreadId(turnThreadIdOf(source));
 
             const terminal =
                 source.status !== 'running' && (source.status as string) !== 'queued';
@@ -2859,7 +3293,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
         // Clicking the header expands a compact tile; clicking the expanded tile
         // collapses it back to the compact list (so the whole conversation is
-        // visible at once). Only one tile is ever expanded.
+        // visible at once). Only one persistent conversation is ever expanded; a
+        // collapse is a deliberate unfocus.
         select.addEventListener('click', () => {
             if (expandedTurn === turn) collapse();
             else expand(turn);
@@ -2932,6 +3367,21 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             return descriptors;
         };
 
+        // Repaint everything roster-derived. The badge name and the child markers
+        // must come from ONE source (`ui/threads.ts` canonical label) so a tile and
+        // the strip cannot disagree about the same conversation (S6). A focused child
+        // whose thread the roster no longer lists is collapsed here, which is how a
+        // deletion clears a child focus without any local guesswork.
+        const refreshThreadRoster = (): void => {
+            paintThreadBadge();
+            paintPersistentMarkers();
+
+            if (focusedChildKey !== undefined) {
+                const entry = threads.get(focusedChildKey);
+                if (entry === undefined || persistentIdOf(entry) === undefined) clearThreadFocus();
+            }
+        };
+
         const turn: TurnHandle = {
             element: card,
             prompt,
@@ -2942,6 +3392,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             applied: () => appliedCount,
             flush,
             id: () => serverId,
+            threadId: () => runtimeThreadId,
+            refreshThreadRoster,
+            knowsThread,
+            focusChildThread,
+            clearThreadFocus,
             bind,
             setTiming,
             elapsed: () => blockMeta.elapsed.textContent ?? '',
@@ -2962,9 +3417,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // `setState('streaming')` start it from the server's start stamp, so a
         // task that waited in the queue is never charged for the wait.
         paintElapsed();
-        // Newest turn opens full-width. This is the *only* moment the board
-        // changes the selection on its own: stream deltas never steal the view.
-        expand(turn);
+        // NO auto-expansion here (S1). `create` is shared by the optimistic submit
+        // (which expands explicitly in `begin`), by snapshot adoption and by the
+        // observer's `upsert`; adopting a turn — another tab's, a queued sibling's,
+        // a late record for a failed submit — must never steal the reader's focus.
+        // Initial content is opened by `reconcile`/`hydrate` under their own rules.
 
         return turn;
     };
@@ -2993,12 +3450,38 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         for (const node of [...element.querySelectorAll<HTMLElement>('.notice')]) node.remove();
 
         expandedTurn = undefined;
+        hideFocusPanel();
+        focusedThreadId = undefined;
+        // A cleared board is a NEW conversation surface: the next content may be
+        // auto-opened (`reconcile` first-content rule). The explicit "no focus" flag
+        // is reset with the session, not inherited across it.
+        explicitUnfocus = false;
+        pendingFirstFocus = false;
+        // A cleared board has no focused thread; the shell must drop its steering
+        // target in the same tick or the next submit would name a thread that this
+        // view no longer shows (a deleted/new session).
+        notifyFocus();
         if (empty !== undefined) element.append(empty);
     };
 
     // Route lookup by explicit server id. A stream frame names its `turnId`, so
     // the board never has to guess which tile a delta belongs to.
     const find = (id: string): TurnHandle | undefined => turns.find((candidate) => candidate.id() === id);
+
+    // Remove one tile from the board without touching server state. The submit path
+    // uses this when a POST answer names a turn that already has a tile (steering
+    // answers with the owner), so the optimistic row cannot survive as an unbound
+    // queued ghost that every later snapshot would keep alive as "pending".
+    const discard = (turn: TurnHandle): void => {
+        const position = turns.indexOf(turn);
+        if (position === -1) return;
+
+        if (expandedTurn === turn) collapse();
+
+        turns.splice(position, 1);
+        turn.destroy();
+        turn.element.parentElement?.remove();
+    };
 
     // Claim the oldest optimistic tile started for `prompt` (R2). The submit path
     // calls `begin(prompt)` before the request leaves the browser and binds the
@@ -3028,12 +3511,18 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // Rebuild one tile from the server's record. Replaying the events (rather
     // than trusting browser state) is what makes a reload render the same
     // transcript: `events` includes subagent events the server recorded.
-    const adopt = (source: SessionTurn, model?: string): TurnHandle => {
+    const adopt = (
+        source: SessionTurn,
+        model?: string,
+        labelSeed?: Record<string, number>
+    ): TurnHandle => {
         // R3: the server `index` is not rendered, so adoption only needs the prompt;
         // the record's position is the list order (`reconcile` re-orders by record).
         // Attachments are passed to the optimistic render, then `merge` applies the
-        // same record's list — one code path, no duplicated DOM.
-        const handle = create(source.prompt, turnAttachmentsOf(source));
+        // same record's list — one code path, no duplicated DOM. The turn's recorded
+        // label seed (when the server sent one) keeps its labels stable across a
+        // deleted earlier thread.
+        const handle = create(source.prompt, turnAttachmentsOf(source), undefined, labelSeed);
         // One code path with `merge` keeps a freshly adopted tile and a reconciled
         // live tile identical: timing, events, tally and status all come from the
         // record, and `appliedCount` starts at zero for a new tile.
@@ -3060,7 +3549,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         sources: readonly SessionTurn[],
         options: HydrateOptions = {}
     ): TurnHandle[] => {
-        const keepId = options.keep ?? expandedTurn?.id();
+        // Snapshot the focus BEFORE any merge/adopt can change it (S1). Focus is
+        // explicit state; the expansion is only the surface that currently carries
+        // it. `hadTurns` distinguishes the first content of a board (auto-open) from
+        // every later background adoption (never steal).
+        const keepHandle = expandedTurn;
+        const keepFocus = focusedThreadId;
+        const keepId = options.keep ?? keepHandle?.id();
+        const hadTurns = turns.length > 0;
         const seen = new Set<string>();
         const ordered: TurnHandle[] = [];
 
@@ -3087,7 +3583,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 continue;
             }
 
-            ordered.push(adopt(source, options.model));
+            ordered.push(adopt(source, options.model, options.labelSeeds?.[source.id]));
         }
 
         const next = [...ordered];
@@ -3129,10 +3625,47 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
         for (const node of [...element.querySelectorAll<HTMLElement>('.notice')]) element.append(node);
 
-        // Keep the reader where they were; collapse only if that turn disappeared.
-        const kept = keepId === undefined ? undefined : next.find((handle) => handle.id() === keepId);
-        if (kept !== undefined) expand(kept);
-        else if (expandedTurn !== undefined && !next.includes(expandedTurn)) collapse();
+        // --- focus preservation (S1) ---------------------------------------
+        //
+        // A snapshot may adopt turns of other threads (another tab, a queued
+        // sibling, a late record). NONE of that may move the reader's focus, and
+        // `create` no longer auto-expands, so the only decisions here are explicit:
+        //
+        //   a. the expanded surface survived -> keep it expanded, and re-report its
+        //      thread if the tile only NOW learned its id (an optimistic follow-up);
+        //   b. the expanded surface disappeared but the focused thread still exists
+        //      -> re-focus that thread (its next-newest turn / child / roster panel);
+        //   c. nothing is focused and this is the FIRST content of an empty board
+        //      -> open the newest conversation (initial session render);
+        //   d. otherwise leave the board exactly as the reader left it (including a
+        //      deliberate "New thread" unfocus).
+        if (keepHandle !== undefined && next.includes(keepHandle)) {
+            const boundFocus = keepHandle.threadId();
+            if (boundFocus !== undefined && boundFocus !== focusedThreadId) {
+                focusedThreadId = boundFocus;
+                notifyFocus();
+            }
+            // A claim/merge may have re-parented focus to a child row; a surviving
+            // expanded TILE is the authoritative surface, so clear stale child focus.
+            if (boundFocus !== undefined) keepHandle.clearThreadFocus();
+        } else if (keepFocus !== undefined) {
+            if (!focusThread(keepFocus)) {
+                // The focused thread is gone from this snapshot (deleted): drop the
+                // focus instead of resurrecting it from a stale id. On a SESSION
+                // SWITCH the same path runs for the previous session's focus, and the
+                // incoming conversation is then opened like first content.
+                dropFocusState();
+                notifyFocus();
+                if (!explicitUnfocus && pendingFirstFocus) {
+                    const newest = next[next.length - 1];
+                    if (newest !== undefined) expand(newest);
+                }
+            }
+        } else if (!explicitUnfocus && (!hadTurns || pendingFirstFocus)) {
+            const newest = next[next.length - 1];
+            if (newest !== undefined) expand(newest);
+        }
+        pendingFirstFocus = false;
 
         return next;
     };
@@ -3143,12 +3676,22 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const hydrate = (sources: readonly SessionTurn[], options: HydrateOptions = {}): TurnHandle[] => {
         const keepId = options.keep ?? expandedTurn?.id();
 
+        // `clear` resets the explicit-unfocus flag: a rebuild is a new surface, and
+        // the opened conversation below is a deliberate selection, not a background
+        // adoption (S1's no-steal rule concerns ADOPTION, not an explicit rebuild).
         clear();
 
-        const handles = sources.map((source) => adopt(source, options.model));
+        const handles = sources.map((source) =>
+            adopt(source, options.model, options.labelSeeds?.[source.id])
+        );
 
         const kept = keepId === undefined ? undefined : handles.find((handle) => handle.id() === keepId);
-        if (kept !== undefined) expand(kept);
+        const target = kept ?? handles[handles.length - 1];
+        if (target !== undefined) {
+            expand(target);
+        } else {
+            notifyFocus();
+        }
 
         return handles;
     };
@@ -3168,6 +3711,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const bindSession = (sessionId: string | undefined): void => {
         if (boundSession === sessionId) return;
 
+        // A real session switch: the next reconciled content belongs to a different
+        // conversation, so its newest surface may be opened once (see `reconcile`).
+        // A first binding (undefined -> id) is the conversation already on screen.
+        if (boundSession !== undefined && sessionId !== undefined) pendingFirstFocus = true;
+
         for (const record of answerCards.values()) {
             if (record.session === undefined) {
                 record.session = sessionId;
@@ -3183,6 +3731,30 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         boundSession = sessionId;
     };
 
+    // Authoritative roster update (S2/S6). Repaints every roster-derived label and
+    // child marker; drops a focus the roster no longer describes (a deleted thread),
+    // which is what keeps a late/stale roster from re-opening a deleted conversation.
+    const setThreads = (entries: readonly SessionThreadEntry[]): void => {
+        roster = [...entries];
+
+        for (const turn of turns) turn.refreshThreadRoster();
+
+        if (focusedThreadId === undefined) return;
+
+        const entry = roster.find((candidate) => candidate.id === focusedThreadId);
+        if (entry === undefined && !threadKnown(focusedThreadId)) {
+            dropFocusState();
+            notifyFocus();
+            return;
+        }
+
+        // A roster-only conversation is rendered FROM the roster: refresh its
+        // transcript in place when a newer snapshot carries more messages.
+        if (focusPanel !== undefined && entry !== undefined && expandedTurn === undefined) {
+            showFocusPanel(entry);
+        }
+    };
+
     return {
         element,
         bindSession,
@@ -3193,6 +3765,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         collapse,
         expanded: () => expandedTurn,
         turns: () => turns,
+        focusedThread: () => focusedThreadId,
+        focusThread,
+        setThreads,
+        discard,
         find,
         claim,
         adopt,

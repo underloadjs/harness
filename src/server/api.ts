@@ -1219,13 +1219,30 @@ export const createHarnessApi = ({
                             first,
                             body.input,
                             body.attachments,
-                            body.references
+                            body.references,
+                            // R1-R6: an explicit thread steers/continues that
+                            // conversation; absent opens a new standalone thread.
+                            body.threadId
                         );
 
+                        // The envelope stays `{ session, turn }`; `steered` appears
+                        // ONLY when the submit folded into a running thread, in
+                        // which case `turn` is the turn that owns that run.
                         return {
                             kind: 'json',
                             status: 202,
-                            body: { session: submitted.session, turn: submitted.turn }
+                            body: {
+                                session: submitted.session,
+                                turn: submitted.turn,
+                                ...(submitted.steered === true
+                                    ? {
+                                          steered: true,
+                                          ...(submitted.steeredThreadId === undefined
+                                              ? {}
+                                              : { steeredThreadId: submitted.steeredThreadId })
+                                      }
+                                    : {})
+                            }
                         };
                     }
 
@@ -1306,6 +1323,41 @@ export const createHarnessApi = ({
                             body: { cancelled: store.cancel(first, { all: body.all === true }) }
                         };
                     }
+                }
+
+                // DELETE /sessions/:id/threads/:threadId (R6). Removes the thread,
+                // its descendants, every owning turn/reference/transcript, and the
+                // persisted copies. 404 unknown, 409 running (or queued) work, 400
+                // for the default agent conversation (use reset).
+                if (segments.length === 4 && second === 'threads') {
+                    if (method !== 'DELETE') {
+                        throw new HttpError(405, `Use DELETE for ${mount}/sessions/:id/threads/:threadId.`);
+                    }
+
+                    const session = store.deleteThread(first, segments[3]);
+                    return {
+                        kind: 'json',
+                        status: 200,
+                        body: { deleted: true, session }
+                    };
+                }
+
+                // POST /sessions/:id/threads/:threadId/cancel (R6). Stops ONE
+                // conversation (and the children it owns) without touching a
+                // sibling lane; the response carries the post-stop snapshot.
+                if (segments.length === 5 && second === 'threads' && segments[4] === 'cancel') {
+                    if (method !== 'POST') {
+                        throw new HttpError(
+                            405,
+                            `Use POST for ${mount}/sessions/:id/threads/:threadId/cancel.`
+                        );
+                    }
+
+                    return {
+                        kind: 'json',
+                        status: 200,
+                        body: store.cancelThread(first, segments[3])
+                    };
                 }
 
                 if (segments.length === 5 && second === 'actions' && segments[4] === 'answer') {

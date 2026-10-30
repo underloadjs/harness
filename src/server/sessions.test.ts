@@ -1195,6 +1195,10 @@ describe('SessionStore turns', () => {
                     usage: { input: 3, output: 2, total: 5 }
                 }
             ],
+            // R6 tombstone: the label this turn minted is remembered (counters
+            // only), so deleting the turn later cannot re-mint "SE1" for different
+            // content.
+            labelHighWater: { SE: 1 },
             // The frozen configuration captured at creation, and the (empty)
             // discovery set. Both survive a reload.
             harnessDefinition: {
