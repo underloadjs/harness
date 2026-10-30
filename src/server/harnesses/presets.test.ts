@@ -250,11 +250,14 @@ describe('one toolbox, different agents', () => {
 
         // Identical by construction: preset.tools is the same table, every real
         // preset declares subagents (so agentDelegate exists on all five), and the
-        // only other difference is the example's testFlaky.
+        // only other difference is the example's testFlaky. W4: the toolbox factory
+        // also opts into webfetch, so webFetch is registered right after the
+        // configured webSearch and stays SEARCHABLE (it is not in CORE).
         for (const name of REAL) {
             expect(registeredTools(name)).toEqual([
                 ...TOOLBOX,
                 'webSearch',
+                'webFetch',
                 ...CORE,
                 'agentDelegate',
                 'threadFork'
@@ -266,6 +269,7 @@ describe('one toolbox, different agents', () => {
             ...TOOLBOX,
             'testFlaky',
             'webSearch',
+            'webFetch',
             ...CORE,
             'threadFork'
         ]);
@@ -278,12 +282,21 @@ describe('one toolbox, different agents', () => {
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
 
+        // W4: webFetch needs no credential, so unlike webSearch it is still here on
+        // a keyless host; it lands after the shared table and before the core set.
         for (const name of REAL) {
-            expect(registeredTools(name)).toEqual([...TOOLBOX, ...CORE, 'agentDelegate', 'threadFork']);
+            expect(registeredTools(name)).toEqual([
+                ...TOOLBOX,
+                'webFetch',
+                ...CORE,
+                'agentDelegate',
+                'threadFork'
+            ]);
         }
 
         // No key means the factory registers no webSearch at all; the global
         // catalogue is where a keyless host learns it exists but is unconfigured.
+        // webFetch is the documented exception: native fetch is keyless.
         expect(registeredTools('instruct')).not.toContain('webSearch');
     });
 
@@ -328,6 +341,12 @@ describe('one toolbox, different agents', () => {
         // Names and metadata are registered without eager implementation loading
         // (the package entries are lazy proxies, see src/tools/lazy.ts).
         expect(harness.tools.fileRead.tags).toEqual(['files', 'read', 'filesystem']);
+
+        // W4: the toolbox factory also opts into webfetch, but fetching stays
+        // discovery-gated (SEARCHABLE), so it is never a core declaration and
+        // never appears in a descriptor's coreTools.
+        expect(harness.tools.webFetch.visibility).toBe('searchable');
+        expect(harness.tools.webFetch.tags).toEqual(['web', 'fetch', 'internet', 'read', 'url', 'research']);
         expect(harness.tools.toolRequest.visibility).toBe('core');
         expect(harness.tools.toolCreate.visibility).toBe('core');
         expect(harness.tools.todoManage.visibility).toBe('core');
@@ -390,6 +409,9 @@ describe('one toolbox, different agents', () => {
             'agentDelegate',
             'threadFork'
         ]);
+        // W4: webFetch is registered by the live factory but is SEARCHABLE, so a
+        // descriptor must never advertise it as a core declaration.
+        expect(describeHarness(presetOf('instruct'), configured).coreTools).not.toContain('webFetch');
     });
 
     it('gives each real preset distinct instructions and the right subagents', () => {

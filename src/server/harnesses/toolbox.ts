@@ -280,6 +280,13 @@ export const createToolboxHarness = (
         // `.env` is loaded by the CLI/server. The CONFIGURATION field keeps its
         // name (`websearch`); the core tool it registers is webSearch (R18).
         websearch: true,
+        // Page fetch (W4) must be opted into as well, or `webFetch` never enters
+        // this harness's tool map and `toolRequest` has nothing to surface under
+        // the `web`/`fetch`/`url` tags — the agent then legitimately reports
+        // "search only". `native` needs no credential, so this is safe on a
+        // keyless host; the tool stays SEARCHABLE (see src/harness.ts), so it
+        // costs no request schema until the model asks for it.
+        webfetch: true,
         // The server's persistence observer rides along with progress; either may
         // be absent (CLI, direct preset creation).
         report: {

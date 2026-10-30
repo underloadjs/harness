@@ -15,7 +15,7 @@
 //
 // No provider and no network: constructing a preset never calls the transport.
 
-import { describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HarnessProgress } from '../../harness';
 import type { HarnessPreset } from './types';
 import { createHarnessRegistry } from './registry';
@@ -23,6 +23,20 @@ import { describeHarness } from './descriptor';
 import { presets } from './presets';
 import { SHARED_TOOL_NAMES } from './toolbox';
 import { AGENT_PROFILE_NAMES } from '../../agents';
+
+// The exact tool-order assertions below assume a KEYLESS host: webSearch is
+// registered only when EXA_API_KEY/TAVILY_API_KEY resolves (harness.ts:728-738),
+// while webFetch is keyless and registers whenever the factory opts in
+// (harness.ts:753-761). Pin the env so a developer shell holding real keys cannot
+// insert webSearch ahead of webFetch and turn a correct order into a failure.
+beforeEach(() => {
+    vi.stubEnv('EXA_API_KEY', '');
+    vi.stubEnv('TAVILY_API_KEY', '');
+});
+
+afterEach(() => {
+    vi.unstubAllEnvs();
+});
 
 const SETTINGS = {
     baseURL: 'http://provider.test/v1',
@@ -142,8 +156,14 @@ describe('creating a harness', () => {
         expect(Object.keys(harness.agents)).toEqual(['research', 'summarizer']);
         expect(Object.keys(harness.subagents)).toEqual(['summarizer']);
         expect(harness.tools.agentDelegate.visibility).toBe('core');
+        // W4: createToolboxHarness opts into `webfetch: true`, and the harness
+        // appends environment tools after the configured table and before the
+        // harness-owned core set (harness.ts:740-761). webSearch is absent because
+        // this host is keyless; webFetch needs no credential, so it lands first of
+        // the appended tools and stays searchable (not core).
         expect(Object.keys(harness.tools)).toEqual([
             ...SHARED_TOOL_NAMES,
+            'webFetch',
             'toolRequest',
             'toolCreate',
             'todoManage',
