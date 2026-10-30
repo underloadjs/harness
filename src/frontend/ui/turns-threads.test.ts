@@ -1290,7 +1290,11 @@ describe('invocation thread entries', () => {
         turn.apply(delegateCall('helper', 'child task', 'd1'));
 
         const rootSelect = turn.element.querySelector<HTMLElement>('.tile-select');
+        // R1: the persistent-thread badge LEADS the header, in the same slot as the
+        // nested block's `.thread-name`; the measurements stay in `.tile-top`. This
+        // turn is built without a runtime thread, so the badge is present but hidden.
         expect([...(rootSelect?.children ?? [])].map((child) => child.className)).toEqual([
+            'tile-thread',
             'tile-agent',
             'tile-top',
             'tile-prompt',
@@ -1298,9 +1302,7 @@ describe('invocation thread entries', () => {
         ]);
         expect(rootSelect?.querySelector('.tile-agent')?.textContent).toBe('WR1');
         expect([...(rootSelect?.querySelector('.tile-top')?.children ?? [])].map((child) => child.className)).toEqual(
-            // R5/R6: the persistent-thread badge leads the cluster. This turn is
-            // built without a runtime thread, so the badge is present but hidden.
-            ['tile-thread', 'tile-elapsed', 'tile-tokens', 'tile-status']
+            ['tile-elapsed', 'tile-tokens', 'tile-status']
         );
 
         const childSelect = threadRows(turn)[0].querySelector<HTMLElement>('.thread-select');
@@ -1327,7 +1329,11 @@ describe('invocation thread entries', () => {
             updatedAt: 11
         });
 
-        expect(turn.element.querySelector('.tile-select')?.firstElementChild?.className).toBe('tile-agent');
+        // R1: the header order survives the rebuild — the (hidden) thread badge is
+        // first, then the agent code; identity stays left of the measurements.
+        expect(
+            [...(turn.element.querySelector('.tile-select')?.children ?? [])].map((child) => child.className)
+        ).toEqual(['tile-thread', 'tile-agent', 'tile-top', 'tile-prompt', 'tile-meta']);
         expect(turn.element.querySelector('.tile-agent')?.textContent).toBe('WR1');
     });
 

@@ -724,6 +724,226 @@ describe('host-parent delegation (R4)', () => {
         }
     });
 
+    // R3 IDENTITY: a focused child is RESUMED in place — the same persistent id and
+    // owner, the same transcript — and never replaced by a fresh conversation. A
+    // SEPARATE delegation invocation from the same parent is a new conversation
+    // (distinct id, untouched history), and a restore keeps every id/owner/routing.
+    it('resumes a focused child in place and keeps its id, owner, and history across restore', async () => {
+        // Routes on the LAST user message: the lead's second turn continues the
+        // SAME parent conversation, so its FIRST user prompt is still the earlier
+        // task and would select the wrong script.
+        const routedLast = (
+            routes: Record<string, HarnessStream>,
+            fallback: HarnessStream
+        ): HarnessStream =>
+            async function* (request) {
+                const users = request.messages.filter((message) => message.role === 'user') as {
+                    content?: string;
+                }[];
+                const last = users[users.length - 1];
+                yield* (routes[last?.content ?? ''] ?? fallback)(request);
+            };
+
+        const buildIdentity = () => {
+            const helper = brain(
+                routedLast(
+                    {
+                        'child one': scripted([answer('one facts')]),
+                        'child two': scripted([answer('two facts')]),
+                        'child follow': scripted([answer('follow facts')])
+                    },
+                    scripted([answer('unused')])
+                )
+            );
+            // Distinct tool-call ids per parent turn: the harness rejects a call id
+            // reused from an earlier turn of the same conversation.
+            const lead = brain(
+                routedLast(
+                    {
+                        first: scripted([
+                            callTool(
+                                'd1',
+                                'agentDelegate',
+                                JSON.stringify({ agent: 'helper', input: 'child one' })
+                            ),
+                            answer('first done')
+                        ]),
+                        continue: scripted([
+                            callTool(
+                                'd2',
+                                'agentDelegate',
+                                JSON.stringify({ agent: 'helper', input: 'child two' })
+                            ),
+                            answer('second done')
+                        ])
+                    },
+                    scripted([answer('unused')])
+                )
+            );
+
+            return harness({
+                agents: { lead, helper },
+                primary: 'lead',
+                subagents: ['helper'],
+                presets: false
+            });
+        };
+
+        const writer = buildIdentity();
+        const parent = writer.createThread('lead');
+        expect(parent.id).toBe('thread-1');
+
+        // First delegation: the child gets its OWN host conversation, linked to the
+        // parent. `helper`'s default conversation stays untouched.
+        await writer.sendThreadInput(parent.id, 'first');
+        expect(writer.threads()).toEqual([
+            { id: 'agent:lead', agent: 'lead', origin: 'agent', status: 'idle', sequence: 1 },
+            { id: 'agent:helper', agent: 'helper', origin: 'agent', status: 'idle', sequence: 2 },
+            {
+                id: 'thread-1',
+                agent: 'lead',
+                origin: 'host',
+                status: 'idle',
+                sequence: 3,
+                invocationId: '1'
+            },
+            {
+                id: 'thread-2',
+                agent: 'helper',
+                origin: 'host',
+                status: 'idle',
+                sequence: 4,
+                ownerThreadId: 'thread-1',
+                invocationId: '2'
+            }
+        ]);
+        expect(textOf(writer.threadMessages('thread-2'))).toEqual(['child one', 'one facts']);
+        expect(writer.threadMessages('agent:helper')).toEqual([]);
+
+        // Resume the child: SAME record (id/owner/sequence), new invocation id, and
+        // the follow-up accumulates in its own transcript.
+        await writer.sendThreadInput('thread-2', 'child follow');
+        expect(writer.thread('thread-2')).toEqual({
+            id: 'thread-2',
+            agent: 'helper',
+            origin: 'host',
+            status: 'idle',
+            sequence: 4,
+            ownerThreadId: 'thread-1',
+            invocationId: '3'
+        });
+        expect(textOf(writer.threadMessages('thread-2'))).toEqual([
+            'child one',
+            'one facts',
+            'child follow',
+            'follow facts'
+        ]);
+        // No extra conversation was minted by the resume.
+        expect(writer.threads().map((record) => record.id)).toEqual([
+            'agent:lead',
+            'agent:helper',
+            'thread-1',
+            'thread-2'
+        ]);
+
+        // A SEPARATE delegation invocation is a NEW child conversation: sibling
+        // identity stays distinct and the resumed child is not appended to.
+        await writer.sendThreadInput('thread-1', 'continue');
+        expect(
+            writer.threads().map((record) => [record.id, record.ownerThreadId, record.invocationId])
+        ).toEqual([
+            ['agent:lead', undefined, undefined],
+            ['agent:helper', undefined, undefined],
+            ['thread-1', undefined, '4'],
+            ['thread-2', 'thread-1', '3'],
+            ['thread-3', 'thread-1', '5']
+        ]);
+        expect(textOf(writer.threadMessages('thread-2'))).toEqual([
+            'child one',
+            'one facts',
+            'child follow',
+            'follow facts'
+        ]);
+        expect(textOf(writer.threadMessages('thread-3'))).toEqual(['child two', 'two facts']);
+        // The parent conversation grew only by its own turns, never the child's.
+        expect(roles(writer.threadMessages('thread-1'))).toEqual([
+            'user',
+            'assistant',
+            'tool',
+            'assistant',
+            'user',
+            'assistant',
+            'tool',
+            'assistant'
+        ]);
+
+        // Snapshot persists every host conversation with its owner and invocation.
+        const snapshot = writer.snapshot();
+        expect(
+            (snapshot.threads ?? []).map((entry) => [
+                entry.id,
+                entry.agent,
+                entry.status,
+                entry.sequence,
+                entry.ownerThreadId,
+                entry.invocationId
+            ])
+        ).toEqual([
+            ['thread-1', 'lead', 'idle', 3, undefined, '4'],
+            ['thread-2', 'helper', 'idle', 4, 'thread-1', '3'],
+            ['thread-3', 'helper', 'idle', 5, 'thread-1', '5']
+        ]);
+
+        // Restore then resume the SAME child: id, owner, and transcript are kept
+        // (the counter continues after every archived invocation).
+        const restored = buildIdentity();
+        restored.restore(snapshot);
+
+        expect(restored.thread('thread-2')).toEqual({
+            id: 'thread-2',
+            agent: 'helper',
+            origin: 'host',
+            status: 'idle',
+            sequence: 4,
+            ownerThreadId: 'thread-1',
+            invocationId: '3'
+        });
+        expect(textOf(restored.threadMessages('thread-2'))).toEqual([
+            'child one',
+            'one facts',
+            'child follow',
+            'follow facts'
+        ]);
+
+        await restored.sendThreadInput('thread-2', 'child follow');
+        expect(restored.thread('thread-2')).toEqual({
+            id: 'thread-2',
+            agent: 'helper',
+            origin: 'host',
+            status: 'idle',
+            sequence: 4,
+            ownerThreadId: 'thread-1',
+            invocationId: '6'
+        });
+        expect(textOf(restored.threadMessages('thread-2'))).toEqual([
+            'child one',
+            'one facts',
+            'child follow',
+            'follow facts',
+            'child follow',
+            'follow facts'
+        ]);
+        // The restored sibling conversations are neither replaced nor extended.
+        expect(restored.threads().map((record) => record.id)).toEqual([
+            'agent:lead',
+            'agent:helper',
+            'thread-1',
+            'thread-2',
+            'thread-3'
+        ]);
+        expect(textOf(restored.threadMessages('thread-3'))).toEqual(['child two', 'two facts']);
+    });
+
     it('stops one child conversation without disturbing its sibling or either parent', async () => {
         const { writer, alphaChild, betaChild } = build();
 

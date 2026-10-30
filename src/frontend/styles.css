@@ -789,12 +789,15 @@ button {
     color: var(--warn);
 }
 
+/* No divider below the head: the pane's top band (`.session-note`, if any) and the
+   transcript below already separate themselves, so a `border-bottom` here would
+   draw a redundant second bar right under the harness title (the line the user
+   asked to remove). */
 .harness-head {
     display: flex;
     flex-direction: column;
     gap: 3px;
     padding: 12px 20px 10px;
-    border-bottom: 1px solid var(--border);
 }
 
 .harness-title-row {
@@ -1775,36 +1778,72 @@ button {
     display: none;
 }
 
-/* T12b: one top-level CONVERSATION per persistent thread. The server still records
-   one turn per run, but every run of the same thread is projected into this one
-   container, so a continuation/steer never appears as a second top-level
-   conversation. Each exchange keeps its own tile (and therefore its own events,
-   timing and # result blocks); only the repeated conversation identity is hidden
-   on the later exchanges. */
+/* One top-level CONVERSATION card per persistent thread. The server still records
+   one turn per RUN, so every run of one thread is projected into this container:
+   a continuation/steer never appears as a second top-level conversation.
+
+   The CARD IS THE CONTAINER, not the individual runs (R2). A follow-up submitted to
+   a focused thread appends a sequential exchange inside this one block; the inner
+   `.tile`s drop their own frame (rule below), so the reader sees one card with
+   prompt → answer → prompt → answer instead of stacked bordered tiles. Each exchange
+   keeps its own tile DOM (and therefore its own events, timing and # result blocks);
+   only the frame and the repeated conversation identity are shared. */
 .conversation {
     display: flex;
     flex-direction: column;
     width: 100%;
     min-width: 0;
     max-width: 100%;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+    /* Same agent-identity treatment as a single tile: the outline is painted from
+       `--agent-line`, which ui/turns.ts `placeTurn` sets from the FIRST exchange. */
+    outline: 1px solid var(--agent-line);
+    outline-offset: -2px;
+    overflow: hidden;
+    transition: border-color 120ms ease, background 120ms ease;
+}
+
+.conversation:hover {
+    border-color: var(--border-strong);
+}
+
+.conversation.is-expanded {
+    border-color: var(--border-strong);
+}
+
+/* The exchanges inside the card are frameless: the card owns border, radius,
+   surface and outline. A NESTED child-conversation row keeps its own framed tile —
+   a distinct agent thread must stay a distinct card (R3). */
+.conversation > .turn-row:not([data-child-thread]) > .tile,
+.thread-flow > .turn-row > .tile {
+    border: 0;
+    border-radius: 0;
+    background: transparent;
+    outline: 0;
 }
 
 .conversation .turn-row + .turn-row {
-    /* A small separation makes the ordered exchanges readable while the shared
-       conversation container still reads as ONE block. */
-    margin-top: 4px;
+    /* A hairline separates the ordered exchanges; it is one card, not two. */
+    border-top: 1px solid var(--border);
 }
 
 .conversation .turn-row.is-continuation:not([data-child-thread]) :is(.tile-thread, .tile-agent) {
     /* The conversation label is an identity, not a per-message measurement: show
-       it once, on the first exchange. A nested CHILD continuation keeps its own
-       label so it stays addressable/identifiable. */
+       it once, on the first exchange (the card header). */
+    display: none;
+}
+
+/* A resumed CHILD conversation appends its next turn inside the child's own nested
+   card (ui/turns.ts `placeTurn`), so the card header is the identity there too. */
+.thread-flow > .turn-row :is(.tile-thread, .tile-agent) {
     display: none;
 }
 
 .conversation .turn-row[data-child-thread] {
-    /* Actual agent-spawned child conversations stay NESTED inside the owning
-       conversation; only user-created threads are top-level. */
+    /* A child conversation WITHOUT its own invocation card stays NESTED inside the
+       owning conversation; only user-created threads are top-level. */
     margin-left: 14px;
     padding-left: 8px;
     border-left: 2px solid var(--border);
@@ -4904,221 +4943,25 @@ button {
 }
 
 /* ---------------------------------------------------------------------------
-   Persistent agent threads (R5/R6/R7): the thread strip, the tile badge, the
-   separate stop-all control and the composer's routing line.
+   Persistent agent threads (R5/R6/R7): the tile badge, the separate stop-all
+   control and the composer's routing line.
 
-   The strip is the ONE visible owner of thread focus. Exactly one row can be
-   `is-focused` because focus IS the single expanded conversation (ui/turns.ts
-   `expand`); the transcript's repeated turns of that thread carry the same
-   `.tile-thread` badge, so they never read as independent conversations.
+   The `.thread-strip` band that used to live here is REMOVED: it duplicated the
+   transcript's own `.tile-thread` badge and cost a permanent row of height.
+   Focus is still visible — the expanded tile plus the composer's routing label
+   name the target, and the composer's stop control cancels the session.
 --------------------------------------------------------------------------- */
 
-.thread-strip {
-    /* A fixed-height band of the pane column: it never steals height from the
-       scrolling transcript (`flex: 1` on `.log-wrap`). */
-    flex: 0 0 auto;
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    padding: 6px 20px;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg-elevated);
-}
-
-/* Nothing to show (no threads, no focus): the strip leaves no empty bar. */
-.thread-strip[hidden] {
-    display: none;
-}
-
-.thread-strip-list {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 6px;
-    width: 100%;
-    /* The same desktop cap as `.log`, so the strip lines up with the transcript. */
-    max-width: 1180px;
-    margin: 0 auto;
-    padding: 0;
-    list-style: none;
-}
-
-.thread-strip-row {
-    display: flex;
-    align-items: center;
-    gap: 2px;
-    border: 1px solid var(--border);
-    border-radius: 999px;
-    background: var(--bg-input);
-}
-
-.thread-strip-row.is-focused {
-    border-color: var(--accent);
-}
-
-/* The footer holds the unfocus control OUTSIDE the <ul> (a list item must be a
-   thread; the unfocus button is not). */
-.thread-strip-footer {
-    display: flex;
-    width: 100%;
-    max-width: 1180px;
-    margin: 0 auto;
-}
-
-.thread-strip-footer[hidden] {
-    display: none;
-}
-
-/* The whole label surface focuses the thread (pointer + keyboard). */
-.thread-strip-focus {
-    display: inline-flex;
-    align-items: center;
-    gap: 6px;
-    max-width: 260px;
-    /* S4: 24px minimum hit target, the same accessibility floor as the terminal
-       action; the visual pill stays compact via the padding below. */
-    min-height: 24px;
-    padding: 3px 8px;
-    border: 0;
-    border-radius: 999px;
-    background: transparent;
-    color: var(--text-muted);
-    font-family: var(--sans);
-    font-size: 11px;
-    line-height: 1.4;
-    cursor: pointer;
-}
-
-/* Agent token: the conversation's owner, so two threads of one agent read as
-   different conversations (S6). Muted and separated from the thread name. */
-.thread-strip-agent {
-    flex: 0 0 auto;
-    max-width: 90px;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    color: var(--text-dim);
-    font-family: var(--mono);
-    font-size: 10px;
-    letter-spacing: 0.02em;
-}
-
-.thread-strip-agent::after {
-    content: '·';
-    margin-left: 5px;
-    color: var(--border-strong);
-}
-
-.thread-strip-row.is-focused .thread-strip-focus {
-    color: var(--text);
-}
-
-.thread-strip-focus:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-}
-
-.thread-strip-name {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-/* State word: the same vocabulary as the tile badge (idle/running/stopped). */
-.thread-strip-status {
-    flex: 0 0 auto;
-    font-size: 10px;
-    letter-spacing: 0.02em;
-    color: var(--text-dim);
-}
-
-.thread-strip-row[data-status='running'] .thread-strip-status {
-    color: var(--accent);
-}
-
-.thread-strip-row[data-status='stopped'] .thread-strip-status {
-    color: var(--warn);
-}
-
-/* Far-right terminal action: STOP while running, DELETE when not. The glyph is
-   the same `x`; the accessible name and the confirmation step differ. */
-.thread-strip-action {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    min-width: 24px;
-    min-height: 24px;
-    margin-right: 2px;
-    padding: 0;
-    border: 1px solid transparent;
-    border-radius: 999px;
-    background: transparent;
-    color: var(--text-muted);
-    font-family: var(--sans);
-    font-size: 11px;
-    line-height: 1;
-    cursor: pointer;
-}
-
-.thread-strip-action:hover:not(:disabled) {
-    border-color: var(--border-strong);
-    color: var(--text);
-}
-
-.thread-strip-action[data-action='stop']:hover:not(:disabled) {
-    border-color: var(--danger);
-    color: var(--danger);
-}
-
-.thread-strip-action[data-action='delete']:hover:not(:disabled),
-.thread-strip-action.is-confirm {
-    border-color: var(--danger);
-    color: var(--danger);
-}
-
-.thread-strip-action:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-}
-
-.thread-strip-action:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-}
-
-/* Explicit unfocus: the only way back to "next message opens a NEW thread". */
-.thread-strip-unfocus {
-    min-height: 24px;
-    padding: 3px 9px;
-    border: 1px dashed var(--border-strong);
-    border-radius: 999px;
-    background: transparent;
-    color: var(--text-muted);
-    font-family: var(--sans);
-    font-size: 11px;
-    line-height: 1.4;
-    cursor: pointer;
-}
-
-.thread-strip-unfocus:hover {
-    color: var(--text);
-    border-color: var(--accent);
-}
-
-.thread-strip-unfocus:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 1px;
-}
-
-/* Persistent thread badge in a tile header. It LEADS the right-aligned metadata
-   cluster (identity before measurements), shares the 10px compact register with
-   the clock/tally/status, and is clipped with the rest of the meta line on a
-   compact row (the full id stays in `title`/`data-thread-id`). */
+/* Persistent thread badge in a tile header. It LEADS the header (R1), in the same
+   slot as the nested block's `.thread-name`: identity first, then the prompt, then
+   the right-aligned measurements. `order: 0` is what places it before the flexible
+   prompt in the compact row even though the DOM also carries `.tile-top`. The full
+   id stays in `title`/`data-thread-id`. */
 .tile-thread {
+    order: 0;
     flex: 0 0 auto;
+    max-width: 40%;
+    overflow: hidden;
     padding: 0 5px;
     border: 1px solid var(--border-strong);
     border-radius: 999px;
@@ -5126,9 +4969,14 @@ button {
     font-size: 10px;
     line-height: 1.5;
     letter-spacing: 0.04em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
+/* Expanded tiles stack the header as a column, so the pill must not stretch across
+   the full width like the identity line does. */
 .tile.is-expanded .tile-thread {
+    align-self: flex-start;
     color: var(--text-muted);
 }
 
@@ -5226,9 +5074,6 @@ button {
 }
 
 @media (forced-colors: active) {
-    .thread-strip-row,
-    .thread-strip-action,
-    .thread-strip-unfocus,
     .composer-stop {
         border-color: CanvasText;
     }

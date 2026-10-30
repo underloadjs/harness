@@ -1634,12 +1634,55 @@ export class SessionStore {
         }
     }
 
+    // Every invocation this server observed running in ONE persistent conversation,
+    // oldest first, for the roster's `invocationIds` join (R3).
+    //
+    // Source of truth is `session.invocationThreads`, written when a run's `start`
+    // frame names its invocation (noteInvocationThread, line ~3920) and persisted
+    // with the session, so the ORIGINAL delegated run and every later resume are all
+    // present — including after a restart. Only this session's map is read, and only
+    // entries mapped to THIS thread are kept, so a sibling's or another session's
+    // history can never leak into the roster.
+    //
+    // `record.invocationId` (the latest run) and the roster's `originInvocationId`
+    // are folded in when the map does not already name them: a legacy document whose
+    // map is empty/absent then still reports what its runtime record knows. The result
+    // is deduplicated, because a resume observed twice must not appear twice.
+    private invocationIdsOf(
+        session: Session,
+        record: HarnessThreadRecord,
+        originInvocationId: string | undefined
+    ): string[] {
+        const ids: string[] = [];
+        const seen = new Set<string>();
+        const push = (invocationId: string | undefined): void => {
+            if (invocationId === undefined || invocationId.length === 0) return;
+            if (seen.has(invocationId)) return;
+
+            seen.add(invocationId);
+            ids.push(invocationId);
+        };
+
+        // Map iteration order is observation order, so the card's ORIGINAL run comes
+        // before the continuations that advanced the single `invocationId` slot.
+        for (const [invocationId, threadId] of session.invocationThreads) {
+            if (threadId === record.id) push(invocationId);
+        }
+
+        push(record.invocationId);
+        push(originInvocationId);
+
+        return ids;
+    }
+
     // R1-R6 roster: every HOST thread (an agent's default conversation is internal
     // plumbing and stays out of the wire shape). Each entry joins the runtime
     // record to the recorded turns:
     //   - originTurnId/originInvocationId: the first turn that ran in the thread and
     //     the invocation id its root run reported, so a client can anchor the
     //     conversation in the legacy turn timeline;
+    //   - invocationIds: EVERY invocation observed in the thread (oldest first), so
+    //     a historical invocation card still joins this conversation after a resume;
     //   - references: the result blocks the thread's turns consumed (the "#" links);
     //   - messages: the thread's own committed transcript, so a focused UI can
     //     render one conversation without filtering the whole turn list.
@@ -1678,6 +1721,15 @@ export class SessionStore {
             const originInvocationId =
                 first === undefined ? undefined : session.turnInvocations.get(first.id);
 
+            // R3: the FULL invocation roster of this conversation, not just the
+            // latest one. A delegated child's card was created by its ORIGINAL run
+            // (`invocationId` at the time); once the child is resumed that slot
+            // advances, so a client could not join the card any more — and a fresh
+            // hydration had no way back. `session.invocationThreads` already records
+            // every invocation observed in a conversation (for the F6 purge) and is
+            // persisted, which makes it the authoritative, restart-safe join.
+            const invocationIds = this.invocationIdsOf(session, record, originInvocationId);
+
             // F2: reference EDGES, derived from the recorded turns. A connection is
             // never ownership, so it names the source conversations without making
             // this one a child of them.
@@ -1700,6 +1752,10 @@ export class SessionStore {
                 label: this.ensureThreadLabel(session, record.id, record.agent),
                 ...(first === undefined ? {} : { originTurnId: first.id }),
                 ...(originInvocationId === undefined ? {} : { originInvocationId }),
+                // Omitted while nothing was recorded (a legacy document), so every
+                // pre-existing roster shape stays byte-identical and a client that
+                // does not know the field is unaffected.
+                ...(invocationIds.length === 0 ? {} : { invocationIds }),
                 ...(references.length === 0 ? {} : { references }),
                 ...(connectedThreadIds.length === 0 ? {} : { connectedThreadIds }),
                 // Always present (possibly empty): a focused UI can render "no

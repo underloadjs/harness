@@ -1,19 +1,23 @@
-// Persistent runtime threads (R2/R5/R6/R7): roster reading, submit routing and the
-// thread strip.
+// Persistent runtime threads (R2/R5/R6/R7/R8) — the pure UI layer of
+// src/frontend/ui/threads.ts.
 //
-// These pin the contract the composer and the shell depend on:
-//   - the roster is read STRUCTURALLY and additively (a legacy snapshot has none);
-//   - focus decides the target: continue an idle/stopped thread, steer a running one,
-//     and with NO focus a submit opens a NEW thread (connected when the draft carries
-//     `#` references);
-//   - the far-right `x` STOPS a running thread but only DELETES an idle/stopped one,
-//     and that delete needs a second click.
+// These pin the contract the composer, the transcript board and the shell depend on:
+//   - the roster is read STRUCTURALLY and additively (a legacy snapshot has none, so
+//     `sessionThreadsOf` yields [] and `turnThreadIdOf` yields undefined);
+//   - the submit-routing DECISION is a pure function: focus decides the target —
+//     continue an idle/stopped thread, steer a running one (queued when it cannot be
+//     steered) — and with NO focus a submit opens a NEW thread (connected when the
+//     draft carries `#` references);
+//   - display labels are canonical: one agent-prefixed name per conversation, the
+//     same string on the tile badge and on a `#` reference, never parsed from ids.
+//
+// The compact `.thread-strip` DOM band was REMOVED from the module (it duplicated the
+// transcript's own `.tile-thread` badge), so nothing here mounts or queries DOM:
+// every assertion below is on a plain return value.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/threads.test.ts
 
 import {
-    THREAD_DELETE_CONFIRM_MS,
-    createThreadStrip,
     resolveSubmitTarget,
     sessionThreadsOf,
     submitTargetLabel,
@@ -107,6 +111,45 @@ describe('sessionThreadsOf', () => {
                 originTurnId: 'turn-4',
                 originInvocationId: 'thread-invocation-7'
             }
+        ]);
+    });
+
+    // R3: the roster's historical invocation list is the authoritative join for a
+    // card whose original invocation id the single slots no longer name. It is read
+    // defensively (non-strings and blanks dropped, duplicates collapsed, oldest first)
+    // and OMITTED when nothing usable remains, so the board can tell "not sent" from
+    // "this thread ran nothing".
+    it('reads the historical invocation list defensively', () => {
+        const threads = sessionThreadsOf({
+            threads: [
+                {
+                    id: 'thread-5',
+                    agent: 'research',
+                    origin: 'host',
+                    status: 'idle',
+                    sequence: 1,
+                    invocationId: 'inv-9',
+                    invocationIds: ['inv-7', '', '  ', 'inv-9', 'inv-7', 42, null]
+                },
+                // Absent, empty and non-array values all mean "the server sent none".
+                { id: 'thread-6', agent: 'research', origin: 'host', status: 'idle', sequence: 2 },
+                { id: 'thread-7', agent: 'research', origin: 'host', status: 'idle', sequence: 3, invocationIds: [] },
+                {
+                    id: 'thread-8',
+                    agent: 'research',
+                    origin: 'host',
+                    status: 'idle',
+                    sequence: 4,
+                    invocationIds: 'inv-1'
+                }
+            ]
+        });
+
+        expect(threads.map((entry) => [entry.id, entry.invocationIds])).toEqual([
+            ['thread-5', ['inv-7', 'inv-9']],
+            ['thread-6', undefined],
+            ['thread-7', undefined],
+            ['thread-8', undefined]
         ]);
     });
 
@@ -299,271 +342,5 @@ describe('submitTargetLabel', () => {
             'Continuing Writing'
         );
         expect(submitTargetLabel({ mode: 'new', queued: true })).toBe('New thread');
-    });
-});
-
-describe('createThreadStrip', () => {
-    const mount = () => {
-        const calls: string[] = [];
-        const strip = createThreadStrip({
-            onFocus: (threadId) => calls.push(`focus:${threadId}`),
-            onUnfocus: () => calls.push('unfocus'),
-            onStop: (threadId) => calls.push(`stop:${threadId}`),
-            onDelete: (threadId) => calls.push(`delete:${threadId}`)
-        });
-        document.body.replaceChildren(strip.element);
-        return { strip, calls };
-    };
-
-    const rows = (strip: ReturnType<typeof createThreadStrip>): HTMLElement[] => [
-        ...strip.element.querySelectorAll<HTMLElement>('.thread-strip-row')
-    ];
-
-    it('stays hidden with no roster and no focus', () => {
-        const { strip } = mount();
-
-        strip.render([]);
-
-        expect(strip.element.hidden).toBe(true);
-        expect(rows(strip)).toEqual([]);
-    });
-
-    it('renders one row per persistent thread and marks exactly the focused one', () => {
-        const { strip } = mount();
-
-        strip.render(
-            [
-                rosterEntry({ id: 'thread-1', sequence: 1, label: 'Writing', status: 'stopped' }),
-                rosterEntry({ id: 'thread-2', sequence: 2, status: 'running' })
-            ],
-            'thread-2'
-        );
-
-        expect(strip.element.hidden).toBe(false);
-        expect(rows(strip).map((row) => row.dataset.threadId)).toEqual(['thread-1', 'thread-2']);
-        expect(rows(strip).map((row) => row.dataset.status)).toEqual(['stopped', 'running']);
-
-        const [first, second] = rows(strip);
-        expect(first.classList.contains('is-focused')).toBe(false);
-        expect(second.classList.contains('is-focused')).toBe(true);
-
-        const focusButtons = [...strip.element.querySelectorAll<HTMLButtonElement>('.thread-strip-focus')];
-        expect(focusButtons.map((button) => button.textContent)).toEqual([
-            'writerWritingstopped',
-            'writerWR2running'
-        ]);
-        expect(focusButtons.map((button) => button.getAttribute('aria-pressed'))).toEqual(['false', 'true']);
-        expect(focusButtons.map((button) => button.getAttribute('aria-label'))).toEqual([
-            'Focus thread Writing of writer (stopped)',
-            'Focus thread WR2 of writer (running)'
-        ]);
-
-        // The far-right action is STOP for the running thread and DELETE otherwise.
-        const actions = [...strip.element.querySelectorAll<HTMLButtonElement>('.thread-strip-action')];
-        expect(actions.map((button) => button.dataset.action)).toEqual(['delete', 'stop']);
-        expect(actions.map((button) => button.getAttribute('aria-label'))).toEqual([
-            'Delete thread Writing of writer',
-            'Stop thread WR2 of writer'
-        ]);
-    });
-
-    it('focuses a thread by clicking its row label', () => {
-        const { strip, calls } = mount();
-        strip.render([rosterEntry({ id: 'thread-1', sequence: 1 })]);
-
-        strip.element.querySelector<HTMLButtonElement>('.thread-strip-focus')?.click();
-
-        expect(calls).toEqual(['focus:thread-1']);
-    });
-
-    it('stops a running thread once and disables the action until a repaint', () => {
-        const { strip, calls } = mount();
-        strip.render([rosterEntry({ id: 'thread-2', sequence: 2, status: 'running' })]);
-
-        const action = () => strip.element.querySelector<HTMLButtonElement>('.thread-strip-action');
-        expect(action()?.disabled).toBe(false);
-        action()?.click();
-
-        expect(calls).toEqual(['stop:thread-2']);
-        // The repaint marks the row pending: the action is disabled until the
-        // authoritative snapshot shows the thread stopped (or a failure resyncs).
-        expect(action()?.disabled).toBe(true);
-        // The click is single-flight: a second one must not send another cancel.
-        action()?.click();
-        expect(calls).toEqual(['stop:thread-2']);
-    });
-
-    it('deletes a stopped thread only after a confirming second click', () => {
-        vi.useFakeTimers();
-        try {
-            const { strip, calls } = mount();
-            strip.render([rosterEntry({ id: 'thread-3', sequence: 3, status: 'stopped' })]);
-
-            const action = () => strip.element.querySelector<HTMLButtonElement>('.thread-strip-action');
-            action()?.click();
-
-            // Armed, not deleted: the label asks for confirmation.
-            expect(calls).toEqual([]);
-            expect(strip.armed()).toBe('thread-3');
-            expect(action()?.getAttribute('aria-label')).toBe('Confirm delete thread WR3 of writer');
-            expect(action()?.classList.contains('is-confirm')).toBe(true);
-
-            action()?.click();
-            expect(calls).toEqual(['delete:thread-3']);
-            expect(strip.armed()).toBeUndefined();
-        } finally {
-            vi.useRealTimers();
-        }
-    });
-
-    it('disarms a pending delete after the confirmation window', () => {
-        vi.useFakeTimers();
-        try {
-            const { strip, calls } = mount();
-            strip.render([rosterEntry({ id: 'thread-3', sequence: 3 })]);
-
-            strip.element.querySelector<HTMLButtonElement>('.thread-strip-action')?.click();
-            expect(strip.armed()).toBe('thread-3');
-
-            vi.advanceTimersByTime(THREAD_DELETE_CONFIRM_MS);
-
-            expect(strip.armed()).toBeUndefined();
-            expect(
-                strip.element.querySelector<HTMLButtonElement>('.thread-strip-action')?.getAttribute('aria-label')
-            ).toBe('Delete thread WR3 of writer');
-            // The disarmed click did NOT delete anything.
-            expect(calls).toEqual([]);
-        } finally {
-            vi.useRealTimers();
-        }
-    });
-
-    it('offers the explicit unfocus control only while something is focused', () => {
-        const { strip, calls } = mount();
-        const threads = [rosterEntry({ id: 'thread-1', sequence: 1 })];
-
-        strip.render(threads);
-        expect(strip.element.querySelector('.thread-strip-unfocus')).toBeNull();
-
-        strip.render(threads, 'thread-1');
-        const unfocus = strip.element.querySelector<HTMLButtonElement>('.thread-strip-unfocus');
-        expect(unfocus?.textContent).toBe('New thread');
-        expect(unfocus?.getAttribute('aria-label')).toBe(
-            'Unfocus the current thread and start new messages in a new thread'
-        );
-        unfocus?.click();
-        expect(calls).toEqual(['unfocus']);
-    });
-
-    it('stays visible with the unfocus control when the focused conversation is not in the roster', () => {
-        // A default agent conversation has a runtime id but no HOST roster row.
-        const { strip } = mount();
-
-        strip.render([], 'agent:writer');
-
-        expect(strip.element.hidden).toBe(false);
-        expect(rows(strip)).toEqual([]);
-        expect(strip.element.querySelector('.thread-strip-unfocus')).not.toBeNull();
-    });
-
-    it('drops an armed delete whose thread left the roster', () => {
-        vi.useFakeTimers();
-        try {
-            const { strip } = mount();
-            strip.render([rosterEntry({ id: 'thread-3', sequence: 3 })]);
-            strip.element.querySelector<HTMLButtonElement>('.thread-strip-action')?.click();
-            expect(strip.armed()).toBe('thread-3');
-
-            strip.render([]);
-
-            expect(strip.armed()).toBeUndefined();
-            expect(strip.element.hidden).toBe(true);
-        } finally {
-            vi.useRealTimers();
-        }
-    });
-
-    it('keeps the keyboard on the SAME semantic control across a repaint (S4)', () => {
-        const { strip } = mount();
-        const roster = [
-            rosterEntry({ id: 'thread-1', sequence: 1 }),
-            rosterEntry({ id: 'thread-2', sequence: 2, status: 'running' })
-        ];
-        strip.render(roster, 'thread-1');
-
-        const stop = () => strip.element.querySelector<HTMLButtonElement>('[data-thread-id="thread-2"] .thread-strip-action');
-        stop()?.focus();
-        expect(document.activeElement).toBe(stop());
-
-        // An authoritative snapshot repaints every row.
-        strip.render(roster, 'thread-1');
-        expect(document.activeElement).not.toBe(document.body);
-        expect(document.activeElement).toBe(stop());
-        expect(stop()?.getAttribute('aria-label')).toBe('Stop thread WR2 of writer');
-    });
-
-    it('keeps the armed delete and its focus across a repaint (S4)', () => {
-        vi.useFakeTimers();
-        try {
-            const { strip } = mount();
-            const roster = [rosterEntry({ id: 'thread-3', sequence: 3 })];
-            strip.render(roster);
-
-            const arm = strip.element.querySelector<HTMLButtonElement>('.thread-strip-action');
-            arm?.focus();
-            arm?.click();
-            expect(strip.armed()).toBe('thread-3');
-            // The arming repaint moved focus onto the rebuilt confirm button.
-            expect(document.activeElement?.getAttribute('aria-label')).toBe('Confirm delete thread WR3 of writer');
-
-            const confirm = strip.element.querySelector<HTMLButtonElement>('.thread-strip-action');
-            confirm?.focus();
-            strip.render(roster);
-
-            expect(strip.armed()).toBe('thread-3');
-            expect(strip.element.querySelector('.thread-strip-action')?.getAttribute('aria-label')).toBe(
-                'Confirm delete thread WR3 of writer'
-            );
-            expect(document.activeElement).toBe(strip.element.querySelector('.thread-strip-action'));
-        } finally {
-            vi.useRealTimers();
-        }
-    });
-
-    it('keeps the unfocus control OUTSIDE the list so the content model is valid (S5)', () => {
-        const { strip } = mount();
-        strip.render([rosterEntry({ id: 'thread-1', sequence: 1 })], 'thread-1');
-
-        const list = strip.element.querySelector('ul');
-        expect([...(list?.children ?? [])].map((node) => node.tagName)).toEqual(['LI']);
-        const footer = strip.element.querySelector('.thread-strip-footer');
-        expect(footer?.parentElement).toBe(strip.element);
-        expect(footer?.querySelector('.thread-strip-unfocus')).not.toBeNull();
-    });
-
-    it('never offers stop/delete for an agent DEFAULT conversation (S6)', () => {
-        const { strip } = mount();
-
-        strip.render([
-            rosterEntry({ id: 'thread-1', sequence: 1, status: 'running' }),
-            rosterEntry({ id: 'agent:writer', sequence: 2, origin: 'agent', status: 'idle' })
-        ]);
-
-        expect(rows(strip).map((row) => row.dataset.threadId)).toEqual(['thread-1']);
-        expect(strip.element.querySelectorAll('.thread-strip-action')).toHaveLength(1);
-        expect(
-            strip.element.querySelector('.thread-strip-row[data-thread-id="thread-1"] .thread-strip-action')?.getAttribute('aria-label')
-        ).toBe('Stop thread WR1 of writer');
-    });
-
-    it('destroy clears the rows and hides the strip', () => {
-        const { strip } = mount();
-        strip.render([rosterEntry({ id: 'thread-1', sequence: 1 })], 'thread-1');
-
-        strip.destroy();
-
-        expect(strip.element.hidden).toBe(true);
-        expect(rows(strip)).toEqual([]);
-        expect(strip.armed()).toBeUndefined();
     });
 });

@@ -17,15 +17,20 @@
 //   - the routing decision for the next submit (new thread vs continue vs steer vs
 //     connected new thread). It is a pure function so the composer's promise and
 //     the POST body can never disagree;
-//   - the compact thread strip: one row per persistent thread with a FOCUS control
-//     (exactly one thread is focused), a far-right `×` that STOPS a running thread,
-//     and a distinct, confirmed DELETE for an idle/stopped one.
+//   - the canonical display labels the board stamps on a conversation's tile badge
+//     and on a `#` reference.
+//
+// The compact `.thread-strip` DOM band that used to be built here is REMOVED: it
+// duplicated the transcript's own `.tile-thread` badge and cost a permanent row of
+// height. Thread focus is now expressed by the expanded tile plus the composer's
+// routing label only (see main.ts `createView`).
 //
 // Server contract this file is written against (agreed, additive):
 //   SessionSnapshot.threads?: Array<{
 //       id: string; agent: string; origin: 'host'; status: 'idle'|'running'|'stopped';
 //       sequence: number; ownerThreadId?: string; label?: string; invocationId?: string;
 //       originTurnId?: string; originInvocationId?: string; references?: unknown[];
+//       invocationIds?: string[];
 //   }>
 //   SessionTurn.threadId?: string          // the turn's persistent thread
 //   SubmitTaskRequest.threadId?: string    // absent = create a NEW thread
@@ -64,6 +69,14 @@ export type SessionThreadEntry = {
     // recorded it. Display-only provenance; the board uses `SessionTurn.threadId`.
     originTurnId?: string;
     originInvocationId?: string;
+    // EVERY invocation id the conversation ran, oldest first (additive). The two
+    // slots above name only the LATEST run and the first TURN; a delegated child has
+    // no turn of its own, so after it is resumed neither names the invocation that
+    // created its card. This is the server's persisted invocation→thread map, and it
+    // is what the board joins a HISTORICAL invocation card on — live and after a
+    // fresh hydration. Absent on a payload that predates it: the board then keeps
+    // only what it already learned and never guesses from task text.
+    invocationIds?: readonly string[];
     // The thread's committed transcript (`SessionThread.messages`). A runtime child
     // has NO SessionTurn of its own (its work is recorded inside its parent's turn),
     // so this is the only way the UI can render that conversation (S2). Kept as an
@@ -82,6 +95,23 @@ const isObjectLike = (value: unknown): value is Record<string, unknown> =>
 
 const nonEmptyString = (value: unknown): string | undefined =>
     typeof value === 'string' && value.trim().length > 0 ? value : undefined;
+
+// Read an optional list of opaque ids (the roster's `invocationIds`). Only non-empty
+// strings are kept, deduplicated in first-seen (oldest-first) order. An absent or
+// malformed value means "the server did not send it" — NEVER "the thread ran no
+// invocation": the board must be able to tell the difference, because an empty list
+// would be read as authoritative evidence and drop a known join.
+const idList = (value: unknown): string[] | undefined => {
+    if (!Array.isArray(value)) return undefined;
+
+    const ids: string[] = [];
+    for (const entry of value) {
+        const id = nonEmptyString(entry);
+        if (id !== undefined && !ids.includes(id)) ids.push(id);
+    }
+
+    return ids.length === 0 ? undefined : ids;
+};
 
 // Read the optional roster from a snapshot. Omitted (legacy server) => [] so the
 // strip stays hidden and every pre-thread behaviour is byte-identical.
@@ -110,6 +140,11 @@ export const sessionThreadsOf = (session: unknown): SessionThreadEntry[] => {
         // as an agent default conversation.
         const origin = entry.origin === 'agent' ? 'agent' : 'host';
 
+        // R3: the historical invocation join, validated like every other roster field
+        // (a malformed entry must never break the transcript, and an id repeated by a
+        // server bug must not appear twice).
+        const invocationIds = idList(entry.invocationIds);
+
         seen.add(id);
         threads.push({
             id,
@@ -130,6 +165,7 @@ export const sessionThreadsOf = (session: unknown): SessionThreadEntry[] => {
             ...(nonEmptyString(entry.originInvocationId) === undefined
                 ? {}
                 : { originInvocationId: nonEmptyString(entry.originInvocationId) as string }),
+            ...(invocationIds === undefined ? {} : { invocationIds }),
             ...(Array.isArray(entry.messages) ? { messages: [...entry.messages] } : {})
         });
     }
@@ -337,287 +373,3 @@ export const turnThreadLabelOf = (turn: unknown): string | undefined => {
 };
 
 export { agentCodeOf };
-
-// --- the thread strip --------------------------------------------------------
-
-export type ThreadStripOptions = {
-    // Focus one thread (the board expands its newest turn). Focus is UI state; the
-    // selected thread is never sent anywhere until a submit targets it.
-    onFocus: (threadId: string) => void;
-    // Remove focus and go back to "next submit opens a new thread".
-    onUnfocus: () => void;
-    // Stop the running work of one thread (POST .../threads/:id/cancel).
-    onStop: (threadId: string) => void;
-    // Delete an idle/stopped thread (DELETE .../threads/:id). Never offered while
-    // the thread is running: the server answers 409 by contract.
-    onDelete: (threadId: string) => void;
-};
-
-export type ThreadStrip = {
-    element: HTMLElement;
-    // Repaint from the authoritative roster + the currently focused id. Called on
-    // every snapshot and whenever the board's focus changes.
-    render: (threads: readonly SessionThreadEntry[], focused?: string) => void;
-    // The thread whose DELETE is waiting for its confirming second click, if any.
-    // Exposed for tests and so a caller can reset the armed state explicitly.
-    armed: () => string | undefined;
-    destroy: () => void;
-};
-
-// How long an armed DELETE waits for confirmation before reverting to the plain
-// delete label. Long enough to read the confirmation prompt, short enough that a
-// later, unrelated click cannot silently delete a conversation.
-export const THREAD_DELETE_CONFIRM_MS = 4000;
-
-const el = <K extends keyof HTMLElementTagNameMap>(
-    tag: K,
-    className?: string,
-    text?: string
-): HTMLElementTagNameMap[K] => {
-    const node = document.createElement(tag);
-    if (className !== undefined) node.className = className;
-    if (text !== undefined) node.textContent = text;
-    return node;
-};
-
-// Which control inside one row the keyboard was on, captured before a repaint so it
-// can be restored afterwards (S4: every snapshot repaints the strip; losing focus to
-// <body> makes the row unreachable without tabbing from the top of the page).
-type StripFocus = { kind: 'unfocus' } | { kind: 'focus' | 'action'; threadId: string };
-
-export const createThreadStrip = (options: ThreadStripOptions): ThreadStrip => {
-    const element = el('section', 'thread-strip');
-    element.setAttribute('aria-label', 'Agent threads');
-    element.hidden = true;
-
-    const list = el('ul', 'thread-strip-list');
-    // The explicit unfocus control is a SIBLING of the list, never a list item: it
-    // is not a thread, and a bare <button> inside <ul> is invalid content (S5).
-    const footer = el('div', 'thread-strip-footer');
-    footer.hidden = true;
-    element.append(list, footer);
-
-    let focused: string | undefined;
-    let entries: readonly SessionThreadEntry[] = [];
-    // Thread ids whose terminal action is in flight, WITH that action: the button is
-    // disabled until the authoritative roster moves on. A stop clears as soon as the
-    // thread is no longer running (so its delete affordance is usable); a delete
-    // clears when the row disappears.
-    const pending = new Map<string, 'stop' | 'delete'>();
-    let armedId: string | undefined;
-    let armedTimer: number | undefined;
-
-    const disarm = (): void => {
-        armedId = undefined;
-        if (armedTimer !== undefined) {
-            window.clearTimeout(armedTimer);
-            armedTimer = undefined;
-        }
-    };
-
-    const arm = (threadId: string): void => {
-        disarm();
-        armedId = threadId;
-        armedTimer = window.setTimeout(() => {
-            armedTimer = undefined;
-            armedId = undefined;
-            // Repaint only if this strip still shows the thread: the timer can fire
-            // after the roster dropped it, and an empty repaint is harmless anyway.
-            paint();
-        }, THREAD_DELETE_CONFIRM_MS);
-    };
-
-    const nameOf = (entry: SessionThreadEntry): string => threadNameOf(entry);
-
-    // Only HOST threads are actionable here (S6): an agent's default conversation is
-    // not deletable (the server answers 400; reset is the operation) and is omitted
-    // from the protocol roster anyway. A server that includes one must not get a
-    // stop/delete affordance for it.
-    // A roster entry without `origin` predates the field (or was hand-built by a
-    // caller): it is a HOST thread, matching `sessionThreadsOf`'s default. Only an
-    // explicit `origin: 'agent'` is excluded.
-    const hostEntries = (): SessionThreadEntry[] => entries.filter((entry) => entry.origin !== 'agent');
-
-    // One compact row per PERSISTENT thread. The focus button is the row's whole
-    // label surface (`aria-pressed` names the single focused thread); the far-right
-    // `×` is the terminal action for THAT thread only. The agent is shown as its own
-    // muted token so two threads of the same agent read as different conversations
-    // (S6) without relying on colour alone.
-    const rowOf = (entry: SessionThreadEntry): HTMLElement => {
-        const name = nameOf(entry);
-        const isFocused = focused === entry.id;
-        const isPending = pending.has(entry.id);
-        const isArmed = armedId === entry.id;
-
-        const row = el('li', 'thread-strip-row');
-        row.dataset.threadId = entry.id;
-        row.dataset.status = entry.status;
-        row.dataset.agent = entry.agent;
-        if (isFocused) row.classList.add('is-focused');
-
-        // Focus control. Exactly one row can be pressed, which is the visible form
-        // of "only one thread is focused/expanded". Focus is NOT set by typing: a
-        // new thread must be visible (pressed + composer target line) before the
-        // next message steers it.
-        const focus = el('button', 'thread-strip-focus');
-        focus.type = 'button';
-        focus.setAttribute('aria-pressed', isFocused ? 'true' : 'false');
-        focus.setAttribute('aria-label', `Focus thread ${name} of ${entry.agent} (${entry.status})`);
-        focus.title = `${name} · ${entry.agent} · ${entry.status} · focus this thread to steer it`;
-        focus.append(
-            el('span', 'thread-strip-agent', entry.agent),
-            el('span', 'thread-strip-name', name),
-            el('span', 'thread-strip-status', entry.status)
-        );
-        focus.addEventListener('click', () => options.onFocus(entry.id));
-
-        // Terminal action: STOP a running thread, DELETE a stopped/idle one. The two
-        // are deliberately different labels (and a different number of clicks), so a
-        // destructive delete can never be mistaken for a stop.
-        const stop = entry.status === 'running';
-        const action = el('button', 'thread-strip-action');
-        action.type = 'button';
-        action.dataset.action = stop ? 'stop' : 'delete';
-        action.textContent = '×';
-        action.disabled = isPending;
-
-        if (stop) {
-            action.setAttribute('aria-label', `Stop thread ${name} of ${entry.agent}`);
-            action.title = 'Stop this thread';
-            action.addEventListener('click', () => {
-                if (pending.has(entry.id)) return;
-                pending.set(entry.id, 'stop');
-                options.onStop(entry.id);
-                paint();
-            });
-        } else if (isArmed) {
-            action.classList.add('is-confirm');
-            action.setAttribute('aria-label', `Confirm delete thread ${name} of ${entry.agent}`);
-            action.title = 'Click again to delete this thread permanently';
-            action.addEventListener('click', () => {
-                disarm();
-                if (pending.has(entry.id)) return;
-                pending.set(entry.id, 'delete');
-                options.onDelete(entry.id);
-                paint();
-            });
-        } else {
-            action.setAttribute('aria-label', `Delete thread ${name} of ${entry.agent}`);
-            action.title = 'Delete this thread';
-            action.addEventListener('click', () => {
-                arm(entry.id);
-                paint();
-            });
-        }
-
-        row.append(focus, action);
-
-        return row;
-    };
-
-    // The single explicit UNFOCUS control: it clears the steering target so the next
-    // message opens a NEW standalone thread. Without it, a focused thread would keep
-    // capturing every message and there would be no way back to "new thread".
-    const unfocusOf = (): HTMLElement => {
-        const button = el('button', 'thread-strip-unfocus', 'New thread');
-        button.type = 'button';
-        button.setAttribute('aria-label', 'Unfocus the current thread and start new messages in a new thread');
-        button.title = 'Next message starts a new thread';
-        button.addEventListener('click', () => options.onUnfocus());
-
-        return button;
-    };
-
-    // Capture/restore the keyboard position across a repaint (S4), including the
-    // two-click delete arm: the arm itself lives in `armedId` and survives, and the
-    // rebuilt confirm button is re-focused because it is the SAME semantic control.
-    const captureFocus = (): StripFocus | undefined => {
-        const active = element.ownerDocument.activeElement;
-        if (!(active instanceof HTMLElement) || !element.contains(active)) return undefined;
-        if (active.classList.contains('thread-strip-unfocus')) return { kind: 'unfocus' };
-
-        const row = active.closest<HTMLElement>('[data-thread-id]');
-        const threadId = row?.dataset.threadId;
-        if (threadId === undefined) return undefined;
-
-        return { threadId, kind: active.classList.contains('thread-strip-action') ? 'action' : 'focus' };
-    };
-
-    const restoreFocus = (state: StripFocus | undefined): void => {
-        if (state === undefined) return;
-
-        if (state.kind === 'unfocus') {
-            footer.querySelector<HTMLButtonElement>('.thread-strip-unfocus')?.focus();
-            return;
-        }
-
-        const row = [...list.children].find(
-            (node): node is HTMLElement => node instanceof HTMLElement && node.dataset.threadId === state.threadId
-        );
-        if (row === undefined) return;
-
-        const wanted = row.querySelector<HTMLButtonElement>(
-            state.kind === 'action' ? '.thread-strip-action' : '.thread-strip-focus'
-        );
-        if (wanted !== null && !wanted.disabled) {
-            wanted.focus();
-            return;
-        }
-
-        // The action was just disabled (a stop is in flight): keep the keyboard on
-        // the same ROW rather than dropping it to <body>.
-        if (state.kind === 'action') row.querySelector<HTMLButtonElement>('.thread-strip-focus')?.focus();
-    };
-
-    const paint = (): void => {
-        const focus = captureFocus();
-        // A stale armed id (thread deleted, focus moved) must not survive a repaint.
-        if (armedId !== undefined && !entries.some((entry) => entry.id === armedId)) disarm();
-
-        list.replaceChildren(...hostEntries().map(rowOf));
-
-        // The explicit unfocus control is offered whenever SOMETHING is focused,
-        // even when that conversation is not a host roster row (the default agent
-        // thread). It is the only way back to "the next message opens a new thread".
-        footer.replaceChildren();
-        footer.hidden = focused === undefined;
-        if (focused !== undefined) footer.append(unfocusOf());
-
-        // Hidden only when there is nothing to show at all. A focused conversation
-        // outside the roster still needs the unfocus control, so the strip stays
-        // visible for it.
-        element.hidden = hostEntries().length === 0 && focused === undefined;
-
-        restoreFocus(focus);
-    };
-
-    return {
-        element,
-        render: (threads, focusedId) => {
-            entries = [...threads];
-            // The authoritative roster settles in-flight actions: a stop is done once
-            // the thread is no longer running (its delete affordance must become
-            // clickable), and a delete is done once the row is gone.
-            for (const [threadId, action] of pending) {
-                const entry = entries.find((candidate) => candidate.id === threadId);
-                const settled = entry === undefined || (action === 'stop' && entry.status !== 'running');
-                if (settled) pending.delete(threadId);
-            }
-            // Focus is NOT validated against the roster here. A default agent
-            // conversation can be focused without appearing in the host roster, and
-            // clearing it would silently turn the next message into a new thread.
-            // Focus is cleared by the BOARD (collapse / deleted tile), which reports
-            // `undefined` through `onFocusChange`.
-            focused = focusedId;
-            paint();
-        },
-        armed: () => armedId,
-        destroy: () => {
-            disarm();
-            list.replaceChildren();
-            footer.replaceChildren();
-            footer.hidden = true;
-            element.hidden = true;
-        }
-    };
-};

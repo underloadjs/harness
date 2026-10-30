@@ -264,6 +264,9 @@ export type ToolDescriptor = {
 //     turn);
 //   - `originInvocationId` is that first run's invocation id, so the persistent
 //     record can be joined to the events of the turn that started it;
+//   - `invocationIds` is the FULL invocation roster of the thread (oldest first),
+//     so a client can join an invocation card even after the conversation advanced
+//     past it — the single `invocationId`/`originInvocationId` slots cannot;
 //   - `references` lists the result blocks this thread's turns consume (the "#"
 //     links), deduplicated, so a client can draw the connection graph without
 //     walking every turn;
@@ -284,6 +287,16 @@ export type SessionThread = {
     invocationId?: string;
     originTurnId?: string;
     originInvocationId?: string;
+    // EVERY invocation id this server observed running in the thread, oldest first.
+    // The single slot above names only the LATEST run, and `originInvocationId` only
+    // the thread's FIRST turn — a delegated child has no turn of its own, so neither
+    // names the invocation that created its card once the child is resumed. This is
+    // the persisted invocation→thread map (src/server/sessions.ts `invocationThreads`)
+    // projected per thread, so a client can join a HISTORICAL invocation card live and
+    // after a fresh hydration without inferring it from task text. Values are unique
+    // and belong to THIS thread only. Omitted when nothing was recorded (a legacy
+    // document whose map is empty/absent).
+    invocationIds?: string[];
     references?: AgentResultReference[];
     // Persistent threads referenced by this conversation's result links (a
     // reference EDGE, not ownership). Derived from the recorded turns and the

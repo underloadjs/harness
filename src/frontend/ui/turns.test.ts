@@ -1164,8 +1164,9 @@ describe('token tally', () => {
         usage: { input, output, total: input + output, ...(cached === undefined ? {} : { cached }) }
     });
 
-    // The four header spans, in DOM order. `tile-tokens` sits between the elapsed
-    // label and the status badge.
+    // The MEASUREMENT spans, in DOM order. `tile-tokens` sits between the elapsed
+    // label and the status badge. The persistent-thread badge is identity, not a
+    // measurement, and leads the header (asserted below and in turns-threads.test.ts).
     const topClasses = (turn: { element: HTMLElement }): (string | null)[] =>
         [...(turn.element.querySelector('.tile-top')?.children ?? [])].map((child) => child.className);
 
@@ -1206,9 +1207,11 @@ describe('token tally', () => {
         expect(label?.title).toBe(
             'Latest request context: 150 input tokens · Total cached input sent: 140 tokens'
         );
-        // R5/R6: the persistent-thread badge leads the metadata cluster and stays
-        // hidden (but present) for a turn with no runtime thread identity.
-        expect(topClasses(turn)).toEqual(['tile-thread', 'tile-elapsed', 'tile-tokens', 'tile-status']);
+        // R1: the persistent-thread badge LEADS the header (identity before
+        // measurements) and stays hidden (but present) for a turn with no runtime
+        // thread identity; `.tile-top` holds measurements only.
+        expect(topClasses(turn)).toEqual(['tile-elapsed', 'tile-tokens', 'tile-status']);
+        expect(turn.element.querySelector('.tile-select')?.firstElementChild?.className).toBe('tile-thread');
     });
 
     it('falls back to the cumulative input only when no usage event was recorded', () => {

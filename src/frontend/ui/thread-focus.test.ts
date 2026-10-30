@@ -457,6 +457,65 @@ describe('persistent child conversations (S2)', () => {
         expect(board.element.querySelector('.thread-focus-panel')).toBeNull();
     });
 
+    it('opens the child card so the focused exchange is actually visible', () => {
+        const { board } = mount();
+        board.setThreads(roster());
+        board.hydrate([turnRecord({ id: 'turn-1', index: 0, threadId: 'thread-root', events: delegationEvents() })]);
+
+        board.reconcile([
+            turnRecord({ id: 'turn-1', index: 0, threadId: 'thread-root', events: delegationEvents() }),
+            turnRecord({ id: 'turn-2', index: 1, threadId: 'thread-child', status: 'running' })
+        ]);
+
+        // The continuation lives INSIDE the child's own card (ui/turns.ts placeTurn).
+        const card = board.element.querySelector<HTMLElement>('.thread-row[data-persistent-thread="thread-child"]');
+        const exchange = card?.querySelector<HTMLElement>('.thread-flow > .turn-row');
+        expect(exchange?.dataset.threadExchange).toBe('thread-child');
+        expect(card?.classList.contains('is-expanded')).toBe(false);
+
+        expect(board.focusThread('thread-child')).toBe(true);
+        // The card and the exchange are opened together: an "expanded" turn hidden by
+        // a collapsed ancestor body would be an invisible focus.
+        expect(card?.classList.contains('is-expanded')).toBe(true);
+        expect(card?.querySelector<HTMLButtonElement>('.thread-select')?.getAttribute('aria-expanded')).toBe('true');
+        expect(exchange?.querySelector('.tile')?.classList.contains('is-expanded')).toBe(true);
+
+        // Moving the focus closes the card THIS focus opened (one surface at a time).
+        board.expand(board.turns()[0]);
+        expect(card?.classList.contains('is-expanded')).toBe(false);
+        expect(board.focusedThread()).toBe('thread-root');
+    });
+
+    it('drops focus-owned expansion when the board is cleared (F2)', () => {
+        const { board } = mount();
+        board.setThreads(roster());
+        board.hydrate([turnRecord({ id: 'turn-1', index: 0, threadId: 'thread-root', events: delegationEvents() })]);
+        board.reconcile([
+            turnRecord({ id: 'turn-1', index: 0, threadId: 'thread-root', events: delegationEvents() }),
+            turnRecord({ id: 'turn-2', index: 1, threadId: 'thread-child', status: 'running' })
+        ]);
+
+        board.focusThread('thread-child');
+        const card = board.element.querySelector<HTMLElement>('.thread-row[data-persistent-thread="thread-child"]');
+        expect(card?.classList.contains('is-expanded')).toBe(true);
+
+        // `clear` is the one teardown that does not run `detachTileExpansion`, so it has
+        // to drop the focus-owned expansion itself instead of keeping the opened rows.
+        board.clear();
+        expect(board.expanded()).toBeUndefined();
+        expect(board.element.querySelectorAll('.conversation')).toHaveLength(0);
+
+        // The NEXT board starts closed: no expansion leaks across the teardown, and the
+        // same child can be focused again from scratch.
+        board.setThreads(roster());
+        board.hydrate([turnRecord({ id: 'turn-1', index: 0, threadId: 'thread-root', events: delegationEvents() })]);
+        const fresh = board.element.querySelector<HTMLElement>('.thread-row[data-persistent-thread="thread-child"]');
+        expect(fresh?.classList.contains('is-expanded')).toBe(false);
+
+        expect(board.focusThread('thread-child')).toBe(true);
+        expect(fresh?.classList.contains('is-expanded')).toBe(true);
+    });
+
     it('drops the focus when the roster no longer describes the child', () => {
         const { board } = mount();
         board.setThreads(roster());

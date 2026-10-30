@@ -292,6 +292,10 @@ describe('SessionStore persistent threads', () => {
                 originTurnId: task.turn.id,
                 originInvocationId: '1',
                 invocationId: '1',
+                // R3: the thread's full invocation roster (oldest first), so a client
+                // can still join a HISTORICAL invocation card after the conversation
+                // advances. Derived from the persisted `invocationThreads` map.
+                invocationIds: ['1'],
                 messages: [
                     { role: 'system', content: 'sys' },
                     { role: 'user', content: 'hello' },
@@ -812,6 +816,9 @@ describe('SessionStore thread persistence', () => {
                 originTurnId: done.turn.id,
                 originInvocationId: '1',
                 invocationId: '1',
+                // R3: the historical invocation roster survives the restart, because it
+                // is derived from the persisted `invocationThreads` map.
+                invocationIds: ['1'],
                 messages: [
                     { role: 'system', content: 'sys' },
                     { role: 'user', content: 'kept' },
@@ -1236,6 +1243,343 @@ describe('delegated child threads', () => {
         expect(
             await reloaded.callTool(created.id, 'agentResult', { agent: 'lead', invocationId: '1' })
         ).toMatchObject({ agent: 'lead', invocationId: '1', status: 'completed' });
+
+        reloaded.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    // R3 IDENTITY: a submit addressed to a delegated child is a CONTINUATION of
+    // that conversation — the same id and owner, its own turn/lane, and no extra
+    // thread. The parent transcript is untouched and a restart keeps the routing.
+    it('resumes a delegated child through a focused submit without minting a thread', async () => {
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
+        const persistence = new HarnessPersistence(root);
+        const store = createStore([delegationPreset()], persistence);
+        const created = store.create('lead');
+
+        // Parent submit opens thread-1; its delegation opens the owned child
+        // thread-2 (invocations: parent 1, child 2).
+        const task = store.enqueue(created.id, 'delegate please');
+        await task.settled;
+        await store.waitForIdle(created.id);
+
+        const before = store.get(created.id);
+        expect(before.threads!.map((thread) => [thread.id, thread.ownerThreadId, thread.label])).toEqual([
+            ['thread-1', undefined, 'LD1'],
+            ['thread-2', 'thread-1', 'HR1']
+        ]);
+        // R3: the historical roster starts with the runs observed so far — the parent's
+        // root run and the child's ORIGINAL delegated run, each on its own thread.
+        expect(before.threads!.map((thread) => thread.invocationIds)).toEqual([['1'], ['2']]);
+        const parentMessages = transcript(before.threads![0].messages);
+        expect(parentMessages).toEqual([
+            { role: 'system', content: 'lead' },
+            { role: 'user', content: 'delegate please' },
+            { role: 'assistant', content: '' },
+            { role: 'tool', content: '{"agent":"helper","content":"helper answer"}' },
+            { role: 'assistant', content: 'lead answer' }
+        ]);
+
+        // A focused submit addresses the CHILD conversation by its persistent id.
+        const continuation = store.enqueue(created.id, 'continue child', undefined, undefined, 'thread-2');
+        expect(continuation.turn.threadId).toBe('thread-2');
+        // The conversation keeps its own display name (it is the same thread).
+        expect(continuation.turn.threadLabel).toBe('HR1');
+
+        await continuation.settled;
+        await store.waitForIdle(created.id);
+
+        const after = store.get(created.id);
+        // No thread was minted: the continuation reused the child conversation.
+        expect(after.threads!.map((thread) => thread.id)).toEqual(['thread-1', 'thread-2']);
+        expect(
+            after.threads!.map((thread) => [
+                thread.id,
+                thread.ownerThreadId,
+                thread.invocationId,
+                thread.originTurnId === continuation.turn.id
+            ])
+        ).toEqual([
+            ['thread-1', undefined, '1', false],
+            ['thread-2', 'thread-1', '3', true]
+        ]);
+        // R3: the resume ADVANCES the single slot but the historical roster keeps the
+        // original delegated run, so a client can still bind the card it created.
+        // Neither thread gains the other's ids (no cross-thread leakage, no duplicate).
+        expect(after.threads!.map((thread) => thread.invocationIds)).toEqual([
+            ['1'],
+            ['2', '3']
+        ]);
+        // The child conversation accumulated the focused turn; the parent did not.
+        expect(transcript(after.threads![1].messages)).toEqual([
+            { role: 'system', content: 'helper' },
+            { role: 'user', content: 'child work' },
+            { role: 'assistant', content: 'helper answer' },
+            { role: 'user', content: 'continue child' },
+            { role: 'assistant', content: 'helper answer' }
+        ]);
+        expect(transcript(after.threads![0].messages)).toEqual(parentMessages);
+
+        // The focused submit's own turn records its invocation identity, joined to
+        // the child conversation through the roster (no parent/call: it is a host
+        // turn of an existing thread).
+        expect(after.turns.map((turn) => [turn.prompt, turn.threadId, turn.threadLabel, turn.status])).toEqual([
+            ['delegate please', 'thread-1', 'LD1', 'done'],
+            ['continue child', 'thread-2', 'HR1', 'done']
+        ]);
+        expect(after.turns[1].events[0]).toEqual({
+            type: 'start',
+            agent: 'helper',
+            model: 'scripted/test',
+            thread: { id: '3', input: 'continue child' }
+        });
+
+        store.dispose();
+
+        // Restart: both conversations, the owner link, and the transcript survive;
+        // the NEXT focused submit continues the same child (invocation 4) again
+        // without minting a thread.
+        const reloaded = createStore([delegationPreset()], persistence, persistence.load());
+        const restored = reloaded.get(created.id);
+        expect(
+            restored.threads!.map((thread) => [thread.id, thread.ownerThreadId, thread.invocationId, thread.label])
+        ).toEqual([
+            ['thread-1', undefined, '1', 'LD1'],
+            ['thread-2', 'thread-1', '3', 'HR1']
+        ]);
+        // R3 (restart): the historical roster is derived from the PERSISTED
+        // invocation→thread map, so a fresh page after a restart can still join the
+        // card created by the child's original delegated run.
+        expect(restored.threads!.map((thread) => thread.invocationIds)).toEqual([
+            ['1'],
+            ['2', '3']
+        ]);
+        expect(transcript(restored.threads![1].messages)).toEqual(
+            transcript(after.threads![1].messages)
+        );
+
+        const resumed = reloaded.enqueue(created.id, 'after restart', undefined, undefined, 'thread-2');
+        await resumed.settled;
+        await reloaded.waitForIdle(created.id);
+
+        const final = reloaded.get(created.id);
+        expect(final.threads!.map((thread) => [thread.id, thread.ownerThreadId, thread.invocationId])).toEqual([
+            ['thread-1', undefined, '1'],
+            ['thread-2', 'thread-1', '4']
+        ]);
+        // The post-restart resume APPENDS to the surviving history: the original
+        // delegated run and the pre-restart continuation stay joinable, and the parent
+        // thread still owns only its own invocation (no leakage, no duplicates).
+        expect(final.threads!.map((thread) => thread.invocationIds)).toEqual([
+            ['1'],
+            ['2', '3', '4']
+        ]);
+        expect(transcript(final.threads![1].messages)).toEqual([
+            { role: 'system', content: 'helper' },
+            { role: 'user', content: 'child work' },
+            { role: 'assistant', content: 'helper answer' },
+            { role: 'user', content: 'continue child' },
+            { role: 'assistant', content: 'helper answer' },
+            { role: 'user', content: 'after restart' },
+            { role: 'assistant', content: 'helper answer' }
+        ]);
+
+        reloaded.dispose();
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    // R3 fallback: a document written BEFORE `invocationThreads` existed has no
+    // historical map, so the roster must not invent one. It reports only what each
+    // thread's own runtime record still names, and never borrows another thread's
+    // ids — an unavailable original run stays unavailable rather than guessed.
+    it('falls back to the live invocation slot when the persisted history is absent', async () => {
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
+        const persistence = new HarnessPersistence(root);
+        const store = createStore([delegationPreset()], persistence);
+        const created = store.create('lead');
+
+        const task = store.enqueue(created.id, 'delegate please');
+        await task.settled;
+        await store.waitForIdle(created.id);
+
+        // The child resumes, so its single slot advances past the original run ('2').
+        const continuation = store.enqueue(created.id, 'continue child', undefined, undefined, 'thread-2');
+        await continuation.settled;
+        await store.waitForIdle(created.id);
+        expect(store.get(created.id).threads!.map((thread) => thread.invocationIds)).toEqual([
+            ['1'],
+            ['2', '3']
+        ]);
+        store.dispose();
+
+        // Simulate a document from before the map existed.
+        const document = JSON.parse(fs.readFileSync(persistence.file, 'utf8')) as {
+            sessions: { invocationThreads?: unknown }[];
+        };
+        for (const session of document.sessions) delete session.invocationThreads;
+        fs.writeFileSync(persistence.file, JSON.stringify(document, null, 2), 'utf8');
+
+        const reloaded = createStore([delegationPreset()], persistence, persistence.load()).get(created.id);
+        expect(
+            reloaded.threads!.map((thread) => [thread.id, thread.invocationId, thread.invocationIds])
+        ).toEqual([
+            ['thread-1', '1', ['1']],
+            ['thread-2', '3', ['3']]
+        ]);
+        // The original delegated run ('2') is genuinely unavailable in this document:
+        // no inference from the identical-looking transcript is attempted.
+        expect(reloaded.threads![1].invocationIds).not.toContain('2');
+
+        fs.rmSync(root, { recursive: true, force: true });
+    });
+
+    // R3 (identical siblings): TWO delegations to the SAME agent with the SAME task
+    // text are still two conversations with two invocation identities. The roster's
+    // historical list is what lets a client tell their cards apart — content-based
+    // inference could not — and a resume of one must never touch the other.
+    it('keeps identical sibling delegations on their own invocation histories', async () => {
+        const root = fs.mkdtempSync(path.join(process.env.TEMP ?? os.tmpdir(), 't4-threads-'));
+        const persistence = new HarnessPersistence(root);
+
+        // ONE lead turn spawns two helper invocations with the same input text.
+        const twinPreset = (): HarnessPreset => {
+            let leadRequests = 0;
+
+            return {
+                name: 'lead',
+                title: 'lead',
+                description: 'lead + helper',
+                requiresEndpoint: false,
+                primary: 'lead',
+                subagents: ['helper'],
+                agents: ['lead', 'helper'],
+                tools: [],
+                builtin: true,
+                editable: true,
+                create: (settings, progress) =>
+                    harness({
+                        agents: {
+                            lead: agent({
+                                model: settings.model,
+                                instruction: 'lead',
+                                stream: async function* (): AsyncGenerator<HarnessStreamEvent> {
+                                    leadRequests += 1;
+
+                                    if (leadRequests === 1) {
+                                        yield {
+                                            type: 'done',
+                                            stopReason: 'tool_calls',
+                                            toolCalls: [
+                                                {
+                                                    id: 'twin-a',
+                                                    name: 'agentDelegate',
+                                                    arguments: JSON.stringify({
+                                                        agent: 'helper',
+                                                        input: 'twin task'
+                                                    })
+                                                },
+                                                {
+                                                    id: 'twin-b',
+                                                    name: 'agentDelegate',
+                                                    arguments: JSON.stringify({
+                                                        agent: 'helper',
+                                                        input: 'twin task'
+                                                    })
+                                                }
+                                            ]
+                                        };
+                                        return;
+                                    }
+
+                                    yield { type: 'text', delta: 'lead answer' };
+                                    yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                                }
+                            }),
+                            helper: agent({
+                                model: settings.model,
+                                instruction: 'helper',
+                                stream: async function* (): AsyncGenerator<HarnessStreamEvent> {
+                                    yield { type: 'text', delta: 'helper answer' };
+                                    yield { type: 'done', stopReason: 'stop', toolCalls: [] };
+                                }
+                            })
+                        },
+                        primary: 'lead',
+                        subagents: ['helper'],
+                        presets: false,
+                        report: { progress }
+                    })
+            };
+        };
+
+        const store = createStore([twinPreset()], persistence);
+        const created = store.create('lead');
+
+        const task = store.enqueue(created.id, 'delegate twice');
+        await task.settled;
+        await store.waitForIdle(created.id);
+
+        const snapshot = store.get(created.id);
+        // Two SEPARATE child conversations, same agent, same task text, same owner.
+        expect(
+            snapshot.threads!.map((thread) => [
+                thread.id,
+                thread.agent,
+                thread.ownerThreadId,
+                thread.invocationId,
+                thread.invocationIds
+            ])
+        ).toEqual([
+            ['thread-1', 'lead', undefined, '1', ['1']],
+            ['thread-2', 'helper', 'thread-1', '2', ['2']],
+            ['thread-3', 'helper', 'thread-1', '3', ['3']]
+        ]);
+        // Their transcripts are IDENTICAL, which is exactly why text cannot join them.
+        expect(transcript(snapshot.threads![1].messages)).toEqual(
+            transcript(snapshot.threads![2].messages)
+        );
+        // The delegating turn carries both invocation ids, one per child card.
+        expect(
+            snapshot.turns[0].events
+                .filter((event) => event.type === 'start' && event.agent === 'helper')
+                .map((event) => (event as { thread?: { id: string; input?: string } }).thread)
+        ).toEqual([
+            { id: '2', parentId: '1', callId: 'twin-a', input: 'twin task' },
+            { id: '3', parentId: '1', callId: 'twin-b', input: 'twin task' }
+        ]);
+
+        store.dispose();
+
+        // Restart, then resume ONE sibling. Its history grows by exactly its own new
+        // run; the identical sibling's roster and transcript are untouched.
+        const reloaded = createStore([twinPreset()], persistence, persistence.load());
+        const restored = reloaded.get(created.id);
+        expect(restored.threads!.map((thread) => thread.invocationIds)).toEqual([['1'], ['2'], ['3']]);
+
+        const resumed = reloaded.enqueue(created.id, 'resume b', undefined, undefined, 'thread-3');
+        await resumed.settled;
+        await reloaded.waitForIdle(created.id);
+
+        const final = reloaded.get(created.id);
+        expect(
+            final.threads!.map((thread) => [thread.id, thread.invocationId, thread.invocationIds])
+        ).toEqual([
+            ['thread-1', '1', ['1']],
+            ['thread-2', '2', ['2']],
+            ['thread-3', '4', ['3', '4']]
+        ]);
+        expect(transcript(final.threads![1].messages)).toEqual([
+            { role: 'system', content: 'helper' },
+            { role: 'user', content: 'twin task' },
+            { role: 'assistant', content: 'helper answer' }
+        ]);
+        expect(transcript(final.threads![2].messages)).toEqual([
+            { role: 'system', content: 'helper' },
+            { role: 'user', content: 'twin task' },
+            { role: 'assistant', content: 'helper answer' },
+            { role: 'user', content: 'resume b' },
+            { role: 'assistant', content: 'helper answer' }
+        ]);
 
         reloaded.dispose();
         fs.rmSync(root, { recursive: true, force: true });

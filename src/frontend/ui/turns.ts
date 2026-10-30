@@ -109,6 +109,15 @@
 // this identity to the invocation ids in `blocks()`: those are `#` reference
 // bindings for ONE run and are a different namespace.
 //
+// Invocation → conversation join (R3). A nested card is keyed by the runtime
+// invocation id of ONE run, while its conversation keeps running (and advancing
+// `invocationId`) on every resume. The join therefore comes from the roster's
+// authoritative `invocationIds` (the server's persisted invocation→thread map) and
+// never from content: two identical sibling delegations are indistinguishable by
+// agent/task text, and a wrong merge would mix two agent threads. When a payload
+// does not send the list, the board keeps only joins it already observed while the
+// single slots still named them, and otherwise leaves the invocation as detail.
+//
 // Cross-references:
 //   - persistent threads (roster, routing, strip): src/frontend/ui/threads.ts
 //   - tool cards: src/frontend/ui/tools.ts
@@ -455,8 +464,8 @@ export type TurnBoard = {
     // Focus one persistent thread (S2), in this order:
     //   1. a visible turn of that thread -> expand its NEWEST turn;
     //   2. a nested invocation entry whose runtime identity matches the roster
-    //      (`invocationId`/`originInvocationId`) -> show that child conversation,
-    //      collapsing every other PERSISTENT child conversation;
+    //      (`invocationId`/`originInvocationId`/historical `invocationIds`) -> show
+    //      that child conversation, collapsing every other PERSISTENT child one;
     //   3. roster-only (a runtime child with no turn yet) -> show its recorded
     //      transcript from `SessionThread.messages`.
     // Returns false only when the id is unknown to both the turns and the roster.
@@ -1003,10 +1012,18 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // Authoritative roster (S2/S6). Used for canonical labels, for resolving a
     // child invocation to its persistent id, and for a roster-only transcript.
     let roster: readonly SessionThreadEntry[] = [];
+    // DURABLE invocation → persistent-thread cache (R3), BOARD-scoped so a session
+    // switch can drop it (`bindSession`) instead of letting one session's invocation
+    // ids resolve against another's roster. Each tile writes here from
+    // `persistentIdOf` whenever the roster names its invocation; the authoritative
+    // source is still the roster's `invocationIds`, which needs no cache. The cache
+    // only preserves a join for an OLD payload whose roster advanced the single
+    // invocation slots without sending the historical list.
+    const learnedThreads = new Map<string, string>();
     // The roster-only conversation surface (a runtime child with no turn of its own).
     let focusPanel: HTMLElement | undefined;
 
-    // --- conversation projection (T12b) --------------------------------
+    // --- conversation projection (T12b, revised for the one-card rule) ---
     //
     // A persistent thread is ONE conversation, even though the server records one
     // `SessionTurn` per RUN (a continuation, a steered submit that became a queued
@@ -1015,25 +1032,80 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // thread stays its own top-level `.turn-row`. The tiles (and therefore
     // `blocks()`, timing, status and references) are untouched: only their DOM
     // parent changes, so grouping can never renumber a result block.
+    //
+    // ONE VISIBLE CARD (R2): the `.conversation` container IS the card. styles.css
+    // gives it the border/radius/agent outline and neutralises the inner `.tile`
+    // frames, so a follow-up submitted to a focused thread appends a sequential
+    // exchange INSIDE the same block instead of opening a second bordered tile
+    // (which is what the previous projection did: one card per run, stacked under a
+    // wrapper). A distinct sibling thread still gets its own card (R3).
     const conversationHosts = new Map<string, HTMLElement>();
 
     const conversationHost = (threadId: string): HTMLElement => {
         const existing = conversationHosts.get(threadId);
         if (existing !== undefined) return existing;
 
+        // The section is the VISIBLE card of a persistent thread (styles.css), not a
+        // transparent grouping wrapper: it carries the frame and the identity tone.
         const host = el('section', 'conversation');
         host.dataset.threadId = threadId;
         conversationHosts.set(threadId, host);
         return host;
     };
 
-    // A CONVERSATION container for a thread. A runtime CHILD thread belongs to the
-    // conversation that owns it (roster `ownerThreadId`), so its continuation turn
-    // is nested inside the owner's conversation instead of becoming a second
-    // top-level row. A user-created thread has no owner and is its own root.
-    // The conversation container a tile currently lives in (undefined for a legacy
-    // standalone turn). Expansion and focus follow the CONTAINER, not the thread id,
-    // because a child conversation shares its owner's container.
+    // Paint the card with the identity of its FIRST exchange. The tile already paints
+    // `--agent-*` / `data-agent` when its root section names the agent
+    // (ui/agent-color.ts `paintAgentColor`), so the card outline is the conversation's
+    // own tone; an unnamed conversation falls back to the neutral default instead of
+    // inheriting whatever the last painted block left behind.
+    const paintConversationAgent = (host: HTMLElement): void => {
+        const lead = [...host.children].find(
+            (node): node is HTMLElement => node instanceof HTMLElement && node.classList.contains('turn-row')
+        );
+        paintAgentColor(host, lead?.querySelector<HTMLElement>('.tile')?.dataset.agent);
+    };
+
+    // The exchange surface of a nested CHILD conversation card. A child thread is
+    // spawned inside its parent's turn as a `.thread-row` keyed by the invocation;
+    // once the roster joins it to the persistent id the row is marked with
+    // `data-persistent-thread` (see `paintPersistentMarkers`). A CONTINUATION of that
+    // child is a real turn of its OWN thread and belongs inside that card — not as a
+    // sibling `.turn-row` under the owner conversation, which made a resumed child
+    // read as a second block. Returns the card's flow so the exchange lands after the
+    // child's recorded transcript, exactly like a root conversation card.
+    const childExchangeHost = (threadId: string): HTMLElement | undefined => {
+        // Iterate instead of escaping the id into a selector: runtime thread ids are
+        // opaque and may contain quotes/percent signs.
+        for (const row of element.querySelectorAll<HTMLElement>('.thread-row')) {
+            if (row.dataset.persistentThread !== threadId) continue;
+
+            const flow = row.querySelector<HTMLElement>(':scope > .thread-tile > .thread-body > .thread-flow');
+            if (flow !== null) return flow;
+        }
+
+        return undefined;
+    };
+
+    // Chronological order INSIDE one card (a conversation host or a nested child
+    // card's flow). `placeTurn` re-appends a row on every reconcile, and a live
+    // snapshot can list a continuation BEFORE its owner (or re-place an earlier
+    // exchange), so without this pass the card could show its messages out of order.
+    // Only the turn rows move; a child card's own transcript/tool nodes stay ahead.
+    const orderRows = (flow: HTMLElement): void => {
+        const rows = [...flow.children].filter(
+            (node): node is HTMLElement => node instanceof HTMLElement && node.classList.contains('turn-row')
+        );
+        const positionOf = (node: HTMLElement): number =>
+            turns.findIndex((turn) => turn.element.parentElement === node);
+
+        rows.sort((left, right) => positionOf(left) - positionOf(right));
+        for (const node of rows) flow.append(node);
+    };
+
+    // The conversation CARD a tile currently lives in (undefined for a legacy
+    // standalone turn, and for a continuation routed into a nested child card).
+    // Expansion and focus follow the CONTAINER, not the thread id, because a child
+    // conversation without its own card shares its owner's container.
     const hostOfTurn = (turn: TurnHandle): HTMLElement | undefined => {
         const row = turn.element.parentElement;
         const host = row?.parentElement;
@@ -1068,13 +1140,36 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         if (row === null) return;
 
         const threadId = turn.threadId();
+
+        // 1. A continuation of a CHILD conversation lands inside that child's own
+        //    nested card (see `childExchangeHost`), so a resumed child keeps ONE card
+        //    with sequential exchanges instead of gaining a sibling tile under its
+        //    owner. Guarded against a card that lives inside THIS tile: appending the
+        //    row into its own subtree would tear the DOM apart.
+        const exchange = threadId === undefined ? undefined : childExchangeHost(threadId);
+        if (exchange !== undefined && !turn.element.contains(exchange)) {
+            if (row.parentElement !== exchange) exchange.append(row);
+            delete row.dataset.childThread;
+            row.dataset.threadExchange = threadId;
+            orderRows(exchange);
+            reorderBoard();
+            return;
+        }
+
         const hostId = threadId === undefined ? undefined : hostThreadIdOf(threadId);
         const host = hostId === undefined ? undefined : conversationHost(hostId);
         if (host === undefined) {
             if (row.parentElement !== element) element.append(row);
             delete row.dataset.childThread;
+            delete row.dataset.threadExchange;
         } else {
             if (row.parentElement !== host) host.append(row);
+            delete row.dataset.threadExchange;
+
+            // RECORDED order inside the card. A live snapshot can list the
+            // continuation before its owner (or re-place an earlier exchange), and a
+            // blind `append` would then show the follow-up above the first prompt.
+            orderRows(host);
 
             // A child CONVERSATION is visually nested in its owner, marking the row
             // so CSS can indent it without a generic `.thread-row` wrapper.
@@ -1088,6 +1183,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 (node): node is HTMLElement => node instanceof HTMLElement && node.classList.contains('turn-row')
             );
             grouped.forEach((node, index) => node.classList.toggle('is-continuation', index > 0));
+
+            // The card owns the frame, so its identity tone follows the FIRST exchange.
+            paintConversationAgent(host);
         }
 
         reorderBoard();
@@ -1097,6 +1195,21 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         if (expandedTurn === turn && hostId !== undefined) {
             conversationHost(hostId).classList.add('is-expanded');
         }
+    };
+
+    // The board-direct ancestor of a row: the top-level unit this pass may move.
+    // Walking up (rather than assuming `row.parentElement`) is what keeps a row
+    // routed into a NESTED card from hoisting its `.thread-flow` out of the card —
+    // the unit is then the turn row that owns the card, which is already placed.
+    const topLevelOf = (node: HTMLElement): HTMLElement | undefined => {
+        let cursor: HTMLElement | undefined = node;
+        // `parentElement === null` also ends the walk: a freshly created conversation
+        // card is DETACHED until this pass appends it, and stopping early would leave
+        // it out of the board while its exchanges were already inside it.
+        while (cursor !== undefined && cursor.parentElement !== null && cursor.parentElement !== element) {
+            cursor = cursor.parentElement;
+        }
+        return cursor === element ? undefined : cursor;
     };
 
     // Restore deterministic top-level order: first appearance of each conversation
@@ -1111,8 +1224,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
             // A legacy/standalone turn is its own top-level unit; a grouped turn's
             // unit is its conversation container. Never append `.turns` into itself.
-            const container = row.parentElement === element ? row : row.parentElement;
-            if (container === null || container === element) continue;
+            const container = topLevelOf(row);
+            if (container === undefined) continue;
             if (seen.has(container)) continue;
 
             seen.add(container);
@@ -1123,6 +1236,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // surviving groups mark their first exchange as the header so removing the
         // original run never leaves a continuation wearing the conversation label.
         for (const [threadId, host] of [...conversationHosts]) {
+            // Ordering first: the "first exchange is the header" rule below must be
+            // applied to RECORDED order, not to whatever order the nodes arrived in.
+            orderRows(host);
             const grouped = [...host.children].filter(
                 (node): node is HTMLElement => node instanceof HTMLElement && node.classList.contains('turn-row')
             );
@@ -1134,6 +1250,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             }
 
             grouped.forEach((node, index) => node.classList.toggle('is-continuation', index > 0));
+            // The first exchange may have learned its agent AFTER the placement that
+            // painted the card (the start frame can arrive later), so repaint it here:
+            // the card outline follows the conversation, not the `:root` fallback.
+            paintConversationAgent(host);
         }
 
         for (const node of [...element.querySelectorAll<HTMLElement>(':scope > .notice')]) {
@@ -1141,12 +1261,64 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
     };
 
+    // Re-run the projection for EVERY turn. A nested child card only becomes
+    // addressable once it is painted with its persistent id (roster join), which can
+    // happen after its continuation was already placed; hydration/reconcile order must
+    // never decide whether a resumed child lands in its own card. Called from the
+    // per-turn projection when a card appears or is re-keyed (see `createThread` and
+    // `adoptPlaceholder`) and on every roster update.
+    //
+    // The joins themselves come from the persistent markers (`persistentIdOf`, i.e.
+    // the authoritative roster: `id`, `invocationId`, `originInvocationId`,
+    // `invocationIds`) — NOT from content. A task-text match would be a guess that
+    // cannot separate two identical sibling delegations, so it is deliberately absent.
+    const placeAllTurns = (): void => {
+        for (const turn of turns) placeTurn(turn);
+        reorderBoard();
+    };
+
     const notifyFocus = (): void => options.onFocusChange?.(focusedThreadId);
+
+    // Cards THIS focus opened automatically, so ending the focus closes only them
+    // (a card the reader opened by hand is their own state, not ours to collapse).
+    const openedCards: HTMLElement[] = [];
+
+    // Open every NESTED card that contains this turn's row. A continuation routed
+    // into a child card (see `placeTurn`) is only visible while that card is open, so
+    // focusing a resumed child would otherwise show an "expanded" turn nobody can see.
+    // The reader can still collapse the card afterwards; this only guarantees the
+    // focused exchange is not hidden by an ancestor's collapsed body.
+    const openEnclosingCards = (turn: TurnHandle): void => {
+        let host = turn.element.parentElement?.closest<HTMLElement>('.thread-row') ?? null;
+
+        while (host !== null) {
+            if (!host.classList.contains('is-expanded') && !openedCards.includes(host)) openedCards.push(host);
+
+            host.classList.add('is-expanded');
+            host.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-select')?.setAttribute(
+                'aria-expanded',
+                'true'
+            );
+            // Continue from the card's ROW, not the card body: the next enclosing
+            // card (a grandparent invocation) is an ancestor of the row.
+            host = host.parentElement?.closest<HTMLElement>('.thread-row') ?? null;
+        }
+    };
 
     // Detach the expanded TILE without touching focus state (used when focus moves
     // to a child conversation or to a roster-only panel: only ONE persistent
     // conversation may be open at a time).
     const detachTileExpansion = (): void => {
+        // Cards opened only to reveal a focused exchange are closed with it; the tile
+        // itself is a separate surface and is handled below.
+        for (const card of openedCards.splice(0)) {
+            card.classList.remove('is-expanded');
+            card.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-select')?.setAttribute(
+                'aria-expanded',
+                'false'
+            );
+        }
+
         if (expandedTurn === undefined) return;
 
         expandedTurn.element.classList.remove('is-expanded');
@@ -1335,6 +1507,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
         turn.element.classList.add('is-expanded');
         turn.element.querySelector<HTMLButtonElement>('.tile-select')?.setAttribute('aria-expanded', 'true');
+        // R3: a continuation routed into a nested child card lives inside that card's
+        // body, so the card has to be open for the expanded exchange to be visible.
+        openEnclosingCards(turn);
         // T12b: expansion is a CONVERSATION state. Mark the group so every exchange
         // (owner runs and nested child continuations) is visible; all others close.
         const threadId = turn.threadId();
@@ -1373,8 +1548,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
         // 2. A delegated/forked child has no turn of its own: its work is recorded
         //    inside the parent's events. Focus it by the runtime identity the roster
-        //    joins (`invocationId`/`originInvocationId`). The board is only touched
-        //    once a match exists: an unknown id must be a NO-OP, never a collapse.
+        //    joins (`invocationId`/`originInvocationId`, or the historical
+        //    `invocationIds` list). The board is only touched once a match exists: an
+        //    unknown id must be a NO-OP, never a collapse.
         for (const candidate of turns) {
             if (!candidate.knowsThread(threadId)) continue;
 
@@ -1483,13 +1659,18 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // the server assigns the id. The full id stays in `data-thread-id`/`title`.
         const threadBadge = el('span', 'tile-thread');
         threadBadge.hidden = true;
-        // R3: no `#ordinal` span. The header group is the metadata cluster
-        // (`thread | elapsed | tokens | status`); the turn's protocol `index` is
-        // bound for ordering/identity but never displayed. The thread badge leads
-        // the cluster (it is identity, not a measurement) and is hidden whenever the
-        // turn has no persistent thread.
-        top.append(threadBadge, blockMeta.elapsed, blockMeta.tokens, badge);
-        select.append(tileAgent, top, promptPreview, meta);
+        // R3: no `#ordinal` span. The metadata cluster is `elapsed | tokens | status`
+        // (measurements only); the turn's protocol `index` is bound for
+        // ordering/identity but never displayed.
+        top.append(blockMeta.elapsed, blockMeta.tokens, badge);
+        // R1: the thread IDENTITY leads the header, exactly like a nested entry's
+        // `.thread-name` leads `.thread-select`. The badge used to sit inside the
+        // right-aligned metadata cluster, which put the conversation name beside the
+        // clock/tokens instead of left of them. DOM order puts it before the agent
+        // code/prompt; styles.css pins `order: 0` so the compact row (CSS-ordered) and
+        // the expanded column agree. It is hidden whenever the turn has no persistent
+        // thread, and `.tile-agent` disappears when it would repeat the same label.
+        select.append(threadBadge, tileAgent, top, promptPreview, meta);
 
         const body = el('div', 'tile-body');
         body.id = `${id}-body`;
@@ -2010,15 +2191,74 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // one is ephemeral invocation detail and keeps the old independent expand.
         let focusedChildKey: string | undefined;
 
-        const persistentIdOf = (entry: ThreadEntry): string | undefined => {
-            const match = roster.find(
+        // DURABLE invocation → persistent-thread association (R3).
+        //
+        // The authoritative join is the roster's `invocationIds` — the server's
+        // persisted invocation→thread map, which names the ORIGINAL delegated run AND
+        // every resume, so a fresh hydration can bind a historical card exactly. The
+        // board-level `learnedThreads` cache covers a payload that predates that field:
+        // an association established while the roster still named the invocation
+        // (`invocationId`/`originInvocationId`) is REMEMBERED, so a later roster frame
+        // that advanced those slots can only ADD joins, never silently subtract a true
+        // one. Nothing here infers a join from task text: two identical sibling
+        // delegations would be indistinguishable, and a wrong merge is worse than an
+        // invocation-only card.
+        //
+        // Invalidation is explicit: a NON-EMPTY roster that no longer lists the thread
+        // is evidence of deletion (`forgetRemovedThreads`), and a SESSION SWITCH drops
+        // the whole cache (see `bindSession`) so one session's invocation ids can never
+        // resolve to another's conversation. An empty/absent roster is not evidence of
+        // anything and never erases a known identity.
+
+        // The ONE roster conversation that claims `key`, or undefined. A card key is
+        // either a persistent thread id (a ROOT entry) or an invocation id, and the
+        // roster names an invocation through three exact sources: the latest run
+        // (`invocationId`), the thread's first turn (`originInvocationId`) and the
+        // HISTORICAL `invocationIds` list — only the last one still names the original
+        // delegated run after the child was resumed.
+        //
+        // UNIQUENESS IS REQUIRED. A correct server maps an invocation id to exactly one
+        // conversation; a payload that names it twice is ambiguous, and merging the
+        // card into either one could mix two agent threads (two identical sibling
+        // delegations are the realistic case). Then: no claim.
+        const rosterClaimOf = (key: string): SessionThreadEntry | undefined => {
+            const direct = roster.find((candidate) => candidate.id === key);
+            if (direct !== undefined) return direct;
+
+            const claims = roster.filter(
                 (candidate) =>
-                    candidate.id === entry.key ||
-                    candidate.invocationId === entry.key ||
-                    candidate.originInvocationId === entry.key
+                    candidate.invocationId === key ||
+                    candidate.originInvocationId === key ||
+                    candidate.invocationIds?.includes(key) === true
             );
 
-            return match?.id;
+            return claims.length === 1 ? claims[0] : undefined;
+        };
+
+        const persistentIdOf = (entry: ThreadEntry): string | undefined => {
+            const claim = rosterClaimOf(entry.key);
+            if (claim !== undefined) {
+                // Remember the join while the roster still names it: this card's key
+                // never changes, the roster's invocation fields do.
+                learnedThreads.set(entry.key, claim.id);
+                return claim.id;
+            }
+
+            // Ambiguous, or not named at all: keep only what was learned while the
+            // roster was unambiguous. Never guess (in particular, never from task text).
+            return learnedThreads.get(entry.key);
+        };
+
+        // Drop associations whose THREAD the roster no longer lists. A non-empty
+        // roster enumerates every host conversation, so an absent id means the
+        // conversation was deleted (and its turns with it); an empty roster is a
+        // payload without the list, not a deletion signal.
+        const forgetRemovedThreads = (): void => {
+            if (roster.length === 0) return;
+
+            for (const [key, persistent] of [...learnedThreads]) {
+                if (!roster.some((candidate) => candidate.id === persistent)) learnedThreads.delete(key);
+            }
         };
 
         // R8: repaint one entry's visible label. The conversation label replaces
@@ -2381,13 +2621,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // R8: a nested invocation shows its child CONVERSATION label when the
             // roster already joins this invocation id; only a legacy/threadless
             // block falls back to the allocator (and therefore consumes a number).
+            // The SAME claim `persistentIdOf` uses (including the historical
+            // `invocationIds` list), so the header label and the conversation marker
+            // can never disagree about one card.
             const conversationLabel = ((): string | undefined => {
-                const match = roster.find(
-                    (candidate) =>
-                        candidate.id === options.key ||
-                        candidate.invocationId === options.key ||
-                        candidate.originInvocationId === options.key
-                );
+                const match = rosterClaimOf(options.key);
                 return match === undefined ? undefined : threadNameOf(match);
             })();
             reserveConversationLabel(conversationLabel);
@@ -2490,6 +2728,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // roster before this turn was replayed), so mark the persistent identity
             // immediately instead of waiting for the next `setThreads`.
             paintPersistentMarkers();
+            // This card may now be the surface a continuation turn of the SAME child
+            // thread belongs to (R3), so re-project the board: an already-placed
+            // continuation must move into the card it just gained.
+            placeAllTurns();
             updateMeta();
             return entry;
         };
@@ -2664,6 +2906,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // adoption the roster can join the CHILD conversation, so repaint its
             // stable label (`RR5`) and persistent marker now.
             paintPersistentMarkers();
+            // R3: the re-key can make this card the addressable surface of a child
+            // thread that already has a continuation turn placed elsewhere.
+            placeAllTurns();
             // R1: an adopted entry inherits the reader's expansion for its canonical
             // key (the placeholder was created under the synthesized key).
             if (expandedThreads.has(entry.key)) setThreadExpanded(entry, true);
@@ -3883,6 +4128,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // whose thread the roster no longer lists is collapsed here, which is how a
         // deletion clears a child focus without any local guesswork.
         const refreshThreadRoster = (): void => {
+            // Prune FIRST: a conversation the roster dropped is deleted, while an
+            // invocation id that merely ADVANCED (`inv-5` -> `inv-6`) keeps its join.
+            forgetRemovedThreads();
             paintThreadBadge();
             paintPersistentMarkers();
             // T12b/T12d: a steer addressed to a child may have arrived before its
@@ -3962,9 +4210,19 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             turn.element.parentElement?.remove();
         }
         turns.length = 0;
+        // F2: the focus-owned expansion list must not outlive the rows. `clear` is the
+        // one teardown that does NOT run `detachTileExpansion`, so without this the
+        // array kept references to the cards it had opened (detached nodes for the
+        // whole life of the next board) and a later focus change would walk them.
+        openedCards.length = 0;
         // A cleared board starts a new numbering (hydrate re-creates the tiles in
         // recorded order, so the conversation's labels are rebuilt exactly).
         labelCounters.clear();
+        // R3: the remembered invocation → thread joins belong to the conversation
+        // being torn down. Keeping them would let an invocation id of the NEXT
+        // session resolve to a thread of the previous one (ids are opaque and only
+        // unique per session).
+        learnedThreads.clear();
         // T12b: the conversation containers are structural, not turn-owned; drop
         // every shell so a rebuild starts from a clean board.
         for (const host of conversationHosts.values()) host.remove();
@@ -4144,8 +4402,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // Project each tile into its conversation container (T12b). `placeTurn`
         // appends/moves existing rows, so no tile is rebuilt and its events,
         // references and timers survive; the final call also drops empty groups.
-        for (const turn of next) placeTurn(turn);
-        reorderBoard();
+        // The durable invocation joins come from the roster (`invocationIds`), which
+        // `setThreads` repaints before this pass runs (R3).
+        placeAllTurns();
         renderCrossSteers();
 
         // --- focus preservation (S1) ---------------------------------------
@@ -4209,8 +4468,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         );
 
         // A child conversation may be listed before its owner; settle ownership
-        // grouping only after every adopted tile knows its thread id.
-        for (const handle of handles) placeTurn(handle);
+        // grouping only after every adopted tile knows its thread id. The durable
+        // invocation joins (R3) are already painted: the roster's `invocationIds`
+        // names the historical delegated run, so `adopt`'s own projection bound the
+        // card before this pass routes the continuations.
+        placeAllTurns();
         renderCrossSteers();
 
         const kept = keepId === undefined ? undefined : handles.find((handle) => handle.id() === keepId);
@@ -4242,7 +4504,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // A real session switch: the next reconciled content belongs to a different
         // conversation, so its newest surface may be opened once (see `reconcile`).
         // A first binding (undefined -> id) is the conversation already on screen.
-        if (boundSession !== undefined && sessionId !== undefined) pendingFirstFocus = true;
+        if (boundSession !== undefined && sessionId !== undefined) {
+            pendingFirstFocus = true;
+            // R3: invocation ids are unique per SESSION only, so a remembered join from
+            // the conversation being left must not resolve an invocation of the new
+            // one. The new session's roster (`invocationIds`) re-establishes every join
+            // it can prove; anything else stays an invocation-only card.
+            learnedThreads.clear();
+        }
 
         for (const record of answerCards.values()) {
             if (record.session === undefined) {
@@ -4265,10 +4534,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const setThreads = (entries: readonly SessionThreadEntry[]): void => {
         roster = [...entries];
 
-        // A roster can reveal that a thread is a CHILD of another (ownerThreadId):
-        // move its continuation into the owner's conversation and re-label it.
-        for (const turn of turns) placeTurn(turn);
+        // A roster can reveal that a thread is a CHILD of another (ownerThreadId) and
+        // can JOIN an invocation entry to its persistent id — including a HISTORICAL
+        // one through `invocationIds` (R3), so a resumed child's card keeps its
+        // conversation. The markers must be painted BEFORE the projection runs:
+        // `placeTurn` routes a child continuation by `data-persistent-thread`, so
+        // projecting on stale markers would park it under the owner instead of inside
+        // its own card.
         for (const turn of turns) turn.refreshThreadRoster();
+        placeAllTurns();
 
         if (focusedThreadId === undefined) return;
 

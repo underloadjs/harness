@@ -43,6 +43,11 @@ type ThreadFixture = {
     sequence: number;
     label?: string;
     invocationId?: string;
+    // The server's persisted invocation roster (oldest first), the authoritative
+    // join for a card whose original invocation id the single slot no longer names.
+    invocationIds?: string[];
+    // A runtime CHILD thread names the conversation that owns it.
+    ownerThreadId?: string;
 };
 
 const message = (agent: string, content: string) => ({
@@ -80,13 +85,13 @@ const snapshot = (
 
 // A host-thread run's recorded frames: metadata-only thread identity, exactly the
 // shape the runtime emits (no parent/callId/kind/branch).
-const hostEvents = (invocation: string, input: string, answer: string): HarnessEvent[] => [
-    { type: 'start', agent: 'researcher', model: 'm1', thread: { id: invocation, input } } as HarnessEvent,
-    { type: 'text', agent: 'researcher', delta: answer, thread: { id: invocation } } as HarnessEvent,
+const hostEvents = (invocation: string, input: string, answer: string, agent = 'researcher'): HarnessEvent[] => [
+    { type: 'start', agent, model: 'm1', thread: { id: invocation, input } } as HarnessEvent,
+    { type: 'text', agent, delta: answer, thread: { id: invocation } } as HarnessEvent,
     {
         type: 'done',
-        agent: 'researcher',
-        message: message('researcher', answer),
+        agent,
+        message: message(agent, answer),
         thread: { id: invocation }
     } as HarnessEvent
 ];
@@ -240,6 +245,17 @@ it('keeps an idle submission INSIDE the open RR2 conversation', async () => {
     expect(
         [...roots[0].querySelectorAll<HTMLElement>('.turn-prompt')].map((node) => node.textContent?.trim())
     ).toEqual(['first prompt', 'test']);
+    // R2: ONE card. The container is the visible block (styles.css keeps the frame
+    // there and drops it from the exchanges); the first exchange is the header and
+    // the follow-up is an ordered continuation of it.
+    expect(roots[0].querySelectorAll(':scope > .turn-row > .tile')).toHaveLength(2);
+    expect(
+        [...roots[0].querySelectorAll<HTMLElement>(':scope > .turn-row')].map((row) =>
+            row.classList.contains('is-continuation')
+        )
+    ).toEqual([false, true]);
+    // R1: the thread identity leads the header of the card.
+    expect(roots[0].querySelector('.tile-select')?.firstElementChild?.className).toBe('tile-thread');
     expect([...roots[0].querySelectorAll<HTMLElement>('.agent-text')].map((node) => node.textContent)).toEqual([
         'first answer\n',
         'second answer\n'
@@ -341,9 +357,18 @@ it('opens a new unfocused submit as an independent RR4 conversation', async () =
         'thread-3'
     ]);
 
-    // Explicit unfocus (the "New thread" control), then submit.
-    byClass('.thread-strip-unfocus', 'button').click();
+    // Explicit unfocus. The `.thread-strip-unfocus` band is gone (ui/threads.ts no
+    // longer builds `.thread-strip*`), so the remaining "New thread" gesture is the
+    // tile-header collapse: clicking `.tile-select` of the ALREADY-EXPANDED tile runs
+    // ui/turns.ts `collapse` (line ~1527), which sets `explicitUnfocus = true`.
+    const expanded = document.querySelector<HTMLElement>('.tile.is-expanded');
+    if (expanded === null) throw new Error('missing element .tile.is-expanded');
+    const unfocus = expanded.querySelector<HTMLButtonElement>('.tile-select');
+    if (unfocus === null) throw new Error('missing element .tile-select');
+    unfocus.click();
     await flush();
+    // The visible statement of "unfocused": the routing line offers a new thread.
+    expect(byClass('.composer-target', 'p').textContent).toBe('New thread');
     composerSubmit('new conversation');
     await flush();
     await flush();
@@ -358,4 +383,126 @@ it('opens a new unfocused submit as an independent RR4 conversation', async () =
     const rr4 = conversations()[3];
     expect(rr4.querySelector('.tile-thread')?.textContent).toBe('RR4');
     expect(rr4.querySelectorAll(':scope > .turn-row')).toHaveLength(1);
+});
+
+it('keeps a focused CHILD follow-up inside that child card', async () => {
+    // Owner run delegates to `helper` (runtime invocation `inv-child`, joined by the
+    // roster to the persistent conversation `thread-child`).
+    const owner = turn({
+        id: 'turn-1',
+        index: 0,
+        prompt: 'owner',
+        status: 'running',
+        threadId: 'thread-1',
+        threadLabel: 'RR1',
+        events: [
+            { type: 'start', agent: 'researcher', model: 'm1', thread: { id: 'inv-1', input: 'owner' } },
+            {
+                type: 'tool_call',
+                agent: 'researcher',
+                call: {
+                    id: 'd1',
+                    name: 'agentDelegate',
+                    arguments: JSON.stringify({ agent: 'helper', input: 'child task' })
+                }
+            },
+            {
+                type: 'start',
+                agent: 'helper',
+                model: 'm1',
+                thread: { id: 'inv-child', parentId: 'inv-1', callId: 'd1', input: 'child task' }
+            }
+        ] as HarnessEvent[]
+    });
+    const childFollowUp = turn({
+        id: 'turn-2',
+        index: 1,
+        prompt: 'child follow-up',
+        status: 'running',
+        threadId: 'thread-child',
+        threadLabel: 'HL1',
+        events: hostEvents('inv-child-2', 'child follow-up', 'child answer', 'helper')
+    });
+
+    // The roster is part of EVERY session snapshot (the server reports it with the
+    // turn list), and it carries the invocation → persistent-thread join the board
+    // needs to place the child's own card.
+    const threads: ThreadFixture[] = [
+        {
+            id: 'thread-1',
+            agent: 'researcher',
+            origin: 'host',
+            status: 'running',
+            sequence: 1,
+            label: 'RR1',
+            invocationId: 'inv-1'
+        },
+        {
+            id: 'thread-child',
+            agent: 'helper',
+            origin: 'host',
+            status: 'idle',
+            sequence: 2,
+            label: 'HL1',
+            ownerThreadId: 'thread-1',
+            invocationId: 'inv-child',
+            // The server's persisted invocation roster for this conversation. It is
+            // what keeps the card joined once the single slot advances.
+            invocationIds: ['inv-child']
+        }
+    ];
+
+    const stub = stubServer(
+        snapshot({ status: 'running', turns: [owner], threads }),
+        () => ({
+            // The POST answer reports the state AFTER the child ran: the runtime moves
+            // `invocationId` to the continuation run (src/harness.ts:4536), so the
+            // original delegated `inv-child` is no longer the current slot. It survives
+            // in the roster's historical `invocationIds` (src/server/sessions.ts
+            // `invocationIdsOf`), which is the authoritative join the refresh must use —
+            // otherwise the follow-up is ejected out of the card.
+            session: snapshot({
+                status: 'running',
+                turns: [owner, childFollowUp],
+                threads: threads.map((entry) =>
+                    entry.id === 'thread-child'
+                        ? { ...entry, invocationId: 'inv-child-2', invocationIds: ['inv-child', 'inv-child-2'] }
+                        : entry
+                )
+            }),
+            turn: childFollowUp
+        })
+    );
+
+    await mount();
+
+    // Focus the child through its nested card, then submit: the shell sends the
+    // child's persistent id, so the server records a REAL turn of that thread.
+    const childCard = document.querySelector<HTMLElement>('.thread-row[data-persistent-thread="thread-child"]');
+    childCard?.querySelector<HTMLButtonElement>('.thread-select')?.click();
+    await flush();
+    composerSubmit('child follow-up');
+    await flush();
+    await flush();
+
+    expect(stub.initial.turns.map((entry) => entry.id)).toEqual(['turn-1', 'turn-2']);
+
+    // ONE top-level card (the owner) and ONE child card — no second `.turn-row`
+    // under the owner for the child's follow-up.
+    const cards = conversations();
+    expect(cards).toHaveLength(1);
+    expect(cards[0].dataset.threadId).toBe('thread-1');
+    expect(cards[0].querySelectorAll(':scope > .turn-row')).toHaveLength(1);
+    expect(cards[0].querySelector('.tile-prompt')?.textContent).toBe('owner');
+    expect(document.querySelectorAll('.thread-row')).toHaveLength(1);
+    expect(cards[0].querySelector('.turn-row[data-child-thread]')).toBeNull();
+
+    // The follow-up is an exchange INSIDE the child's own card, with its answer.
+    const exchanges = [...document.querySelectorAll<HTMLElement>('.thread-flow > .turn-row')];
+    expect(
+        exchanges.map((row) => [row.dataset.threadExchange, row.querySelector('.tile-prompt')?.textContent])
+    ).toEqual([['thread-child', 'child follow-up']]);
+    expect(exchanges[0].querySelector('.agent-text')?.textContent).toBe('child answer\n');
+    // Focus stays on the child conversation it continued.
+    expect(byClass('.composer-target', 'p').textContent).toBe('Continuing HL1');
 });
