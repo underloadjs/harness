@@ -13,6 +13,7 @@ import {
     REFERENCED_RESULTS_BUDGET_MESSAGE,
     REFERENCED_RESULTS_FOOTER,
     REFERENCED_RESULTS_HEADER,
+    agentLabelParts,
     boundAgentResultContent,
     collectAgentLabelCounters,
     composeAgentResultPrompt,
@@ -477,6 +478,73 @@ describe('reference lookup', () => {
     });
 });
 
+describe('conversation labels (R8)', () => {
+    // A host-thread run carries a metadata-only thread frame on every event. It is
+    // the TURN'S conversation, not a child, so its root block takes the turn's
+    // persistent label and never mints an extra occurrence.
+    const hostTurn = (id: string, threadLabel: string, content: string): AgentResultTurn => ({
+        id,
+        status: 'done',
+        threadLabel,
+        events: [
+            { type: 'start', agent: 'Researcher', model: 'scripted/test', thread: { id: `inv-${id}`, input: id } },
+            { type: 'text', agent: 'Researcher', delta: content, thread: { id: `inv-${id}` } },
+            { type: 'done', agent: 'Researcher', thread: { id: `inv-${id}` }, message: assistant(content) }
+        ]
+    });
+
+    it('reuses the conversation label across runs instead of numbering invocations', () => {
+        const turns = [hostTurn('turn-1', 'RR2', 'first'), hostTurn('turn-2', 'RR2', 'second')];
+
+        expect(
+            listAgentResultBlocks(turns).map((block) => `${block.label}:${block.threadId ?? 'root'}:${block.content}`)
+        ).toEqual(['RR2:root:first', 'RR2:root:second']);
+        // Typed `#RR2` resolves the latest response of that SAME conversation.
+        expect(findLatestAgentResultBlock(turns, '#RR2')?.content).toBe('second');
+    });
+
+    it('names a nested child block with the CHILD conversation label', () => {
+        const turn: AgentResultTurn = {
+            id: 'turn-4',
+            status: 'done',
+            threadLabel: 'RR4',
+            threadLabels: { 'inv-child': 'RR5' },
+            events: [
+                { type: 'start', agent: 'Researcher', model: 'scripted/test', thread: { id: 'inv-root', input: 'go' } },
+                {
+                    type: 'tool_call',
+                    agent: 'Researcher',
+                    thread: { id: 'inv-root' },
+                    call: {
+                        id: 'call_1',
+                        name: 'agentDelegate',
+                        arguments: '{"agent":"Helper","input":"child"}'
+                    }
+                },
+                {
+                    type: 'start',
+                    agent: 'Helper',
+                    model: 'scripted/test',
+                    thread: { id: 'inv-child', parentId: 'inv-root', callId: 'call_1', input: 'child' }
+                },
+                {
+                    type: 'done',
+                    agent: 'Helper',
+                    thread: { id: 'inv-child', parentId: 'inv-root', callId: 'call_1' },
+                    message: assistant('child answer')
+                },
+                { type: 'tool_result', agent: 'Researcher', name: 'agentDelegate', callId: 'call_1', content: 'ok', isError: false },
+                { type: 'done', agent: 'Researcher', thread: { id: 'inv-root' }, message: assistant('root answer') }
+            ]
+        };
+
+        expect(listAgentResultBlocks([turn]).map((block) => `${block.label}:${block.threadId ?? 'root'}`)).toEqual([
+            'RR4:root',
+            'RR5:inv-child'
+        ]);
+    });
+});
+
 describe('parseAgentReferenceLabels', () => {
     it('extracts only exact label tokens, unique and in order', () => {
         expect(
@@ -800,5 +868,157 @@ describe('host-thread root routing', () => {
                 content: 'found it'
             }
         ]);
+    });
+});
+
+
+// T14 (R8-R10): a conversation label is authoritative AND RESERVES its ordinal.
+//
+// The server records one stable label per persistent conversation (`RR4`) and the
+// projector chains ONE per-code allocator across the turns. Adopting the label
+// without reserving its number meant a nested block of the same code could be
+// minted the very number the conversation already showed (`PE1` root + `PE1`
+// child), and `collectAgentLabelCounters` did not report conversation labels at
+// all, so the server's durable counters drifted from what the UI displayed.
+describe('agentLabelParts', () => {
+    it('splits a normalised label into code and positive ordinal', () => {
+        // Uppercase spelling, the code, and the ordinal as a NUMBER.
+        expect(agentLabelParts('RR1')).toEqual({ label: 'RR1', code: 'RR', ordinal: 1 });
+        // The composer's typed spelling is normalised before parsing.
+        expect(agentLabelParts(' #it1 ')).toEqual({ label: 'IT1', code: 'IT', ordinal: 1 });
+        // The neutral fallback code is a label like any other.
+        expect(agentLabelParts('ag12')).toEqual({ label: 'AG12', code: 'AG', ordinal: 12 });
+    });
+
+    it('rejects a zero ordinal and anything that is not a label', () => {
+        // An ordinal is a COUNT: `RR0` can never be minted, so a persisted `RR0` is
+        // corruption rather than a name.
+        expect(agentLabelParts('RR0')).toBeUndefined();
+        // Leading zeros are preserved in the TEXT and parsed as the same number.
+        expect(agentLabelParts('RR01')).toEqual({ label: 'RR01', code: 'RR', ordinal: 1 });
+
+        expect(agentLabelParts('1234')).toBeUndefined();
+        expect(agentLabelParts('intro')).toBeUndefined();
+        expect(agentLabelParts('T8')).toBeUndefined();
+        expect(agentLabelParts('')).toBeUndefined();
+        expect(agentLabelParts(7)).toBeUndefined();
+        expect(agentLabelParts(undefined)).toBeUndefined();
+    });
+});
+
+describe('explicit conversation labels reserve their ordinal', () => {
+    // A host conversation's ROOT frame carries its thread id and nothing else, so
+    // this turn's root block is the conversation itself.
+    const conversationTurn = (threadLabel: string, content: string): AgentResultTurn => ({
+        id: `turn-${threadLabel}`,
+        status: 'done',
+        threadLabel,
+        events: [
+            { type: 'start', agent: 'probe', model: 'scripted/test', thread: { id: '1' } },
+            { type: 'done', agent: 'probe', message: assistant(content), thread: { id: '1' } }
+        ]
+    });
+
+    it('adopts the recorded conversation label without minting a new number', () => {
+        const turn = conversationTurn('PE4', 'four');
+
+        // The label is authoritative: this block is the fourth conversation, not
+        // "the first block of a fresh allocator".
+        expect(listAgentResultBlocks([turn])).toEqual([
+            {
+                turnId: 'turn-PE4',
+                label: 'PE4',
+                agent: 'probe',
+                status: 'done',
+                content: 'four'
+            }
+        ]);
+
+        // ...but the number is CONSUMED: the next turn of the code starts at 5.
+        expect([...collectAgentLabelCounters([turn])]).toEqual([['PE', 4]]);
+    });
+
+    it('never gives a nested block of the same code the root conversation number', () => {
+        const turn: AgentResultTurn = {
+            id: 'turn-1',
+            status: 'done',
+            // Root conversation PE1; the nested child uses the SAME agent id code.
+            threadLabel: 'PE1',
+            events: [
+                { type: 'start', agent: 'probe', model: 'scripted/test', thread: { id: '1' } },
+                {
+                    type: 'start',
+                    agent: 'probe',
+                    model: 'scripted/test',
+                    thread: { id: 'thread-9', parentId: '1', input: 'nested' }
+                },
+                {
+                    type: 'done',
+                    agent: 'probe',
+                    message: assistant('nested answer'),
+                    thread: { id: 'thread-9', parentId: '1' }
+                },
+                { type: 'done', agent: 'probe', message: assistant('root answer'), thread: { id: '1' } }
+            ]
+        };
+
+        // PE1 is reserved by the root, so the child is minted PE2 — a duplicate PE1
+        // would make a typed `#PE1` ambiguous.
+        expect(listAgentResultBlocks([turn])).toEqual([
+            {
+                turnId: 'turn-1',
+                label: 'PE1',
+                agent: 'probe',
+                status: 'done',
+                content: 'root answer'
+            },
+            {
+                turnId: 'turn-1',
+                threadId: 'thread-9',
+                label: 'PE2',
+                agent: 'probe',
+                status: 'done',
+                content: 'nested answer'
+            }
+        ]);
+
+        expect([...collectAgentLabelCounters([turn])]).toEqual([['PE', 2]]);
+    });
+
+    it('chains the reservation across turns in both orders', () => {
+        const labelled = conversationTurn('PE1', 'first');
+        const legacy: AgentResultTurn = {
+            id: 'turn-legacy',
+            status: 'done',
+            events: [
+                { type: 'start', agent: 'probe', model: 'scripted/test' },
+                { type: 'done', agent: 'probe', message: assistant('legacy answer') }
+            ]
+        };
+
+        // Conversation first, legacy block after: the legacy block is PE2.
+        expect(listAgentResultBlocks([labelled, legacy]).map((block) => block.label)).toEqual([
+            'PE1',
+            'PE2'
+        ]);
+
+        // Legacy block first (PE1), then a conversation recorded as PE3: both keep
+        // their numbers and the high-water is the labelled ordinal.
+        const late = conversationTurn('PE3', 'third');
+        expect(listAgentResultBlocks([legacy, late]).map((block) => block.label)).toEqual([
+            'PE1',
+            'PE3'
+        ]);
+        expect([...collectAgentLabelCounters([legacy, late])]).toEqual([['PE', 3]]);
+
+        // The exact lookup still resolves the legacy block by the number its
+        // position in the chain gives it.
+        expect(findAgentResultBlock([labelled, legacy], { turnId: 'turn-legacy', label: 'PE2' })).toEqual({
+            turnId: 'turn-legacy',
+            label: 'PE2',
+            agent: 'probe',
+            status: 'done',
+            content: 'legacy answer'
+        });
     });
 });

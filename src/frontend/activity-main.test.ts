@@ -69,11 +69,23 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(selector: string, tag: K
     return found;
 };
 
+// R11 (T5): the agent deck now lives inside the shared agent dialog, so deck reads
+// open it from the composer's single agent button (a no-op once open; chrome
+// rebuilds refresh the content in place and keep it painted from the live set).
+const openDeck = (): void => {
+    if (document.querySelector('.dialog') !== null) return;
+    byClass('.agent-control-button', 'button').click();
+};
+
 // `data-activity` and `aria-busy` per tile, in member order.
-const tileActivity = (): (string | undefined)[] =>
-    [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.dataset.activity);
-const tileBusy = (): (string | null)[] =>
-    [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.getAttribute('aria-busy'));
+const tileActivity = (): (string | undefined)[] => {
+    openDeck();
+    return [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.dataset.activity);
+};
+const tileBusy = (): (string | null)[] => {
+    openDeck();
+    return [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.getAttribute('aria-busy'));
+};
 
 type Controlled = {
     response: Response;

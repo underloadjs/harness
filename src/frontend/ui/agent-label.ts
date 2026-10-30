@@ -21,5 +21,5 @@
 //     sections) and writes them into block headers;
 //   - ui/agent-color.ts `agentKeyOf` — shared identity normalisation.
 
-export { createAgentLabels } from '../../shared/agent-results';
+export { agentCodeOf, createAgentLabels } from '../../shared/agent-results';
 export type { AgentLabels } from '../../shared/agent-results';

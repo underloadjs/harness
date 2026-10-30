@@ -47,21 +47,36 @@ const blockOf = (selector: string): string => {
     throw new Error(`unbalanced block for ${selector}`);
 };
 
-it('lays the action inside a positioned field wrapper', () => {
-    // R10: the wrapper is the positioning context; without `position: relative`
-    // the action would fly to the viewport corner and duplicate the old footer.
+it('keeps the send action and the agent control INSIDE one field frame', () => {
+    // R10/R11 (T5): the field wrapper is the visible frame (border/background) AND
+    // the positioning context for the @/# popup. Without `min-width: 0` the frame
+    // could not shrink and the controls would be pushed out of the page.
     const field = blockOf('.composer-field {');
     expect(field).toContain('position: relative');
     expect(field).toContain('display: flex');
+    expect(field).toContain('align-items: flex-end');
     expect(field).toContain('flex: 1');
     expect(field).toContain('min-width: 0');
+    expect(field).toContain('border: 1px solid var(--border-strong)');
+    expect(field).toContain('border-radius: 8px');
 
-    // The action is anchored bottom-right INSIDE that wrapper in every state.
+    // The right-hand control row is a FLOW child of the frame, wraps internally and
+    // never escapes the border.
+    const controls = blockOf('.composer-controls {');
+    expect(controls).toContain('display: flex');
+    expect(controls).toContain('flex-wrap: wrap');
+    expect(controls).toContain('justify-content: flex-end');
+    expect(controls).toContain('flex: 0 0 auto');
+
+    // The action is no longer absolutely positioned over the text: it is a sibling
+    // of the agent button inside `.composer-controls`, so it cannot drift outside the
+    // input frame.
     const action = blockOf('.composer-action {');
-    expect(action).toContain('position: absolute');
-    expect(action).toContain('right: 8px');
-    expect(action).toContain('bottom: 8px');
+    expect(action).not.toContain('position: absolute');
+    expect(action).not.toContain('right: 8px');
+    expect(action).not.toContain('bottom: 8px');
     expect(action).toContain('display: inline-flex');
+    expect(action).toContain('flex: 0 0 auto');
     expect(action).toContain('width: 28px');
     expect(action).toContain('height: 28px');
     expect(action).toContain('border-radius: 999px');
@@ -70,7 +85,7 @@ it('lays the action inside a positioned field wrapper', () => {
     const hidden = blockOf('.composer-action[hidden] {');
     expect(hidden).toContain('display: none');
 
-    // Stop shares the spot but reads as outlined, not as the primary submit.
+    // Stop reads as outlined, not as the primary submit.
     const stop = blockOf(".composer-action[data-action='stop'] {");
     expect(stop).toContain('background: transparent');
     expect(stop).toContain('border-color: var(--border-strong)');
@@ -87,17 +102,21 @@ it('makes the chat field one row by default, auto-grown and scrolling at the cap
     const base = blockOf('.composer-input {');
     expect(base).toContain('max-height: 200px');
 
-    // R9/T15: the empty height is ONE line box + the compact padding + border
-    // (13.5 * 1.45 = 19.575 + 12 + 2 => 34px); the script owns every height above it.
+    // R9/T15: the empty height is ONE line box + compact padding
+    // (13.5 * 1.45 = 19.575 + 12 => ~32px); the script owns every height above it.
     const field = blockOf('.composer-field .composer-input {');
-    expect(field).toContain('width: 100%');
-    expect(field).toContain('min-height: 34px');
+    expect(field).toContain('flex: 1');
+    expect(field).toContain('min-width: 0');
+    expect(field).toContain('min-height: 32px');
     expect(field).not.toContain('min-height: 40px');
     expect(field).not.toContain('min-height: 54px');
-    // R7/T15 compact inset: 6px vertical, 8px left. The right gutter clears the
-    // in-field action (right 8px + 28px wide + ~8px gap => 44px), not the removed
-    // attachment button; text must still never run under the glyph.
-    expect(field).toContain('padding: 6px 44px 6px 8px');
+    // R9/R10: the text column is borderless and shares the frame with the control
+    // row. It reserves no overlay gutter — the controls are flow siblings, so text
+    // can never run under the send glyph.
+    expect(field).toContain('border: 0');
+    expect(field).toContain('background: transparent');
+    expect(field).toContain('padding: 6px 4px 6px 8px');
+    expect(field).not.toContain('padding: 6px 44px 6px 8px');
     expect(field).not.toContain('padding: 10px 52px 10px 12px');
     // The script measures the content; a manual handle would fight it.
     expect(field).toContain('resize: none');

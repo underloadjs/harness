@@ -2191,7 +2191,13 @@ Two identities exist and must never be conflated:
   Its id changes on every run and it is what a `#` reference binds to.
 - `SessionTurn.threadId` and `SessionSnapshot.threads[]` = ONE persistent runtime
   conversation. Its id is stable for the thread's life, and repeated turns of it
-  are the same conversation (one badge `T3`, one strip row).
+  are the same conversation (one badge `RR2`, one strip row). R8: the id is opaque;
+  the DISPLAY name is `<agent code><per-agent conversation ordinal>` (`RR1`, `RR2`,
+  …; `IT1` for Instruct), allocated once per CONVERSATION by the server and re-used
+  by every run/steer/continuation. It is carried on `SessionTurn.threadLabel` and
+  `SessionThread.label`, never minted per invocation. A host-thread ROOT frame has a
+  metadata-only `thread` record (no parent/callId/kind/branch): it belongs to the
+  tile's root block and must never render as an indented `T<n>` wrapper.
 
 `src/frontend/ui/threads.ts` owns the decisions; `main.ts` owns the POSTs and the
 DOM. The contract it is written against is optional/additive, so a server that does
@@ -2241,12 +2247,27 @@ not send `threads`/`threadId` renders exactly the old UI (`sessionThreadsOf` →
   conversation — not what other histories were told, not what it wrote to shared
   memory (todos/profiles/chapters/locations), and not a result a connected thread
   already received.
+- **One conversation, many runs (T12b).** The server keeps one `SessionTurn` per run,
+  but the board projects every turn of one `threadId` into ONE top-level
+  `.conversation` container (`ui/turns.ts` `placeTurn`/`reorderHosts`), in recorded
+  order. Idle continuations and steered prompts therefore extend the SAME RR2
+  conversation instead of adding a second top-level tile; only the first exchange
+  shows the conversation label. A legacy turn without a thread stays its own row. A
+  roster `ownerThreadId` nests a child conversation's continuation inside its
+  owner (still focusable by id); agent-spawned invocation rows remain the only
+  indented `.thread-row` entries. `blocks()` is per turn and unchanged, so `#`
+  result bindings survive grouping. Expanding a conversation opens every exchange;
+  exactly one conversation is open at a time.
 - **Steering answers with the owner.** A running target may return the OWNING turn
   (same id), so `run()` discards its optimistic steering tile and merges the record
   into the existing tile (`view.discard`). Without that, an unbound queued ghost
-  would survive every later snapshot as "pending".
+  would survive every later snapshot as "pending". The owner's `steers` audit is
+  rendered as a visible `.turn-steer` user message INSIDE that tile (R9), in record
+  order, so steering both replies and shows the typed text in the same conversation.
 - **Strip actions.** One row per roster entry in `sequence` order; the label is the
-  server `label` or `T{sequence}`. The far-right `×` is `stop` while running (POST
+  server conversation label (`RR2`/`IT1`). A legacy row without one derives the
+  same agent-prefixed shape from roster order — there is no `T{sequence}` wrapper.
+  The far-right `×` is `stop` while running (POST
   `.../threads/:id/cancel`, single-flight per row) and `delete` when idle/stopped
   (DELETE, two clicks: the first only arms, with a 4 s window and a distinct
   `aria-label`). Pending row state clears when the authoritative roster moves on, so
@@ -2270,11 +2291,14 @@ not send `threads`/`threadId` renders exactly the old UI (`sessionThreadsOf` →
   its draft snapshot (N3, silently — the failure notice stays), keeping the surviving
   text/attachment draft intact; labels of surviving blocks are kept by the snapshot's
   per-turn `labelSeeds`.
-- **Labels (S6).** `threadLabelOf` is the ONE display identity: the roster's label
-  or `T{sequence}`, `T?` when the roster does not describe the id (never digits
-  parsed from the opaque id). It titles both the strip row and the tile badge, and
-  the badge title carries the agent. The strip lists HOST threads only: an
-  `origin: 'agent'` default conversation gets no stop/delete affordance.
+- **Labels (S6/R8).** `threadLabelOf` is the ONE display identity: the roster's
+  agent-prefixed conversation label (`RR2`) or an agent-prefixed fallback for a
+  legacy row, `T?` only when the roster does not describe the id (never digits
+  parsed from the opaque id). It titles the strip row, the tile badge, the root
+  block header and a `#` reference. The strip lists HOST threads only: an
+  `origin: 'agent'` default conversation gets no stop/delete affordance. A deleted
+  conversation's ordinal is retired (the server keeps a per-code high-water), so a
+  later conversation never reuses `RR3`.
 - **Keyboard (S4).** The strip restores the focused control (focus button, action,
   or unfocus) across every repaint — including the armed delete button — and its
   hit targets are at least 24px. The unfocus control lives outside the `<ul>` (S5).

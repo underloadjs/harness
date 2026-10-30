@@ -302,7 +302,7 @@ it('keeps a live turn that an older snapshot no longer lists (N2)', async () => 
         })
     ]);
     await mount();
-    expect(target()).toBe('Steering T1');
+    expect(target()).toBe('Steering IT1');
 
     // A NEWER turn of another conversation arrives live.
     stub.emit('s2', {
@@ -330,7 +330,7 @@ it('keeps a live turn that an older snapshot no longer lists (N2)', async () => 
     expect(tiles().map((tile) => tile.dataset.turnId)).toEqual(['turn-1', 'turn-2']);
     expect(tiles().map((tile) => tile.dataset.state)).toEqual(['streaming', 'streaming']);
     expect(document.querySelector('.tile.is-expanded')?.getAttribute('data-turn-id')).toBe('turn-1');
-    expect(target()).toBe('Steering T1');
+    expect(target()).toBe('Steering IT1');
 });
 
 it('does not restore a # chip whose target was deleted while the submit was in flight (N3)', async () => {
@@ -346,7 +346,7 @@ it('does not restore a # chip whose target was deleted while the submit was in f
         { holdTasks: true }
     );
     await mount();
-    expect(target()).toBe('Continuing T1');
+    expect(target()).toBe('Continuing IT1');
 
     // A real reference chip binding turn-1, plus surviving text after it.
     const input = byClass('.composer-input', 'div');

@@ -40,7 +40,11 @@ const rules = css.replace(/\/\*[\s\S]*?\*\//g, '');
 // Slice a rule/at-rule body by brace matching, so a nested `@media` block cannot be
 // cut short by the first `}`.
 const blockOf = (selector: string): string => {
-    const start = rules.indexOf(selector);
+    // Anchor to a TOP-LEVEL selector at the start of a line. A plain `indexOf`
+    // also matches the same class name inside a longer descendant selector (e.g.
+    // the dialog runner's `.dialog-body > … > .log-wrap`), which would return that
+    // rule's body and hide the base declaration this test is pinning.
+    const start = rules.indexOf(`\n${selector}`);
     if (start < 0) throw new Error(`missing selector ${selector}`);
 
     const open = rules.indexOf('{', start);

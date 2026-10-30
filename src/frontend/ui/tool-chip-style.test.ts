@@ -61,6 +61,88 @@ it('hides verbose summary pieces while the chip is closed', () => {
     expect(blockOf('.tool-body {')).toContain('gap: 8px');
 });
 
+it('fills the dialog height with the result pane instead of leaving a blank tail', () => {
+    // R12 dialog sizing: the shell is content-sized with a viewport cap, and the
+    // tool body is the flex chain that distributes that height. `min-height: 0`
+    // lets each level shrink so the result block scrolls internally rather than
+    // keeping the card's fixed 300px and exposing empty space beneath it.
+    const body = blockOf('.dialog-body > .tool-body {');
+    expect(body).toContain('flex: 1 1 auto');
+    expect(body).toContain('min-height: 0');
+    expect(body).toContain('padding: 0');
+
+    // Arguments are capped relative to the viewport and do not shrink: a long
+    // result must not collapse this pane below its label.
+    const argsSection = blockOf('.dialog-body > .tool-body > .tool-section:first-child {');
+    expect(argsSection).toContain('flex: 0 0 auto');
+    expect(blockOf('.dialog-body > .tool-body > .tool-section:first-child > .code-block {')).toContain(
+        'max-height: min(32vh, 280px)'
+    );
+
+    // The result section and its code block take the remaining height. The
+    // `max-height: none` is the dialog-only override of `.tool-result .code-block`.
+    const resultSection = blockOf('.dialog-body > .tool-body > .tool-section:last-child {');
+    expect(resultSection).toContain('flex: 1 1 auto');
+    // A short viewport scrolls `.dialog-body` rather than collapsing the result.
+    expect(resultSection).toContain('min-height: 96px');
+    expect(blockOf('.dialog-body > .tool-body > .tool-section:last-child > .tool-result {')).toContain(
+        'flex-direction: column'
+    );
+    const result = blockOf('.dialog-body > .tool-body > .tool-section:last-child > .tool-result > .code-block {');
+    expect(result).toContain('flex: 1 1 auto');
+    expect(result).toContain('min-height: 0');
+    expect(result).toContain('max-height: none');
+});
+
+it('sizes the ACTUAL manual-runner dialog chain, not the chip body path', () => {
+    // F3: the manual runner is built by main.ts as
+    //   .dialog-body > .tool-runner-slot > .pane > .log-wrap > .log > .tool-card
+    // and has NO `.tool-body` child. Its own chain must fill the dialog and let
+    // `.tool-output > .card-body` take the remaining height.
+    const wrap = blockOf(
+        '.dialog-body > .tool-runner-slot > .pane > .log-wrap {'
+    );
+    expect(wrap).toContain('display: flex');
+    expect(wrap).toContain('flex: 1 1 auto');
+    expect(wrap).toContain('min-height: 0');
+    expect(wrap).toContain('padding: 0');
+
+    const log = blockOf(
+        '.dialog-body > .tool-runner-slot > .pane > .log-wrap > .log {'
+    );
+    expect(log).toContain('display: flex');
+    expect(log).toContain('flex-direction: column');
+    expect(log).toContain('max-width: none');
+
+    const card = blockOf(
+        '.dialog-body > .tool-runner-slot > .pane > .log-wrap > .log > .tool-card {'
+    );
+    expect(card).toContain('flex: 1 1 auto');
+    expect(card).toContain('min-height: 0');
+
+    // Only the result grows; the notes/schema/arguments/Call controls keep their
+    // intrinsic height.
+    expect(
+        blockOf(
+            '.dialog-body > .tool-runner-slot > .pane > .log-wrap > .log > .tool-card > :not(.tool-output) {'
+        )
+    ).toContain('flex: 0 0 auto');
+
+    const output = blockOf(
+        '.dialog-body > .tool-runner-slot > .pane > .log-wrap > .log > .tool-card > .tool-output {'
+    );
+    expect(output).toContain('display: flex');
+    expect(output).toContain('flex: 1 1 auto');
+    expect(output).toContain('min-height: 96px');
+
+    const body = blockOf(
+        '.dialog-body > .tool-runner-slot > .pane > .log-wrap > .log > .tool-card > .tool-output > .card-body {'
+    );
+    expect(body).toContain('flex: 1 1 auto');
+    expect(body).toContain('min-height: 0');
+    expect(body).toContain('max-height: none');
+});
+
 it('colours the tool name by state, keeping running neutral', () => {
     expect(blockOf('.tool-name {')).toContain('color: var(--text)');
     expect(blockOf(".tool[data-state='ok'] .tool-name {")).toContain('color: var(--ok)');

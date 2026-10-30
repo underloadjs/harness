@@ -85,7 +85,8 @@ describe('persistent thread identity on tiles (S6)', () => {
         const labelled = board.begin('b', [], 'thread-2');
         const unknown = board.begin('c', [], 'thread-999');
 
-        expect(badgeOf(sequenced.element)?.textContent).toBe('T7');
+        // R8: an unlabeled roster row shows its agent-prefixed fallback, never `T7`.
+        expect(badgeOf(sequenced.element)?.textContent).toBe('WR7');
         expect(badgeOf(labelled.element)?.textContent).toBe('Research');
         expect(badgeOf(unknown.element)?.textContent).toBe('T?');
         expect(badgeOf(unknown.element)?.title).toBe('Thread thread-999');
@@ -330,7 +331,7 @@ describe('persistent child conversations (S2)', () => {
         expect(board.expanded()).toBeUndefined();
         const panel = board.element.querySelector<HTMLElement>('.thread-focus-panel');
         expect(panel?.dataset.threadId).toBe('thread-child');
-        expect(panel?.querySelector('.thread-focus-owner')?.textContent).toBe('owned by T1');
+        expect(panel?.querySelector('.thread-focus-owner')?.textContent).toBe('owned by WR1');
         // Markdown rendering ends a paragraph with a newline; the text is exact.
         expect(panel?.querySelector('.thread-focus-text')?.textContent?.trim()).toBe('child answer');
     });

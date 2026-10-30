@@ -1058,3 +1058,123 @@ describe('R3b durable harness database', () => {
         expect(doomedBefore.id).toBe(doomed.id);
     });
 });
+
+// T14/F4: a persisted conversation label is AUTHORITATIVE display state, so it must
+// be a label this server can actually emit. A blank/lowercase/zero-ordinal/free-text
+// value (for example a global creation ordinal such as `T8`) would otherwise be
+// adopted as a conversation name and break `#LABEL` resolution, so the load fails
+// loudly — exactly like any other structural corruption, and without touching the
+// file. A valid value is normalised to the allocator's uppercase spelling.
+describe('durable conversation labels (T14)', () => {
+    type StoredDocument = {
+        version: number;
+        savedAt: number;
+        registry: unknown[];
+        sessions: {
+            id: string;
+            threadLabels?: Record<string, string>;
+            threadLabelHighWater?: Record<string, number>;
+            turns: { id: string; threadLabel?: string }[];
+        }[];
+    };
+
+    // One persisted session that owns exactly ONE host conversation (RR1), so every
+    // case below has a real thread id and a real recorded turn label to tamper with.
+    const persistOneConversation = async (label: string): Promise<{
+        root: string;
+        threadId: string;
+        turnId: string;
+    }> => {
+        const root = tempRoot(label);
+        const runtime = runtimeOf(root, [liveScriptedPreset('researcher')]);
+        const id = runtime.store.create('researcher').id;
+        const task = runtime.store.enqueue(id, 'one');
+        await task.settled;
+        await runtime.store.waitForIdle(id);
+        runtime.store.dispose();
+
+        const threadId = task.turn.threadId;
+        if (threadId === undefined) throw new Error('the persisted submit opened no conversation');
+        return { root, threadId, turnId: task.turn.id };
+    };
+
+    const readDocument = (root: string): StoredDocument =>
+        JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as StoredDocument;
+
+    const writeDocument = (root: string, document: StoredDocument): void => {
+        fs.writeFileSync(stateFile(root), JSON.stringify(document, null, 2), 'utf8');
+    };
+
+    it('normalises a valid conversation label and its recorded turn label', async () => {
+        const { root, threadId } = await persistOneConversation('labels-normalise');
+        const document = readDocument(root);
+
+        // Lowercase is the client/typing spelling: the durable contract is the
+        // allocator's uppercase label, so both copies are normalised on load.
+        document.sessions[0].threadLabels = { [threadId]: 'rr1' };
+        document.sessions[0].turns[0].threadLabel = 'rr1';
+        writeDocument(root, document);
+
+        const database = new HarnessPersistence(root).load();
+        const session = database?.sessions[0];
+        if (session === undefined) throw new Error('the document did not load');
+
+        expect(session.threadLabels).toEqual({ [threadId]: 'RR1' });
+        expect(session.turns[0].threadLabel).toBe('RR1');
+    });
+
+    it('rejects a label the allocator can never emit', async () => {
+        const { root, threadId } = await persistOneConversation('labels-reject');
+        const document = readDocument(root);
+
+        // A global creation ordinal is NOT a conversation label (R10), and `RR0` is
+        // not an occurrence the allocator can mint.
+        for (const bad of ['T8', 'RR0', '']) {
+            const tampered = readDocument(root);
+            tampered.sessions[0].threadLabels = { [threadId]: bad };
+            writeDocument(root, tampered);
+
+            expect(() => new HarnessPersistence(root).load()).toThrow(
+                `sessions[0].threadLabels.${threadId} must be a conversation label such as "RR1".`
+            );
+        }
+
+        // The original document is untouched by a failed load: the file still holds
+        // the tampered text, and restoring valid content loads again.
+        writeDocument(root, document);
+        expect(new HarnessPersistence(root).load()?.sessions[0].threadLabels).toEqual({
+            [threadId]: 'RR1'
+        });
+    });
+
+    it('rejects a blank conversation key and a malformed recorded turn label', async () => {
+        const { root, threadId } = await persistOneConversation('labels-turn');
+        const document = readDocument(root);
+
+        // A blank thread id could never be addressed by a client.
+        document.sessions[0].threadLabels = { '   ': 'RR1' };
+        writeDocument(root, document);
+        expect(() => new HarnessPersistence(root).load()).toThrow(
+            'sessions[0].threadLabels has a blank thread id key.'
+        );
+
+        // The per-turn copy is validated the same way, so a hand edit cannot smuggle
+        // an arbitrary display name past the session-level map.
+        const turnTampered = readDocument(root);
+        turnTampered.sessions[0].threadLabels = { [threadId]: 'RR1' };
+        turnTampered.sessions[0].turns[0].threadLabel = 'T8';
+        writeDocument(root, turnTampered);
+        expect(() => new HarnessPersistence(root).load()).toThrow(
+            'sessions[0].turns[0].threadLabel must be a conversation label such as "RR1".'
+        );
+
+        // A turn WITHOUT the field is a valid old record: the key stays absent.
+        const noField = readDocument(root);
+        delete noField.sessions[0].turns[0].threadLabel;
+        writeDocument(root, noField);
+        const restored = new HarnessPersistence(root).load()?.sessions[0];
+        expect(restored?.turns[0].threadLabel).toBeUndefined();
+        // `toEqual` on the record proves the key is absent rather than empty.
+        expect(restored?.turns[0]).not.toHaveProperty('threadLabel');
+    });
+});

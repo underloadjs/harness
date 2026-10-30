@@ -52,7 +52,7 @@ import type {
 } from '../harness';
 import type { HarnessDescriptor, SessionStatus, SessionTurn } from './protocol';
 import { validateAttachments } from '../shared/attachments';
-import { readAgentResultReferenceList } from '../shared/agent-results';
+import { agentLabelParts, readAgentResultReferenceList } from '../shared/agent-results';
 
 // Bumped only when the on-disk document becomes incompatible. The core snapshot
 // carries its own version (HARNESS_SNAPSHOT_VERSION); this one gates the
@@ -123,7 +123,16 @@ export type HarnessSessionRecord = {
     // Highest label occurrence ever minted per code (tombstone high-water). Kept
     // when turns are deleted so a retired textual label is never re-minted for
     // different content — including after every turn carrying it is gone.
+    //
+    // T14: this is ONE of the two mirrored views of the single canonical label
+    // sequence (the other is `threadLabelHighWater`): every mint — a conversation
+    // name, a legacy `/messages` block or a nested block — raises BOTH, so a
+    // document that lost one map can still recover the ordinals from the other.
     labelHighWater?: Record<string, number>;
+    // R8: stable agent-prefixed conversation labels by thread id, plus the
+    // per-code high-water that keeps a deleted conversation's name retired.
+    threadLabels?: Record<string, string>;
+    threadLabelHighWater?: Record<string, number>;
     // Invocation id recorded by each THREAD turn's root run, keyed by turn id.
     // This is the join the snapshot roster exposes as originInvocationId; it lives
     // beside the turns so a restart keeps the mapping.
@@ -408,11 +417,34 @@ const readTurn = (value: unknown, label: string): SessionTurn => {
                   return value;
               })();
 
+    // R8: the conversation display label recorded WITH the turn (an old turn has
+    // none; the store derives it from the roster on demand). T14/F4: it must be a
+    // label this server can actually emit (two-letter code + POSITIVE ordinal) — a
+    // blank, lowercase, `RR0` or free-text value would be adopted as an authoritative
+    // display name and could break `#` resolution, so it fails the load like any
+    // other corruption. Old documents simply have no key.
+    const threadLabel =
+        record.threadLabel === undefined
+            ? undefined
+            : (() => {
+                  const value = requireString(record.threadLabel, `${label}.threadLabel`);
+                  const parts = agentLabelParts(value);
+
+                  if (parts === undefined) {
+                      throw new TypeError(
+                          `${label}.threadLabel must be a conversation label such as "RR1".`
+                      );
+                  }
+
+                  return parts.label;
+              })();
+
     return {
         id: requireString(record.id, `${label}.id`),
         index: requireNumber(record.index, `${label}.index`),
         prompt: requireString(record.prompt, `${label}.prompt`),
         ...(threadId === undefined ? {} : { threadId }),
+        ...(threadLabel === undefined ? {} : { threadLabel }),
         ...(references === undefined ? {} : { references }),
         ...(attachments === undefined ? {} : { attachments }),
         status: status as SessionTurn['status'],
@@ -461,6 +493,36 @@ const readStringMap = (value: unknown, label: string): Record<string, string> =>
     return mapped;
 };
 
+// Optional `threadId -> conversation label` map (R8). T14/F4: each value must be a
+// label the allocator can emit (two-letter code + positive ordinal) and each key a
+// non-blank thread id. Adopting an arbitrary string as a display name would let a
+// hand edit (or a foreign/global ordinal such as `T8`) become authoritative and
+// break `#LABEL` resolution, so a malformed entry fails the load instead. The value
+// is normalised to the allocator's uppercase spelling; duplicates ACROSS threads are
+// repaired deterministically by the store (the first owner keeps the name), not
+// rejected here, so a recoverable document still loads.
+const readLabelMap = (value: unknown, label: string): Record<string, string> => {
+    const record = requireRecord(value, label);
+    const mapped: Record<string, string> = {};
+
+    for (const [key, entry] of Object.entries(record)) {
+        if (key.trim().length === 0) {
+            throw new TypeError(`${label} has a blank thread id key.`);
+        }
+
+        const text = requireString(entry, `${label}.${key}`);
+        const parts = agentLabelParts(text);
+
+        if (parts === undefined) {
+            throw new TypeError(`${label}.${key} must be a conversation label such as "RR1".`);
+        }
+
+        mapped[key] = parts.label;
+    }
+
+    return mapped;
+};
+
 // Steered-submit audit records (R5/F3). Optional; each entry keeps the timestamp,
 // the user-facing text, and the result blocks whose content was injected. Bounded
 // so a long-running turn cannot grow its record without limit.
@@ -489,9 +551,23 @@ const readSteerRecords = (value: unknown, label: string): SessionTurn['steers'] 
                       }
                   })();
 
+        // T12b: optional child-conversation attribution for a steered submit.
+        const threadId =
+            record.threadId === undefined
+                ? undefined
+                : (() => {
+                      const value = requireString(record.threadId, `${at}.threadId`);
+                      if (value.trim().length === 0) {
+                          throw new TypeError(`${at}.threadId must not be blank.`);
+                      }
+
+                      return value;
+                  })();
+
         return {
             at: requireNumber(record.at, `${at}.at`),
             prompt: requireString(record.prompt, `${at}.prompt`),
+            ...(threadId === undefined ? {} : { threadId }),
             ...(references === undefined ? {} : { references })
         };
     });
@@ -599,6 +675,16 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
             ? undefined
             : readStringMap(record.invocationThreads, `${label}.invocationThreads`);
 
+    const threadLabels =
+        record.threadLabels === undefined
+            ? undefined
+            : readLabelMap(record.threadLabels, `${label}.threadLabels`);
+
+    const threadLabelHighWater =
+        record.threadLabelHighWater === undefined
+            ? undefined
+            : readCounterMap(record.threadLabelHighWater, `${label}.threadLabelHighWater`);
+
     return {
         id: requireString(record.id, `${label}.id`),
         harness: requireString(record.harness, `${label}.harness`),
@@ -617,6 +703,8 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
         ...(threadSequence === undefined ? {} : { threadSequence }),
         ...(labelSeeds === undefined ? {} : { labelSeeds }),
         ...(labelHighWater === undefined ? {} : { labelHighWater }),
+        ...(threadLabels === undefined ? {} : { threadLabels }),
+        ...(threadLabelHighWater === undefined ? {} : { threadLabelHighWater }),
         ...(turnInvocations === undefined ? {} : { turnInvocations }),
         ...(invocationThreads === undefined ? {} : { invocationThreads }),
         core: core as unknown as HarnessSnapshot,

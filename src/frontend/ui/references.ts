@@ -182,17 +182,93 @@ const escapeGlob = (value: string): string => value.replace(/([*?[\]{}])/g, '[$1
 //     directory) PLUS `**/src/frontend*` (the path itself / a file prefix). A bare
 //     `**/src/frontend*` alone matches NO descendant file because `*` never crosses
 //     a `/`, which was the T8 review finding.
+//   - drilled folder query (`src/`): `**/src/**` — picking a folder row types the
+//     trailing slash, so only that folder's descendants are candidates. Without
+//     this branch the slash would be stripped and `src` would fall back to the
+//     basename pattern, listing files NAMED *src* instead of files INSIDE src.
 //
 // Glob magic in the query is escaped so a search cannot widen the walk.
 export const fileGlobPattern = (query: string): string[] => {
     const trimmed = normalizeFileQuery(query);
+    // Read the trailing slash BEFORE normalizeFileQuery strips it (see above).
+    const drilling = query.trim().replace(/\\/g, '/').endsWith('/');
 
     if (trimmed.length === 0) return ['**/*'];
 
     const escaped = escapeGlob(trimmed);
+    if (drilling) return [`**/${escaped}/**`];
     if (!trimmed.includes('/')) return [`**/*${escaped}*`];
 
     return [`**/${escaped}*/**`, `**/${escaped}*`];
+};
+
+// --- @ folder rows -----------------------------------------------------------
+//
+// `fileGlob` only ever yields FILES (tools/files/glob.ts `walkFiles` recurses past
+// directories), so the one source of folder rows is `fileList`: it reads ONE
+// directory non-recursively and marks directories with a trailing slash.
+//
+// A typed @ query splits into the directory to read and the partial entry name:
+//   `@`         -> { directory: '.',     prefix: '' }     root overview
+//   `@src`      -> { directory: '.',     prefix: 'src' }  root entries starting with "src"
+//   `@src/`     -> { directory: 'src',   prefix: '' }     drilled into src
+//   `@src/fr`   -> { directory: 'src',   prefix: 'fr' }
+// The trailing slash is read before `normalizeFileQuery` drops it, because `@src/`
+// (drill down) and `@src` (name prefix) ask for different listings.
+export type FileQueryScope = {
+    directory: string;
+    prefix: string;
+};
+
+export const fileQueryScope = (query: string): FileQueryScope => {
+    // Same normalization as the glob/filter, minus the trailing-slash strip.
+    const raw = query.trim().replace(/\\/g, '/').replace(/^\.\/+/, '');
+    const normalized = normalizeFileQuery(query);
+
+    if (raw.endsWith('/')) {
+        return { directory: normalized.length === 0 ? '.' : normalized, prefix: '' };
+    }
+
+    const cut = normalized.lastIndexOf('/');
+    if (cut === -1) return { directory: '.', prefix: normalized };
+
+    const directory = normalized.slice(0, cut);
+    return { directory: directory.length === 0 ? '.' : directory, prefix: normalized.slice(cut + 1) };
+};
+
+// `fileList` answers `{ entries, ... }`; an error body / unconfigured tool answers
+// something else and contributes no folder rows.
+export const fileListEntriesOf = (result: unknown): string[] => {
+    if (typeof result !== 'object' || result === null) return [];
+
+    const entries = (result as { entries?: unknown }).entries;
+    if (!Array.isArray(entries)) return [];
+
+    return entries.filter((entry): entry is string => typeof entry === 'string');
+};
+
+// Immediate FOLDER rows for a scope. Entries arrive already prefixed with the
+// directory `fileList` read (`src/nested/`, or bare `nested/` for '.'), in the
+// tool's deterministic code-point order, and files never end with "/", so the
+// split is unambiguous. The typed prefix matches the entry NAME only
+// (case-insensitive, like `filterFilePathList`), never an ancestor directory.
+export const folderPathsOf = (entries: readonly string[], scope: FileQueryScope): string[] => {
+    const needle = scope.prefix.toLowerCase();
+    const folders: string[] = [];
+    const seen = new Set<string>();
+
+    for (const entry of entries) {
+        // A lone "/" is the filesystem root, not an entry of this scope.
+        if (!entry.endsWith('/') || entry.length <= 1) continue;
+        const name = fileDisplayName(entry.slice(0, -1)).toLowerCase();
+        if (!name.startsWith(needle)) continue;
+        if (seen.has(entry)) continue;
+
+        seen.add(entry);
+        folders.push(entry);
+    }
+
+    return folders;
 };
 
 // Defensive client filter for a result set. The server pattern already narrowed

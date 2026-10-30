@@ -347,7 +347,7 @@ it('stops a running thread from its far-right x, and deletes it after it stopped
 
     const stop = rowOf('thread-1').querySelector<HTMLButtonElement>('.thread-strip-action');
     expect(stop?.dataset.action).toBe('stop');
-    expect(stop?.getAttribute('aria-label')).toBe('Stop thread T1 of instruct');
+    expect(stop?.getAttribute('aria-label')).toBe('Stop thread IT1 of instruct');
     stop?.click();
     await flush();
     await flush();
@@ -359,7 +359,7 @@ it('stops a running thread from its far-right x, and deletes it after it stopped
     expect(remove?.dataset.action).toBe('delete');
     remove?.click();
     expect(rowOf('thread-1').querySelector('.thread-strip-action')?.getAttribute('aria-label')).toBe(
-        'Confirm delete thread T1 of instruct'
+        'Confirm delete thread IT1 of instruct'
     );
     expect(stub.threadDeletes).toEqual([]);
 
@@ -396,7 +396,7 @@ it('never resurrects a deleted thread from a late snapshot, turn or event (S3)',
     await mount();
 
     // Focus is thread-1 (the expanded turn) before the deletion.
-    expect(byClass('.composer-target', 'p').textContent).toBe('Steering T1');
+    expect(byClass('.composer-target', 'p').textContent).toBe('Steering IT1');
     expect(rows().map((row) => row.dataset.threadId)).toEqual(['thread-1', 'thread-child']);
 
     rowOf('thread-1').querySelector<HTMLButtonElement>('.thread-strip-action')?.click();

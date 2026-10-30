@@ -124,6 +124,13 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(selector: string, tag: K
     return found;
 };
 
+// T5 R11/R12: the agent deck now lives in the shared dialog, so deck/activity reads
+// open it from the composer's single agent button (idempotent once open).
+const openDeck = (): void => {
+    if (document.querySelector('.dialog') !== null) return;
+    byClass('.agent-control-button', 'button').click();
+};
+
 const host = (slot: 'scratch' | 'center' | 'left'): HTMLElement =>
     byClass(`.panel-host[data-slot="${slot}"]`, 'div');
 
@@ -200,6 +207,7 @@ it('keeps a legacy editable:false preset fully editable and never says read-only
     expect(document.querySelector('.harness-meta')?.textContent).not.toContain('editable');
 
     // The team row is genuinely editable: promotion, add, remove and model selects.
+    openDeck();
     expect(byClass('.agent-main', 'button').disabled).toBe(false);
     expect(byClass('.agent-add', 'button').disabled).toBe(false);
     expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
@@ -333,6 +341,7 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
     expect(document.querySelector('.scratch-note')?.textContent).toBe('1 tool panel for instruct.');
     // A settled turn's panel is valid scratch state, but it must not light the
     // agent ring: activity is derived only from a RUNNING turn.
+    openDeck();
     expect(document.querySelector('.agent-tile')?.dataset.activity).toBeUndefined();
 
     // Opening s2 replaces the board with that conversation's panels (no leakage
@@ -449,6 +458,7 @@ it('renders live tool_result.ui panels and keeps them across the terminal snapsh
     // lit because that is a separate, honest signal.
     expect(panelIds('scratch')).toEqual(['live']);
     expect(panelText('scratch')).toEqual(['running now']);
+    openDeck();
     expect(document.querySelector('.agent-tile')?.dataset.activity).toBe('active');
 
     push([{ type: 'snapshot', session: snapshot({ turns: [recorded] }) }]);
@@ -522,6 +532,7 @@ it('derives panels from a polled snapshot without replaying old activity', async
     expect(panelText('scratch')).toEqual(['from poll']);
     // The turn is still running, so the agent ring is legitimately active — panels
     // are not what lights it (activity comes from the turn's own events).
+    openDeck();
     expect(document.querySelector('.agent-tile')?.dataset.activity).toBe('active');
 
     // Hiding the page stops polling; the panel (a completed tool's output) is still
@@ -572,15 +583,32 @@ it('routes a manual tool result to the owner captured before the call', async ()
         'rail-section scratch-section'
     );
 
+    // Opening the Tools view shows ONLY the catalogue: nothing is auto-opened, so
+    // neither a dialog nor a runner exists until the reader activates an entry.
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(document.querySelector('.tool-args')).toBeNull();
+    expect(document.querySelector('.tool-card')).toBeNull();
+
+    // Activating the entry opens the shared modal; the runner is adopted inside
+    // `.dialog-body > .tool-runner-slot`, which is where the manual call is made.
+    byClass('.tool-tab-button[data-tool="publish"]', 'button').click();
+    await flush();
+
+    expect(document.querySelector('.dialog-title')?.textContent).toBe('publish');
+    expect(document.querySelectorAll('.dialog-body > .tool-runner-slot')).toHaveLength(1);
+    expect(document.querySelectorAll('.tool-runner-slot > .pane > .log-wrap > .log > .tool-card')).toHaveLength(1);
+
     byClass('.tool-args', 'textarea').value = '{}';
     document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.click();
 
     // The request is in flight; the reader moves to the OTHER harness before the
-    // answer lands. A manual call does not lock harness selection.
+    // answer lands. A manual call does not lock harness selection, and the harness
+    // switch closes the open tool dialog (the runner keeps the in-flight call).
     byClass('.harness-item[data-harness="beta"]', 'button').click();
     await flush();
     expect(document.querySelector('.main-title')?.textContent).toBe('Beta');
     expect(host('scratch').hidden).toBe(true);
+    expect(document.querySelector('.dialog')).toBeNull();
 
     answer?.(
         json({

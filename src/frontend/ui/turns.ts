@@ -123,7 +123,13 @@
 //     `turn` upsert BEFORE the 202 body is returned, so an observer frame can
 //     describe a turn whose optimistic tile is still unbound (`claim`).
 
-import type { HarnessEvent, HarnessUsage, SessionTurn, SessionTurnStatus } from '../../server/protocol';
+import type {
+    HarnessEvent,
+    HarnessUsage,
+    SessionSteerRecord,
+    SessionTurn,
+    SessionTurnStatus
+} from '../../server/protocol';
 import type {
     HarnessActionAnswer,
     HarnessActionChoice,
@@ -164,6 +170,11 @@ import { UNNAMED_AGENT_PLACEHOLDER, paintAgentColor } from './agent-color';
 // the board seeds each turn's allocator from the turns before it, so numbering is
 // deterministic on replay and unique across the conversation.
 import { createAgentLabels } from './agent-label';
+// T14 parity: the shared block projection RESERVES an explicit conversation label
+// in its allocator (root `turn.threadLabel` and child `threadLabels[id]`), so a
+// same-code fallback invocation continues AFTER it (`RR1` + child `RR2`) instead of
+// re-minting `RR1`. The board must consume the SAME parser and reservation rule.
+import { agentLabelParts } from '../../shared/agent-results';
 import type { AgentBlockDescriptor } from './references';
 import { markdownFragment, plainPreview } from './markdown';
 import { elapsedBetween, formatDuration } from './time';
@@ -174,7 +185,13 @@ import type { ToolCallCard, ToolState } from './tools';
 // `#` references: `SessionTurn.threadId` names the stable conversation a turn
 // belongs to, while `AgentBlockDescriptor.threadId` names one invocation. The two
 // must never be joined — see ui/threads.ts for both contracts.
-import { threadLabelOf, threadNameOf, threadTitleOf, turnThreadIdOf } from './threads';
+import {
+    threadLabelOf,
+    threadNameOf,
+    threadTitleOf,
+    turnThreadIdOf,
+    turnThreadLabelOf
+} from './threads';
 import type { SessionThreadEntry } from './threads';
 
 // Lifecycle of one user turn. `queued` and `waiting` are distinct on purpose:
@@ -321,6 +338,15 @@ export type TurnHandle = {
     // binding, display label, raw agent id, status and latest text. Empty while
     // the tile has no server id (an unbound optimistic tile cannot be referenced).
     blocks: () => AgentBlockDescriptor[];
+    // T12d F1: the steered-submit audit recorded on this turn, so the BOARD can
+    // route guidance to a child conversation that lives in an EARLIER turn.
+    steerAudit: () => readonly SessionSteerRecord[];
+    // Render one steer into THIS tile's target conversation when it owns it:
+    // `target` = this turn's own thread (or no target) -> root flow; `target` =
+    // a child invocation joined by this tile -> that child flow. Idempotent by
+    // `key`. False when this tile is not the target, so the board can try another
+    // turn or the roster-only panel. Never renders a child steer on the parent.
+    tryRenderSteer: (steer: SessionSteerRecord, sourceTurnId: string, key: string) => boolean;
     // Stop every timer the tile owns (elapsed tick, tool timers, pending text
     // frame). Called when the board clears or the page is hidden.
     destroy: () => void;
@@ -903,6 +929,28 @@ type ThreadEntry = {
 // wire value; the map keys are otherwise the runtime ids or synthesized keys.
 const ROOT_KEY = 'root';
 
+// T12d F1: one steer audit entry has a stable render key across local event-order
+// rendering, the board's cross-turn pass, and a rebuilt projection. It is stored on
+// the rendered node (`data-steer-key`) so rendering is idempotent without a second
+// board-level cache that could outlive the DOM.
+const steerKeyOf = (turnId: string, index: number): string => `${turnId}\u0000${index}`;
+
+const flowHasSteer = (flow: HTMLElement, key: string): boolean =>
+    [...flow.querySelectorAll<HTMLElement>('.turn-steer')].some((node) => node.dataset.steerKey === key);
+
+// The visible user-guidance surface. Shared by the tile flow (root/child invocation)
+// and the roster-only focus panel, so a steer reads the same wherever its target
+// conversation is shown.
+const createSteerNode = (steer: SessionSteerRecord, key: string): HTMLElement => {
+    const node = el('div', 'turn-steer');
+    node.dataset.steerKey = key;
+    node.append(el('span', 'turn-steer-role', 'you · steering'));
+    const body = el('div', 'turn-steer-text markdown');
+    body.append(markdownFragment(steer.prompt));
+    node.append(body);
+    return node;
+};
+
 // Terminal test for an invocation. A queued placeholder is not terminal: its
 // child has not answered yet.
 const isTerminalThread = (state: ThreadState): boolean =>
@@ -958,6 +1006,141 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // The roster-only conversation surface (a runtime child with no turn of its own).
     let focusPanel: HTMLElement | undefined;
 
+    // --- conversation projection (T12b) --------------------------------
+    //
+    // A persistent thread is ONE conversation, even though the server records one
+    // `SessionTurn` per RUN (a continuation, a steered submit that became a queued
+    // continuation, …). Every turn of the same `threadId` is projected into one
+    // top-level `.conversation` container, in recorded order; a legacy turn with no
+    // thread stays its own top-level `.turn-row`. The tiles (and therefore
+    // `blocks()`, timing, status and references) are untouched: only their DOM
+    // parent changes, so grouping can never renumber a result block.
+    const conversationHosts = new Map<string, HTMLElement>();
+
+    const conversationHost = (threadId: string): HTMLElement => {
+        const existing = conversationHosts.get(threadId);
+        if (existing !== undefined) return existing;
+
+        const host = el('section', 'conversation');
+        host.dataset.threadId = threadId;
+        conversationHosts.set(threadId, host);
+        return host;
+    };
+
+    // A CONVERSATION container for a thread. A runtime CHILD thread belongs to the
+    // conversation that owns it (roster `ownerThreadId`), so its continuation turn
+    // is nested inside the owner's conversation instead of becoming a second
+    // top-level row. A user-created thread has no owner and is its own root.
+    // The conversation container a tile currently lives in (undefined for a legacy
+    // standalone turn). Expansion and focus follow the CONTAINER, not the thread id,
+    // because a child conversation shares its owner's container.
+    const hostOfTurn = (turn: TurnHandle): HTMLElement | undefined => {
+        const row = turn.element.parentElement;
+        const host = row?.parentElement;
+
+        return host instanceof HTMLElement && host.classList.contains('conversation') ? host : undefined;
+    };
+
+    const hostThreadIdOf = (threadId: string): string => {
+        const seen = new Set<string>([threadId]);
+        let current = roster.find((candidate) => candidate.id === threadId)?.ownerThreadId;
+
+        while (current !== undefined && !seen.has(current)) {
+            // Nest under the nearest OWNED ancestor that already has a conversation
+            // container (or at least a turn). A link to a thread with no visible
+            // surface falls through to this conversation remaining top-level.
+            if (conversationHosts.has(current) || turns.some((turn) => turn.threadId() === current)) {
+                return current;
+            }
+
+            seen.add(current);
+            current = roster.find((candidate) => candidate.id === current)?.ownerThreadId;
+        }
+
+        return threadId;
+    };
+
+    // Put one tile's row at its current conversation position. Idempotent: it is
+    // called on creation, whenever a tile learns/changes its persistent id (a new
+    // thread adopted from its first record), and on every reconcile.
+    const placeTurn = (turn: TurnHandle): void => {
+        const row = turn.element.parentElement;
+        if (row === null) return;
+
+        const threadId = turn.threadId();
+        const hostId = threadId === undefined ? undefined : hostThreadIdOf(threadId);
+        const host = hostId === undefined ? undefined : conversationHost(hostId);
+        if (host === undefined) {
+            if (row.parentElement !== element) element.append(row);
+            delete row.dataset.childThread;
+        } else {
+            if (row.parentElement !== host) host.append(row);
+
+            // A child CONVERSATION is visually nested in its owner, marking the row
+            // so CSS can indent it without a generic `.thread-row` wrapper.
+            if (threadId !== undefined && hostId !== threadId) row.dataset.childThread = threadId;
+            else delete row.dataset.childThread;
+
+            // Keep the first exchange as the conversation header; later exchanges
+            // are ordered messages of the SAME conversation (their repeated label
+            // is hidden by CSS, but the marker keeps the semantics assertable).
+            const grouped = [...host.children].filter(
+                (node): node is HTMLElement => node instanceof HTMLElement && node.classList.contains('turn-row')
+            );
+            grouped.forEach((node, index) => node.classList.toggle('is-continuation', index > 0));
+        }
+
+        reorderBoard();
+        // A tile that was already the focused surface when it learned its thread
+        // must take its newly created group with it (otherwise the later exchanges
+        // would stay collapsed under an open conversation).
+        if (expandedTurn === turn && hostId !== undefined) {
+            conversationHost(hostId).classList.add('is-expanded');
+        }
+    };
+
+    // Restore deterministic top-level order: first appearance of each conversation
+    // in recorded turn order, then legacy standalone rows, then notices. The focus
+    // panel stays first because it is prepended and never moved by this pass.
+    const reorderBoard = (): void => {
+        const seen = new Set<HTMLElement>();
+
+        for (const turn of turns) {
+            const row = turn.element.parentElement;
+            if (row === null) continue;
+
+            // A legacy/standalone turn is its own top-level unit; a grouped turn's
+            // unit is its conversation container. Never append `.turns` into itself.
+            const container = row.parentElement === element ? row : row.parentElement;
+            if (container === null || container === element) continue;
+            if (seen.has(container)) continue;
+
+            seen.add(container);
+            element.append(container);
+        }
+
+        // Empty conversation shells (all turns removed) must not leave a blank row;
+        // surviving groups mark their first exchange as the header so removing the
+        // original run never leaves a continuation wearing the conversation label.
+        for (const [threadId, host] of [...conversationHosts]) {
+            const grouped = [...host.children].filter(
+                (node): node is HTMLElement => node instanceof HTMLElement && node.classList.contains('turn-row')
+            );
+
+            if (grouped.length === 0) {
+                host.remove();
+                conversationHosts.delete(threadId);
+                continue;
+            }
+
+            grouped.forEach((node, index) => node.classList.toggle('is-continuation', index > 0));
+        }
+
+        for (const node of [...element.querySelectorAll<HTMLElement>(':scope > .notice')]) {
+            element.append(node);
+        }
+    };
+
     const notifyFocus = (): void => options.onFocusChange?.(focusedThreadId);
 
     // Detach the expanded TILE without touching focus state (used when focus moves
@@ -970,6 +1153,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         expandedTurn.element
             .querySelector<HTMLButtonElement>('.tile-select')
             ?.setAttribute('aria-expanded', 'false');
+        // The whole CONVERSATION was open (all its exchanges), not just this tile.
+        hostOfTurn(expandedTurn)?.classList.remove('is-expanded');
         expandedTurn = undefined;
     };
 
@@ -1031,6 +1216,70 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // transcript while the compact turn rows below stay navigable.
         element.prepend(panel);
         focusPanel = panel;
+        // A steer audit recorded by an active run must be reachable here when its
+        // target has no visible invocation of its own.
+        renderCrossSteers();
+    };
+
+    // T12d F1: route a steer whose target child conversation lives in ANOTHER turn
+    // (or only in the roster) to the surface that actually represents it. The tile
+    // that recorded the audit usually owns the parent turn, so its local renderer
+    // correctly refuses a child id it cannot see; this board pass finds the earlier
+    // invocation or the focused roster panel. Sorted by acceptance time and
+    // idempotent by `data-steer-key`, so later snapshots cannot duplicate guidance.
+    const renderSteerInPanel = (steer: SessionSteerRecord, key: string): boolean => {
+        if (focusPanel === undefined || steer.threadId === undefined) return false;
+        if (focusPanel.dataset.threadId !== steer.threadId) return false;
+
+        const transcript = focusPanel.querySelector<HTMLElement>('.thread-focus-messages');
+        if (transcript === null) return false;
+        if (flowHasSteer(transcript, key)) return true;
+
+        // The roster transcript may already COMMIT the guidance as a user message
+        // (the runtime appends it at the model boundary). Never show it twice.
+        const already = [...transcript.querySelectorAll<HTMLElement>('.thread-focus-message')].some(
+            (row) =>
+                row.dataset.role === 'user' &&
+                (row.querySelector('.thread-focus-text')?.textContent ?? '').trim() === steer.prompt.trim()
+        );
+        if (already) return true;
+
+        transcript.querySelector('.thread-focus-empty')?.remove();
+        transcript.append(createSteerNode(steer, key));
+        return true;
+    };
+
+    const renderCrossSteers = (): void => {
+        const audits: Array<{ source: TurnHandle; sourceId: string; steer: SessionSteerRecord; key: string }> = [];
+
+        for (const turn of turns) {
+            const sourceId = turn.id();
+            if (sourceId === undefined) continue;
+
+            turn.steerAudit().forEach((steer, index) => {
+                audits.push({ source: turn, sourceId, steer, key: steerKeyOf(sourceId, index) });
+            });
+        }
+
+        audits.sort((left, right) => left.steer.at - right.steer.at);
+
+        for (const audit of audits) {
+            // The source tile gets the first chance (root/self and same-tile child),
+            // then every other visible turn can claim the target invocation.
+            if (audit.source.tryRenderSteer(audit.steer, audit.sourceId, audit.key)) continue;
+
+            let rendered = false;
+            for (const candidate of turns) {
+                if (candidate === audit.source) continue;
+                if (!candidate.tryRenderSteer(audit.steer, audit.sourceId, audit.key)) continue;
+
+                rendered = true;
+                break;
+            }
+            if (rendered) continue;
+
+            renderSteerInPanel(audit.steer, audit.key);
+        }
     };
 
     const threadKnown = (threadId: string): boolean =>
@@ -1041,7 +1290,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // follow-up submit: used when the focused conversation was deleted.
     const dropFocusState = (): void => {
         detachTileExpansion();
-        for (const turn of turns) turn.clearThreadFocus();
+        // Exactly one conversation is open at a time.
+        for (const host of conversationHosts.values()) host.classList.remove('is-expanded');
+        for (const turn of turns) {
+            turn.clearThreadFocus();
+            turn.element.classList.remove('is-expanded');
+        }
         hideFocusPanel();
         focusedThreadId = undefined;
     };
@@ -1081,9 +1335,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
         turn.element.classList.add('is-expanded');
         turn.element.querySelector<HTMLButtonElement>('.tile-select')?.setAttribute('aria-expanded', 'true');
+        // T12b: expansion is a CONVERSATION state. Mark the group so every exchange
+        // (owner runs and nested child continuations) is visible; all others close.
+        const threadId = turn.threadId();
+        const ownHost = hostOfTurn(turn);
+        for (const host of conversationHosts.values()) {
+            host.classList.toggle('is-expanded', host === ownHost);
+        }
         // The tile's PERSISTENT thread is the steering target (or undefined for a
         // legacy turn / an unbound new-thread tile, which becomes known on merge).
-        focusedThreadId = turn.threadId();
+        focusedThreadId = threadId;
         explicitUnfocus = false;
         notifyFocus();
     };
@@ -1303,25 +1564,66 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // clears a known id (legacy fallback): the tile keeps the identity the
         // submit already told the server about.
         let runtimeThreadId = turnThreadIdOf({ threadId: initialThreadId });
-        // S6: ONE canonical display identity, shared with the strip. The roster's
-        // label/sequence wins; an id the roster does not describe (yet) reads `T?`
-        // rather than a digit invented from the opaque id. The full id and the agent
-        // stay in `title`/`data-thread-id`.
+        // R8: the conversation's display label, recorded ON THE TURN. It is the
+        // authoritative root-block name (`RR2`) even when the roster omits the
+        // default conversation; a legacy record has none and falls back to the
+        // roster join.
+        let runtimeThreadLabel: string | undefined;
+        // S6: ONE canonical display identity, shared with the strip. The server's
+        // agent-prefixed conversation label wins; an id the roster does not describe
+        // (yet) reads `T?` rather than a digit invented from the opaque id. The full
+        // id and the agent stay in `title`/`data-thread-id`.
+        // T12d F2: a conversation-owned root already carries its canonical label in
+        // the persistent-thread badge (`RR4`, with title/agent/status). The root code
+        // (`tile-agent`) must not print the SAME label beside it (`RR4RR4`). Keep the
+        // badge as the single visible identity; the code node stays in the DOM only
+        // for legacy/unthreaded turns or a thread without a resolved badge name.
+        const syncRootAgentVisibility = (): void => {
+            const duplicate =
+                runtimeThreadId !== undefined &&
+                threadBadge.textContent !== null &&
+                threadBadge.textContent.length > 0 &&
+                threadBadge.textContent === tileAgent.textContent;
+
+            tileAgent.hidden = duplicate || tileAgent.textContent === '';
+        };
+
         const paintThreadBadge = (): void => {
             if (runtimeThreadId === undefined) {
                 threadBadge.hidden = true;
                 threadBadge.textContent = '';
                 threadBadge.title = '';
                 delete card.dataset.threadId;
+                syncRootAgentVisibility();
                 return;
             }
 
             threadBadge.hidden = false;
-            threadBadge.textContent = threadLabelOf(runtimeThreadId, roster) ?? '';
+            threadBadge.textContent =
+                runtimeThreadLabel ?? threadLabelOf(runtimeThreadId, roster) ?? '';
             threadBadge.title = threadTitleOf(runtimeThreadId, roster) ?? '';
             card.dataset.threadId = runtimeThreadId;
+            syncRootAgentVisibility();
         };
-        const setThreadId = (value: string | undefined): void => {
+        // Set once the handle exists so a thread identity learned during `merge`
+        // can move this tile into its conversation container (T12b). Before then
+        // the optimistic tile sits as a standalone/initial row.
+        let placedTurn: TurnHandle | undefined;
+        // The conversation label this tile's ROOT block must show: the turn's own
+        // recorded name first, then the roster's name for its persistent thread. An
+        // id the roster does not describe yields UNDEFINED (not the `T?` sentinel):
+        // a legacy turn then keeps its allocator label instead of printing `T?`.
+        const rootConversationLabel = (): string | undefined => {
+            if (runtimeThreadLabel !== undefined) return runtimeThreadLabel;
+            if (runtimeThreadId === undefined) return undefined;
+
+            const entry = roster.find((candidate) => candidate.id === runtimeThreadId);
+            return entry === undefined ? undefined : threadNameOf(entry);
+        };
+
+        const setThreadId = (value: string | undefined, label?: string): void => {
+            if (label !== undefined && label.trim().length > 0) runtimeThreadLabel = label;
+
             if (value !== undefined && value.length > 0) {
                 const changed = runtimeThreadId !== value;
                 runtimeThreadId = value;
@@ -1338,12 +1640,26 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             }
 
             paintThreadBadge();
+            // A first record can tell an optimistic NEW thread its id; move the row
+            // into that conversation now instead of leaving a second top-level row.
+            if (placedTurn !== undefined) placeTurn(placedTurn);
         };
         setThreadId(undefined);
         // How many of the server turn's `events` this tile has applied. Live
         // frames and replayed records both count, so `merge()` can skip the
         // prefix it already rendered instead of appending it twice.
         let appliedCount = 0;
+        // R9: how many of the turn's recorded STEERS are already rendered as visible
+        // user messages. A steered submit creates no new turn, so without this the
+        // user's text would only exist in the audit metadata and never in the
+        // conversation the reader is looking at.
+        // T12b: indexes (not a count) because a steer addressed to a child
+        // conversation may be unrenderable until that child's invocation entry
+        // exists; it must not block a later steer or be duplicated on a retry.
+        let renderedSteers = new Set<number>();
+        // The latest recorded steer audit, kept so `refreshThreadRoster` can retry
+        // attribution once the child invocation appears.
+        let steerRecords: NonNullable<SessionTurn['steers']> = [];
         // The events themselves, in order. `merge()` compares the server's prefix
         // against these: identical means "append the remainder"; different means
         // the server record won and the projection must be rebuilt.
@@ -1435,6 +1751,27 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             }
 
             return label;
+        };
+
+        // T14 parity with shared/agent-results.ts `createBlock`: an EXPLICIT
+        // conversation label (`turn.threadLabel` or a child `threadLabels[id]`) is
+        // shown verbatim but still RESERVES its ordinal in this tile's allocator.
+        // Without it, root RR1 + a same-code fallback child would both read RR1;
+        // with it the fallback continues at RR2 exactly like the server projection.
+        // `seed` only raises, so a continuation repeating RR1 burns nothing.
+        const reserveConversationLabel = (label: string | undefined): void => {
+            if (label === undefined) return;
+
+            const parts = agentLabelParts(label);
+            if (parts === undefined) return;
+
+            labels.seed(new Map([[parts.code, parts.ordinal]]));
+
+            // Publish the reservation so LATER tiles (and a rebuilt projection)
+            // continue after it instead of re-minting the same number.
+            for (const [code, used] of labels.counters()) {
+                if (used > (labelCounters.get(code) ?? 0)) labelCounters.set(code, used);
+            }
         };
 
         // One entry per INVOCATION in this turn. The map is keyed by the canonical
@@ -1684,10 +2021,46 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             return match?.id;
         };
 
+        // R8: repaint one entry's visible label. The conversation label replaces
+        // the provisional per-invocation number the allocator minted when the entry
+        // was created before its roster identity was known.
+        const paintEntryLabel = (entry: ThreadEntry, label: string): void => {
+            // A roster-provided child conversation label is authoritative too: it
+            // reserves its ordinal exactly like a create-time explicit label, so a
+            // later same-code fallback cannot collide with `RR5`.
+            reserveConversationLabel(label);
+            if (entry.label === label) return;
+
+            entry.label = label;
+            if (entry.select !== undefined) {
+                const name = entry.select.querySelector('.thread-name');
+                if (name !== null) name.textContent = label;
+            }
+            // The section head (a flat legacy subagent) carries the same code.
+            const head = entry.section.root.querySelector('.agent-name');
+            if (head !== null) head.textContent = label;
+        };
+
+        // R8: the ROOT block shows the tile's PERSISTENT conversation label, not a
+        // separately allocated invocation number. There is no row to repaint; the
+        // code lives in the tile header (`tileAgent`) and the section head.
+        const paintRootLabel = (): void => {
+            const entry = threads.get(ROOT_KEY);
+            if (entry === undefined) return;
+
+            const label = rootConversationLabel();
+            if (label === undefined) return;
+
+            paintEntryLabel(entry, label);
+            tileAgent.textContent = label;
+            tileAgent.hidden = false;
+            syncRootAgentVisibility();
+        };
+
         const paintPersistentMarkers = (): void => {
             for (const entry of threads.values()) {
                 // The ROOT invocation has no row (its surface is the tile body), so
-                // it has nothing to mark.
+                // it has nothing to mark; its label is painted separately.
                 if (entry.row === undefined) continue;
 
                 const persistent = persistentIdOf(entry);
@@ -1700,7 +2073,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 entry.row.dataset.persistentThread = persistent;
                 const match = roster.find((candidate) => candidate.id === persistent);
                 entry.row.title = match === undefined ? `Thread ${persistent}` : `${threadNameOf(match)} · ${match.agent}`;
+                // S6/R8: the row's own header names the child CONVERSATION.
+                if (match !== undefined) paintEntryLabel(entry, threadNameOf(match));
             }
+
+            paintRootLabel();
         };
 
         // Collapse persistent child conversations and clear the focused marker. A
@@ -2001,7 +2378,20 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // (`.thread-top`) is the nested counterpart of `.tile-top`. Both clusters
             // carry the same two labels from the shared `createBlockMeta`, so a child
             // block shows its own duration and usage when its events report them.
-            const label = nextLabel(options.agent);
+            // R8: a nested invocation shows its child CONVERSATION label when the
+            // roster already joins this invocation id; only a legacy/threadless
+            // block falls back to the allocator (and therefore consumes a number).
+            const conversationLabel = ((): string | undefined => {
+                const match = roster.find(
+                    (candidate) =>
+                        candidate.id === options.key ||
+                        candidate.invocationId === options.key ||
+                        candidate.originInvocationId === options.key
+                );
+                return match === undefined ? undefined : threadNameOf(match);
+            })();
+            reserveConversationLabel(conversationLabel);
+            const label = conversationLabel ?? nextLabel(options.agent);
             const name = el('span', 'thread-name', label);
             const kindTag =
                 options.kind === 'fork' || options.kind === 'autoanswer'
@@ -2125,10 +2515,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // attribute.
             paintAgentColor(card, agentName);
 
-            // The root invocation consumes the next occurrence of its agent (the
-            // requirement counts the entry agent too, R2). Its header label lives in
-            // the section head; the tile header itself carries the metadata cluster.
-            const label = nextLabel(agentName);
+            // R8: the root block IS the tile's persistent conversation, so it shows
+            // that conversation's label (`RR4`). Only a legacy turn with no
+            // persistent identity consumes an allocator occurrence. An explicit
+            // conversation label still reserves its ordinal (T14 parity), so a
+            // same-code child fallback continues AFTER it.
+            const conversationLabel = rootConversationLabel();
+            reserveConversationLabel(conversationLabel);
+            const label = conversationLabel ?? nextLabel(agentName);
             const section = createSection(flow, agentName, 'primary', label);
             // R1/F3: the compact root header shows the same code as a child header.
             // The section's own `.agent-head` is hidden by CSS for the primary part
@@ -2136,6 +2530,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // keep their head because they are DIFFERENT agents that need telling apart.
             tileAgent.textContent = label;
             tileAgent.hidden = false;
+            syncRootAgentVisibility();
             threads.set(ROOT_KEY, {
                 key: ROOT_KEY,
                 agent: agentName,
@@ -2265,6 +2660,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
             entry.started = true;
             setThreadState(entry, 'streaming');
+            // R8: the placeholder showed the allocator's provisional number; after
+            // adoption the roster can join the CHILD conversation, so repaint its
+            // stable label (`RR5`) and persistent marker now.
+            paintPersistentMarkers();
             // R1: an adopted entry inherits the reader's expansion for its canonical
             // key (the placeholder was created under the synthesized key).
             if (expandedThreads.has(entry.key)) setThreadExpanded(entry, true);
@@ -2353,10 +2752,42 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             return threads.get(ROOT_KEY) as ThreadEntry;
         };
 
+        // R8/R10: a HOST-thread run carries an invocation identity on every frame
+        // (so its events can be grouped), but it is still the TURN'S OWN root
+        // conversation — not an agent-spawned child. Such a record has no parent,
+        // no spawning call and no branch marker (the same discriminator
+        // shared/agent-results.ts uses). Rendering it as a `.thread-row` is the
+        // generic `T8` wrapper with an indented root that R8 removes.
+        const isConversationRoot = (meta: HarnessThreadInfo): boolean =>
+            meta.parentId === undefined &&
+            meta.callId === undefined &&
+            meta.kind === undefined &&
+            meta.branchId === undefined;
+
         const entryFor = (event: HarnessEvent): ThreadEntry => {
             // Explicit metadata is authoritative (frozen runtime contract).
             const meta = threadOf(event);
-            if (meta !== undefined) return entryForMeta(meta, event);
+            if (meta !== undefined) {
+                // An already-known invocation id owns its frame, even when later
+                // frames carry only `{id}` (the runtime sends the full record once).
+                const known = threads.get(meta.id);
+                if (known !== undefined) return known;
+
+                if (isConversationRoot(meta)) {
+                    const root = threads.get(ROOT_KEY);
+                    if (root === undefined) {
+                        rootSection(event.agent);
+                        return threads.get(ROOT_KEY) as ThreadEntry;
+                    }
+
+                    // Same agent as the turn's root: this is another frame of the
+                    // host-thread run, NOT a child. A DIFFERENT agent with no parent
+                    // is a legacy/incomplete child record; keep the old row path.
+                    if (root.agent === event.agent) return root;
+                }
+
+                return entryForMeta(meta, event);
+            }
 
             return entryForLegacy(event);
         };
@@ -2385,6 +2816,53 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // rendered nodes stay in place, only the incremental writer is closed.
             section.lastText = section.text.buffer;
             section.text = undefined;
+        };
+
+        // R9/T12d: render one steer into THIS tile's target surface. `sourceTurnId`
+        // prevents an untargeted/self steer from being painted on another tile that
+        // happens to scan the same audit. Child targets are resolved through the
+        // roster join, so a child invocation is never rendered on the parent flow.
+        const tryRenderSteer = (steer: SessionSteerRecord, sourceTurnId: string, key: string): boolean => {
+            const targetId = steer.threadId;
+            let section: AgentSection | undefined;
+
+            if (targetId === undefined || targetId === runtimeThreadId) {
+                if (serverId === undefined || serverId !== sourceTurnId) return false;
+                section = threads.get(ROOT_KEY)?.section;
+            } else {
+                for (const entry of threads.values()) {
+                    if (entry.row === undefined) continue;
+                    if (persistentIdOf(entry) !== targetId) continue;
+
+                    section = entry.section;
+                    break;
+                }
+            }
+
+            if (section === undefined) return false;
+            // Idempotent across local event-order rendering, the board pass and a
+            // rebuilt projection (the node is gone after a rebuild, so it re-appends).
+            if (flowHasSteer(section.flow, key)) return true;
+
+            closeText(section);
+            section.flow.append(createSteerNode(steer, key));
+            return true;
+        };
+
+        let notifySteerChange: () => void = () => undefined;
+
+        // Local event-order pass for steers this tile owns; the board pass then
+        // routes targets that live in an earlier turn or the roster panel.
+        const renderSteersThrough = (limitAt?: number): void => {
+            for (let index = 0; index < steerRecords.length; index += 1) {
+                if (renderedSteers.has(index)) continue;
+                if (limitAt !== undefined && steerRecords[index].at > limitAt) continue;
+
+                const key = steerKeyOf(serverId ?? '', index);
+                if (!tryRenderSteer(steerRecords[index], serverId ?? '', key)) continue;
+
+                renderedSteers.add(index);
+            }
         };
 
         // End the current run of tool calls. The group node stays in the flow (its
@@ -2827,6 +3305,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             toolCount = 0;
             appliedCount = 0;
             appliedEvents.length = 0;
+            // R9/T12b: the steer nodes lived in flows that were just cleared.
+            renderedSteers = new Set<number>();
             // Token figures derived from the discarded events must go too; the
             // server tally is re-applied by the caller after the rebuild.
             blockMeta.clearUsage();
@@ -2842,6 +3322,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // replay's `rootSection` names the root agent again (F3).
             tileAgent.textContent = '';
             tileAgent.hidden = true;
+            syncRootAgentVisibility();
         };
 
         // --- events -------------------------------------------------------
@@ -2873,7 +3354,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // non-terminal invocation of that agent).
             const usageOwner = (): ThreadEntry | undefined => {
                 const info = threadOf(event);
-                if (info !== undefined) return threads.get(info.id);
+                // A metadata-only HOST root frame belongs to the tile's root
+                // section (it has no child row); its usage is the root's.
+                if (info !== undefined) {
+                    const known = threads.get(info.id);
+                    if (known !== undefined) return known;
+
+                    return isConversationRoot(info) ? threads.get(ROOT_KEY) : undefined;
+                }
 
                 const root = threads.get(ROOT_KEY);
                 if (root !== undefined && event.agent === root.agent) return root;
@@ -3250,9 +3738,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             recordStatus = source.status;
 
             bind(source);
-            // Adopt the record's persistent thread identity (additive field). A
-            // record without it leaves the optimistic target in place.
-            setThreadId(turnThreadIdOf(source));
+            // Adopt the record's persistent thread identity AND its conversation
+            // label (both additive). A record without a label leaves the roster
+            // join / derived name in place.
+            setThreadId(turnThreadIdOf(source), turnThreadLabelOf(source));
 
             const terminal =
                 source.status !== 'running' && (source.status as string) !== 'queued';
@@ -3274,10 +3763,28 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 );
             if (!samePrefix) resetProjection();
 
+            // R9: steered user messages are part of the conversation, not hidden
+            // metadata. A record carries them on the owning turn (`steers`), so they
+            // are rendered in real order: before the first UNAPPLIED event whose
+            // server stamp is at/after the steer, and after everything already
+            // applied (the live case, where the steer arrived mid-run).
+            const steers = Array.isArray(source.steers) ? source.steers : [];
+            steerRecords = steers;
             for (let position = appliedCount; position < events.length; position += 1) {
-                apply(events[position], times?.[position], 'recorded');
+                const eventAt = times?.[position];
+
+                // Steers stamped at/ before this event are inserted before it, so a
+                // replayed conversation keeps the user's text in chronological order.
+                if (eventAt !== undefined) renderSteersThrough(eventAt);
+
+                apply(events[position], eventAt, 'recorded');
             }
             appliedCount = events.length;
+
+            renderSteersThrough();
+            // Steers targeting a child invocation owned by an EARLIER turn (or a
+            // roster-only conversation) are not visible from this tile alone.
+            notifySteerChange();
 
             // The server owns the tally (see setUsage).
             setUsage(usageOf(source.usage));
@@ -3289,6 +3796,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
             setState(stateOf(source.status), model !== undefined && model.length > 0 ? model : undefined);
             flush();
+            // The record may have told us the conversation label after the root
+            // section was created (e.g. a live frame that arrived before the ack).
+            paintRootLabel();
         };
 
         // Clicking the header expands a compact tile; clicking the expanded tile
@@ -3375,6 +3885,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const refreshThreadRoster = (): void => {
             paintThreadBadge();
             paintPersistentMarkers();
+            // T12b/T12d: a steer addressed to a child may have arrived before its
+            // invocation entry was known (or lives in another turn); render it now
+            // in the TARGET conversation/panel.
+            renderSteersThrough();
+            notifySteerChange();
 
             if (focusedChildKey !== undefined) {
                 const entry = threads.get(focusedChildKey);
@@ -3406,13 +3921,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             attachments: () => attachmentRecords,
             setAttachments,
             blocks,
+            steerAudit: () => steerRecords,
+            tryRenderSteer,
             destroy
         };
 
+        notifySteerChange = renderCrossSteers;
         turns.push(turn);
-        // The card lives inside its row; the row is what the board appends,
-        // removes and reorders, and it mirrors the tile state.
-        element.append(row);
+        // The card lives inside its row; the row is what the board groups, removes
+        // and reorders, and it mirrors the tile state.
+        placedTurn = turn;
+        placeTurn(turn);
         // A queued tile paints no clock (nothing is running yet). `bind()` and
         // `setState('streaming')` start it from the server's start stamp, so a
         // task that waited in the queue is never charged for the wait.
@@ -3446,6 +3965,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // A cleared board starts a new numbering (hydrate re-creates the tiles in
         // recorded order, so the conversation's labels are rebuilt exactly).
         labelCounters.clear();
+        // T12b: the conversation containers are structural, not turn-owned; drop
+        // every shell so a rebuild starts from a clean board.
+        for (const host of conversationHosts.values()) host.remove();
+        conversationHosts.clear();
 
         for (const node of [...element.querySelectorAll<HTMLElement>('.notice')]) node.remove();
 
@@ -3481,6 +4004,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         turns.splice(position, 1);
         turn.destroy();
         turn.element.parentElement?.remove();
+        reorderBoard();
     };
 
     // Claim the oldest optimistic tile started for `prompt` (R2). The submit path
@@ -3617,13 +4141,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         turns.length = 0;
         turns.push(...next);
 
-        // Appending an existing node MOVES it, which is how the order is fixed
-        // without rebuilding any tile. Notices are re-anchored after the rows.
-        for (const turn of next) {
-            const row = turn.element.parentElement;
-            if (row !== null) element.append(row);
-        }
-        for (const node of [...element.querySelectorAll<HTMLElement>('.notice')]) element.append(node);
+        // Project each tile into its conversation container (T12b). `placeTurn`
+        // appends/moves existing rows, so no tile is rebuilt and its events,
+        // references and timers survive; the final call also drops empty groups.
+        for (const turn of next) placeTurn(turn);
+        reorderBoard();
+        renderCrossSteers();
 
         // --- focus preservation (S1) ---------------------------------------
         //
@@ -3685,6 +4208,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             adopt(source, options.model, options.labelSeeds?.[source.id])
         );
 
+        // A child conversation may be listed before its owner; settle ownership
+        // grouping only after every adopted tile knows its thread id.
+        for (const handle of handles) placeTurn(handle);
+        renderCrossSteers();
+
         const kept = keepId === undefined ? undefined : handles.find((handle) => handle.id() === keepId);
         const target = kept ?? handles[handles.length - 1];
         if (target !== undefined) {
@@ -3737,6 +4265,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const setThreads = (entries: readonly SessionThreadEntry[]): void => {
         roster = [...entries];
 
+        // A roster can reveal that a thread is a CHILD of another (ownerThreadId):
+        // move its continuation into the owner's conversation and re-label it.
+        for (const turn of turns) placeTurn(turn);
         for (const turn of turns) turn.refreshThreadRoster();
 
         if (focusedThreadId === undefined) return;

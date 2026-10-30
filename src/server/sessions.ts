@@ -156,6 +156,8 @@ import type {
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { validateAttachments } from '../shared/attachments';
 import {
+    agentCodeOf,
+    agentLabelParts,
     collectAgentLabelCounters,
     composeAgentResultPrompt,
     findAgentResultBlock,
@@ -374,7 +376,28 @@ type Session = {
     // Survives deletion of every turn carrying a label, so a retired textual label
     // is never re-minted for different content. Only counters are kept — never the
     // content they described.
+    //
+    // T14: mirrored with `threadLabelHighWater` (see raiseThreadLabelHighWater).
+    // Both are views of the ONE canonical per-code label sequence that legacy
+    // `/messages` blocks, nested blocks and conversation names all draw from, so a
+    // persisted document that lost either map still recovers the ordinals.
     labelHighWater: Map<string, number>;
+    // R8: stable agent-prefixed display label of every persistent conversation,
+    // keyed by thread id (`RR1`, `IT1`, …). IDs stay opaque runtime values; this is
+    // the ONE user-facing conversation name shared by the roster, the turn badge,
+    // the root/child block header and a `#` reference. It is allocated once per
+    // thread (never per invocation, run or continuation) and persisted.
+    threadLabels: Map<string, string>;
+    // Highest conversation label ordinal minted per agent code. Kept when a thread
+    // is deleted so a retired display name (`RR3`) is never re-minted for another
+    // conversation — the same non-reuse rule as `labelHighWater`.
+    //
+    // T14: the two maps are MIRRORED views of one canonical per-code sequence, not
+    // disjoint namespaces. A legacy `/messages` block reserves its ordinal here too
+    // (so the first user conversation after three legacy turns is `RR4`), and a
+    // conversation name raises `labelHighWater` (so it can never be re-minted as a
+    // block label). Allocation reads the HIGHEST of both.
+    threadLabelHighWater: Map<string, number>;
     // Invocation id recorded by each THREAD turn's root run, keyed by turn id. The
     // roster exposes it as originInvocationId and it survives a restart.
     turnInvocations: Map<string, string>;
@@ -536,6 +559,9 @@ const copyTurn = (turn: SessionTurn): SessionTurn => ({
     // R1-R6: the owning persistent thread, when the turn has one. Absent for a
     // legacy `/messages` turn, preserving that record's exact shape.
     ...(turn.threadId === undefined ? {} : { threadId: turn.threadId }),
+    // R8: the conversation's display name travels WITH the turn, so a client can
+    // label the root block even for a default conversation the roster omits.
+    ...(turn.threadLabel === undefined ? {} : { threadLabel: turn.threadLabel }),
     // Attachments are copied too (T3): the validated record is plain data and a
     // client/snapshot consumer must never be able to mutate the stored bytes. The
     // key stays absent for a text-only turn, preserving every old shape.
@@ -562,6 +588,7 @@ const copyTurn = (turn: SessionTurn): SessionTurn => ({
               steers: turn.steers.map((steer) => ({
                   at: steer.at,
                   prompt: steer.prompt,
+                  ...(steer.threadId === undefined ? {} : { threadId: steer.threadId }),
                   ...(steer.references === undefined
                       ? {}
                       : { references: steer.references.map((reference) => ({ ...reference })) })
@@ -781,6 +808,8 @@ export class SessionStore {
             turnSequence: 0,
             labelSeeds: new Map(),
             labelHighWater: new Map(),
+            threadLabels: new Map(),
+            threadLabelHighWater: new Map(),
             turnInvocations: new Map(),
             invocationThreads: new Map(),
             legacyRunning: false,
@@ -1181,6 +1210,12 @@ export class SessionStore {
             ...(session.labelHighWater.size === 0
                 ? {}
                 : { labelHighWater: Object.fromEntries([...session.labelHighWater]) }),
+            ...(session.threadLabels.size === 0
+                ? {}
+                : { threadLabels: Object.fromEntries([...session.threadLabels]) }),
+            ...(session.threadLabelHighWater.size === 0
+                ? {}
+                : { threadLabelHighWater: Object.fromEntries([...session.threadLabelHighWater]) }),
             ...(session.turnInvocations.size === 0
                 ? {}
                 : { turnInvocations: Object.fromEntries(session.turnInvocations) }),
@@ -1409,6 +1444,10 @@ export class SessionStore {
                 // The tombstone high-water is NOT filtered by live turns: its whole
                 // purpose is to remember labels whose turns are gone.
                 labelHighWater: new Map(Object.entries(record.labelHighWater ?? {})),
+                // R8 conversation names: restored verbatim; a pre-R8 document has
+                // none and the store derives them deterministically on demand.
+                threadLabels: new Map(Object.entries(record.threadLabels ?? {})),
+                threadLabelHighWater: new Map(Object.entries(record.threadLabelHighWater ?? {})),
                 turnInvocations: new Map(
                     Object.entries(record.turnInvocations ?? {}).filter(([turnId]) =>
                         turns.some((turn) => turn.id === turnId)
@@ -1607,6 +1646,10 @@ export class SessionStore {
     private threadRoster(session: Session): SessionThread[] {
         if (!this.threadsSupported(session)) return [];
 
+        // R8: make sure every conversation has its stable display label before the
+        // roster is built (a pre-R8 document derives them here, in turn order).
+        this.ensureThreadLabels(session);
+
         const hostThreads = session.harness.threads().filter((record) => record.origin === 'host');
 
         if (hostThreads.length === 0) return [];
@@ -1651,6 +1694,10 @@ export class SessionStore {
 
             return {
                 ...record,
+                // The DISPLAY name is the session's conversation label, never the
+                // runtime's optional free-text label and never the global creation
+                // ordinal (`T8`). IDs remain opaque; this is what the UI shows.
+                label: this.ensureThreadLabel(session, record.id, record.agent),
                 ...(first === undefined ? {} : { originTurnId: first.id }),
                 ...(originInvocationId === undefined ? {} : { originInvocationId }),
                 ...(references.length === 0 ? {} : { references }),
@@ -1865,6 +1912,16 @@ export class SessionStore {
 
         session.turns.push(turn);
 
+        // T14/F1: number this block in the ONE canonical conversation sequence. The
+        // seed is the same per-turn start state an enqueue records, so a later
+        // deletion (or a deleted earlier thread) cannot renumber this block, and the
+        // reservation settles the ordinal NOW — before a concurrently accepted task
+        // could mint the same label for its new conversation.
+        const seed = this.labelSeedOf(session);
+        if (seed !== undefined) session.labelSeeds.set(turn.id, seed);
+
+        this.reserveLegacyBlockLabel(session);
+
         // The legacy path keeps the original fresh-block semantics: no thread id,
         // every agent conversation reseeded before the run.
         await this.executeTurn(session, turn, emit, options.signal, { freshBlock: true });
@@ -1974,17 +2031,274 @@ export class SessionStore {
     // numbering deletion-safe: a surviving turn keeps the labels it had before an
     // earlier thread was deleted (see shared/agent-results.ts).
     private projectionTurns(session: Session, turns: readonly SessionTurn[]): AgentResultTurn[] {
+        // R8: conversation labels are allocated/loaded BEFORE projecting, so the
+        // root block's label is the thread's display name (`RR2`) rather than a new
+        // per-invocation number.
+        this.ensureThreadLabels(session);
+        const threadLabels = this.invocationThreadLabels(session);
+        const hasThreadLabels = Object.keys(threadLabels).length > 0;
+
         return [...turns]
             .sort((left, right) => left.index - right.index)
             .map((turn) => {
                 const seed = session.labelSeeds.get(turn.id);
+                const threadLabel =
+                    turn.threadId === undefined
+                        ? turn.threadLabel
+                        : this.ensureThreadLabel(session, turn.threadId);
+
                 return {
                     id: turn.id,
                     status: turn.status,
                     events: turn.events,
-                    ...(seed === undefined ? {} : { labels: seed })
+                    ...(seed === undefined ? {} : { labels: seed }),
+                    ...(threadLabel === undefined ? {} : { threadLabel }),
+                    ...(hasThreadLabels ? { threadLabels } : {})
                 };
             });
+    }
+
+    // R8: allocate (once) the stable display label of one persistent conversation.
+    //
+    // The label is the owning agent's two-letter code plus a PER-AGENT conversation
+    // ordinal (`RR1`, `RR2`, …; `IT1`). It belongs to the THREAD, so every turn,
+    // run, steer or continuation of that thread repeats it; only a genuinely new
+    // conversation consumes the next ordinal. The high-water map is never lowered
+    // by deletion, which is what stops a retired name from being re-minted.
+    private ensureThreadLabel(session: Session, threadId: string, agentHint?: string): string {
+        const known = session.threadLabels.get(threadId);
+        if (known !== undefined) {
+            this.raiseThreadLabelHighWater(session, known);
+            return known;
+        }
+
+        const record = this.threadsSupported(session) ? session.harness.thread(threadId) : undefined;
+        const agent = record?.agent ?? agentHint ?? session.preset.primary;
+
+        return this.mintThreadLabel(session, threadId, agentCodeOf(agent));
+    }
+
+    // Mint the next ordinal of `code` for one conversation and record it.
+    private mintThreadLabel(session: Session, threadId: string, code: string): string {
+        const ordinal = this.nextConversationOrdinal(session, code);
+        const label = `${code}${ordinal}`;
+
+        session.threadLabels.set(threadId, label);
+        // Raising through the shared helper writes BOTH durable counters (see
+        // raiseThreadLabelHighWater), so the number is retired in the one sequence.
+        this.raiseThreadLabelHighWater(session, label);
+        return label;
+    }
+
+    // T14/F1: the next ordinal of a code in the ONE canonical sequence.
+    //
+    // A legacy `/messages` block, a persistent conversation and a nested/threadless
+    // block all draw from this sequence, so no two of them can ever show the same
+    // text label. `threadLabelHighWater` answers "which conversation numbers are
+    // taken" and `labelHighWater` answers "which block numbers are taken"; a
+    // persisted document may carry only one of them (a partial/hand-edited write),
+    // so the allocation reads the HIGHEST of both instead of trusting one map. The
+    // two maps are kept in sync on every mint, which is what makes that fallback
+    // safe.
+    private nextConversationOrdinal(session: Session, code: string): number {
+        return (
+            Math.max(
+                session.threadLabelHighWater.get(code) ?? 0,
+                session.labelHighWater.get(code) ?? 0
+            ) + 1
+        );
+    }
+
+    // Reserve one ordinal of a code in both durable counters WITHOUT binding it to
+    // a conversation. Used by the legacy `/messages` path: its single block owns a
+    // number, but no thread exists to own the name.
+    private reserveConversationOrdinal(session: Session, code: string, ordinal: number): void {
+        this.raiseThreadLabelHighWater(session, `${code}${ordinal}`);
+    }
+
+    // Raise the high-water from an already known label. A restored/hand-edited
+    // label is authoritative, but a later new conversation of the same agent must
+    // still continue AFTER it instead of colliding.
+    //
+    // T14: BOTH counters are raised. `threadLabelHighWater` is the conversation
+    // sequence and `labelHighWater` the result-block tombstone; mirroring them is
+    // what unifies the two namespaces (a retired conversation name can never come
+    // back as a block label, and vice versa) and what lets a document that lost one
+    // map still recover the other's numbers.
+    private raiseThreadLabelHighWater(session: Session, label: string): void {
+        const parts = agentLabelParts(label);
+        if (parts === undefined) return;
+
+        const code = parts.code;
+        const used = parts.ordinal;
+
+        session.threadLabelHighWater.set(
+            code,
+            Math.max(session.threadLabelHighWater.get(code) ?? 0, used)
+        );
+        session.labelHighWater.set(code, Math.max(session.labelHighWater.get(code) ?? 0, used));
+    }
+
+    // T14/F2: adopt the durable display labels BEFORE any allocation.
+    //
+    // A document can lose the label MAP (a partial write or a hand edit) while every
+    // surviving turn still records the label it showed. Allocating first would mint
+    // a fresh `RR1` for a conversation whose turn says `RR3` and only THEN raise the
+    // counter to 3 — the surviving name would be lost and the next conversation
+    // would collide with the stale turn record. So the recorded evidence is adopted
+    // first, in a deterministic, duplicate-free order:
+    //   1. `threadLabels` (the per-thread allocation record) in map order; a label
+    //      already held by another thread is dropped from the map so that thread is
+    //      re-allocated below instead of sharing a name;
+    //   2. each recorded turn's label in turn order, for a thread that still has no
+    //      name — that turn label is what the user actually saw on the block, so it
+    //      is the strongest recovery evidence;
+    //   3. every adopted label raises BOTH counters, so the next conversation (or
+    //      legacy block) continues AFTER it.
+    // A CONFLICT (the map and a turn disagree) is resolved deterministically: the
+    // map is the per-thread allocation record and wins, the turn record is rewritten
+    // to it, and the stale label still reserves its ordinal so it is never minted
+    // for different content.
+    private adoptPersistedLabels(session: Session): void {
+        // label -> the conversation that owns it, so two threads can never adopt the
+        // same text label.
+        const owner = new Map<string, string>();
+
+        for (const [threadId, label] of [...session.threadLabels]) {
+            const parts = agentLabelParts(label);
+
+            // A label this system can never emit is corruption: forget the entry so
+            // the allocation pass mints a fresh name (the turns keep their content).
+            if (parts === undefined) {
+                session.threadLabels.delete(threadId);
+                continue;
+            }
+
+            const holder = owner.get(parts.label);
+
+            if (holder !== undefined && holder !== threadId) {
+                // Two conversations claim one name. The first owner keeps it; this
+                // entry is dropped so the other conversation is re-named below.
+                session.threadLabels.delete(threadId);
+                continue;
+            }
+
+            // Normalise the stored spelling (a hand-edited lowercase value must not
+            // survive as the authoritative display name).
+            session.threadLabels.set(threadId, parts.label);
+            owner.set(parts.label, threadId);
+            this.raiseThreadLabelHighWater(session, parts.label);
+        }
+
+        const ordered = [...session.turns].sort((left, right) => left.index - right.index);
+
+        for (const turn of ordered) {
+            const threadId = turn.threadId;
+            const recorded = turn.threadLabel;
+
+            // A legacy turn owns no conversation name (its block label comes from the
+            // shared allocator); a turn without a recorded label has no evidence.
+            if (threadId === undefined || recorded === undefined) continue;
+
+            const parts = agentLabelParts(recorded);
+            if (parts === undefined) continue;
+
+            if (session.threadLabels.has(threadId)) {
+                // The map wins the conflict; the differing recorded label still
+                // reserves its number.
+                this.raiseThreadLabelHighWater(session, parts.label);
+                continue;
+            }
+
+            const holder = owner.get(parts.label);
+            if (holder !== undefined && holder !== threadId) {
+                // Another conversation already shows this name. Do not adopt it (that
+                // would duplicate a `#` reference); reserve it and let the allocation
+                // pass below mint the next free one for this thread.
+                this.raiseThreadLabelHighWater(session, parts.label);
+                continue;
+            }
+
+            session.threadLabels.set(threadId, parts.label);
+            owner.set(parts.label, threadId);
+            this.raiseThreadLabelHighWater(session, parts.label);
+        }
+    }
+
+    // Assign a label to every conversation the session already knows, in a
+    // DETERMINISTIC order: recorded turns first (so a pre-R8 transcript keeps the
+    // names its root blocks showed: RR1, RR2, RR3 …), then any remaining runtime
+    // thread in creation order. Called before a snapshot or a projection, so every
+    // consumer (roster, turn badge, block header, reference) reads the same value.
+    private ensureThreadLabels(session: Session): void {
+        // Adopt every persisted name/counter FIRST (T14/F2), so nothing below can
+        // mint an ordinal that a surviving turn record already shows.
+        this.adoptPersistedLabels(session);
+
+        const ordered = [...session.turns].sort((left, right) => left.index - right.index);
+        for (const turn of ordered) {
+            if (turn.threadId === undefined) continue;
+
+            const label = this.ensureThreadLabel(session, turn.threadId);
+
+            // The conversation's canonical name is authoritative for every turn that
+            // ran in it: an old turn (no label) adopts it, and a turn whose recorded
+            // label conflicts with its own conversation is reconciled to it (the map
+            // is the allocation record; see adoptPersistedLabels).
+            turn.threadLabel = label;
+            this.raiseThreadLabelHighWater(session, label);
+        }
+
+        if (!this.threadsSupported(session)) return;
+
+        for (const record of [...session.harness.threads()].sort(
+            (left, right) => left.sequence - right.sequence
+        )) {
+            // Only INDEPENDENT (host) conversations are labelled eagerly. An
+            // agent's implicit default conversation is internal plumbing: it takes a
+            // number only when a turn actually runs in it, so the first user-opened
+            // Researcher thread is `RR1`, not `RR2`.
+            if (record.origin !== 'host') continue;
+
+            this.ensureThreadLabel(session, record.id, record.agent);
+        }
+    }
+
+    // Invocation id → conversation label, for the shared block projection. A
+    // delegated child's events carry its runtime invocation id; the shared
+    // projector needs that id's CONVERSATION label (not a fresh per-invocation
+    // number), so a repeated run in one child conversation keeps one `#` name.
+    private invocationThreadLabels(session: Session): Record<string, string> {
+        const labels: Record<string, string> = {};
+
+        if (!this.threadsSupported(session)) return labels;
+
+        for (const [invocationId, threadId] of session.invocationThreads) {
+            labels[invocationId] = this.ensureThreadLabel(session, threadId);
+        }
+
+        for (const [turnId, invocationId] of session.turnInvocations) {
+            const turn = session.turns.find((candidate) => candidate.id === turnId);
+            if (turn?.threadId === undefined) continue;
+
+            labels[invocationId] = this.ensureThreadLabel(session, turn.threadId);
+        }
+
+        for (const record of session.harness.threads()) {
+            if (record.invocationId === undefined) continue;
+
+            // T14/F1: only INDEPENDENT (host) conversations own a display name. An
+            // agent's DEFAULT conversation (`origin: 'agent'`, id `agent:<name>`) is
+            // internal plumbing: minting a number for it would silently consume the
+            // ordinal the user's own block or NEXT conversation must show, and no
+            // event needs the join — a legacy stream carries no thread metadata, so
+            // its blocks are labelled by the shared allocator instead.
+            if (record.origin !== 'host') continue;
+
+            labels[record.invocationId] = this.ensureThreadLabel(session, record.id, record.agent);
+        }
+
+        return labels;
     }
 
     // The label counters a NEW turn starts from: one chained allocator over the
@@ -1992,12 +2306,19 @@ export class SessionStore {
     // high-water so a retired textual label is never re-minted after its turns are
     // deleted. Recorded per turn at creation so deleting an earlier thread cannot
     // renumber later blocks.
+    //
+    // T14/F1: the seed is the union of BOTH durable counters. `mergeLabelHighWater`
+    // collects every number the recorded turns show (legacy `/messages` roots,
+    // nested blocks, and — through the projector's reservation — each conversation
+    // label), while `threadLabelHighWater` carries retired conversation names whose
+    // turns are gone. A new block therefore always starts AFTER a conversation name,
+    // which is what stops a nested child from being minted the root's number.
     private labelSeedOf(session: Session): Record<string, number> | undefined {
         this.mergeLabelHighWater(session, session.turns);
 
         const counters: Record<string, number> = Object.fromEntries(session.labelHighWater);
 
-        for (const [code, used] of collectAgentLabelCounters(this.projectionTurns(session, session.turns))) {
+        for (const [code, used] of session.threadLabelHighWater) {
             counters[code] = Math.max(counters[code] ?? 0, used);
         }
 
@@ -2011,6 +2332,38 @@ export class SessionStore {
         for (const [code, used] of collectAgentLabelCounters(this.projectionTurns(session, turns))) {
             session.labelHighWater.set(code, Math.max(session.labelHighWater.get(code) ?? 0, used));
         }
+    }
+
+    // Restore one label counter map IN PLACE from a detached copy. In place on
+    // purpose: every reader (and the session record projection) holds a reference to
+    // the same Map instance, so replacing `session.threadLabels` would leave a stale
+    // view behind.
+    private restoreCounterMap<T>(target: Map<string, T>, copy: ReadonlyMap<string, T>): void {
+        target.clear();
+        for (const [key, value] of copy) target.set(key, value);
+    }
+
+    // T14/F1: reserve the one ordinal a legacy `/messages` block will show.
+    //
+    // A legacy run is a single fresh block with no conversation record, so nothing
+    // would otherwise take its number until its first event is projected. A task
+    // accepted WHILE that run is still starting would then mint the same label for a
+    // new conversation (`RR1` + `RR1`), and a typed `#RR1` would resolve the wrong
+    // target (latest-wins). Reserving at turn creation settles the number before any
+    // concurrent submit can see it; the block's own projection continues from the
+    // seed recorded for this turn, so it lands on exactly this ordinal.
+    //
+    // The legacy path always runs the preset's PRIMARY agent (`session.harness(...)`
+    // calls the entry agent), so its code is known here even with no events yet.
+    //
+    // The reservation is deliberately NOT released if the run fails before recording
+    // a single event: the turn itself IS published (it stays in the transcript as a
+    // terminal error row), and re-offering its number afterwards could re-mint a
+    // label a `#` reference already resolved to. Only an UNPUBLISHED submit rolls its
+    // counters back (see enqueue's persistence rollback).
+    private reserveLegacyBlockLabel(session: Session): void {
+        const code = agentCodeOf(session.preset.primary);
+        this.reserveConversationOrdinal(session, code, this.nextConversationOrdinal(session, code));
     }
 
     // Bind one explicit reference against the session record. Returns the exact
@@ -2288,6 +2641,27 @@ export class SessionStore {
             if (steered !== undefined) return steered;
         }
 
+        const now = Date.now();
+        const index = session.turnSequence;
+        session.turnSequence += 1;
+
+        // The counters THIS turn starts from, computed over the conversation as it
+        // exists BEFORE this submit opens a thread. Recording the pre-thread state
+        // keeps a first submit's record exactly as it was (no seed) while a later
+        // turn still starts after every label the earlier turns show — the
+        // conversation label itself is reserved by the projection, so leaving it out
+        // of the seed cannot renumber a nested block.
+        const seed = this.labelSeedOf(session);
+
+        // T14/F3: snapshot the label bookkeeping BEFORE this submit mints anything,
+        // so a failed write can restore it exactly (see the catch below). Only the
+        // three label maps mutate between here and the save, and opening a host
+        // thread already allocates its label (the harness notifies the store, which
+        // projects the roster), so the capture must precede `createSubmitThread`.
+        const previousThreadLabels = new Map(session.threadLabels);
+        const previousThreadLabelHighWater = new Map(session.threadLabelHighWater);
+        const previousLabelHighWater = new Map(session.labelHighWater);
+
         // Resolve the execution thread. An explicit id is used as-is (a stopped
         // thread is revived by the explicit host action); an unfocused submit opens
         // a NEW standalone host thread. A reference is a LINK, not ownership: the
@@ -2300,10 +2674,11 @@ export class SessionStore {
                 ? (createdThreadId = this.createSubmitThread(session))
                 : undefined);
 
-        const now = Date.now();
-        const index = session.turnSequence;
-        session.turnSequence += 1;
-        const seed = this.labelSeedOf(session);
+        // R8: bind the conversation's display name at CREATION. A continuation
+        // (same thread) reuses the existing label; a new standalone thread consumed
+        // exactly one ordinal when it was opened above.
+        const targetLabel =
+            targetThread === undefined ? undefined : this.ensureThreadLabel(session, targetThread);
 
         // `status: 'queued'` and no `startedAt`: this record is complete and
         // renderable before any execution, which is what lets a reload show the
@@ -2313,6 +2688,7 @@ export class SessionStore {
             index,
             prompt: input,
             threadId: targetThread,
+            ...(targetLabel === undefined ? {} : { threadLabel: targetLabel }),
             // Omitted when nothing was referenced, so a plain task keeps the exact
             // legacy record shape. The bound list is persisted and expanded later.
             ...(boundReferences.length === 0 ? {} : { references: boundReferences }),
@@ -2360,6 +2736,15 @@ export class SessionStore {
 
             session.labelSeeds.delete(turn.id);
             session.settlers.delete(turn.id);
+
+            // T14/F3: the label this submit minted was NEVER PUBLISHED (the 202 never
+            // left, the turn never ran), so the counters must roll back with the
+            // thread. Leaving them behind would retire an ordinal the user never saw
+            // and the next accepted submit would be numbered past it (RR5 instead of
+            // the expected RR4).
+            this.restoreCounterMap(session.threadLabels, previousThreadLabels);
+            this.restoreCounterMap(session.threadLabelHighWater, previousThreadLabelHighWater);
+            this.restoreCounterMap(session.labelHighWater, previousLabelHighWater);
 
             // The new thread was created for this submit only; a failed write must
             // not leave an empty conversation behind.
@@ -2475,6 +2860,13 @@ export class SessionStore {
             {
                 at,
                 prompt: input,
+                // T12b: attribute the steer to the conversation it actually
+                // reached. A parent turn owning a running CHILD records the child
+                // id; a normal steer into the owner's own thread omits the field
+                // (keeping the pre-T12b wire shape for root conversations).
+                ...(owning.threadId !== undefined && owning.threadId !== threadId
+                    ? { threadId }
+                    : {}),
                 ...(references.length === 0
                     ? {}
                     : { references: references.map((reference) => ({ ...reference })) })
@@ -3808,6 +4200,10 @@ export class SessionStore {
             ([turnId]) => !removedIds.has(turnId)
         );
         const highWaterEntries = [...session.labelHighWater];
+        // R8: a deleted conversation's display name leaves the map; the per-code
+        // high-water STAYS, so the retired name is never minted again.
+        const threadLabelEntries = [...session.threadLabels].filter(([id]) => !doomed.has(id));
+        const threadLabelHighWaterEntries = [...session.threadLabelHighWater];
 
         const previous = this.sessionRecord(session);
 
@@ -3822,7 +4218,13 @@ export class SessionStore {
                 : { turnInvocations: Object.fromEntries(invocationEntries) }),
             ...(highWaterEntries.length === 0
                 ? {}
-                : { labelHighWater: Object.fromEntries(highWaterEntries) })
+                : { labelHighWater: Object.fromEntries(highWaterEntries) }),
+            ...(threadLabelEntries.length === 0
+                ? {}
+                : { threadLabels: Object.fromEntries(threadLabelEntries) }),
+            ...(threadLabelHighWaterEntries.length === 0
+                ? {}
+                : { threadLabelHighWater: Object.fromEntries(threadLabelHighWaterEntries) })
         };
 
         // Drop the stale keys from the override when they are absent in the
@@ -3830,6 +4232,8 @@ export class SessionStore {
         if (seedEntries.length === 0) delete projected.labelSeeds;
         if (invocationEntries.length === 0) delete projected.turnInvocations;
         if (highWaterEntries.length === 0) delete projected.labelHighWater;
+        if (threadLabelEntries.length === 0) delete projected.threadLabels;
+        if (threadLabelHighWaterEntries.length === 0) delete projected.threadLabelHighWater;
 
         this.persistOrThrow(new Map([[session.id, projected]]));
 
@@ -3852,6 +4256,9 @@ export class SessionStore {
 
         // Purge the owning turns and every link that pointed at them.
         session.turns = survivors;
+
+        // R8: forget the doomed conversations' names (their high-water stays).
+        for (const id of doomed) session.threadLabels.delete(id);
         for (const turn of survivors) {
             if (turn.references === undefined) continue;
 
@@ -3940,6 +4347,10 @@ export class SessionStore {
         // A reset starts a NEW conversation, so retired labels are forgotten with it
         // (unlike deletion, which keeps the tombstone counters).
         session.labelHighWater.clear();
+        // R8: a reset opens a NEW conversation, so conversation names restart too
+        // (deletion, by contrast, keeps the high-water to retire a name forever).
+        session.threadLabels.clear();
+        session.threadLabelHighWater.clear();
         session.turnInvocations.clear();
         session.invocationThreads.clear();
         // N4: a reset forgets the conversation, so a question from it is no longer

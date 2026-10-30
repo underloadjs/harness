@@ -593,14 +593,21 @@ button {
 }
 
 /* Global tools view ---------------------------------------------------- */
-/* Full-width, keyed list of every server tool (core entries included) above the
-   manual runner. After R21.2 this is the ONLY catalogue: the right rail no longer
-   duplicates it, and a call always executes on the server. The view replaces the
-   centre column when the topbar's icon-only Tools toggle is pressed (R3). */
+/* Full-width, keyed list of every server tool (core entries included). After R21.2
+   this is the ONLY catalogue: the right rail no longer duplicates it, and a call
+   always executes on the server. The view replaces the centre column when the
+   topbar's icon-only Tools toggle is pressed (R3).
+
+   The list is the WHOLE content area: the manual runner lives in the shared modal
+   (ui/dialog.ts) and opens only when an entry is activated, so there is exactly one
+   scroll box here (the grid below) and no runner pinned under the fold. */
 
 .tools-pane {
     gap: 12px;
     padding: 14px;
+    /* Safety valve only: the list below is the scroll region while the head fits.
+       `auto` (not `hidden`) keeps the explanatory hint reachable on a very short
+       viewport instead of clipping it. */
     overflow: auto;
 }
 
@@ -624,9 +631,13 @@ button {
 
 .tool-tab-list {
     display: grid;
+    /* `flex: 1` + `min-height: 0` make the grid the pane's remaining height (the
+       head stays pinned above it); rows start at the top instead of stretching. */
+    flex: 1;
     grid-template-columns: repeat(auto-fill, minmax(210px, 1fr));
+    align-content: start;
     gap: 6px;
-    max-height: 32vh;
+    min-height: 0;
     padding-right: 2px;
     overflow: auto;
 }
@@ -687,10 +698,80 @@ button {
     font-size: 10.5px;
 }
 
+/* The runner host is the dialog's content now (not a slot under the list). It is a
+   full-height flex column so the persistent runner pane keeps its own scroll box
+   inside the modal body. `flex: 1 1 auto` (not the `1` shorthand) keeps the content
+   height as the basis while still letting the chain shrink under the dialog cap —
+   the same rule `.dialog-body > .tool-body` uses. */
 .tool-runner-slot {
     display: flex;
-    flex: 1;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-width: 0;
     min-height: 0;
+}
+
+/* The dialog body already supplies the inset; the runner's own log padding is all
+   that should separate the card from the frame. */
+.dialog-body > .tool-runner-slot {
+    padding: 0;
+}
+
+/* Manual tool runner inside the modal (F3) -------------------------------
+   This is the ACTUAL current runner path built by main.ts:
+     .dialog-body > .tool-runner-slot > .pane > .log-wrap > .log > .tool-card
+   The card has NO `.tool-body`/`.tool-section` children: it is the direct-call
+   form (notes, schema, arguments, Call, and `.tool-output > .card-body`). The old
+   `.dialog-body > .tool-body` sizing rules only cover the tool-call CHIP dialog
+   (ui/tools.ts), so the runner needs its own chain or it stays content-sized and
+   leaves the blank tail the report describes.
+   Fill the dialog top-down, keep the form controls intrinsic, and let the result
+   payload take the remaining height and scroll itself. */
+.dialog-body > .tool-runner-slot > .pane > .log-wrap {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-height: 0;
+    /* The dialog body owns the outer inset; a second 18/20px band would shrink
+       the usable result pane for no visual gain. */
+    padding: 0;
+}
+
+.dialog-body > .tool-runner-slot > .pane > .log-wrap > .log {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-height: 0;
+    max-width: none;
+    margin: 0;
+}
+
+/* The card is the flex item that fills `.log`; `min-height: 0` lets the output
+   child shrink below its max-content height instead of keeping the dialog at its
+   cap while leaving an empty tail. */
+.dialog-body > .tool-runner-slot > .pane > .log-wrap > .log > .tool-card {
+    flex: 1 1 auto;
+    min-height: 0;
+}
+
+/* Every form element keeps its intrinsic height; only the result grows. */
+.dialog-body > .tool-runner-slot > .pane > .log-wrap > .log > .tool-card > :not(.tool-output) {
+    flex: 0 0 auto;
+}
+
+/* Result payload = the destination. The card is a flex column, so this pane takes
+   all remaining height and its `.card-body` scrolls long output internally. */
+.dialog-body > .tool-runner-slot > .pane > .log-wrap > .log > .tool-card > .tool-output {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-height: 96px;
+}
+
+.dialog-body > .tool-runner-slot > .pane > .log-wrap > .log > .tool-card > .tool-output > .card-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
 }
 
 .tool-session {
@@ -793,6 +874,87 @@ button {
     padding: 10px 20px;
     border-bottom: 1px solid var(--border);
     background: var(--bg-bar);
+}
+
+/* Compact composer agent button (R9/R10/R11) ------------------------------- */
+/* The host lives INSIDE the composer field frame (`.composer-controls`). It keeps
+   the `.agent-slot` class so the Tools view's existing show/hide code and tests are
+   unchanged, but the rail band (padding/border/background) belonged to the old
+   centre row and must not paint around a 32px button. */
+.composer-field .agent-slot {
+    display: flex;
+    flex: 0 0 auto;
+    padding: 0;
+    border: 0;
+    background: transparent;
+}
+
+/* ONE control (R11). The old pair (cycle button + model chevron) and its popover are
+   removed: pressing the agent's name opens the shared dialog, so there is no cycle
+   behaviour to confuse with a team change and no chevron beside the send control. */
+.agent-control {
+    display: flex;
+    flex: 0 0 auto;
+    min-width: 0;
+}
+
+/* R16 (T7): the button sits on the composer's LEFT edge inside the frame. It is
+   deliberately SEAMLESS: no standalone border/background box, so it reads as part of
+   the input surface (`--bg-input` comes from `.composer-field`) instead of a second
+   widget next to it. The transparent border keeps the 32px box and the hover/focus
+   ring geometry identical to the previous outlined button, and the muted label keeps
+   it secondary to the text the reader is writing. Activity ownership is unchanged
+   (`--accent` via `[data-activity='active']` below). */
+.agent-control-button {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    height: 32px;
+    max-width: 180px;
+    padding: 0 10px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    background: transparent;
+    /* `--muted` is the palette's real secondary text token (there is no
+       `--text-muted` variable in :root). */
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.agent-control-button:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.agent-control-button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.agent-control-name {
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* The threading code is the small-width label; it stays in the DOM at every width
+   so a resize needs no re-render. `aria-hidden` keeps it out of the accessible name
+   (the button's aria-label carries the full title). */
+.agent-control-code {
+    display: none;
+    font-weight: 600;
+    letter-spacing: 0.04em;
+}
+
+/* Activity: the compact button carries the same `data-activity`/`aria-busy` pair as
+   a deck tile (ui/activity.ts). A visible border/colour change is enough here; the
+   animated ring stays on the full card inside the dialog. */
+.agent-control[data-activity='active'] .agent-control-button {
+    border-color: var(--accent);
+    color: var(--accent);
 }
 
 .agent-row-wrap {
@@ -1287,6 +1449,101 @@ button {
     font-size: 11.5px;
 }
 
+/* Shared agent dialog (R11/R12) ----------------------------------------- */
+/* Content of ui/dialog.ts's modal (`.dialog-body` owns padding/scroll). It stacks
+   three sections: the explicit primary choice, the existing team deck (models /
+   add / remove) and the read-only preset instructions. */
+.agent-dialog {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.agent-dialog-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* Honest lock reason (frozen saved session / run in flight / session creation).
+   Only painted when team editing is actually restricted (main.ts `hint`). */
+.agent-dialog-note {
+    margin: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-input);
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.4;
+}
+
+.agent-dialog-label {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+/* Primary agent chooser: one button per member, aria-pressed on the current
+   primary. A disabled current/locked entry reads as state, not as an action. */
+.agent-dialog-primary-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.agent-dialog-primary {
+    padding: 6px 11px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--bg-input);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
+.agent-dialog-primary:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.agent-dialog-primary[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--accent);
+}
+
+.agent-dialog-primary:disabled {
+    cursor: default;
+}
+
+/* The dialog IS the disclosure: the deck's phone summary has nothing to collapse,
+   and the cards stay visible at every width (the modal already scrolls). */
+.agent-dialog .agent-summary {
+    display: none;
+}
+
+.agent-dialog .agent-row-wrap:not([data-open='true']) .agent-row {
+    display: flex;
+}
+
+.agent-dialog .agent-row-wrap {
+    margin: 0;
+    max-width: none;
+}
+
+/* Instructions: one collapsed preset detail per agent. The existing
+   `.agent-detail*`/`.agent-instruction` rules paint the body; these only add a
+   little room between collapsed rows inside the modal. */
+.agent-dialog-instructions .agent-detail {
+    padding: 4px 0;
+}
+
 /* R7: `.agent-lock` / `.link-button` styled the saved-session "team is frozen"
    notice and its "New session" link inside the agent row (ui/agents.ts). The
    notice is removed from the UI, so the rules are removed here with it; no
@@ -1516,6 +1773,52 @@ button {
 
 .tile:not(.is-expanded) .tile-body {
     display: none;
+}
+
+/* T12b: one top-level CONVERSATION per persistent thread. The server still records
+   one turn per run, but every run of the same thread is projected into this one
+   container, so a continuation/steer never appears as a second top-level
+   conversation. Each exchange keeps its own tile (and therefore its own events,
+   timing and # result blocks); only the repeated conversation identity is hidden
+   on the later exchanges. */
+.conversation {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.conversation .turn-row + .turn-row {
+    /* A small separation makes the ordered exchanges readable while the shared
+       conversation container still reads as ONE block. */
+    margin-top: 4px;
+}
+
+.conversation .turn-row.is-continuation:not([data-child-thread]) :is(.tile-thread, .tile-agent) {
+    /* The conversation label is an identity, not a per-message measurement: show
+       it once, on the first exchange. A nested CHILD continuation keeps its own
+       label so it stays addressable/identifiable. */
+    display: none;
+}
+
+.conversation .turn-row[data-child-thread] {
+    /* Actual agent-spawned child conversations stay NESTED inside the owning
+       conversation; only user-created threads are top-level. */
+    margin-left: 14px;
+    padding-left: 8px;
+    border-left: 2px solid var(--border);
+}
+
+/* Expanding a conversation opens EVERY exchange in it, not only the clicked run.
+   The selected tile keeps its own `.is-expanded` treatment (header preview hidden,
+   body shown); the sibling exchanges get their body shown too. */
+.conversation.is-expanded .tile-body {
+    display: flex;
+}
+
+.conversation.is-expanded .tile-select {
+    cursor: default;
 }
 
 /* The active (or user-selected) block: full width, content in full, strong frame.
@@ -1772,6 +2075,29 @@ button {
     border-radius: 0 8px 8px 0;
     background: var(--accent-soft);
     font-size: 13px;
+}
+
+/* R9: a steered user message lives INSIDE the same conversation tile. It is the
+   user's own prompt surface (same accent bar/scale as `.turn-prompt`) with an
+   explicit role line, because it was injected mid-run rather than submitted as a
+   second turn. It deliberately has no tile/row of its own: a steer is part of the
+   conversation it steered. */
+.turn-steer {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 9px 11px;
+    border-left: 2px solid var(--accent);
+    border-radius: 0 8px 8px 0;
+    background: var(--accent-soft);
+    font-size: 13px;
+}
+
+.turn-steer-role {
+    color: var(--muted);
+    font-size: 10.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
 }
 
 /* T5 replay: the chip strip under a recorded turn's prompt. Same chip building
@@ -2378,6 +2704,82 @@ button {
     max-height: 300px;
 }
 
+/* Tool-CALL-CHIP details inside the modal (R12) --------------------------
+   SCOPE: these selectors cover ONLY the transcript tool-chip dialog, where
+   ui/tools.ts MOVES `.tool-body` directly into `.dialog-body`. They do NOT match
+   the manual runner (which lives under `.tool-runner-slot` and has no `.tool-body`);
+   the runner's actual chain is sized by the block above. The shell (ui/dialog.css)
+   is a content-sized flex column capped at 82vh; the panes below are the flex
+   chain that fills that cap:
+
+     .dialog-body (flex column, scroll fallback)
+       .tool-body (fills the body, zero card padding)
+         arguments section (intrinsic up to a viewport-relative cap)
+           .code-block (scrolls its own overflow)
+         result section (flex: 1, takes the rest of the height)
+           .tool-result (flex column)
+             .code-block (fills the result pane, scrolls long payloads)
+
+   `min-height: 0` on every level is what lets a level shrink below its content
+   size instead of pushing the dialog past the viewport clearance. Without it the
+   result pane's max-content height would keep the dialog at its cap while the
+   pane itself stayed at 300px, leaving the blank area the report describes.
+   The closed card keeps the base `.tool-body` padding because these selectors
+   require the `.dialog-body` parent. */
+.dialog-body > .tool-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    /* `.dialog-body` already supplies the inset; the card's own would double it. */
+    padding: 0;
+}
+
+/* The sections are flex items of `.tool-body`; `min-height: 0` lets the result
+   section shrink to the height the dialog cap actually leaves. The arguments
+   section opts out of shrinking below, but the floor is still harmless there. */
+.dialog-body > .tool-body > .tool-section {
+    min-height: 0;
+}
+
+/* Arguments are context, not the destination: they keep their intrinsic height
+   up to a viewport-relative cap so a huge request cannot starve the result.
+   `flex-shrink: 0` is deliberate: ordinary proportional shrink lets a very long
+   result (whose content basis is enormous) take almost all of the missing space
+   out of the smaller arguments pane at once, collapsing it below its label and
+   painting its text over the result. The cap is what makes the pane smaller on
+   short screens, and its own `overflow: auto` scrolls instead of clipping. */
+.dialog-body > .tool-body > .tool-section:first-child {
+    flex: 0 0 auto;
+}
+
+.dialog-body > .tool-body > .tool-section:first-child > .code-block {
+    flex: 0 1 auto;
+    max-height: min(32vh, 280px);
+}
+
+/* Result is the payload the user opened the dialog for: it takes all remaining
+   height and its block grows/shrinks with it. `max-height: none` overrides the
+   card's 300px cap only inside the modal; direct-runner cards keep that cap. */
+.dialog-body > .tool-body > .tool-section:last-child {
+    flex: 1 1 auto;
+    /* A usable result floor. In a very short viewport (landscape phone) the two
+       panes cannot both fit; the floor makes `.dialog-body` scroll instead of
+       collapsing the result into an unreadable sliver. */
+    min-height: 96px;
+}
+
+.dialog-body > .tool-body > .tool-section:last-child > .tool-result {
+    display: flex;
+    flex: 1 1 auto;
+    flex-direction: column;
+    min-height: 0;
+}
+
+.dialog-body > .tool-body > .tool-section:last-child > .tool-result > .code-block {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
+}
+
 /* Notices (cancelled, endpoint changed, failed) span the grid. */
 .notice {
     padding: 8px 12px;
@@ -2829,12 +3231,17 @@ button {
     word-break: break-word;
 }
 
+/* R4/R9 (T5): the entry-agent transcript button and its `{}`/label rules are
+   removed from the stylesheet together with the DOM control. The transcript itself
+   is still rendered from the server's turns; only the raw `session.messages`
+   JSON dialog was deleted. */
+
 /* Composer (R9/R10) ----------------------------------------------------- */
 
 /* R7/T15: compact outer spacing. The composer is a single field column now (the
    attachment button is gone), so it only needs a small breathing edge around the
    box; 8px/16px replaces the old 13px/20px shell padding without touching the
-   responsive grid or the action's in-field placement. */
+   responsive grid or the frame's internal layout. */
 .composer {
     display: flex;
     align-items: flex-end;
@@ -2845,10 +3252,9 @@ button {
 }
 
 /* Attachments (T5 clip/attach) -------------------------------------------
-   `.composer-body` is the composer's column: the error line sits ABOVE the existing
-   `.composer-field`, so the action's absolute position inside the field is
-   unchanged. R6 removed the attach button, so the column is the composer's only
-   child and nothing to its right reserves width. */
+   `.composer-body` is the composer's column: the error/routing lines sit ABOVE the
+   `.composer-field` frame (R9/R10 moved ALL controls INSIDE that frame). The column
+   is the composer's only child. */
 .composer-body {
     display: flex;
     flex: 1;
@@ -3165,14 +3571,56 @@ button {
    arrive through clipboard paste, drag/drop and @ file lookup only; leaving either
    selector here would keep space/hit-area rules for a control that no longer exists. */
 
-/* The box that holds the field AND its single action (R10). `position: relative`
-   is what keeps the action inside the input box in every state; `min-width: 0`
-   lets the field shrink inside the flex column instead of overflowing it. */
+/* THE input frame (R10/R11 + T7). This element owns the visible border/background and
+   holds the notched label (absolute), the agent button (LEFT, R16), the text column
+   and the right-hand stop/send row (`.composer-controls`), so every control is
+   inside the same box at every width. It stays the positioning context for the @/#
+   popup AND the label (`position: relative`), and `min-width: 0` lets the whole frame
+   shrink inside the composer column. `align-items: flex-end` keeps the controls on
+   the field's bottom line while the textarea auto-grows above them. */
 .composer-field {
     position: relative;
     display: flex;
+    align-items: flex-end;
     flex: 1;
     min-width: 0;
+    padding: 2px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--bg-input);
+}
+
+/* R14/R15 (T7): the notched label straddles the top border (half above it, half
+   inside), so the frame only needs the extra top padding WHILE the label is painted.
+   main.ts `paintComposerTarget` mirrors `composerTarget.hidden` onto `data-target`;
+   an idle composer with no routing label therefore stays one input line tall
+   (2px frame padding + 32px content + borders), and a labeled one grows by exactly
+   the notch clearance (8px) instead of a full label row + gap. 8px clears the
+   label's half-height (10.5px * line-height 1 / 2 = 5.25px) with room to spare, so
+   the label never touches the agent button or the first text line. */
+.composer-field[data-target='true'] {
+    padding-top: 8px;
+}
+
+/* Right-hand control row: stop-all (when pending) and the single send/stop action.
+   The agent button used to live here; R16 (T7) moved it to the frame's LEFT edge, so
+   this row is exactly the two cancellation/send affordances the user asked to keep on
+   the right. Flow children, never absolute: they cannot escape the frame, and the
+   text column gives up width first. `flex-wrap` is the last-resort layout at
+   extremely narrow widths (buttons move above one another INSIDE the border instead
+   of overflowing it). */
+.composer-controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    justify-content: flex-end;
+    gap: 6px;
+    flex: 0 0 auto;
+    /* R15 (T7): the row holds only stop/send now (the agent button moved to the left
+       edge, R16). A 2px edge inset keeps the 28px controls on the same 32px content
+       line as the text field instead of adding 4px of dead height above and below —
+       that padding was part of why the idle composer read as a tall blank box. */
+    padding: 2px 2px 2px 0;
 }
 
 .composer-input {
@@ -3198,22 +3646,28 @@ button {
 /* R9/R5: the CHAT field is one row by default and grows by script (main.ts autoGrow)
    up to a LINE cap — 3 text lines on a phone viewport (<=860px), 5 on desktop — then
    scrolls. A contentEditable div has no `rows` attribute, so the one-row minimum is
-   an explicit line box + padding (13.5px * 1.45 + 2*6px padding + 2px border = ~34px),
-   replacing the old `rows = 1` default; the script still owns every height above it.
+   an explicit line box + padding (13.5px * 1.45 + 2*6px padding = ~32px), replacing
+   the old `rows = 1` default; the script still owns every height above it.
    `resize` is off because the drag handle would fight the measured height.
    `max-height: none` is deliberate: the script computes the cap from the field's live
    line-height/padding/borders, so the base 200px box (still used by the tool-runner
    arguments textarea) must not clip the fifth line at large fonts or zoom.
 
-   R7/T15 compact inset: 6px vertical + 8px left is the smallest comfortable text
-   inset on the dark box. The right gutter is NOT attachment space (that button is
-   gone): it clears the in-field action at `right: 8px` + `width: 28px` plus ~8px of
-   breathing room, so a wrapped line never runs under the send/stop glyph. */
+   R9/R10/R11 (T5): the border/background moved to `.composer-field` (the frame), so
+   the text column is borderless and shares that frame with the control row. The right
+   gutter no longer reserves room for an overlay button: the controls are flow
+   siblings that take their own width, which is what keeps text from ever running
+   under the send glyph. `flex: 1; min-width: 0` makes the text the element that
+   shrinks when the frame gets narrow. */
 .composer-field .composer-input {
-    width: 100%;
-    min-height: 34px;
+    flex: 1;
+    width: auto;
+    min-width: 0;
+    min-height: 32px;
     max-height: none;
-    padding: 6px 44px 6px 8px;
+    padding: 6px 4px 6px 8px;
+    border: 0;
+    background: transparent;
     resize: none;
     overflow-y: auto;
 }
@@ -3303,8 +3757,11 @@ button {
     cursor: default;
 }
 
-/* @ / # popup. Positioned at the caret by main.ts (absolute coordinates inside
-   .composer-field); the fallback top keeps it attached before first placement. */
+/* @ / # popup. Positioned at the caret by main.ts (`placeComposerPopup`: absolute
+   coordinates inside .composer-field). The composer is docked at the bottom of the
+   pane, so main.ts flips the list ABOVE the caret line when that side has more room
+   and shrinks `max-height` inline to the chosen side; 240px is the default cap and
+   the `top: 100%` / `left: 0` values are the pre-placement fallback. */
 .composer-popup {
     position: absolute;
     top: 100%;
@@ -3340,6 +3797,13 @@ button {
 
 .composer-popup-option[data-active='true'] {
     background: var(--accent-soft);
+}
+
+/* Folder rows are listed ABOVE the file hits (main.ts state.items order) and drill
+   into the directory when picked; the trailing "/" plus this weight keeps them
+   distinguishable from a file with a similar name. */
+.composer-popup-option[data-folder='true'] .composer-popup-name {
+    font-weight: 600;
 }
 
 .composer-popup-token {
@@ -3383,13 +3847,14 @@ button {
    (keyboard + pointer); the glyph is decorative, the accessible name is set in
    main.ts (`aria-label`/`title`). The outline keeps it visible on the dark input
    without adding layout weight. */
+/* R10/R11 (T5): the action is a FLOW child of `.composer-controls`, so it lives
+   inside the frame border at every width instead of being anchored over the text.
+   The circle keeps its old size/colour. */
 .composer-action {
-    position: absolute;
-    right: 8px;
-    bottom: 8px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    flex: 0 0 auto;
     width: 28px;
     height: 28px;
     padding: 0;
@@ -4069,6 +4534,32 @@ button {
         justify-content: flex-end;
     }
 
+    /* R11 small-width label: the agent button shows the thread code
+       (`Reviewer` -> `RR`) instead of the full title, and keeps its explicit
+       aria-label so the compact visual is never the accessible name. The code is
+       already in the DOM at wide widths, so this is a pure CSS swap. */
+    .agent-control-name {
+        display: none;
+    }
+
+    .agent-control-code {
+        display: inline;
+    }
+
+    .agent-control-button {
+        max-width: 64px;
+        padding: 0 8px;
+    }
+
+    /* R10: the control row keeps its buttons on one line by default; at very narrow
+       widths it may wrap INSIDE the frame rather than pushing send out of it.
+       R15 (T7): the phone row uses the same 2px edge inset as desktop so the idle
+       composer stays one input line tall at 360px too. */
+    .composer-controls {
+        gap: 4px;
+        padding: 2px 1px 2px 0;
+    }
+
     /* The list stays one full-width column on a phone: only the spacing and the
        reading surface shrink. */
     .log-wrap {
@@ -4632,14 +5123,13 @@ button {
 
 /* Separate STOP-ALL control (R5/R7). It sits LEFT of the inline action so the
    submit/send affordance never moves, and it exists only while work is pending
-   and the inline action is not already a stop. */
+   and the inline action is not already a stop. Flow child of
+   `.composer-controls` (T5 R10) so it is inside the frame too. */
 .composer-stop {
-    position: absolute;
-    right: 44px;
-    bottom: 8px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
+    flex: 0 0 auto;
     width: 28px;
     height: 28px;
     padding: 0;
@@ -4672,20 +5162,43 @@ button {
     outline-offset: 2px;
 }
 
-/* Two circles need the wider gutter; the single-action state keeps the original
-   inset (composer-style.test.ts pins that padding). */
-.composer.has-stop .composer-field .composer-input {
-    padding-right: 76px;
-}
+/* The old `.composer.has-stop` right-gutter reservation is gone: stop/send are flow
+   siblings of the text now (T5 R10), so no overlay can cover a wrapped line and no
+   state-dependent padding is needed. main.ts still toggles `has-stop` because the
+   running-state class is harmless and composer-control.test.ts observes it. */
 
-/* Routing line above the field: "New thread" / "New connected thread" /
-   "Continuing T2" / "Steering T2". Low-contrast so it informs without competing
-   with the draft; hidden when there is nothing to distinguish. */
+/* R14 (T7): routing label IN the frame's top border: "New thread" / "New connected
+   thread" / "Continuing T2" / "Steering T2". It used to be a separate block row
+   above the field (margin + `.composer-body` gap = ~25px of dead height); now it is
+   absolutely positioned on the border line like an outlined field's notched label.
+   The background is the COMPOSER surface (`--bg-bar`, set on `.composer`), not the
+   input surface, so the patch masks the frame border above/inside it and reads as a
+   real notch. It is out of flow, so it adds no height of its own; the frame's
+   `[data-target='true']` padding is the only reserved space (see above).
+   `pointer-events: none` keeps the label from stealing the click that focuses the
+   field. Low-contrast so it informs without competing with the draft; hidden when
+   there is nothing to distinguish. */
 .composer-target {
-    margin: 0 0 4px;
-    color: var(--text-dim);
+    position: absolute;
+    top: 0;
+    left: 10px;
+    z-index: 1;
+    max-width: calc(100% - 20px);
+    margin: 0;
+    padding: 0 5px;
+    transform: translateY(-50%);
+    border-radius: 4px;
+    background: var(--bg-bar);
+    /* `--muted` is the palette's real secondary token; `--text-dim` is referenced
+       elsewhere but never declared in `:root`, so it would inherit full-strength
+       text and let this label compete with the draft. */
+    color: var(--muted);
     font-size: 10.5px;
-    line-height: 1.4;
+    line-height: 1;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    pointer-events: none;
 }
 
 .composer-target[hidden] {
@@ -4697,7 +5210,8 @@ button {
 }
 
 .composer-target[data-mode='continue'] {
-    color: var(--text-muted);
+    /* Same reason as above: `--text-muted` is not a declared token. */
+    color: var(--muted);
 }
 
 @media (forced-colors: active) {

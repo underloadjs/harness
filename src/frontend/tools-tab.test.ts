@@ -22,6 +22,14 @@
 //     up without a reload;
 //   - a truncated toolRequest result keeps its raw payload and adds guidance that
 //     names the remaining count and asks for refined tags.
+//
+// Dialog rework (main.ts `selectTool`/`openToolDialog`/`setToolsView`): opening the
+// tools view shows ONLY the catalogue list (head = "Tools"/"catalogue"/count note)
+// and activating a `.tool-tab-button` opens the runner inside the shared
+// `.dialog` (`.dialog-title` = tool name, `.tool-runner-slot > .pane > .log-wrap >
+// .log > .tool-card`).
+// The runner therefore does not exist in the document until an entry is clicked —
+// every test that reads `.tool-args` must click its `.tool-tab-button` first.
 
 import type { HarnessDescriptor, SessionSnapshot, ToolDescriptor } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
@@ -228,8 +236,32 @@ it('lists core tools in the global tools view, calls with the captured session a
         [...document.querySelectorAll<HTMLElement>('.tool-tab-kind')].map((node) => node.textContent)
     ).toEqual(['core · session', 'searchable']);
 
-    // The first tool opens automatically; a core tool reports its session context
-    // before anything is created.
+    // Dialog rework: opening the tools view NO LONGER auto-opens a tool. The head
+    // describes the catalogue itself and no runner exists until an entry is picked.
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(document.querySelector('.tool-args')).toBeNull();
+    expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
+    expect(document.querySelector('.harness-id')?.textContent).toBe('catalogue');
+    expect(document.querySelector('.harness-note')?.textContent).toBe(
+        '2 tools · calls run on the harness server'
+    );
+
+    // Activating the core entry adopts the persistent runner into the shared modal.
+    // A core tool reports its session context before anything is created.
+    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="toolRequest"]')?.click();
+
+    expect(document.querySelectorAll('.dialog')).toHaveLength(1);
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('toolRequest');
+    // F3: this is the REAL runner DOM the sizing rules must target. It is a direct
+    // form card under `.log`, with `.tool-output > .card-body` and NO `.tool-body`
+    // (that class belongs to the transcript tool-chip dialog only).
+    const runnerCard = document.querySelector<HTMLElement>(
+        '.dialog .tool-runner-slot > .pane > .log-wrap > .log > .tool-card'
+    );
+    expect(runnerCard).not.toBeNull();
+    expect(runnerCard?.parentElement?.className).toBe('log');
+    expect(runnerCard?.querySelector(':scope > .tool-body')).toBeNull();
+    expect(runnerCard?.querySelector(':scope > .tool-output > .card-body')).not.toBeNull();
     expect(document.querySelector('.main-title')?.textContent).toBe('toolRequest');
     expect(byClass('.agent-slot', 'div').hidden).toBe(true);
     expect(document.querySelector('.tool-session')?.textContent).toBe(
@@ -295,6 +327,106 @@ it('lists core tools in the global tools view, calls with the captured session a
     expect(byClass('.tool-hint', 'p').hidden).toBe(true);
 });
 
+// Dialog rework: the manual runner is a MODAL, not an inline panel under the list.
+// This test pins the modal contract itself — the list-only head, the dialog title,
+// one-at-a-time replacement, and the close reset (head back to the catalogue,
+// `aria-pressed` false, focus back on the entry that opened it).
+it('opens the tool runner in the shared dialog and restores the list on close', async () => {
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL) => {
+            const url = String(input);
+            if (url === '/api') return json(bootstrap());
+            if (url === '/api/models') return json({ models: ['m1'] });
+
+            throw new Error(`unexpected request: ${url}`);
+        })
+    );
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    openTools();
+    await flush();
+
+    // The view is the catalogue only: no layer, no runner, and a head that
+    // describes the list.
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(document.querySelector('.tool-args')).toBeNull();
+    expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
+    expect(document.querySelector('.harness-id')?.textContent).toBe('catalogue');
+    expect(document.querySelector('.harness-note')?.textContent).toBe(
+        '2 tools · calls run on the harness server'
+    );
+
+    const toolRequestButton = byClass('.tool-tab-button[data-tool="toolRequest"]', 'button');
+    const fileReadButton = byClass('.tool-tab-button[data-tool="fileRead"]', 'button');
+    // Every entry advertises the popup it opens and starts unpressed.
+    expect(toolRequestButton.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(toolRequestButton.getAttribute('aria-pressed')).toBe('false');
+    expect(fileReadButton.getAttribute('aria-pressed')).toBe('false');
+
+    toolRequestButton.click();
+
+    // Exactly one dialog, named after the tool, with the runner adopted inside it.
+    expect(document.querySelectorAll('.dialog')).toHaveLength(1);
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('toolRequest');
+    expect(
+        document.querySelector('.dialog .tool-runner-slot > .pane > .log-wrap > .log > .tool-card')
+    ).not.toBeNull();
+    expect(toolRequestButton.getAttribute('aria-pressed')).toBe('true');
+    expect(fileReadButton.getAttribute('aria-pressed')).toBe('false');
+    expect(document.querySelector('.main-title')?.textContent).toBe('toolRequest');
+    expect(document.querySelector('.harness-id')?.textContent).toBe('Core tools');
+    expect(document.querySelector('.harness-note')?.textContent).toBe(
+        'core · tags: core, harness · session-bound'
+    );
+
+    // A second selection REPLACES the layer instead of stacking a second one.
+    fileReadButton.click();
+
+    expect(document.querySelectorAll('.dialog')).toHaveLength(1);
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('fileRead');
+    expect(toolRequestButton.getAttribute('aria-pressed')).toBe('false');
+    expect(fileReadButton.getAttribute('aria-pressed')).toBe('true');
+    expect(document.querySelector('.main-title')?.textContent).toBe('fileRead');
+    expect(document.querySelector('.harness-id')?.textContent).toBe('Files');
+    expect(document.querySelector('.harness-note')?.textContent).toBe('searchable · tags: files, read');
+
+    // `.dialog-close` removes the layer, resets the pressed state, repaints the
+    // catalogue head and hands focus back to the entry that opened it.
+    byClass('.dialog-close', 'button').click();
+
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(fileReadButton.getAttribute('aria-pressed')).toBe('false');
+    expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
+    expect(document.querySelector('.harness-id')?.textContent).toBe('catalogue');
+    expect(document.querySelector('.harness-note')?.textContent).toBe(
+        '2 tools · calls run on the harness server'
+    );
+    expect(document.activeElement).toBe(fileReadButton);
+
+    // Escape is the other dismissal path and converges on the same reset.
+    fileReadButton.click();
+    expect(document.querySelectorAll('.dialog')).toHaveLength(1);
+
+    document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(fileReadButton.getAttribute('aria-pressed')).toBe('false');
+    expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
+    expect(document.querySelector('.harness-id')?.textContent).toBe('catalogue');
+    expect(document.querySelector('.harness-note')?.textContent).toBe(
+        '2 tools · calls run on the harness server'
+    );
+    expect(document.activeElement).toBe(fileReadButton);
+
+    // The list itself never left the stage: the dialog sits over it, not instead.
+    expect(document.querySelector('.stage .tools-pane')?.isConnected).toBe(true);
+    expect(document.querySelector('.dialog-overlay')).toBeNull();
+});
+
 it('shows a server request failure for a core call instead of pretending it ran', async () => {
     vi.stubGlobal(
         'fetch',
@@ -321,6 +453,9 @@ it('shows a server request failure for a core call instead of pretending it ran'
 
     openTools();
     await flush();
+
+    // The runner only exists inside the modal now, so the entry must be opened first.
+    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="toolRequest"]')?.click();
 
     byClass('.tool-args', 'textarea').value = '{"tags":["web"]}';
     document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.click();
@@ -424,6 +559,9 @@ it('reports delegation as unavailable when the selected harness has no subagents
     );
 
     // Delegation is blocked rather than offered with a target this team lacks.
+    // The runner is inside the modal now, so open the entry before reading it.
+    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="agentDelegate"]')?.click();
+
     expect(byClass('.tool-args', 'textarea').value).toBe('{}');
     expect(document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.disabled).toBe(true);
     expect(document.querySelector('.tool-note')?.textContent).toBe(

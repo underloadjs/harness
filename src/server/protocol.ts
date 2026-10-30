@@ -75,6 +75,15 @@ export type SessionTurn = {
     // conversation. Omitted for a LEGACY `/messages` turn, which keeps the
     // response-owned fresh-block shape byte-identical.
     threadId?: string;
+    // R8: the conversation's stable agent-prefixed display label (`RR2`, `IT1`).
+    // It names the THREAD, not the invocation: every continuation turn of one
+    // conversation repeats it, and a child conversation has its own. Omitted for a
+    // legacy turn (and for a pre-R8 server), which the UI derives from the roster.
+    // T14: it is drawn from the ONE per-code label sequence (a legacy `/messages`
+    // block and a nested block draw from it too), and a restored turn's recorded
+    // label is adopted before anything is allocated, so a surviving `RR3` stays
+    // `RR3` and the next conversation is `RR4`.
+    threadLabel?: string;
     // Result blocks this task was submitted with (R2). A block is referenced by
     // the turn that produced it plus its `threadId` (omitted for the turn's ROOT
     // invocation) and its compact conversation-scoped label. The server binds these
@@ -124,6 +133,11 @@ export type SessionSteerRecord = {
     // The user's raw (trimmed) text. The run prompt may also contain the composed
     // reference section; the audit keeps the user-facing original.
     prompt: string;
+    // T12b: the persistent conversation the text was delivered to, present ONLY
+    // when that is NOT the owning turn's own thread (steering a delegated child).
+    // The owner is the parent turn, so without this a client would render the
+    // child's user message as the parent's prompt.
+    threadId?: string;
     // Result blocks whose completed content was injected into the steered text.
     references?: AgentResultReference[];
 };
@@ -328,6 +342,10 @@ export type SessionSnapshot = {
     // different content, even after every turn carrying it is deleted; the next
     // turn seeds from the larger of this and the surviving-turn prefix. Content is
     // never retained — only the counters. Omitted while no label was ever minted.
+    //
+    // T14: conversation labels (`session.threads[].label`) are minted from this
+    // same per-code sequence, so the counters here also cover a conversation's
+    // ordinal — a client seeding a block allocator from them never re-mints a name.
     labelHighWater?: Record<string, number>;
     // The configuration this session was built with, captured at creation. A
     // registry change (POST/PATCH) therefore cannot rewrite what an existing

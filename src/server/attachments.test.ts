@@ -394,6 +394,8 @@ describe('queued attachments dispatch and persist', () => {
             index: 0,
             prompt: 'Look at [Image 1]',
             threadId: 'thread-1',
+            // R8: conversation name (agent code + per-agent ordinal).
+            threadLabel: 'MA1',
             attachments: [attachment],
             status: 'queued',
             updatedAt: expect.any(Number),
@@ -413,6 +415,7 @@ describe('queued attachments dispatch and persist', () => {
             index: 0,
             prompt: 'Look at [Image 1]',
             threadId: 'thread-1',
+            threadLabel: 'MA1',
             attachments: [attachment],
             status: 'done',
             startedAt: expect.any(Number),
@@ -637,7 +640,7 @@ describe('submit routes over HTTP', () => {
         // R1-R6: every /tasks turn names its persistent thread, so `threadId` is
         // part of the accepted record (the text-only shape is otherwise unchanged).
         expect(Object.keys((legacy.body as { turn: object }).turn).sort()).toEqual(
-            ['eventTimes', 'events', 'id', 'index', 'prompt', 'status', 'threadId', 'updatedAt'].sort()
+            ['eventTimes', 'events', 'id', 'index', 'prompt', 'status', 'threadId', 'threadLabel', 'updatedAt'].sort()
         );
 
         // Attachment-only: blank text is valid because a clip carries the task.
@@ -651,6 +654,7 @@ describe('submit routes over HTTP', () => {
             prompt: '',
             // Every unfocused submit opens its own thread (the second submit here).
             threadId: 'thread-2',
+            threadLabel: 'MA2',
             attachments: [attachment],
             status: 'queued',
             updatedAt: expect.any(Number),

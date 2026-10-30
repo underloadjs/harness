@@ -62,7 +62,9 @@ describe('sessionThreadsOf', () => {
         };
 
         expect(sessionThreadsOf(session)).toEqual([
-            { id: 'thread-1', agent: 'writer', origin: 'host', status: 'running', sequence: 1 },
+            // R8: an unlabeled legacy row derives its agent-prefixed name (WR1),
+            // never the generic global creation ordinal.
+            { id: 'thread-1', agent: 'writer', origin: 'host', status: 'running', sequence: 1, label: 'WR1' },
             {
                 id: 'thread-2',
                 agent: 'research',
@@ -99,6 +101,7 @@ describe('sessionThreadsOf', () => {
                 origin: 'host',
                 status: 'idle',
                 sequence: 3,
+                label: 'RH1',
                 ownerThreadId: 'thread-1',
                 invocationId: 'thread-invocation-7',
                 originTurnId: 'turn-4',
@@ -128,6 +131,7 @@ describe('sessionThreadsOf', () => {
                 origin: 'agent',
                 status: 'idle',
                 sequence: 1,
+                label: 'WR1',
                 messages: [{ role: 'assistant', content: 'hi' }]
             }
         ]);
@@ -146,11 +150,12 @@ describe('turnThreadIdOf', () => {
 });
 
 describe('thread labels', () => {
-    it('prefers the server label and otherwise uses the creation ordinal', () => {
-        expect(threadNameOf({ sequence: 2, label: 'Planner' })).toBe('Planner');
-        expect(threadNameOf({ sequence: 2 })).toBe('T2');
+    it('prefers the server label and otherwise uses an agent-prefixed fallback', () => {
+        expect(threadNameOf({ sequence: 2, agent: 'writer', label: 'Planner' })).toBe('Planner');
+        // R8: never the generic global `T<sequence>` wrapper.
+        expect(threadNameOf({ sequence: 2, agent: 'writer' })).toBe('WR2');
         // Whitespace is not a label.
-        expect(threadNameOf({ sequence: 4, label: '   ' })).toBe('T4');
+        expect(threadNameOf({ sequence: 4, agent: 'writer', label: '   ' })).toBe('WR4');
     });
 
     it('resolves ONE canonical label from the roster, never digits from the id', () => {
@@ -161,7 +166,7 @@ describe('thread labels', () => {
         ];
 
         expect(threadLabelOf('thread-3', roster)).toBe('Research');
-        expect(threadLabelOf('conv/3', roster)).toBe('T7');
+        expect(threadLabelOf('conv/3', roster)).toBe('WR7');
         // Unknown ids are explicit, and two long non-numeric ids do NOT collide on a
         // truncated token.
         expect(threadLabelOf('invocation-alpha', roster)).toBe('T?');
@@ -205,7 +210,7 @@ describe('resolveSubmitTarget', () => {
         expect(resolveSubmitTarget({ focus: 'thread-3', threads })).toEqual({
             mode: 'continue',
             threadId: 'thread-3',
-            name: 'T3'
+            name: 'WR3'
         });
     });
 
@@ -213,7 +218,7 @@ describe('resolveSubmitTarget', () => {
         expect(resolveSubmitTarget({ focus: 'thread-2', threads, references: 3 })).toEqual({
             mode: 'steer',
             threadId: 'thread-2',
-            name: 'T2'
+            name: 'WR2'
         });
     });
 
@@ -237,7 +242,7 @@ describe('resolveSubmitTarget', () => {
         expect(resolveSubmitTarget({ focus: 'thread-2', threads, attachments: 0, unfinishedReferences: 0 })).toEqual({
             mode: 'steer',
             threadId: 'thread-2',
-            name: 'T2'
+            name: 'WR2'
         });
     });
 
@@ -247,7 +252,7 @@ describe('resolveSubmitTarget', () => {
         expect(resolveSubmitTarget({ focus: 'thread-2', threads, attachments: 1 })).toEqual({
             mode: 'steer',
             threadId: 'thread-2',
-            name: 'T2',
+            name: 'WR2',
             queued: true
         });
     });
@@ -258,7 +263,7 @@ describe('resolveSubmitTarget', () => {
         expect(resolveSubmitTarget({ focus: 'thread-2', threads, unfinishedReferences: 1 })).toEqual({
             mode: 'steer',
             threadId: 'thread-2',
-            name: 'T2',
+            name: 'WR2',
             queued: true
         });
     });
@@ -345,12 +350,12 @@ describe('createThreadStrip', () => {
         const focusButtons = [...strip.element.querySelectorAll<HTMLButtonElement>('.thread-strip-focus')];
         expect(focusButtons.map((button) => button.textContent)).toEqual([
             'writerWritingstopped',
-            'writerT2running'
+            'writerWR2running'
         ]);
         expect(focusButtons.map((button) => button.getAttribute('aria-pressed'))).toEqual(['false', 'true']);
         expect(focusButtons.map((button) => button.getAttribute('aria-label'))).toEqual([
             'Focus thread Writing of writer (stopped)',
-            'Focus thread T2 of writer (running)'
+            'Focus thread WR2 of writer (running)'
         ]);
 
         // The far-right action is STOP for the running thread and DELETE otherwise.
@@ -358,7 +363,7 @@ describe('createThreadStrip', () => {
         expect(actions.map((button) => button.dataset.action)).toEqual(['delete', 'stop']);
         expect(actions.map((button) => button.getAttribute('aria-label'))).toEqual([
             'Delete thread Writing of writer',
-            'Stop thread T2 of writer'
+            'Stop thread WR2 of writer'
         ]);
     });
 
@@ -400,7 +405,7 @@ describe('createThreadStrip', () => {
             // Armed, not deleted: the label asks for confirmation.
             expect(calls).toEqual([]);
             expect(strip.armed()).toBe('thread-3');
-            expect(action()?.getAttribute('aria-label')).toBe('Confirm delete thread T3 of writer');
+            expect(action()?.getAttribute('aria-label')).toBe('Confirm delete thread WR3 of writer');
             expect(action()?.classList.contains('is-confirm')).toBe(true);
 
             action()?.click();
@@ -425,7 +430,7 @@ describe('createThreadStrip', () => {
             expect(strip.armed()).toBeUndefined();
             expect(
                 strip.element.querySelector<HTMLButtonElement>('.thread-strip-action')?.getAttribute('aria-label')
-            ).toBe('Delete thread T3 of writer');
+            ).toBe('Delete thread WR3 of writer');
             // The disarmed click did NOT delete anything.
             expect(calls).toEqual([]);
         } finally {
@@ -494,7 +499,7 @@ describe('createThreadStrip', () => {
         strip.render(roster, 'thread-1');
         expect(document.activeElement).not.toBe(document.body);
         expect(document.activeElement).toBe(stop());
-        expect(stop()?.getAttribute('aria-label')).toBe('Stop thread T2 of writer');
+        expect(stop()?.getAttribute('aria-label')).toBe('Stop thread WR2 of writer');
     });
 
     it('keeps the armed delete and its focus across a repaint (S4)', () => {
@@ -509,7 +514,7 @@ describe('createThreadStrip', () => {
             arm?.click();
             expect(strip.armed()).toBe('thread-3');
             // The arming repaint moved focus onto the rebuilt confirm button.
-            expect(document.activeElement?.getAttribute('aria-label')).toBe('Confirm delete thread T3 of writer');
+            expect(document.activeElement?.getAttribute('aria-label')).toBe('Confirm delete thread WR3 of writer');
 
             const confirm = strip.element.querySelector<HTMLButtonElement>('.thread-strip-action');
             confirm?.focus();
@@ -517,7 +522,7 @@ describe('createThreadStrip', () => {
 
             expect(strip.armed()).toBe('thread-3');
             expect(strip.element.querySelector('.thread-strip-action')?.getAttribute('aria-label')).toBe(
-                'Confirm delete thread T3 of writer'
+                'Confirm delete thread WR3 of writer'
             );
             expect(document.activeElement).toBe(strip.element.querySelector('.thread-strip-action'));
         } finally {
@@ -548,7 +553,7 @@ describe('createThreadStrip', () => {
         expect(strip.element.querySelectorAll('.thread-strip-action')).toHaveLength(1);
         expect(
             strip.element.querySelector('.thread-strip-row[data-thread-id="thread-1"] .thread-strip-action')?.getAttribute('aria-label')
-        ).toBe('Stop thread T1 of writer');
+        ).toBe('Stop thread WR1 of writer');
     });
 
     it('destroy clears the rows and hides the strip', () => {

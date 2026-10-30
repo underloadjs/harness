@@ -147,8 +147,10 @@ it('opens and closes the global tools view from the topbar icon only', async () 
     expect(stage.querySelector('.tools-pane')).toBeNull();
     expect(head.querySelector('.main-title')?.textContent).toBe('Instruct');
 
-    // Press: the existing catalogue + runner view replaces the centre column and the
-    // harness-only chrome is hidden, exactly as the removed Tools tab did.
+    // Press: the catalogue LIST replaces the centre column and the harness-only
+    // chrome is hidden, exactly as the removed Tools tab did. The list is ALL that
+    // opens (R12): the first entry is no longer auto-selected, so there is no
+    // runner and no modal yet.
     toggle.click();
     await flush();
 
@@ -157,17 +159,85 @@ it('opens and closes the global tools view from the topbar icon only', async () 
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-tab-button')].map((node) => node.dataset.tool)
     ).toEqual(['fileRead']);
-    expect(head.querySelector('.main-title')?.textContent).toBe('fileRead');
+    // List-only head: the head describes the CATALOGUE, not a tool.
+    expect(head.querySelector('.main-title')?.textContent).toBe('Tools');
+    expect(head.querySelector('.harness-id')?.textContent).toBe('catalogue');
+    expect(head.querySelector('.harness-note')?.textContent).toBe(
+        '1 tool · calls run on the harness server'
+    );
+    // The runner lives in the shared modal now, so nothing of it is mounted while
+    // the list is alone on screen.
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(document.querySelector('.tool-runner-slot')).toBeNull();
+    expect(document.querySelector('.tool-card')).toBeNull();
     expect(agentSlot.hidden).toBe(true);
     expect(composer.hidden).toBe(true);
 
-    // Press again: the toggle is the close control too. The chat comes back with the
-    // same harness head, the agent strip and the composer.
+    // Activating the entry opens its runner in the shared modal. The button names
+    // the popup kind and reports the current selection.
+    const toolButton = byClass('.tool-tab-button', 'button');
+    expect(toolButton.dataset.tool).toBe('fileRead');
+    expect(toolButton.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(toolButton.getAttribute('aria-pressed')).toBe('false');
+
+    toolButton.click();
+    await flush();
+
+    const dialog = byClass('.dialog', 'div');
+    expect(dialog.getAttribute('role')).toBe('dialog');
+    expect(dialog.querySelector('.dialog-title')?.textContent).toBe('fileRead');
+    // While the dialog is open the head describes the SELECTED tool (name, group,
+    // visibility · tags), not the catalogue.
+    expect(head.querySelector('.main-title')?.textContent).toBe('fileRead');
+    expect(head.querySelector('.harness-id')?.textContent).toBe('Files');
+    expect(head.querySelector('.harness-note')?.textContent).toBe('searchable · tags: files, read');
+    expect(toolButton.getAttribute('aria-pressed')).toBe('true');
+    // Opening moves focus onto the modal panel, so the close-time focus restore
+    // below is a real move back to the entry rather than a no-op.
+    expect(document.activeElement).toBe(dialog);
+    // The persistent runner pane is adopted inside the dialog body: slot > pane >
+    // the real tool card (schema + arguments + result), not a copy.
+    const slot = byClass('.tool-runner-slot', 'div');
+    expect(slot.parentElement?.className).toBe('dialog-body');
+    expect(byClass('.tool-runner-slot > .pane', 'div').className).toBe('pane');
+
+    const runnerCard = byClass('.tool-runner-slot > .pane .tool-card', 'section');
+    expect(runnerCard.className).toBe('tool-card');
+    expect(runnerCard.closest('.dialog-body')).toBe(dialog.querySelector('.dialog-body'));
+    // The list stays behind the dialog: one screen, one modal.
+    expect(stage.querySelector('.tools-pane')).not.toBeNull();
+    expect(agentSlot.hidden).toBe(true);
+    expect(composer.hidden).toBe(true);
+
+    // Closing the dialog drops the layer, resets the pressed state, re-describes
+    // the catalogue in the head and returns focus to the entry that opened it.
+    byClass('.dialog-close', 'button').click();
+    await flush();
+
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(document.querySelector('.tool-runner-slot')).toBeNull();
+    expect(document.querySelector('.tool-card')).toBeNull();
+    expect(toolButton.getAttribute('aria-pressed')).toBe('false');
+    expect(toolButton.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(head.querySelector('.main-title')?.textContent).toBe('Tools');
+    expect(head.querySelector('.harness-id')?.textContent).toBe('catalogue');
+    expect(head.querySelector('.harness-note')?.textContent).toBe(
+        '1 tool · calls run on the harness server'
+    );
+    expect(document.activeElement).toBe(toolButton);
+    expect(stage.querySelector('.tools-pane')).not.toBeNull();
+    expect(agentSlot.hidden).toBe(true);
+    expect(composer.hidden).toBe(true);
+
+    // Press again: the toggle is the close control too (and it closes any tool
+    // layer). The chat comes back with the same harness head, the agent strip and
+    // the composer.
     toggle.click();
     await flush();
 
     expect(toggle.getAttribute('aria-pressed')).toBe('false');
     expect(stage.querySelector('.tools-pane')).toBeNull();
+    expect(document.querySelector('.dialog')).toBeNull();
     expect(head.querySelector('.main-title')?.textContent).toBe('Instruct');
     expect(agentSlot.hidden).toBe(false);
     expect(composer.hidden).toBe(false);
@@ -225,19 +295,27 @@ it('collapses the harness note behind a disclosure that reports its state', asyn
     expect(head.dataset.expanded).toBe('false');
 });
 
-it('keeps the agent cards reachable through the phone summary', async () => {
+it('keeps the agent cards reachable from the composer button at every width', async () => {
     await boot();
 
-    const summary = byClass('.agent-summary', 'button');
-    const row = byClass('.agent-row', 'div');
+    // T5 R11/R12: nothing from the deck sits permanently in the chat chrome any more.
+    expect(document.querySelector('.agent-row')).toBeNull();
+    expect(document.querySelector('.agent-summary')).toBeNull();
 
-    // Summary text is the primary's title plus the team size; the cards are still in
-    // the DOM with every editing control, collapsed by CSS only.
+    // The single composer button opens the shared dialog, whose content is the
+    // existing deck. The DIALOG is the disclosure, so the cards start visible
+    // (`data-open` is written by the deck; styles.css pins the always-visible rule).
+    byClass('.agent-control-button', 'button').click();
+
+    const row = byClass('.agent-row', 'div');
+    const wrap = byClass('.agent-row-wrap', 'div');
+    expect(wrap.dataset.open).toBe('true');
+
+    const summary = byClass('.agent-summary', 'button');
     expect(summary.getAttribute('aria-controls')).toBe(row.id);
     expect(summary.querySelector('.agent-summary-label')?.textContent).toBe('Instruct');
     expect(summary.querySelector('.agent-summary-meta')?.textContent).toBe('1 agent');
-    expect(summary.getAttribute('aria-expanded')).toBe('false');
-    expect(document.querySelector('.agent-row-wrap')?.getAttribute('data-open')).toBeNull();
+    expect(summary.getAttribute('aria-expanded')).toBe('true');
 
     const primary = byClass('.agent-main', 'button');
     const model = byClass('.agent-model-select', 'select');
@@ -248,13 +326,9 @@ it('keeps the agent cards reachable through the phone summary', async () => {
     // The only agent cannot be removed (the same rule as desktop).
     expect(byClass('.agent-remove', 'button').disabled).toBe(true);
 
-    summary.click();
-    expect(summary.getAttribute('aria-expanded')).toBe('true');
-    expect(document.querySelector('.agent-row-wrap')?.getAttribute('data-open')).toBe('true');
-
-    summary.click();
-    expect(summary.getAttribute('aria-expanded')).toBe('false');
-    expect(document.querySelector('.agent-row-wrap')?.getAttribute('data-open')).toBeNull();
+    // Closing removes the deck with the modal layer; nothing dead is left behind.
+    byClass('.dialog-close', 'button').click();
+    expect(document.querySelector('.agent-row')).toBeNull();
 });
 
 it('keeps the create-harness close button plain icon-button (F2)', async () => {

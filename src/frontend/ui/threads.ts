@@ -36,6 +36,8 @@
 // (snapshot v1, with `messages`); it is not rendered here. A client must not join
 // the two by assumption: the runtime roster is the live view.
 
+import { agentCodeOf } from './agent-label';
+
 // One live persistent thread, as the session snapshot reports it. Every field is
 // validated on read (see sessionThreadsOf) because the roster is server data and a
 // malformed entry must never break the transcript.
@@ -134,7 +136,20 @@ export const sessionThreadsOf = (session: unknown): SessionThreadEntry[] => {
 
     // Creation order is the server's `sequence`, not the array order: a restored or
     // re-serialized roster must not reshuffle the strip. Ties keep input order.
-    return threads.sort((left, right) => left.sequence - right.sequence);
+    const ordered = threads.sort((left, right) => left.sequence - right.sequence);
+
+    // R8 legacy fallback: a pre-R8 roster carries no `label`. Derive the SAME
+    // agent-prefixed shape (`RR1`, `RR2`, … per agent) from roster order, so the
+    // generic global `T<sequence>` name never appears. A server label always wins.
+    const ordinals = new Map<string, number>();
+    return ordered.map((entry) => {
+        if (entry.label !== undefined) return entry;
+
+        const code = agentCodeOf(entry.agent);
+        const ordinal = (ordinals.get(code) ?? 0) + 1;
+        ordinals.set(code, ordinal);
+        return { ...entry, label: `${code}${ordinal}` };
+    });
 };
 
 // Read one turn's PERSISTENT thread id structurally. `SessionTurn.threadId` is
@@ -146,11 +161,17 @@ export const turnThreadIdOf = (turn: unknown): string | undefined => {
     return nonEmptyString(turn.threadId);
 };
 
-// Display name of a roster entry: the server label when it has one, otherwise the
-// creation ordinal (`T1`). The ordinal is derived from `sequence`, so it is stable
-// across reloads and never renumbers as turns arrive.
-export const threadNameOf = (entry: Pick<SessionThreadEntry, 'sequence' | 'label'>): string =>
-    entry.label !== undefined && entry.label.trim().length > 0 ? entry.label : `T${entry.sequence}`;
+// Display name of a roster entry: the server conversation label when it has one,
+// otherwise an agent-prefixed fallback derived from the entry itself. There is
+// deliberately NO `T<sequence>` fallback: that generic wrapper is exactly the
+// duplicate identity R8 removes. A hand-built entry with no agent at all reads
+// the explicit unknown token.
+export const threadNameOf = (entry: Pick<SessionThreadEntry, 'agent' | 'sequence' | 'label'>): string => {
+    if (entry.label !== undefined && entry.label.trim().length > 0) return entry.label;
+
+    const agent = nonEmptyString(entry.agent);
+    return agent === undefined ? UNKNOWN_THREAD_LABEL : `${agentCodeOf(agent)}${entry.sequence}`;
+};
 
 // CANONICAL display identity of a persistent thread (S6).
 //
@@ -298,6 +319,24 @@ export const submitTargetLabel = (target: SubmitTarget): string => {
 
     return 'New thread';
 };
+
+// --- display labels (R8) -----------------------------------------------------
+//
+// A conversation's visible name is its server-allocated agent-prefixed label
+// (`RR1`, `RR2`, …, `IT1`). It belongs to the PERSISTENT thread: every turn, run
+// and continuation repeats it, and only a new conversation consumes the next
+// ordinal. A legacy roster entry without a label derives the SAME shape from its
+// per-agent order (never the global creation ordinal `T8`).
+
+// Read one turn's recorded conversation label structurally (additive protocol
+// field). Undefined for a legacy/pre-R8 turn; callers then use the roster name.
+export const turnThreadLabelOf = (turn: unknown): string | undefined => {
+    if (!isObjectLike(turn)) return undefined;
+
+    return nonEmptyString(turn.threadLabel);
+};
+
+export { agentCodeOf };
 
 // --- the thread strip --------------------------------------------------------
 

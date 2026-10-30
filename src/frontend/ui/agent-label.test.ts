@@ -9,7 +9,21 @@
 //     across turns, `reset()` restarts a rebuilt turn; separate allocators are
 //     independent.
 
-import { createAgentLabels } from './agent-label';
+import { agentCodeOf, createAgentLabels } from './agent-label';
+
+describe('agentCodeOf', () => {
+    it('returns the bare thread code used by the compact agent button', () => {
+        // R7: the user-facing title is the input, so Researcher -> RR exactly like
+        // the thread badge RR1; the occurrence counter is deliberately absent.
+        expect(agentCodeOf('Researcher')).toBe('RR');
+        expect(agentCodeOf('Instruct')).toBe('IT');
+        expect(agentCodeOf('Coder')).toBe('CR');
+        expect(agentCodeOf(' research ')).toBe('RH');
+        expect(agentCodeOf('a')).toBe('AA');
+        expect(agentCodeOf('研究员')).toBe('AG');
+        expect(agentCodeOf(undefined)).toBe('AG');
+    });
+});
 
 describe('createAgentLabels', () => {
     it('uses the uppercase first and last ASCII letter plus a 1-based occurrence', () => {

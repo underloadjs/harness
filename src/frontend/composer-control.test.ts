@@ -196,22 +196,25 @@ it('paints the single in-field action for every state and never renders old cont
     expect(input.getAttribute('aria-label')).toBe('Task message');
     expect(input.getAttribute('placeholder')).toBeNull();
 
-    // R10: the action is a child of the field wrapper; the wrapper is wrapped in
-    // the composer BODY column (the attachment error line sits above it). R6/T15: the
-    // body column is the composer's ONLY child — the file chooser and its hidden
-    // input are gone, so there is no accessory beside the field and no dead control.
+    // R10/R11 (T5): the field wrapper is the INPUT FRAME. It holds the text column
+    // and one control row (`agent`, stop-all, send) INSIDE the same border; the
+    // composer body is the only text column and the composer's only child.
     expect(input.parentElement).toBe(field);
-    expect(action.parentElement).toBe(field);
+    expect(action.parentElement?.className).toBe('composer-controls');
     expect(field.parentElement?.className).toBe('composer-body');
-    expect(composer.children).toHaveLength(1);
-    expect(composer.firstElementChild?.className).toBe('composer-body');
+    expect([...composer.children].map((child) => child.className)).toEqual(['composer-body']);
     expect(composer.querySelector('.composer-attach')).toBeNull();
     expect(composer.querySelector('.composer-file')).toBeNull();
     expect(composer.querySelector('input[type="file"]')).toBeNull();
-    // R5/R7: the composer has exactly TWO controls — the in-field action and the
-    // separate session-wide stop-all, which is hidden unless work is pending while a
-    // draft exists. No chooser, and no legacy Run/Stop/Reset controls.
-    expect(composer.querySelectorAll('button')).toHaveLength(2);
+    // R5/R7: the control row has exactly THREE controls — the agent button that
+    // opens the shared dialog, the separate session-wide stop-all (hidden unless work
+    // is pending while a draft exists) and the in-field send/stop. No chooser, and
+    // no legacy Run/Stop/Reset controls.
+    expect([...field.querySelectorAll('button')].map((button) => button.className)).toEqual([
+        'agent-control-button',
+        'composer-stop',
+        'composer-action'
+    ]);
     expect(byClass('.composer-stop', 'button').hidden).toBe(true);
     expect(composer.querySelector('.run')).toBeNull();
     expect(composer.querySelector('.stop')).toBeNull();

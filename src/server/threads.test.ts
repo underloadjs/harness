@@ -235,6 +235,9 @@ describe('SessionStore persistent threads', () => {
             index: 0,
             prompt: 'hello',
             threadId: 'thread-1',
+            // R8: the first conversation of `probe` is PE1 (its root block, badge
+            // and roster name all read this).
+            threadLabel: 'PE1',
             status: 'queued',
             updatedAt: 1_000,
             events: [],
@@ -251,6 +254,7 @@ describe('SessionStore persistent threads', () => {
                 index: 0,
                 prompt: 'hello',
                 threadId: 'thread-1',
+                threadLabel: 'PE1',
                 status: 'done',
                 startedAt: 1_000,
                 updatedAt: 1_000,
@@ -284,6 +288,7 @@ describe('SessionStore persistent threads', () => {
                 origin: 'host',
                 status: 'idle',
                 sequence: 2,
+                label: 'PE1',
                 originTurnId: task.turn.id,
                 originInvocationId: '1',
                 invocationId: '1',
@@ -301,6 +306,55 @@ describe('SessionStore persistent threads', () => {
         // lives in the thread); label seeds record the conversation prefix.
         expect(transcript(snapshot.messages)).toEqual([{ role: 'system', content: 'sys' }]);
         expect(snapshot.labelSeeds).toBeUndefined();
+    });
+
+    // R8: the display name belongs to the CONVERSATION (agent code + per-agent
+    // ordinal), is reused by a continuation, and is never re-minted after a
+    // deletion. IDs stay opaque and are never parsed for the number.
+    it('names conversations per agent, reuses the name on continuation and retires a deleted ordinal', async () => {
+        pinClock(1_500);
+        const fixture = createFixture();
+        const store = createStore([fixture.preset]);
+        const created = store.create('probe');
+
+        const first = store.enqueue(created.id, 'one');
+        await first.settled;
+        const second = store.enqueue(created.id, 'two');
+        await second.settled;
+        const third = store.enqueue(created.id, 'three');
+        await third.settled;
+
+        // Three DISTINCT conversations: PE1, PE2, PE3 (not T1/T2/T3 and not one
+        // number per invocation).
+        expect(store.get(created.id).threads?.map((thread) => thread.label)).toEqual([
+            'PE1',
+            'PE2',
+            'PE3'
+        ]);
+
+        // A continuation of PE2 repeats its label and consumes NO new ordinal.
+        const continuation = store.enqueue(created.id, 'again', undefined, undefined, second.turn.threadId);
+        expect(continuation.turn.threadId).toBe(second.turn.threadId);
+        expect(continuation.turn.threadLabel).toBe('PE2');
+        await continuation.settled;
+        expect(store.get(created.id).threads?.map((thread) => thread.label)).toEqual([
+            'PE1',
+            'PE2',
+            'PE3'
+        ]);
+
+        // Deleting PE1 retires its name: the next standalone conversation is PE4.
+        store.deleteThread(created.id, first.turn.threadId as string);
+        const fourth = store.enqueue(created.id, 'four');
+        expect(fourth.turn.threadLabel).toBe('PE4');
+        await fourth.settled;
+
+        const after = store.get(created.id);
+        expect(after.threads?.map((thread) => [thread.id, thread.label])).toEqual([
+            [second.turn.threadId, 'PE2'],
+            [third.turn.threadId, 'PE3'],
+            [fourth.turn.threadId, 'PE4']
+        ]);
     });
 
     it('continues an idle thread, preserving its transcript and index order', async () => {
@@ -752,6 +806,9 @@ describe('SessionStore thread persistence', () => {
                 origin: 'host',
                 status: 'idle',
                 sequence: 2,
+                // R8: the conversation's display name survives the restart; ids
+                // stay opaque (`thread-1`) and are never read as labels.
+                label: 'PE1',
                 originTurnId: done.turn.id,
                 originInvocationId: '1',
                 invocationId: '1',

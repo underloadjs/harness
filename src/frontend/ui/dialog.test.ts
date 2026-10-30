@@ -543,10 +543,25 @@ describe('dialog.css contract', () => {
         expect(panel).toContain('overflow: hidden');
 
         const body = blockOf('.dialog-body {');
+        expect(body).toContain('display: flex');
         expect(body).toContain('flex: 1 1 auto');
+        expect(body).toContain('flex-direction: column');
         expect(body).toContain('min-height: 0');
         expect(body).toContain('overflow: auto');
         expect(body).toContain('overscroll-behavior: contain');
+    });
+
+    it('stays content-sized and centred instead of stretching on phones', () => {
+        // A stretched flex item made every short dialog fill the viewport, which
+        // left a large unused area under a short tool result. The gutter comes
+        // from the overlay padding and the panel cap, not from stretching.
+        const phone = css.slice(css.indexOf('@media (max-width: 720px) {'));
+        expect(phone).toContain('align-items: center');
+        expect(phone).toContain('padding: 16px');
+        expect(phone).not.toContain('align-items: stretch');
+        expect(phone).toContain('.dialog {\n        width: 100%;');
+        // 24px gutter, and more usable height than the desktop 82%.
+        expect(phone).toContain('max-height: calc(100vh - 48px)');
     });
 
     it('sizes preview images and code blocks inside the scroll area', () => {
@@ -555,12 +570,5 @@ describe('dialog.css contract', () => {
         expect(pre).toContain('overflow: auto');
         expect(pre).toContain('white-space: pre');
         expect(pre).toContain('font: 12px/1.6 var(--mono)');
-    });
-
-    it('goes edge-to-edge on phone widths', () => {
-        const phone = css.slice(css.indexOf('@media (max-width: 720px) {'));
-        expect(phone).toContain('align-items: stretch');
-        expect(phone).toContain('padding: 10px');
-        expect(phone).toContain('max-height: calc(100vh - 20px)');
     });
 });

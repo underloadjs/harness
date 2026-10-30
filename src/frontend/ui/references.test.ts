@@ -1,6 +1,7 @@
 // Composer @ / # pure logic (T5 R1/R2).
 //
-// Pins the token grammar, the query-aware file glob, the latest-label rule (the
+// Pins the token grammar, the query-aware file glob, the @ folder rows (folders
+// come from `fileList`; `fileGlob` only yields files), the latest-label rule (the
 // same rule the server applies to plain `#LABEL`) and the exact {turnId,
 // threadId?, label} metadata a reference chip carries into a submit.
 //
@@ -11,8 +12,11 @@ import {
     referenceChipOf,
     fileChipOf,
     fileGlobPattern,
+    fileListEntriesOf,
     filePathsOf,
+    fileQueryScope,
     filterFilePathList,
+    folderPathsOf,
     isReferenceableBlock,
     latestReferenceBlock,
     mentionTriggerAt,
@@ -21,7 +25,7 @@ import {
     referenceOfBlock,
     referencesOfChips
 } from './references';
-import type { AgentBlockDescriptor } from './references';
+import type { AgentBlockDescriptor, FileQueryScope } from './references';
 
 const block = (overrides: Partial<AgentBlockDescriptor> = {}): AgentBlockDescriptor => ({
     turnId: 't1',
@@ -51,12 +55,82 @@ it('builds a narrowing glob instead of filtering a capped page', () => {
     // A path query needs BOTH descendants and the path itself: `**/src/frontend*`
     // alone matches no file below `src/frontend`.
     expect(fileGlobPattern('src/frontend')).toEqual(['**/src/frontend*/**', '**/src/frontend*']);
-    expect(fileGlobPattern('./src/frontend/')).toEqual(['**/src/frontend*/**', '**/src/frontend*']);
+    // A TRAILING SLASH means "drill into this folder" — it is exactly what picking
+    // a folder row types (`@src/frontend/`), so only that folder's descendants are
+    // candidates. The no-slash form above still means "name prefix".
+    expect(fileGlobPattern('./src/frontend/')).toEqual(['**/src/frontend/**']);
     // Windows-style separators normalize to the posix paths fileGlob returns.
     expect(fileGlobPattern('.\\src\\frontend')).toEqual(['**/src/frontend*/**', '**/src/frontend*']);
     // Glob magic is escaped, so a query cannot widen the walk.
     expect(fileGlobPattern('a*b')).toEqual(['**/*a[*]b*']);
     expect(fileGlobPattern('src/x[1]')).toEqual(['**/src/x[[]1[]]*/**', '**/src/x[[]1[]]*']);
+});
+
+it('drills into a folder for a trailing-slash query', () => {
+    // `@src/` is the folder row for src: descendants only, no `src*` sibling match.
+    expect(fileGlobPattern('src/')).toEqual(['**/src/**']);
+    expect(fileGlobPattern('src/frontend/')).toEqual(['**/src/frontend/**']);
+    // A Windows-style trailing slash drills the same folder.
+    expect(fileGlobPattern('.\\src\\frontend\\')).toEqual(['**/src/frontend/**']);
+    // Glob magic is still escaped in the drilled walk.
+    expect(fileGlobPattern('a*b/')).toEqual(['**/a[*]b/**']);
+});
+
+it('splits an @ query into the directory to list and the name prefix', () => {
+    // An empty query is the repository ROOT overview; `fileList` takes '.'.
+    expect(fileQueryScope('')).toEqual({ directory: '.', prefix: '' });
+    // No slash: a name prefix within the root listing.
+    expect(fileQueryScope('src')).toEqual({ directory: '.', prefix: 'src' });
+    // Trailing slash: drill INTO that folder, no prefix.
+    expect(fileQueryScope('src/')).toEqual({ directory: 'src', prefix: '' });
+    // A leading `./` is stripped, the trailing slash still drills.
+    expect(fileQueryScope('./src/')).toEqual({ directory: 'src', prefix: '' });
+    // A partial entry name inside a listed directory.
+    expect(fileQueryScope('src/frontend')).toEqual({ directory: 'src', prefix: 'frontend' });
+    expect(fileQueryScope('src/frontend/')).toEqual({ directory: 'src/frontend', prefix: '' });
+    // Windows-style separators normalize like the glob/filter.
+    expect(fileQueryScope('.\\src\\fr')).toEqual({ directory: 'src', prefix: 'fr' });
+    // A lone "/" normalizes to the root directory, never an empty directory name.
+    expect(fileQueryScope('/')).toEqual({ directory: '.', prefix: '' });
+});
+
+it('reads `fileList` entries tolerantly', () => {
+    // Folder rows keep their trailing slash; files are bare paths.
+    expect(fileListEntriesOf({ entries: ['a', 'b/'] })).toEqual(['a', 'b/']);
+    // A malformed entry list contributes only the strings.
+    expect(fileListEntriesOf({ entries: [1, 'x', null] })).toEqual(['x']);
+    // An error body / missing reply contributes no rows.
+    expect(fileListEntriesOf(null)).toEqual([]);
+    // `fileGlob`-shaped replies are not `fileList` replies.
+    expect(fileListEntriesOf({ files: [] })).toEqual([]);
+});
+
+it('offers only immediate FOLDER rows matching the name prefix', () => {
+    // Files and dot-folders: only trailing-slash entries survive, in input order.
+    expect(folderPathsOf(['README.md', '.git/', 'src/', '.storybook/', 'src/a.ts'], { directory: '.', prefix: '' })).toEqual([
+        '.git/',
+        'src/',
+        '.storybook/'
+    ]);
+    // The prefix filters entry NAMES (src matches "s", dist does not).
+    expect(folderPathsOf(['src/', 'dist/', 'a.md'], { directory: '.', prefix: 's' })).toEqual(['src/']);
+    // The prefix is case-insensitive, like `filterFilePathList`.
+    expect(folderPathsOf(['src/', 'dist/'], { directory: '.', prefix: 'S' })).toEqual(['src/']);
+    // Inside a listed directory `fileList` prefixes entries with that directory.
+    expect(folderPathsOf(['src/ui/', 'src/frontend/', 'src/a.ts'], { directory: 'src', prefix: '' })).toEqual([
+        'src/ui/',
+        'src/frontend/'
+    ]);
+    // The prefix matches the entry NAME only, never an ancestor directory: the
+    // `src` segment of `src/ui/` does not make it a row for the prefix `src`.
+    expect(folderPathsOf(['src/ui/'], { directory: '.', prefix: 'src' })).toEqual([]);
+    // `folderPathsOf` does NOT scope by `directory`: it trusts the caller, which
+    // passes the entries `fileList` returned for that ONE directory. Both entries
+    // are folders whose NAME starts with `ui`, so both are rows.
+    const srcScope: FileQueryScope = { directory: 'src', prefix: 'ui' };
+    expect(folderPathsOf(['src/ui/', 'lib/ui/'], srcScope)).toEqual(['src/ui/', 'lib/ui/']);
+    // A repeated entry is one row.
+    expect(folderPathsOf(['src/', 'src/'], { directory: '.', prefix: '' })).toEqual(['src/']);
 });
 
 it('marks completed and active blocks as referenceable only', () => {

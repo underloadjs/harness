@@ -95,9 +95,18 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(selector: string, tag: K
     return found;
 };
 
-const modelSelects = (): HTMLSelectElement[] => [
-    ...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')
-];
+// T5 R11/R12: the per-agent selects live in the shared agent dialog now, so reading
+// them opens it from the composer's single agent button (idempotent once open; the
+// dialog refreshes itself after each confirmed PATCH).
+const openDeck = (): void => {
+    if (document.querySelector('.dialog') !== null) return;
+    byClass('.agent-control-button', 'button').click();
+};
+
+const modelSelects = (): HTMLSelectElement[] => {
+    openDeck();
+    return [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
+};
 
 const optionTexts = (select: HTMLSelectElement): (string | null)[] =>
     [...select.options].map((option) => option.textContent);
@@ -371,6 +380,7 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         'Viewing a saved session · agent team frozen'
     );
+    openDeck();
     expect(byClass('.agent-main', 'button').disabled).toBe(true);
     expect(byClass('.agent-add', 'button').disabled).toBe(true);
     expect(byClass('.agent-remove', 'button').disabled).toBe(true);
@@ -479,6 +489,7 @@ it('changes a RUNNING session’s model without cancelling the stream', async ()
     expect(byClass('.status', 'span').dataset.state).toBe('idle');
     expect(document.querySelector('.status-text')?.textContent).toBe('idle');
     // Team still frozen while running; MODELS editable (R2).
+    openDeck();
     expect(byClass('.agent-main', 'button').disabled).toBe(true);
     expect(modelSelects().map((select) => select.disabled)).toEqual([false, false]);
     expect(document.querySelectorAll('.tile')).toHaveLength(1);

@@ -487,8 +487,12 @@ it('renders no attachment chooser and still attaches through paste and drop', as
     expect(document.querySelector('.composer-attach')).toBeNull();
     expect(document.querySelector('.composer-file')).toBeNull();
     expect(document.querySelector('.composer input[type="file"]')).toBeNull();
-    // The composer is one field column: no accessory beside it and no dead tab stop.
-    expect(byClass('.composer', 'form').children).toHaveLength(1);
+    // T5 R9/R10/R11: the composer has ONE child (the field column). The transcript
+    // flank and the agent slot moved INSIDE the field frame, so nothing flanks the
+    // input and no attachment accessory/dead tab stop comes back.
+    expect([...byClass('.composer', 'form').children].map((child) => child.className)).toEqual([
+        'composer-body'
+    ]);
 
     // Paste remains the primary attachment path: the chip lands at the caret.
     const input = composerField();

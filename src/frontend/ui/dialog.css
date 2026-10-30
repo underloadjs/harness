@@ -14,7 +14,11 @@
  * All selectors are scoped to `.dialog-*`; nothing here touches shell classes. */
 
 /* Full-viewport dismiss layer. Fixed + inset keeps it out of the shell grid, and
- * the padding is the backdrop gutter (the click target that closes). */
+ * the padding is the backdrop gutter (the click target that closes). The vertical
+ * gutter is viewport-relative so a tall window gets breathing room instead of a
+ * fixed 24px band, while the centre alignment keeps the panel content-sized: a
+ * stretched panel (`align-items: stretch`) is what used to leave a large blank
+ * area below short content on phone widths. */
 .dialog-overlay {
     position: fixed;
     inset: 0;
@@ -22,13 +26,14 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    padding: 24px;
+    padding: clamp(16px, 4vh, 40px) 24px;
     background: rgba(4, 6, 10, 0.7);
     backdrop-filter: blur(2px);
 }
 
-/* The panel is a flex column so only the body scrolls; header stays put. Capped
- * height keeps long files/previews usable without hiding the close button. */
+/* The panel is a flex column so only the body scrolls; header stays put. Height
+ * stays CONTENT-AWARE (`height: auto` + a viewport cap), so a short preview is a
+ * short panel and a long one stops at the cap with the body scrolling. */
 .dialog {
     display: flex;
     flex-direction: column;
@@ -40,6 +45,15 @@
     border-radius: var(--radius);
     background: var(--bg-elevated);
     box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
+}
+
+/* Wide variant for a working surface rather than a reader: the tool runner shows a
+ * parameter schema, an editable argument box and a result, so it gets more width
+ * and height than a prose preview. Opt-in via `element.classList.add('dialog-wide')`
+ * (main.ts openToolDialog); every other dialog keeps the compact 760px panel. */
+.dialog.dialog-wide {
+    width: min(1040px, 100%);
+    max-height: min(88vh, 960px);
 }
 
 /* The panel receives programmatic focus on open (ui/dialog.ts) so Escape/Tab work
@@ -92,9 +106,16 @@
 }
 
 /* The only scroll container: `min-height: 0` is what lets flex actually shrink it,
- * and `overscroll-behavior` stops chained scroll behind the modal. */
+ * and `overscroll-behavior` stops chained scroll behind the modal.
+ *
+ * The body is also a flex column so content-aware children (the tool detail body
+ * in styles.css) can grow into the panel's remaining height and shrink/scroll
+ * when the viewport cap is reached. Plain content (prose, images, previews) is
+ * unaffected: a single child keeps its content height and the body scrolls it. */
 .dialog-body {
+    display: flex;
     flex: 1 1 auto;
+    flex-direction: column;
     min-height: 0;
     padding: 16px 18px;
     overflow: auto;
@@ -129,17 +150,20 @@
     font-family: var(--mono);
 }
 
-/* Phone layout: edge-to-edge panel with a small gutter. `align-items: stretch`
- * gives the body the full height between header and viewport edge. */
+/* Phone layout: full-width panel with a real gutter. The panel must stay
+ * CENTRE-ALIGNED (not `stretch`): stretching forced every short dialog to the
+ * full viewport height, which is the blank interior area under a short result.
+ * The panel cap is relaxed from the desktop 82% so a phone uses more of its
+ * height, while the subtraction keeps a fixed 24px top/bottom gutter. */
 @media (max-width: 720px) {
     .dialog-overlay {
-        align-items: stretch;
-        padding: 10px;
+        align-items: center;
+        padding: 16px;
     }
 
     .dialog {
         width: 100%;
-        max-height: calc(100vh - 20px);
+        max-height: calc(100vh - 48px);
     }
 
     .dialog-head {

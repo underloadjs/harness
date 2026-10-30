@@ -200,13 +200,27 @@ const tileStates = (): (string | null | undefined)[] =>
     [...document.querySelectorAll<HTMLElement>('.tile')].map((tile) => tile.dataset.state);
 const tileElapsed = (): (string | null)[] =>
     [...document.querySelectorAll<HTMLElement>('.tile-elapsed')].map((node) => node.textContent);
-const agentRoles = (): (string | undefined)[] =>
-    [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.dataset.role);
-const agentNames = (): (string | null)[] =>
-    [...document.querySelectorAll<HTMLElement>('.agent-tile-name')].map((node) => node.textContent);
+// R11 (T5): the team/model deck now lives inside the shared agent dialog, so every
+// deck read opens it from the composer's SINGLE agent button. A no-op when the modal
+// is already open (a chrome rebuild refreshes it in place).
+function openAgents(): void {
+    if (document.querySelector('.dialog') !== null) return;
+    byClass('.agent-control-button', 'button').click();
+}
+
+const agentRoles = (): (string | undefined)[] => {
+    openAgents();
+    return [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.dataset.role);
+};
+const agentNames = (): (string | null)[] => {
+    openAgents();
+    return [...document.querySelectorAll<HTMLElement>('.agent-tile-name')].map((node) => node.textContent);
+};
 // R2 deck: the FRONT card per tile, in DOM order (`undefined` = hidden card).
-const agentFronts = (): (string | undefined)[] =>
-    [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.dataset.front);
+const agentFronts = (): (string | undefined)[] => {
+    openAgents();
+    return [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.dataset.front);
+};
 const harnessNames = (): (string | null)[] =>
     [...document.querySelectorAll<HTMLElement>('.harness-item .harness-name')].map((node) => node.textContent);
 // The core list is gone from the UI (R21.2); this helper stays only so a test can
@@ -899,7 +913,9 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
     await flush();
     await flush();
 
-    // The picker is the trusted preset list, with read-only instructions.
+    // The picker is the trusted preset list, with read-only instructions. The deck
+    // (and its picker) lives in the shared agent dialog now (T5 R11).
+    openAgents();
     byClass('.agent-add', 'button').click();
     const picker = byClass('.agent-picker', 'div');
     expect(picker.hidden).toBe(false);
@@ -1061,6 +1077,7 @@ it('falls back to the primary when the viewed card is removed', async () => {
     await flush();
 
     // View the secondary, then remove it from its own (now front) card.
+    openAgents();
     document.querySelector<HTMLButtonElement>('.agent-handle[data-agent="summarizer"]')?.click();
     await flush();
     expect(agentFronts()).toEqual([undefined, 'true']);
@@ -1128,6 +1145,7 @@ it('fronts a card of a frozen team and keeps that card across the live model PAT
     await flush();
 
     // R2/R3: the team is frozen, but VIEWING is not a team edit, so the strip works.
+    openAgents();
     document.querySelector<HTMLButtonElement>('.agent-handle[data-agent="summarizer"]')?.click();
     await flush();
 
@@ -1412,6 +1430,7 @@ it('stops every task in the originating session while a run is in flight', async
     // the team row is locked (frozen session) and New session refuses pending work.
     expect(byClass('.harness-item[data-harness="workspace"]', 'button').disabled).toBe(false);
     expect(byClass('.new-session', 'button').disabled).toBe(true);
+    openAgents();
     expect(byClass('.agent-add', 'button').disabled).toBe(true);
     // R2: the TEAM is locked mid-run, the MODEL is not — it edits the session's live
     // map for the next request and never cancels this stream.
@@ -1669,6 +1688,7 @@ it('queues a second task behind the active one and advances it automatically', a
     expect(composerAction.disabled).toBe(false);
     expect(document.querySelector('.composer .reset')).toBeNull();
     // R2: models stay editable while a queue runs.
+    openAgents();
     expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
 
     // A completes; the server advances B without another submit.
@@ -1839,6 +1859,7 @@ it('keeps a live model edit when the delayed 202 answer lands afterwards', async
     // While the answer is in flight the reader changes the session's model. The
     // effective model is what the dropdown DISPLAYS: an override equal to the
     // session fallback is represented by option 0 (ui/agents.ts dedupe rule).
+    openAgents();
     const shownModel = (): string | null =>
         byClass('.agent-model-select', 'select').selectedOptions[0]?.textContent ?? null;
 
@@ -2439,6 +2460,7 @@ it('confirms an inactive session delete once, and cancel sends no request', asyn
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         'Viewing a saved session · agent team frozen'
     );
+    openAgents();
     expect(byClass('.agent-main', 'button').disabled).toBe(true);
     // No session was created: a delete is not a submit.
     expect(calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST')).toEqual([]);
@@ -2545,6 +2567,7 @@ it('deletes the running current session, stops watching and creates no replaceme
     expect(document.querySelector('.agent-text')).toBeNull();
     expect(localStorage.getItem(SESSION_KEY)).toBeNull();
     expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
+    openAgents();
     expect(byClass('.agent-main', 'button').disabled).toBe(false);
     expect(byClass('.agent-add', 'button').disabled).toBe(false);
     // The deleted conversation took its pending work with it: empty field + idle
@@ -2776,6 +2799,7 @@ it('never resurrects a deleted session from a stale session-list answer', async 
     expect(localStorage.getItem(SESSION_KEY)).toBeNull();
     expect(document.querySelectorAll('.tile')).toHaveLength(0);
     expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
+    openAgents();
     expect(byClass('.agent-main', 'button').disabled).toBe(false);
     expect(refresh.disabled).toBe(false);
 });

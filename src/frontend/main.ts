@@ -18,12 +18,15 @@
 //   - left rail  — harnesses (built-ins and user-created) plus the create form,
 //                  the `left` tool-panel host, and a collapsed endpoint/model
 //                  panel at the bottom;
-//   - centre     — the selected harness title, its agent row (with a per-agent
-//                  model dropdown), the `center` tool-panel host, the transcript
-//                  and the composer. The GLOBAL tools view (the full-width list of
-//                  EVERY server tool — core entries included — plus the manual
-//                  runner) replaces this column when the topbar's icon-only Tools
-//                  toggle is pressed; there is no tab strip (R3);
+//   - centre     — the selected harness title, the `center` tool-panel host, the
+//                  transcript and the composer. The composer is ONE bordered frame
+//                  with a notched routing label on its top border (R14), the single
+//                  agent button on its LEFT edge (R16, opens the shared agent dialog
+//                  — team, models and instructions) and stop/send on the right. The GLOBAL tools view (the
+//                  full-width list of EVERY server tool — core entries included)
+//                  replaces this column when the topbar's icon-only Tools toggle is
+//                  pressed; activating one entry opens its manual runner in the
+//                  shared modal. There is no tab strip (R3);
 //   - right rail — the tool-contributed SCRATCH BOARD (primary panel host) and,
 //                  below it, the sessions for the selected harness only.
 //
@@ -120,7 +123,12 @@ import {
     uniqueNames
 } from './contract';
 import { createCreateHarnessPanel } from './ui/create-harness';
-import { createAgentRow } from './ui/agents';
+import { createAgentControl } from './ui/agent-control';
+import type { AgentControl } from './ui/agent-control';
+import { openAgentDialog } from './ui/agent-dialog';
+import type { AgentDialog } from './ui/agent-dialog';
+import { openDialog } from './ui/dialog';
+import type { DialogHandle } from './ui/dialog';
 import {
     composerActionOf,
     composerFieldHeight,
@@ -157,8 +165,12 @@ import {
 import {
     fileChipOf,
     fileGlobPattern,
+    fileListEntriesOf,
     filePathsOf,
+    fileQueryScope,
+    fileToken,
     filterFilePathList,
+    folderPathsOf,
     isReferenceableBlock,
     mentionTriggerAt,
     normalizeReferenceLabel,
@@ -355,7 +367,12 @@ type View = {
     // reported HERE and stay attached to the conversation they happened in
     // (R2: details remain visible; R1: never in the global header).
     setNotice: (text?: string, tone?: 'info' | 'error') => void;
-    setTranscript: (text: string) => void;
+    // R9 (T5): the entry-agent transcript button/dialog and their per-view text are
+    // GONE — the serialized `session.messages` pane was duplicate plumbing nobody
+    // used. The conversation itself is still rendered from the server's turns below
+    // (and tool calls/arguments keep their own read-only details); only the
+    // entry-agent raw-JSON surface was removed.
+    //
     // Replace the whole transcript with the server's turns. Used on boot and on
     // session selection — the server record always wins over local projection.
     // `labelSeeds` is the snapshot's per-turn label counters (`labelSeedsOf`), so a
@@ -406,8 +423,8 @@ const createView = (
     const pane = el('div', 'pane');
     const logWrap = el('div', 'log-wrap');
 
-    // The empty state is deliberately short: the agent row above already explains
-    // *who* will run, and the old description wall made the centre noisy.
+    // The empty state is deliberately short: the composer's agent control already
+    // names *who* will run, and the old description wall made the centre noisy.
     const empty = el('div', 'empty');
     empty.append(
         el('h2', 'empty-title', descriptor.title),
@@ -460,10 +477,8 @@ const createView = (
     const log = el('div', 'log');
     log.append(board.element);
 
-    const details = el('details', 'transcript');
-    details.append(el('summary', 'transcript-summary', 'Entry agent transcript (session.messages)'));
-    const transcriptBody = el('pre', 'transcript-body', '[]');
-    details.append(transcriptBody);
+    // R9 (T5): the per-view serialized transcript text/dialog is removed with the
+    // composer button that opened it. Nothing else in this view depended on it.
 
     // Session outcome line. ONE element per view (per harness/session card), so a
     // failure from a conversation the reader left can never paint into another one:
@@ -483,7 +498,7 @@ const createView = (
     // The strip sits between the session outcome line and the transcript: it is the
     // thread switcher AND the per-thread stop/delete surface, and it hides itself
     // when the session has no persistent threads (legacy server => no strip at all).
-    pane.append(sessionNote, strip.element, logWrap, details);
+    pane.append(sessionNote, strip.element, logWrap);
 
     // Only follow the stream when the reader has not scrolled away from the
     // bottom. Reading history while a run streams is a legitimate thing to do.
@@ -527,9 +542,6 @@ const createView = (
             stick(true);
         },
         setNotice,
-        setTranscript: (text) => {
-            transcriptBody.textContent = text;
-        },
         hydrate: (turns, model, keep, labelSeeds) => {
             const follow = pinned();
             const handles = board.hydrate(turns, {
@@ -578,7 +590,12 @@ const createView = (
         },
         turn: (id) => board.find(id),
         blocks: () => board.blocks(),
-        dispose: () => board.destroy()
+        dispose: () => {
+            // The entry-agent transcript dialog is gone (R9), so this view owns no
+            // overlay of its own; the shared agent dialog is app-scoped and closed
+            // by the shell's lifecycle helpers.
+            board.destroy();
+        }
     };
 };
 
@@ -1167,7 +1184,7 @@ statusPill.append(statusDot, statusText);
 
 // R3: Tools is a GLOBAL icon-only toggle in the top-right corner, not a centre tab.
 // It opens the same full-width catalogue + manual runner in `stage`; the harness
-// head, agent strip and composer are hidden while it is open (`setToolsView`).
+// head, composer (with both flanking controls) is hidden while it is open (`setToolsView`).
 //
 // The glyph is decoration (`aria-hidden`), the accessible name is `aria-label`, and
 // `aria-pressed` reports whether the tools view is showing, so the button is a real
@@ -1514,7 +1531,7 @@ endpoint.append(endpointBody);
 // answers, so the dropdown must show it rather than an empty control.
 renderModelOptions();
 
-// --- centre: harness head, agent row, transcript, composer ------------------
+// --- centre: harness head, transcript, composer (agent control right) -------
 const center = el('main', 'center');
 
 // R1: the harness head is a single title line; its detail note lives behind this
@@ -1584,18 +1601,27 @@ stage.id = 'harness-stage';
 //     matrix (including @/# popup navigation).
 //
 // Attachments (T5 clip/attach) are INLINE chips in that field, not a second input:
-//   - `.composer-body` is a column holding the error line and the field wrapper, so
+//   - `.composer-body` is the column holding the error line and the field wrapper, so
 //     `.composer-field`/`.composer-action` keep their exact layout contract
 //     (composer-style.test.ts);
 //   - there is NO attach button / hidden file input any more (R6): clipboard paste,
-//     drag/drop and @ file lookup are the whole attachment surface, so the composer
-//     has exactly one child column and no space is reserved for a removed control;
+//     drag/drop and @ file lookup are the whole attachment surface;
 //   - paste/drop file detection lives on the field/composer below. Each file becomes
 //     one atomic chip; its serialized text is the plain marker and the bytes travel
 //     separately in `attachments`.
+//
+// R9/R10/R11 (T5): the composer no longer has OUTSIDE flanks. The transcript button
+// is gone, and the single agent button now lives INSIDE the field frame at its right
+// edge, next to stop/send (see `.composer-controls` below). The text column keeps
+// `flex: 1; min-width: 0`, so it is the element that shrinks; the controls never
+// leave the border.
 const composer = el('form', 'composer');
 
 const composerBody = el('div', 'composer-body');
+
+// R9 (T5): the entry-agent transcript button is REMOVED entirely. It was the
+// composer's left flank and its only consumer of `session.messages`; deleting the
+// node (rather than hiding it) keeps no dead control in the tab order.
 
 // Chips now live INLINE in the contentEditable field (T5 R1): the old chip strip
 // above the field is gone. The explicit error line stays above the field so a
@@ -1614,10 +1640,24 @@ attachmentError.hidden = true;
 // this line carry the same state visually.
 const composerTarget = el('p', 'composer-target');
 composerTarget.hidden = true;
+// R14 (T7): the routing line is also the frame's FLOATING LABEL. It keeps the same
+// `<p class="composer-target">` node (thread-routing.test.ts / thread-session-scope
+// .test.ts read its text and `data-mode`; attachments-main.test.ts reads the tag), but
+// it is now positioned over the frame's top border as a notched outlined label
+// instead of taking a row above the field. The id lets paintComposerTarget wire
+// `aria-describedby` on the field while the label is visible, so the "where will this
+// send?" promise is still announced without turning it into a second control.
+composerTarget.id = 'composer-target';
 
 // The field is the positioning context for the action, so the button travels with
 // the box as it grows instead of sitting in a separate column.
 const composerField = el('div', 'composer-field');
+// R15 (T7): mirrors whether the notched label is painted. The stylesheet reserves the
+// notch's top padding ONLY in that state (`.composer-field[data-target='true']`), so
+// an idle composer with nothing to distinguish stays one input line tall. Set here
+// rather than with `:has()` so every engine (and jsdom source tests) sees the same
+// explicit state the paint pass writes in paintComposerTarget.
+composerField.dataset.target = 'false';
 // R1: ONE contentEditable surface. Chips are atomic non-editable spans
 // (ui/editor.ts); its plain-text value is still the old marker grammar, so the
 // server contract and attachment payload are unchanged.
@@ -1666,13 +1706,47 @@ stopAllButton.hidden = true;
 stopAllButton.textContent = '×';
 stopAllButton.setAttribute('aria-label', 'Stop all tasks');
 stopAllButton.title = 'Stop all running and queued tasks';
-composerField.append(input, composerPopup, stopAllButton, actionButton);
-composerBody.append(attachmentError, composerTarget, composerField);
 
-// R6: the composer ends at the field column. The old "+" chooser (button + hidden
-// file input) is deliberately gone: paste, drop and @ lookup cover attachments, and
-// keeping either node would leave a dead control in the tab order and a stylesheet
-// rule reserving space for it.
+// R10/R11 (T5) + R14/R16 (T7): ONE input frame. `.composer-field` is the visible
+// border/background of the composer now, and its children are the notched label (out
+// of flow), the agent button on the LEFT, the text column and a right-hand control
+// row:
+//
+//     ┌ New thread ────────────────────────────────────┐
+//     │ [ RR ]  textarea .................... [×] [▶] │
+//     └───────────────────────────────────────────────┘
+//
+// The controls are FLOW children (not absolutely positioned), so they can never
+// escape the frame — the previous design anchored the send control with
+// `position: absolute` while the agent control lived outside the border, which is
+// exactly the "button outside the input frame" the user reported. `.composer-field`
+// is a flex row: the text disc keeps `flex: 1; min-width: 0` and shrinks first, and
+// `.composer-controls` wraps internally at very small widths instead of pushing the
+// send button out of the box.
+//
+// R16 (T7): the agent slot moved from the right cluster to the LEFT edge of the same
+// frame, so the send/stop pair is untouched on the right and the agent button reads
+// as part of the input (borderless/transparent in styles.css) rather than as a
+// separate box. The agent dialog wiring is unchanged.
+const composerControls = el('div', 'composer-controls');
+composerControls.append(stopAllButton, actionButton);
+
+// DOM order = visual order: label (absolute, so it is not a flex item), agent (left),
+// text, popup (absolute), stop/send (right). The label stays FIRST so the notch reads
+// before the input in the reading order too.
+composerField.append(composerTarget, agentSlot, input, composerPopup, composerControls);
+// R14 (T7): the routing label moved INSIDE the frame; the body column now holds only
+// the (hidden unless there is a rejection) error line and the frame itself.
+composerBody.append(attachmentError, composerField);
+
+// R6: the attachment chooser (button + hidden file input) is deliberately gone:
+// paste, drop and @ lookup cover attachments, and keeping either node would leave a
+// dead control in the tab order and a stylesheet rule reserving space for it.
+//
+// The composer now has ONE child: the column with the field frame (R9 removed the
+// left transcript flank; R10/R11 moved the agent button INSIDE the frame). The
+// `.agent-slot` host stays the same node so the Tools view's existing hide/show
+// (`agentSlot.hidden`, tools-tab.test.ts) is unchanged.
 composer.append(composerBody);
 
 // --- attachment draft state ------------------------------------------------
@@ -2008,20 +2082,29 @@ const autoGrow = (): void => {
 
 // --- @ / # popup -------------------------------------------------------------
 //
-// One popup, two sources:
-//   - `@query`: a DEBOUNCED, query-aware fileGlob call (the existing /tools
+// One popup, three sources:
+//   - `@query` files: a DEBOUNCED, query-aware fileGlob call (the existing /tools
 //     endpoint; no new route). Each query changes the glob, so the server walk is
 //     narrowed instead of permanently limiting the picker to the first 100 files.
 //     A monotonically increasing sequence drops stale replies.
+//   - `@query` folders: the SAME debounced beat also reads `fileList` for the typed
+//     scope (fileGlob never yields directories), because folders are listed FIRST —
+//     navigation on top, matching file hits below. Both answers carry the same
+//     sequence, so they are painted together or not at all.
 //   - `#query`: the board's REAL root+nested agent blocks (view.blocks()), deduped
 //     by label with the latest occurrence winning (the server's plain-text
 //     resolution rule). No network.
+//
+// A THIRD source fills the same list: `@query` also asks fileList for the folders
+// of the typed scope (fileGlob yields files only), and those rows are placed FIRST
+// so folder navigation reads top-down. A folder row ends with "/" and drills in.
 //
 // Accessibility: the field owns aria-expanded/aria-activedescendant and the popup
 // is a listbox of option rows. Mouse rows preventDefault on mousedown so picking
 // one never blurs the editor before the click runs.
 type ComposerPopupItem =
     | { kind: 'file'; path: string }
+    | { kind: 'folder'; path: string }
     | { kind: 'reference'; block: AgentBlockDescriptor };
 
 type ComposerPopupState = {
@@ -2038,6 +2121,11 @@ type ComposerPopupState = {
 let composerPopupState: ComposerPopupState | undefined;
 let lookupTimer: number | undefined;
 let lookupSeq = 0;
+
+// Page size for the folder read. `fileList` defaults to 200 entries per page, which
+// is already far more folders than a picker can usefully show; asking for more would
+// only make the debounced read heavier for the same browsing experience.
+const FILE_FOLDER_LIMIT = 200;
 
 const closeComposerPopup = (): void => {
     if (lookupTimer !== undefined) {
@@ -2088,15 +2176,19 @@ const popupRow = (item: ComposerPopupItem, index: number, selected: boolean): HT
     row.dataset.index = String(index);
     if (selected) row.dataset.active = 'true';
 
-    if (item.kind === 'file') {
-        row.append(el('span', 'composer-popup-token', '@'), el('span', 'composer-popup-name', item.path));
-        row.title = item.path;
-    } else {
+    if (item.kind === 'reference') {
         row.append(
             el('span', 'composer-popup-token', `#${normalizeReferenceLabel(item.block.label)}`),
             el('span', 'composer-popup-name', item.block.agent),
             el('span', 'composer-popup-state', item.block.status)
         );
+    } else {
+        // File and folder rows share the "@" token so the list reads as one mention
+        // surface; a folder is marked in the dataset (styles.css bolds its name) and
+        // its path already carries the trailing "/" the pick uses to drill in.
+        row.append(el('span', 'composer-popup-token', '@'), el('span', 'composer-popup-name', item.path));
+        row.title = item.path;
+        if (item.kind === 'folder') row.dataset.folder = 'true';
     }
 
     return row;
@@ -2117,8 +2209,57 @@ const placeComposerPopup = (): void => {
     const field = composerField.getBoundingClientRect();
     if (!Number.isFinite(rect.top)) return;
 
-    const top = Math.max(0, Math.round(rect.bottom - field.top + 4));
-    const left = Math.max(0, Math.round(rect.left - field.left));
+    // The composer is docked at the BOTTOM of the pane (styles.css `.pane` column:
+    // `.log-wrap` flex:1, `.composer` last). Opening the list strictly below the
+    // caret therefore painted it past the window edge — the list was anchored to a
+    // side of the caret that has no room. Placement below is still the default;
+    // the list flips above the caret line when that side has more room, and its
+    // inline max-height shrinks to the chosen side so the rows scroll in place
+    // instead of being clipped by the viewport.
+    const gap = 4;
+    // Reset the previous inline cap first so this measurement reflects the
+    // stylesheet's own `max-height` rather than a stale clamp.
+    composerPopup.style.maxHeight = '';
+
+    // Every value below is 0 in jsdom, so `placeVertical` stays undefined there and
+    // the measurements are only used once real layout exists.
+    const viewportHeight = typeof window === 'undefined' ? 0 : window.innerHeight;
+    const popupHeight = composerPopup.offsetHeight;
+    const popupWidth = composerPopup.offsetWidth;
+
+    let top = Math.max(0, Math.round(rect.bottom - field.top + gap));
+
+    if (popupHeight > 0 && viewportHeight > 0) {
+        // Space available on each side of the caret line, minus the gap.
+        const roomBelow = viewportHeight - rect.bottom - gap;
+        const roomAbove = rect.top - gap;
+        const openAbove = popupHeight > roomBelow && roomAbove > roomBelow;
+        const room = openAbove ? roomAbove : roomBelow;
+
+        if (openAbove) {
+            // Sit the list on top of the caret line: its bottom edge is `gap` above
+            // the line, using the height it will actually have after the cap below.
+            const height = Math.min(popupHeight, Math.max(0, room));
+            top = Math.round(rect.top - field.top - height - gap);
+        } else {
+            top = Math.max(0, Math.round(rect.bottom - field.top + gap));
+        }
+
+        // Only ever SHRINK: the stylesheet cap (240px) still controls the tall case,
+        // because growing it here would let a long list paint over the transcript.
+        const cssCap = Number.parseFloat(window.getComputedStyle(composerPopup).maxHeight);
+        if (Number.isFinite(cssCap) && room < cssCap) {
+            composerPopup.style.maxHeight = `${Math.max(0, Math.floor(room))}px`;
+        }
+    }
+
+    // Horizontal: keep the list inside the field so a caret near its right edge does
+    // not push the box out of the composer.
+    let left = Math.max(0, Math.round(rect.left - field.left));
+    if (popupWidth > 0 && field.width > 0 && left + popupWidth > field.width) {
+        left = Math.max(0, Math.round(field.width - popupWidth));
+    }
+
     composerPopup.style.top = `${top}px`;
     composerPopup.style.left = `${left}px`;
 };
@@ -2180,12 +2321,26 @@ const scheduleFileLookup = (trigger: MentionTrigger & { kind: 'file' }): void =>
     lookupTimer = window.setTimeout(() => {
         lookupTimer = undefined;
         void (async () => {
+            const scope = fileQueryScope(trigger.query);
+            // Folders come from `fileList` (fileGlob walks past directories), read
+            // in parallel with the glob: one debounce still, two answers. The folder
+            // read NEVER fails the picker — an unreadable half-typed directory or an
+            // unconfigured tool just contributes no folder rows, and the glob keeps
+            // ownership of the error note.
+            const folders = callTool('fileList', { paths: [scope.directory], limit: FILE_FOLDER_LIMIT }).then(
+                (reply) => (reply.ok ? folderPathsOf(fileListEntriesOf(reply.result), scope) : []),
+                () => []
+            );
+
             try {
-                const response = await callTool('fileGlob', {
-                    patterns: fileGlobPattern(trigger.query),
-                    paths: ['.'],
-                    maxResults: 100
-                });
+                const [response, folderRows] = await Promise.all([
+                    callTool('fileGlob', {
+                        patterns: fileGlobPattern(trigger.query),
+                        paths: ['.'],
+                        maxResults: 100
+                    }),
+                    folders
+                ]);
 
                 // A newer keystroke, a closed popup, or a different trigger makes
                 // this answer stale. Never paint it.
@@ -2205,7 +2360,12 @@ const scheduleFileLookup = (trigger: MentionTrigger & { kind: 'file' }): void =>
                 } else {
                     const result = response.result as { truncated?: unknown } | undefined;
                     const files = filterFilePathList(filePathsOf(response.result), trigger.query);
-                    state.items = files.map((path) => ({ kind: 'file', path }));
+                    // FOLDER ROWS FIRST, then the matching files: navigation is the
+                    // top of the list, so a folder is never buried under file hits.
+                    state.items = [
+                        ...folderRows.map((path) => ({ kind: 'folder' as const, path })),
+                        ...files.map((path) => ({ kind: 'file' as const, path }))
+                    ];
                     state.truncated = result?.truncated === true;
                     state.error = undefined;
                 }
@@ -2287,7 +2447,8 @@ const moveComposerPopup = (delta: number): boolean => {
     return true;
 };
 
-// Pick the active row: replace `[trigger.start, caret)` with one atomic chip.
+// Pick the active row: replace `[trigger.start, caret)` with one atomic chip, or —
+// for a folder row — with the plain `@dir/` text that drills into it.
 // Returns false when there is nothing to pick, so Enter can fall through to
 // newline / submit.
 const selectComposerPopup = (index = composerPopupState?.index): boolean => {
@@ -2298,9 +2459,23 @@ const selectComposerPopup = (index = composerPopupState?.index): boolean => {
     if (item === undefined) return false;
 
     const caret = editorSelection(input).end;
+    const range = { start: state.trigger.start, end: Math.max(state.trigger.start, caret) };
+
+    // A folder row attaches nothing: it TYPES the folder path (with its trailing
+    // "/") over the query and immediately re-opens the picker for that directory,
+    // so "@" browsing is drill-down instead of a dead token. Plain text, not a chip:
+    // only files become file chips.
+    if (item.kind === 'folder') {
+        editorInsertPlainText(input, range, fileToken(item.path));
+        autoGrow();
+        paintComposer();
+        updateComposerPopup();
+        return true;
+    }
+
     const chip = item.kind === 'file' ? fileChipOf(item.path) : referenceChipOf(item.block);
 
-    editorInsertChips(input, { start: state.trigger.start, end: Math.max(state.trigger.start, caret) }, [chip]);
+    editorInsertChips(input, range, [chip]);
     closeComposerPopup();
     autoGrow();
     paintComposer();
@@ -2359,8 +2534,20 @@ const paintComposerTarget = (): void => {
     composerTarget.dataset.mode = target.mode;
     // "New thread" is only worth saying when this session HAS threads to distinguish
     // from (or when a reference just turned it into a connected thread). A legacy
-    // session therefore shows no extra line at all.
-    composerTarget.hidden = target.mode === 'new' && (instance?.threads.length ?? 0) === 0;
+    // session therefore shows no label at all.
+    const showTarget = !(target.mode === 'new' && (instance?.threads.length ?? 0) === 0);
+    composerTarget.hidden = !showTarget;
+
+    // R14 (T7): the routing line is the frame's notched label. These two writes keep
+    // the visual notch and the accessible description in the SAME state:
+    //   - `data-target` on the frame reserves the notch's top padding only while the
+    //     label is painted, which is what keeps the idle composer one line tall;
+    //   - `aria-describedby` is removed while hidden: a description that points at a
+    //     `display:none` node is silently dropped by AT anyway, so removing it keeps
+    //     the DOM honest (and the field keeps its own `aria-label` = "Task message").
+    composerField.dataset.target = showTarget ? 'true' : 'false';
+    if (showTarget) input.setAttribute('aria-describedby', 'composer-target');
+    else input.removeAttribute('aria-describedby');
 };
 
 const paintComposer = (): void => {
@@ -2506,7 +2693,10 @@ const centerPanels = createPanelHost('center');
 // The left host is appended with the create-harness panel below (harness list →
 // panels → endpoint), which is the requested "below harnesses, above endpoint".
 const leftPanels = createPanelHost('left');
-center.append(mainHead, agentSlot, centerPanels.element, stage, composer);
+// R5/T7: `agentSlot` lives inside the `.composer-field` frame now (LEFT edge, R16),
+// NOT under the head. The centre keeps the head, the panel host, the stage and the
+// composer.
+center.append(mainHead, centerPanels.element, stage, composer);
 
 // --- right rail: scratch board (primary panel host), then sessions ----------
 const rightRail = el('aside', 'rail rail-right');
@@ -2612,7 +2802,7 @@ type Instance = {
     view: View;
     sessionId?: string;
     // The definition the current conversation was created with. When present the
-    // agent row renders this and editing is locked, so an updated harness cannot
+    // compact agent control renders this and editing is locked, so an updated harness cannot
     // pretend to have changed a chat that is already on screen.
     frozen?: HarnessDescriptor;
     // The session's CURRENT effective per-agent models (`SessionSnapshot.agentModels`,
@@ -2679,19 +2869,24 @@ let toolEntries: readonly ToolDescriptor[] = [];
 // view (catalogue + manual runner). There is no tab strip (R3); the topbar's
 // icon-only Tools toggle drives this through `setToolsView`.
 let showingTools = false;
-// R1 mobile disclosure state for the agent strip. `renderAgents` rebuilds the DOM on
-// every paint (activity frames, model PATCHes, busy changes), so the open/closed
-// choice has to live out here or it would reset mid-interaction. It is CSS-inert on
-// desktop/tablet, where the card row is always visible.
-let agentsExpanded = false;
-// Which agent tile is FRONT (fully visible) in the overlapping card deck (R2). Same
-// reason as `agentsExpanded`: the row is rebuilt constantly, so the viewed card has
-// to be remembered here or an activity frame would flip the deck back. This is
-// VIEW state only — it is deliberately not `selectedName`/`primaryOf`, never sent to
+// Which agent tile is FRONT (fully visible) in the overlapping card deck (R2). The
+// dialog content is rebuilt on every paint (activity frames, model PATCHes, busy
+// changes), so the viewed card has to be remembered here or an activity frame would
+// flip the deck back. This is VIEW state only — it is deliberately not
+// `selectedName`/`primaryOf`, never sent to
 // the server, and fronting a card never PATCHes the team. `undefined` means "front
 // the primary"; a name that is no longer a member is dropped on the next render so
 // removing the viewed agent falls back to the primary instead of blanking the deck.
 let agentFront: string | undefined;
+// R11/R12 (T5): the agent dialog is APP-scoped, not per view. It is opened from the
+// composer button, kept in sync across routine chrome rebuilds (see
+// `refreshAgentDialog`) and closed by the lifecycle changes that used to reset the
+// old popover (harness switch, new/deleted session, Tools view).
+let agentDialog: AgentDialog | undefined;
+// The state the open dialog was last painted from. A chrome rebuild happens for
+// every snapshot/activity frame; rebuilding identical content would collapse open
+// instruction details and churn focus, so an unchanged signature is a no-op.
+let agentDialogSignature: string | undefined;
 
 // Single-flight submit state (R4). `running` means the selected session has work
 // the server has not finished; it drives the composer's stop state and the harness
@@ -2924,16 +3119,22 @@ const selectHarness = (name: string): void => {
     stopWatching();
     stopPolling();
 
+    // A tool runner is a modal belonging to the view being left; close it before
+    // the chat is restored (a programmatic switch may happen while it is open).
+    closeToolDialog();
+
     // Switching harness closes the global tools view and drops every ring: the
-    // activity belonged to the view being left. The mobile agent disclosure also
-    // starts collapsed for the new team (R1 default).
+    // activity belonged to the view being left. The deck disclosure also starts
+    // collapsed for the new team (R1 default).
     showingTools = false;
     paintToolsToggle();
-    agentsExpanded = false;
     // The deck's front card belonged to the team being left; the new team starts
     // with its own primary in front (the deck's own fallback does the same, this
     // just keeps the remembered state honest).
     agentFront = undefined;
+    // Lifecycle: the agent dialog belongs to the conversation being left. The new
+    // harness/session starts with it closed.
+    closeAgentDialog();
     clearActivity();
 
     selectedName = descriptor.name;
@@ -2999,8 +3200,8 @@ const buildHarnesses = (): void => {
     }
 };
 
-// Rebuild the header, agent row and core-tool list from the instance's current
-// (or frozen) definition. Called after every server-confirmed change and on
+// Rebuild the header, compact agent control and core-tool list from the instance's
+// current (or frozen) definition. Called after every server-confirmed change and on
 // snapshot hydration.
 const renderHarnessChrome = (): void => {
     const instance = current;
@@ -3021,9 +3222,11 @@ const renderHarnessChrome = (): void => {
     // itself only rewrites its argument box when the target list actually changed.
     runner.sync();
 
-    // While a tool runner owns the centre, the head/agent row belong to the tool;
-    // do not overwrite them.
-    if (currentTool !== undefined) return;
+    // While the tools view owns the centre, the head describes the list (or the
+    // tool whose dialog is open); a background repaint must not overwrite it with
+    // the chat title. `setToolsView`/`selectHarness` restore the chat head by
+    // clearing `showingTools` before they call back in here.
+    if (showingTools) return;
 
     const locked = instance.sessionId !== undefined;
 
@@ -3038,17 +3241,51 @@ const renderHarnessChrome = (): void => {
         : 'Edits apply to new sessions';
 
     // A locked session renders the definition it started with; the live harness
-    // may already have moved on.
-    agentSlot.replaceChildren(renderAgents(instance));
+    // may already have moved on. The composer button opens the shared agent dialog
+    // (R11), so there is no popover to restore here: only the BUTTON's own focus has
+    // to survive the rebuild, and an already-open dialog is refreshed from the new
+    // state (R12).
+    const hadAgentFocus = agentSlot.contains(document.activeElement);
+    const view = agentViewOf(instance);
+    const control = renderAgentControl(view, instance);
+    agentSlot.replaceChildren(control.element);
+
+    // A keyboard user who was on the agent button must not be dropped to <body> when
+    // a snapshot/activity frame replaces it.
+    if (hadAgentFocus) control.focus();
+
+    // Keep the open dialog truthful after a promotion/model PATCH/frame without
+    // closing it (unchanged state is a no-op inside refreshAgentDialog).
+    refreshAgentDialog(view, instance);
 };
 
-const renderAgents = (instance: Instance): HTMLElement => {
+// One derived description of the agent UI for the selected instance. Both the
+// composer button and the dialog read from it, so the two can never disagree about
+// the team, the primary, the lock reason or the effective model map.
+type AgentView = {
+    display: HarnessDescriptor;
+    members: string[];
+    primary: string;
+    locked: boolean;
+    // TEAM editing (promotion/add/remove). A saved session freezes the team; models
+    // stay live through `models.editable` below (R2).
+    editable: boolean;
+    // Per-member EFFECTIVE model (override or session/global fallback).
+    models: Record<string, string>;
+    // The model a no-override choice resolves to (rendered as an id, never
+    // "inherit"); '' means "not known", which the select states honestly.
+    fallback: string;
+    // The real reason team editing is locked. Omitted when it is allowed.
+    hint?: string;
+};
+
+const agentViewOf = (instance: Instance): AgentView => {
     const display = instance.frozen ?? instance.descriptor;
     const members = membersOf(display);
     const locked = instance.sessionId !== undefined;
     // R21.1: the harness itself is always editable; only a saved session (frozen
     // team), an in-flight run, or a submit that is currently creating/answering a
-    // session locks the row.
+    // session locks the team.
     const editable = !locked && !running && !submitting;
 
     // Effective model per member.
@@ -3107,46 +3344,151 @@ const renderAgents = (instance: Instance): HTMLElement => {
     // ghost selection. `members` order is the server's, primary first.
     if (agentFront !== undefined && !members.includes(agentFront)) agentFront = undefined;
 
-    return createAgentRow({
+    // The hint names the ACTUAL cause instead of claiming "locked" for a busy run.
+    const hint = locked
+        ? 'The agent team is locked for this conversation.'
+        : running
+          ? 'Wait for the current run to finish before switching agents.'
+          : submitting
+            ? 'A session is being created; try again in a moment.'
+            : undefined;
+
+    return {
+        display,
         members,
         primary: primaryOf(display),
-        agents: agentLibrary,
+        locked,
         editable,
-        models: {
-            models,
-            catalogue: modelIds,
-            ...(fallback.length > 0 ? { fallbackModel: fallback } : {}),
-            // R2: models are NOT part of the frozen team. A saved session edits its
-            // live map through PATCH /sessions/:id, and an in-flight run keeps
-            // streaming while the next request picks the new id up. The single-flight
-            // guard lives in setAgentModel/patchSessionModels, not in this flag
-            // (rendering while that PATCH is in flight must not look disabled).
-            editable: locked || !running,
-            // Tells the tile which promise the control makes: a session edit applies
-            // to the next request in THIS chat, a harness edit to future sessions.
-            ...(locked ? { session: true } : {}),
-            onChange: (name, model) => void setAgentModel(name, model)
-        },
+        models,
+        fallback,
+        ...(hint === undefined ? {} : { hint })
+    };
+};
+
+// The model dropdown payload shared by the deck inside the dialog. Every rule below
+// is the pre-existing one from the old centre row/popover; only its host changed.
+const agentModelSelectOf = (view: AgentView) => ({
+    models: view.models,
+    catalogue: modelIds,
+    ...(view.fallback.length > 0 ? { fallbackModel: view.fallback } : {}),
+    // R2: models are NOT part of the frozen team. A saved session edits its live map
+    // through PATCH /sessions/:id, and an in-flight run keeps streaming while the
+    // next request picks the new id up. The single-flight guard lives in
+    // setAgentModel/patchSessionModels, not in this flag (rendering while that PATCH
+    // is in flight must not look disabled).
+    editable: view.locked || !running,
+    // Tells the tile which promise the control makes: a session edit applies to the
+    // next request in THIS chat, a harness edit to future sessions.
+    ...(view.locked ? { session: true } : {}),
+    onChange: (name: string, model: string) => void setAgentModel(name, model)
+});
+
+// The composer button (R11). One control, no cycling, no chevron: pressing it opens
+// the dialog. `hint` is the tooltip, not a disabled state — models and instructions
+// must stay reachable while the TEAM is locked.
+const renderAgentControl = (view: AgentView, instance: Instance): AgentControl =>
+    createAgentControl({
+        primary: view.primary,
+        agents: agentLibrary,
         activity: [...instance.activity],
-        // R1: the phone disclosure state is owned here (module-level) because this
-        // row is rebuilt on every paint; the callback writes the reader's choice
-        // back so a rebuild (an activity frame, a model PATCH) keeps the cards open.
-        expanded: agentsExpanded,
-        onToggle: (open) => {
-            agentsExpanded = open;
-        },
-        // R2: the front card is remembered here for the same reason. It is pruned
-        // against the CURRENT team first, so removing the viewed agent drops the
-        // name on this very render and the deck falls back to the primary instead
-        // of keeping a stale module value. Fronting never PATCHes.
-        ...(agentFront !== undefined ? { front: agentFront } : {}),
-        onFront: (name) => {
-            agentFront = name;
-        },
-        onSelectPrimary: (name) => void selectPrimary(name),
-        onAdd: (name) => void addAgent(name),
-        onRemove: (name) => void removeAgent(name)
+        ...(view.hint === undefined ? {} : { hint: view.hint }),
+        onActivate: () => openAgentDialogForCurrent()
     });
+
+// Everything the dialog paints, derived from the same `AgentView`.
+const agentDialogOptionsOf = (view: AgentView, instance: Instance) => ({
+    members: view.members,
+    primary: view.primary,
+    agents: agentLibrary,
+    editable: view.editable,
+    models: agentModelSelectOf(view),
+    activity: [...instance.activity],
+    ...(view.hint === undefined ? {} : { hint: view.hint }),
+    ...(agentFront === undefined ? {} : { front: agentFront }),
+    // R2: the front card is remembered across rebuilds for the same reason as
+    // before. Fronting never PATCHes.
+    onFront: (name: string) => {
+        agentFront = name;
+    },
+    onSelectPrimary: (name: string) => void selectPrimary(name),
+    onAdd: (name: string) => void addAgent(name),
+    onRemove: (name: string) => void removeAgent(name)
+});
+
+// A cheap equality key for "does the open dialog need repainting?". It covers every
+// field the dialog renders that can change while it is open.
+const agentDialogSignatureOf = (view: AgentView, instance: Instance): string =>
+    JSON.stringify({
+        members: view.members,
+        primary: view.primary,
+        editable: view.editable,
+        models: view.models,
+        fallback: view.fallback,
+        front: agentFront ?? null,
+        activity: [...instance.activity].sort(),
+        agents: agentLibrary.map((agent) => agent.name)
+    });
+
+// Open the dialog for the SELECTED instance. The click handler resolves `current`
+// at press time, so a rebuilt button can never target a conversation left behind.
+const openAgentDialogForCurrent = (): void => {
+    const instance = current;
+    if (instance === undefined) return;
+
+    const view = agentViewOf(instance);
+    // One dialog at a time. A second programmatic open replaces the previous layer
+    // instead of stacking two views of the same team.
+    agentDialog?.close();
+    agentDialogSignature = agentDialogSignatureOf(view, instance);
+
+    agentDialog = openAgentDialog({
+        ...agentDialogOptionsOf(view, instance),
+        onClose: () => {
+            agentDialog = undefined;
+            agentDialogSignature = undefined;
+
+            // Focus return (R11/R13). ui/dialog.ts restores the opener when it is
+            // still connected; a chrome rebuild may have replaced the composer button
+            // while the modal was open, so fall back to the LIVE button rather than
+            // leaving focus on <body>.
+            const active = document.activeElement;
+            if (active === null || active === document.body) {
+                agentSlot.querySelector<HTMLButtonElement>('.agent-control-button')?.focus();
+            }
+        }
+    });
+};
+
+// Close the app-scoped agent dialog (lifecycle changes, Tools view). Idempotent.
+const closeAgentDialog = (): void => {
+    const dialog = agentDialog;
+    agentDialog = undefined;
+    agentDialogSignature = undefined;
+    dialog?.close();
+};
+
+// Keep an open dialog in sync with a chrome rebuild. Identical state is a no-op so
+// activity frames cannot collapse instruction details or churn focus.
+//
+// `force` exists for a REJECTED/IGNORED write: the stored state did not move, so the
+// signature matches, yet the control the reader pressed is showing the choice that
+// was refused. Rebuilding is the only way to snap it back to the last confirmed value.
+const refreshAgentDialog = (view: AgentView, instance: Instance, force = false): void => {
+    if (agentDialog === undefined || !agentDialog.isOpen) return;
+
+    const signature = agentDialogSignatureOf(view, instance);
+    if (!force && signature === agentDialogSignature) return;
+
+    agentDialogSignature = signature;
+    agentDialog.update(agentDialogOptionsOf(view, instance));
+};
+
+// Rebuild the open dialog from the CURRENT instance, even when the derived state is
+// unchanged (see `force` above). Used only on the failure/drop paths of an agent edit.
+const forceRefreshAgentDialog = (): void => {
+    const instance = current;
+    if (instance === undefined) return;
+    refreshAgentDialog(agentViewOf(instance), instance, true);
 };
 
 // Send the complete team on every change: `primary` plus every other member as
@@ -3200,9 +3542,11 @@ const patchAgents = async (
         setStatus('idle', `${label} saved · applies to new sessions`);
     } catch (error) {
         // The descriptor on screen is still the last server answer, so a failed
-        // PATCH leaves a truthful row.
+        // PATCH leaves a truthful row. The dialog is forced because its derived state
+        // is unchanged while the rejected select still shows the user's choice (T5 R13).
         setStatus('error', `${label}: ${messageOf(error)}`);
         renderHarnessChrome();
+        forceRefreshAgentDialog();
     } finally {
         savingAgents = false;
     }
@@ -3289,8 +3633,12 @@ const patchSessionModels = async (
     if (savingAgents) {
         // A second change while one PATCH is in flight is dropped, not queued. Redraw
         // so the control snaps back to the last CONFIRMED model instead of showing a
-        // choice that will never be sent.
-        if (current === instance) renderHarnessChrome();
+        // choice that will never be sent. The dialog needs the forced rebuild for the
+        // same reason as the failure path below (derived state did not change).
+        if (current === instance) {
+            renderHarnessChrome();
+            forceRefreshAgentDialog();
+        }
         return;
     }
 
@@ -3325,10 +3673,13 @@ const patchSessionModels = async (
         setStatus('idle', 'agent models saved · next request');
     } catch (error) {
         // Errors are shown even mid-run: a rejected model is something the reader
-        // must see, and the streaming turn keeps its tiles either way. The row is
-        // redrawn from the last confirmed map so it cannot pretend the change stuck.
+        // must see, and the streaming turn keeps its tiles either way. The row/dialog
+        // is redrawn from the last confirmed map so it cannot pretend the change stuck.
         setStatus('error', `agent models: ${messageOf(error)}`);
-        if (current === instance) renderHarnessChrome();
+        if (current === instance) {
+            renderHarnessChrome();
+            forceRefreshAgentDialog();
+        }
     } finally {
         savingAgents = false;
     }
@@ -3342,6 +3693,10 @@ const selectPrimary = async (name: string): Promise<void> => {
     // Selecting a member promotes it and demotes the old primary to a secondary,
     // in place (order is preserved so the row does not shuffle unexpectedly).
     const members = membersOf(display);
+    // After a promotion the NEW primary must be the front card, so the refreshed
+    // dialog shows its model select immediately. `undefined` is the deck's documented
+    // "front the primary" value.
+    agentFront = undefined;
     await patchAgents(name, members);
 };
 
@@ -3396,12 +3751,19 @@ const renderToolsSession = (
 };
 
 // ---------------------------------------------------------------------------
-// Tools view: the complete catalogue and the manual runner (centre column)
+// Tools view: the complete catalogue (centre column) and the tool-testing dialog
 // ---------------------------------------------------------------------------
 //
 // R21.2: this is the ONLY tool listing. The right rail used to duplicate it (a
 // catalogue plus a core-tools disclosure); both were removed so there is one place
 // to review and call every server tool, core entries included.
+//
+// R12/dialog rework: the centre column IS the list. The manual runner no longer
+// sits inline UNDER the list (which forced the list into a 32vh scroll box and put
+// the schema/arguments/result below the fold). Instead, activating one entry opens
+// the shared modal (`ui/dialog.ts`) with the runner adopted inside it. The dialog
+// owns focus/Escape/backdrop dismissal, so the list stays exactly one screen.
+//
 // A `sessionBound` entry runs inside the selected harness's session
 // (api.ts `callTool(name, parameters, sessionId)`); every other entry is a direct
 // function call on the server.
@@ -3413,22 +3775,97 @@ const toolsTabHead = el('div', 'tools-tab-head');
 const toolsTabHint = el(
     'p',
     'tools-tab-hint',
-    'Every tool the server lists, core tools included. Calls execute on the harness server — nothing runs in this browser. Session-bound tools (toolRequest, toolCreate, todoManage, and agentDelegate when the selected harness has subagents) run inside the selected harness’s session; every other tool, including the core file and search tools, runs directly.'
+    'Every tool the server lists, core tools included. Select one to open its runner. Calls execute on the harness server — nothing runs in this browser. Session-bound tools (toolRequest, toolCreate, todoManage, and agentDelegate when the selected harness has subagents) run inside the selected harness’s session; every other tool, including the core file and search tools, runs directly.'
 );
 const toolsSessionNote = el('p', 'tools-session-note field-hint', '');
 toolsTabHead.append(el('h2', 'tools-tab-title', 'Tools'), toolsTabHint, toolsSessionNote);
 const toolsTabList = el('div', 'tool-tab-list');
-const runnerSlot = el('div', 'tool-runner-slot');
-toolsPane.append(toolsTabHead, toolsTabList, runnerSlot);
+// The list is the whole content area. The runner is NOT mounted here any more: it
+// is adopted by `openToolDialog` only while the reader is testing that tool.
+toolsPane.append(toolsTabHead, toolsTabList);
 
-const selectTool = (entry: ToolDescriptor): void => {
+// The open tool-runner dialog, if any. The UI exercises ONE tool at a time, so a
+// second selection closes this layer before opening the next (openDialog stacks
+// by design; replacement is the catalogue's own rule).
+let toolDialog: DialogHandle | undefined;
+
+// The head shown while the tools view owns the centre and no dialog is open.
+// `renderHarnessChrome` returns early whenever `showingTools` is true, so this is
+// the only writer of the title/note in that state (a background snapshot or a
+// pending-state repaint can never repaint the chat title under the list).
+const paintToolsHead = (): void => {
+    const count = toolEntries.length;
+    headTitle.textContent = 'Tools';
+    headName.textContent = 'catalogue';
+    headNote.textContent =
+        count === 0
+            ? 'The server reported no tools.'
+            : `${count} tool${count === 1 ? '' : 's'} · calls run on the harness server`;
+};
+
+// Close the tool dialog if one is open. Idempotent; `onClose` performs the local
+// state cleanup, so every dismissal path (Escape, backdrop, close button, harness
+// switch, tools toggle) converges on the same reset.
+const closeToolDialog = (): void => {
+    toolDialog?.close();
+};
+
+// Open the runner for one catalogue entry in the shared modal. The runner pane is
+// PERSISTENT (it owns the in-flight call state), so it is moved into a fresh
+// dialog slot on every open instead of rebuilt. When the dialog closes, the slot
+// is removed with the overlay and the pane is re-adopted on the next open; a call
+// that finished meanwhile keeps its result.
+const openToolDialog = (entry: ToolDescriptor, trigger?: HTMLElement): void => {
+    const slot = el('div', 'tool-runner-slot');
+    slot.append(runner.pane);
+
+    let handle: DialogHandle | undefined;
+    handle = openDialog({
+        // The chips name the tool; the group is already on the head note behind the
+        // dialog, so repeating it in the title would only wrap long names.
+        title: entry.name,
+        content: slot,
+        // `returnFocus` is the tool button that opened this dialog, so Escape/close
+        // lands the reader back on the entry they picked (never the composer).
+        ...(trigger === undefined ? {} : { returnFocus: trigger }),
+        onClose: () => {
+            // Identity check: a replacement dialog may already have been opened by
+            // the time a queued close callback runs.
+            if (toolDialog !== handle) return;
+
+            toolDialog = undefined;
+            currentTool = undefined;
+            for (const button of toolTabButtons.values()) {
+                button.setAttribute('aria-pressed', 'false');
+            }
+
+            // The list is still on screen: describe it again. When the dialog was
+            // closed by LEAVING the tools view, that view has its own restore path
+            // (setToolsView/selectHarness) and must not be painted over here.
+            if (showingTools) paintToolsHead();
+            else if (current !== undefined) renderHarnessChrome();
+        }
+    });
+
+    // The runner is a full working surface (schema + editable arguments + result),
+    // so it uses the wide dialog variant. `dialog.ts` keeps the class list generic;
+    // the width lives in ui/dialog.css.
+    handle.element.classList.add('dialog-wide');
+    toolDialog = handle;
+};
+
+const selectTool = (entry: ToolDescriptor, trigger?: HTMLElement): void => {
     if (running) return;
 
     stopPolling();
 
+    // Replace, never stack: close the previous runner first so its `onClose` reset
+    // runs against the state that was actually on screen.
+    closeToolDialog();
+
     currentTool = entry;
-    // Selecting a tool opens the GLOBAL tools view: that is the only tool listing
-    // (R21.2), so the full catalogue and the runner are always in view together.
+    // Selecting a tool ensures the GLOBAL tools view is behind the dialog: that is
+    // the only tool listing (R21.2).
     showingTools = true;
     paintToolsToggle();
 
@@ -3453,22 +3890,39 @@ const selectTool = (entry: ToolDescriptor): void => {
 
     agentSlot.hidden = true;
     composer.hidden = true;
-    runner.show(entry);
-    runnerSlot.replaceChildren(runner.pane);
+    // Lifecycle: the agent dialog is not carried behind the Tools view; returning to
+    // the chat starts with it closed.
+    closeAgentDialog();
     stage.replaceChildren(toolsPane);
     delete stage.dataset.preset;
+    // Populate the persistent runner BEFORE it is adopted, so the dialog paints the
+    // argument template/schema on its first frame.
+    runner.show(entry);
+    openToolDialog(entry, trigger);
     setStatus('idle');
 };
 
 // Open or close the GLOBAL tools view (R3). One function for both directions: the
-// topbar icon toggle calls it, selecting a tool opens it, and harness selection
-// closes it. The panel (`stage`) is shared; the rest of the centre chrome (head,
-// agent row, composer) is shown or hidden to match. A run in flight keeps the view
-// locked, exactly as the removed tabs were.
+// topbar icon toggle calls it and harness selection closes it. The panel (`stage`)
+// is shared; the rest of the centre chrome (head and composer, with both flanking
+// controls) is shown or
+// hidden to match. A run in flight keeps the view locked, exactly as the removed
+// tabs were.
+//
+// Opening NEVER auto-opens a tool any more: the content area is the list, and a
+// dialog appears only after the reader activates one entry.
 const setToolsView = (open: boolean): void => {
     if (running || showingTools === open) return;
 
+    // Lifecycle: entering the Tools view dismisses the agent dialog; the chat starts
+    // with it closed when the view returns.
+    if (open) closeAgentDialog();
+
     if (!open) {
+        // Close the runner first: its `onClose` still sees the tools view and only
+        // resets the list's pressed state/head, then the chat chrome is restored
+        // below.
+        closeToolDialog();
         showingTools = false;
         paintToolsToggle();
 
@@ -3488,30 +3942,17 @@ const setToolsView = (open: boolean): void => {
         return;
     }
 
-    // Tools view with nothing chosen yet: open the first entry (core tools are
-    // listed first by the server) so the view is never an empty shell. An empty
-    // catalogue explains itself instead.
-    const entry = currentTool ?? toolEntries[0];
-    if (entry === undefined) {
-        showingTools = true;
-        paintToolsToggle();
-        currentTool = undefined;
-        agentSlot.hidden = true;
-        composer.hidden = true;
-        headTitle.textContent = 'Tools';
-        headName.textContent = '';
-        headNote.textContent = 'The server reported no tools.';
-        const empty = el('div', 'pane');
-        const wrap = el('div', 'log-wrap');
-        wrap.append(
-            el('p', 'field-hint', 'The server reported no tools. Check that the harness server is reachable.')
-        );
-        empty.append(wrap);
-        stage.replaceChildren(empty);
-        return;
-    }
+    showingTools = true;
+    paintToolsToggle();
+    currentTool = undefined;
+    for (const button of toolTabButtons.values()) button.setAttribute('aria-pressed', 'false');
 
-    selectTool(entry);
+    agentSlot.hidden = true;
+    composer.hidden = true;
+    paintToolsHead();
+    stage.replaceChildren(toolsPane);
+    delete stage.dataset.preset;
+    setStatus('idle');
 };
 
 // The topbar icon is a real toggle: pressing it while the tools view is showing
@@ -3540,6 +3981,10 @@ const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
         button.type = 'button';
         button.dataset.tool = entry.name;
         button.setAttribute('aria-pressed', 'false');
+        // The activation opens a modal runner rather than an inline panel, so the
+        // control advertises the popup kind to assistive technology. The button is
+        // passed back as `returnFocus` so closing restores focus here.
+        button.setAttribute('aria-haspopup', 'dialog');
         button.disabled = running;
 
         const unavailable = entry.availability?.state === 'unconfigured';
@@ -3554,7 +3999,7 @@ const buildToolsTab = (entries: readonly ToolDescriptor[]): void => {
             el('span', 'tool-tab-name', entry.name),
             el('span', 'tool-tab-kind', kind)
         );
-        button.addEventListener('click', () => selectTool(entry));
+        button.addEventListener('click', () => selectTool(entry, button));
 
         toolTabButtons.set(entry.name, button);
         toolsTabList.append(button);
@@ -3718,9 +4163,8 @@ const forgetDeletedSession = (id: string): void => {
         instance.panels.clear();
         instance.view.clear();
         // The conversation (and its outcome detail) is gone; nothing is left to
-        // report, and an empty view must not carry its transcript.
+        // report.
         instance.view.setNotice(undefined);
-        instance.view.setTranscript('[]');
     }
 
     // The remembered pointer must not resurrect a deleted id on the next reload.
@@ -3735,6 +4179,9 @@ const forgetDeletedSession = (id: string): void => {
     // re-enables the agent team and New session, since the server stopped whatever
     // was running in the deleted conversation.
     clearActivity();
+    // Lifecycle: the deleted conversation's agent dialog must not reopen against the
+    // next session.
+    closeAgentDialog();
     renderHarnessChrome();
     paintPanels();
     runner.sync();
@@ -4221,7 +4668,6 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     // composer, so another harness's snapshot cannot mutate it.
     if (instance === current) purgeStaleReferences(new Set(incomingTurns.map((turn) => turn.id)));
 
-    instance.view.setTranscript(JSON.stringify(session.messages, null, 2));
     upsertSession(session);
     renderSessions();
 
@@ -4367,7 +4813,13 @@ const onStreamItem = (
         // Per-agent ring. `start` activates the agent; a `done`/`error` for one
         // agent removes only that agent (a delegated sibling keeps spinning).
         applyActivity(instance.activity, item.event);
-        if (current === instance) paintActivity(agentSlot, instance.activity);
+        if (current === instance) {
+            paintActivity(agentSlot, instance.activity);
+            // R12 (T5): keep the OPEN dialog's team cards truthful without a rebuild —
+            // event frames can arrive many times per second, so repainting the ring is
+            // both cheaper and non-disruptive (focus/details stay put).
+            agentDialog?.paintActivity(instance.activity);
+        }
 
         // R21.3 LIVE panels: a tool result may carry `ui`. Upsert it into THIS
         // instance's board immediately, scoped by the tool name.
@@ -4713,8 +5165,10 @@ const newSession = (): void => {
     // The conversation (and its failure/stop detail) is gone; an empty session has
     // no outcome to report.
     instance.view.setNotice(undefined);
-    instance.view.setTranscript('[]');
     if (instance === current) forgetRememberedSession();
+    // Lifecycle: the agent dialog belongs to the conversation being left. Closing it
+    // here also releases its focus trap/scroll lock before the chrome repaints.
+    closeAgentDialog();
     renderHarnessChrome();
     renderSessions();
     paintPanels();
@@ -4773,8 +5227,8 @@ const paintControls = (): void => {
         button.disabled = deletionsBlocked || (id !== undefined && removingSessions.has(id));
     }
 
-    // The agent row follows the pending lock for TEAM edits; models remain live
-    // (R2) and are handled in renderHarnessChrome/renderAgents.
+    // The compact agent control follows the pending lock for TEAM edits; models
+    // remain live (R2) and are handled in renderHarnessChrome/renderAgentControl.
     if (current !== undefined) renderHarnessChrome();
 };
 

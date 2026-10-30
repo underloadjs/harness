@@ -154,7 +154,13 @@ let nextId = 0;
 // does not know (an old saved session); the tile still renders instead of
 // disappearing. The fallback title is a neutral word, NOT the slug: R3 keeps every
 // raw agent id out of visible text, and `data-agent` still carries the id.
-const detailsOf = (agents: readonly AgentDescriptor[], name: string): AgentDescriptor =>
+// Exported so the shared agent dialog (ui/agent-dialog.ts) renders instructions for
+// the exact same descriptor set, with the same fallback for a member the catalogue
+// no longer advertises (a saved session can name an agent the server dropped).
+export const agentDetailsOf = (
+    agents: readonly AgentDescriptor[],
+    name: string
+): AgentDescriptor =>
     agents.find((agent) => agent.name === name) ?? {
         name,
         title: 'Agent',
@@ -166,12 +172,21 @@ const detailsOf = (agents: readonly AgentDescriptor[], name: string): AgentDescr
 // The ONE visible label used by the preset picker: the server's display title.
 // R3: the slug is an internal id, so a descriptor without a title (never one of the
 // built-in profiles) falls back to a neutral word instead of exposing the id.
-const displayTitleOf = (agent: AgentDescriptor): string =>
+export const displayTitleOf = (agent: AgentDescriptor): string =>
     agent.title.trim().length > 0 ? agent.title : 'Agent';
 
-const presetDetail = (agent: AgentDescriptor): HTMLElement => {
+// Read-only preset instructions (details/summary + instruction + guidelines).
+//
+// `summary` defaults to the deck picker's historical wording; the agent dialog
+// passes the agent's display title so a collapsed entry is identifiable in a list
+// of many presets. Keeping ONE builder means the dialog cannot drift from the
+// picker's markup/classes, and `styles.css` already paints `.agent-detail*`.
+export const createAgentPresetDetail = (
+    agent: AgentDescriptor,
+    summary = 'preset details'
+): HTMLElement => {
     const detail = el('details', 'agent-detail');
-    detail.append(el('summary', 'agent-detail-summary', 'preset details'));
+    detail.append(el('summary', 'agent-detail-summary', summary));
 
     const body = el('div', 'agent-detail-body');
     body.append(
@@ -217,10 +232,16 @@ const presetDetail = (agent: AgentDescriptor): HTMLElement => {
 // The visible control is just the select; its accessible name carries the agent,
 // so a screen reader announces "Model for Summarizer" without adding a visible
 // MODEL label above it.
-const modelSelectFor = (name: string, title: string, models: AgentModelSelect): HTMLElement => {
-    // A plain container, not a <label>: there is no visible label text to click.
-    const row = el('div', 'agent-model');
-
+// The select itself is exported so the compact composer control can reuse the
+// EXACT option rules instead of maintaining a second copy: option 0 is the resolved
+// default (never "inherit"), provider ids are sorted alphabetically, and a current
+// override missing from the catalogue is sorted in rather than dropped. The deck
+// wraps it in `.agent-model`; the composer control places it inside its popover.
+export const createAgentModelSelect = (
+    name: string,
+    title: string,
+    models: AgentModelSelect
+): HTMLSelectElement => {
     const select = el('select', 'agent-model-select field-select');
     select.setAttribute('aria-label', `Model for ${title}`);
 
@@ -269,7 +290,14 @@ const modelSelectFor = (name: string, title: string, models: AgentModelSelect): 
         models.onChange?.(name, select.value);
     });
 
-    row.append(select);
+    return select;
+};
+
+// The deck's per-tile wrapper. A plain container, not a <label>: there is no
+// visible label text to click, and the select carries the agent in its aria-label.
+const modelSelectFor = (name: string, title: string, models: AgentModelSelect): HTMLElement => {
+    const row = el('div', 'agent-model');
+    row.append(createAgentModelSelect(name, title, models));
     return row;
 };
 
@@ -294,7 +322,7 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
     const teamId = `agent-team-${++nextId}`;
     row.id = teamId;
 
-    const teamLabel = displayTitleOf(detailsOf(options.agents, options.primary));
+    const teamLabel = displayTitleOf(agentDetailsOf(options.agents, options.primary));
     const summary = el('button', 'agent-summary');
     summary.type = 'button';
     summary.setAttribute('aria-controls', teamId);
@@ -389,7 +417,7 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
             setPickerOpen(false);
         });
 
-        option.append(choose, presetDetail(agent));
+        option.append(choose, createAgentPresetDetail(agent));
         picker.append(option);
     }
 
@@ -507,7 +535,7 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
     };
 
     for (const name of options.members) {
-        const agent = detailsOf(options.agents, name);
+        const agent = agentDetailsOf(options.agents, name);
         const isPrimary = name === options.primary;
         const tile = el('article', 'agent-tile');
         tile.dataset.agent = name;
@@ -528,7 +556,7 @@ export const createAgentRow = (options: AgentRowOptions): HTMLElement => {
         // Exactly one human-readable name (the preset title). The slug is kept in
         // `data-agent` for the callbacks and tests but is never displayed, so a
         // tile reads "Summarizer", not "summarizer" + "Summarizer". An unknown
-        // descriptor (see detailsOf) or an empty title reads a neutral word (R3).
+        // descriptor (see agentDetailsOf) or an empty title reads a neutral word (R3).
         const label = displayTitleOf(agent);
 
         main.title = isPrimary

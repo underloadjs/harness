@@ -8,6 +8,13 @@
 // across the session's turns in recorded order, so two distinct invocations of the
 // same agent never share a label (`RR1`/`RR2`), even across turns.
 //
+// ONE SEQUENCE (T14/R8-R10): a PERSISTENT conversation has a stable label of its
+// own (`RR4`, `IT1`) that every run/continuation in it repeats, and that number is
+// RESERVED in this same per-code sequence when the block is projected (see
+// `createBlock`). A legacy `/messages` turn (no conversation) and a threadless
+// nested block draw from that sequence too, so a conversation label, a legacy root
+// and a nested child can never share one text label.
+//
 // A user can type `#IT1` in a NEW prompt to reference the completed result of a
 // prior block. The reference is resolved against the SERVER's recorded turns (not
 // the live agent transcript), and the completed `done` content is appended to the
@@ -87,6 +94,18 @@ export type AgentResultTurn = {
     // the recorded start state keeps a surviving turn's labels stable, and
     // `seed()` never lowers a counter, so a normal (undeleted) prefix is unaffected.
     labels?: Readonly<Record<string, number>>;
+    // R8: the stable display label of the PERSISTENT conversation this turn ran
+    // in (`RR2`, `IT1`). The root block adopts it instead of minting a new
+    // occurrence, so a continuation turn repeats the conversation's label instead
+    // of consuming another number; the adopted number is still RESERVED in the
+    // per-code sequence (T14), so no nested block can be minted with it. Optional:
+    // a legacy turn has none and falls back to the conversation-scoped allocator.
+    threadLabel?: string;
+    // R8: runtime invocation id → its conversation's display label, for nested
+    // blocks. A delegated child's events carry an invocation id; a reference must
+    // name the CHILD CONVERSATION (`RR5`), not a fresh per-run number. Optional
+    // because a legacy record carries no roster join.
+    threadLabels?: Readonly<Record<string, string>>;
 };
 
 // One block plus the content to inject, as composed into a run prompt.
@@ -130,6 +149,29 @@ export const normalizeAgentLabel = (value: unknown): string | undefined => {
     return AGENT_REFERENCE_LABEL_PATTERN.test(label) ? label : undefined;
 };
 
+// A parsed compact label: the normalised text, its two-letter code, and its
+// occurrence ordinal. `AGENT_REFERENCE_LABEL_PATTERN` alone accepts `RR0`; an
+// ordinal is a COUNT, so it is validated as a POSITIVE integer here. Callers use
+// this both to validate a persisted/authoritative label (persistence) and to
+// reserve its number in an allocator (the block projection), which is why the
+// canonical text is returned with the parts.
+export type AgentLabelParts = {
+    label: string;
+    code: string;
+    ordinal: number;
+};
+
+export const agentLabelParts = (value: unknown): AgentLabelParts | undefined => {
+    const label = normalizeAgentLabel(value);
+    if (label === undefined) return undefined;
+
+    // `normalizeAgentLabel` guarantees two letters followed by at least one digit.
+    const ordinal = Number(label.slice(2));
+    if (!Number.isInteger(ordinal) || ordinal < 1) return undefined;
+
+    return { label, code: label.slice(0, 2), ordinal };
+};
+
 // Canonical identity used by the allocator: trimmed + lower-cased (identical to
 // `agentKeyOf` in ../frontend/ui/agent-color.ts).
 const agentKeyOf = (agent: string | undefined): string => (agent ?? '').trim().toLowerCase();
@@ -148,6 +190,15 @@ const codeOf = (key: string): string => {
 
     return `${letters[0]}${letters[letters.length - 1]}`.toUpperCase();
 };
+
+// The bare two-letter code WITHOUT the occurrence number. The compact agent
+// selector uses this in its small-width label, so the display title `Researcher`
+// reads `RR`. It applies the SAME first+last-ASCII-letter convention as the thread
+// badges, but it is NOT the same input: transcript labels key on the agent ID, so
+// the built-in `research` profile's badge is `RH1` (research -> RH), not `RR1`.
+// Passing the title here is deliberate: the user-facing abbreviation follows the
+// name they see. Same normalization and fallback (`AG`) as `codeOf`.
+export const agentCodeOf = (agent: string | undefined): string => codeOf(agentKeyOf(agent));
 
 export type AgentLabels = {
     next: (agent: string | undefined) => string;
@@ -169,7 +220,8 @@ export type AgentLabels = {
 //     name, so id collisions share one sequence (`research` → `RH1`, `rhesearch`
 //     → `RH2`) instead of silently producing duplicate labels;
 //   - `next()` is called once per invocation (never per event) and `reset()` starts
-//     a fresh sequence;
+//     a fresh sequence. An explicit conversation label does not call `next()` but
+//     still reserves its ordinal (see `blocksOfTurn`'s `createBlock`);
 //   - `seed()` CONTINUES a sequence. The reference namespace is the whole
 //     conversation (typed `#LABEL` resolves across turns), so the UI seeds each
 //     turn's allocator from the turns before it and the projection chains one
@@ -298,11 +350,26 @@ const blocksOfTurn = (
         agent: string,
         threadId: string | undefined,
         callId: string | undefined,
-        aliases: string[] = []
+        aliases: string[] = [],
+        // R8: an explicit CONVERSATION label. When present it is authoritative and
+        // the allocator does not MINT a number for this block (a run, continuation
+        // or nested invocation inside one conversation repeats the same label).
+        label?: string
     ): ReplayBlock => {
+        // T14: an explicit label still RESERVES its number in the sequence. The
+        // projector chains one allocator across the conversation, and a nested
+        // block of the same agent code would otherwise be minted the very number
+        // the conversation already shows (`RR1` root + `RR1` child). Raising the
+        // counter also makes `collectAgentLabelCounters` report conversation labels,
+        // so the server's durable counters and this sequence cannot diverge.
+        if (label !== undefined) {
+            const parts = agentLabelParts(label);
+            if (parts !== undefined) labels.seed(new Map([[parts.code, parts.ordinal]]));
+        }
+
         const block: ReplayBlock = {
             agent,
-            label: labels.next(agent),
+            label: label ?? labels.next(agent),
             threadId,
             runtimeThreadId: undefined,
             callId,
@@ -322,7 +389,9 @@ const blocksOfTurn = (
         if (root !== undefined) return root;
 
         primaryAgent = agent;
-        root = createBlock(agent, undefined, undefined);
+        // R8: the root block IS the turn's persistent conversation, so it shows
+        // that conversation's label (`RR4`) for every run/continuation in it.
+        root = createBlock(agent, undefined, undefined, [], turn.threadLabel);
         root.started = true;
         return root;
     };
@@ -355,16 +424,21 @@ const blocksOfTurn = (
         // Adopt a delegation placeholder created by the spawning tool call. The
         // placeholder was visible as `call:<callId>`; after adoption its CURRENT
         // identity is the runtime id, while the call key stays an alias.
+        const conversationLabel = turn.threadLabels?.[thread.id];
+
         const placeholder = thread.callId === undefined ? undefined : byCall.get(thread.callId);
         if (placeholder !== undefined && placeholder.runtimeThreadId === undefined) {
             placeholder.threadId = thread.id;
             placeholder.runtimeThreadId = thread.id;
+            // R8: the child's CONVERSATION label replaces the provisional
+            // per-invocation number the spawning call minted.
+            if (conversationLabel !== undefined) placeholder.label = conversationLabel;
             byThread.set(thread.id, placeholder);
             placeholder.started = true;
             return placeholder;
         }
 
-        const block = createBlock(event.agent, thread.id, thread.callId);
+        const block = createBlock(event.agent, thread.id, thread.callId, [], conversationLabel);
         block.runtimeThreadId = thread.id;
         byThread.set(thread.id, block);
         return block;

@@ -145,7 +145,12 @@ export const activityOfTurns = (turns: readonly SessionTurn[]): Set<string> => {
 // survive a `done`/`error` event. `ParentNode` keeps this usable on the agent slot
 // and on a detached wrapper in tests.
 export const paintActivity = (root: ParentNode, active: ReadonlySet<string>): void => {
-    for (const tile of root.querySelectorAll<HTMLElement>('.agent-tile[data-agent]')) {
+    // Both the full deck tiles (inside the composer popover) and the compact
+    // composer control carry `data-agent`; painting the same state on both keeps the
+    // ring visible whether the agent panel is open or closed.
+    for (const tile of root.querySelectorAll<HTMLElement>(
+        '.agent-tile[data-agent], .agent-control[data-agent]'
+    )) {
         const name = tile.dataset.agent ?? '';
 
         if (active.has(name)) {
