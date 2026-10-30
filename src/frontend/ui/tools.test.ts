@@ -1,6 +1,10 @@
-// Tool-card tests: status, collapsible summary and the pairing of a call with its
+// Tool-chip tests: status, the compact summary and the pairing of a call with its
 // result. The card is the only place a user learns whether a tool ran and what it
 // returned, so both the text and the `data-state` attribute are asserted.
+//
+// R12 moved the detail view into a modal (see tool-dialog.test.ts). These tests
+// keep pinning the chip and the shared body that the dialog adopts; they assert
+// exact text/HTML and never open an inline `<details>` panel.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts
 import { createToolCallCard } from './tools';
@@ -20,6 +24,8 @@ describe('createToolCallCard', () => {
         expect(card.element.querySelector('.tool-state')?.textContent).toBe('running');
         expect(card.element.querySelector('.tool-name')?.textContent).toBe('fileRead');
         expect(card.element.querySelector('.tool-summary')?.getAttribute('aria-label')).toBe('fileRead: running');
+        expect(card.element.querySelector('.tool-summary')?.getAttribute('aria-haspopup')).toBe('dialog');
+        expect(card.element.querySelector<HTMLElement>('.tool-summary')?.tabIndex).toBe(0);
         expect(card.element.querySelector('.tool-peek')?.textContent).toBe('{"paths":["package.json"]}');
         expect(card.element.querySelector('.tool-label')?.textContent).toBe('arguments');
         expect(card.element.querySelectorAll('.tool-label')[1]?.textContent).toBe('result · pending');
@@ -29,7 +35,7 @@ describe('createToolCallCard', () => {
         expect(card.state()).toBe('running');
     });
 
-    it('keeps arguments and result available when a chip is expanded', () => {
+    it('keeps the argument/result body in the closed card for the dialog to adopt', () => {
         const card = createToolCallCard('fileRead', '{"paths":["package.json"]}');
         card.resolve('{"ok":true}', false);
 
@@ -39,20 +45,16 @@ describe('createToolCallCard', () => {
         const argumentsText = '{\n  "paths": [\n    "package.json"\n  ]\n}';
         const resultText = '{\n  "ok": true\n}';
 
-        // Collapsed chip markup still contains the full detail; styles.css is what
-        // hides the verbose summary pieces, not the DOM.
+        // R12: the body never becomes an inline panel. It lives inside the always-
+        // closed `<details>` (which renders only its summary) until the dialog
+        // adopts it, so transcript consumers can still read the detail.
+        expect(card.element.open).toBe(false);
+        expect(card.element.querySelector('.tool-body')).not.toBeNull();
         expect(card.element.querySelectorAll('.tool-section code')[0]?.textContent).toBe(argumentsText);
         expect(card.element.querySelector('.tool-result code')?.textContent).toBe(resultText);
-
-        card.element.open = true;
-        expect(card.element.open).toBe(true);
         expect(card.element.querySelector('.tool-peek')?.textContent).toBe(
             '{"paths":["package.json"]} · 11 chars'
         );
-
-        card.element.open = false;
-        expect(card.element.querySelectorAll('.tool-section code')[0]?.textContent).toBe(argumentsText);
-        expect(card.element.querySelector('.tool-result code')?.textContent).toBe(resultText);
     });
 
     it('resolves a successful result, highlighting JSON and summarising the size', () => {

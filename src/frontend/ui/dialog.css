@@ -1,0 +1,152 @@
+/* Reusable modal dialog (T17 R9) — see ui/dialog.ts for the behavioural contract.
+ *
+ * HOST INTEGRATION: this file is not imported by ui/dialog.ts on purpose. The
+ * browser barrel src/frontend/index.ts must stay inert at module scope (see its
+ * header), so the app shell loads the stylesheet with ONE line, first in
+ * src/frontend/styles.css:
+ *
+ *     @import './ui/dialog.css';
+ *
+ * Vite inlines that import into the bundle. Colours come from styles.css :root
+ * tokens (--bg-elevated, --border-strong, ...), so the dialog matches the harness
+ * dark UI without redefining the palette.
+ *
+ * All selectors are scoped to `.dialog-*`; nothing here touches shell classes. */
+
+/* Full-viewport dismiss layer. Fixed + inset keeps it out of the shell grid, and
+ * the padding is the backdrop gutter (the click target that closes). */
+.dialog-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 1000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 24px;
+    background: rgba(4, 6, 10, 0.7);
+    backdrop-filter: blur(2px);
+}
+
+/* The panel is a flex column so only the body scrolls; header stays put. Capped
+ * height keeps long files/previews usable without hiding the close button. */
+.dialog {
+    display: flex;
+    flex-direction: column;
+    width: min(760px, 100%);
+    min-height: 0;
+    max-height: min(82vh, 900px);
+    overflow: hidden;
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius);
+    background: var(--bg-elevated);
+    box-shadow: 0 24px 64px rgba(0, 0, 0, 0.6);
+}
+
+/* The panel receives programmatic focus on open (ui/dialog.ts) so Escape/Tab work
+ * immediately. It is not an interactive control, so the global :focus-visible
+ * ring would read as a second border around the whole frame. */
+.dialog:focus {
+    outline: none;
+}
+
+.dialog-head {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: flex-start;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg-bar);
+}
+
+/* Long single-word titles wrap instead of widening the panel. */
+.dialog-title {
+    margin: 0;
+    overflow-wrap: anywhere;
+    color: var(--text);
+    font: 600 15px/1.4 var(--sans);
+}
+
+.dialog-close {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--muted);
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.dialog-close:hover {
+    border-color: var(--border);
+    background: var(--accent-soft);
+    color: var(--text);
+}
+
+/* The only scroll container: `min-height: 0` is what lets flex actually shrink it,
+ * and `overscroll-behavior` stops chained scroll behind the modal. */
+.dialog-body {
+    flex: 1 1 auto;
+    min-height: 0;
+    padding: 16px 18px;
+    overflow: auto;
+    overscroll-behavior: contain;
+    overflow-wrap: anywhere;
+}
+
+/* Content is caller-built DOM (image / pre / code / text). These rules only make
+ * those common node types fit inside the scroll container; they never add markup. */
+.dialog-body img {
+    display: block;
+    max-width: 100%;
+    height: auto;
+    margin: 0 auto;
+}
+
+.dialog-body pre {
+    max-width: 100%;
+    margin: 0;
+    padding: 12px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-deep);
+    color: var(--text);
+    font: 12px/1.6 var(--mono);
+    tab-size: 4;
+    white-space: pre;
+}
+
+.dialog-body code {
+    font-family: var(--mono);
+}
+
+/* Phone layout: edge-to-edge panel with a small gutter. `align-items: stretch`
+ * gives the body the full height between header and viewport edge. */
+@media (max-width: 720px) {
+    .dialog-overlay {
+        align-items: stretch;
+        padding: 10px;
+    }
+
+    .dialog {
+        width: 100%;
+        max-height: calc(100vh - 20px);
+    }
+
+    .dialog-head {
+        padding: 10px 12px;
+    }
+
+    .dialog-body {
+        padding: 12px;
+    }
+}

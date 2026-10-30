@@ -100,6 +100,9 @@
 // Cross-references:
 //   - tool cards: src/frontend/ui/tools.ts
 //   - attachment chips (composer + replay): src/frontend/ui/attachments.ts
+//   - attachment/image preview dialogs: src/frontend/ui/preview.ts
+//   - transcript file links + bounded file preview: src/frontend/ui/file-links.ts,
+//     src/frontend/ui/file-preview.ts
 //   - lifecycle status (topbar pill): src/frontend/main.ts (`setLifecycle`)
 //   - elapsed formatting: src/frontend/ui/time.ts
 //   - styles: src/frontend/styles.css (`.turns`, `.turn-row`, `.tile`, `.agent`)
@@ -115,7 +118,11 @@ import type {
     HarnessAttachment,
     HarnessBranchSummary
 } from '../../types';
-import { attachmentChipElement, attachmentThumbnailUrl } from './attachments';
+import { applyAttachmentChips } from './attachments';
+import { enhanceFileLinks } from './file-links';
+import { openFilePreview } from './file-preview';
+import type { FilePreviewReader } from './file-preview';
+import { openAttachmentDialog, enhanceImages, openImageDialog } from './preview';
 import {
     actionAnswerEventOf,
     actionRequestEventOf,
@@ -261,9 +268,11 @@ export type TurnHandle = {
     // created by `begin` carries the draft's attachments until the server record
     // replaces them, so the optimistic and replayed renderings agree.
     attachments: () => readonly HarnessAttachment[];
-    // Replace the chips under the prompt. Called by `merge` with the server's
-    // record; never renders the base64 payload as text (filename/marker only, plus
-    // a safe raster-image thumbnail).
+    // Replace the inline attachment chips in the prompt. Called by `merge` with
+    // the server's record (and by the optimistic path with the draft list); never
+    // renders the base64 payload as text (filename/marker only, plus a safe
+    // raster-image thumbnail). R10: every call re-renders the prompt so a marker
+    // that moved/duplicated in the record cannot leave a stale chip behind.
     setAttachments: (attachments: readonly HarnessAttachment[]) => void;
     // Real agent blocks in this turn, root first then nested invocations, in
     // allocation order. This is the ONLY source for the composer's # reference
@@ -305,6 +314,11 @@ export type TurnBoardOptions = {
     // Sends one human answer to the harness server. Omitted in standalone tests and
     // on a page with no wiring; the card then reports a recoverable local error.
     answerAction?: (input: AnswerActionInput) => Promise<void>;
+    // Reads a bounded window of one LOCAL RELATIVE file for the R11 preview dialog.
+    // Injected by the app shell (main.ts -> `callTool('fileRead', ...)`) so the UI
+    // layer owns no network code. Omitted in standalone use: clicking a file link
+    // still opens the dialog, which reports that reading is not wired.
+    readFile?: FilePreviewReader;
 };
 
 export type TurnBoard = {
@@ -925,42 +939,58 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
         // The prompt itself is rendered as Markdown too: users paste code fences
         // and lists into the composer, and the tile should read like the answer.
+        // R10: recorded attachments are INLINE chips in this same flow. The marker
+        // the user typed ("[Image 1]") is replaced in place after sanitizing; an
+        // attachment whose marker is absent is appended at the end of the prompt.
+        // There is deliberately NO second `.turn-attachments` row: one file must
+        // never appear twice in the transcript.
         const promptBlock = el('div', 'turn-prompt markdown');
-        promptBlock.append(markdownFragment(prompt));
 
-        // Attachments (T5, additive): the chip strip sits directly under the prompt
-        // and is hidden for a text-only turn, so every pre-attachment tile keeps its
-        // exact layout. Chips are built by ui/attachments.ts (filename via
-        // textContent, decorative raster thumbnail only; the base64 payload is never
-        // rendered as text). History is read-only: no remove control here.
-        const attachmentHost = el('div', 'turn-attachments');
-        attachmentHost.setAttribute('role', 'list');
-        attachmentHost.hidden = true;
-
+        // Attachments recorded for this tile (optimistic draft first, then the
+        // server record). Kept as the source of truth for re-rendering, because
+        // `merge` may call `setAttachments` more than once (e.g. ack + snapshot).
         let attachmentRecords: HarnessAttachment[] = [];
+
+        // Open a file link in the R11 preview dialog. Only a user activation calls
+        // this, so no path is fetched automatically; `options.readFile` supplies
+        // the bounded request (main.ts -> callTool('fileRead', ...)).
+        const openTranscriptFile = (path: string): void => {
+            openFilePreview(path, options.readFile === undefined ? {} : { read: options.readFile });
+        };
+
+        // A recorded attachment opens the shared preview modal. The dialog captures
+        // the focused chip before opening and restores it on close; it never falls
+        // back to the composer.
+        const openAttachment = (attachment: HarnessAttachment): void => {
+            openAttachmentDialog(attachment);
+        };
+
+        // A Markdown image opens the same modal (fitted full preview). The dialog
+        // re-checks the source; the sanitizer already removed scriptable URLs.
+        const openTranscriptImage = (source: string, alt: string): void => {
+            openImageDialog(source, { alt });
+        };
+
+        // Rebuild the prompt's DOM from its sanitized Markdown and then apply the
+        // post-sanitization transforms (file links, clickable images, attachment
+        // chips). Called on creation and on every `setAttachments`, so optimistic
+        // and replayed turns always show the same chips at the same marker positions.
+        const renderPrompt = (): void => {
+            promptBlock.replaceChildren(markdownFragment(prompt));
+            enhanceFileLinks(promptBlock, { open: openTranscriptFile });
+            enhanceImages(promptBlock, { open: openTranscriptImage });
+            applyAttachmentChips(promptBlock, attachmentRecords, { onOpen: openAttachment });
+        };
 
         const setAttachments = (attachments: readonly HarnessAttachment[]): void => {
             attachmentRecords = [...attachments];
-
-            const chips = attachments.map((attachment) => {
-                const preview = attachmentThumbnailUrl(attachment);
-                return attachmentChipElement({
-                    kind: attachment.kind,
-                    marker: attachment.marker,
-                    name: attachment.name,
-                    mime: attachment.mime,
-                    ...(preview === undefined ? {} : { previewUrl: preview })
-                });
-            });
-
-            attachmentHost.replaceChildren(...chips);
-            attachmentHost.hidden = chips.length === 0;
+            renderPrompt();
         };
 
         setAttachments(initialAttachments);
 
         const flow = el('div', 'tile-flow');
-        body.append(promptBlock, attachmentHost, flow);
+        body.append(promptBlock, flow);
 
         card.append(select, body);
 
@@ -1316,6 +1346,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             }
 
             entry.prompt.replaceChildren(markdownFragment(input));
+            // File mentions and images in a delegated task are the same affordance
+            // as in the main prompt (R11); the transforms are DOM-only.
+            enhanceFileLinks(entry.prompt, { open: openTranscriptFile });
+            enhanceImages(entry.prompt, { open: openTranscriptImage });
         };
 
         const setThreadInput = (entry: ThreadEntry, input: string | undefined): void => {
@@ -1855,6 +1889,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
         const renderText = (block: TextBlock): void => {
             block.node.replaceChildren(markdownFragment(block.buffer));
+            // R11: file mentions in the assistant's answer are clickable too. The
+            // transform runs after sanitizing and only creates buttons from text.
+            enhanceFileLinks(block.node, { open: openTranscriptFile });
+            enhanceImages(block.node, { open: openTranscriptImage });
         };
 
         const flushText = (section: AgentSection): void => {

@@ -20,7 +20,8 @@
 // Cross-references:
 //   - ./api.ts       — API root resolution, fetch client, SSE parser
 //   - ./contract.ts  — wire validation/presentation helpers
-//   - ./ui/*.ts      — turn board, agent row, create form, markdown, panels, tools
+//   - ./ui/*.ts      — turn board, agent row, create form, markdown, panels, tools,
+//                      dialog shell, attachment/file/image previews
 //   - ./main.ts      — the app shell (NOT exported: it boots on import)
 //   - ../../package.json — "exports[./frontend]"
 export * from './api';
@@ -28,9 +29,13 @@ export * from './contract';
 export * from './ui/activity';
 export * from './ui/agents';
 export * from './ui/create-harness';
+export * from './ui/dialog';
+export * from './ui/file-links';
+export * from './ui/file-preview';
 export * from './ui/markdown';
 export * from './ui/model-order';
 export * from './ui/panels';
+export * from './ui/preview';
 export * from './ui/time';
 export * from './ui/tokens';
 export * from './ui/tools';

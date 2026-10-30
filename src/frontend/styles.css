@@ -1,5 +1,10 @@
 /* Harness UI styles. Not part of the published package. */
 
+/* T17 dialog shell (ui/dialog.ts). This is the ONE host integration line the
+   dialog module documents; Vite inlines it into the app bundle. It must stay the
+   first rule so the browser treats it as a stylesheet import. */
+@import './ui/dialog.css';
+
 :root {
     color-scheme: dark;
 
@@ -2825,20 +2830,24 @@ button {
 
 /* Composer (R9/R10) ----------------------------------------------------- */
 
+/* R7/T15: compact outer spacing. The composer is a single field column now (the
+   attachment button is gone), so it only needs a small breathing edge around the
+   box; 8px/16px replaces the old 13px/20px shell padding without touching the
+   responsive grid or the action's in-field placement. */
 .composer {
     display: flex;
     align-items: flex-end;
-    gap: 10px;
-    padding: 13px 20px;
+    gap: 8px;
+    padding: 8px 16px;
     border-top: 1px solid var(--border);
     background: var(--bg-bar);
 }
 
 /* Attachments (T5 clip/attach) -------------------------------------------
-   `.composer-body` is the composer's flexible column: the chip strip and the
-   error line sit ABOVE the existing `.composer-field`, so the action's absolute
-   position inside the field is unchanged. The attach button is a sibling of the
-   column, bottom-aligned with the field. */
+   `.composer-body` is the composer's column: the error line sits ABOVE the existing
+   `.composer-field`, so the action's absolute position inside the field is
+   unchanged. R6 removed the attach button, so the column is the composer's only
+   child and nothing to its right reserves width. */
 .composer-body {
     display: flex;
     flex: 1;
@@ -2941,6 +2950,202 @@ button {
     cursor: default;
 }
 
+/* R10: a recorded attachment is an INLINE chip in the prompt, so it uses the same
+   visual anatomy as a composer chip but sits in prose. It is a real <button>
+   (Enter/Space open the preview), so the reset rules below are deliberate. */
+.attachment-inline {
+    margin: 0 2px;
+    padding: 2px 6px;
+    vertical-align: baseline;
+    cursor: pointer;
+    text-align: left;
+}
+
+.attachment-inline:hover {
+    border-color: var(--accent);
+}
+
+.attachment-inline:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* A thumbnail inside a line of prose must not grow the line height. */
+.attachment-inline .attachment-thumb {
+    width: 18px;
+    height: 18px;
+}
+
+.attachment-inline .attachment-text {
+    gap: 4px;
+}
+
+/* R11: a transcript path that opens the file-preview dialog. It is a real button
+   so keyboard activation works; it inherits the surrounding type scale so a link
+   in prose or in a heading looks like the text, only tinted/underlined. */
+.file-link {
+    display: inline;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--accent);
+    font: inherit;
+    text-align: inherit;
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    text-underline-offset: 2px;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+}
+
+.file-link:hover {
+    text-decoration-style: solid;
+}
+
+.file-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 3px;
+}
+
+/* An inline-code path keeps its code face inside the link (the code element is
+   moved into the button by ui/file-links.ts). */
+.file-link > code {
+    border: 0;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+}
+
+/* R11: a Markdown image is wrapped in a modal trigger. The button is plain so the
+   image keeps its own `.markdown img` size/rounding rules; only the focus ring and
+   pointer affordance change. */
+.image-link {
+    display: inline-block;
+    max-width: 100%;
+    margin: 0;
+    padding: 0;
+    border: 0;
+    background: transparent;
+    cursor: zoom-in;
+    line-height: 0;
+}
+
+.image-link:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 6px;
+}
+
+/* --- previews (attachment + file), hosted by ui/dialog.css ----------------- */
+
+.preview {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.preview-image {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    margin: 0;
+}
+
+/* Fitted full preview: the dialog body is the scroll container, so the image is
+   capped against the viewport rather than upscaled past its bytes. */
+.preview-image img {
+    max-width: 100%;
+    max-height: 68vh;
+    width: auto;
+    height: auto;
+    object-fit: contain;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-deep);
+}
+
+.preview-facts {
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 4px 12px;
+    margin: 0;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.preview-facts dt {
+    color: var(--muted);
+}
+
+.preview-facts dd {
+    margin: 0;
+    overflow-wrap: anywhere;
+}
+
+.preview-meta {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11.5px;
+}
+
+.preview-status,
+.preview-empty,
+.preview-truncated,
+.preview-note {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 12px;
+}
+
+.preview-error {
+    color: var(--danger);
+    font-family: var(--mono);
+    font-size: 12px;
+    overflow-wrap: anywhere;
+}
+
+.preview-code {
+    max-height: 68vh;
+    margin: 0;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-deep);
+    color: var(--text);
+    font: 12px/1.6 var(--mono);
+    tab-size: 4;
+    white-space: pre;
+}
+
+.preview-actions {
+    display: flex;
+    gap: 8px;
+}
+
+.preview-download {
+    padding: 6px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--bg-input);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 12px;
+    cursor: pointer;
+}
+
+.preview-download:hover {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.preview-download:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
 /* Explicit rejection/read-failure line. It is a live region in main.ts, so it is
    present but hidden when there is nothing to say. */
 .composer-attachment-error {
@@ -2954,41 +3159,10 @@ button {
     display: none;
 }
 
-/* File chooser accessory: the visible, focusable control; the native input stays
-   hidden (main.ts). */
-.composer-attach {
-    width: 34px;
-    height: 34px;
-    flex: 0 0 auto;
-    align-self: flex-end;
-    padding: 0;
-    border: 1px solid var(--border-strong);
-    border-radius: 8px;
-    background: var(--bg-input);
-    color: var(--text);
-    font-family: var(--sans);
-    font-size: 18px;
-    line-height: 1;
-    cursor: pointer;
-}
-
-.composer-attach:hover:not(:disabled) {
-    border-color: var(--accent);
-}
-
-.composer-attach:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-}
-
-.composer-attach:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-}
-
-.composer-file {
-    display: none;
-}
+/* R6/T15: the attachment chooser (`.composer-attach` button + hidden native
+   `.composer-file` input) is removed from the DOM and the stylesheet. Attachments
+   arrive through clipboard paste, drag/drop and @ file lookup only; leaving either
+   selector here would keep space/hit-area rules for a control that no longer exists. */
 
 /* The box that holds the field AND its single action (R10). `position: relative`
    is what keeps the action inside the input box in every state; `min-width: 0`
@@ -3023,18 +3197,22 @@ button {
 /* R9/R5: the CHAT field is one row by default and grows by script (main.ts autoGrow)
    up to a LINE cap — 3 text lines on a phone viewport (<=860px), 5 on desktop — then
    scrolls. A contentEditable div has no `rows` attribute, so the one-row minimum is
-   an explicit line box + padding (13.5px * 1.45 + 20px), replacing the old
-   `rows = 1` default; the script still owns every height above that. `resize` is off
-   because the drag handle would fight the measured height. `max-height: none` is
-   deliberate: the script computes the cap from the field's live line-height/padding/
-   borders, so the base 200px box (still used by the tool-runner arguments textarea)
-   must not clip the fifth line at large fonts or zoom. The right padding reserves
-   the action's footprint so text never runs underneath it (R10). */
+   an explicit line box + padding (13.5px * 1.45 + 2*6px padding + 2px border = ~34px),
+   replacing the old `rows = 1` default; the script still owns every height above it.
+   `resize` is off because the drag handle would fight the measured height.
+   `max-height: none` is deliberate: the script computes the cap from the field's live
+   line-height/padding/borders, so the base 200px box (still used by the tool-runner
+   arguments textarea) must not clip the fifth line at large fonts or zoom.
+
+   R7/T15 compact inset: 6px vertical + 8px left is the smallest comfortable text
+   inset on the dark box. The right gutter is NOT attachment space (that button is
+   gone): it clears the in-field action at `right: 8px` + `width: 28px` plus ~8px of
+   breathing room, so a wrapped line never runs under the send/stop glyph. */
 .composer-field .composer-input {
     width: 100%;
-    min-height: 40px;
+    min-height: 34px;
     max-height: none;
-    padding: 10px 52px 10px 12px;
+    padding: 6px 44px 6px 8px;
     resize: none;
     overflow-y: auto;
 }

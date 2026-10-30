@@ -12,7 +12,9 @@
 //   - the pre-read budget gate (count / per-file / total bytes) and MIME-to-kind
 //     classification;
 //   - raw-base64 extraction from a FileReader data URL;
-//   - the history chip DOM (filename via textContent, optional safe image thumbnail).
+//   - the history chip DOM (filename via textContent, optional safe image thumbnail);
+//   - inline transcript chips placed over exact prompt markers (R10) and their
+//     replacement rules, so the attachment is NOT repeated in a second row.
 //
 // Contract sources (frozen, don't re-invent):
 //   - ../../types/index.ts          — HarnessAttachment (single type owner)
@@ -22,7 +24,8 @@
 //   - ./main.ts                     — composer state machine that consumes these
 //   - ./editor.ts                   — inline atomic chips (draft attachments)
 //   - ./turns.ts                    — replay/history chips (same chip builder)
-//   - ../../frontend/styles.css     — `.composer-chip`, `.attachment-chip`
+//   - ./preview.ts                  — the dialog an inline chip opens
+//   - ../../frontend/styles.css     — `.composer-chip`, `.attachment-chip`, `.attachment-inline`
 
 import type { HarnessAttachment } from '../../types';
 import {
@@ -469,20 +472,13 @@ export type AttachmentChipFacts = {
     pending?: boolean;
 };
 
-// Build one chip. `name` and `marker` are written with textContent (never HTML),
-// and the remove affordance is a SIBLING button inside a plain div — never a
-// button nested in a button, which would be invalid and inaccessible.
-export const attachmentChipElement = (
-    facts: AttachmentChipFacts,
-    options: { onRemove?: () => void } = {}
-): HTMLElement => {
+// Shared inner content for every chip variant. Split out so the static history
+// chip (div/listitem) and the interactive inline chip (button) cannot drift in
+// class names or in what they write: `name`/`marker`/`kind` always use
+// textContent, so no payload-derived string can ever be parsed as HTML.
+const attachmentChipContent = (facts: AttachmentChipFacts): DocumentFragment => {
     const document = globalThis.document;
-
-    const chip = document.createElement('div');
-    chip.className = 'attachment-chip';
-    chip.dataset.kind = facts.kind;
-    chip.setAttribute('role', 'listitem');
-    if (facts.pending === true) chip.dataset.state = 'reading';
+    const fragment = document.createDocumentFragment();
 
     if (facts.previewUrl !== undefined) {
         const thumb = document.createElement('img');
@@ -490,7 +486,7 @@ export const attachmentChipElement = (
         // Decorative: the filename next to it is the accessible identity.
         thumb.alt = '';
         thumb.src = facts.previewUrl;
-        chip.append(thumb);
+        fragment.append(thumb);
     }
 
     const text = document.createElement('span');
@@ -509,7 +505,27 @@ export const attachmentChipElement = (
     name.textContent = facts.name;
 
     text.append(kind, marker, name);
-    chip.append(text);
+    fragment.append(text);
+    return fragment;
+};
+
+// Build one static chip (composer strip / legacy list). `name` and `marker` are
+// written with textContent (never HTML), and the remove affordance is a SIBLING
+// button inside a plain div — never a button nested in a button, which would be
+// invalid and inaccessible.
+export const attachmentChipElement = (
+    facts: AttachmentChipFacts,
+    options: { onRemove?: () => void } = {}
+): HTMLElement => {
+    const document = globalThis.document;
+
+    const chip = document.createElement('div');
+    chip.className = 'attachment-chip';
+    chip.dataset.kind = facts.kind;
+    chip.setAttribute('role', 'listitem');
+    if (facts.pending === true) chip.dataset.state = 'reading';
+
+    chip.append(attachmentChipContent(facts));
 
     if (options.onRemove !== undefined) {
         const remove = document.createElement('button');
@@ -526,4 +542,148 @@ export const attachmentChipElement = (
     }
 
     return chip;
+};
+
+// ---------------------------------------------------------------------------
+// Inline transcript chips (R10)
+// ---------------------------------------------------------------------------
+//
+// A recorded turn's attachments are NOT a second list under the prompt: the
+// marker the user typed ("[Image 1]") is the attachment. This builder returns a
+// REAL <button>, so it is keyboard-activatable by default (Enter/Space) and has
+// an accessible name; clicking it is what opens the preview dialog.
+//
+// It reuses the `.attachment-chip` visual vocabulary and adds `.attachment-inline`
+// for the compact in-flow sizing. The payload is never rendered: only filename,
+// marker, kind and a safe raster thumbnail (attachmentThumbnailUrl refuses SVG
+// and any non-image MIME) reach the DOM.
+
+export type InlineAttachmentChipOptions = {
+    // Invoked on click/Enter/Space. The recorded attachment is passed through, so
+    // the caller can open the preview without re-reading the DOM.
+    onOpen?: (attachment: HarnessAttachment) => void;
+};
+
+export const attachmentInlineChipElement = (
+    attachment: HarnessAttachment,
+    options: InlineAttachmentChipOptions = {}
+): HTMLButtonElement => {
+    const document = globalThis.document;
+    const preview = attachmentThumbnailUrl(attachment);
+
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'attachment-chip attachment-inline';
+    chip.dataset.kind = attachment.kind;
+    chip.dataset.marker = attachment.marker;
+    chip.setAttribute('aria-haspopup', 'dialog');
+    // The accessible name uses the same facts a sighted reader sees. Marker is
+    // included so two same-named files stay distinguishable.
+    chip.setAttribute('aria-label', `Open ${attachment.name} (${attachment.marker})`);
+    chip.title = attachment.name;
+
+    chip.append(
+        attachmentChipContent({
+            kind: attachment.kind,
+            marker: attachment.marker,
+            name: attachment.name,
+            mime: attachment.mime,
+            ...(preview === undefined ? {} : { previewUrl: preview })
+        })
+    );
+
+    if (options.onOpen !== undefined) {
+        const open = options.onOpen;
+        chip.addEventListener('click', () => open(attachment));
+    }
+
+    return chip;
+};
+
+// Elements whose text must never be turned into an attachment chip: code is the
+// user showing a marker literally, links/buttons already own activation, and an
+// existing chip must not be replaced twice on a re-render.
+const ATTACHMENT_CHIP_BLOCKED = 'pre, code, a, button, .attachment-chip, .file-link';
+
+// Text nodes under `root`, in document order. Collected eagerly because inserting
+// a chip splits the very node being visited.
+const textNodesWithin = (root: HTMLElement): Text[] => {
+    const document = root.ownerDocument;
+    const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
+    const nodes: Text[] = [];
+
+    for (let node = walker.nextNode(); node !== null; node = walker.nextNode()) {
+        nodes.push(node as Text);
+    }
+
+    return nodes;
+};
+
+// Find the first text node holding `marker` exactly as a substring, outside the
+// blocked containers above.
+const markerTextNode = (root: HTMLElement, marker: string): Text | undefined => {
+    for (const node of textNodesWithin(root)) {
+        if (!node.data.includes(marker)) continue;
+
+        const parent = node.parentElement;
+        if (parent !== null && parent.closest(ATTACHMENT_CHIP_BLOCKED) !== null) continue;
+        return node;
+    }
+
+    return undefined;
+};
+
+// Replace an exact marker inside one text node with `chip`, preserving the text
+// before and after it. `splitText` keeps every character, so a marker in the
+// middle of a sentence becomes a chip inside that sentence rather than a
+// separate row.
+const replaceMarkerInText = (node: Text, marker: string, chip: HTMLElement): void => {
+    const index = node.data.indexOf(marker);
+    if (index < 0) return;
+
+    // The returned node starts at the marker; the original keeps the prefix.
+    const target = node.splitText(index);
+    if (target.data.length > marker.length) target.splitText(marker.length);
+
+    target.parentNode?.replaceChild(chip, target);
+};
+
+export type AttachmentChipPlacement = {
+    // Markers found in the rendered prompt and replaced in place.
+    matched: number;
+    // Attachments whose marker was not present; appended at the end of the prompt.
+    appended: number;
+};
+
+// Apply recorded attachments to an ALREADY-SANITIZED prompt element. This is a
+// post-sanitization DOM transform only: the marker is matched as plain text, and
+// the chip is built with createElement/textContent. No HTML string is ever
+// injected, so the sanitizer's guarantees still hold.
+//
+// Matching is by exact marker, once per attachment. An unmatched attachment is
+// appended at the end of the prompt instead of a separate list, so the transcript
+// never shows the same file twice.
+export const applyAttachmentChips = (
+    root: HTMLElement,
+    attachments: readonly HarnessAttachment[],
+    options: InlineAttachmentChipOptions = {}
+): AttachmentChipPlacement => {
+    let matched = 0;
+    let appended = 0;
+
+    for (const attachment of attachments) {
+        const chip = attachmentInlineChipElement(attachment, options);
+        const node = markerTextNode(root, attachment.marker);
+
+        if (node === undefined) {
+            root.append(chip);
+            appended += 1;
+            continue;
+        }
+
+        replaceMarkerInText(node, attachment.marker, chip);
+        matched += 1;
+    }
+
+    return { matched, appended };
 };

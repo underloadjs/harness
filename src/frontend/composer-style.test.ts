@@ -87,16 +87,18 @@ it('makes the chat field one row by default, auto-grown and scrolling at the cap
     const base = blockOf('.composer-input {');
     expect(base).toContain('max-height: 200px');
 
-    // R9: rows=1 + min-height 0 decide the empty height, script growth owns the rest.
+    // R9/T15: the empty height is ONE line box + the compact padding + border
+    // (13.5 * 1.45 = 19.575 + 12 + 2 => 34px); the script owns every height above it.
     const field = blockOf('.composer-field .composer-input {');
     expect(field).toContain('width: 100%');
-    // A contentEditable div has no `rows` attribute: one line box + padding is the
-    // explicit empty height, and the script owns every height above it.
-    expect(field).toContain('min-height: 40px');
+    expect(field).toContain('min-height: 34px');
+    expect(field).not.toContain('min-height: 40px');
     expect(field).not.toContain('min-height: 54px');
-    // R10: the right gutter reserves the 28px action + margins, so text never
-    // runs under the icon; the other sides keep the normal field padding.
-    expect(field).toContain('padding: 10px 52px 10px 12px');
+    // R7/T15 compact inset: 6px vertical, 8px left. The right gutter clears the
+    // in-field action (right 8px + 28px wide + ~8px gap => 44px), not the removed
+    // attachment button; text must still never run under the glyph.
+    expect(field).toContain('padding: 6px 44px 6px 8px');
+    expect(field).not.toContain('padding: 10px 52px 10px 12px');
     // The script measures the content; a manual handle would fight it.
     expect(field).toContain('resize: none');
     expect(field).not.toContain('resize: vertical');
@@ -123,7 +125,7 @@ it('does not keep a footer action row for the composer', () => {
     expect(rules).not.toContain('.composer-actions .run');
 });
 
-it('styles the attachment accessory additively without touching the field contract', () => {
+it('keeps the composer column additive and compact, with no attachment chooser rules', () => {
     // T5: chips/error sit in a column ABOVE the existing `.composer-field`, so the
     // action's absolute position inside the field is untouched.
     const body = blockOf('.composer-body {');
@@ -132,16 +134,23 @@ it('styles the attachment accessory additively without touching the field contra
     expect(body).toContain('flex: 1');
     expect(body).toContain('min-width: 0');
 
-    // An empty draft truly removes the strip; the native file input never paints.
-    expect(blockOf('.composer-attachments[hidden] {')).toContain('display: none');
-    expect(blockOf('.composer-file {')).toContain('display: none');
+    // R7/T15: compact outer spacing (8px/16px) instead of the old 13px/20px shell
+    // padding; the removed chooser leaves no sibling gap to reserve.
+    const composer = blockOf('.composer {');
+    expect(composer).toContain('padding: 8px 16px');
+    expect(composer).not.toContain('padding: 13px 20px');
 
-    // The chooser is a real focusable button with the same hit area as the action.
-    const attach = blockOf('.composer-attach {');
-    expect(attach).toContain('width: 34px');
-    expect(attach).toContain('height: 34px');
-    expect(attach).toContain('cursor: pointer');
-    expect(blockOf('.composer-attach:focus-visible {')).toContain('outline: 2px solid var(--accent)');
+    // R6/T15: the attachment chooser (button + hidden input) is gone from the
+    // stylesheet as well as the DOM. The selectors are matched with their `{`/`:` so
+    // the still-valid `.composer-attachment-error`/`.composer-attachments` prefixes
+    // are not mistaken for the removed accessory.
+    expect(rules).not.toContain('.composer-attach {');
+    expect(rules).not.toContain('.composer-attach:');
+    expect(rules).not.toContain('.composer-file {');
+
+    // An empty draft truly removes the strip; the inline chips and the replay strip
+    // (now the only attachment affordances) keep their contract.
+    expect(blockOf('.composer-attachments[hidden] {')).toContain('display: none');
 
     // Chips clip a long filename instead of growing the composer off-screen, and
     // the replay strip is hidden for text-only turns.

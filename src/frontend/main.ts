@@ -163,6 +163,7 @@ import { applyActivity, activityOfTurns, paintActivity } from './ui/activity';
 import { highlightCode, looksLikeJson, prettyJson } from './ui/markdown';
 import { applyPanels, createPanelHost, mediaOfTurns } from './ui/panels';
 import type { PanelMedia } from './ui/panels';
+import type { FilePreviewReader, FilePreviewResult } from './ui/file-preview';
 import { createTurnBoard } from './ui/turns';
 import type { AnswerActionInput, TurnHandle } from './ui/turns';
 
@@ -182,6 +183,20 @@ const el = <K extends keyof HTMLElementTagNameMap>(
 };
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+// R11: the ONLY file request a transcript click may make. It is bounded by the
+// preview dialog (`startLine`/`maxLines`) and goes through the existing direct
+// tool endpoint — no new server route, no client filesystem access. A refused
+// request surfaces the server's own message in the dialog.
+const readFileForPreview: FilePreviewReader = async ({ path, startLine, maxLines }) => {
+    const response = await callTool('fileRead', [{ path, startLine, maxLines }]);
+
+    if (!response.ok) throw new Error(response.error.message);
+
+    // The dialog reads this structurally (`files[]`); the cast only carries the
+    // tool's documented result shape across the generic endpoint boundary.
+    return response.result as FilePreviewResult;
+};
 
 // ---------------------------------------------------------------------------
 // Settings
@@ -343,6 +358,9 @@ const createView = (
     // turn is never interrupted by deltas arriving for a newer one.
     const board = createTurnBoard({
         empty,
+        // R11: file links in the transcript get the bounded read adapter. Omitted
+        // in a standalone/embedded page, where the dialog reports it is unwired.
+        readFile: readFileForPreview,
         ...(answer === undefined ? {} : { answerAction: answer })
     });
 
@@ -1457,8 +1475,9 @@ stage.id = 'harness-stage';
 //   - `.composer-body` is a column holding the error line and the field wrapper, so
 //     `.composer-field`/`.composer-action` keep their exact layout contract
 //     (composer-style.test.ts);
-//   - the attach button is a sibling of that column (a real button, never a nested
-//     one) and opens the hidden file input;
+//   - there is NO attach button / hidden file input any more (R6): clipboard paste,
+//     drag/drop and @ file lookup are the whole attachment surface, so the composer
+//     has exactly one child column and no space is reserved for a removed control;
 //   - paste/drop file detection lives on the field/composer below. Each file becomes
 //     one atomic chip; its serialized text is the plain marker and the bytes travel
 //     separately in `attachments`.
@@ -1518,28 +1537,11 @@ actionButton.hidden = true;
 composerField.append(input, composerPopup, actionButton);
 composerBody.append(attachmentError, composerField);
 
-// File chooser accessory. The visible button is the only focusable control; the
-// native input is hidden from the tab order and from AT (its button carries the
-// accessible name). Selecting the same file twice still fires `change` because the
-// input is reset after every pick.
-const attachButton = el('button', 'composer-attach', '+');
-attachButton.type = 'button';
-attachButton.setAttribute('aria-label', 'Attach files');
-attachButton.title = 'Attach an image, video, audio file, PDF or other file';
-const fileInput = el('input', 'composer-file');
-fileInput.type = 'file';
-fileInput.multiple = true;
-fileInput.hidden = true;
-fileInput.tabIndex = -1;
-attachButton.addEventListener('click', () => fileInput.click());
-fileInput.addEventListener('change', () => {
-    const chosen = fileInput.files === null ? [] : Array.from(fileInput.files);
-    // Reset before reading so a second pick of the same file is a new change.
-    fileInput.value = '';
-    if (chosen.length > 0) addFiles(chosen);
-});
-
-composer.append(composerBody, attachButton, fileInput);
+// R6: the composer ends at the field column. The old "+" chooser (button + hidden
+// file input) is deliberately gone: paste, drop and @ lookup cover attachments, and
+// keeping either node would leave a dead control in the tab order and a stylesheet
+// rule reserving space for it.
+composer.append(composerBody);
 
 // --- attachment draft state ------------------------------------------------
 //
@@ -1691,15 +1693,15 @@ const finishAttachmentRead = (draft: DraftAttachment, data: string | Error): voi
     paintAttachments();
 };
 
-// Add a clipboard/drop/file-chooser batch. The budget gate runs BEFORE any bytes
+// Add a clipboard/drop batch. The budget gate runs BEFORE any bytes
 // are read and is ATOMIC: one oversized/invalid file rejects the whole batch with
 // an explicit reason, inserting nothing. A read failure afterwards is partial and
 // per-file (see finishAttachmentRead) because the markers are already in the text.
 //
 // FREEZE: while a submit owns the enqueue window (`submitting`), no new draft entry
-// may appear. The chooser is disabled in that state, and paste/drop are still
-// intercepted by their handlers (the native paste/drop is always prevented), so a
-// payload arriving during the window must be dropped here too. Otherwise the new
+// may appear. Paste/drop are still intercepted by their handlers (the native
+// paste/drop is always prevented), so a payload arriving during the window must be
+// dropped here too. Otherwise the new
 // chip sits in the cleared field while the keydown chip-delete and the chip
 // MutationObserver both skip `submitting`, so a Backspace in that window could
 // remove only the chip and leave bytes behind: an orphan attachment whose marker is
@@ -1808,8 +1810,13 @@ input.addEventListener('paste', (event) => {
     paintComposer();
 });
 
-// Drag/drop is the third way in. Like paste, the native drop is ALWAYS prevented:
+// Drag/drop is the second way in. Like paste, the native drop is ALWAYS prevented:
 // a drop payload is either files (same gate/atomicity) or plain text, never HTML.
+//
+// R8: a drop never calls input.focus(). The insertion lands at the field's stored
+// caret, but focus stays wherever the user had it (another control, or nowhere):
+// the requirement is "no automatic focus", and a drop on the composer is not a
+// request to move the caret for typing.
 composer.addEventListener('dragover', (event) => {
     // Prevent default even for text: the drop handler owns what lands in the field.
     event.preventDefault();
@@ -1823,7 +1830,6 @@ composer.addEventListener('drop', (event) => {
     const files = clipboardFilesOf(event.dataTransfer);
     if (files.length > 0) {
         addFiles(files);
-        input.focus();
         return;
     }
 
@@ -1831,16 +1837,12 @@ composer.addEventListener('drop', (event) => {
         typeof event.dataTransfer?.getData === 'function'
             ? event.dataTransfer.getData('text/plain')
             : '';
-    if (text.length === 0) {
-        input.focus();
-        return;
-    }
+    if (text.length === 0) return;
 
     // A drop can land anywhere on the composer; insert at the field's caret.
     editorInsertPlainText(input, editorSelection(input), text);
     autoGrow();
     paintComposer();
-    input.focus();
 });
 
 
@@ -2196,11 +2198,6 @@ const paintComposer = (): void => {
     const reading = attachmentReads > 0;
     actionButton.disabled = action === 'submit' ? submitting || !booted || reading : false;
     actionButton.type = action === 'stop' ? 'button' : 'submit';
-
-    // The attach accessory is locked only during the short enqueue window, so the
-    // payload a submit captured cannot change underneath it.
-    attachButton.disabled = submitting || !booted;
-    fileInput.disabled = attachButton.disabled;
 
     if (action === 'stop') {
         actionButton.textContent = '×';
@@ -4269,7 +4266,9 @@ const newSession = (): void => {
     renderSessions();
     paintPanels();
     setStatus('idle');
-    input.focus();
+    // R8: starting a new session must not move focus into the composer. The draft is
+    // module-scoped and survives session switches, so there is nothing to re-enter;
+    // the user clicks the field when they want to type.
 };
 
 // ---------------------------------------------------------------------------
@@ -4578,7 +4577,9 @@ const run = async (): Promise<void> => {
         // every later transition; this only releases the enqueue lock.
         setBusy(current?.pending === true);
         turn.flush();
-        input.focus();
+        // R8: send success/failure must not refocus the composer. The field was
+        // cleared optimistically (or restored on failure); the user decides when to
+        // return to it, so no lifecycle branch calls input.focus() here.
         // Release the frozen chip strip (remove controls return; a successful send
         // already emptied it above).
         paintAttachments();
@@ -4958,7 +4959,8 @@ const boot = async (): Promise<void> => {
             setStatus('idle');
         }
 
-        input.focus();
+        // R8: initial load never focuses the composer. The page opens with focus
+        // where the browser put it (body); the user clicks the field to type.
     } catch (error) {
         showOffline(messageOf(error));
         setStatus('error', 'server offline');

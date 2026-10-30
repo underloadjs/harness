@@ -12,10 +12,10 @@
 // (send) / Shift+Alt+Enter (newline) / IME Enter (ignored) / clicking keep the
 // exact submission semantics the old buttons had.
 //
-// T5 adds ONE composer accessory (the file chooser, `.composer-attach`) and the
-// attachment strip above the field. Those are deliberately not part of the
-// single-ACTION matrix above; the attachment flow is pinned in
-// attachments-main.test.ts and ui/attachments.test.ts.
+// T15/R6: the composer has NO attachment accessory. Clipboard paste, drag/drop and
+// @ file lookup are the whole attachment surface, and the inline chips are pinned in
+// attachments-main.test.ts / ui/attachments.test.ts. This file only proves the
+// chooser button and its hidden input are gone from the rendered shell.
 //
 // The field's growth math is unit-tested in ui/composer.test.ts; here the textarea's
 // `scrollHeight` is stubbed because jsdom has no layout.
@@ -24,6 +24,7 @@ import type { HarnessDescriptor, SessionSnapshot, SessionTurn } from '../server/
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
 const T = 1_700_000_000_000;
+const SESSION_KEY = 'underload-harness-app:session';
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 
 const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescriptor =>
@@ -73,12 +74,12 @@ const flush = async (): Promise<void> => {
     await new Promise((resolve) => setTimeout(resolve, 30));
 };
 
-const bootstrap = (): Record<string, unknown> => ({
+const bootstrap = (restored?: SessionSnapshot): Record<string, unknown> => ({
     rootPath: '/api',
     presets: [descriptor()],
     tools: [],
     defaults,
-    sessions: [],
+    sessions: restored === undefined ? [] : [restored],
     agents: []
 });
 
@@ -91,9 +92,10 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(selector: string, tag: K
 // The whole server surface this page needs. `tasks` counts POST /sessions/:id/tasks;
 // `cancels` records every cancel body. GET /sessions/s1 answers a RUNNING snapshot
 // until a cancel lands, then a terminal one, which is what drives pending -> false.
+// `taskError` makes the task POST fail (500) so the send-failure path is observable.
 type Server = { tasks: number; cancels: unknown[]; cancelled: boolean };
 
-const stubServer = (): Server => {
+const stubServer = (taskError?: string, restored?: SessionSnapshot): Server => {
     const server: Server = { tasks: 0, cancels: [], cancelled: false };
 
     vi.stubGlobal(
@@ -102,12 +104,14 @@ const stubServer = (): Server => {
             const url = String(input);
             const method = init?.method;
 
-            if (url === '/api') return json(bootstrap());
+            if (url === '/api') return json(bootstrap(restored));
             if (url === '/api/models') return json({ models: ['m1'] });
             if (url === '/api/sessions' && method === 'POST') return json({ session: snapshot() }, 201);
 
             if (url === '/api/sessions/s1/tasks' && method === 'POST') {
                 server.tasks += 1;
+                if (taskError !== undefined) return json({ error: { message: taskError } }, 500);
+
                 const opening = turn({ prompt: `task ${server.tasks}` });
                 return json(
                     { session: snapshot({ status: 'running', turns: [opening] }), turn: opening },
@@ -193,20 +197,19 @@ it('paints the single in-field action for every state and never renders old cont
     expect(input.getAttribute('placeholder')).toBeNull();
 
     // R10: the action is a child of the field wrapper; the wrapper is wrapped in
-    // the composer BODY column (the attachment error line sits above it). T5 adds
-    // exactly one accessory (the file chooser) and its hidden input: there is still
-    // no sibling action column and no Run/Stop/Reset trio.
+    // the composer BODY column (the attachment error line sits above it). R6/T15: the
+    // body column is the composer's ONLY child — the file chooser and its hidden
+    // input are gone, so there is no accessory beside the field and no dead control.
     expect(input.parentElement).toBe(field);
     expect(action.parentElement).toBe(field);
     expect(field.parentElement?.className).toBe('composer-body');
-    expect([...composer.children].map((child) => child.className)).toEqual([
-        'composer-body',
-        'composer-attach',
-        'composer-file'
-    ]);
-    // The in-field action plus the file-chooser accessory; the hidden file input is
-    // not a button.
-    expect(composer.querySelectorAll('button')).toHaveLength(2);
+    expect(composer.children).toHaveLength(1);
+    expect(composer.firstElementChild?.className).toBe('composer-body');
+    expect(composer.querySelector('.composer-attach')).toBeNull();
+    expect(composer.querySelector('.composer-file')).toBeNull();
+    expect(composer.querySelector('input[type="file"]')).toBeNull();
+    // The in-field action is the composer's only button; no chooser, no Run/Stop/Reset.
+    expect(composer.querySelectorAll('button')).toHaveLength(1);
     expect(composer.querySelector('.run')).toBeNull();
     expect(composer.querySelector('.stop')).toBeNull();
     expect(composer.querySelector('.reset')).toBeNull();
@@ -499,4 +502,105 @@ it('caps growth at 3 text lines on a phone and 5 on desktop, scrolling past the 
     await flush();
     await flush();
     expect(byClass('.composer-action', 'button').dataset.action).toBe('stop');
+});
+
+// --- R8/T15: the composer is never focused programmatically -------------------
+//
+// The field used to receive focus on boot, on New session, and in the send
+// `finally` block. R8 makes the user the only one who can enter it: no lifecycle
+// event may move focus into the composer, and a send must not pull it back from the
+// control that invoked it. These tests pin `document.activeElement` exactly.
+
+it('never autofocuses the composer on load, including a restored session', async () => {
+    // A remembered session is restored during boot: the path that used to end with
+    // `input.focus()` after opening the conversation.
+    localStorage.setItem(SESSION_KEY, 's1');
+    stubServer(undefined, snapshot({ status: 'running', turns: [turn()] }));
+    await mount();
+
+    const input = byClass('.composer-input', 'div');
+
+    // Boot restored the session but left focus on the document: the composer
+    // subtree contains no focused node.
+    expect(document.activeElement).toBe(document.body);
+    expect(input.contains(document.activeElement)).toBe(false);
+    expect(document.activeElement).not.toBe(input);
+
+    // A user click is the only way in; once focused the editor is fully editable.
+    input.focus();
+    expect(document.activeElement).toBe(input);
+    expect(input.getAttribute('contenteditable')).toBe('true');
+
+    input.value = 'typed';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(byClass('.composer-action', 'button').dataset.action).toBe('submit');
+});
+
+it('keeps focus where the user put it when a new session starts', async () => {
+    stubServer();
+    await mount();
+
+    const input = byClass('.composer-input', 'div');
+    const newSession = byClass('.new-session', 'button');
+
+    // The user is mid-draft in the field, then activates New session from the rail.
+    input.focus();
+    input.value = 'draft';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    newSession.focus();
+    newSession.click();
+    await flush();
+
+    // The reset repaints the conversation but does not pull focus back into the
+    // composer; the invoking control keeps it.
+    expect(document.activeElement).toBe(newSession);
+    expect(document.activeElement).not.toBe(input);
+    // The draft is module-scoped, so it is still there and typing remains possible
+    // only after the user chooses to return to the field.
+    expect(input.value).toBe('draft');
+    input.focus();
+    expect(document.activeElement).toBe(input);
+});
+
+it('never refocuses the composer after a successful send', async () => {
+    const server = stubServer();
+    await mount();
+
+    const input = byClass('.composer-input', 'div');
+    const action = byClass('.composer-action', 'button');
+
+    input.value = 'send me';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    // The in-field send control is the invoking control: it owns focus when clicked.
+    action.focus();
+    action.click();
+    await flush();
+    await flush();
+
+    expect(server.tasks).toBe(1);
+    expect(input.value).toBe('');
+    // R8: the send `finally` block no longer calls input.focus().
+    expect(document.activeElement).toBe(action);
+    expect(document.activeElement).not.toBe(input);
+});
+
+it('never refocuses the composer after a failed send', async () => {
+    stubServer('submit rejected');
+    await mount();
+
+    const input = byClass('.composer-input', 'div');
+    const action = byClass('.composer-action', 'button');
+
+    input.value = 'keep this';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    action.focus();
+    action.click();
+    await flush();
+    await flush();
+
+    // The failed turn restores the draft but leaves focus on the invoking control.
+    expect(input.value).toBe('keep this');
+    expect(document.querySelector('.log .notice')?.textContent).toBe('task failed: submit rejected');
+    expect(document.activeElement).toBe(action);
+    expect(document.activeElement).not.toBe(input);
 });

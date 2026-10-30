@@ -9,8 +9,9 @@
 //   - send is gated while a read is in flight;
 //   - a rejected batch keeps the draft intact; a failed read removes only its own
 //     marker/chip and reports why;
-//   - a replayed turn renders filename/type chips (never base64 text) with no remove
-//     control.
+//   - a replayed turn renders the marker as an INLINE filename/type chip in the
+//     prompt (never base64 text, no duplicate chip row, no remove control), and
+//     clicking it opens the shared preview dialog.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts attachments-main.test.ts
 
@@ -421,25 +422,46 @@ it('always prevents native paste and inserts nothing for an empty payload', asyn
     expect(composerChips()).toEqual([]);
 });
 
-it('accepts the file-chooser alternative and the same gate', async () => {
+it('renders no attachment chooser and still attaches through paste and drop', async () => {
     stubServer();
     await mount();
 
-    const input = byClass('.composer-input', 'textarea');
-    input.value = 'choose ';
-    input.setSelectionRange(7, 7);
+    // R6/T15: the "+" chooser button and its hidden file input are removed from the
+    // DOM (not merely hidden), so nothing in the composer promises a file picker.
+    expect(document.querySelector('.composer-attach')).toBeNull();
+    expect(document.querySelector('.composer-file')).toBeNull();
+    expect(document.querySelector('.composer input[type="file"]')).toBeNull();
+    // The composer is one field column: no accessory beside it and no dead tab stop.
+    expect(byClass('.composer', 'form').children).toHaveLength(1);
 
-    const fileInput = byClass('.composer-file', 'input');
-    const file = new File([PNG_BYTES], 'chosen.png', { type: 'image/png' });
-    Object.defineProperty(fileInput, 'files', { configurable: true, value: [file] });
-    fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-
-    expect(input.value).toBe('choose [Image 1]');
-    expect(composerChips()).toHaveLength(1);
-    expect(byClass('.composer-attach', 'button').getAttribute('aria-label')).toBe('Attach files');
-
+    // Paste remains the primary attachment path: the chip lands at the caret.
+    const input = composerField();
+    input.value = 'paste ';
+    input.setSelectionRange(6, 6);
+    pasteClipboard(
+        input,
+        [clipboardFile('pasted.png', 'image/png')],
+        [clipboardFile('pasted.png', 'image/png')]
+    );
     await flush();
-    expect(composerChips()[0]?.dataset.state).toBeUndefined();
+    expect(input.value).toBe('paste [Image 1]');
+
+    // Drop still attaches its files at the stored caret, now with no chooser beside it.
+    const composer = byClass('.composer', 'form');
+    const dropped = clipboardFile('dropped.png', 'image/png');
+    const fileDrop = new Event('drop', { bubbles: true, cancelable: true });
+    Object.defineProperty(fileDrop, 'dataTransfer', {
+        value: { items: [{ kind: 'file', getAsFile: () => dropped }], files: [dropped] }
+    });
+    composer.dispatchEvent(fileDrop);
+    await flush();
+
+    expect(fileDrop.defaultPrevented).toBe(true);
+    expect(input.value).toBe('paste [Image 1] [Image 2]');
+    expect(composerChips().map((chip) => chip.dataset.attachmentName)).toEqual([
+        'pasted.png',
+        'dropped.png'
+    ]);
 });
 
 it('accepts dropped files and prevents a text/empty drop natively', async () => {
@@ -673,7 +695,7 @@ it('synchronizes the draft when an inline chip is deleted atomically', async () 
     expect(taskBodies(calls)).toEqual([{ input: 'text only' }]);
 });
 
-it('renders recorded attachments as filename/type chips, never as base64 text', async () => {
+it('renders recorded attachments as inline filename/type chips, never as base64 text', async () => {
     const recorded: HarnessAttachment = {
         id: 'a1',
         kind: 'image',
@@ -700,20 +722,35 @@ it('renders recorded attachments as filename/type chips, never as base64 text', 
     await mount();
 
     const tile = byClass('.tile', 'article');
-    const host = tile.querySelector<HTMLElement>('.turn-attachments');
-    expect(host?.hidden).toBe(false);
-    expect(host?.querySelectorAll('.attachment-chip')).toHaveLength(1);
-    expect(host?.querySelector('.attachment-kind')?.textContent).toBe('Image');
-    expect(host?.querySelector('.attachment-marker')?.textContent).toBe('[Image 1]');
-    expect(host?.querySelector('.attachment-name')?.textContent).toBe('holiday.png');
-    expect(host?.querySelector('img')?.getAttribute('src')).toBe(`data:image/png;base64,${PNG_BASE64}`);
+    // R10: the marker itself is the chip, in the prompt flow. There is no
+    // separate attachment strip and therefore no duplicate rendering.
+    expect(tile.querySelector('.turn-attachments')).toBeNull();
+    const chips = [...tile.querySelectorAll<HTMLButtonElement>('.turn-prompt .attachment-inline')];
+    expect(chips).toHaveLength(1);
+    expect(chips[0]?.dataset.kind).toBe('image');
+    expect(chips[0]?.dataset.marker).toBe('[Image 1]');
+    expect(chips[0]?.querySelector('.attachment-kind')?.textContent).toBe('Image');
+    expect(chips[0]?.querySelector('.attachment-marker')?.textContent).toBe('[Image 1]');
+    expect(chips[0]?.querySelector('.attachment-name')?.textContent).toBe('holiday.png');
+    expect(chips[0]?.querySelector('img')?.getAttribute('src')).toBe(`data:image/png;base64,${PNG_BASE64}`);
     // History is read-only: no remove affordance on a recorded turn.
-    expect(host?.querySelector('.attachment-remove')).toBeNull();
+    expect(tile.querySelector('.attachment-remove')).toBeNull();
+    // The surrounding prose is preserved around the chip.
+    expect(tile.querySelector('.turn-prompt')?.textContent).toBe('look at Image[Image 1]holiday.png\n');
     // The payload never becomes visible text.
     expect(document.body.textContent).not.toContain(PNG_BASE64);
+
+    // Clicking the inline chip opens the reusable dialog with the fitted image.
+    chips[0]?.click();
+    const dialog = byClass('.dialog', 'div');
+    expect(dialog.querySelector('.dialog-title')?.textContent).toBe('holiday.png');
+    const image = dialog.querySelector<HTMLImageElement>('.preview-image img');
+    expect(image?.src).toBe(`data:image/png;base64,${PNG_BASE64}`);
+    expect(image?.alt).toBe('holiday.png');
+    expect(dialog.textContent).not.toContain(PNG_BASE64);
 });
 
-it('shows no attachment strip for a text-only recorded turn', async () => {
+it('shows no attachment chip or strip for a text-only recorded turn', async () => {
     const restored = snapshot({
         turns: [turn({ prompt: 'just text', status: 'done' })]
     });
@@ -722,14 +759,13 @@ it('shows no attachment strip for a text-only recorded turn', async () => {
     stubServer(restored);
     await mount();
 
-    const host = document.querySelector<HTMLElement>('.tile .turn-attachments');
-    expect(host?.hidden).toBe(true);
-    expect(host?.children).toHaveLength(0);
+    expect(document.querySelector('.tile .turn-attachments')).toBeNull();
+    expect(document.querySelector('.tile .attachment-inline')).toBeNull();
 });
 
-it('renders the ack record attachments once, without duplicating the strip', async () => {
+it('renders the ack record attachments once, in the prompt', async () => {
     // The queue observer may deliver the same recorded turn before the POST answer;
-    // chips must be idempotent across `merge` (one strip, not a second one).
+    // chips must be idempotent across `merge` (one inline chip, no second row).
     stubServer();
     await mount();
 
@@ -742,11 +778,11 @@ it('renders the ack record attachments once, without duplicating the strip', asy
     submit();
     await flush();
 
-    const hosts = document.querySelectorAll('.turn-attachments');
-    expect(hosts).toHaveLength(1);
-    expect(hosts[0]?.querySelectorAll('.attachment-chip')).toHaveLength(1);
-    expect(hosts[0]?.querySelector('.attachment-remove')).toBeNull();
-    expect(hosts[0]?.querySelector('.attachment-name')?.textContent).toBe('shot.png');
+    expect(document.querySelectorAll('.turn-attachments')).toHaveLength(0);
+    const chips = [...document.querySelectorAll<HTMLElement>('.tile .turn-prompt .attachment-inline')];
+    expect(chips).toHaveLength(1);
+    expect(chips[0]?.querySelector('.attachment-remove')).toBeNull();
+    expect(chips[0]?.querySelector('.attachment-name')?.textContent).toBe('shot.png');
 });
 
 // --- R4/R5: one image = one chip, and Backspace/Delete are atomic ------------
@@ -947,13 +983,14 @@ it('treats two separate pastes of the same image as two attachments', async () =
 
 // --- freeze-window reconciliation (T14) -------------------------------------
 //
-// While a submit owns the enqueue window (`submitting`), the chooser is disabled
-// and the keydown chip delete / chip observer both skip that state. Anything that
-// could still add or lose a draft entry in that window must therefore be closed
-// here: no new chip may appear, and a failed turn may not leave bytes whose marker
-// is not in the prompt.
+// While a submit owns the enqueue window (`submitting`), paste/drop are still
+// intercepted and the keydown chip delete / chip observer both skip that state.
+// Anything that could still add or lose a draft entry in that window must therefore
+// be closed here: no new chip may appear, and a failed turn may not leave bytes whose
+// marker is not in the prompt. (The chooser that used to be disabled here is gone
+// entirely - R6/T15.)
 
-it('ignores paste, drop and the file chooser during the submit freeze', async () => {
+it('ignores paste and drop during the submit freeze', async () => {
     const { calls, release } = gatedServer();
     await mount();
 
@@ -993,17 +1030,6 @@ it('ignores paste, drop and the file chooser during the submit freeze', async ()
     });
     byClass('.composer', 'form').dispatchEvent(drop);
     expect(drop.defaultPrevented).toBe(true);
-    expect(input.value).toBe('');
-    expect(composerChips()).toEqual([]);
-
-    // File chooser: the accessory is disabled, and a stray change is discarded too.
-    const fileInput = byClass('.composer-file', 'input');
-    expect(fileInput.disabled).toBe(true);
-    Object.defineProperty(fileInput, 'files', {
-        configurable: true,
-        value: [clipboardFile('four.png', 'image/png')]
-    });
-    fileInput.dispatchEvent(new Event('change', { bubbles: true }));
     expect(input.value).toBe('');
     expect(composerChips()).toEqual([]);
 
