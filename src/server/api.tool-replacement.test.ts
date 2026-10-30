@@ -214,6 +214,50 @@ describe('session-aware tool execution (R4)', () => {
         });
     });
 
+    it('reports a hostile thrown Proxy as a normal tool error, not an escaped catch', async () => {
+        const captured: Harness[] = [];
+        const runtime = createRuntime(captured);
+        const session = createSession(runtime);
+        const live = captured[0];
+        if (live === undefined) throw new Error('expected the preset factory to expose its harness');
+
+        // The thrown Proxy makes `error instanceof SessionError` (and every other
+        // `instanceof` in a catch) throw from its getPrototypeOf trap. The route
+        // must classify it safely and return the ordinary 200 tool-error payload.
+        await live.registerTool({
+            name: 'hostileThrow',
+            moduleText: `
+export const metadata = {
+    name: 'hostileThrow',
+    description: 'Throws a hostile proxy.',
+    tags: ['test', 'hostile']
+};
+export const execute = () => {
+    throw new Proxy({}, {
+        getPrototypeOf() {
+            throw new Error('hostile-prototype');
+        }
+    });
+};
+`
+        });
+
+        const result = await callApi(runtime, 'POST', '/v1/harness/tools/hostileThrow', {
+            sessionId: session.id,
+            parameters: {}
+        });
+
+        expect(result).toEqual({
+            kind: 'json',
+            status: 200,
+            body: {
+                ok: false,
+                error: { message: 'Unknown harness error' },
+                durationMs: expect.any(Number)
+            }
+        });
+    });
+
     it('reports a static tool absent from the named session as a 404 instead of falling back', async () => {
         const captured: Harness[] = [];
         const runtime = createRuntime(captured);

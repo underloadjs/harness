@@ -1144,8 +1144,17 @@ const app = document.querySelector<HTMLDivElement>('#app');
 if (app === null) throw new Error('The harness UI needs an #app element.');
 
 const topbar = el('header', 'topbar');
-const brand = el('div', 'brand');
-brand.append(el('span', 'brand-mark', '◍'), el('span', 'brand-name', 'Harness UI'));
+// R2: the visible "Harness UI" title is the phone drawer trigger. It is a real
+// button (not a click handler on a div) so it is keyboard reachable and exposes
+// `aria-controls`/`aria-expanded` for the harness listing. `syncBrandTrigger` below
+// adds those disclosure semantics ONLY on phones; above 860px the rails are always
+// visible, so the brand is a non-disclosure and is natively disabled (no tab stop,
+// no misleading `aria-expanded=false`). Its visual styling is unchanged.
+const brand = el('button', 'brand');
+brand.type = 'button';
+const brandMark = el('span', 'brand-mark', '◍');
+brandMark.setAttribute('aria-hidden', 'true');
+brand.append(brandMark, el('span', 'brand-name', 'Harness UI'));
 
 // The status pill is the app's single live region, and it is APP-SCOPED: it
 // announces startup/readiness and app/config failures to screen readers and shows
@@ -1245,7 +1254,15 @@ const createHarnessButton = el('button', 'button small new-harness', '+ New');
 createHarnessButton.type = 'button';
 createHarnessButton.disabled = true;
 createHarnessButton.setAttribute('aria-expanded', 'false');
-harnessHead.append(harnessHeading, createHarnessButton);
+// R2: close affordance for the phone drawer. It is hidden by CSS on wider layouts,
+// where the rail is permanent; main.ts wires it to the same `setRailOpen(undefined)`
+// path as Escape, the backdrop and picking a harness.
+const closeHarnessSidebar = el('button', 'button small rail-close', '×');
+closeHarnessSidebar.type = 'button';
+closeHarnessSidebar.setAttribute('aria-label', 'Close harnesses panel');
+const harnessHeadActions = el('div', 'rail-head-actions');
+harnessHeadActions.append(createHarnessButton, closeHarnessSidebar);
+harnessHead.append(harnessHeading, harnessHeadActions);
 
 const harnessList = el('div', 'harness-list');
 
@@ -2734,10 +2751,47 @@ app.append(topbar, shell);
 // than something the server or storage knows about.
 let openRail: 'left' | 'right' | undefined;
 
+// The element that opened the current phone rail. Restoring focus there on close is
+// what keeps the drawer usable from the keyboard: without it, hiding the rail's own
+// close button leaves focus on <body> after Escape, the backdrop, or picking a row.
+let railReturnFocus: HTMLElement | undefined;
+
+// One query instance for the drawer state: `isPhoneLayout` and the resize listener
+// must observe the same MediaQueryList. `matchMedia` is absent in jsdom and very old
+// browsers: that environment is treated as phone-sized so the drawer remains
+// reachable and testable. It is defined everywhere a real desktop browser runs.
+const phoneMedia = window.matchMedia?.('(max-width: 860px)');
+const isPhoneLayout = (): boolean => phoneMedia?.matches ?? true;
+
+// Apply the platform-appropriate brand semantics:
+//   - phone: a real disclosure trigger, enabled, with `aria-controls` and the live
+//     `aria-expanded` state;
+//   - desktop/tablet: the rail is permanently visible, so the brand is NOT a
+//     disclosure. Native `disabled` removes it from the tab order and prevents the
+//     no-op click; the ARIA disclosure attributes and action title are removed so
+//     assistive tech never hears a false "collapsed" state. `.brand`'s author styles
+//     keep the title visually identical to the former text label.
+const syncBrandTrigger = (): void => {
+    if (isPhoneLayout()) {
+        brand.disabled = false;
+        brand.setAttribute('aria-controls', 'rail-left');
+        brand.setAttribute('aria-expanded', openRail === 'left' ? 'true' : 'false');
+        brand.title = 'Show or hide harnesses';
+        return;
+    }
+
+    brand.disabled = true;
+    brand.removeAttribute('aria-controls');
+    brand.removeAttribute('aria-expanded');
+    brand.removeAttribute('title');
+};
+
 // One painter for the whole state: the shell attribute drives CSS, the two toggles'
 // `aria-expanded` drives the accessibility tree. `undefined` removes the attribute
-// so the collapsed default has no lingering data state to style.
-const setRailOpen = (side: 'left' | 'right' | undefined): void => {
+// so the collapsed default has no lingering data state to style. `trigger` is the
+// control that opened the rail, so closing always restores focus there even when the
+// reader switches from one rail to the other.
+const setRailOpen = (side: 'left' | 'right' | undefined, trigger?: HTMLElement): void => {
     openRail = side;
 
     if (side === undefined) delete shell.dataset.railOpen;
@@ -2745,16 +2799,61 @@ const setRailOpen = (side: 'left' | 'right' | undefined): void => {
 
     leftRailToggle.setAttribute('aria-expanded', side === 'left' ? 'true' : 'false');
     rightRailToggle.setAttribute('aria-expanded', side === 'right' ? 'true' : 'false');
+    // The brand is only a disclosure on a phone; on desktop this disables it and
+    // strips the ARIA state rather than publishing a misleading collapsed control.
+    syncBrandTrigger();
+
+    if (side !== undefined) {
+        // The explicit trigger wins. The active-element fallback keeps programmatic
+        // opens honest without relying on browser click focus behaviour.
+        const active = document.activeElement;
+        railReturnFocus =
+            trigger ??
+            (active instanceof HTMLElement && active !== document.body && active !== document.documentElement
+                ? active
+                : undefined);
+
+        // The harness drawer is modal-ish: move focus to its own close control so
+        // Escape/Tab and the dismiss affordance are immediately reachable.
+        if (side === 'left') closeHarnessSidebar.focus({ preventScroll: true });
+        return;
+    }
+
+    // Closed: hand focus back to the trigger when it is still in the page. A
+    // programmatic close (selecting a harness / starting a session) is harmless
+    // here because the trigger is a persistent topbar control.
+    const returnFocus = railReturnFocus;
+    railReturnFocus = undefined;
+    if (returnFocus?.isConnected) returnFocus.focus({ preventScroll: true });
 };
+
+// Initial platform pass: desktop disables the brand before first paint; a phone gets
+// the familiar collapsed disclosure state.
+syncBrandTrigger();
 
 // Toggling the open side closes it (the button is a real toggle), and opening one
 // always closes the other: the two rails are exclusive on a phone.
 leftRailToggle.addEventListener('click', () => {
-    setRailOpen(openRail === 'left' ? undefined : 'left');
+    setRailOpen(openRail === 'left' ? undefined : 'left', leftRailToggle);
 });
 
 rightRailToggle.addEventListener('click', () => {
-    setRailOpen(openRail === 'right' ? undefined : 'right');
+    setRailOpen(openRail === 'right' ? undefined : 'right', rightRailToggle);
+});
+
+// R2: clicking the "Harness UI" brand opens the harness DRAWER on sm/mobile. It is
+// a toggle, so a second click closes it. `syncBrandTrigger` natively disables the
+// button above 860px; the media guard here is the second line of defence against a
+// programmatic click while a resize transition is in flight.
+brand.addEventListener('click', () => {
+    if (!isPhoneLayout()) return;
+    setRailOpen(openRail === 'left' ? undefined : 'left', brand);
+});
+
+// R2: the drawer's own close control. Backdrop, Escape and picking a harness all
+// converge on the same state reset, so no separate cleanup path is needed.
+closeHarnessSidebar.addEventListener('click', () => {
+    setRailOpen(undefined);
 });
 
 // Backdrop click is the pointer dismiss; Escape is the keyboard one. Both only act
@@ -2770,9 +2869,16 @@ document.addEventListener('keydown', (event) => {
 
 // Leaving the phone breakpoint forgets the phone-only state, so rotating/resizing to
 // a desktop width and back cannot resurrect a rail the reader had already dismissed.
+// Entering the phone breakpoint re-enables the brand and restores its disclosure
+// semantics; leaving it disables/strips them through `setRailOpen(undefined)`.
 // `matchMedia` is absent in jsdom and in very old browsers: optional, not required.
-window.matchMedia?.('(max-width: 860px)')?.addEventListener?.('change', (event) => {
-    if (!event.matches) setRailOpen(undefined);
+phoneMedia?.addEventListener?.('change', (event) => {
+    if (event.matches) {
+        syncBrandTrigger();
+        return;
+    }
+
+    setRailOpen(undefined);
 });
 
 // ---------------------------------------------------------------------------

@@ -33,13 +33,18 @@
 
 /* The panel is a flex column so only the body scrolls; header stays put. Height
  * stays CONTENT-AWARE (`height: auto` + a viewport cap), so a short preview is a
- * short panel and a long one stops at the cap with the body scrolling. */
+ * short panel and a long one stops at the cap with the body scrolling. The cap is
+ * 80% of the viewport for EVERY dialog variant (R1): a taller panel would cover the
+ * shell chrome and could hide controls on a short laptop or phone screen. `dvh`
+ * follows the visible viewport when mobile browser chrome collapses; the `vh` line
+ * above it is the fallback for browsers without dynamic viewport units. */
 .dialog {
     display: flex;
     flex-direction: column;
     width: min(760px, 100%);
     min-height: 0;
-    max-height: min(82vh, 900px);
+    max-height: min(80vh, 900px);
+    max-height: min(80dvh, 900px);
     overflow: hidden;
     border: 1px solid var(--border-strong);
     border-radius: var(--radius);
@@ -49,11 +54,13 @@
 
 /* Wide variant for a working surface rather than a reader: the tool runner shows a
  * parameter schema, an editable argument box and a result, so it gets more width
- * and height than a prose preview. Opt-in via `element.classList.add('dialog-wide')`
+ * than a prose preview. Height is the SAME 80% cap as `.dialog` (R1) — its extra
+ * width must not buy extra height. Opt-in via `element.classList.add('dialog-wide')`
  * (main.ts openToolDialog); every other dialog keeps the compact 760px panel. */
 .dialog.dialog-wide {
     width: min(1040px, 100%);
-    max-height: min(88vh, 960px);
+    max-height: min(80vh, 960px);
+    max-height: min(80dvh, 960px);
 }
 
 /* The panel receives programmatic focus on open (ui/dialog.ts) so Escape/Tab work
@@ -153,8 +160,9 @@
 /* Phone layout: full-width panel with a real gutter. The panel must stay
  * CENTRE-ALIGNED (not `stretch`): stretching forced every short dialog to the
  * full viewport height, which is the blank interior area under a short result.
- * The panel cap is relaxed from the desktop 82% so a phone uses more of its
- * height, while the subtraction keeps a fixed 24px top/bottom gutter. */
+ * The 80% height cap is NOT relaxed on a phone (R1): the 16px overlay gutter
+ * already fits inside that cap, so the header and close control stay visible
+ * while `.dialog-body` scrolls. */
 @media (max-width: 720px) {
     .dialog-overlay {
         align-items: center;
@@ -163,7 +171,8 @@
 
     .dialog {
         width: 100%;
-        max-height: calc(100vh - 48px);
+        max-height: 80vh;
+        max-height: 80dvh;
     }
 
     .dialog-head {

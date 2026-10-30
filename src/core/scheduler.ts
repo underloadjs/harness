@@ -50,6 +50,11 @@ export type ScheduledTask<TResult = unknown> = {
     controller: AbortController;
     status: ScheduledTaskStatus;
     result?: TResult;
+    // True when the implementation threw or rejected. This is INDEPENDENT of
+    // `error` because JavaScript may throw `undefined`; consumers must never infer
+    // success from `error === undefined` (a successful `undefined` result looks
+    // identical otherwise).
+    failed: boolean;
     error?: unknown;
     // Resolves when the underlying function settles. Callers never await this to
     // decide a run is finished (the board is the source of truth); it exists for
@@ -207,6 +212,7 @@ export const createTaskScheduler = (options: TaskSchedulerOptions): TaskSchedule
             startedAt: now(),
             controller,
             status: 'pending',
+            failed: false,
             promise: Promise.resolve()
         };
 
@@ -221,9 +227,15 @@ export const createTaskScheduler = (options: TaskSchedulerOptions): TaskSchedule
         tasks.set(id, record);
         ensureTimer();
 
-        const settle = (status: 'completed', result: TResult | undefined, error: unknown): void => {
+        const settle = (
+            status: 'completed',
+            result: TResult | undefined,
+            error: unknown,
+            failed: boolean
+        ): void => {
             task.status = status;
             task.result = result;
+            task.failed = failed;
             task.error = error;
             record._detach?.();
             record._detach = undefined;
@@ -251,17 +263,21 @@ export const createTaskScheduler = (options: TaskSchedulerOptions): TaskSchedule
                     return;
                 }
 
-                settle('completed', result, undefined);
+                settle('completed', result, undefined, false);
             } catch (error) {
+                // Keep the late failure inspectable too. `failed` is false for a
+                // successful `undefined` result, so this flag is the only honest
+                // record when the thrown value itself is undefined.
+                task.failed = true;
                 if (task.status !== 'pending') {
                     task.error = error;
                     return;
                 }
 
                 // A thrown tool is still COMPLETED work: the delivery layer turns
-                // it into a failed tool result the model can read. The board does
-                // not distinguish success from failure, only settled from running.
-                settle('completed', undefined, error);
+                // it into a failed tool result the model can read. `failed` records
+                // the outcome independently of the thrown payload.
+                settle('completed', undefined, error, true);
             }
         })();
 

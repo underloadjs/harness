@@ -1,12 +1,21 @@
-// R1/R4: phone rails start collapsed and are opened from the topbar.
+// R1/R2/R4: phone rails start collapsed, the harness listing opens as a drawer
+// from the "Harness UI" brand, and legacy topbar toggles remain available.
 //
-// Two contracts, both pinned here:
+// Three contracts, all pinned here:
 //   - DOM/state: two independent ICON-ONLY toggles exist in the topbar, both rails
 //     start collapsed, one rail opens at a time, the toggle they own reports
-//     `aria-expanded`, and Escape or the backdrop collapses without removing the
-//     rails from the DOM;
-//   - CSS: the collapse only exists inside the <=860px media query, so the desktop
-//     and tablet layouts keep both rails. jsdom cannot compute media queries, so the
+//     `aria-expanded`, and Escape, the backdrop, the drawer close control or picking
+//     a harness collapse without removing the rails from the DOM;
+//   - R2: the brand is a real button whose accessible name is "Harness UI"; clicking
+//     it opens the harness listing as an off-canvas sidebar and the sidebar exposes
+//     an accessible close control;
+//   - R3: above 860px the permanently visible rail means the brand must NOT be a
+//     tabbable no-op or claim `aria-expanded=false`; it is natively disabled with no
+//     disclosure ARIA, and resize transitions restore/remove that semantics;
+//   - CSS: the collapse and the drawer only exist inside the <=860px media query, so
+//     the desktop and tablet layouts keep both rails; the harness drawer is fixed
+//     and full-height instead of an in-flow strip, while the right rail keeps its
+//     existing in-flow placement. jsdom cannot compute media queries, so the
 //     stylesheet source is read the same way the other style tests do.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts
@@ -94,6 +103,34 @@ const toggles = (): HTMLButtonElement[] => [
 ];
 const expanded = (): (string | null)[] => toggles().map((button) => button.getAttribute('aria-expanded'));
 
+// A controllable MediaQueryList stand-in. `main.ts` creates ONE query for the whole
+// shell, so the returned setter drives both `isPhoneLayout()` and the resize listener
+// exactly as a real breakpoint change would.
+type PhoneMediaListener = (event: { matches: boolean }) => void;
+
+const stubMedia = (matches: boolean): { setMatches(next: boolean): void } => {
+    const listeners = new Set<PhoneMediaListener>();
+    const media = {
+        matches,
+        media: '(max-width: 860px)',
+        addEventListener: (_type: string, listener: PhoneMediaListener): void => {
+            listeners.add(listener);
+        },
+        removeEventListener: (_type: string, listener: PhoneMediaListener): void => {
+            listeners.delete(listener);
+        }
+    };
+
+    vi.stubGlobal('matchMedia', vi.fn(() => media));
+
+    return {
+        setMatches(next: boolean): void {
+            media.matches = next;
+            for (const listener of [...listeners]) listener({ matches: next });
+        }
+    };
+};
+
 it('starts both phone rails collapsed and toggles them one at a time', async () => {
     const shell = await boot();
 
@@ -142,6 +179,109 @@ it('starts both phone rails collapsed and toggles them one at a time', async () 
     // The rails survive every toggle: the collapse is presentational only.
     expect(document.querySelector('#rail-left')).not.toBeNull();
     expect(document.querySelector('#rail-right')).not.toBeNull();
+});
+
+it('opens the harness sidebar from the Harness UI brand and closes it from the drawer control', async () => {
+    const shell = await boot();
+
+    const brand = document.querySelector<HTMLButtonElement>('.brand');
+    if (brand === null) throw new Error('missing brand trigger');
+
+    // R2: the visible title is a real button, not a clickable div, so keyboard users
+    // reach the same action and the accessible name matches the visible label.
+    expect(brand.tagName).toBe('BUTTON');
+    expect(brand.type).toBe('button');
+    expect(brand.disabled).toBe(false);
+    expect(brand.textContent).toBe('◍Harness UI');
+    expect(brand.getAttribute('aria-controls')).toBe('rail-left');
+    expect(brand.getAttribute('aria-expanded')).toBe('false');
+    expect(brand.title).toBe('Show or hide harnesses');
+    // The decorative mark is not part of the accessible name.
+    expect(brand.querySelector('.brand-mark')?.getAttribute('aria-hidden')).toBe('true');
+
+    // The drawer's own close control is button-labelled, not a glyph-only target.
+    const close = document.querySelector<HTMLButtonElement>('.rail-close');
+    if (close === null) throw new Error('missing drawer close button');
+    expect(close.tagName).toBe('BUTTON');
+    expect(close.type).toBe('button');
+    expect(close.textContent).toBe('×');
+    expect(close.getAttribute('aria-label')).toBe('Close harnesses panel');
+
+    // Opening from the brand is the same state as the legacy hamburger: one rail
+    // open, both triggers report it, and the listing stays in the DOM. Focus moves
+    // into the drawer so keyboard users can Escape or dismiss immediately.
+    brand.focus();
+    brand.click();
+    expect(shell.dataset.railOpen).toBe('left');
+    expect(brand.getAttribute('aria-expanded')).toBe('true');
+    expect(expanded()).toEqual(['true', 'false']);
+    expect(document.querySelector('#rail-left .harness-list')).not.toBeNull();
+    expect(document.activeElement).toBe(close);
+
+    // Closing hands focus back to the trigger; the drawer is hidden (CSS) but its
+    // DOM and selection state are untouched.
+    close.click();
+    expect(shell.dataset.railOpen).toBeUndefined();
+    expect(brand.getAttribute('aria-expanded')).toBe('false');
+    expect(expanded()).toEqual(['false', 'false']);
+    expect(document.activeElement).toBe(brand);
+    expect(document.querySelector('#rail-left')).not.toBeNull();
+
+    // Brand is a toggle: a second press closes the sidebar it opened.
+    brand.click();
+    expect(shell.dataset.railOpen).toBe('left');
+    brand.click();
+    expect(shell.dataset.railOpen).toBeUndefined();
+    expect(brand.getAttribute('aria-expanded')).toBe('false');
+});
+
+it('keeps the desktop brand a non-disclosure and restores affordances across resize transitions', async () => {
+    // Desktop first: both rails are permanently visible, so the brand must not expose
+    // a collapsed disclosure or remain a tabbable no-op button.
+    const media = stubMedia(false);
+    const shell = await boot();
+
+    const brand = document.querySelector<HTMLButtonElement>('.brand');
+    if (brand === null) throw new Error('missing brand trigger');
+
+    expect(brand.disabled).toBe(true);
+    expect(brand.hasAttribute('aria-controls')).toBe(false);
+    expect(brand.hasAttribute('aria-expanded')).toBe(false);
+    expect(brand.title).toBe('');
+    expect(brand.textContent).toBe('◍Harness UI');
+
+    // A programmatic click cannot open a phone rail on desktop; the permanently
+    // visible rail itself is still present in the DOM (CSS owns its display).
+    brand.click();
+    expect(shell.dataset.railOpen).toBeUndefined();
+    expect(document.querySelector('#rail-left')).not.toBeNull();
+
+    // Enter the phone breakpoint: the brand becomes the real harness-drawer toggle.
+    media.setMatches(true);
+    expect(brand.disabled).toBe(false);
+    expect(brand.getAttribute('aria-controls')).toBe('rail-left');
+    expect(brand.getAttribute('aria-expanded')).toBe('false');
+    expect(brand.title).toBe('Show or hide harnesses');
+
+    brand.click();
+    expect(shell.dataset.railOpen).toBe('left');
+    expect(brand.getAttribute('aria-expanded')).toBe('true');
+
+    // Leave the phone breakpoint while the drawer is open: the rail state is reset
+    // and the desktop semantics come back, with no false collapsed ARIA state.
+    media.setMatches(false);
+    expect(shell.dataset.railOpen).toBeUndefined();
+    expect(brand.disabled).toBe(true);
+    expect(brand.hasAttribute('aria-controls')).toBe(false);
+    expect(brand.hasAttribute('aria-expanded')).toBe(false);
+    expect(brand.title).toBe('');
+
+    // Re-entering the phone breakpoint starts from the clean collapsed state, rather
+    // than resurrecting the rail the resize dismissed.
+    media.setMatches(true);
+    expect(brand.disabled).toBe(false);
+    expect(brand.getAttribute('aria-controls')).toBe('rail-left');
+    expect(brand.getAttribute('aria-expanded')).toBe('false');
 });
 
 it('dismisses an open rail with Escape and with the backdrop', async () => {
@@ -219,32 +359,43 @@ it('collapses both rails only inside the phone breakpoint', () => {
     // rails are not auto-placed, so the row placement must be explicit).
     expect(phone).toContain('.center {\n        grid-row: 1;\n    }');
 
-    // Each open state restores its OWN display type: the left rail is a flex
-    // column, the right rail a grid of sections at this width; each adds one row and
-    // keeps the chat in the remaining 1fr row.
-    expect(phone).toContain(
+    // R2: the harness listing opens as a dashboard-style off-canvas sidebar. It is
+    // FIXED to the viewport and full height, rather than an in-flow strip that steals
+    // a grid row from the conversation.
+    const drawer = ".shell[data-rail-open='left'] .rail-left {";
+    expect(phone).toContain(drawer);
+    expect(phone).not.toContain(
         ".shell[data-rail-open='left'] {\n        grid-template-rows: auto minmax(0, 1fr);\n    }"
     );
-    expect(phone).toContain(
-        ".shell[data-rail-open='left'] .rail-left {\n        display: flex;\n        grid-row: 1;\n    }"
-    );
-    expect(phone).toContain(
-        ".shell[data-rail-open='left'] .center {\n        grid-row: 2;\n    }"
-    );
+    expect(phone).not.toContain(".shell[data-rail-open='left'] .center");
+    expect(phone).toContain('position: fixed');
+    expect(phone).toContain('inset: 0 auto 0 0');
+    expect(phone).toContain('width: min(86vw, 320px)');
+    expect(phone).toContain('max-height: none');
+    expect(phone).toContain('z-index: 3');
+
+    // The brand is the human-readable trigger, and the drawer has its own visible
+    // close control at phone widths (hidden at wider widths, where rails are fixed).
+    expect(phone).toContain('.brand {\n        cursor: pointer;\n    }');
+    expect(blockOf('.rail-close {')).toContain('display: none');
+    expect(phone).toContain('.rail-close {\n        display: inline-flex;\n    }');
+
+    // The right rail keeps the existing in-flow strip below the chat: only the
+    // harness listing moved into the overlay sidebar.
     expect(phone).toContain(
         ".shell[data-rail-open='right'] {\n        grid-template-rows: minmax(0, 1fr) auto;\n    }"
     );
     expect(phone).toContain(
-        ".shell[data-rail-open='right'] .rail-right {\n        display: grid;\n        grid-template-columns: minmax(0, 1fr);\n        grid-row: 2;\n    }"
+        ".shell[data-rail-open='right'] .rail-right {\n        display: grid;\n        grid-template-columns: minmax(0, 1fr);\n        grid-row: 2;"
     );
 
     // Backdrop: hidden by default, a fixed full-viewport layer while open, below the
-    // rail it dismisses.
+    // drawer it dismisses (2) and above the in-flow right strip.
     expect(blockOf('.rail-backdrop {')).toContain('display: none');
     expect(phone).toContain('.shell[data-rail-open] .rail-backdrop {\n        display: block;');
     expect(phone).toContain('position: fixed');
-    expect(phone).toContain('z-index: 1');
     expect(phone).toContain('z-index: 2');
+    expect(phone).toContain('z-index: 3');
 });
 
 it('leaves the tablet and desktop shells untouched', () => {

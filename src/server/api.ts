@@ -76,6 +76,7 @@ import { createCoreToolEntries } from './harnesses';
 import { createHarnessRegistry } from './harnesses';
 import type { CatalogueEntry, HarnessRegistry, ToolCatalogue } from './harnesses';
 import { toolUiOf, boundToolResult, resolveToolParameters } from '../harness';
+import { isInstanceOf, toErrorInfo } from '../util';
 import { listModels, ModelListError } from '../transport/models';
 import type { ModelListConfiguration } from '../transport/models';
 import type {
@@ -206,7 +207,11 @@ export class HttpError extends Error {
     }
 }
 
-const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+// Manual tool execution reaches this API through SessionStore.callTool, so the
+// thrown value can be anything a runtime-compiled tool produced. Use the total
+// formatter: `error instanceof Error` itself can throw for a hostile proxy, and a
+// reporting catch must not become a second failure that hides the tool error.
+const messageOf = (error: unknown): string => toErrorInfo(error).message;
 
 // What a transport adapter hands the dispatcher.
 export type HarnessApiRequest = {
@@ -670,7 +675,7 @@ export const createHarnessApi = ({
                 // A statically listed tool the session does not register is
                 // therefore an honest 404 here, not a silent fallback to a detached
                 // catalogue implementation.
-                if (error instanceof SessionError) throw error;
+                if (isInstanceOf(error, SessionError)) throw error;
 
                 const payload: ToolCallResult = {
                     ok: false,
@@ -1400,13 +1405,17 @@ export const createHarnessApi = ({
             // SettingsError carries a 400 for the shared settings caps/type checks;
             // HarnessRegistryError carries 400/404/409 for create/patch (no 403:
             // no harness is read-only, R20.1).
-            const status =
-                error instanceof HttpError ||
-                error instanceof SessionError ||
-                error instanceof SettingsError ||
-                error instanceof HarnessRegistryError
+            // Same total-classification rule as the tool route: an arbitrary
+            // thrown Proxy must fall through to 500, not make this catch throw.
+            const status = isInstanceOf(error, HttpError)
+                ? error.status
+                : isInstanceOf(error, SessionError)
+                  ? error.status
+                  : isInstanceOf(error, SettingsError)
                     ? error.status
-                    : 500;
+                    : isInstanceOf(error, HarnessRegistryError)
+                      ? error.status
+                      : 500;
             return { kind: 'json', status, body: { error: { message: messageOf(error) } } };
         }
     };

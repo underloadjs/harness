@@ -84,11 +84,22 @@ button {
     background: linear-gradient(180deg, #11141b, var(--bg-bar));
 }
 
+/* The brand is a real BUTTON (R2): on a phone it opens the harness drawer, so a
+   click on the visible "Harness UI" name is the dashboard-style menu trigger. These
+   resets keep it looking like the former text label on desktop/tablet, where the
+   rails are permanent and the mobile drawer state is intentionally inert. */
 .brand {
     display: flex;
     align-items: baseline;
     gap: 9px;
     min-width: 0;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
+    cursor: default;
 }
 
 .brand-mark {
@@ -315,6 +326,39 @@ button {
     align-items: center;
     justify-content: space-between;
     gap: 8px;
+}
+
+/* Keep the New action and the phone-only drawer close control together, so the
+   heading stays on the left and the controls do not spread across the header. */
+.rail-head-actions {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    gap: 8px;
+}
+
+/* The drawer close affordance is phone-only: desktop/tablet rails are permanent
+   and have no open/closed state to dismiss. The phone block reveals it. */
+.rail-close {
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: transparent;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.rail-close:hover {
+    border-color: var(--accent);
+    color: var(--text);
 }
 
 .rail-title {
@@ -2748,7 +2792,7 @@ button {
    ui/tools.ts MOVES `.tool-body` directly into `.dialog-body`. They do NOT match
    the manual runner (which lives under `.tool-runner-slot` and has no `.tool-body`);
    the runner's actual chain is sized by the block above. The shell (ui/dialog.css)
-   is a content-sized flex column capped at 82vh; the panes below are the flex
+   is a content-sized flex column capped at 80vh; the panes below are the flex
    chain that fills that cap:
 
      .dialog-body (flex column, scroll fallback)
@@ -4509,6 +4553,22 @@ button {
         display: flex;
     }
 
+    /* R2: "Harness UI" (the brand button) is the human-readable drawer trigger on
+       a phone. The desktop brand is inert, so the pointer affordance is phone-only. */
+    .brand {
+        cursor: pointer;
+    }
+
+    .brand:hover {
+        color: var(--text);
+    }
+
+    /* The drawer owns a visible close control; Escape and the backdrop remain the
+       keyboard and pointer dismiss paths (main.ts). */
+    .rail-close {
+        display: inline-flex;
+    }
+
     /* Collapsed by default: no `data-rail-open` means neither rail is shown (they
        stay in the DOM; display is the only thing that changes). */
     .rail-left,
@@ -4518,28 +4578,32 @@ button {
 
     /* Placement is explicit. `display:none` rails are not auto-placed, so without
        this the chat would land in an `auto` row and the 1fr row would be empty when
-       both rails are closed. The chat always owns row 1 by default. */
+       both rails are closed. The chat always owns row 1 by default, and the
+       off-canvas harness drawer deliberately does NOT add a grid row. */
     .center {
         grid-row: 1;
     }
 
-    /* Each open state adds ONE row for its rail and keeps the chat in the remaining
-       1fr row: left above the chat, right below it — the strip order the phone
-       layout already used. `.rail-right` is a grid (its two sections) at <=1180px,
-       so it is restored explicitly rather than with `revert`. */
-    .shell[data-rail-open='left'] {
-        grid-template-rows: auto minmax(0, 1fr);
-    }
-
+    /* R2: the harness listing is a dashboard-style SIDEBAR on phones: an
+       off-canvas, full-height panel over the chat, not a strip that pushes the
+       conversation down. It stays a direct grid child in the DOM, but `fixed`
+       removes it from grid flow while open. */
     .shell[data-rail-open='left'] .rail-left {
         display: flex;
-        grid-row: 1;
+        position: fixed;
+        inset: 0 auto 0 0;
+        z-index: 3;
+        width: min(86vw, 320px);
+        max-height: none;
+        border-right: 1px solid var(--border);
+        border-bottom: 0;
+        box-shadow: 16px 0 48px rgba(0, 0, 0, 0.55);
+        animation: rail-slide-in 160ms ease-out;
     }
 
-    .shell[data-rail-open='left'] .center {
-        grid-row: 2;
-    }
-
+    /* The right rail keeps its existing in-flow strip below the chat (R3): only
+       the harness listing moved into the overlay drawer. `.rail-right` is a grid
+       (its two sections) at <=1180px, so it is restored explicitly. */
     .shell[data-rail-open='right'] {
         grid-template-rows: minmax(0, 1fr) auto;
     }
@@ -4548,32 +4612,33 @@ button {
         display: grid;
         grid-template-columns: minmax(0, 1fr);
         grid-row: 2;
+        position: relative;
+        z-index: 3;
     }
 
-    /* The open rail sits above the backdrop; the backdrop dims the chat behind it
-       and is the pointer dismiss (Escape is the keyboard one, main.ts). */
+    /* The backdrop dims the chat behind the drawer and is the pointer dismiss
+       (Escape is the keyboard one, main.ts). It sits below the drawer and above
+       the right rail's in-flow strip. */
     .shell[data-rail-open] .rail-backdrop {
         display: block;
         position: fixed;
         inset: 0;
-        z-index: 1;
-        background: rgba(0, 0, 0, 0.45);
-    }
-
-    .shell[data-rail-open='left'] .rail-left,
-    .shell[data-rail-open='right'] .rail-right {
-        position: relative;
         z-index: 2;
-    }
-
-    .rail-left {
-        max-height: 34vh;
-        border-right: 0;
-        border-bottom: 1px solid var(--border);
+        background: rgba(0, 0, 0, 0.45);
     }
 
     .rail-right {
         max-height: 38vh;
+    }
+
+    @keyframes rail-slide-in {
+        from {
+            transform: translateX(-100%);
+        }
+
+        to {
+            transform: translateX(0);
+        }
     }
 
     /* R10: the composer has a single full-width field child, so there is no action
@@ -4696,7 +4761,8 @@ button {
     .tile[data-state='streaming']::before,
     .thread-tile[data-state='waiting']::before,
     .thread-tile[data-state='streaming']::before,
-    .agent-tile[data-activity='active']::before {
+    .agent-tile[data-activity='active']::before,
+    .shell[data-rail-open='left'] .rail-left {
         animation: none !important;
     }
 

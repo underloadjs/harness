@@ -1425,7 +1425,25 @@ Recoverable failures become tool results the model can read:
 - undiscovered tool → result naming tags that would enable it (it does not run);
 - malformed JSON arguments → result naming the parse failure (the tool is not
   executed);
-- throwing tool → result with the error message.
+- throwing/rejecting tool (including a runtime-compiled module) → result with the
+  error message. `throw undefined` / `Promise.reject(undefined)` are still
+  failures: the scheduler records a `failed` flag independently of the payload.
+  `toErrorInfo` also describes non-Error thrown values (`42`, a symbol, a plain
+  object) and never throws while doing so;
+- a tool that returns a result the harness cannot serialize → failed result naming
+  the serialization error. The run continues and the other calls in the turn still
+  deliver.
+- a nested `context.callTool` or `context.run` failure propagates unchanged to an
+  awaiting caller. A compiled tool that fires and forgets that promise cannot turn
+  the failure into a process `unhandledRejection`; manual `executeTool` has the
+  same observation while still rejecting for callers that await it. This covers the
+  harness-issued promise only: a caller's own `.then(...)` chain without a
+  rejection handler, a timer callback, or another detached async task is outside
+  the harness boundary.
+- arbitrary thrown values are classified with `isInstanceOf` (guarded
+  `instanceof`) on server/harness catch paths. A hostile Proxy whose
+  `getPrototypeOf` throws is reported as a normal tool error instead of escaping
+  the catch; it is never misclassified as a `SessionError`/HTTP status.
 
 Terminal failures truncate history to the pre-call length, emit `error`, and
 throw:

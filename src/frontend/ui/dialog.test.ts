@@ -535,12 +535,20 @@ describe('dialog.css contract', () => {
         expect(overlay).toContain('justify-content: center');
     });
 
-    it('caps the panel and scrolls only the body', () => {
+    it('caps every dialog variant at 80% of the viewport and scrolls only the body', () => {
         const panel = blockOf('.dialog {');
         expect(panel).toContain('display: flex');
         expect(panel).toContain('flex-direction: column');
-        expect(panel).toContain('max-height: min(82vh, 900px)');
+        // R1: the compact panel is never taller than 80% of the viewport, and the
+        // test pins the fallback plus the dynamic-viewport follow-up.
+        expect(panel).toContain('max-height: min(80vh, 900px)');
+        expect(panel).toContain('max-height: min(80dvh, 900px)');
         expect(panel).toContain('overflow: hidden');
+
+        // R1 applies to the wide working surface too: it gains width, not height.
+        const wide = blockOf('.dialog.dialog-wide {');
+        expect(wide).toContain('max-height: min(80vh, 960px)');
+        expect(wide).toContain('max-height: min(80dvh, 960px)');
 
         const body = blockOf('.dialog-body {');
         expect(body).toContain('display: flex');
@@ -560,8 +568,11 @@ describe('dialog.css contract', () => {
         expect(phone).toContain('padding: 16px');
         expect(phone).not.toContain('align-items: stretch');
         expect(phone).toContain('.dialog {\n        width: 100%;');
-        // 24px gutter, and more usable height than the desktop 82%.
-        expect(phone).toContain('max-height: calc(100vh - 48px)');
+        // R1: the phone still uses the 80% cap (never the old viewport-minus-gutter
+        // 100vh rule), while the 16px overlay gutter keeps a visible edge.
+        expect(phone).toContain('max-height: 80vh');
+        expect(phone).toContain('max-height: 80dvh');
+        expect(phone).not.toContain('max-height: calc(100vh');
     });
 
     it('sizes preview images and code blocks inside the scroll area', () => {

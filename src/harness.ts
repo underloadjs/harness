@@ -171,6 +171,19 @@
 // re-requests a paused agent so it can inspect elapsed times and cancel a hung
 // call through the `toolCancel` control. Scheduler: core/scheduler.ts.
 //
+// Tool-failure containment (compiled tools are arbitrary JavaScript):
+//   - a scheduled throw/rejection is caught by core/scheduler.ts and DELIVERED as
+//     a failed tool result (deliverTask), so the model can recover and the run
+//     continues;
+//   - a result the harness cannot serialize is also delivered as a failed tool
+//     result; it no longer escapes through the mailbox and aborts the run;
+//   - manual executeTool and nested callTool keep their documented REJECTING
+//     promise, but the invocation promise is observed (observeToolRejection) so
+//     a caller that fires and forgets cannot turn a failed tool into a process
+//     unhandledRejection. This is containment, not a sandbox: process.exit, OOM,
+//     infinite loops, and a caller's own derived unhandled chains are outside a
+//     try/catch's reach.
+//
 // Model-facing output cap (R10): every serialized tool result AND tool error is
 // passed through `boundToolResult` (64 KiB UTF-8 by default, core/result-budget.ts).
 // Small outputs are byte-exact; a large one becomes a small, valid JSON truncation
@@ -228,7 +241,7 @@
 // role folder with its own barrel, and the public surface is re-exported at the
 // bottom of this file.
 
-import { HarnessError, toErrorInfo } from './util';
+import { HarnessError, isInstanceOf, toErrorInfo } from './util';
 import {
     agent as createAgent,
     tool as defineTool,
@@ -568,6 +581,18 @@ const serialize = (value: unknown): string => {
     if (value === undefined) return '';
     if (typeof value === 'string') return value;
     return JSON.stringify(value) ?? String(value);
+};
+
+// Mark an invocation promise as observed without changing its settlement. A
+// compiled tool that fires `context.callTool(...)` without awaiting it looks
+// healthy, but the nested tool's rejection would otherwise become a process-level
+// unhandledRejection and can terminate the Node host (and therefore the agent
+// step). Attaching this handler only suppresses the "nobody listened" crash: the
+// ORIGINAL promise is returned, so an awaiting caller still receives the same
+// rejection and the documented manual/nested failure contract is unchanged.
+const observeToolRejection = <T>(promise: Promise<T>): Promise<T> => {
+    void promise.catch(() => undefined);
+    return promise;
 };
 
 // The single-property rule (see core/tool.ts) plus runtime schema validation
@@ -2149,6 +2174,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // behaviour), so keep the first one and prefer it over the generic
         // AbortError.
         abortError?: unknown;
+        // `abortError` may legitimately BE `undefined` (a tool that rejected with
+        // undefined). This sentinel distinguishes "recorded undefined" from "no
+        // tool error was recorded"; without it throwIfAborted would wrongly
+        // substitute the generic signal reason.
+        abortErrorSet: boolean;
         // A progress/observer failure raised while delivering a background
         // outcome or a wake. The mailbox must stay serialized even when a callback
         // throws, so the error is parked here and rethrown by the loop: a failing
@@ -2891,7 +2921,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // the standard AbortError propagates.
     const throwIfAborted = (run: RunState): void => {
         if (run.signal?.aborted === true) {
-            throw run.abortError ?? run.signal.reason;
+            // An explicitly recorded tool failure wins EVEN when its value is
+            // undefined (`throw undefined` is legal JavaScript). Using `??` here
+            // used to replace it with the generic abort reason.
+            if (run.abortErrorSet) throw run.abortError;
+            throw run.signal.reason;
         }
     };
 
@@ -3265,7 +3299,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // Keep a tool's own abort error, though: a tool that observed the signal
         // and threw explains the cancellation better than "operation was aborted".
         if (run.aborted) {
-            if (run.abortError === undefined && task.error !== undefined) run.abortError = task.error;
+            // Record the tool's own explanation once, including an explicitly
+            // thrown `undefined`: the scheduler's `failed` flag, not the payload,
+            // decides whether there is an error to keep.
+            if (!run.abortErrorSet && task.failed) {
+                run.abortError = task.error;
+                run.abortErrorSet = true;
+            }
             return;
         }
 
@@ -3293,17 +3333,34 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 `Tool call "${call.name}" (${call.id}) was cancelled before it completed; no result is available.`
             ).content;
             outcome = 'cancelled';
-        } else if (task.error !== undefined) {
+        } else if (task.failed) {
+            // `toErrorInfo` is total (see util/errors.ts): a compiled tool may throw
+            // a primitive/object/proxy, and this failure reporter must never throw
+            // while describing that value. `task.failed` (not `task.error`) decides
+            // failure so `throw undefined` is still an error result.
             content = boundToolResult(
                 `Tool "${call.name}" failed: ${toErrorInfo(task.error).message}`
             ).content;
             outcome = 'failed';
         } else {
-            // Same unwrap/cap as the historical synchronous path (R10/R20.2).
-            const ui = toolUiOf(task.result);
-            content = boundToolResult(serialize(ui === undefined ? task.result : ui.content)).content;
-            panels = ui?.panels;
-            outcome = 'completed';
+            // A tool can RESOLVE successfully with a value the harness cannot put on
+            // the wire: a cycle or BigInt makes JSON.stringify throw, and a hostile
+            // proxy can make the UI unwrap throw. That is still the tool's outcome,
+            // not a harness failure: report it to the model as a failed call so the
+            // missing tool message cannot abort the run (the delivery catch would
+            // otherwise park a deliveryError and lose this result).
+            try {
+                // Same unwrap/cap as the historical synchronous path (R10/R20.2).
+                const ui = toolUiOf(task.result);
+                content = boundToolResult(serialize(ui === undefined ? task.result : ui.content)).content;
+                panels = ui?.panels;
+                outcome = 'completed';
+            } catch (error) {
+                content = boundToolResult(
+                    `Tool "${call.name}" completed but its result could not be serialized: ${toErrorInfo(error).message}`
+                ).content;
+                outcome = 'failed';
+            }
         }
 
         // The provider/transcript-facing boolean is DERIVED, never set separately:
@@ -3605,17 +3662,30 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         // extraction (a whitespace-only final turn resolves to the
                         // run's last substantive tool-free response). Any other tool
                         // using ctx.run keeps the literal final-turn return.
-                        return runAgent(
-                            target,
-                            input,
-                            signal,
-                            run,
-                            call.id,
-                            delegateAnswerDefinitions.has(definition) ? DELEGATE_ANSWER : undefined
+                        // Same containment as callTool: a compiled tool may ignore
+                        // this promise. Observation keeps an ignored rejection from
+                        // crashing the process, while an awaiting caller still gets
+                        // the original runAgent rejection unchanged.
+                        return observeToolRejection(
+                            runAgent(
+                                target,
+                                input,
+                                signal,
+                                run,
+                                call.id,
+                                delegateAnswerDefinitions.has(definition)
+                                    ? DELEGATE_ANSWER
+                                    : undefined
+                            )
                         );
                     }
                 };
 
+                // No local catch on purpose: core/scheduler.ts wraps this call in
+                // its own try/catch, so BOTH a synchronous throw from a raw
+                // compiled Tool-like export and an async rejection settle the task
+                // and reach deliverTask as a failed tool result. The run keeps
+                // going; only a cancellation is treated as non-failure.
                 return definition.execute(context);
             },
             onSettled: (task) => {
@@ -4850,7 +4920,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             const info = toErrorInfo(error);
             await emitError(run, info);
 
-            throw error instanceof HarnessError ? error : new HarnessError(info.message, { cause: error });
+            // Safe classification: a hostile Proxy thrown through a tool path may
+            // make `instanceof` itself throw. The total formatter produced `info`
+            // above; classification must be equally total.
+            throw isInstanceOf(error, HarnessError)
+                ? error
+                : new HarnessError(info.message, { cause: error });
         }
     };
 
@@ -5144,6 +5219,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 parent,
                 active: true,
                 aborted: false,
+                abortErrorSet: false,
                 iteration: 0,
                 dirty: false,
                 waiters: [],
@@ -5791,7 +5867,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // the invocation options. A baseline runtime control is rejected because it
     // needs the owning RunState, not an ordinary tool context; a replacement under
     // the same name has no marker and runs normally.
-    const callToolInternal = async (
+    // The implementation of a registered/live-registry invocation. A sync throw
+    // or a rejected promise from the compiled implementation is deliberately
+    // rethrown unchanged (manual/nested callers own their error contract); the
+    // `observeToolRejection` wrapper below is what keeps an IGNORED invocation
+    // from crashing the process. `finally` still runs for both outcomes.
+    const invokeRegisteredTool = async (
         name: string,
         parameters: unknown,
         options: HarnessToolCallOptions = {}
@@ -5828,13 +5909,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     throw new HarnessError(`Agent "${agentName}" is not registered.`);
                 }
 
-                return runAgent(
-                    target,
-                    input,
-                    signal,
-                    undefined,
-                    undefined,
-                    delegateAnswerDefinitions.has(definition) ? DELEGATE_ANSWER : undefined
+                return observeToolRejection(
+                    runAgent(
+                        target,
+                        input,
+                        signal,
+                        undefined,
+                        undefined,
+                        delegateAnswerDefinitions.has(definition) ? DELEGATE_ANSWER : undefined
+                    )
                 );
             }
         };
@@ -5851,7 +5934,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
-    const executeTool = async (name: string, parameters: unknown): Promise<unknown> => {
+    // Every registered-tool call (model-scheduled nested call, host callTool,
+    // public execute helper) goes through this exact function. The observer is
+    // attached to the OUTER promise so a fire-and-forget nested call cannot
+    // produce an unhandled rejection; awaited callers still see the rejection.
+    const callToolInternal = (
+        name: string,
+        parameters: unknown,
+        options: HarnessToolCallOptions = {}
+    ): Promise<unknown> => observeToolRejection(invokeRegisteredTool(name, parameters, options));
+
+    const executeToolInternal = async (name: string, parameters: unknown): Promise<unknown> => {
         const definition = tools[name];
 
         // The session owns which tools exist: a harness without subagents has no
@@ -5901,13 +5994,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     // cannot return a blank terminal turn while the child already
                     // answered substantively. Other manual ctx.run tools keep the
                     // literal final-turn return.
-                    return runAgent(
-                        target,
-                        input,
-                        undefined,
-                        undefined,
-                        undefined,
-                        delegateAnswerDefinitions.has(definition) ? DELEGATE_ANSWER : undefined
+                    return observeToolRejection(
+                        runAgent(
+                            target,
+                            input,
+                            undefined,
+                            undefined,
+                            undefined,
+                            delegateAnswerDefinitions.has(definition)
+                                ? DELEGATE_ANSWER
+                                : undefined
+                        )
                     );
                 }
             });
@@ -5919,6 +6016,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             notifyStateChange('tool_execute', { tool: name });
         }
     };
+
+    // A manual host call has the same containment requirement as a nested one: the
+    // documented contract is a REJECTED promise (the implementation error is never
+    // swallowed), but a host that forgets to await it must not take down the whole
+    // process through an unhandledRejection.
+    const executeTool = (name: string, parameters: unknown): Promise<unknown> =>
+        observeToolRejection(executeToolInternal(name, parameters));
 
     // The harness is a function you call. Properties ride on it so a CLI has
     // everything in one handle without a second lookup object.
