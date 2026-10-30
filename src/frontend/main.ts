@@ -326,8 +326,8 @@ type View = {
     // Look up a tile by the server turn id carried on a stream `event` frame.
     turn: (id: string) => TurnHandle | undefined;
     // Every real block in this conversation (root+nested), oldest→newest. The
-    // composer's # reference popup reads it; the latest matching label wins
-    // (ui/references.ts) exactly like the server's plain-text resolution.
+    // composer's # reference popup reads it; labels are conversation-scoped, so a
+    // label names one block and the popup matches the server's resolution.
     blocks: () => AgentBlockDescriptor[];
     // Stop every live timer this view owns (elapsed labels, tool durations).
     dispose: () => void;

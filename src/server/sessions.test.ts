@@ -494,7 +494,8 @@ describe('SessionStore turns', () => {
                 // (harness.ts deliverTask). The clock is pinned at 2_000, so the
                 // inline todoManage round is exactly 0 ms.
                 durationMs: 0,
-                isError: false
+                isError: false,
+                outcome: 'completed'
             },
             { type: 'text', agent: 'rounds', delta: 'all done' },
             { type: 'usage', agent: 'rounds', usage: { input: 3, output: 2, total: 5 } },
@@ -750,7 +751,8 @@ describe('SessionStore turns', () => {
                 // Additive execution span (harness.ts deliverTask). The clock is
                 // pinned at 2_000, so the delegated inline call is exactly 0 ms.
                 durationMs: 0,
-                isError: false
+                isError: false,
+                outcome: 'completed'
             },
             { type: 'text', agent: 'lead', delta: 'done by helper' },
             {

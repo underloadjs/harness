@@ -37,7 +37,7 @@ describe('createToolCallCard', () => {
 
     it('keeps the argument/result body in the closed card for the dialog to adopt', () => {
         const card = createToolCallCard('fileRead', '{"paths":["package.json"]}');
-        card.resolve('{"ok":true}', false);
+        card.resolve('{"ok":true}', 'completed');
 
         const summary = card.element.querySelector('.tool-summary');
         expect(summary?.getAttribute('aria-label')).toBe('fileRead: ok');
@@ -59,7 +59,7 @@ describe('createToolCallCard', () => {
 
     it('resolves a successful result, highlighting JSON and summarising the size', () => {
         const card = createToolCallCard('fileRead', '{"paths":["package.json"]}');
-        card.resolve('{"ok":true}', false);
+        card.resolve('{"ok":true}', 'completed');
 
         expect(card.state()).toBe('ok');
         expect(card.element.getAttribute('data-state')).toBe('ok');
@@ -75,7 +75,7 @@ describe('createToolCallCard', () => {
 
     it('marks failures and never overwrites a settled card', () => {
         const card = createToolCallCard('commandRun', '{"command":"false"}');
-        card.resolve('exit code 1', true);
+        card.resolve('exit code 1', 'failed');
 
         expect(card.state()).toBe('error');
         expect(card.element.querySelector('.tool-state')?.textContent).toBe('error');
@@ -88,15 +88,50 @@ describe('createToolCallCard', () => {
         expect(card.element.querySelectorAll('.tool-label')[1]?.textContent).toBe('result · error');
 
         const before = card.element.querySelector('.tool-result')?.innerHTML;
-        card.resolve('second result', false);
+        card.resolve('second result', 'completed');
 
         expect(card.state()).toBe('error');
         expect(card.element.querySelector('.tool-result')?.innerHTML).toBe(before);
     });
 
+    it('shows a cancelled call as a control outcome, not a failure', () => {
+        // R1: the runtime classifies a toolCancel release as `cancelled`; the card
+        // must reflect that instead of borrowing the red error state.
+        const card = createToolCallCard('fileRead', '{"paths":["a.txt"]}', {
+            callId: 'k1'
+        });
+        card.resolve('Tool call "fileRead" (k1) was cancelled before it completed; no result is available.', 'cancelled');
+
+        expect(card.state()).toBe('cancelled');
+        expect(card.element.getAttribute('data-state')).toBe('cancelled');
+        expect(card.element.querySelector('.tool-state')?.textContent).toBe('cancelled');
+        expect(card.element.querySelector('.tool-summary')?.getAttribute('aria-label')).toBe(
+            'fileRead: cancelled'
+        );
+        expect(card.element.querySelector('.tool-peek')?.textContent).toBe(
+            '{"paths":["a.txt"]} · cancelled'
+        );
+        expect(card.element.querySelectorAll('.tool-label')[1]?.textContent).toBe('result · cancelled');
+    });
+
+    it('shows a rejected invocation as an error, exactly like a failed execution', () => {
+        // R1: the card surface only needs "no usable value"; the distinction between
+        // rejected (never ran) and failed (ran and threw) lives in the event.
+        const rejected = createToolCallCard('missing', '{"value":"M"}');
+        rejected.resolve('Tool "missing" is not registered.', 'rejected');
+        expect(rejected.state()).toBe('error');
+        expect(rejected.element.querySelector('.tool-peek')?.textContent).toBe(
+            '{"value":"M"} · failed'
+        );
+
+        const failed = createToolCallCard('broken', '{"value":"F"}');
+        failed.resolve('Tool "broken" failed: kaput', 'failed');
+        expect(failed.state()).toBe('error');
+    });
+
     it('shows a placeholder for an empty result', () => {
         const card = createToolCallCard('timeNow', '');
-        card.resolve('', false);
+        card.resolve('', 'completed');
 
         expect(card.element.querySelector('.tool-peek')?.textContent).toBe(
             '(no arguments) · 14 chars'
@@ -119,7 +154,7 @@ describe('createToolCallCard', () => {
         expect(label?.textContent).toBe('1.5s');
 
         vi.advanceTimersByTime(500);
-        card.resolve('done', false);
+        card.resolve('done', 'completed');
         expect(card.durationMs()).toBe(2000);
         expect(label?.textContent).toBe('2.0s');
 
@@ -133,7 +168,7 @@ describe('createToolCallCard', () => {
         const card = createToolCallCard('fileRead', '{}');
         expect(card.element.querySelector<HTMLElement>('.tool-duration')?.hidden).toBe(true);
 
-        card.resolve('ok', false, 1500);
+        card.resolve('ok', 'completed', 1500);
         expect(card.durationMs()).toBe(1500);
         expect(card.element.querySelector('.tool-duration')?.textContent).toBe('1.5s');
         expect(card.element.querySelector<HTMLElement>('.tool-duration')?.hidden).toBe(false);
@@ -203,7 +238,7 @@ describe('createToolCallCard', () => {
 
     it('never overwrites a resolved card and is idempotent', () => {
         const card = createToolCallCard('fileRead', '{}');
-        card.resolve('{"ok":true}', false);
+        card.resolve('{"ok":true}', 'completed');
 
         const settled = card.element.querySelector('.tool-result')?.innerHTML;
         card.abandon('too late');

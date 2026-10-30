@@ -284,6 +284,7 @@ import type {
     HarnessStreamTool,
     HarnessThread,
     HarnessToolCall,
+    HarnessToolOutcome,
     Tool,
     ToolContext,
     ToolCreation,
@@ -1869,8 +1870,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return insertAt;
     };
 
+    // The committed result for one call id, if any. R2: this is the canonical
+    // "this call already settled" record (see the toolCancel branch), because the
+    // harness inserts exactly one tool message per settled call and never commits
+    // a pending placeholder. Bounded by the conversation, scoped to this agent.
+    const toolResultOf = (
+        brain: Agent,
+        callId: string
+    ): Extract<HarnessMessage, { role: 'tool' }> | undefined =>
+        brain.messages.find(
+            (message): message is Extract<HarnessMessage, { role: 'tool' }> =>
+                message.role === 'tool' && message.toolCallId === callId
+        );
+
     const hasToolResult = (brain: Agent, callId: string): boolean =>
-        brain.messages.some((message) => message.role === 'tool' && message.toolCallId === callId);
+        toolResultOf(brain, callId) !== undefined;
 
     // Insert one real result into the canonical transcript. Returns false when
     // there is nothing to insert (already answered, or originating block gone).
@@ -2033,30 +2047,42 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const brain = run.agent;
         const durationMs = Math.max(0, Date.now() - task.startedAt);
 
+        // R1: ONE structured outcome, computed here and projected onto `isError`
+        // below. A settled task has three honest shapes: released by toolCancel
+        // (cancelled — an expected control outcome, not a failure), threw while
+        // running (failed — an operational failure), or returned a value
+        // (completed). Invocation errors never reach this function; they are
+        // answered by immediateResult() before a task exists.
         let content: string;
-        let isError: boolean;
+        let outcome: HarnessToolOutcome;
         let panels: ToolUiPanel[] | undefined;
 
         if (task.status === 'cancelled') {
             // A targeted cancellation is a result the model must see: without it
             // the provider projection would keep a placeholder forever. It is
-            // error-shaped because no usable value exists.
+            // error-SHAPED (no usable value exists) but classified `cancelled`, so
+            // a UI renders it as a control outcome instead of a tool failure.
             content = boundToolResult(
                 `Tool call "${call.name}" (${call.id}) was cancelled before it completed; no result is available.`
             ).content;
-            isError = true;
+            outcome = 'cancelled';
         } else if (task.error !== undefined) {
             content = boundToolResult(
                 `Tool "${call.name}" failed: ${toErrorInfo(task.error).message}`
             ).content;
-            isError = true;
+            outcome = 'failed';
         } else {
             // Same unwrap/cap as the historical synchronous path (R10/R20.2).
             const ui = toolUiOf(task.result);
             content = boundToolResult(serialize(ui === undefined ? task.result : ui.content)).content;
             panels = ui?.panels;
-            isError = false;
+            outcome = 'completed';
         }
+
+        // The provider/transcript-facing boolean is DERIVED, never set separately:
+        // a consumer that ignores `outcome` still gets an honest answer, and the
+        // two fields cannot drift apart.
+        const isError = outcome !== 'completed';
 
         insertToolMessage(brain, call, content, run.branch === undefined);
 
@@ -2077,6 +2103,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             callId: call.id,
             content,
             isError,
+            outcome,
             // Every EXECUTED call reports its span. An inline call is a real
             // (usually sub-millisecond) measurement, not a milder kind of call;
             // consumers can render 0ms without special-casing background work.
@@ -2092,11 +2119,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     // Emit a result that never became background work (validation failure, or a
     // toolCancel acknowledgement). It is inserted and reported in one step.
+    //
+    // `outcome` is the structured classification (R1): every `fail()` call site is
+    // a REJECTED invocation (the tool never ran), a cancellation acknowledgement
+    // is COMPLETED (the control did what was asked), and a branch-control refusal
+    // is REJECTED. `isError` is derived from it, so a caller cannot report an
+    // error-shaped result without also saying why.
     const immediateResult = async (
         run: RunState,
         call: HarnessToolCall,
         raw: string,
-        isError: boolean,
+        outcome: HarnessToolOutcome,
         withDuration = false
     ): Promise<void> => {
         const content = boundToolResult(raw).content;
@@ -2110,7 +2143,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             name: call.name,
             callId: call.id,
             content,
-            isError,
+            isError: outcome !== 'completed',
+            outcome,
             ...(withDuration ? { durationMs: 0 } : {}),
             ...(pending.length === 0 ? {} : { pending })
         });
@@ -2130,7 +2164,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         const brain = run.agent;
 
-        const fail = (content: string): Promise<void> => immediateResult(run, call, content, true);
+        const fail = (content: string): Promise<void> =>
+            immediateResult(run, call, content, 'rejected');
 
         const parseArguments = (schema: Record<string, unknown> | undefined): unknown =>
             parseToolCallArguments(schema, call);
@@ -2139,6 +2174,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // while this agent has work in flight (see declarations). Call ids are
         // resolved inside the CALLING run's scope, so a run can never cancel a
         // sibling's work.
+        //
+        // R2 — IDEMPOTENCE: cancellation is a state to reach, not a transition to
+        // perform exactly once. A call that is still pending is released; a call
+        // that ALREADY settled in this conversation (completed, failed, or already
+        // cancelled) is a SUCCESS with `alreadySettled: true`, because the caller's
+        // intent ("this call must not keep the run waiting") already holds. Only an
+        // id this run never started is an error — a foreign/unknown id must never
+        // be reported as a successful cancellation it did not perform.
         if (call.name === TOOL_CANCEL) {
             let parameters: unknown;
 
@@ -2158,8 +2201,38 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             const task = scheduler.find(run.scope, callId);
 
             if (!task) {
+                // No pending task under this run's scope. The canonical record of a
+                // SETTLED call is its tool message in this agent's transcript:
+                // deliverTask/immediateResult insert one for every completed,
+                // failed, rejected, and cancelled call, and a placeholder is never
+                // committed. Consulting it (rather than a growing ledger) keeps the
+                // memory bounded by the conversation itself and keeps the answer
+                // honest: a foreign run's id never appears here.
+                const settled = toolResultOf(brain, callId);
+
+                if (settled !== undefined) {
+                    await immediateResult(
+                        run,
+                        call,
+                        JSON.stringify({
+                            cancelled: true,
+                            callId,
+                            name: settled.name,
+                            alreadySettled: true
+                        }),
+                        // The control outcome is a success, not an error: nothing
+                        // is left running and nothing needs to be reported as
+                        // "already cancelled/completed".
+                        'completed',
+                        // Control result: report its (zero) span like any other
+                        // completed call.
+                        true
+                    );
+                    return;
+                }
+
                 await fail(
-                    `No pending tool call "${callId}" belongs to this run. Use a callId from tool_call events or the pending list.`
+                    `No tool call "${callId}" was started in this run, so there is nothing to cancel. Pass the callId of a call this run started (see the pending list or the tool_call event).`
                 );
                 return;
             }
@@ -2173,7 +2246,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 run,
                 call,
                 JSON.stringify({ cancelled: true, callId, name: task.name }),
-                false,
+                'completed',
                 // The acknowledgement is a control result; report its (zero)
                 // span so a UI can render it like any other completed call.
                 true
@@ -2446,7 +2519,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         run: RunState,
         call: HarnessToolCall,
         message: string
-    ): Promise<void> => immediateResult(run, call, message, true);
+    ): Promise<void> => immediateResult(run, call, message, 'rejected');
 
     // Turn a validated choice into the model-facing result. An option answer is
     // widened with the label/description the model never sent, so it can reason

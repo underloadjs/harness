@@ -3,7 +3,8 @@
 // Pins the end-to-end contract:
 //   - `#` popup lists the REAL root+nested blocks from the board, and a pick
 //     inserts an atomic chip carrying the exact turn/thread binding;
-//   - the LATEST matching label wins across turns (the server's plain-text rule);
+//   - labels are conversation-scoped: one label names one block (R5/R6), so the
+//     popup and the server's plain-text resolution cannot disagree;
 //   - `@` lookup uses the query-aware fileGlob call and inserts a path token (no
 //     bytes);
 //   - submitting sends `references` alongside the unchanged prompt text, including
@@ -46,8 +47,9 @@ const turn = (overrides: Partial<SessionTurn> = {}): SessionTurn =>
         ...overrides
     }) as SessionTurn;
 
-// Two turns that BOTH allocate `IT1` plus one nested research invocation in t2.
-// The # popup must list IT1 once (latest = t2) and RH1 once (nested t2).
+// Two turns: the roots are IT1 (t1) and IT2 (t2) because the numbering continues
+// across the conversation, plus one nested research invocation in t2 (RH1). The #
+// popup must list each label exactly once, and a label names exactly one block.
 const restored = (): SessionSnapshot => ({
     id: 's1',
     harness: 'instruct',
@@ -219,7 +221,7 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-it('lists real root+nested blocks and binds the latest matching label', async () => {
+it('lists real root+nested blocks and binds the block a label names', async () => {
     const calls = stubServer(restored());
     await mount();
 
@@ -230,9 +232,11 @@ it('lists real root+nested blocks and binds the latest matching label', async ()
     const popup = byClass('.composer-popup', 'div');
     expect(popup.hidden).toBe(false);
     expect(input.getAttribute('aria-expanded')).toBe('true');
-    // One IT1 (latest t2) and the nested t2 RH1; no duplicate root labels.
-    expect(popupTokens()).toEqual(['#IT1', '#RH1']);
+    // Conversation-scoped labels: t1's root is IT1, t2's root is IT2 (never a
+    // second IT1), and t2's nested research is RH1. Each label appears once.
+    expect(popupTokens()).toEqual(['#IT1', '#IT2', '#RH1']);
     expect([...document.querySelectorAll<HTMLElement>('.composer-popup-name')].map((node) => node.textContent)).toEqual([
+        'instruct',
         'instruct',
         'research'
     ]);
@@ -243,7 +247,7 @@ it('lists real root+nested blocks and binds the latest matching label', async ()
     expect(popup.hidden).toBe(true);
     expect(input.value).toBe('use #IT1');
     const chip = document.querySelector<HTMLElement>('.composer-input [data-chip="reference"]');
-    expect(chip?.dataset.referenceTurn).toBe('t2');
+    expect(chip?.dataset.referenceTurn).toBe('t1');
     expect(chip?.dataset.referenceLabel).toBe('IT1');
     expect(chip?.hasAttribute('data-reference-thread')).toBe(false);
 
@@ -253,7 +257,7 @@ it('lists real root+nested blocks and binds the latest matching label', async ()
     expect(taskBodies(calls)).toEqual([
         {
             input: 'use #IT1',
-            references: [{ turnId: 't2', label: 'IT1' }]
+            references: [{ turnId: 't1', label: 'IT1' }]
         }
     ]);
 });
@@ -382,9 +386,10 @@ it('offers only referenceable blocks (done/running), never failed or cancelled',
     input.value = '#';
     input.setSelectionRange(1, 1);
 
-    // The failed and cancelled roots allocate IT1 too, but only the running block
-    // is referenceable; a failed latest block must not be offered.
-    expect(popupTokens()).toEqual(['#IT1']);
+    // The failed and cancelled roots allocate IT1/IT2, but only the third (running)
+    // block is referenceable: a failed block never hides an earlier completed one,
+    // and it is never offered itself.
+    expect(popupTokens()).toEqual(['#IT3']);
     expect(
         [...document.querySelectorAll<HTMLElement>('.composer-popup-state')].map((node) => node.textContent)
     ).toEqual(['running']);

@@ -86,7 +86,9 @@
 // Every OTHER failure still rejects the WHOLE call, because a partial array would
 // look complete: a blank/NUL/non-string path, an invalid range value, a directory,
 // binary bytes ENCOUNTERED WHILE READING, or any other filesystem error. Every
-// filesystem error names the requested path.
+// filesystem error names the requested path, and the two confusable cases are
+// classified explicitly (R3): a directory says it is a directory and points at
+// fileList/fileGlob, while a real denial says it is a permission problem.
 //
 // COST OF RANGES / CONTINUATIONS
 // ------------------------------
@@ -107,7 +109,7 @@
 // Metadata (name, description, tags, schema) lives in ../catalogue so the preset
 // can be enumerated without importing this module — and so text can't drift.
 
-import { open } from 'node:fs/promises';
+import { open, stat } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { tool } from '../../core';
@@ -212,7 +214,8 @@ type PreparedTarget =
 
 // ENOENT is the one filesystem outcome that is DATA (the requested file is absent),
 // not a failed request. Anything else — EISDIR, EPERM, EACCES, ENOTDIR — still
-// rejects the whole batch.
+// rejects the whole batch; fileError() below classifies a directory and a real
+// permission denial separately so neither is reported as the other.
 const isNotFound = (error: unknown): boolean =>
     typeof error === 'object' &&
     error !== null &&
@@ -518,8 +521,51 @@ const scanFile = async (handle: FileHandle, request: NormalizedTarget, budget: n
 // (Windows EISDIR on a directory read is the usual offender). Wrap them with the
 // requested path so every failure is equally actionable; a HarnessError from the
 // scanner (binary content) is already path-aware and passes through untouched.
-const fileError = (path: string, error: unknown): HarnessError => {
+//
+// R3: a directory is NOT a permission problem and NOT a generic I/O failure, so it
+// gets its own message naming the real mistake and the tool that can help. A
+// genuine denial keeps permission wording, and is therefore distinguishable.
+const directoryFailure = (path: string): HarnessError =>
+    new HarnessError(
+        `fileRead cannot read "${path}": it is a directory, not a file. Use fileList to list its entries, or fileGlob to find files inside it.`
+    );
+
+const permissionFailure = (path: string, message: string): HarnessError =>
+    new HarnessError(
+        `fileRead was denied permission to read "${path}": ${message}. This is a filesystem permission problem, not a missing path or a directory read.`
+    );
+
+const errorCodeOf = (error: unknown): string | undefined => {
+    if (typeof error !== 'object' || error === null) return undefined;
+    const code = (error as { code?: unknown }).code;
+    return typeof code === 'string' ? code : undefined;
+};
+
+// True when the failure means "the target IS a directory". EISDIR is
+// unambiguous. Windows instead reports EPERM for a directory read, which by code
+// alone is indistinguishable from a real permission denial — so only in that case
+// (and only after the failure) one narrow stat decides. A failed stat keeps the
+// original classification, so an actual EPERM is never relabelled as a directory.
+const isDirectoryTarget = async (path: string, error: unknown): Promise<boolean> => {
+    const code = errorCodeOf(error);
+
+    if (code === 'EISDIR') return true;
+    if (code !== 'EPERM') return false;
+
+    try {
+        return (await stat(path)).isDirectory();
+    } catch {
+        return false;
+    }
+};
+
+const fileError = async (path: string, error: unknown): Promise<HarnessError> => {
     const message = error instanceof Error ? error.message : String(error);
+    const code = errorCodeOf(error);
+
+    if (await isDirectoryTarget(path, error)) return directoryFailure(path);
+    if (code === 'EACCES' || code === 'EPERM') return permissionFailure(path, message);
+
     return new HarnessError(`fileRead failed to read "${path}": ${message}`);
 };
 
@@ -553,7 +599,7 @@ export const fileRead = tool<FileReadParameters, FileReadResult>({
                         continue;
                     }
 
-                    throw fileError(request.path, error);
+                    throw await fileError(request.path, error);
                 }
             }
         } catch (error) {
@@ -592,7 +638,7 @@ export const fileRead = tool<FileReadParameters, FileReadResult>({
                     // Binary errors are already HarnessError with the path; only wrap
                     // raw filesystem/decoder failures.
                     if (error instanceof HarnessError) throw error;
-                    throw fileError(item.request.path, error);
+                    throw await fileError(item.request.path, error);
                 } finally {
                     openHandles.delete(item.handle);
                     await closeQuietly([item.handle]);

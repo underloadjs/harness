@@ -150,7 +150,7 @@ describe('tool detail dialog', () => {
         // The SAME node was adopted (dialog.ts moves it), not cloned.
         expect(dialog()?.querySelector('.tool-body')).toBe(body);
 
-        card.resolve('{"ok":true}', false, 1500);
+        card.resolve('{"ok":true}', 'completed', 1500);
 
         expect(dialog()?.querySelector('.dialog-title')?.textContent).toBe('fileRead · ok');
         expect(dialog()?.querySelectorAll('.tool-section .tool-label')[1]?.textContent).toBe('result');
@@ -162,7 +162,7 @@ describe('tool detail dialog', () => {
     it('shows a full error result and the cancelled reason in an open dialog', () => {
         const failed = mount(createToolCallCard('commandRun', '{"command":"false"}'));
         clickSummary(failed);
-        failed.resolve('exit code 1', true);
+        failed.resolve('exit code 1', 'failed');
 
         expect(dialog()?.querySelector('.dialog-title')?.textContent).toBe('commandRun · error');
         expect(dialog()?.querySelectorAll('.tool-label')[1]?.textContent).toBe('result · error');
@@ -182,7 +182,7 @@ describe('tool detail dialog', () => {
 
     it('returns the body to the closed card and reopens the same node', () => {
         const card = mount(createToolCallCard('fileRead', '{"paths":["package.json"]}'));
-        card.resolve('{"ok":true}', false);
+        card.resolve('{"ok":true}', 'completed');
         const body = card.element.querySelector('.tool-body');
 
         clickSummary(card);
@@ -238,7 +238,7 @@ describe('tool detail dialog', () => {
         // Cleanup also returns the shared body so a late resolve cannot write into
         // a detached overlay.
         expect(card.element.querySelector('.tool-body')).toBe(body);
-        card.resolve('late result', false);
+        card.resolve('late result', 'completed');
         expect(card.element.querySelector('.tool-result code')?.textContent).toBe('late result');
     });
 
@@ -247,7 +247,7 @@ describe('tool detail dialog', () => {
         // surface now, so the tail must still be present as escaped text.
         const payload = `${'a'.repeat(40_005)}TAIL`;
         const card = mount(createToolCallCard('fileRead', '{}'));
-        card.resolve(payload, false);
+        card.resolve(payload, 'completed');
         clickSummary(card);
 
         const code = dialog()?.querySelector('.tool-result code');
@@ -272,7 +272,7 @@ describe('tool detail dialog', () => {
         const card = mount(
             createToolCallCard('fileRead', '{"path":"src/frontend/main.ts"}', {}, { readFile: read })
         );
-        card.resolve('also read src/frontend/tools.ts', false);
+        card.resolve('also read src/frontend/tools.ts', 'completed');
 
         // Building/resolving a card never requests a file. The reader is dormant
         // until a link inside the open modal is activated.
@@ -326,7 +326,7 @@ describe('tool detail dialog', () => {
         } as ToolCallResult);
 
         const card = mount(createToolCallCard('commandRun', '{"command":"cat README.md"}'));
-        card.resolve('README.md', false);
+        card.resolve('README.md', 'completed');
         clickSummary(card);
 
         const link = dialog()?.querySelector<HTMLButtonElement>('.tool-result button.file-link');
@@ -343,7 +343,7 @@ describe('tool detail dialog', () => {
 
     it('never interprets tool code as Markdown images', () => {
         const card = mount(createToolCallCard('fileRead', '{}'));
-        card.resolve('![chart](https://example.com/a.png)', false);
+        card.resolve('![chart](https://example.com/a.png)', 'completed');
         clickSummary(card);
 
         const code = dialog()?.querySelector('.tool-result code');
@@ -360,7 +360,7 @@ describe('tool detail dialog', () => {
                 '{"path":"<img src=x onerror=\\"window.pwned=1\\">"}'
             )
         );
-        card.resolve('<script>window.pwned=1</script>', true);
+        card.resolve('<script>window.pwned=1</script>', 'failed');
         clickSummary(card);
 
         const argumentsCode = dialog()?.querySelectorAll('.tool-section code')[0];

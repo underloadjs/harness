@@ -1914,8 +1914,9 @@ button {
 /* Agent code (R2/F3): the visible half of the agent identity (the outline is the
    other half). ONE rule paints the root block's `.tile-agent` and the nested
    `.thread-name`, so a collapsed parent and a collapsed child show the code in the
-   same position, register and size. The label is the compact per-turn code (`RH1`),
-   never the raw agent id (R3). */
+   same position, register and size. The label is the compact agent code (`RH1`),
+   never the raw agent id (R3). Numbering is conversation-scoped, so two threads of
+   one agent read RR1/RR2 across turns. */
 :is(.tile-agent, .thread-name) {
     order: 0;
     flex: 0 0 auto;

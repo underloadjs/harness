@@ -1456,14 +1456,25 @@ export class SessionStore {
         return bound.map((reference) => ({ ...reference }));
     }
 
+    // Turns from the start of the conversation THROUGH `index`, in recorded order.
+    // Compact labels are conversation-scoped (shared/agent-results.ts chains one
+    // allocator across turns), so resolving a block must project the PREFIX that
+    // consumed earlier occurrences of its two-letter code. Projecting the target
+    // turn alone would number it as if it were the first turn and resolve the wrong
+    // block (or none) — the duplicate-label defect behind R5/R6.
+    private turnsThrough(session: Session, index: number): SessionTurn[] {
+        return session.turns
+            .filter((candidate) => candidate.index <= index)
+            .sort((left, right) => left.index - right.index);
+    }
+
     // Bind one explicit reference against the session record. Returns the exact
     // normalised reference to store. See normalizeReferences for the status rules.
     private bindReference(
         session: Session,
         turnIndex: number,
         reference: AgentResultReference
-    ): AgentResultReference {
-        const target = session.turns.find((turn) => turn.id === reference.turnId);
+    ): AgentResultReference {        const target = session.turns.find((turn) => turn.id === reference.turnId);
 
         if (target === undefined) {
             throw new SessionError(
@@ -1491,7 +1502,8 @@ export class SessionStore {
             return { ...reference };
         }
 
-        const block = findAgentResultBlock([target], reference);
+        // Conversation prefix (not just `[target]`): see `turnsThrough`.
+        const block = findAgentResultBlock(this.turnsThrough(session, target.index), reference);
 
         if (block === undefined) {
             throw new SessionError(
@@ -1559,7 +1571,8 @@ export class SessionStore {
                 throw new Error('The session was removed while waiting for a referenced block.');
             }
 
-            const block = findAgentResultBlock([target], reference);
+            // Conversation prefix (not just `[target]`): see `turnsThrough`.
+        const block = findAgentResultBlock(this.turnsThrough(session, target.index), reference);
 
             if (block === undefined) {
                 throw new Error(

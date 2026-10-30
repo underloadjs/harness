@@ -68,7 +68,8 @@ export type SessionTurn = {
     prompt: string;
     // Result blocks this task was submitted with (R2). A block is referenced by
     // the turn that produced it plus its `threadId` (omitted for the turn's ROOT
-    // invocation) and its compact per-turn label. The server binds these at
+    // invocation) and its compact conversation-scoped label. The server binds these
+    // at
     // enqueue (rejecting unknown/already-failed targets), then expands each
     // referenced block's terminal `done` content into the run prompt AFTER that
     // block has completed. Omitted for a task that references nothing, so every

@@ -15,6 +15,7 @@
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/turns-threads.test.ts
 
 import type { HarnessAssistantMessage, HarnessEvent, SessionTurn } from '../../server/protocol';
+import { findLatestAgentResultBlock, listAgentResultBlocks } from '../../shared/agent-results';
 import { createTurnBoard } from './turns';
 import type { TurnHandle } from './turns';
 
@@ -404,6 +405,36 @@ describe('invocation thread entries', () => {
         expect(project(threadRows(turn)[2]).outcome).toBe('error · delegation cancelled');
     });
 
+    it('terminalizes a cancelled delegation as cancelled, never as an error', () => {
+        // R1: the runtime marks a toolCancel release with outcome 'cancelled'; the
+        // child row must show that control outcome in its own state (info tone)
+        // instead of turning red like a provider failure.
+        const board = mount();
+        const turn = board.begin('cancel');
+
+        turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+        turn.apply(delegateCall('helper', 'slow', 'd1'));
+        turn.apply(withThread({ type: 'start', agent: 'helper', model: 'h1' }, { id: 't1', callId: 'd1', input: 'slow' }));
+
+        turn.apply({
+            type: 'tool_result',
+            agent: 'writer',
+            name: 'agentDelegate',
+            callId: 'd1',
+            content: 'Tool call "agentDelegate" (d1) was cancelled before it completed; no result is available.',
+            isError: true,
+            outcome: 'cancelled'
+        });
+
+        const [row] = threadRows(turn);
+        expect(row.dataset.state).toBe('cancelled');
+        expect(row.querySelector('.thread-status')?.textContent).toBe('cancelled');
+        expect(project(row).outcome).toBe(
+            'cancelled · Tool call "agentDelegate" (d1) was cancelled before it completed; no result is available.'
+        );
+        expect(row.querySelector<HTMLElement>('.thread-outcome')?.dataset.tone).toBe('info');
+    });
+
     it('infers repeated same-agent legacy delegations from their spawning calls', () => {
         const board = mount();
 
@@ -599,20 +630,199 @@ describe('invocation thread entries', () => {
         failed.setState('error', 'boom');
 
         // A delegation cancelled before its child ever started is resolved by the
-        // root's terminal status, not left as a forever-queued row.
+        // root's terminal status, not left as a forever-queued row. Labels are
+        // conversation-scoped, so this second helper thread is HR2 — the first tile's
+        // helper keeps HR1 (no duplicate thread labels, R5/R6).
         expect(threadRows(failed).map(project)).toEqual([
             {
                 id: 'call:d2',
                 depth: '1',
                 agent: 'helper',
                 state: 'error',
-                name: 'HR1',
+                name: 'HR2',
                 status: 'error',
                 preview: 'queued task',
                 text: undefined,
                 outcome: 'outcome · interrupted when the turn failed.'
             }
         ]);
+    });
+
+    it('continues one agent code across turns so threads are RR1 then RR2 (R5/R6)', () => {
+        const board = mount();
+
+        const firstRecord = serverTurn({
+            id: 'turn-a',
+            index: 0,
+            prompt: 'first',
+            status: 'running',
+            events: [
+                { type: 'start', agent: 'writer', model: 'm1' },
+                delegateCall('researcher', 'first question', 'd1'),
+                withThread(
+                    { type: 'start', agent: 'researcher', model: 'r1' },
+                    { id: 't1', callId: 'd1', input: 'first question' }
+                )
+            ]
+        });
+        const secondRecord = serverTurn({
+            id: 'turn-b',
+            index: 1,
+            prompt: 'second',
+            status: 'running',
+            events: [
+                { type: 'start', agent: 'writer', model: 'm1' },
+                delegateCall('researcher', 'second question', 'd2'),
+                withThread(
+                    { type: 'start', agent: 'researcher', model: 'r1' },
+                    { id: 't2', callId: 'd2', input: 'second question' }
+                )
+            ]
+        });
+
+        const first = board.adopt(firstRecord);
+        const second = board.adopt(secondRecord);
+
+        // The defect: two Researcher threads both reading RR1. Numbering continues
+        // across turns, so the second thread is RR2 and the prompts stay distinct.
+        expect(threadRows(first).map((row) => row.querySelector('.thread-name')?.textContent)).toEqual([
+            'RR1'
+        ]);
+        expect(threadRows(second).map((row) => row.querySelector('.thread-name')?.textContent)).toEqual([
+            'RR2'
+        ]);
+        expect(threadRows(second)[0].querySelector('.thread-preview')?.textContent).toBe('second question');
+
+        // The # descriptors agree with the displayed labels (R6).
+        expect(board.blocks().map((block) => `${block.label}:${block.threadId ?? 'root'}`)).toEqual([
+            'WR1:root',
+            'RR1:t1',
+            'WR2:root',
+            'RR2:t2'
+        ]);
+
+        // A reload re-derives the SAME numbering from the recorded turn order (R5).
+        const reloaded = mount();
+        const handles = reloaded.hydrate([firstRecord, secondRecord]);
+        expect(threadRows(handles[1]).map((row) => row.querySelector('.thread-name')?.textContent)).toEqual([
+            'RR2'
+        ]);
+        expect(reloaded.blocks().map((block) => block.label)).toEqual(['WR1', 'RR1', 'WR2', 'RR2']);
+    });
+
+    it('seeds a queued tile on its first allocation, not at creation (R5/R6)', () => {
+        // The interleaving T4 found: turn 1 is still running when turn 2 is
+        // created optimistically, and turn 1 allocates a LATER label afterwards. A
+        // seed frozen at turn-2 creation would miss it and mint a duplicate.
+        const board = mount();
+
+        const firstEvents: HarnessEvent[] = [
+            { type: 'start', agent: 'writer', model: 'm1' },
+            delegateCall('researcher', 'first question', 'd1'),
+            withThread(
+                { type: 'start', agent: 'researcher', model: 'r1' },
+                { id: 't1', callId: 'd1', input: 'first question' }
+            )
+        ];
+        const first = board.begin('first');
+        for (const event of firstEvents) first.apply(event);
+
+        // Turn 2 exists (queued, nothing allocated) while turn 1 is still running.
+        const second = board.begin('second');
+
+        // Turn 1 continues and allocates RR2 AFTER turn 2 was created.
+        const lateEvents: HarnessEvent[] = [
+            delegateCall('researcher', 'second question', 'd2'),
+            withThread(
+                { type: 'start', agent: 'researcher', model: 'r1' },
+                { id: 't2', callId: 'd2', input: 'second question' }
+            )
+        ];
+        for (const event of lateEvents) first.apply(event);
+
+        // Turn 2's FIRST allocation must continue after RR2 (WR2, then RR3).
+        const secondEvents: HarnessEvent[] = [
+            { type: 'start', agent: 'writer', model: 'm1' },
+            delegateCall('researcher', 'third question', 'd3'),
+            withThread(
+                { type: 'start', agent: 'researcher', model: 'r1' },
+                { id: 't3', callId: 'd3', input: 'third question' }
+            )
+        ];
+        for (const event of secondEvents) second.apply(event);
+
+        // Bind both tiles to their server records so `blocks()` can describe them.
+        const records = [
+            serverTurn({
+                id: 'turn-a',
+                index: 0,
+                prompt: 'first',
+                status: 'running',
+                events: [...firstEvents, ...lateEvents]
+            }),
+            serverTurn({ id: 'turn-b', index: 1, prompt: 'second', status: 'running', events: secondEvents })
+        ];
+        first.merge(records[0]);
+        second.merge(records[1]);
+
+        // Displayed labels: RR1/RR2 in turn 1, and RR3 (never a duplicate RR2) in 2.
+        expect(threadRows(first).map((row) => row.querySelector('.thread-name')?.textContent)).toEqual([
+            'RR1',
+            'RR2'
+        ]);
+        expect(threadRows(second).map((row) => row.querySelector('.thread-name')?.textContent)).toEqual([
+            'RR3'
+        ]);
+
+        // Exact parity with the shared/server projection, and the typed # law
+        // resolves the same block the transcript shows.
+        const shared = listAgentResultBlocks(records);
+        expect(board.blocks()).toEqual(shared);
+        expect(findLatestAgentResultBlock(records, '#RR3')).toEqual(
+            expect.objectContaining({
+                turnId: 'turn-b',
+                threadId: 't3',
+                label: 'RR3',
+                agent: 'researcher'
+            })
+        );
+    });
+
+    it('numbers a fork branch row exactly like the shared projection', () => {
+        const board = mount();
+        // The runtime forks the REQUESTING agent (`threadFork`), so the frame's agent
+        // and the branch summary's agent are the same id. The branch row must still
+        // agree with the shared projection on label, thread id, and order.
+        const record = serverTurn({
+            id: 'turn-branch',
+            index: 0,
+            status: 'running',
+            events: [
+                { type: 'start', agent: 'writer', model: 'm1' },
+                // A branch frame carries the BRANCH's own thread id, so UI and the
+                // shared projection both allocate one block for it.
+                {
+                    type: 'branch_start',
+                    agent: 'writer',
+                    branch: {
+                        branchId: 'b1',
+                        agent: 'writer',
+                        kind: 'fork',
+                        role: 'subagent',
+                        forkDepth: 1,
+                        model: 'm1',
+                        tools: [],
+                        label: 'audit'
+                    },
+                    thread: { id: 'b1', kind: 'fork', branchId: 'b1', parentId: 'root' }
+                }
+            ] as unknown as HarnessEvent[]
+        });
+
+        board.adopt(record);
+
+        expect(board.blocks()).toEqual(listAgentResultBlocks([record]));
+        expect(board.blocks().map((block) => block.label)).toEqual(['WR1', 'WR2']);
     });
 
     it('attaches an unknown or self parent at depth 1 instead of throwing', () => {
@@ -1155,8 +1365,9 @@ describe('invocation thread entries', () => {
         }
     });
 
-    // R2: the code is first+last letter + occurrence within the turn, ordered by
-    // invocation, root included — and a repeated event does not bump the number.
+    // R2/R5: the code is first+last letter + occurrence, ordered by invocation,
+    // root included — and a repeated event does not bump the number. Numbering is
+    // conversation-scoped (one tile is the first turn here, so it starts at 1).
     it('labels invocations RH1/RH2 with the root counted, and never per event', () => {
         const board = mount();
         const turn = board.begin('research twice');

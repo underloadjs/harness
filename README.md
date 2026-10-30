@@ -988,7 +988,11 @@ appended as they settle. This changes three things a caller must know:
 Cancellation follows the same model. A run's signal (and `toolCancel({ callId })`
 for one call) reaches every running tool; `commandRun` honours it and kills its
 process tree. `toolCancel` logically settles/aborts that call's own task: its late
-result is ignored. Arbitrary JavaScript cannot be preempted — a created tool keeps
+result is ignored. Cancellation is **idempotent**: cancelling a call that already
+completed, failed, or was already cancelled succeeds with
+`{ cancelled: true, alreadySettled: true }` and changes nothing, so a caller never
+has to check the pending list first. Only a `callId` this run never started is an
+error. Arbitrary JavaScript cannot be preempted — a created tool keeps
 its CPU until it yields. A whole-run abort does more than flip the signal: it
 preempts an uncooperative provider request, releases the child actor/restore slot
 immediately, and rolls back the cancelled turn's in-flight prompt state without
@@ -1224,7 +1228,7 @@ try {
 | `reasoning` | `agent`, `delta` |
 | `text` | `agent`, `delta` |
 | `tool_call` | `agent`, `call` (`id`, `name`, `arguments`) |
-| `tool_result` | `agent`, `name`, `content`, `isError`, optional `durationMs`, optional `pending`, optional `ui` (declarative panels) |
+| `tool_result` | `agent`, `name`, `content`, `isError`, optional `outcome` (`'completed' \| 'failed' \| 'rejected' \| 'cancelled'` — the structured reason; `isError` is always `outcome !== 'completed'`), optional `durationMs`, optional `pending`, optional `ui` (declarative panels) |
 | `usage` | `agent`, `usage` (`input`, `output`, `total`, optional `cached`) — one per model request, tool rounds included |
 | `done` | `agent`, `message`, optional `pending` |
 | `wakeup` | `agent`, `reason: 'pending-tools'`, `pending` |
@@ -1857,7 +1861,9 @@ the server's hint, so it never looks like a working tool.
 (`POST /sessions/:id/cancel`, `DELETE /sessions/:id`, or a closed legacy stream)
 signals every call that is running, and `toolCancel({ callId })` targets one call.
 `toolCancel` logically settles/aborts that call's own task; its late result is
-ignored. `commandRun` honours the abort signal and kills its process tree, and
+ignored, and cancelling an already settled (or already cancelled) call succeeds
+without an error — cancellation is a state, not a one-shot transition.
+`commandRun` honours the abort signal and kills its process tree, and
 `ToolContext.signal` is the same signal a tool can watch. Arbitrary JavaScript
 cannot be preempted: a created tool keeps its CPU until it yields. A **whole-run
 abort** additionally preempts an uncooperative provider request, releases the

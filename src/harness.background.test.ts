@@ -38,7 +38,10 @@
 //   2. Placeholder tool-message CONTENT is not part of the published contract, so
 //      it is asserted as "a string" and never by wording.
 //   3. A cancelled call is expected to be delivered as an `isError: true` result
-//      with implementation-chosen text; only its ids/flag are pinned.
+//      with outcome 'cancelled' (error-shaped for the provider, but a control
+//      outcome); only its ids/flag/outcome are pinned, its text is implementation-
+//      chosen. Cancelling an already settled call is a successful result with
+//      `alreadySettled: true` and changes nothing (R2).
 //   4. `toolCancel` is expected to be declared only while the calling agent has a
 //      pending call (metadata.ts documents exactly that), so it is checked as a
 //      declared name on pending requests and absent on the first request.
@@ -507,6 +510,7 @@ describe('background tool calls', () => {
                 callId: 'a1',
                 content: 'A-done',
                 isError: false,
+                outcome: 'completed',
                 durationMs: 1500,
                 pending: [{ callId: 'b1', name: 'beta', elapsedMs: 1500 }]
             }
@@ -545,6 +549,7 @@ describe('background tool calls', () => {
                 callId: 'b1',
                 content: 'B-done',
                 isError: false,
+                outcome: 'completed',
                 durationMs: 1500
             }
         ]);
@@ -649,6 +654,7 @@ describe('background tool calls', () => {
             callId: 'b1',
             content: 'B-done',
             isError: false,
+            outcome: 'completed',
             durationMs: 1000,
             pending: [
                 { callId: 'a1', name: 'alpha', elapsedMs: 1000 },
@@ -682,6 +688,7 @@ describe('background tool calls', () => {
                 callId: 'a1',
                 content: 'A-done',
                 isError: false,
+                outcome: 'completed',
                 durationMs: 2000
             }
         ]);
@@ -693,6 +700,7 @@ describe('background tool calls', () => {
                 callId: 'g1',
                 content: 'G-done',
                 isError: false,
+                outcome: 'completed',
                 durationMs: 2000
             }
         ]);
@@ -823,6 +831,7 @@ describe('recurring wakeup', () => {
                 callId: 'a1',
                 content: 'A-done',
                 isError: false,
+                outcome: 'completed',
                 durationMs: 1_200_000
             }
         ]);
@@ -1363,13 +1372,15 @@ describe('toolCancel', () => {
                 agent: 'writer',
                 name: 'toolCancel',
                 callId: 'k3',
-                content: expect.any(String),
+                content: '{"cancelled":true,"callId":"k1","name":"stubborn"}',
                 isError: false,
+                outcome: 'completed',
                 durationMs: 0
             }
         ]);
-        // A cancelled call is settled logically, as a failed result the model can
-        // read; its text is implementation-chosen.
+        // A cancelled call is settled logically as an error-SHAPED result the model
+        // must read (no value exists), but its structured outcome is `cancelled`, so
+        // a consumer renders a control outcome instead of a tool failure.
         expect(resultsOf(events, 'stubborn')).toMatchObject([
             {
                 type: 'tool_result',
@@ -1377,7 +1388,8 @@ describe('toolCancel', () => {
                 name: 'stubborn',
                 callId: 'k1',
                 content: expect.any(String),
-                isError: true
+                isError: true,
+                outcome: 'cancelled'
             }
         ]);
 
@@ -1396,6 +1408,7 @@ describe('toolCancel', () => {
                 callId: 'k2',
                 content: 'sibling-done',
                 isError: false,
+                outcome: 'completed',
                 durationMs: 0
             }
         ]);
@@ -1409,6 +1422,319 @@ describe('toolCancel', () => {
 
         expect(writer.agent.messages).toEqual(settledTranscript);
         expect(resultsOf(events, 'stubborn')).toHaveLength(resultCount);
+        expect(wireIssues(seen)).toEqual([]);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    // R2: cancellation is a STATE to reach, not a one-shot transition. Repeating it
+    // for an already cancelled call must succeed and change nothing — the caller's
+    // intent (this call must not hold the run open) was already satisfied, so an
+    // "already cancelled" error would only cost a turn.
+    it('treats a repeated cancel of an already cancelled call as success', async () => {
+        const stubborn = stubbornTool('stubborn');
+        const siblingGate = deferred<string>();
+        const seen: SeenRequest[] = [];
+        const events: HarnessEvent[] = [];
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/model',
+                    stream: streamFrom(
+                        (turn) => {
+                            if (turn === 0) {
+                                return calls(
+                                    call('k1', 'stubborn', '{"value":"S"}'),
+                                    call('k2', 'sibling', '{"value":"T"}')
+                                );
+                            }
+                            // The sibling stays pending, so toolCancel is declared on
+                            // both of these turns: that is exactly the situation in
+                            // which a model repeats a cancel.
+                            if (turn === 1) return calls(call('k3', 'toolCancel', '{"callId":"k1"}'));
+                            if (turn === 2) return calls(call('k4', 'toolCancel', '{"callId":"k1"}'));
+                            return answer('done');
+                        },
+                        seen
+                    )
+                })
+            },
+            tools: {
+                stubborn: stubborn.definition,
+                sibling: gatedTool('sibling', siblingGate)
+            },
+            presets: false,
+            report: { progress: (event) => void events.push(event) }
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+
+        // Both acknowledgements are successful control results, and the second one
+        // says what it found instead of raising an error.
+        const cancels = resultsOf(events, 'toolCancel');
+        expect(cancels.map((event) => event.callId)).toEqual(['k3', 'k4']);
+        expect(cancels.map((event) => event.outcome)).toEqual(['completed', 'completed']);
+        expect(cancels.map((event) => event.isError)).toEqual([false, false]);
+        expect(cancels.map((event) => event.content)).toEqual([
+            '{"cancelled":true,"callId":"k1","name":"stubborn"}',
+            '{"cancelled":true,"callId":"k1","name":"stubborn","alreadySettled":true}'
+        ]);
+        // The already-cancelled call keeps exactly one result, classified as a
+        // control outcome rather than a failure.
+        expect(resultsOf(events, 'stubborn').map((event) => event.outcome)).toEqual(['cancelled']);
+
+        // The run is genuinely unblocked: the sibling finishes and the run ends.
+        expect(state.status).toBe('pending');
+        siblingGate.resolve('sibling-done');
+        await flush();
+        expect(state.status).toBe('resolved');
+        expect(state.value?.content).toBe('done');
+        expect(wireIssues(seen)).toEqual([]);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    // R2: the same idempotence covers calls that FINISHED, including an execution
+    // that failed: "cancel" means "do not wait for it", which is already true.
+    it('treats a cancel of an already completed or failed call as success', async () => {
+        const siblingGate = deferred<string>();
+        const seen: SeenRequest[] = [];
+        const events: HarnessEvent[] = [];
+
+        const quick = tool<string, string>({
+            description: 'Returns at once.',
+            tags: ['test'],
+            visibility: 'core',
+            parameters: {
+                type: 'object',
+                properties: { value: { type: 'string' } },
+                required: ['value'],
+                additionalProperties: false
+            },
+            execute: () => 'quick-done'
+        });
+
+        const broken = tool<string, string>({
+            description: 'Fails at once.',
+            tags: ['test'],
+            visibility: 'core',
+            parameters: {
+                type: 'object',
+                properties: { value: { type: 'string' } },
+                required: ['value'],
+                additionalProperties: false
+            },
+            execute: () => {
+                throw new Error('kaput');
+            }
+        });
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/model',
+                    stream: streamFrom(
+                        (turn) => {
+                            if (turn === 0) {
+                                return calls(
+                                    call('q1', 'quick', '{"value":"Q"}'),
+                                    call('f1', 'broken', '{"value":"F"}'),
+                                    call('k2', 'sibling', '{"value":"T"}')
+                                );
+                            }
+                            if (turn === 1) {
+                                return calls(
+                                    call('c1', 'toolCancel', '{"callId":"q1"}'),
+                                    call('c2', 'toolCancel', '{"callId":"f1"}')
+                                );
+                            }
+                            return answer('done');
+                        },
+                        seen
+                    )
+                })
+            },
+            tools: {
+                quick,
+                broken,
+                sibling: gatedTool('sibling', siblingGate)
+            },
+            presets: false,
+            report: { progress: (event) => void events.push(event) }
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+
+        // The two settled calls are classified by what actually happened.
+        expect(resultsOf(events, 'quick').map((event) => event.outcome)).toEqual(['completed']);
+        expect(resultsOf(events, 'broken').map((event) => event.outcome)).toEqual(['failed']);
+        expect(resultsOf(events, 'broken').map((event) => event.content)).toEqual([
+            'Tool "broken" failed: kaput'
+        ]);
+
+        // Cancelling either of them is a successful no-op, never "already completed".
+        const cancels = resultsOf(events, 'toolCancel');
+        expect(cancels.map((event) => event.callId)).toEqual(['c1', 'c2']);
+        expect(cancels.map((event) => event.outcome)).toEqual(['completed', 'completed']);
+        expect(cancels.map((event) => event.isError)).toEqual([false, false]);
+        expect(cancels.map((event) => event.content)).toEqual([
+            '{"cancelled":true,"callId":"q1","name":"quick","alreadySettled":true}',
+            '{"cancelled":true,"callId":"f1","name":"broken","alreadySettled":true}'
+        ]);
+
+        siblingGate.resolve('sibling-done');
+        await flush();
+        expect(state.status).toBe('resolved');
+        expect(state.value?.content).toBe('done');
+        expect(wireIssues(seen)).toEqual([]);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    // R2: idempotence must not become a blanket "yes". An id that never started in
+    // THIS run — including a child run's own tool call — is rejected, so a foreign
+    // id never looks like a cancellation this run performed.
+    it('rejects an id this run never started, including a child run\'s call', async () => {
+        const helperGate = deferred<string>();
+        const seen: SeenRequest[] = [];
+        const events: HarnessEvent[] = [];
+
+        const helper = agent({
+            model: 'test/child',
+            stream: streamFrom(
+                (turn) => (turn === 0 ? calls(call('h1', 'slow', '{"value":"x"}')) : answer('child done')),
+                []
+            )
+        });
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/parent',
+                    stream: streamFrom(
+                        (turn) => {
+                            if (turn === 0) {
+                                return calls(
+                                    call('d1', 'agentDelegate', '{"agent":"helper","input":"work"}')
+                                );
+                            }
+                            if (turn === 1) {
+                                return calls(
+                                    call('c1', 'toolCancel', '{"callId":"h1"}'),
+                                    call('c2', 'toolCancel', '{"callId":"ghost"}')
+                                );
+                            }
+                            return answer('done');
+                        },
+                        seen
+                    )
+                }),
+                helper
+            },
+            primary: 'writer',
+            subagents: ['helper'],
+            tools: { slow: gatedTool('slow', helperGate) },
+            presets: false,
+            report: { progress: (event) => void events.push(event) }
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+
+        // d1 is still pending, so both cancels run; neither id is this run's call.
+        expect(resultsOf(events, 'toolCancel')).toMatchObject([
+            {
+                type: 'tool_result',
+                agent: 'writer',
+                name: 'toolCancel',
+                callId: 'c1',
+                content:
+                    'No tool call "h1" was started in this run, so there is nothing to cancel. Pass the callId of a call this run started (see the pending list or the tool_call event).',
+                isError: true,
+                outcome: 'rejected'
+            },
+            {
+                type: 'tool_result',
+                agent: 'writer',
+                name: 'toolCancel',
+                callId: 'c2',
+                content:
+                    'No tool call "ghost" was started in this run, so there is nothing to cancel. Pass the callId of a call this run started (see the pending list or the tool_call event).',
+                isError: true,
+                outcome: 'rejected'
+            }
+        ]);
+
+        // The child's call was NOT aborted by the rejected attempt.
+        expect(helperGate.settled).toBe(false);
+        helperGate.resolve('child work');
+        await flush();
+        expect(state.status).toBe('resolved');
+        expect(state.value?.content).toBe('done');
+        expect(wireIssues(seen)).toEqual([]);
+        expect(vi.getTimerCount()).toBe(0);
+    });
+
+    // R1: the two error families are distinguishable without reading the text.
+    it('classifies an unregistered tool as rejected and a throwing tool as failed', async () => {
+        const seen: SeenRequest[] = [];
+        const events: HarnessEvent[] = [];
+
+        const broken = tool<string, string>({
+            description: 'Fails at once.',
+            tags: ['test'],
+            visibility: 'core',
+            parameters: {
+                type: 'object',
+                properties: { value: { type: 'string' } },
+                required: ['value'],
+                additionalProperties: false
+            },
+            execute: () => {
+                throw new Error('kaput');
+            }
+        });
+
+        const writer = harness({
+            agents: {
+                writer: agent({
+                    model: 'test/model',
+                    stream: streamFrom(
+                        (turn) =>
+                            turn === 0
+                                ? calls(
+                                      call('n1', 'missing', '{"value":"M"}'),
+                                      call('f1', 'broken', '{"value":"F"}')
+                                  )
+                                : answer('done'),
+                        seen
+                    )
+                })
+            },
+            tools: { broken },
+            presets: false,
+            report: { progress: (event) => void events.push(event) }
+        });
+
+        const state = probe(writer('go'));
+        await flush();
+
+        expect(state.status).toBe('resolved');
+        expect(state.value?.content).toBe('done');
+
+        const rejected = resultsOf(events, 'missing');
+        const failed = resultsOf(events, 'broken');
+
+        // Never executed: an invocation/dispatch error the model can fix.
+        expect(rejected.map((event) => event.outcome)).toEqual(['rejected']);
+        expect(rejected.map((event) => event.isError)).toEqual([true]);
+        expect(rejected[0].content).toContain('Tool "missing" is not registered.');
+
+        // Executed and threw: an operational failure.
+        expect(failed.map((event) => event.outcome)).toEqual(['failed']);
+        expect(failed.map((event) => event.isError)).toEqual([true]);
+        expect(failed.map((event) => event.content)).toEqual(['Tool "broken" failed: kaput']);
+
         expect(wireIssues(seen)).toEqual([]);
         expect(vi.getTimerCount()).toBe(0);
     });
@@ -1567,6 +1893,7 @@ describe('failure paths', () => {
                 callId: 'f1',
                 content: 'Tool "flaky" failed: boom',
                 isError: true,
+                outcome: 'failed',
                 durationMs: 250
             }
         ]);

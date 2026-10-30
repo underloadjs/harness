@@ -45,12 +45,15 @@
 // root's server-supplied timing.
 //
 // Agent labels (R2/R3): a header names its agent with the compact code from
-// ui/agent-label.ts (`RH1` = first+last letter of `research` + its 1-based
-// occurrence within the turn, root invocation included). A code is allocated ONCE
+// ui/agent-label.ts (`RH1` = first+last letter of `research` + its occurrence,
+// root invocation included). Occurrence numbering is conversation-scoped: it
+// continues across the session's turns, so two threads of one agent read `RR1`
+// and `RR2` and a `#label` always names one block. A code is allocated ONCE
 // per invocation, so a stream cannot inflate it, and a rebuilt projection
-// (`resetProjection`) re-numbers from the record, so replay is deterministic. Raw
-// agent ids never appear as text; they stay on `data-agent` for colour/routing and
-// in the runtime metadata. The turn's protocol `index` is bound but not displayed.
+// (`resetProjection`) re-seeds the tile's frozen base and replays the record, so
+// replay is deterministic. Raw agent ids never appear as text; they stay on
+// `data-agent` for colour/routing and in the runtime metadata. The turn's protocol
+// `index` is bound but not displayed.
 //
 // Collapsed blocks (R4): the main tile and EVERY nested entry are exactly one
 // compact row (`.tile:not(.is-expanded)`, `.thread-row:not(.is-expanded)`).
@@ -116,7 +119,8 @@ import type {
     HarnessActionChoice,
     HarnessActionRequest,
     HarnessAttachment,
-    HarnessBranchSummary
+    HarnessBranchSummary,
+    HarnessToolOutcome
 } from '../../types';
 import { applyAttachmentChips } from './attachments';
 import { enhanceFileLinks } from './file-links';
@@ -145,9 +149,10 @@ import type { ActionRequestCard } from './action-request';
 // constant keeps the "cannot attribute this stream" sentinel in ONE place, so the
 // tile and its section resolve to the same neutral tone.
 import { UNNAMED_AGENT_PLACEHOLDER, paintAgentColor } from './agent-color';
-// Compact per-turn agent labels (`RH1`, `RH2`, …): the visible agent identity in a
-// block header. Raw agent ids never reach the DOM as text (R2/R3); the allocator is
-// per turn so the numbering is deterministic on replay.
+// Compact conversation-scoped agent labels (`RH1`, `RH2`, …): the visible agent
+// identity in a block header. Raw agent ids never reach the DOM as text (R2/R3);
+// the board seeds each turn's allocator from the turns before it, so numbering is
+// deterministic on replay and unique across the conversation.
 import { createAgentLabels } from './agent-label';
 import type { AgentBlockDescriptor } from './references';
 import { markdownFragment, plainPreview } from './markdown';
@@ -358,7 +363,8 @@ export type TurnBoard = {
     reconcile: (turns: readonly SessionTurn[], options?: HydrateOptions) => TurnHandle[];
     // Every real block across the visible turns, oldest→newest then root/nested.
     // The # popup uses this order together with ui/references.ts
-    // `latestReferenceBlock` (latest matching label wins across turns).
+    // `latestReferenceBlock` (latest matching label wins; labels are unique across
+    // the conversation, so this is an exact lookup in practice).
     blocks: () => AgentBlockDescriptor[];
     // Stop every live timer the board owns. Safe to call repeatedly; the page's
     // `pagehide` handler and a view teardown both use it.
@@ -820,6 +826,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const element = el('div', 'turns');
 
     const turns: TurnHandle[] = [];
+    // Conversation-scoped label counters (R5): the highest occurrence number USED
+    // so far per two-letter code (see shared/agent-results.ts `createAgentLabels`).
+    // A new tile seeds its allocator from this map and publishes every allocation
+    // back, so two distinct threads of one agent read `RR1`/`RR2` instead of both
+    // restarting at `RR1`. Cleared with the board, because the numbering is a
+    // function of the recorded turn order (a reload rebuilds the same sequence).
+    const labelCounters = new Map<string, number>();
     // Every real block across the visible turns, oldest→newest. The composer's #
     // popup reads this on open (and on each keystroke while it stays open); the
     // list is computed live so a streaming turn's new nested block appears without
@@ -877,7 +890,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // One tile, shared by the optimistic `begin` path and server adoption. R3: the
     // tile no longer paints a `#position` ordinal; the server's `index` still binds
     // (protocol/ordering) but is never displayed. The agent identity in the header
-    // is the compact per-turn label (`RH1`), not a raw agent id.
+    // is the compact conversation-scoped label (`RH1`), not a raw agent id.
     const create = (prompt: string, initialAttachments: readonly HarnessAttachment[] = []): TurnHandle => {
         empty?.remove();
 
@@ -925,7 +938,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // R1/R2: the root block's compact header carries the SAME agent code a nested
         // block shows (`.tile-agent`, group-styled with `.thread-name`). It stays
         // hidden until an event names the root agent (`rootSection` fills it from the
-        // per-turn label allocator), so an optimistic tile never claims an identity.
+        // conversation-scoped label allocator), so an optimistic tile never claims an
+        // identity.
         const tileAgent = el('span', 'tile-agent');
         tileAgent.hidden = true;
         // R3: no `#ordinal` span. The header group is the metadata cluster
@@ -1055,11 +1069,40 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // entry's tally from that entry's own `usage` events (R1).
         const setUsage = (usage?: HarnessUsage): void => blockMeta.setTally(usage);
 
-        // Compact agent labels (`RH1`, `RH2`, …): ONE allocator per turn, consumed
+        // Compact agent labels (`RH1`, `RH2`, …): ONE allocator per tile, consumed
         // once per invocation (root included). The raw agent id never reaches the
-        // header text (R2/R3); `resetProjection` clears it so a rebuilt turn
-        // re-numbers from 1 in recorded order.
+        // header text (R2/R3).
+        //
+        // R5/R6: numbering CONTINUES the conversation. `labelSeed` is captured
+        // LAZILY on the tile's FIRST allocation, not at construction: a queued tile
+        // can be created while an earlier turn is still running and may allocate a
+        // later label (writer WR1 -> research RH1, then the still-running turn adds
+        // research RH2). Seeding at construction would miss that and mint a
+        // duplicate RH2; capturing the board counters at first allocation keeps the
+        // tile strictly after every label already shown. FIFO execution (one turn at
+        // a time, src/server/sessions.ts queue pump) is what makes this sound: a
+        // later turn cannot allocate before the earlier turn has finished allocating.
+        // The captured seed is kept for the whole tile so a rebuilt projection
+        // (`resetProjection`) re-seeds the SAME base and never renumbers this tile's
+        // threads. `nextLabel` publishes each allocation so tiles allocating
+        // afterwards continue the sequence.
         const labels = createAgentLabels();
+        let labelSeed: Map<string, number> | undefined;
+        const nextLabel = (agent: string | undefined): string => {
+            // First allocation of THIS tile: freeze the base it continues from.
+            if (labelSeed === undefined) {
+                labelSeed = new Map(labelCounters);
+                labels.seed(labelSeed);
+            }
+
+            const label = labels.next(agent);
+
+            for (const [code, used] of labels.counters()) {
+                if (used > (labelCounters.get(code) ?? 0)) labelCounters.set(code, used);
+            }
+
+            return label;
+        };
 
         // One entry per INVOCATION in this turn. The map is keyed by the canonical
         // invocation key (runtime `thread.id`, synthesized placeholder key, or
@@ -1228,10 +1271,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // the same surface as a main block and is told apart by indentation plus
         // its agent colour, not by the word "subagent".
         //
-        // `label` is the compact per-turn agent code (`RH1`) allocated once by the
-        // caller for THIS invocation: the section header shows the code, never the
-        // raw agent id (R2/R3). The id is still mirrored on `data-agent` by
-        // `paintAgentColor` for colour/routing.
+        // `label` is the compact conversation-scoped agent code (`RH1`) allocated
+        // once by the caller for THIS invocation: the section header shows the code,
+        // never the raw agent id (R2/R3). The id is still mirrored on `data-agent`
+        // by `paintAgentColor` for colour/routing.
         const createSection = (
             container: HTMLElement,
             agentName: string,
@@ -1543,7 +1586,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // (`.thread-top`) is the nested counterpart of `.tile-top`. Both clusters
             // carry the same two labels from the shared `createBlockMeta`, so a child
             // block shows its own duration and usage when its events report them.
-            const label = labels.next(options.agent);
+            const label = nextLabel(options.agent);
             const name = el('span', 'thread-name', label);
             const kindTag =
                 options.kind === 'fork' || options.kind === 'autoanswer'
@@ -1651,10 +1694,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // attribute.
             paintAgentColor(card, agentName);
 
-            // The root invocation consumes the first occurrence of its agent (the
+            // The root invocation consumes the next occurrence of its agent (the
             // requirement counts the entry agent too, R2). Its header label lives in
             // the section head; the tile header itself carries the metadata cluster.
-            const label = labels.next(agentName);
+            const label = nextLabel(agentName);
             const section = createSection(flow, agentName, 'primary', label);
             // R1/F3: the compact root header shows the same code as a child header.
             // The section's own `.agent-head` is hidden by CSS for the primary part
@@ -1713,7 +1756,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // The flat legacy block consumes one occurrence, like any other
             // invocation of that agent; the same label goes to the header and to the
             // entry (R2).
-            const label = labels.next(agentName);
+            const label = nextLabel(agentName);
             const section = createSection(flow, agentName, 'subagent', label);
             threads.set(key, {
                 key,
@@ -2256,7 +2299,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const resolveTool = (
             name: string,
             content: string,
-            isError: boolean,
+            outcome: HarnessToolOutcome,
             callId: string | undefined,
             at: number | undefined,
             origin: ApplyOrigin,
@@ -2293,7 +2336,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 // duration. Legacy frames without `durationMs` keep the local span.
                 tool.card.resolve(
                     content,
-                    isError,
+                    outcome,
                     durationMs ?? elapsedBetween(tool.startedAt, finishedAt)
                 );
                 return { entry: tool.entry, section: tool.section, callId: tool.callId };
@@ -2312,7 +2355,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const owner = threads.get(ROOT_KEY) ?? inlineEntry(primaryAgent ?? UNNAMED_AGENT_PLACEHOLDER);
             const section = owner.section;
             const card = createToolCallCard(name, '');
-            card.resolve(content, isError);
+            card.resolve(content, outcome);
             toolGroupOf(section).append(card.element);
             section.tools.push(card);
             toolCount += 1;
@@ -2356,9 +2399,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // Token figures derived from the discarded events must go too; the
             // server tally is re-applied by the caller after the rebuild.
             blockMeta.clearUsage();
-            // R2: the rebuilt pass re-numbers the agents from 1 in recorded order, so
-            // a replayed turn always shows the same labels.
+            // The rebuilt pass re-creates the SAME conversation-scoped labels: reset
+            // to the tile's captured base seed and replay the record in order. Using
+            // the live board counters here would let later tiles' allocations push
+            // this tile's numbers up (R6: revisiting a thread never renumbers it).
+            // A tile that never allocated has no captured seed yet; its first
+            // allocation will capture the current base lazily (`nextLabel`).
             labels.reset();
+            if (labelSeed !== undefined) labels.seed(labelSeed);
             // The root code belongs to the discarded projection: hide it until the
             // replay's `rootSection` names the root agent again (F3).
             tileAgent.textContent = '';
@@ -2464,20 +2512,25 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
                 case 'tool_result': {
                     const callId = callIdOf(event);
-                    const outcome = resolveTool(
+                    // R1: `outcome` is authoritative when present. An older recorded
+                    // event (or a hand-written reporter) has only `isError`, which is
+                    // the same value's boolean projection.
+                    const outcome: HarnessToolOutcome =
+                        event.outcome ?? (event.isError ? 'failed' : 'completed');
+                    const settledTool = resolveTool(
                         event.name,
                         event.content,
-                        event.isError,
+                        outcome,
                         callId,
                         at,
                         origin,
                         toolDurationOf(event)
                     );
 
-                    if (outcome !== undefined) {
+                    if (settledTool !== undefined) {
                         // The settling event is also this invocation's clock stamp
                         // (a call can be the first thing an invocation does).
-                        observeInvocation(outcome.entry, at, origin);
+                        observeInvocation(settledTool.entry, at, origin);
 
                         // A PRESENT array is the server's authoritative snapshot for
                         // that agent; otherwise the call that just settled is pruned
@@ -2485,9 +2538,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                         // queue drained" — the runtime omits `pending` when nothing
                         // remains, and siblings of another agent must stay listed.
                         const pending = pendingOf(event);
-                        if (pending !== undefined) paintPending(outcome.section, pending);
-                        else if (outcome.callId !== undefined) {
-                            noteSettled(outcome.section, outcome.callId);
+                        if (pending !== undefined) paintPending(settledTool.section, pending);
+                        else if (settledTool.callId !== undefined) {
+                            noteSettled(settledTool.section, settledTool.callId);
                         }
                     }
 
@@ -2497,14 +2550,29 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     // before the child ever started still resolves its placeholder
                     // here. Matching is by callId, so same-agent siblings settle the
                     // right entry. Its block clock freezes at this event's stamp.
+                    //
+                    // R1: a CANCELLED call is a control outcome, not a broken child,
+                    // so its row reads "cancelled" rather than "error"; only a
+                    // failed/rejected call is an error.
                     if (callId !== undefined) {
                         const child = findThreadByCallId(callId);
                         if (child !== undefined) {
                             const preview = plainPreview(event.content, 200);
+                            // Completed -> done; cancelled -> the dedicated
+                            // cancelled state (info tone, never red); everything
+                            // else (failed/rejected) -> error.
+                            const childState: ThreadState =
+                                outcome === 'completed'
+                                    ? 'done'
+                                    : outcome === 'cancelled'
+                                      ? 'cancelled'
+                                      : 'error';
                             completeThread(
                                 child,
-                                event.isError ? 'error' : 'done',
-                                `${event.isError ? 'error' : 'outcome'} · ${preview.length === 0 ? 'no output' : preview}`
+                                childState,
+                                `${outcome === 'completed' ? 'outcome' : outcome === 'cancelled' ? 'cancelled' : 'error'} · ${
+                                    preview.length === 0 ? 'no output' : preview
+                                }`
                             );
                             settleInvocation(child, at, origin);
                         }
@@ -2644,11 +2712,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     if (frame === undefined) break;
 
                     const branch = frame.branch;
-                    // IMPORTANT: the frame is emitted by the REQUESTING run, so its
-                    // optional `thread` describes the SOURCE invocation, not the
-                    // branch. The branch's own thread id is its branchId (runtime
-                    // contract, harness.ts `withThread`), so the row key/anchor is
-                    // derived from the summary and never from `event.thread`.
+                    // The audit frame carries the BRANCH's OWN thread (runtime
+                    // contract: harness.ts `branchThreadOf` — `branch_start`,
+                    // `branch_end`, and every branch frame share one id/kind/branchId;
+                    // `thread.parentId` names the REQUESTER when there is one). The
+                    // row is therefore keyed by the summary's `branchId`, which is the
+                    // same identity the frame's `thread.id` reports — never the
+                    // requester's thread.
                     let entry = threads.get(branch.branchId) ?? findBranchEntry(branch.branchId);
 
                     if (entry === undefined) {
@@ -2831,8 +2901,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const descriptors: AgentBlockDescriptor[] = [];
 
             // Map insertion order is allocation order: root (created by the first
-            // event), then each delegated invocation. The label allocator is per
-            // turn, so this is exactly the numbering the transcript shows.
+            // event), then each delegated invocation. Labels are conversation-scoped
+            // (seeded by the tiles before this one), so this is exactly the numbering
+            // the transcript shows AND the numbering the server projection derives
+            // from the same recorded turn order (R6).
+            // NOTE: an optimistic tile returns [] above, so a turn that has no server
+            // id yet contributes no descriptors to the # popup (nothing is bindable),
+            // but its allocations are still published to `labelCounters` so later
+            // tiles continue the sequence.
             for (const entry of threads.values()) {
                 const isRoot = entry.key === ROOT_KEY;
                 // While prose is still streaming read the live buffer; after a
@@ -2910,6 +2986,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             turn.element.parentElement?.remove();
         }
         turns.length = 0;
+        // A cleared board starts a new numbering (hydrate re-creates the tiles in
+        // recorded order, so the conversation's labels are rebuilt exactly).
+        labelCounters.clear();
 
         for (const node of [...element.querySelectorAll<HTMLElement>('.notice')]) node.remove();
 

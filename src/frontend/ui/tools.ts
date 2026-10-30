@@ -57,6 +57,7 @@
 //   - styles: src/frontend/styles.css (`.tool`, `.tool-*`, `.file-link`) and ui/dialog.css
 
 import { callTool } from '../api';
+import type { HarnessToolOutcome } from '../../types';
 import { openDialog, type DialogHandle } from './dialog';
 import { enhanceFileLinks } from './file-links';
 import { openFilePreview, type FilePreviewReader, type FilePreviewResult } from './file-preview';
@@ -114,9 +115,11 @@ export type ToolCallCard = {
     // timing data — never NaN.
     durationMs: () => number | undefined;
     // Attach the matching `tool_result`. Idempotent: a duplicate result for the
-    // same call is ignored instead of overwriting the first answer. `durationMs`
-    // overrides the local measurement (used when replaying `eventTimes`).
-    resolve: (content: string, isError: boolean, durationMs?: number) => void;
+    // same call is ignored instead of overwriting the first answer. `outcome` is
+    // the structured classification from the runtime (R1): a cancelled call shows
+    // "cancelled", not "error". `durationMs` overrides the local measurement (used
+    // when replaying `eventTimes`).
+    resolve: (content: string, outcome: HarnessToolOutcome, durationMs?: number) => void;
     // Close a call that will never produce a result — the turn was cancelled,
     // failed, or ended while the call was still running (R6: pending work is
     // INTERRUPTED, never resumed). Without this the card kept saying `running`
@@ -413,7 +416,18 @@ export const createToolCallCard = (
         duration.hidden = true;
     }
 
-    const resolve = (content: string, isError: boolean, durationMs?: number): void => {
+    // The card's visible state is the OUTCOME, not a boolean: a cancelled call is a
+    // control outcome and must not borrow the red error mark (R1). `rejected` and
+    // `failed` both read as "error" because both mean this call produced nothing
+    // usable, while their difference stays in the result text and the event.
+    const stateOfOutcome = (outcome: HarnessToolOutcome): ToolState => {
+        if (outcome === 'completed') return 'ok';
+        if (outcome === 'cancelled') return 'cancelled';
+
+        return 'error';
+    };
+
+    const resolve = (content: string, outcome: HarnessToolOutcome, durationMs?: number): void => {
         if (settled) return;
         settled = true;
 
@@ -429,12 +443,17 @@ export const createToolCallCard = (
         stopTicker();
         paintDuration();
 
-        current = isError ? 'error' : 'ok';
+        current = stateOfOutcome(outcome);
         element.dataset.state = current;
         glyph.textContent = STATE_GLYPH[current];
         state.textContent = STATE_TEXT[current];
         summary.setAttribute('aria-label', summaryLabel(name, current));
-        resultLabel.textContent = isError ? 'result · error' : 'result';
+        resultLabel.textContent =
+            outcome === 'completed'
+                ? 'result'
+                : outcome === 'cancelled'
+                  ? 'result · cancelled'
+                  : 'result · error';
 
         // R12: the result only renders in the modal, which scrolls, so the whole
         // available payload/error is shown — no display truncation. An empty answer
@@ -452,10 +471,14 @@ export const createToolCallCard = (
         );
 
         // Recompute the summary so the compact card still answers "did it work and
-        // what did it touch?" without opening the dialog.
-        peek.textContent = isError
-            ? `${previewArguments(rawArguments)} · failed`
-            : `${previewArguments(rawArguments)} · ${text.length.toLocaleString()} chars`;
+        // what did it touch?" without opening the dialog. A cancelled call says so
+        // instead of reporting a character count it does not have.
+        peek.textContent =
+            outcome === 'completed'
+                ? `${previewArguments(rawArguments)} · ${text.length.toLocaleString()} chars`
+                : `${previewArguments(rawArguments)} · ${
+                      outcome === 'cancelled' ? 'cancelled' : 'failed'
+                  }`;
 
         // A modal opened while the call was running now shows the settled state in
         // its title. The body was updated in place above, so no `update({content})`

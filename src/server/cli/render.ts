@@ -188,7 +188,15 @@ export const createRenderer = ({ json, color }: RenderOptions): Renderer => {
                 // older event, in which case the name is printed alone.
                 const duration = durationOf(event);
                 const label = duration === undefined ? event.name : `${event.name} · ${formatMs(duration)}`;
-                const head = event.isError ? red(`← ${label} (error)`) : green(`← ${label}`);
+                // R1: a cancelled call is a control outcome, not a failure, so it
+                // does not get the error marker or the `(error)` suffix.
+                const outcome = event.outcome ?? (event.isError ? 'failed' : 'completed');
+                const head =
+                    outcome === 'cancelled'
+                        ? yellow(`← ${label} (cancelled)`)
+                        : outcome !== 'completed'
+                          ? red(`← ${label} (error)`)
+                          : green(`← ${label}`);
                 process.stdout.write(`${head}\n${indent(truncate(event.content.length > 0 ? event.content : '(empty result)'))}\n`);
 
                 // Calls still running when this one finished (R6). Absent means the

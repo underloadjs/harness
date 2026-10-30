@@ -9,9 +9,11 @@
 // Shared rules (see shared/agent-results.ts):
 //   - code = uppercase first + last ASCII LETTER (digits/punctuation ignored), or
 //     the neutral fallback `AG` when the id has no ASCII letters;
-//   - occurrence numbering is PER TURN and keyed by the two-letter CODE, so two
-//     different ids with the same code cannot mint duplicate labels;
-//   - `next()` is called once per invocation, `reset()` re-numbers a rebuilt turn.
+//   - occurrence numbering is CONVERSATION-scoped and keyed by the two-letter CODE,
+//     so two different ids with the same code cannot mint duplicate labels and two
+//     threads of one agent read `RR1`/`RR2` across turns;
+//   - `next()` is called once per invocation, `reset()` restarts a rebuilt turn,
+//     and `seed()` continues a sequence from the turns before it.
 //
 // Cross-references:
 //   - ../../shared/agent-results.ts — single owner of createAgentLabels;

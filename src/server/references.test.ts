@@ -355,7 +355,7 @@ describe('explicit result references', () => {
         expect(fixture.requests[1].messages.filter((message) => message.role === 'user')).toHaveLength(1);
     });
 
-    it('resolves a typed #LABEL without metadata to the latest prior block', async () => {
+    it('resolves each typed #LABEL to the conversation-scoped block it names', async () => {
         const fixture = probeFixture();
         const store = createStore([fixture.preset]);
         const created = store.create('probe');
@@ -363,14 +363,26 @@ describe('explicit result references', () => {
         const first = await submit(store, created.id, 'first block');
         const second = await submit(store, created.id, 'second block');
 
+        // Conversation-scoped numbering: the second `probe` invocation is PE2, so
+        // #PE1 still names turn 1 — one label, one block (R5/R6).
+        expect(listAgentResultBlocks(store.get(created.id).turns).map((block) => block.label)).toEqual([
+            'PE1',
+            'PE2'
+        ]);
+
         const third = await submit(store, created.id, 'reuse #PE1');
 
-        // Latest matching block wins: turn 2, not turn 1.
-        expect(third.references).toEqual([{ turnId: second.id, label: 'PE1' }]);
+        expect(third.references).toEqual([{ turnId: first.id, label: 'PE1' }]);
         expect(lastUser(fixture.requests[2].messages)).toBe(
-            injectedPrompt('reuse #PE1', 'PE1', 'probe', second.id, 'answer 2')
+            injectedPrompt('reuse #PE1', 'PE1', 'probe', first.id, 'answer 1')
         );
-        expect(third.references?.[0].turnId).not.toBe(first.id);
+
+        const fourth = await submit(store, created.id, 'reuse #PE2');
+
+        expect(fourth.references).toEqual([{ turnId: second.id, label: 'PE2' }]);
+        expect(lastUser(fixture.requests[3].messages)).toBe(
+            injectedPrompt('reuse #PE2', 'PE2', 'probe', second.id, 'answer 2')
+        );
     });
 
     it('binds a still-streaming target and expands after it completes', async () => {
@@ -654,11 +666,19 @@ describe('reference persistence', () => {
             })
         ]);
 
-        // The archive still resolves after the restart, and a new block expands it.
+        // The archive still resolves after the restart: the re-derived numbering is
+        // the same conversation-scoped one (#PE1 = turn 1, #PE2 = turn 2), so a
+        // stored label keeps its identity across a reload (R5/R6).
         const third = await submit(secondStore, created.id, 'again #PE1');
-        expect(third.references).toEqual([{ turnId: second.id, label: 'PE1' }]);
+        expect(third.references).toEqual([{ turnId: first.id, label: 'PE1' }]);
         expect(lastUser(fixture.requests.at(-1)?.messages ?? [])).toBe(
-            injectedPrompt('again #PE1', 'PE1', 'probe', second.id, 'answer 2')
+            injectedPrompt('again #PE1', 'PE1', 'probe', first.id, 'answer 1')
+        );
+
+        const fourth = await submit(secondStore, created.id, 'and #PE2');
+        expect(fourth.references).toEqual([{ turnId: second.id, label: 'PE2' }]);
+        expect(lastUser(fixture.requests.at(-1)?.messages ?? [])).toBe(
+            injectedPrompt('and #PE2', 'PE2', 'probe', second.id, 'answer 2')
         );
     });
 });

@@ -732,13 +732,33 @@ describe('fileRead', () => {
         });
     });
 
-    it('rejects a directory path with the path in the message', async () => {
+    it('rejects a directory path as a directory, not a permission problem', async () => {
         // A directory read fails at the filesystem layer (EISDIR on POSIX, EPERM on
         // Windows), so the whole batch is rejected rather than returning directory
-        // "content". The wrapper names the requested path, matching ENOENT.
+        // "content". R3: the message must name the real mistake and point at the
+        // tools that answer it; a permission denial is a DIFFERENT failure and must
+        // not be what the caller reads here.
         const directory = join(workdir, 'nested');
 
-        await expect(fileRead([directory])).rejects.toThrow(`fileRead failed to read "${directory}":`);
+        await expect(fileRead([directory])).rejects.toThrow(
+            `fileRead cannot read "${directory}": it is a directory, not a file. Use fileList to list its entries, or fileGlob to find files inside it.`
+        );
+
+        // The SAME rejection must not read as a permission problem: a caller (or
+        // model) that saw both messages can tell them apart without guessing.
+        const error = await fileRead([directory]).catch((caught: unknown) => caught);
+        expect((error as Error).message).not.toMatch(/permission/i);
+    });
+
+    it('rejects the whole batch when one target is a directory', async () => {
+        // Preserved contract: only ENOENT is reported in place. A directory still
+        // rejects the call, so a returned array never looks complete.
+        const readable = join(workdir, 'a.txt');
+        const directory = join(workdir, 'nested');
+
+        await expect(fileRead([readable, directory])).rejects.toThrow(
+            `fileRead cannot read "${directory}": it is a directory, not a file.`
+        );
     });
 
     it('rejects an empty array instead of answering "no files"', async () => {

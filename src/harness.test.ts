@@ -593,6 +593,7 @@ describe('harness', () => {
                 callId: 'c1',
                 content: '{"answer":42}',
                 isError: false,
+                outcome: 'completed',
                 ui: panels
             },
             {
@@ -601,7 +602,8 @@ describe('harness', () => {
                 name: 'plainTool',
                 callId: 'c2',
                 content: '{"answer":7}',
-                isError: false
+                isError: false,
+                outcome: 'completed'
             }
         ]);
 

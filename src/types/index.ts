@@ -132,6 +132,25 @@ export type HarnessPendingTool = {
     elapsedMs: number;
 };
 
+// WHY a tool call ended. This is the structured replacement for reading the
+// result text: a consumer must never decide "cancelled" vs "failed" vs "this tool
+// does not exist" by matching strings.
+//
+//   completed — the tool ran and returned a value (success).
+//   failed    — the tool ran and threw. An OPERATIONAL failure: the arguments were
+//               acceptable and the implementation itself could not finish.
+//   rejected  — the call never reached an implementation. An INVOCATION/DISPATCH
+//               error the caller can fix: unregistered or not-yet-enabled name,
+//               malformed/ schema-invalid arguments, wrong agent role.
+//   cancelled — an EXPECTED CONTROL OUTCOME: `toolCancel` released the call before
+//               it produced a value. Nothing failed; the caller asked for this.
+//
+// `completed` and `cancelled` are both healthy control outcomes; only `failed`
+// says the tool broke, and only `rejected` says the call itself was wrong. The
+// `tool_result` event's `isError` is always derived from this value
+// (`outcome !== 'completed'`), so the two can never disagree.
+export type HarnessToolOutcome = 'completed' | 'failed' | 'rejected' | 'cancelled';
+
 // Token accounting, normalized from the provider's `usage` block.
 export type HarnessUsage = {
     // Prompt/input tokens for the request, INCLUDING any replayed cache prefix.
@@ -1119,7 +1138,16 @@ export type HarnessEvent =
           name: string;
           callId?: string;
           content: string;
+          // Derived projection of `outcome` for consumers that only need "is this
+          // an error-shaped tool message". Always `outcome !== 'completed'`.
           isError: boolean;
+          // Structured reason this call ended (HarnessToolOutcome). Optional so an
+          // older recorded event — or a hand-written progress reporter — stays
+          // valid; a reader then falls back to `isError` (error-shaped without a
+          // classification reads as `failed`). Every result the runtime produces
+          // carries it, which is what lets a UI show a cancelled call as
+          // "cancelled" instead of "error".
+          outcome?: HarnessToolOutcome;
           // Optional declarative panels a tool supplied with `toolUi()`. The
           // `content` above is always the underlying value, and the model never
           // sees this field: it is presentation data for the client only. Absent

@@ -5,7 +5,9 @@
 //   - uppercase first + last ASCII LETTER (digits/punctuation ignored), fallback AG;
 //   - counters are keyed by the two-letter CODE, so different ids with the same
 //     code share one sequence instead of colliding;
-//   - reset re-numbers a rebuilt turn; separate allocators are independent.
+//   - numbering is conversation-scoped: `seed()`/`counters()` continue a sequence
+//     across turns, `reset()` restarts a rebuilt turn; separate allocators are
+//     independent.
 
 import { createAgentLabels } from './agent-label';
 
@@ -66,6 +68,17 @@ describe('createAgentLabels', () => {
         labels.reset();
 
         expect(labels.next('research')).toBe('RH1');
+    });
+
+    it('continues a sequence through seed() so a later turn never restarts at 1', () => {
+        const first = createAgentLabels();
+        expect(first.next('researcher')).toBe('RR1');
+
+        const second = createAgentLabels(first.counters());
+        // Same code: the second Researcher thread is RR2.
+        expect(second.next('researcher')).toBe('RR2');
+        // A different agent's code still starts its own sequence.
+        expect(second.next('instruct')).toBe('IT1');
     });
 
     it('keeps separate turns independent', () => {

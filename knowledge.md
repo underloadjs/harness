@@ -1436,7 +1436,10 @@ agent's `done` is a response boundary, not a turn boundary: with concurrent call
 it may arrive while its own calls are still running (`pending`), and the runtime
 wakes the agent (`wakeup`) as outcomes land. Cancellation signals every running
 call (`toolCancel({ callId })` targets one): `toolCancel` logically settles/aborts
-that call's own task and its late result is ignored; command tools honour the abort
+that call's own task and its late result is ignored; cancelling an already settled
+(or already cancelled) call is a SUCCESS with `alreadySettled: true`, because
+cancellation is a state to reach rather than a one-shot transition, while a
+`callId` this run never started is an error. Command tools honour the abort
 and kill their process tree, but arbitrary JavaScript cannot be preempted. A
 whole-run abort preempts an uncooperative provider request, releases the child
 actor/restore slot and rolls back the cancelled turn's in-flight prompt state
@@ -1520,7 +1523,7 @@ const ids = await listModels({ baseURL, apiKey, headers?, signal? });
 | { type: 'text';           agent: string; delta: string }
 | { type: 'reasoning';      agent: string; delta: string }
 | { type: 'tool_call';      agent: string; call: HarnessToolCall }
-| { type: 'tool_result';    agent: string; name: string; callId?: string; content: string; isError: boolean; durationMs?: number; pending?: HarnessPendingTool[]; ui?: ToolUiPanel[] }
+| { type: 'tool_result';    agent: string; name: string; callId?: string; content: string; isError: boolean; outcome?: HarnessToolOutcome; durationMs?: number; pending?: HarnessPendingTool[]; ui?: ToolUiPanel[] }
 | { type: 'usage';         agent: string; usage: HarnessUsage }
 | { type: 'done';           agent: string; message: HarnessAssistantMessage; pending?: HarnessPendingTool[] }
 | { type: 'wakeup';         agent: string; reason: 'pending-tools'; pending: HarnessPendingTool[] }

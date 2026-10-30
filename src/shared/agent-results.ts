@@ -3,8 +3,10 @@
 // A "block" is ONE agent invocation inside a submitted turn: the turn's root
 // invocation (the entry agent) or a nested/subagent invocation identified by the
 // runtime's `HarnessThread.id`. The UI renders each block with a compact label
-// (`IT1`, `RH2`, … — first+last letter of the agent id plus its 1-based occurrence
-// WITHIN the turn, see ui/agent-label.ts).
+// (`IT1`, `RH2`, … — first+last letter of the agent id plus its occurrence, see
+// ui/agent-label.ts). Occurrence numbering is CONVERSATION-scoped: it continues
+// across the session's turns in recorded order, so two distinct invocations of the
+// same agent never share a label (`RR1`/`RR2`), even across turns.
 //
 // A user can type `#IT1` in a NEW prompt to reference the completed result of a
 // prior block. The reference is resolved against the SERVER's recorded turns (not
@@ -38,7 +40,8 @@ export type AgentResultReference = {
     turnId: string;
     threadId?: string;
     // Normalised display label, e.g. `IT1`. Uppercase two letters (the fallback
-    // `AG`) followed by the per-turn occurrence.
+    // `AG`) followed by the occurrence; occurrences are conversation-scoped (they
+    // continue across the session's turns), so a label identifies one block.
     label: string;
 };
 
@@ -90,10 +93,10 @@ export const MAX_REFERENCE_CONTENT_CHARS = 100_000;
 export const MAX_REFERENCE_TOTAL_CHARS = 200_000;
 
 // A valid block label: exactly two ASCII LETTERS (the allocator's first+last
-// letter, or `AG` for a name with no ASCII letters) plus the per-turn occurrence
-// count. Digits inside an agent id are ignored by the allocator, so every emitted
-// label satisfies this grammar; it also keeps a typed issue number (`#1234`) from
-// looking like a reference.
+// letter, or `AG` for a name with no ASCII letters) plus the conversation-scoped
+// occurrence count. Digits inside an agent id are ignored by the allocator, so
+// every emitted label satisfies this grammar; it also keeps a typed issue number
+// (`#1234`) from looking like a reference.
 export const AGENT_REFERENCE_LABEL_PATTERN = /^[A-Z]{2}\d+$/;
 
 // Delimiters of the injected context. Exported so tests and clients can assert
@@ -137,17 +140,39 @@ const codeOf = (key: string): string => {
 export type AgentLabels = {
     next: (agent: string | undefined) => string;
     reset: () => void;
+    // Continue an EXISTING sequence: raise every per-code occurrence to at least
+    // the seeded value. Seeding never lowers a counter, so a late seed cannot
+    // renumber a label an allocator already minted. Used to continue numbering
+    // across turns (a new tile seeds from the previous tiles' allocations).
+    seed: (counters: ReadonlyMap<string, number>) => void;
+    // Snapshot of the per-code occurrence counters (code -> last used number),
+    // detached so a caller can seed a later allocator without aliasing this one.
+    counters: () => Map<string, number>;
 };
 
-// Shared label allocator. SEMANTICS ARE FROZEN as of T7:
+// Shared label allocator. SEMANTICS (conversation-scoped as of the duplicate-label
+// fix; the per-code rules are frozen from T7):
 //   - the code is the first+last ASCII LETTER (or `AG`);
-//   - occurrence numbering is per TURN and keyed by that TWO-LETTER CODE, not by
-//     the full agent name, so id collisions share one sequence (`research` →
-//     `RH1`, `rhesearch` → `RH2`) instead of silently producing duplicate labels;
-//   - `next()` is called once per invocation (never per event), and `reset()`
-//     starts a new turn's sequence.
-export const createAgentLabels = (): AgentLabels => {
+//   - occurrence numbering is keyed by that TWO-LETTER CODE, not by the full agent
+//     name, so id collisions share one sequence (`research` → `RH1`, `rhesearch`
+//     → `RH2`) instead of silently producing duplicate labels;
+//   - `next()` is called once per invocation (never per event) and `reset()` starts
+//     a fresh sequence;
+//   - `seed()` CONTINUES a sequence. The reference namespace is the whole
+//     conversation (typed `#LABEL` resolves across turns), so the UI seeds each
+//     turn's allocator from the turns before it and the projection chains one
+//     allocator over the turn list. Two distinct threads of one agent therefore
+//     read `RR1`/`RR2` instead of both restarting at `RR1`.
+export const createAgentLabels = (initial?: ReadonlyMap<string, number>): AgentLabels => {
     const occurrences = new Map<string, number>();
+
+    const adopt = (counters: ReadonlyMap<string, number>): void => {
+        for (const [code, used] of counters) {
+            if (used > (occurrences.get(code) ?? 0)) occurrences.set(code, used);
+        }
+    };
+
+    if (initial !== undefined) adopt(initial);
 
     return {
         next(agent: string | undefined): string {
@@ -160,6 +185,14 @@ export const createAgentLabels = (): AgentLabels => {
 
         reset(): void {
             occurrences.clear();
+        },
+
+        seed(counters: ReadonlyMap<string, number>): void {
+            adopt(counters);
+        },
+
+        counters(): Map<string, number> {
+            return new Map(occurrences);
         }
     };
 };
@@ -212,6 +245,11 @@ const delegateOf = (rawArguments: string): { agent: string; input: string } | un
 
 // Project ONE recorded turn into its listable blocks.
 //
+// `labels` is passed in so a caller can CHAIN the allocator across turns: the
+// reference namespace is the whole conversation, so occurrence numbers continue
+// from the previous turn rather than restarting at 1. A single-turn caller gets a
+// fresh allocator (its labels start at 1).
+//
 // The replay follows the event order the UI uses, because labels depend on it:
 //   - the root block is created by the first event routed to it and consumes the
 //     first occurrence of the entry agent;
@@ -226,8 +264,10 @@ const delegateOf = (rawArguments: string): { agent: string; input: string } | un
 // a `branch_end` maps completed/failed/cancelled; the parent's `tool_result` for a
 // spawning call completes an unstarted/queued child. At the end the TURN status is
 // authoritative for the root (and closes children the record left running).
-const blocksOfTurn = (turn: AgentResultTurn): ProjectedBlock[] => {
-    const labels = createAgentLabels();
+const blocksOfTurn = (
+    turn: AgentResultTurn,
+    labels: AgentLabels = createAgentLabels()
+): ProjectedBlock[] => {
     const blocks: ReplayBlock[] = [];
     const byThread = new Map<string, ReplayBlock>();
     const byCall = new Map<string, ReplayBlock>();
@@ -469,15 +509,25 @@ const publicBlock = (block: ProjectedBlock): AgentResultBlock => {
 };
 
 // List every block across turns, oldest turn first and each turn's blocks in
-// creation (label-allocation) order.
-export const listAgentResultBlocks = (turns: readonly AgentResultTurn[]): AgentResultBlock[] =>
-    turns.flatMap((turn) => blocksOfTurn(turn).map(publicBlock));
+// creation (label-allocation) order. ONE allocator is chained across the turns, so
+// the labels are the conversation-scoped ones the UI shows (`RR1`, then `RR2` in a
+// later turn) rather than each turn restarting at 1.
+export const listAgentResultBlocks = (turns: readonly AgentResultTurn[]): AgentResultBlock[] => {
+    const labels = createAgentLabels();
+
+    return turns.flatMap((turn) => blocksOfTurn(turn, labels).map(publicBlock));
+};
 
 // Exact lookup for a submitted reference: `turnId` + `threadId` (or root) + label.
 // `threadId` may be the block's CURRENT identity OR any stable alias it carried
 // (`call:<callId>` for a delegation that has since adopted a runtime id,
 // `inline:<agent>` for a threadless legacy block). A genuinely wrong id matches
 // nothing and the caller rejects it.
+//
+// `turns` MUST be the conversation prefix in recorded order (all turns up to and
+// including the target): occurrence numbering is conversation-scoped, so a block's
+// label depends on the turns BEFORE it. Passing only the target turn numbers it as
+// if it were the first turn and would resolve the wrong block (or none).
 //
 // A reference with NO threadId is the root signal. For compatibility with
 // descriptors produced before aliases existed, a threadless reference whose label
@@ -487,13 +537,21 @@ export const findAgentResultBlock = (
     turns: readonly AgentResultTurn[],
     reference: Pick<AgentResultReference, 'turnId' | 'threadId' | 'label'>
 ): AgentResultBlock | undefined => {
-    const turn = turns.find((candidate) => candidate.id === reference.turnId);
-    if (turn === undefined) return undefined;
+    // Project the ordered prefix through the target: later turns cannot change an
+    // earlier turn's labels, so they are not needed (and may be absent).
+    const targetIndex = turns.findIndex((candidate) => candidate.id === reference.turnId);
+    if (targetIndex === -1) return undefined;
 
     const label = normalizeAgentLabel(reference.label);
     if (label === undefined) return undefined;
 
-    const blocks = blocksOfTurn(turn);
+    // One chained allocator across the prefix, exactly like listAgentResultBlocks.
+    const labels = createAgentLabels();
+    let blocks: ProjectedBlock[] = [];
+    for (let index = 0; index <= targetIndex; index++) {
+        blocks = blocksOfTurn(turns[index], labels);
+    }
+
     const labelled = blocks.filter((block) => block.label === label);
 
     if (reference.threadId === undefined) {
@@ -514,9 +572,15 @@ export const findAgentResultBlock = (
 };
 
 // Latest block with this label across the given turns. Typed `#LABEL` resolves to
-// the newest matching prior block ("latest wins"); there is deliberately NO
-// fallback to an older block when the latest one failed — the caller rejects
-// instead of silently injecting an outdated result.
+// the newest matching prior block ("latest wins"). With conversation-scoped
+// numbering a label identifies exactly ONE block in the given list, so this is an
+// exact lookup in practice; the newest-first scan is kept as the defensive rule for
+// a record whose history was rewritten. There is deliberately NO fallback to an
+// older block when the latest one failed — the caller rejects instead of silently
+// injecting an outdated result.
+//
+// `turns` must be the conversation prefix in recorded order (same reason as
+// findAgentResultBlock): the allocator is chained over the whole list.
 export const findLatestAgentResultBlock = (
     turns: readonly AgentResultTurn[],
     label: string
@@ -524,8 +588,12 @@ export const findLatestAgentResultBlock = (
     const wanted = normalizeAgentLabel(label);
     if (wanted === undefined) return undefined;
 
-    for (let index = turns.length - 1; index >= 0; index--) {
-        const match = blocksOfTurn(turns[index]).find((block) => block.label === wanted);
+    // Project every turn with ONE allocator so the labels are the conversation's.
+    const labels = createAgentLabels();
+    const projected = turns.map((turn) => blocksOfTurn(turn, labels));
+
+    for (let index = projected.length - 1; index >= 0; index--) {
+        const match = projected[index].find((block) => block.label === wanted);
         if (match !== undefined) return publicBlock(match);
     }
 

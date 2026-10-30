@@ -99,6 +99,28 @@ describe('createAgentLabels', () => {
         labels.reset();
         expect(labels.next('instruct')).toBe('IT1');
     });
+
+    it('continues a sequence through seed() and never lowers a counter', () => {
+        const first = createAgentLabels();
+        expect(first.next('researcher')).toBe('RR1');
+
+        // The detached snapshot is the seed a later turn continues from.
+        const snapshot = first.counters();
+        expect(snapshot).toEqual(new Map([['RR', 1]]));
+
+        const second = createAgentLabels(snapshot);
+        expect(second.next('researcher')).toBe('RR2');
+
+        // A lower seed cannot renumber a label that was already minted.
+        second.seed(new Map([['RR', 1]]));
+        expect(second.next('researcher')).toBe('RR3');
+
+        // reset() drops the seed; re-seeding the tile's frozen base reproduces the
+        // exact label a rebuilt projection must show again (R6).
+        second.reset();
+        second.seed(snapshot);
+        expect(second.next('researcher')).toBe('RR2');
+    });
 });
 
 describe('listAgentResultBlocks', () => {
@@ -376,10 +398,81 @@ describe('reference lookup', () => {
         ).toBeUndefined();
     });
 
-    it('resolves a typed label to the latest matching turn', () => {
-        expect(findLatestAgentResultBlock(turns, '#it1')?.content).toBe('second answer');
+    it('resolves a typed label to the one conversation-scoped block it names', () => {
+        // turn-2's `instruct` root is IT2, not a second IT1: numbering spans the
+        // conversation, so a label always names exactly one block (R5/R6).
+        expect(findLatestAgentResultBlock(turns, '#it1')?.content).toBe('final answer');
+        expect(findLatestAgentResultBlock(turns, 'it2')?.content).toBe('second answer');
         expect(findLatestAgentResultBlock(turns, 'rh1')?.threadId).toBe('2');
+        expect(findLatestAgentResultBlock(turns, 'rh2')).toBeUndefined();
         expect(findLatestAgentResultBlock(turns, 'ZZ9')).toBeUndefined();
+    });
+
+    it('numbers distinct threads of one agent RR1/RR2 across turns (R5/R6)', () => {
+        // The user's defect: two Researcher threads both showing `RR1`. Numbering
+        // spans the conversation, so the second turn continues the code sequence and
+        // a label still names exactly one block.
+        const researcherTurn = (id: string, answerText: string): AgentResultTurn => ({
+            id,
+            status: 'done',
+            events: [
+                { type: 'start', agent: 'instruct', model: 'scripted/test' },
+                {
+                    type: 'tool_call',
+                    agent: 'instruct',
+                    call: {
+                        id: `call-${id}`,
+                        name: 'agentDelegate',
+                        arguments: '{"agent":"researcher","input":"look"}'
+                    }
+                },
+                {
+                    type: 'start',
+                    agent: 'researcher',
+                    model: 'scripted/test',
+                    thread: { id: `t-${id}`, callId: `call-${id}`, input: 'look' }
+                },
+                {
+                    type: 'done',
+                    agent: 'researcher',
+                    thread: { id: `t-${id}`, callId: `call-${id}` },
+                    message: assistant(answerText)
+                },
+                {
+                    type: 'tool_result',
+                    agent: 'instruct',
+                    name: 'agentDelegate',
+                    callId: `call-${id}`,
+                    content: answerText,
+                    isError: false
+                },
+                { type: 'done', agent: 'instruct', message: assistant(`done ${id}`) }
+            ]
+        });
+
+        const twoTurns = [researcherTurn('turn-a', 'first'), researcherTurn('turn-b', 'second')];
+
+        // Distinct threads, distinct stable labels — never two RR1s.
+        expect(
+            listAgentResultBlocks(twoTurns).map((block) => `${block.label}:${block.threadId ?? 'root'}`)
+        ).toEqual(['IT1:root', 'RR1:t-turn-a', 'IT2:root', 'RR2:t-turn-b']);
+
+        expect(findLatestAgentResultBlock(twoTurns, '#RR1')?.content).toBe('first');
+        expect(findLatestAgentResultBlock(twoTurns, '#RR2')?.content).toBe('second');
+        // The later turn's binding resolves its OWN thread, not a restart at RR1.
+        expect(
+            findAgentResultBlock(twoTurns, { turnId: 'turn-b', threadId: 't-turn-b', label: 'RR2' })
+        ).toEqual({
+            turnId: 'turn-b',
+            threadId: 't-turn-b',
+            label: 'RR2',
+            agent: 'researcher',
+            status: 'done',
+            content: 'second'
+        });
+        expect(
+            findAgentResultBlock(twoTurns, { turnId: 'turn-b', threadId: 't-turn-b', label: 'RR1' })
+        ).toBeUndefined();
     });
 });
 

@@ -10,17 +10,17 @@
 //                    The chip serializes back to the same token; NO bytes are
 //                    attached (a mention is a pointer, not an upload).
 //   #LABEL           a block (agent invocation) in this conversation, e.g. `#IT1`
-//                    = first `instruct` invocation (ui/agent-label.ts). A chip
-//                    carries the EXACT `{ turnId, threadId?, label }` binding so a
-//                    later submit references the block the user picked, even when
-//                    another turn later allocates the same label.
+//                    = first `instruct` invocation (ui/agent-label.ts). Labels are
+//                    conversation-scoped, so a label names exactly ONE block. A chip
+//                    still carries the EXACT `{ turnId, threadId?, label }` binding
+//                    (defence in depth for a record rewritten out of order).
 //
 // LABEL RESOLUTION (agreed server contract)
 // -----------------------------------------
-// Plain `#LABEL` text is still supported: the server resolves the LATEST turn that
-// allocated that label. The UI's `latestReferenceBlock` mirrors that rule for the
-// popup/lookup, so selecting a typed-looking label binds the same block the server
-// would resolve at execution time.
+// Plain `#LABEL` text is still supported. The server projects the conversation's
+// turns in recorded order with ONE allocator (shared/agent-results.ts), so the
+// label it resolves is the label the transcript shows. The UI's
+// `latestReferenceBlock` mirrors that rule for the popup/lookup.
 //
 // Cross-references:
 //   - ui/turns.ts      — `blocks()` supplies the real root+nested descriptors
@@ -66,9 +66,10 @@ export const referenceToken = (label: string): string => `#${normalizeReferenceL
 
 export const fileToken = (path: string): string => `@${path}`;
 
-// Latest matching label wins: the board is oldest→newest, so the LAST match is the
-// block the server will resolve at execution time. Exact (normalized) label match
-// only — `IT1` must not match `IT10`.
+// Label match. Labels are conversation-scoped (unique across the board), so the
+// match is exact in practice; the newest-first scan is kept because the board is
+// oldest→newest and a rewritten record could still list a label twice. Exact
+// (normalized) label match only — `IT1` must not match `IT10`.
 export const latestReferenceBlock = (
     blocks: readonly AgentBlockDescriptor[],
     label: string
