@@ -1121,6 +1121,7 @@ describe('cross-thread chat and delegation links (R4)', () => {
         const result = await writer.sendThreadInput(alpha.id, 'talk to beta');
         expect(result.content).toBe('alpha sent');
         expect(seen[0]!.tools?.map((tool) => tool.name)).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',

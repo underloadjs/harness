@@ -211,4 +211,27 @@ describe('testFlaky', () => {
         await expect(harnessTools.testFlaky({})).rejects.toThrow('Temporary failure (attempt 2). Retry the same call.');
         await expect(harnessTools.testFlaky({})).resolves.toBe('Success on attempt 3.');
     });
+
+    it('stores the per-agent attempt store in harness-owned memory when present', async () => {
+        // A minimal live harness memory: the tool only needs get/set. The WeakMap
+        // lives INSIDE this memory, so a replacement module (which shares the same
+        // harness) reads the same counters instead of starting from zero.
+        const data = new Map<string, unknown>();
+        const harness = {
+            memory: {
+                get: (key: string) => data.get(key),
+                set: (key: string, value: unknown) => {
+                    data.set(key, value);
+                }
+            }
+        } as never;
+
+        const agent = {} as never;
+        const attempt = () => harnessTools.testFlaky.execute({ parameters: {}, agent, harness });
+
+        await expect(attempt()).rejects.toThrow('Temporary failure (attempt 1). Retry the same call.');
+        await expect(attempt()).rejects.toThrow('Temporary failure (attempt 2). Retry the same call.');
+        await expect(attempt()).resolves.toBe('Success on attempt 3.');
+        expect(data.get('testFlaky:attempts')).toBeInstanceOf(WeakMap);
+    });
 });

@@ -1211,6 +1211,7 @@ describe('SessionStore turns', () => {
                 agents: ['single'],
                 tools: [],
                 coreTools: [
+                    'toolRegistry',
                     'toolRequest',
                     'toolCreate',
                     'todoManage',

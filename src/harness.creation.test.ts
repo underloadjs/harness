@@ -81,6 +81,7 @@ describe('toolCreate', () => {
         expect(writer.tools.toolCreate.visibility).toBe('core');
         expect(writer.tools.toolCreate.description).toContain('Create a tool for yourself from JavaScript source.');
         expect(declaredNames(seen[0])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -111,6 +112,7 @@ describe('toolCreate', () => {
 
         // Round 1: core only. Round 2: the created tool is already enabled.
         expect(declaredNames(seen[0])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -122,6 +124,7 @@ describe('toolCreate', () => {
             'threadFork'
         ]);
         expect(declaredNames(seen[1])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -209,37 +212,49 @@ describe('toolCreate', () => {
             source: 'return args;'
         });
 
-        expect(await writer.tools.toolRequest({ tags: ['summary'] })).toEqual({
+        expect(await writer.executeTool('toolRequest', { tags: ['summary'] })).toEqual({
             enabled: ['digest'],
             tools: [{ name: 'digest', description: 'Summarise text.', tags: ['text', 'summary'] }],
             remaining: 0
         });
     });
 
-    it('rejects reserved and colliding names without touching the registry', () => {
+    it('replaces reserved and existing names intentionally through the same kernel', async () => {
         const existing = tool({ description: 'Existing.', tags: ['x'], execute: () => 'ok' });
         const writer = quiet(brain(scripted([answer('hi')])), { existing });
 
-        expect(() =>
-            writer.createTool({ name: 'toolRequest', description: 'Mine.', tags: ['x'], source: 'return 1;' })
-        ).toThrow('Tool name "toolRequest" is reserved by the harness.');
+        // No reserved names: toolCreate can intentionally replace a harness-owned
+        // control and a previously registered name.
+        writer.createTool({ name: 'toolRequest', description: 'Mine.', tags: ['x'], source: 'return 1;' });
+        await expect(writer.executeTool('toolRequest', { tags: [] })).resolves.toBe(1);
 
-        expect(() =>
-            writer.createTool({ name: 'agentDelegate', description: 'Mine.', tags: ['x'], source: 'return 1;' })
-        ).toThrow('Tool name "agentDelegate" is reserved by the harness.');
+        writer.createTool({
+            name: 'agentDelegate',
+            description: 'Mine.',
+            tags: ['x'],
+            source: 'return 2;'
+        });
+        await expect(writer.executeTool('agentDelegate', {})).resolves.toBe(2);
 
-        expect(() => writer.createTool({ ...creation, name: 'existing' })).toThrow(
-            'Tool "existing" is already registered; choose another name.'
-        );
+        writer.createTool({
+            name: 'existing',
+            description: 'Replacement.',
+            tags: ['x'],
+            source: 'return "replaced";'
+        });
+        await expect(writer.executeTool('existing', {})).resolves.toBe('replaced');
 
-        // Case-insensitive: two names differing only by case would be ambiguous.
-        expect(() => writer.createTool({ ...creation, name: 'Existing' })).toThrow(
-            'Tool "existing" is already registered; choose another name.'
-        );
+        // A case-different name is a distinct registry key (no collision ban).
+        writer.createTool({
+            name: 'Existing',
+            description: 'Case variant.',
+            tags: ['x'],
+            source: 'return "replaced";'
+        });
+        await expect(writer.executeTool('Existing', {})).resolves.toBe('replaced');
 
-        // Nothing was registered by the rejected attempts.
         expect(Object.keys(writer.tools)).toEqual([
-            'existing',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -248,7 +263,11 @@ describe('toolCreate', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'threadFork'
+            'threadFork',
+            'toolCancel',
+            'existing',
+            'agentDelegate',
+            'Existing'
         ]);
     });
 
@@ -313,10 +332,10 @@ describe('toolCreate', () => {
             });
         }
 
-        // Nine harness-owned core tools plus the 32 creations (toolRequest,
-        // toolCreate, the four record tools, agentManage/agentResult, and N6's
-        // threadFork).
-        expect(Object.keys(writer.tools)).toHaveLength(41);
+        // Eleven harness-owned baseline entries (toolRegistry, toolRequest,
+        // toolCreate, the four record tools, agentManage/agentResult, threadFork,
+        // and the pending-only toolCancel) plus the 32 creations.
+        expect(Object.keys(writer.tools)).toHaveLength(43);
         expect(() =>
             writer.createTool({
                 name: 'generated32',

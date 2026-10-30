@@ -87,8 +87,10 @@ const TOOLBOX = [
     'textSummarize'
 ];
 
-// The harness-owned core set, in registration order, without agentDelegate.
+// The harness-owned core set, in descriptor order, without agentDelegate.
+// toolRegistry leads because the kernel registers it before every other core tool.
 const CORE = [
+    'toolRegistry',
     'toolRequest',
     'toolCreate',
     'todoManage',
@@ -255,27 +257,34 @@ describe('one toolbox, different agents', () => {
         // configured webSearch and stays SEARCHABLE (it is not in CORE).
         for (const name of REAL) {
             expect(registeredTools(name)).toEqual([
-                ...TOOLBOX,
-                'webSearch',
-                'webFetch',
                 ...CORE,
                 'agentDelegate',
-                'threadFork'
+                'threadFork',
+                'toolCancel',
+                ...TOOLBOX,
+                'webSearch',
+                'webFetch'
             ]);
         }
 
         // The example gets the same shared set plus its own failure tool.
         expect(registeredTools('flaky')).toEqual([
+            ...CORE,
+            'threadFork',
+            'toolCancel',
             ...TOOLBOX,
             'testFlaky',
             'webSearch',
-            'webFetch',
-            ...CORE,
-            'threadFork'
+            'webFetch'
         ]);
 
         // The scripted offline fixture is a documented exception.
-        expect(registeredTools('demo')).toEqual(['timeNow', ...CORE, 'threadFork']);
+        expect(registeredTools('demo')).toEqual([
+            ...CORE,
+            'threadFork',
+            'toolCancel',
+            'timeNow'
+        ]);
     });
 
     it('registers the identical toolbox on every real preset when the host is keyless', () => {
@@ -286,11 +295,12 @@ describe('one toolbox, different agents', () => {
         // a keyless host; it lands after the shared table and before the core set.
         for (const name of REAL) {
             expect(registeredTools(name)).toEqual([
-                ...TOOLBOX,
-                'webFetch',
                 ...CORE,
                 'agentDelegate',
-                'threadFork'
+                'threadFork',
+                'toolCancel',
+                ...TOOLBOX,
+                'webFetch'
             ]);
         }
 
@@ -400,14 +410,14 @@ describe('one toolbox, different agents', () => {
 
         // Pin the configured real order too, so a descriptor cannot drift silently.
         expect(describeHarness(presetOf('instruct'), configured).coreTools).toEqual([
+            ...CORE,
+            'agentDelegate',
+            'threadFork',
             'fileRead',
             'fileWrite',
             'fileEdit',
             'fileGlob',
-            'webSearch',
-            ...CORE,
-            'agentDelegate',
-            'threadFork'
+            'webSearch'
         ]);
         // W4: webFetch is registered by the live factory but is SEARCHABLE, so a
         // descriptor must never advertise it as a core declaration.

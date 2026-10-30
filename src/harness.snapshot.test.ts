@@ -416,6 +416,7 @@ describe('harness snapshot/restore', () => {
             { role: 'user', content: 'continue' }
         ]);
         expect((seen[0].tools ?? []).map((declaration) => declaration.name)).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',

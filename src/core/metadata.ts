@@ -60,6 +60,10 @@ import { ACTION_REQUEST_LIMITS } from './action';
 // tool source.
 export const TOOL_REQUEST_NAME = 'toolRequest';
 export const TOOL_CREATE_NAME = 'toolCreate';
+// Runtime source registration/replacement (self-modifying tools). This is an
+// ordinary core tool that delegates to the harness kernel; it is deliberately not
+// reserved and can replace itself like every other tool.
+export const TOOL_REGISTRY_NAME = 'toolRegistry';
 export const TODO_MANAGE_NAME = 'todoManage';
 export const PROFILE_MANAGE_NAME = 'profileManage';
 export const CHAPTER_MANAGE_NAME = 'chapterManage';
@@ -171,6 +175,77 @@ export const TOOL_CREATE_METADATA: CoreToolMetadata = {
             }
         },
         required: ['name', 'description', 'tags', 'source'],
+        additionalProperties: false
+    }
+};
+
+// Self-modifying source registration. `sourcePath` and `moduleText` are mutually
+// exclusive; both compile through the SAME synchronous kernel operation startup
+// uses. Successful registration publishes metadata, schema, and implementation
+// together, and replaces an existing name (including this tool's own) atomically.
+// Transpilation is not a type check and the loaded code runs with full process
+// permissions; the description states both facts so the model is not misled.
+export const TOOL_REGISTRY_METADATA: CoreToolMetadata = {
+    name: TOOL_REGISTRY_NAME,
+    description:
+        'Compile and register a tool from editable source, replacing any existing registration with the same name. Provide `sourcePath` (a tool-source-relative or absolute path) or `moduleText` (full TypeScript/JavaScript module text). The module must export a Tool (named/default), a `tool` export, or `metadata` + `execute`. Local helper imports are compiled from source; `node:` imports and package dependencies resolve through Node. Success returns the installed name and source revision and makes the tool immediately callable; syntax, loading, or contract failures return diagnostics and leave the previous registration untouched. Transpilation checks syntax, NOT semantic types or runtime correctness, and loaded code runs with full process permissions.',
+    tags: ['tools', 'registry', 'source', 'self-modifying', 'compile'],
+    visibility: 'core',
+    parameters: {
+        type: 'object',
+        properties: {
+            name: {
+                type: 'string',
+                description:
+                    'Wire name to install. Optional when the module exports a named Tool or metadata.name; required for a default/legacy registration.'
+            },
+            sourcePath: {
+                type: 'string',
+                description:
+                    'Editable entry file, relative to the package source roots or absolute. Local relative imports are compiled and captured with it.'
+            },
+            moduleText: {
+                type: 'string',
+                description: 'Full module source, for a revision that is not written to disk yet.'
+            },
+            source: {
+                type: 'string',
+                description:
+                    'Legacy form: the BODY of an async function (args, context) => value. Mutually exclusive with module forms.'
+            },
+            description: {
+                type: 'string',
+                description: 'Optional metadata override for the installed tool.'
+            },
+            tags: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'Optional tag override for the installed tool.'
+            },
+            parameters: {
+                type: 'object',
+                description: 'Optional JSON Schema override for the installed tool.'
+            },
+            visibility: {
+                type: 'string',
+                enum: ['core', 'searchable'],
+                description: 'Optional visibility override; defaults to the module value or "searchable".'
+            },
+            dependencies: {
+                type: 'array',
+                description:
+                    'Optional virtual local modules for moduleText: [{ path, text }]. Relative imports resolve against them.',
+                items: {
+                    type: 'object',
+                    properties: {
+                        path: { type: 'string' },
+                        text: { type: 'string' }
+                    },
+                    required: ['path', 'text'],
+                    additionalProperties: false
+                }
+            }
+        },
         additionalProperties: false
     }
 };

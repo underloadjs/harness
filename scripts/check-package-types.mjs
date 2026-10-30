@@ -21,21 +21,40 @@
 //     node scripts/check-package-types.mjs --scratch <dir> # scratch root override
 //     node scripts/check-package-types.mjs --keep          # keep the fixtures
 //
+// Scratch defaults to <workspace>/Temp/underload-harness/package-types (root
+// AGENTS.md); `--scratch` and `TEMP`/`TMP`/`TMPDIR` are resolved by ./scratch.mjs.
+//
+// The consumer fixture is the RESOLVED `files` shape, not the raw entries: `src`
+// publishes the editable TypeScript tree beside `dist`, so copyPublishedPackage()
+// applies the manifest's negation patterns (tests, snapshots, generated
+// src/frontend/dist) and the checks below assert that source contract explicitly.
+//
 // Run it after `yarn build`. `prepublishOnly` chains it, so a release cannot ship
-// declarations that a NodeNext consumer cannot read.
+// declarations or sources that a NodeNext consumer cannot read.
 //
 // Cross-references:
+//   - ./package-files.mjs              — resolved `files` shape + source layout roots
+//   - ./scratch.mjs                    — repository Temp scratch root
 //   - ./fix-declaration-specifiers.mjs — the post-process this verifies
 //   - ../package.json                  — `exports`, `files`, `test:package`
 //   - ../tsconfig.build.json           — the declaration emit
 
 import { spawnSync } from 'node:child_process';
-import { cpSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { createRequire } from 'node:module';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { builtinModules, createRequire } from 'node:module';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
+import {
+    BUILD_ROOT,
+    EDITABLE_SOURCE_ROOT,
+    PACKAGE_ROOT,
+    copyPublishedPackage,
+    isPublished,
+    publishedFiles,
+    readPackageManifest
+} from './package-files.mjs';
+import { applyScratchEnvironment, resolveScratchRoot } from './scratch.mjs';
 
-const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const require = createRequire(import.meta.url);
 
 const fail = (message) => {
@@ -85,23 +104,103 @@ const resolveTsc = () => {
 };
 
 const tsc = resolveTsc();
-const manifest = JSON.parse(readFileSync(path.join(PACKAGE_ROOT, 'package.json'), 'utf8'));
-const distDir = path.join(PACKAGE_ROOT, 'dist');
+const manifest = readPackageManifest(PACKAGE_ROOT);
+const distDir = path.join(PACKAGE_ROOT, BUILD_ROOT);
 
 if (manifest.type !== 'module') fail('package.json must stay "type": "module" (ESM-only build)');
 if (!existsSync(distDir)) fail('dist/ is missing — run `yarn build` first');
 
+// The resolved packed shape: positive `files` roots minus negation patterns.
+const published = publishedFiles({ root: PACKAGE_ROOT, manifest });
+
 // 1. Every published target must exist and be inside the `files` allow-list.
-const allowedRoots = (manifest.files ?? []).map((entry) => path.join(PACKAGE_ROOT, entry));
 const targets = exportTargets(manifest.exports ?? {}).filter(({ subpath }) => !isManifestSubpath(subpath));
 const missing = targets.filter(({ target }) => !existsSync(path.join(PACKAGE_ROOT, target)));
 if (missing.length > 0) fail(`missing export target(s): ${missing.map(({ target }) => target).join(', ')}`);
 
-const outside = targets.filter(({ target }) => {
-    const absolute = path.join(PACKAGE_ROOT, target);
-    return !allowedRoots.some((root) => absolute === root || absolute.startsWith(`${root}${path.sep}`));
-});
+const outside = targets.filter(
+    ({ target }) => !isPublished(target, { root: PACKAGE_ROOT, manifest })
+);
 if (outside.length > 0) fail(`export target(s) outside "files": ${outside.map(({ target }) => target).join(', ')}`);
+
+// 1b. The editable source model must ship BESIDE the build.
+//
+// tasks/task-harness-self-modifying-tools.md §2/§8: `dist/` is generated and is
+// not editable source. The packaged contract is `<package>/src/**/*.ts` next to
+// `<package>/dist/**`, so a runtime module can resolve sources without a manifest
+// lookup: `fileURLToPath(new URL('../src/', import.meta.url))`.
+const sourceFiles = published.filter((file) => file.startsWith(`${EDITABLE_SOURCE_ROOT}/`));
+if (sourceFiles.length === 0) {
+    fail(`"files" must publish the editable source tree under ${EDITABLE_SOURCE_ROOT}/ beside ${BUILD_ROOT}/`);
+}
+
+const sourceEntry = `${EDITABLE_SOURCE_ROOT}/index.ts`;
+if (!isPublished(sourceEntry, { root: PACKAGE_ROOT, manifest })) fail(`${sourceEntry} is not published`);
+if (!existsSync(path.join(PACKAGE_ROOT, sourceEntry))) fail(`${sourceEntry} is missing from the source tree`);
+
+// Tests, snapshots, and generated browser output must never be shipped as source.
+const testSources = sourceFiles.filter(
+    (file) => /\.(?:test|spec)\.(?:ts|tsx)$/.test(file) || file.includes('/__snapshots__/')
+);
+if (testSources.length > 0) {
+    fail(`test sources leaked into "files": ${testSources.slice(0, 5).join(', ')}`);
+}
+const generatedSources = sourceFiles.filter((file) =>
+    file.startsWith(`${EDITABLE_SOURCE_ROOT}/frontend/${BUILD_ROOT}/`)
+);
+if (generatedSources.length > 0) {
+    fail(`generated browser output leaked into "files": ${generatedSources.slice(0, 5).join(', ')}`);
+}
+
+// Every tool must have an inspectable, independently compilable source entry.
+// The kernel owns the exact per-tool files; packaging only guarantees the tree is
+// present and is not empty.
+const toolSources = sourceFiles.filter(
+    (file) => file.startsWith(`${EDITABLE_SOURCE_ROOT}/tools/`) && file.endsWith('.ts')
+);
+if (toolSources.length === 0) fail('no tool source files are published under src/tools/');
+
+// 1c. Every non-builtin bare import left in `dist` must be a declared
+// `dependencies` entry. Vite externalises `dependencies` (../vite.config.ts), so
+// this is where "the production install can actually run the build" is checked:
+// the runtime compiler (`typescript`, added by the kernel) must not remain a
+// devDependency that a published install omits.
+const runtimeImports = new Set();
+const packageNameOf = (specifier) =>
+    specifier.startsWith('@') ? specifier.split('/').slice(0, 2).join('/') : specifier.split('/')[0];
+const walkDist = (directory) => {
+    for (const entry of readdirSync(directory, { withFileTypes: true })) {
+        const file = path.join(directory, entry.name);
+        if (entry.isDirectory()) {
+            walkDist(file);
+            continue;
+        }
+        if (!/\.(?:mjs|js)$/.test(file)) continue;
+
+        const text = readFileSync(file, 'utf8');
+        for (const match of text.matchAll(/(?:from\s*|import\s*\(\s*|import\s+)['"]([^'"]+)['"]/g)) {
+            const specifier = match[1];
+            if (specifier.startsWith('.') || specifier.startsWith('/') || specifier.startsWith('node:')) continue;
+
+            const name = packageNameOf(specifier);
+            // The regex also matches arbitrary string literals in minified code;
+            // only npm-shaped names can be missing dependencies.
+            if (/^(?:@[a-z0-9][a-z0-9._-]*\/)?[a-z0-9][a-z0-9._-]*$/i.test(name)) runtimeImports.add(name);
+        }
+    }
+};
+walkDist(distDir);
+
+const builtins = new Set([...builtinModules, ...builtinModules.map((id) => `node:${id}`)]);
+const missingDependencies = [...runtimeImports].filter(
+    (name) => !builtins.has(name) && manifest.dependencies?.[name] === undefined
+);
+if (missingDependencies.length > 0) {
+    fail(
+        `dist imports undeclared runtime dependency/dependencies: ${missingDependencies.join(', ')} — ` +
+            'move them from devDependencies to dependencies in package.json'
+    );
+}
 
 for (const { subpath, condition, target } of targets) {
     if (isManifestSubpath(subpath)) continue;
@@ -186,22 +285,16 @@ if (nodeImporters.length > 0) {
 }
 
 // 4. Type-check real consumers against a copied, published shape of the package.
-const scratchArgument = process.argv.indexOf('--scratch');
-const scratchRoot =
-    scratchArgument > 0 && process.argv[scratchArgument + 1] !== undefined
-        ? path.resolve(process.argv[scratchArgument + 1])
-        : path.join(PACKAGE_ROOT, 'node_modules', '.harness-package-types');
+const scratchRoot = resolveScratchRoot({ kind: 'package-types' });
+applyScratchEnvironment(scratchRoot);
 
 const keep = process.argv.includes('--keep');
-mkdirSync(scratchRoot, { recursive: true });
 const work = mkdtempSync(path.join(scratchRoot, 'run-'));
 const packageCopy = path.join(work, 'node_modules', '@underload', 'harness');
 
 mkdirSync(packageCopy, { recursive: true });
 writeFileSync(path.join(packageCopy, 'package.json'), JSON.stringify(manifest, null, 4), 'utf8');
-for (const entry of manifest.files ?? []) {
-    cpSync(path.join(PACKAGE_ROOT, entry), path.join(packageCopy, entry), { recursive: true });
-}
+copyPublishedPackage({ sourceRoot: PACKAGE_ROOT, targetRoot: packageCopy, manifest, entries: published });
 
 // A consumer project: `files` plus a tsconfig and one entry module.
 const consumer = (name, tsconfig, source) => {
@@ -290,5 +383,5 @@ if (failed) process.exit(1);
 
 console.log(
     `package types: ${declarationState.scanned} declaration file(s) are NodeNext-clean; ` +
-        `${targets.length} export target(s) published from ${manifest.files.join(', ')}`
+        `${targets.length} export target(s) and ${published.length} file(s) published from ${manifest.files.join(', ')}`
 );

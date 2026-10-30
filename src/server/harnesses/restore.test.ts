@@ -182,7 +182,7 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         expect(restoredDemo.template).toBe('scripted');
         // The scripted factory (timeNow only) is still what this entry runs.
         expect(Object.keys(restoredDemo.create(SETTINGS, progress).tools)).toEqual([
-            'timeNow',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -191,7 +191,9 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
             'locationManage',
             'agentManage',
             'agentResult',
-            'threadFork'
+            'threadFork',
+            'toolCancel',
+            'timeNow'
         ]);
 
         const restoredFlaky = registry.find('flaky')!;

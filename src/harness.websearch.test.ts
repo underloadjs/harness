@@ -134,7 +134,7 @@ describe('registration', () => {
         ).toThrow('webSearch provider "exa" apiKey must be a string or a function returning one.');
     });
 
-    it('lets a configured tool named webSearch win', () => {
+    it('lets a configured tool named webSearch win', async () => {
         const custom = tool<{ query: string }, string>({
             description: 'A caller-provided search tool.',
             tags: ['web', 'search'],
@@ -153,7 +153,11 @@ describe('registration', () => {
             websearch: { env: { EXA_API_KEY: 'exa-secret-key' } }
         });
 
-        expect(writer.tools.webSearch).toBe(custom);
+        expect(writer.tools.webSearch).not.toBe(custom);
+        expect(writer.tools.webSearch.description).toBe(custom.description);
+        await expect(writer.executeTool('webSearch', { query: 'custom' })).resolves.toBe(
+            'custom result'
+        );
     });
 });
 

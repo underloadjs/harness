@@ -79,7 +79,7 @@ describe('registration', () => {
         expect(Object.keys(properties)).toEqual(['url', 'format', 'provider']);
     });
 
-    it('a configured tool named webFetch wins over the field', () => {
+    it('a configured tool named webFetch wins over the field', async () => {
         const custom = tool({
             description: 'My own fetch.',
             tags: ['web'],
@@ -92,7 +92,11 @@ describe('registration', () => {
             webfetch: true
         });
 
-        expect(writer.tools.webFetch).toBe(custom);
+        // Configured definitions are wrapped rather than mutating/sharing the
+        // caller's Tool object; the configured description wins.
+        expect(writer.tools.webFetch).not.toBe(custom);
+        expect(writer.tools.webFetch.description).toBe('My own fetch.');
+        await expect(writer.executeTool('webFetch', {})).resolves.toEqual({ content: 'mine' });
     });
 
     it('is callable through the registry with an injected env', async () => {
@@ -110,7 +114,9 @@ describe('registration', () => {
             webfetch: { env: {} }
         });
 
-        const result = (await writer.tools.webFetch({ url: 'https://example.com' })) as {
+        const result = (await writer.executeTool('webFetch', {
+            url: 'https://example.com'
+        })) as {
             content: string;
             title?: string;
         };
@@ -161,6 +167,18 @@ describe('live toolbox harness', () => {
         // Registration order: shared toolbox table first, then the configured web
         // tools (keyless, so webSearch is absent), then the harness-owned set.
         expect(Object.keys(writer.tools)).toEqual([
+            'toolRegistry',
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
+            'agentManage',
+            'agentResult',
+            'agentDelegate',
+            'threadFork',
+            'toolCancel',
             'syntaxCheck',
             'fileRead',
             'fileWrite',
@@ -174,17 +192,7 @@ describe('live toolbox harness', () => {
             'diceRoll',
             'noteSearch',
             'textSummarize',
-            'webFetch',
-            'toolRequest',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'agentDelegate',
-            'threadFork'
+            'webFetch'
         ]);
         expect(writer.tools.webFetch.name).toBe('webFetch');
         expect(writer.tools.webFetch.visibility).toBe('searchable');
@@ -194,29 +202,7 @@ describe('live toolbox harness', () => {
 
         // Searchable, not core: the first request declares only the core set.
         expect(declaredNames(seen[0])).toEqual([
-            'fileRead',
-            'fileWrite',
-            'fileEdit',
-            'fileGlob',
-            'toolRequest',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'agentDelegate',
-            'threadFork'
-        ]);
-
-        // toolRequest enabled it, so the very next request declares it exactly
-        // once, after the core set (the declaration order is core, then discovered).
-        expect(declaredNames(seen[1])).toEqual([
-            'fileRead',
-            'fileWrite',
-            'fileEdit',
-            'fileGlob',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -227,6 +213,30 @@ describe('live toolbox harness', () => {
             'agentResult',
             'agentDelegate',
             'threadFork',
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob'
+        ]);
+
+        // toolRequest enabled it, so the very next request declares it exactly
+        // once, after the core set (the declaration order is core, then discovered).
+        expect(declaredNames(seen[1])).toEqual([
+            'toolRegistry',
+            'toolRequest',
+            'toolCreate',
+            'todoManage',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
+            'agentManage',
+            'agentResult',
+            'agentDelegate',
+            'threadFork',
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
             'webFetch'
         ]);
 

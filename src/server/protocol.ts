@@ -597,11 +597,14 @@ export type CancelSessionRequest = {
 
 export type ToolCallRequest = {
     parameters?: unknown;
-    // Which session also runs the call (R8). REQUIRED for `sessionBound` core
-    // tools (toolRequest, toolCreate, todoManage, agentDelegate): they execute inside
-    // that session's harness so discovery, runtime creation, todos, and delegation
-    // affect the conversation the user is looking at. Accepted but ignored for a
-    // directly callable catalogue tool, which keeps one request shape for the UI.
+    // Which session runs the call (R8; live routing per the self-modifying-tools
+    // R4). When present and non-empty, the call resolves through THAT session's
+    // live harness registry: session-bound core tools (toolRegistry, toolRequest,
+    // toolCreate, todoManage, agentDelegate, …), replaced preset/app tools, and
+    // runtime-created names all execute there, so discovery, registration, todos,
+    // and delegation affect the conversation the user is looking at. Omitted or
+    // empty keeps the static direct runner for a directly callable catalogue tool
+    // (one request shape for the UI); a `sessionBound` core tool then answers 400.
     //
     // 400 when a core call omits it; 404 when the session (or the tool inside that
     // session, e.g. agentDelegate without subagents) does not exist; 409 when the

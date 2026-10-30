@@ -85,6 +85,7 @@ describe('toolCreation policy', () => {
 
         // Not declared to the subagent ...
         expect(declaredNames(seenResearcher[0])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'todoManage',
             'profileManage',
@@ -224,7 +225,7 @@ describe('run depth authority', () => {
         });
         // The subagent never discovered it: make it callable for this fixture by
         // running discovery through the same harness (its result enables it).
-        await writer.tools.toolRequest({ tags: ['agents'] });
+        await writer.executeTool('toolRequest', { tags: ['agents'] });
 
         await writer('go');
 

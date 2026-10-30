@@ -78,6 +78,7 @@ describe('todoManage', () => {
 
         // toolRequest is never called, yet todoManage was declared and executed.
         expect(declaredNames(seen[0])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -167,9 +168,9 @@ describe('todoManage', () => {
         });
 
         // Both agents see todoManage as core; the primary additionally sees delegate.
-        // `peek` was configured, so it precedes the harness-owned names.
+        // `peek` was configured later than the baseline, so it follows them.
         expect(declaredNames(writerSeen[0])).toEqual([
-            'peek',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -180,9 +181,10 @@ describe('todoManage', () => {
             'agentResult',
             'agentDelegate',
             'threadFork',
+            'peek'
         ]);
         expect(declaredNames(researcherSeen[0])).toEqual([
-            'peek',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -191,7 +193,8 @@ describe('todoManage', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'threadFork'
+            'threadFork',
+            'peek'
         ]);
     });
 
@@ -202,45 +205,51 @@ describe('todoManage', () => {
         // Separate factory instances per harness: not the same tool object.
         expect(writerA.tools.todoManage).not.toBe(writerB.tools.todoManage);
 
-        await writerA.tools.todoManage({ action: 'add', text: 'Only A' });
+        // Session-bound core tools execute through the harness so they receive the
+        // live reference and that harness's record store.
+        await writerA.executeTool('todoManage', { action: 'add', text: 'Only A' });
 
-        expect(await writerB.tools.todoManage({ action: 'list' })).toEqual(empty);
+        expect(await writerB.executeTool('todoManage', { action: 'list' })).toEqual(empty);
 
         // A reset is a clean start, including the id sequence.
         writerA.reset();
 
-        expect(await writerA.tools.todoManage({ action: 'list' })).toEqual(empty);
-        expect(await writerA.tools.todoManage({ action: 'add', text: 'After reset' })).toEqual({
+        expect(await writerA.executeTool('todoManage', { action: 'list' })).toEqual(empty);
+        expect(await writerA.executeTool('todoManage', { action: 'add', text: 'After reset' })).toEqual({
             todo: { id: '1', text: 'After reset', completed: false },
             counts: { total: 1, completed: 0, remaining: 1 }
         });
     });
 
-    it('reserves the name for configured tools, plugins, and dynamic creation', () => {
+    it('lets configured tools, plugins, and dynamic creation replace todoManage', async () => {
         const custom = tool({ description: 'Mine.', tags: ['todo'], execute: () => 'ok' });
 
-        expect(() =>
-            harness({
-                agents: { writer: brain(scripted([answer('hi')])) },
-                tools: { todoManage: custom },
-                presets: false
-            })
-        ).toThrow('Tool "todoManage" is reserved by the harness.');
+        const configured = harness({
+            agents: { writer: brain(scripted([answer('hi')])) },
+            tools: { todoManage: custom },
+            presets: false
+        });
+        expect(configured.tools.todoManage).not.toBe(custom);
+        expect(configured.tools.todoManage.description).toBe('Mine.');
+        await expect(configured.executeTool('todoManage', {})).resolves.toBe('ok');
 
-        expect(() =>
-            harness({
-                agents: { writer: brain(scripted([answer('hi')])) },
-                presets: false,
-                plugins: [
-                    {
-                        name: 'claim',
-                        setup: (api) => {
-                            api.addTool('todoManage', { description: 'Mine.', tags: ['todo'], execute: () => 'ok' });
-                        }
+        const plugin = harness({
+            agents: { writer: brain(scripted([answer('hi')])) },
+            presets: false,
+            plugins: [
+                {
+                    name: 'claim',
+                    setup: (api) => {
+                        api.addTool('todoManage', {
+                            description: 'Mine.',
+                            tags: ['todo'],
+                            execute: () => 'plugin'
+                        });
                     }
-                ]
-            })
-        ).toThrow('Tool "todoManage" is reserved by the harness.');
+                }
+            ]
+        });
+        await expect(plugin.executeTool('todoManage', {})).resolves.toBe('plugin');
 
         const writer = quiet(brain(scripted([answer('hi')])));
         const creation = {
@@ -249,17 +258,12 @@ describe('todoManage', () => {
             source: 'return 1;'
         };
 
-        expect(() => writer.createTool({ ...creation, name: 'todoManage' })).toThrow(
-            'Tool name "todoManage" is reserved by the harness.'
-        );
-
-        // toolCreate's reservation check is case-insensitive, like every other
-        // reserved name.
-        expect(() => writer.createTool({ ...creation, name: 'TodoManage' })).toThrow(
-            'Tool name "TodoManage" is reserved by the harness.'
-        );
+        const created = writer.createTool({ ...creation, name: 'todoManage' });
+        expect(created.description).toBe('Mine.');
+        await expect(writer.executeTool('todoManage', {})).resolves.toBe(1);
 
         expect(Object.keys(writer.tools)).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -268,7 +272,8 @@ describe('todoManage', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'threadFork'
+            'threadFork',
+            'toolCancel'
         ]);
     });
 
@@ -284,6 +289,6 @@ describe('todoManage', () => {
         expect((entry.messages[2] as { content: string }).content).toBe(
             'Tool "todoManage" failed: todoManage "add" requires a non-empty "text" string.'
         );
-        expect(await writer.tools.todoManage({ action: 'list' })).toEqual(empty);
+        expect(await writer.executeTool('todoManage', { action: 'list' })).toEqual(empty);
     });
 });

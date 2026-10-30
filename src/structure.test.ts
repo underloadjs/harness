@@ -75,6 +75,8 @@ describe('package layout', () => {
             'core',
             'frontend',
             'plugin',
+            // Independently compilable harness-owned tool source entries.
+            'runtime-tools',
             'server',
             'shared',
             'tools',
@@ -147,7 +149,21 @@ describe('package layout', () => {
         // and a `types` target that is not `.d.ts` (or a runtime target that is not
         // `.mjs`) cannot resolve for a consumer.
         const files = manifest.files ?? [];
-        expect(files).toEqual(['dist']);
+        // Production self-modification needs the editable source tree beside
+        // dist: the runtime compiler reads these files rather than compiled
+        // package artifacts alone.
+        expect(files).toEqual([
+            'dist',
+            'src',
+            '!src/**/*.test.ts',
+            '!src/**/*.test.tsx',
+            '!src/**/*.spec.ts',
+            '!src/**/*.spec.tsx',
+            '!src/**/__snapshots__/**',
+            '!src/frontend/dist/**',
+            '!src/**/node_modules/**',
+            '!src/**/.vite/**'
+        ]);
 
         const targets: { subpath: string; condition: string; target: string }[] = [];
         const walk = (subpath: string, condition: string, value: unknown): void => {
@@ -321,8 +337,14 @@ describe('package layout', () => {
         expect(manifest.scripts['build:types']).toBe('node scripts/build-declarations.mjs');
         expect(manifest.scripts['test:package']).toBe('node scripts/check-package-types.mjs');
         expect(manifest.scripts['test:package:runtime']).toBe('node scripts/check-package-runtime.mjs');
+        expect(manifest.scripts['test:package:files']).toBe(
+            'node --test scripts/package-files.test.mjs'
+        );
+        expect(manifest.scripts['test:package:tools']).toBe(
+            'node scripts/check-package-tools.mjs'
+        );
         expect(manifest.scripts.prepublishOnly).toBe(
-            'npm run typecheck && npm run test && npm run build && npm run test:package && npm run test:package:runtime'
+            'npm run typecheck && npm run test && npm run build && npm run test:package:files && npm run test:package && npm run test:package:runtime && npm run test:package:tools'
         );
 
         for (const script of [

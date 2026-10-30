@@ -452,8 +452,7 @@ describe('background tool calls', () => {
             { role: 'tool', content: expect.any(String), toolCallId: 'b1', name: 'beta' }
         ]);
         expect(seen[0].toolNames).toEqual([
-            'alpha',
-            'beta',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -462,7 +461,9 @@ describe('background tool calls', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'threadFork'
+            'threadFork',
+            'alpha',
+            'beta'
         ]);
 
         // R4: the pause is reported as a done with the pending list, and the wake

@@ -55,7 +55,7 @@ describe('CLI preset selection', () => {
         const offline = preset!.create({ baseURL: '', apiKey: '', model: '' }, () => {});
 
         expect(Object.keys(offline.tools)).toEqual([
-            'timeNow',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -66,7 +66,9 @@ describe('CLI preset selection', () => {
             'agentResult',
             // N6: forks are enabled by default, so threadFork is registered even
             // in the scripted fixture (which has no owner interaction).
-            'threadFork'
+            'threadFork',
+            'toolCancel',
+            'timeNow'
         ]);
         expect(offline.tools.agentDelegate).toBeUndefined();
     });

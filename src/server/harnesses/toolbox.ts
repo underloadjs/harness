@@ -27,9 +27,10 @@
 //                        still lists it as `unconfigured`, never fake-callable.
 //   - core tools       - the four everyday file tools (fileRead, fileWrite,
 //                        fileEdit, fileGlob), webSearch when the host configured a
-//                        key, and the harness-owned set (toolRequest, toolCreate,
-//                        todoManage, profileManage, chapterManage, locationManage,
-//                        plus agentDelegate for a preset that declares subagents).
+//                        key, and the harness-owned set (toolRegistry, toolRequest,
+//                        toolCreate, todoManage, profileManage, chapterManage,
+//                        locationManage, plus agentDelegate for a preset that
+//                        declares subagents).
 //                        fileList and the other package/app tools stay
 //                        searchable, so they wait for toolRequest.
 //
@@ -50,20 +51,22 @@
 //
 // LAZY, NOT EAGER
 // ---------------
-// `presetTools` values are lazy proxies and the harness-tool definitions are
-// already imported by this app. Spreading the table registers names and metadata
-// without loading `node:fs`, `node:child_process`, or `node:vm`; an implementation
-// is imported on first execution. "All tools available" therefore means
-// registered/discoverable, never eagerly loaded.
+// `presetTools` values are lazy proxies, which is exactly why the production
+// harness cannot register them as definitions through `configuration.tools`: that
+// path validates a constructed object and never captures a source revision. The
+// live factory therefore passes `SHARED_TOOL_SOURCES` (concrete paths) so startup
+// compiles each entry through the shared kernel; the standalone catalogue still
+// uses `presetTools`/`SHARED_TOOLS` directly. "All tools available" means
+// registered/discoverable through a real source revision, not an eager body load.
 //
 // Cross-references:
 //   - ./presets.ts      — the preset catalogue built on this factory
 //   - ./tools.ts        — the app tools (timeNow, …, textSummarize) in the shared set
-//   - ../src/harness.ts — `presets: false` + explicit `tools` registry semantics
+//   - ../src/harness.ts — `presets: false` + `toolSources` startup compilation
 //   - ../api.ts  — descriptors resolved from the same preset metadata
 
 import { agent, harness, presetTools, WEB_SEARCH_TOOL_NAME } from '../../harness';
-import type { Agent, Harness, HarnessProgress, Tool } from '../../harness';
+import type { Agent, Harness, HarnessConfiguration, HarnessProgress, Tool } from '../../harness';
 import { agentInstruction, agentProfile } from '../../agents';
 import { harnessTools } from './tools';
 import type { RunnerSettings } from './types';
@@ -106,11 +109,49 @@ export const SHARED_TOOLS: Readonly<Record<string, Tool>> = {
 // preset's advertised toolbox at runtime.
 export const SHARED_TOOL_NAMES: readonly string[] = Object.freeze(Object.keys(SHARED_TOOLS));
 
-// Harness-owned core names. agentDelegate is capability-by-configuration: the
-// harness registers it only when the harness declares subagents, so a single-agent
-// Instruct has no delegation tool while Research does. That difference is the
-// agent configuration, not a difference in the shareable toolbox. These are the
-// ONLY core tools the server marks sessionBound.
+// The editable source entry for every shared tool (R2/T14/F1).
+//
+// WHY SOURCE PATHS AND NOT THE `SHARED_TOOLS` DEFINITIONS
+// -------------------------------------------------------
+// The production harness must register startup tools through the SAME
+// compile/load/validate operation runtime replacements use. `SHARED_TOOLS` holds
+// lazy proxy definitions for package presets and already-constructed app tools;
+// passing them via `configuration.tools` takes the non-compiling
+// `prepareDefinition` branch, so `harness.toolSource('fileRead'/'timeNow')` stays
+// undefined and an agent cannot inspect/edit the revision that is actually running.
+//
+// Every entry here points at the concrete, shipped source file. `createToolboxHarness`
+// passes this map as `toolSources`; the harness compiles each one independently and
+// only then applies host `extraTools` definitions, preserving override order.
+//
+// Paths are relative to the package source roots (`src/` during development, the
+// deployed editable `tool-sources/` copy in production); see core/tool-source.ts.
+export const SHARED_TOOL_SOURCES: Readonly<Record<string, string>> = Object.freeze({
+    // Package preset entries, in the same order as `SHARED_TOOLS`.
+    syntaxCheck: 'tools/syntax/syntaxCheck.ts',
+    fileRead: 'tools/files/fileRead.ts',
+    fileWrite: 'tools/files/fileWrite.ts',
+    fileEdit: 'tools/files/fileEdit.ts',
+    fileList: 'tools/files/fileList.ts',
+    fileGlob: 'tools/files/fileGlob.ts',
+    commandRun: 'tools/command/commandRun.ts',
+    gitDiff: 'tools/command/gitDiff.ts',
+    // App tool entries (R2 extraction), in registration order.
+    timeNow: 'server/harnesses/tool-sources/timeNow.ts',
+    textCount: 'server/harnesses/tool-sources/textCount.ts',
+    diceRoll: 'server/harnesses/tool-sources/diceRoll.ts',
+    noteSearch: 'server/harnesses/tool-sources/noteSearch.ts',
+    textSummarize: 'server/harnesses/tool-sources/textSummarize.ts'
+});
+
+// Harness-owned core names. toolRegistry comes first because the kernel registers
+// it before every other core tool (the source-registration bootstrap); it is still
+// an ordinary session-bound tool, so the descriptor advertises it like the rest.
+// agentDelegate is capability-by-configuration: the harness registers it only when
+// the harness declares subagents, so a single-agent Instruct has no delegation tool
+// while Research does. That difference is the agent configuration, not a difference
+// in the shareable toolbox. These are the ONLY core tools the server marks
+// sessionBound.
 //
 // R3: agentManage/agentResult are unconditional and available to every agent
 // (primary and subagent alike), so they sit with the record tools before
@@ -127,6 +168,7 @@ export const SHARED_TOOL_NAMES: readonly string[] = Object.freeze(Object.keys(SH
 // default in the harness (N6), so every preset's runs declare it, but its runtime
 // registration follows agentDelegate and the descriptor must keep that order.
 export const CORE_TOOL_NAMES = [
+    'toolRegistry',
     'toolRequest',
     'toolCreate',
     'todoManage',
@@ -161,14 +203,18 @@ export const coreToolNames = (
 ): string[] => {
     const available = new Set(registered);
 
+    // The runtime registers its harness-owned baseline FIRST (toolRegistry, then
+    // the core metadata set), then the preset catalogue, then configured/app
+    // tools. `coreTools` mirrors the DECLARED order, so harness-owned entries come
+    // before file presets here too.
     return [
-        ...CORE_PRESET_TOOL_NAMES.filter((name) => available.has(name)),
-        ...CORE_ENVIRONMENT_TOOL_NAMES.filter((name) => available.has(name)),
         ...CORE_TOOL_NAMES,
         ...(subagents.length > 0 ? ['agentDelegate'] : []),
         // N6: always registered (forks default enabled), after agentDelegate in
         // the runtime's registration order.
-        'threadFork'
+        'threadFork',
+        ...CORE_PRESET_TOOL_NAMES.filter((name) => available.has(name)),
+        ...CORE_ENVIRONMENT_TOOL_NAMES.filter((name) => available.has(name))
     ];
 };
 
@@ -250,28 +296,47 @@ export type ToolboxHarnessConfiguration = {
     primary: string;
     // Omitted/empty means a single-agent harness (no agentDelegate tool).
     subagents?: readonly string[];
-    // Example-only extras (the recoverable-failure preset adds `testFlaky`). Never
-    // used by Instruct/Research/Workspace, so the shared set stays exact.
+    // Example-only SOURCE extras (the recoverable-failure preset adds `testFlaky`).
+    // Merged after the shared source map and before host `extraTools`, so a shipped
+    // exception is still compiled from its editable entry instead of a prebuilt
+    // definition, while a host definition can still override it.
+    extraToolSources?: Readonly<Record<string, string>>;
+    // Host/example constructed DEFINITION overrides, registered last so they win
+    // over both the shared and extra source maps.
     extraTools?: Readonly<Record<string, Tool>>;
 };
 
-// Build a live harness from agent configuration + the shared toolbox. `presets:
-// false` keeps the registry explicit: the shared table is the only catalogue a
-// session can see, so nothing outside the advertised descriptor set sneaks in
-// through the library's default preload.
+// Build a live harness from agent configuration + the shared toolbox.
+//
+// STARTUP COMPILATION (T14/F1): every shipped tool is supplied as an editable
+// source PATH through `toolSources`, not as a constructed Tool through `tools`.
+// The harness compiles/loads/validates each entry through the SAME kernel runtime
+// replacements use, so `harness.toolSource('fileRead')` and
+// `harness.toolSource('timeNow')` report a real module revision instead of
+// `undefined`. `presets: false` still keeps the registry exact: the kernel's
+// default baseline is skipped because `SHARED_TOOL_SOURCES` lists precisely the
+// shared set a descriptor advertises.
+//
+// `configuration.extraToolSources` is merged AFTER the shared source map and
+// BEFORE `configuration.extraTools`: shipped exceptions (the flaky example's
+// `testFlaky`) are compiled from their editable entries, while a host definition
+// still wins on a name collision exactly as before. Environment tools
+// (webSearch/webFetch) follow the host configuration as usual.
 export const createToolboxHarness = (
     configuration: ToolboxHarnessConfiguration,
     settings: RunnerSettings,
     progress: HarnessProgress,
     observer?: HarnessPresetReport
-): Harness =>
-    harness({
+): Harness => {
+    const liveConfiguration: HarnessConfiguration = {
         agents: configuration.agents,
         // Explicit routing: the entry agent is named even with one key, and the
         // allowlist is copied so later mutation cannot change a live harness.
         primary: configuration.primary,
         ...(configuration.subagents === undefined ? {} : { subagents: [...configuration.subagents] }),
-        tools: { ...SHARED_TOOLS, ...configuration.extraTools },
+        toolSources: { ...SHARED_TOOL_SOURCES, ...configuration.extraToolSources },
+        // Host/example DEFINITIONS override sources by being registered last.
+        tools: { ...configuration.extraTools },
         presets: false,
         // Live sessions use the app-wide tool-loop budget, not the library's 16.
         maxIterations: PRESET_MAX_ITERATIONS,
@@ -298,4 +363,7 @@ export const createToolboxHarness = (
         // runtime register actionRequest. A missing hook simply means this host has
         // no answerer and the tool is not declared.
         ...(observer?.interaction === undefined ? {} : { interaction: observer.interaction })
-    });
+    };
+
+    return harness(liveConfiguration);
+};

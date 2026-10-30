@@ -53,6 +53,22 @@ export { agent } from './agent';
 export { tool, toolParameterKey, normalizeTags } from './tool';
 export { MAX_DISCOVERY_MATCHES, searchTools } from './discovery';
 export { compileToolSource, createDynamicTool, DEFAULT_CREATED_TOOLS_LIMIT } from './creation';
+// The synchronous module compiler behind startup/runtime source registration.
+// Exported for focused tests and for a host that wants to validate a candidate
+// without publishing it; the harness owns the only publish path.
+export {
+    TOOL_SOURCE_PACKAGE_ROOT,
+    TOOL_SOURCE_ROOTS,
+    cloneToolSourceRecord,
+    prepareToolCandidate,
+    supportsToolCompilation
+} from './tool-source';
+export type {
+    PreparedTool,
+    ToolRegistrationCandidate,
+    ToolSourceDependency,
+    ToolSourceRecord
+} from './tool-source';
 export {
     MODEL_TOOL_RESULT_BUDGET_BYTES,
     boundToolResult,
@@ -102,6 +118,8 @@ export type {
 export {
     TOOL_CREATE_METADATA,
     TOOL_CREATE_NAME,
+    TOOL_REGISTRY_METADATA,
+    TOOL_REGISTRY_NAME,
     AGENT_DELEGATE_NAME,
     AGENT_MANAGE_METADATA,
     AGENT_MANAGE_NAME,

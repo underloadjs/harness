@@ -9,7 +9,9 @@
 // unusable in plain Node. Type declarations and import-safety checks cannot see that;
 // this can.
 //
-// What it asserts against `dist/`:
+// What it asserts:
+//   0. the editable TypeScript source tree (`src/`) is packed beside portable
+//      output (`dist/`), with no test files — the runtime compiler's inputs;
 //   1. `loadEnvironmentFile()` reads a real file (the dotenv path);
 //   2. `createHarnessRuntime({ root })` binds the durable database to that absolute
 //      root, and a session created through its API persists under it;
@@ -18,8 +20,8 @@
 //
 // Safety: loopback + port 0 only (never a fixed or production port), no signal
 // handlers, no machine-environment changes, and no `.env` value is ever printed —
-// only paths, status codes and booleans. Scratch lives in a temp root (`--scratch`)
-// and is removed unless `--keep`.
+// only paths, status codes and booleans. Scratch lives under the repository-root
+// Temp (`--scratch` overrides; see ./scratch.mjs) and is removed unless `--keep`.
 //
 // USAGE
 //     node scripts/check-package-runtime.mjs                 # checks <package>/dist
@@ -29,15 +31,24 @@
 //
 // Cross-references:
 //   - ../vite.config.ts              — the externalisation this regression guards
+//   - ./package-files.mjs            — packed shape + source-beside-dist contract
+//   - ./scratch.mjs                  — repository Temp scratch root
 //   - ./check-package-types.mjs      — declaration/type counterpart
 //   - ../package.json                — `test:package:runtime`
 
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pathToFileURL } from 'node:url';
+import {
+    BUILD_ROOT,
+    EDITABLE_SOURCE_ROOT,
+    PACKAGE_ROOT,
+    publishedFiles,
+    readPackageManifest
+} from './package-files.mjs';
+import { applyScratchEnvironment, resolveScratchRoot } from './scratch.mjs';
 
-const PACKAGE_ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
-const DIST = path.join(PACKAGE_ROOT, 'dist');
+const DIST = path.join(PACKAGE_ROOT, BUILD_ROOT);
 
 const fail = (message) => {
     console.error(`package runtime: ${message}`);
@@ -48,14 +59,10 @@ if (!existsSync(path.join(DIST, 'underload-harness.server.mjs'))) {
     fail('dist/ has no server entry — run `yarn build` first');
 }
 
-const scratchArgument = process.argv.indexOf('--scratch');
-const scratchRoot =
-    scratchArgument > 0 && process.argv[scratchArgument + 1] !== undefined
-        ? path.resolve(process.argv[scratchArgument + 1])
-        : path.join(PACKAGE_ROOT, 'node_modules', '.harness-package-runtime');
+const scratchRoot = resolveScratchRoot({ kind: 'package-runtime' });
+applyScratchEnvironment(scratchRoot);
 const keep = process.argv.includes('--keep');
 
-mkdirSync(scratchRoot, { recursive: true });
 const work = mkdtempSync(path.join(scratchRoot, 'run-'));
 
 // Result bookkeeping. `check` awaits its callback so an async assertion cannot pass
@@ -81,6 +88,31 @@ const server = await importFromDist('underload-harness.server.mjs');
 const nodeRoot = await importFromDist('underload-harness.mjs');
 
 console.log('package runtime: built dist');
+
+// The installed layout must expose editable TypeScript beside the generated
+// build. A runtime compiler resolves that sibling path, so a published package
+// containing only `dist/` would be unable to self-modify in production
+// (tasks/task-harness-self-modifying-tools.md §2/§8).
+await check('editable source tree ships beside dist', () => {
+    const manifest = readPackageManifest(PACKAGE_ROOT);
+    const published = publishedFiles({ root: PACKAGE_ROOT, manifest });
+    const sourceRoot = path.join(PACKAGE_ROOT, EDITABLE_SOURCE_ROOT);
+    const sourceEntry = path.join(sourceRoot, 'index.ts');
+
+    assert(existsSync(sourceRoot), `${EDITABLE_SOURCE_ROOT}/ is missing beside ${BUILD_ROOT}/`);
+    assert(existsSync(sourceEntry), `${EDITABLE_SOURCE_ROOT}/index.ts is missing`);
+    assert(
+        path.dirname(sourceRoot) === path.dirname(DIST),
+        `${EDITABLE_SOURCE_ROOT}/ and ${BUILD_ROOT}/ are not siblings`
+    );
+
+    const sourceFiles = published.filter((file) => file.startsWith(`${EDITABLE_SOURCE_ROOT}/`));
+    const tests = sourceFiles.filter((file) => /\.(?:test|spec)\.(?:ts|tsx)$/.test(file));
+    assert(sourceFiles.length > 0, 'the manifest does not publish src/');
+    assert(tests.length === 0, `test files are published as source: ${tests.slice(0, 3).join(', ')}`);
+
+    return { source: EDITABLE_SOURCE_ROOT, files: sourceFiles.length };
+});
 
 await check('server entry exports the reusable API', () => ({
     startHarnessServer: typeof server.startHarnessServer,

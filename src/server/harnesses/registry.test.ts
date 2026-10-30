@@ -162,8 +162,7 @@ describe('creating a harness', () => {
         // this host is keyless; webFetch needs no credential, so it lands first of
         // the appended tools and stays searchable (not core).
         expect(Object.keys(harness.tools)).toEqual([
-            ...SHARED_TOOL_NAMES,
-            'webFetch',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -173,7 +172,10 @@ describe('creating a harness', () => {
             'agentManage',
             'agentResult',
             'agentDelegate',
-            'threadFork'
+            'threadFork',
+            'toolCancel',
+            ...SHARED_TOOL_NAMES,
+            'webFetch'
         ]);
 
         // The registry lists it after the built-ins.
@@ -440,7 +442,7 @@ describe('updating a harness', () => {
 
         // The runtime really keeps them: these are the exact registered names.
         expect(Object.keys(demoAfter.create(SETTINGS, progress).tools)).toEqual([
-            'timeNow',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -449,7 +451,9 @@ describe('updating a harness', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'threadFork'
+            'threadFork',
+            'toolCancel',
+            'timeNow'
         ]);
         expect(Object.keys(flakyAfter.create(SETTINGS, progress).tools)).toContain('testFlaky');
 
@@ -487,7 +491,7 @@ describe('updating a harness', () => {
         // The captured scripted harness is unchanged (frozen-session guarantee).
         expect(Object.keys(scripted.agents)).toEqual(['demo']);
         expect(Object.keys(scripted.tools)).toEqual([
-            'timeNow',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -496,7 +500,9 @@ describe('updating a harness', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'threadFork'
+            'threadFork',
+            'toolCancel',
+            'timeNow'
         ]);
     });
 

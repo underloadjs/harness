@@ -181,6 +181,7 @@ describe('threadFork runtime', () => {
         // The requester only ever received normal tool results between its turns.
         expect(entry.messages.filter((message) => message.role === 'user')).toHaveLength(1);
         expect(toolNames(seen[seen.length - 1])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -770,7 +771,7 @@ describe('threadFork runtime', () => {
         // The branch shared the harness todo store, so its tool mutation is still
         // a persistence-worthy event.
         expect(reasons).toContain('tool_execute:todoManage');
-        expect(await writer.tools.todoManage({ action: 'list' })).toEqual({
+        expect(await writer.executeTool('todoManage', { action: 'list' })).toEqual({
             todos: [{ id: '1', text: 'Shared item', completed: false }],
             counts: { total: 1, completed: 0, remaining: 1 },
             page: { offset: 0, limit: 20, hasMore: false }

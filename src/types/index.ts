@@ -448,7 +448,8 @@ export type ToolSearchOptions = {
 // source does not parse.
 export type ToolCreation = {
     // Wire name the model calls. Must match the registry-safe pattern in
-    // src/core/creation.ts and must not collide with a registered name.
+    // src/core/tool-source.ts and is NOT reserved: an intentional replacement of
+    // any name, including a harness-owned one, is published atomically.
     name: string;
     // Shown to the model and used by toolRequest matching.
     description: string;
@@ -456,8 +457,22 @@ export type ToolCreation = {
     tags: readonly string[];
     // Optional JSON Schema for the arguments.
     parameters?: Record<string, unknown>;
-    // Async function body, e.g. `return args.toUpperCase();`.
-    source: string;
+    // Legacy async function body, e.g. `return args.toUpperCase();`.
+    // OPTIONAL when `moduleText` is present: source-registered tools persist their
+    // full module revision instead.
+    source?: string;
+    // Full editable module source retained by a source registration so a snapshot
+    // can recompile it. Mutually exclusive with `source`.
+    moduleText?: string;
+    // Package-relative or absolute entry path. When present on a snapshot record
+    // restore re-reads the editable source (the record also carries moduleText as
+    // a stable fallback for an edited/deleted file).
+    sourcePath?: string;
+    // Captured local helper modules for the module revision.
+    dependencies?: readonly { path: string; text: string }[];
+    // Optional visibility of the installed registration. Existing toolCreate
+    // records omit it (searchable + enabled).
+    visibility?: ToolVisibility;
 };
 
 // What a successful toolCreate call hands back to the model. Metadata only: the
@@ -470,6 +485,136 @@ export type ToolCreationResult = {
     // A created tool is registered `searchable` and enabled at once, so the very
     // next turn can call it without a second toolRequest round.
     enabled: true;
+};
+
+// One captured local helper that belongs to an installed source revision.
+export type HarnessToolSourceDependency = {
+    path: string;
+    text: string;
+};
+
+// Inspection view of the exact source revision behind a registered tool. `tools`
+// registered from an already-constructed definition (configured tools/plugins)
+// have no source entry and return undefined from `harness.toolSource()`.
+export type HarnessToolSource = {
+    name: string;
+    // Content-addressed revision of the entry plus every captured local helper.
+    revision: string;
+    sourcePath?: string;
+    moduleText?: string;
+    dependencies: HarnessToolSourceDependency[];
+    format: 'module' | 'function-body';
+    source?: string;
+    // The checks that were actually performed before publication. This is NOT a
+    // claim of semantic type checking or behavioural correctness.
+    checks: readonly string[];
+};
+
+// A candidate accepted by the kernel's single compile/load/validate/register
+// operation. `sourcePath` and `moduleText` are module forms; `source` is the
+// legacy async-body form. `definition` is accepted for host/plugin compatibility:
+// those definitions are already constructed and are published through the SAME
+// registry commit path (no source revision exists to inspect).
+export type HarnessToolRegistrationCandidate = {
+    name?: string;
+    description?: string;
+    tags?: readonly string[];
+    parameters?: Record<string, unknown>;
+    visibility?: ToolVisibility;
+    source?: string;
+    moduleText?: string;
+    sourcePath?: string;
+    dependencies?: readonly HarnessToolSourceDependency[];
+};
+
+// What a successful registration returns. It is metadata only: no function,
+// schema body, or source text is echoed to the model.
+export type HarnessToolRegistrationResult = {
+    name: string;
+    // The installed revision. A replacement changes this value.
+    revision: string;
+    // True when the name was not registered before this call.
+    created: boolean;
+    // True when an existing registration was atomically replaced.
+    replaced: boolean;
+    previousRevision?: string;
+    sourcePath?: string;
+    // The checks performed by the kernel for this revision.
+    checks: readonly string[];
+};
+
+// Harness-owned, stable tool memory. It survives implementation replacement and
+// is shared by every agent/tool in this harness. It is intentionally NOT reset by
+// a tool replacement; `reset()` is a session operation and leaves it intact so a
+// replacement can keep its durable state. It is not persisted across processes
+// (that is the existing snapshot contract, not this feature).
+export type HarnessMemory = {
+    // Direct key/value map for tool-owned state. Values may be any JS value.
+    readonly data: Record<string, unknown>;
+    get: (key: string) => unknown;
+    set: (key: string, value: unknown) => void;
+    has: (key: string) => boolean;
+    delete: (key: string) => boolean;
+    keys: () => string[];
+    clear: () => void;
+};
+
+// Live operations the standalone core-tool source entries delegate to. These are
+// kernel/harness state operations (discovery, guarded creation, per-session record
+// stores), not a restricted capability facade: every tool still receives the
+// unrestricted `context.harness` reference above.
+export type HarnessToolRuntime = {
+    // toolRequest: rank/enable catalogue matches with this harness's discovery
+    // cursor and caller-specific core view. Returns the existing search result.
+    requestTools: (
+        caller: Agent | undefined,
+        parameters: { tags?: unknown; limit?: unknown } | unknown
+    ) => ToolSearchResult;
+    // toolCreate: guarded model-facing creation (policy + lifetime budget) through
+    // the same registration kernel. The HOST `createTool` path remains unguarded
+    // by role policy.
+    createToolForAgent: (caller: Agent | undefined, creation: ToolCreation) => ToolCreationResult;
+    // agentManage/agentResult read the harness's bounded invocation registry
+    // (completed answer values only, never transcripts).
+    agentManage: () => unknown;
+    agentResult: (parameters: Record<string, any>) => unknown;
+    // agentDelegate: one-level bounded delegation. `run` is the invocation-bound
+    // harness runner from ToolContext (never a captured implementation).
+    delegate: (
+        caller: Agent | undefined,
+        parameters: { agent?: string; input?: string },
+        run: ToolContext['run'],
+        runDepth: number | undefined
+    ) => Promise<HarnessDelegationResult>;
+    // Conditional cross-thread chat / roster. Sender identity comes from the
+    // runtime context, never from model arguments.
+    threadSend: (
+        caller: Agent | undefined,
+        threadId: string | undefined,
+        parameters: Record<string, unknown>
+    ) => HarnessThreadMessageResult;
+    threadList: (threadId: string | undefined) => HarnessThreadRoster;
+    // Opt-in network tools. The per-harness provider closures (and therefore their
+    // credentials) live in the harness; the independently compiled source entries
+    // only delegate to these live operations. A source replacement that does not
+    // use the configured provider can ignore them.
+    webSearch: (context: ToolContext) => Promise<unknown>;
+    webFetch: (context: ToolContext) => Promise<unknown>;
+    // Session record stores (todo/profile/chapter/location) executed by their
+    // source entries. State stays harness-owned and is cleared by reset().
+    executeRecordTool: (
+        name: 'todoManage' | 'profileManage' | 'chapterManage' | 'locationManage',
+        context: ToolContext
+    ) => Promise<unknown>;
+};
+
+// Options for a nested/registered-tool invocation through `harness.callTool`.
+// Everything omitted is inherited by `ToolContext.callTool` from the calling run.
+export type HarnessToolCallOptions = {
+    agent?: Agent;
+    signal?: AbortSignal;
+    threadId?: string;
+    runDepth?: number;
 };
 
 // Who may create tools at runtime (R12). See HarnessConfiguration.toolCreation:
@@ -977,6 +1122,19 @@ export type ToolContext<TParameters = any> = {
     // cross-thread message cannot be spoofed by the model. Absent for a manual
     // `executeTool` call, which runs as the primary agent outside any thread.
     threadId?: string;
+    // The LIVE harness instance this call belongs to. This is the ORIGINAL
+    // reference created at startup, never a clone, spread, serialized copy, or
+    // replacement harness. It is present for every harness invocation (model,
+    // manual executeTool, nested callTool) and absent for a standalone direct
+    // `tool()(args)` call. A replacement tool therefore receives strict-identical
+    // harness identity to the tool it replaced.
+    harness?: Harness;
+    // Invoke another REGISTERED tool through the live registry, preserving schema
+    // validation, caller/thread identity, cancellation, and state-change
+    // reporting. The definition is resolved at CALL time, so a later replacement
+    // is observed rather than a fixed imported implementation. Available only
+    // inside a harness invocation (it is bound to the current run/call context).
+    callTool?: (name: string, parameters: unknown) => Promise<unknown>;
 };
 
 // A tool definition. `name` is optional: inside a harness the registry key names
@@ -1687,6 +1845,20 @@ export type HarnessConfiguration = {
     // `visibility: 'core'` tools are declared up front; the rest are found
     // through the built-in toolRequest tool and enabled for the next turn.
     tools?: Record<string, Tool>;
+    // Independently compiled source entries, keyed by wire name. Semantics:
+    //   - each value is a source path accepted by the kernel's shared compiler
+    //     (package-source-relative, e.g. `server/harnesses/tool-sources/foo.ts`,
+    //     or absolute);
+    //   - registrations commit after the baseline core/preset set and BEFORE
+    //     `tools` overrides, so a configured Tool of the same name wins;
+    //   - the installed revision is inspectable through `harness.toolSource()`
+    //     and is replaceable like every other registration.
+    // This is the application/extracted-tool integration point: a host does not
+    // need to prebuild a Tool or pass a definition through a fake compiler path.
+    // Virtual dependencies are not expressible here (the path's real local
+    // imports are captured); use `harness.registerTool({ moduleText, dependencies })`
+    // for an in-memory revision.
+    toolSources?: Record<string, string>;
     // Preload the bundled preset catalogue (src/tools/) into the registry. True by
     // default: discovery exists so a large catalogue costs nothing until it is
     // asked for. Set false to start from `tools` alone. A configured tool wins on
@@ -1750,6 +1922,41 @@ export type Harness = {
     // "searchable and enabled at once" behaviour. Throws HarnessError on invalid
     // or colliding input, so a host sees creation failures as exceptions.
     toolCreate: (configuration: ToolCreation) => Tool;
+    // The ONE compile/load/validate/register operation. Startup registration,
+    // toolRegistry, configured tools, and plugins all commit through this method
+    // (startup may call the non-awaited kernel internally because toolRegistry
+    // does not exist yet). A source candidate is captured and compiled
+    // SYNCHRONOUSLY before the returned promise is created; that promise then
+    // resolves with the already-published result. Publication is therefore a
+    // completion barrier: a call submitted after this returns sees the new
+    // definition, and overlapping registrations complete in submission (FIFO)
+    // order because no compilation is deferred to a background task. Replacements
+    // do not consume the new-tool budget.
+    registerTool: (
+        candidate: HarnessToolRegistrationCandidate
+    ) => Promise<HarnessToolRegistrationResult>;
+    // Inspect the captured source/revision of the installed registration. `undefined`
+    // means the tool was registered from an already-constructed definition (no
+    // editable source revision exists for it).
+    toolSource: (name: string) => HarnessToolSource | undefined;
+    // Every installed source revision, in registry insertion order.
+    toolSources: () => HarnessToolSource[];
+    // Invoke a registered tool through the live registry with the same schema
+    // validation as the manual path. Used by tools to reach other tools without
+    // importing/capturing a fixed implementation. Resolves the definition at call
+    // time, preserves caller/thread/signal when supplied, and notifies persistence
+    // observers exactly like executeTool.
+    callTool: (
+        name: string,
+        parameters: unknown,
+        options?: HarnessToolCallOptions
+    ) => Promise<unknown>;
+    // Stable harness-owned memory shared by every tool and agent. Replacing an
+    // implementation does not reset it.
+    readonly memory: HarnessMemory;
+    // Live operations behind the standalone core-tool source entries. This is an
+    // addition to (never a replacement for) the unrestricted harness reference.
+    readonly runtime: HarnessToolRuntime;
     // Execute one registered tool by name, outside the model's discovery gate
     // (R8). This is the server/host path for an EXPLICIT user action — the CLI or
     // the UI's Tools tab — and it runs the SAME session-bound implementation the

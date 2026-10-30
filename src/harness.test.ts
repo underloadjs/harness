@@ -106,8 +106,10 @@ describe('harness', () => {
             tools: { webSearch }
         });
 
-        expect(writer.tools.webSearch).toBe(webSearch);
-        expect(webSearch.name).toBe('webSearch');
+        expect(writer.tools.webSearch.name).toBe('webSearch');
+        // The caller's shared Tool is not mutated; only the registered wrapper is
+        // named by the configuration key.
+        expect(webSearch.name).toBe('tool');
         expect(writer.tools.toolRequest.visibility).toBe('core');
     });
 
@@ -128,9 +130,9 @@ describe('harness', () => {
 
         // The searchable tool is registered but absent from the request; only the
         // configured core tool (plus the harness-owned set) is declared.
-        expect(writer.tools.searchable).toBe(searchable);
+        expect(writer.tools.searchable.name).toBe('searchable');
         expect(declaredNames(seen[0])).toEqual([
-            'core',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -139,7 +141,10 @@ describe('harness', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'threadFork'
+            'threadFork',
+            // A configured core tool is a LATER registration, so it follows the
+            // baseline in declaration order (later registration wins).
+            'core'
         ]);
     });
 
@@ -149,10 +154,14 @@ describe('harness', () => {
 
         await writer('go');
 
-        // Registered, so they can be used without any import...
-        expect(writer.tools.fileRead).toBe(fileRead);
-        expect(writer.tools.commandRun).toBe(commandRun);
-        expect(writer.tools.syntaxCheck).toBe(syntaxCheck);
+        // Registered from their editable source entries, so they can be used
+        // without any import. Each harness gets a FRESH compiled definition rather
+        // than the module-level lazy proxy identity.
+        expect(writer.tools.fileRead).not.toBe(fileRead);
+        expect(writer.tools.fileRead.name).toBe('fileRead');
+        expect(typeof writer.tools.fileRead.execute).toBe('function');
+        expect(writer.tools.commandRun.name).toBe('commandRun');
+        expect(writer.tools.syntaxCheck.name).toBe('syntaxCheck');
         // R18: everyday file access is core; the rest still waits for discovery.
         expect(writer.tools.fileRead.visibility).toBe('core');
         expect(writer.tools.fileWrite.visibility).toBe('core');
@@ -163,10 +172,7 @@ describe('harness', () => {
         // ...so the first request declares exactly the core file tools plus the
         // harness-owned set.
         expect(declaredNames(seen[0])).toEqual([
-            'fileRead',
-            'fileWrite',
-            'fileEdit',
-            'fileGlob',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -175,7 +181,11 @@ describe('harness', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'threadFork'
+            'threadFork',
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob'
         ]);
     });
 
@@ -287,6 +297,7 @@ describe('harness', () => {
 
         expect(writer.tools.fileRead).toBeUndefined();
         expect(Object.keys(writer.tools)).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -295,7 +306,8 @@ describe('harness', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'threadFork'
+            'threadFork',
+            'toolCancel'
         ]);
     });
 
@@ -323,10 +335,7 @@ describe('harness', () => {
         // "javascript" enables syntaxCheck; the core file tools are already
         // declared, and fileGlob is one of them, so discovery adds only syntaxCheck.
         expect(declaredNames(seen[1])).toEqual([
-            'fileRead',
-            'fileWrite',
-            'fileEdit',
-            'fileGlob',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -336,6 +345,10 @@ describe('harness', () => {
             'agentManage',
             'agentResult',
             'threadFork',
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob',
             'syntaxCheck'
         ]);
         expect((entry.messages[4] as { content: string }).content).toBe('true');
@@ -372,6 +385,7 @@ describe('harness', () => {
         // Round one: core only. Round two: the discovered tool joined the
         // declarations, and the unrelated tool stayed out.
         expect(declaredNames(seen[0])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -383,6 +397,7 @@ describe('harness', () => {
             'threadFork'
         ]);
         expect(declaredNames(seen[1])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -633,7 +648,7 @@ describe('harness', () => {
             // so the recovery hint lists exactly those and points at toolRequest
             // for the searchable remainder.
             content:
-                'Tool "nope" is not registered. Available tools: fileRead, fileWrite, fileEdit, fileGlob, toolRequest, toolCreate, todoManage, profileManage, chapterManage, locationManage, agentManage, agentResult, threadFork. Call toolRequest with capability tags to search the catalogue.'
+                'Tool "nope" is not registered. Available tools: toolRegistry, toolRequest, toolCreate, todoManage, profileManage, chapterManage, locationManage, agentManage, agentResult, threadFork, fileRead, fileWrite, fileEdit, fileGlob. Call toolRequest with capability tags to search the catalogue.'
         });
     });
 
@@ -925,7 +940,7 @@ describe('harness', () => {
         writer.reset();
 
         expect(writer.agent.messages).toEqual([{ role: 'system', content: 'You are a writer.' }]);
-        expect(writer.tools.webSearch).toBe(webSearch);
+        expect(writer.tools.webSearch.name).toBe('webSearch');
     });
 
     it('reset() forgets the tools toolRequest enabled', async () => {
@@ -947,6 +962,7 @@ describe('harness', () => {
 
         await writer('go');
         expect(declaredNames(seen[1])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -967,6 +983,7 @@ describe('harness', () => {
 
         // Back to the core set: discovery is part of "start over".
         expect(declaredNames(seen[2])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -1007,6 +1024,7 @@ describe('harness', () => {
 
         await writer('first');
         expect(declaredNames(seen[1])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -1025,6 +1043,7 @@ describe('harness', () => {
         // without another discovery round.
         await writer('second');
         expect(declaredNames(seen[3])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -1055,15 +1074,19 @@ describe('harness', () => {
         ).toThrow('Tool "bad" is not a tool: create it with tool({...}).');
     });
 
-    it('reserves the toolRequest name', () => {
+    it('lets a configured tool replace the toolRequest name (no reserved names)', async () => {
         const custom = tool({ description: 'Mine.', tags: ['discovery'], execute: () => 'ok' });
 
-        expect(() =>
-            harness({
-                agents: { writer: brain(scripted([answer('hi')])) },
-                tools: { toolRequest: custom }
-            })
-        ).toThrow('Tool "toolRequest" is reserved by the harness.');
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('hi')])) },
+            tools: { toolRequest: custom }
+        });
+
+        // Later registration wins; the replacement is a real registry entry, not a
+        // shadowed name the runtime still dispatches around.
+        expect(writer.tools.toolRequest).not.toBe(custom);
+        expect(writer.tools.toolRequest.description).toBe('Mine.');
+        await expect(writer.executeTool('toolRequest', { tags: [] })).resolves.toBe('ok');
     });
 
     it('applies plugins, which can add agents and tools', async () => {
@@ -1096,21 +1119,22 @@ describe('harness', () => {
         ).toThrow('Plugin "x" is registered more than once.');
     });
 
-    it('rejects a plugin that registers a name twice', () => {
-        expect(() =>
-            harness({
-                agents: { writer: brain(scripted([answer('hi')])) },
-                plugins: [
-                    {
-                        name: 'extras',
-                        setup: (api) => {
-                            api.addTool('now', { description: 'Time.', tags: ['time'], execute: () => 'noon' });
-                            api.addTool('now', { description: 'Time.', tags: ['time'], execute: () => 'noon' });
-                        }
+    it('lets a plugin replace an earlier registration instead of rejecting it', async () => {
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('hi')])) },
+            plugins: [
+                {
+                    name: 'extras',
+                    setup: (api) => {
+                        api.addTool('now', { description: 'First.', tags: ['time'], execute: () => 'first' });
+                        api.addTool('now', { description: 'Second.', tags: ['time'], execute: () => 'second' });
                     }
-                ]
-            })
-        ).toThrow('Tool "now" is already registered.');
+                }
+            ]
+        });
+
+        expect(writer.tools.now.description).toBe('Second.');
+        await expect(writer.executeTool('now', {})).resolves.toBe('second');
     });
 
     it('exposes the harness name on the callable itself', () => {
@@ -1378,6 +1402,7 @@ describe('executeTool', () => {
         expect(writer.discoveredTools).toEqual([]);
         await writer('go');
         expect(declaredNames(seen[0])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -1439,10 +1464,12 @@ describe('executeTool', () => {
             enabled: true
         });
 
-        // Registered searchable and enabled at once, exactly like the model path,
-        // and the same collision rule applies to a second manual attempt.
+        // Registered searchable and enabled at once, exactly like the model path.
         expect(writer.discoveredTools).toEqual(['upper']);
         expect(writer.tools.upper.visibility).toBe('searchable');
+
+        // An intentional second manual attempt REPLACES the definition: the same
+        // kernel publishes the new metadata/source atomically.
         await expect(
             writer.executeTool('toolCreate', {
                 name: 'upper',
@@ -1450,7 +1477,14 @@ describe('executeTool', () => {
                 tags: ['text'],
                 source: 'return 1;'
             })
-        ).rejects.toThrow('Tool "upper" is already registered; choose another name.');
+        ).resolves.toEqual({
+            name: 'upper',
+            description: 'Again.',
+            tags: ['text'],
+            enabled: true
+        });
+        expect(writer.tools.upper.description).toBe('Again.');
+        await expect(writer.executeTool('upper', {})).resolves.toBe(1);
     });
 
     it('delegates manually as the primary and leaves the transcript alone', async () => {

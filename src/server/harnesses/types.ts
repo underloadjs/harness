@@ -141,8 +141,8 @@ export type ToolAvailability = {
 // entry is executable: a credential-dependent tool with no key has no callable
 // definition, which is what keeps "listed" from meaning "pretends to work".
 //
-// `sessionBound` marks the harness-owned CORE tools (R8): toolRequest, toolCreate,
-// todoManage, agentDelegate. They have no `tool` and can never be called with a
+// `sessionBound` marks the harness-owned CORE tools (R8): toolRegistry,
+// toolRequest, toolCreate, todoManage, agentDelegate. They have no `tool` and can never be called with a
 // dummy implementation: they run inside a session's harness, so the server requires
 // a `sessionId` and forwards the call to `harness.executeTool`. R18 keeps the flag
 // off the core file tools and webSearch: they have real implementations and run

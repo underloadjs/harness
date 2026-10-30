@@ -238,7 +238,8 @@ import {
     resolveToolParameters,
     boundToolResult,
     DEFAULT_CREATED_TOOLS_LIMIT,
-    createDynamicTool,
+    cloneToolSourceRecord,
+    supportsToolCompilation,
     createTodoTool,
     createProfileTool,
     createChapterTool,
@@ -249,6 +250,9 @@ import {
     readHarnessSnapshot,
     TOOL_CREATE_METADATA,
     TOOL_CREATE_NAME,
+    TOOL_REGISTRY_METADATA,
+    TOOL_REGISTRY_NAME,
+    prepareToolCandidate,
     AGENT_DELEGATE_NAME,
     AGENT_MANAGE_METADATA,
     AGENT_MANAGE_NAME,
@@ -340,7 +344,13 @@ import type {
     HarnessThreadRoster,
     HarnessThreadSteerReceipt,
     HarnessToolCall,
+    HarnessToolCallOptions,
     HarnessToolOutcome,
+    HarnessToolRegistrationCandidate,
+    HarnessToolRegistrationResult,
+    HarnessToolSource,
+    HarnessMemory,
+    HarnessToolRuntime,
     Tool,
     ToolContext,
     ToolCreation,
@@ -349,6 +359,7 @@ import type {
     ToolSearchResult,
     ToolUiPanel
 } from './types';
+import type { PreparedTool, ToolSourceRecord } from './core';
 
 // Hard stop for a model that keeps requesting turns forever (tool rounds, pauses
 // with pending work, and wake-driven turns all count). This is a guard, not a
@@ -475,13 +486,13 @@ const CHAPTER_MANAGE = CHAPTER_MANAGE_NAME;
 const LOCATION_MANAGE = LOCATION_MANAGE_NAME;
 // Agent inspection (R3): every agent, including a subagent, may read the
 // session's agents and their completed results. Registration order matches
-// coreToolMetadata() and RESERVED_TOOL_NAMES below.
+// coreToolMetadata().
 const AGENT_MANAGE = AGENT_MANAGE_NAME;
 const AGENT_RESULT = AGENT_RESULT_NAME;
 const AGENT_DELEGATE = AGENT_DELEGATE_NAME;
 // Targeted cancellation for a background call (T3/R4). Declared only while the
-// calling agent has work in flight; the name is nonetheless reserved so no
-// configured, preset, plugin, or created tool can shadow the control.
+// calling agent has work in flight. It is an ordinary registry definition, not a
+// reserved name: a replacement drops the control marker and executes normally.
 const TOOL_CANCEL = TOOL_CANCEL_NAME;
 // N6 branch controls. threadFork is registered whenever forks are enabled
 // (default true); actionRequest is registered whenever `interaction` is
@@ -492,33 +503,12 @@ const THREAD_FORK = THREAD_FORK_NAME;
 const ACTION_REQUEST = ACTION_REQUEST_NAME;
 // R4 cross-thread chat. Registered lazily (the first `createThread`), because a
 // session with one conversation per agent has no second thread to talk to and
-// must keep its historical declaration list. The name is reserved all the same.
+// must keep its historical declaration list. It remains an ordinary replaceable
+// registry entry once present.
 const THREAD_SEND = THREAD_SEND_NAME;
 // R4 roster: the discoverable source of the ids `threadSend` accepts, so neither a
 // model nor the server has to invent or inject them. Registered with threadSend.
 const THREAD_LIST = THREAD_LIST_NAME;
-
-// Names no configured, preset, plugin, or model-created tool may take. Keeping
-// the whole list in one place is what makes the reservation check exhaustive.
-// Order matches the registration order below (and therefore the declaration
-// order on every request), with agentManage/agentResult after the record tools,
-// agentDelegate last among the pre-N6 tools, and the branch controls after it.
-const RESERVED_TOOL_NAMES = [
-    TOOL_REQUEST,
-    TOOL_CREATE,
-    TODO_MANAGE,
-    PROFILE_MANAGE,
-    CHAPTER_MANAGE,
-    LOCATION_MANAGE,
-    AGENT_MANAGE,
-    AGENT_RESULT,
-    AGENT_DELEGATE,
-    TOOL_CANCEL,
-    THREAD_FORK,
-    ACTION_REQUEST,
-    THREAD_SEND,
-    THREAD_LIST
-] as const;
 
 // Budget for toolCreate: registration is cheap but not free, and an unbounded
 // registry defeats the point of discovery. Session-local (no filesystem writes),
@@ -565,6 +555,11 @@ const resolveToolCreation = (value: ToolCreationPolicy | undefined): ToolCreatio
 // depth 2 and therefore still allowed — the limit only blocks a run STARTED from
 // inside another one at the limit.
 const MAX_RUN_DEPTH = 2;
+
+// The wire-safe tool-name alphabet, identical to the shared source-contract gate.
+// Definition registrations must satisfy the same name/schema shape as compiled
+// source revisions, even though they skip transpilation.
+const WIRE_NAME_PATTERN = /^[A-Za-z][A-Za-z0-9_-]{0,63}$/;
 
 // Tool results are text on the wire. Strings pass through untouched so a tool
 // can return prose; everything else is JSON. The model-facing cap is applied by
@@ -696,79 +691,30 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const subagents: Record<string, Agent> = {};
     for (const name of subagentNames) subagents[name] = agents[name];
 
-    // Build the tool registry, same rule: the key is the wire name. The bundled
-    // preset catalogue is preloaded by default: the four core file tools are
-    // declared immediately and the searchable remainder is discoverable without
-    // the caller importing anything. `presets: false` starts from the configured
-    // tools only, and a configured tool of the same name replaces the preset.
-    const tools: Record<string, Tool> = configuration.presets === false ? {} : { ...presetTools };
+    // The tool registry starts EMPTY. Every entry — the preset catalogue,
+    // configured tools, harness-owned controls, plugin contributions, and runtime
+    // source revisions — is committed through the one kernel registration
+    // operation below. No reserved-name or "already registered" gate exists:
+    // later submissions win, including over the harness's own controls.
+    const tools: Record<string, Tool> = {};
 
-    for (const [name, definition] of Object.entries(configuration.tools ?? {})) {
-        if (!definition || typeof definition.execute !== 'function') {
-            throw new HarnessError(`Tool "${name}" is not a tool: create it with tool({...}).`);
-        }
+    // Captured source revisions and persistence records. The registry is the
+    // runtime truth; these maps only feed inspection and snapshot()/restore().
+    const toolSourceRecords = new Map<string, ToolSourceRecord>();
+    const createdToolRecords = new Map<string, ToolCreation>();
 
-        definition.name = name;
-        tools[name] = definition;
-    }
-
-    // Opt-in web search (W3). `websearch: true` (or a configuration object) builds
-    // one CORE tool from the keys available to THIS harness (R18); `presets: false`
-    // does not disable it, because it is not part of the preset catalogue. Rules:
-    //   - a configured tool named `webSearch` wins: the caller brought its own;
-    //   - no usable key means no tool at all (the factory returns undefined), so a
-    //     keyless deployment and a default harness stay offline-safe;
-    //   - keys resolve now, at construction, and live only in the tool closure, so
-    //     two harnesses never share a credential and nothing reaches the schema,
-    //     arguments, results, or progress events.
-    // The CONFIGURATION field is still spelled `websearch` (it names the feature,
-    // not the tool); only the wire name is webSearch. This runs before the
-    // reserved-name check on purpose: webSearch is not a harness-reserved name,
-    // only a name the harness fills when asked to.
-    if (
-        configuration.websearch !== undefined &&
-        configuration.websearch !== false &&
-        tools[WEB_SEARCH_TOOL_NAME] === undefined
-    ) {
-        const webSearch = createWebSearchTool(
-            configuration.websearch === true ? {} : configuration.websearch
-        );
-
-        if (webSearch) tools[WEB_SEARCH_TOOL_NAME] = webSearch;
-    }
-
-    // Opt-in page fetch (W4). `webfetch: true` (or a configuration object)
-    // registers `webFetch`: a bounded native GET that needs no credential, plus
-    // the `exa` provider when an Exa key is available (the same EXA_API_KEY
-    // webSearch resolves). Rules:
-    //   - a configured tool named `webFetch` wins: the caller brought its own;
-    //   - unlike webSearch, no key still registers the tool — `native` is the
-    //     default provider and is keyless, so opting in means being runnable;
-    //   - the key resolves now, at construction, and lives only in the tool
-    //     closure, so nothing secret reaches the schema, arguments, results, or
-    //     progress events.
-    // The tool stays SEARCHABLE (R18 reserves core for what every request needs;
-    // fetching is the step after searching), so it costs no schema until
-    // toolRequest surfaces it under the web tags.
-    if (
-        configuration.webfetch !== undefined &&
-        configuration.webfetch !== false &&
-        tools[WEB_FETCH_TOOL_NAME] === undefined
-    ) {
-        tools[WEB_FETCH_TOOL_NAME] = createWebFetchTool(
-            configuration.webfetch === true ? {} : configuration.webfetch
-        );
-    }
-
-    // The harness owns its core names. Checked after presets and configured tools
-    // so a collision is reported once, up front, in the same place as toolRequest
-    // always was. Model-created tools are checked separately (they arrive later,
-    // see createToolFrom).
-    for (const reserved of RESERVED_TOOL_NAMES) {
-        if (tools[reserved]) {
-            throw new HarnessError(`Tool "${reserved}" is reserved by the harness.`);
-        }
-    }
+    // Definitions whose declaration/execution is role-gated or runtime-special.
+    // Keyed by the DEFINITION, not by name: replacing the definition drops the
+    // gate, which is what makes built-in/module-facing controls genuinely
+    // replaceable instead of bypassing the registry by wire name.
+    const primaryOnlyDefinitions = new WeakSet<Tool>();
+    const runtimeControlDefinitions = new WeakMap<Tool, 'toolCancel' | 'threadFork' | 'actionRequest'>();
+    const pendingOnlyDefinitions = new WeakSet<Tool>();
+    // T2/R1 answer extraction belongs to the BASELINE agentDelegate definition.
+    // A replacement under the same wire name must behave like an ordinary tool,
+    // so both model and manual `context.run` paths key the descriptor on this
+    // marker rather than on the call name.
+    const delegateAnswerDefinitions = new WeakSet<Tool>();
 
     // Progress reporting is awaited for every step, so a UI can pace the run.
     const progress: HarnessProgress = async (event: HarnessEvent) => {
@@ -842,119 +788,423 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         for (const definition of Object.values(tools)) {
             if (definition.visibility !== 'core') continue;
-            if (definition.name === AGENT_DELEGATE && role !== 'primary') continue;
-            if (definition.name === TOOL_CREATE && toolCreation === 'primary' && role !== 'primary') continue;
+            // Runtime controls (toolCancel) are declared separately and only while
+            // actionable; they are still ordinary replaceable registry entries.
+            if (pendingOnlyDefinitions.has(definition)) continue;
+            // Primary-only definitions are marked by object, NOT by wire name, so
+            // replacing agentDelegate/toolCreate drops the gate unless the
+            // replacement itself declares it.
+            if (primaryOnlyDefinitions.has(definition) && role !== 'primary') continue;
             core.push(definition);
         }
 
         return core;
     };
 
-    // toolRequest is the one discovery tool every harness provides. It is core, so
-    // the model can always reach it, and its result both explains the matches and
-    // enables them for the next turn.
+    // -----------------------------------------------------------------------
+    // The ONE registration kernel (R1/R2/R3)
+    // -----------------------------------------------------------------------
     //
-    // Name, description, tags, and schema come from core/metadata.ts (R7): at most
-    // five matches per request, `remaining` as the count of further matches, and a
-    // `limit` that can only narrow the shortlist. Two schema properties, so the
-    // single-property rule does not apply and `parameters` arrives as an object.
+    // Every registration path funnels through `acceptTool`:
+    //   - startup (toolRegistry first, then the rest of the core set, presets,
+    //     configured tools, and plugins);
+    //   - the model-facing toolCreate (legacy async body);
+    //   - the model-facing toolRegistry and host `registerTool` (editable module
+    //     revision or legacy body).
     //
-    // `alreadyAvailable` is the caller-visible CORE set (visibleCoreTools), passed
-    // as a report only: core tools are never enabled here and never spend the cap,
-    // and the agent check is what keeps agentDelegate out of a subagent's answer.
-    // The manual host path sets `agent: primary`, so an operator sees the same
-    // primary view the model does.
-    tools[TOOL_REQUEST] = defineTool<{ tags: string[]; limit?: number }, ToolSearchResult>({
-        ...TOOL_REQUEST_METADATA,
-        execute: ({ parameters, agent: caller }) => {
-            // Tolerate a bare array (a model ignoring the schema) and a missing
-            // `tags`, so a sloppy call still gets the catalogue vocabulary back.
-            const query = Array.isArray(parameters)
-                ? parameters
-                : Array.isArray(parameters?.tags)
-                  ? parameters.tags
-                  : [];
-            const limit = Array.isArray(parameters) ? undefined : parameters?.limit;
+    // ORDERING: capture, transpilation/loading, contract validation, and the
+    // registry commit all happen SYNCHRONOUSLY in call order. No compilation runs
+    // in a background task, so overlapping registrations have a total submission
+    // order and the last one to complete wins. `registerTool` returns a
+    // Promise-compatible result, but the promise is created only after the commit:
+    // it is a completion barrier, not a queue handle.
+    //
+    // ATOMICITY: the candidate is prepared completely before mutation. A thrown
+    // transpile/load/contract error leaves the registry, the captured revision, the
+    // enabled set, and the creation budget untouched. Unrestricted candidate code
+    // may have external side effects during loading; the guarantee is registry
+    // publication, not rollback of arbitrary side effects.
+    //
+    // REPLACEMENT: names are not reserved, "already registered" is not an error,
+    // and replacing an implementation does not consume the new-tool budget. The
+    // replacement PUBLISHES a new definition object; already-scheduled calls keep
+    // the object they captured.
+    let createdTools = 0;
+    let startupPhase = true;
 
-            // Repeat the same query to advance through the omitted tail (R12).
-            const key = discoveryQueryKey(query, limit);
-            const offset = discoveryOffsets.get(key) ?? 0;
-
-            const result = searchTools(Object.values(tools), query, limit, offset, {
-                declared: visibleCoreTools(caller ?? primary)
-            });
-            enableTools(result.enabled);
-
-            // Advance only when this page actually returned matches AND more are
-            // left; when the tail is exhausted the key is dropped so a later
-            // identical query starts a fresh first page instead of an empty one.
-            if (result.remaining > 0 && result.enabled.length > 0) {
-                discoveryOffsets.set(key, offset + result.enabled.length);
-            } else {
-                discoveryOffsets.delete(key);
-            }
-
-            return result;
+    // Stable harness-owned tool memory. Unlike module-local variables, this
+    // survives a replacement implementation and is shared by every agent/tool in
+    // this harness. `data` is the live store; the methods are the supported API.
+    const memoryData: Record<string, unknown> = {};
+    const memory: HarnessMemory = {
+        data: memoryData,
+        get: (key) => memoryData[key],
+        set: (key, value) => {
+            memoryData[key] = value;
+        },
+        has: (key) => Object.prototype.hasOwnProperty.call(memoryData, key),
+        delete: (key) => delete memoryData[key],
+        keys: () => Object.keys(memoryData),
+        clear: () => {
+            for (const key of Object.keys(memoryData)) delete memoryData[key];
         }
+    };
+
+    type RegistrationIntent = HarnessToolRegistrationCandidate & {
+        // Host/plugin compatibility: an already-constructed Tool. It still goes
+        // through the same atomic publish path, but has no editable source revision.
+        definition?: Tool;
+        // Startup and restore explicitly opt out of the new-tool budget.
+        countAgainstBudget?: boolean;
+    };
+
+    // Convert a prepared source revision to the JSON-shaped record snapshot()
+    // persists. Metadata comes from the installed tool so schema and
+    // implementation always describe the same revision.
+    const creationRecordOf = (prepared: PreparedTool): ToolCreation => ({
+        name: prepared.tool.name,
+        description: prepared.tool.description,
+        tags: [...prepared.tool.tags],
+        ...(prepared.tool.parameters === undefined
+            ? {}
+            : {
+                  parameters: JSON.parse(JSON.stringify(prepared.tool.parameters)) as Record<
+                      string,
+                      unknown
+                  >
+              }),
+        ...(prepared.record.source === undefined ? {} : { source: prepared.record.source }),
+        ...(prepared.record.moduleText === undefined
+            ? {}
+            : { moduleText: prepared.record.moduleText }),
+        ...(prepared.record.sourcePath === undefined
+            ? {}
+            : { sourcePath: prepared.record.sourcePath }),
+        ...(prepared.record.dependencies.length === 0
+            ? {}
+            : { dependencies: prepared.record.dependencies.map((entry) => ({ ...entry })) }),
+        ...(prepared.tool.visibility === 'core' ? { visibility: 'core' as const } : {})
     });
 
-    // Runtime creation (R2b). One registration path serves the model-facing
-    // toolCreate tool and the host-facing harness.createTool(), so the two can
-    // never drift on validation, budget, or discovery behaviour.
-    //
-    // Session-local by design: a created tool lives in this harness's registry
-    // only. Nothing is written to disk, so two harnesses cannot see each other's
-    // tools and a process restart starts clean.
-    let createdTools = 0;
+    // Prepare a definition candidate without re-running `tool()`: configured tools
+    // and plugins already constructed their callable. The contract checks that do
+    // not need compilation are repeated so a hand-built object cannot bypass the
+    // registry's shape rules.
+    const prepareDefinition = (definition: Tool): PreparedTool => {
+        if (
+            typeof definition.name !== 'string' ||
+            !WIRE_NAME_PATTERN.test(definition.name)
+        ) {
+            throw new HarnessError(
+                `Tool name "${String(definition.name)}" is not valid: use one letter followed by letters, digits, "_" or "-", at most 64 characters.`
+            );
+        }
 
-    // Persistence records for tools created at runtime (R3a). A Tool carries the
-    // compiled `execute` function, which cannot be serialized, so the harness
-    // keeps the source-shaped request that produced it. The registry remains the
-    // runtime truth; this map only feeds snapshot()/restore() and never executes
-    // anything on capture. Order is creation order, which is also registry
-    // insertion order (important for declaration order after a restore).
-    const createdToolRecords = new Map<string, ToolCreation>();
+        if (typeof definition.execute !== 'function') {
+            throw new HarnessError('Registered tool definitions require an execute function.');
+        }
 
-    const createToolFrom = (configuration: ToolCreation): Tool => {
-        if (createdTools >= maxCreatedTools) {
+        if (typeof definition.description !== 'string' || definition.description.trim().length === 0) {
+            throw new HarnessError(`Tool "${definition.name}" requires a description.`);
+        }
+
+        if (!Array.isArray(definition.tags) || definition.tags.length === 0) {
+            throw new HarnessError(`Tool "${definition.name}" requires at least one tag.`);
+        }
+
+        if (definition.parameters !== undefined) {
+            if (
+                typeof definition.parameters !== 'object' ||
+                definition.parameters === null ||
+                Array.isArray(definition.parameters)
+            ) {
+                throw new HarnessError(
+                    `Tool "${definition.name}" parameters must be a JSON Schema object.`
+                );
+            }
+
+            try {
+                JSON.stringify(definition.parameters);
+            } catch {
+                throw new HarnessError(
+                    `Tool "${definition.name}" parameters must be JSON-serialisable.`
+                );
+            }
+        }
+
+        return {
+            tool: definition,
+            revision: 'definition',
+            record: {
+                name: definition.name,
+                revision: 'definition',
+                dependencies: [],
+                format: 'function-body',
+                checks: ['contract:definition']
+            }
+        };
+    };
+
+    // The synchronous commit half. Returns everything the public paths need.
+    const acceptTool = (
+        intent: RegistrationIntent,
+        options: { record?: ToolCreation | false; baseline?: boolean } = {}
+    ): { prepared: PreparedTool; result: HarnessToolRegistrationResult } => {
+        // 1. CAPTURE + COMPILE + LOAD + VALIDATE. Nothing below runs on failure.
+        const prepared =
+            intent.definition === undefined
+                ? prepareToolCandidate(intent, { expectedName: intent.name })
+                : prepareDefinition(intent.definition);
+
+        const name = prepared.tool.name;
+        const existing = tools[name];
+        const existed = existing !== undefined;
+        const replacingCreated = createdToolRecords.has(name);
+
+        // 2. Budget: only a NEW name registered after startup counts. Replacing an
+        // existing definition never exhausts the budget.
+        if (
+            !existed &&
+            !startupPhase &&
+            options.baseline !== true &&
+            intent.countAgainstBudget !== false &&
+            createdTools >= maxCreatedTools
+        ) {
             throw new HarnessError(
                 `This harness already created ${maxCreatedTools} tools; reuse an existing tool instead of creating more.`
             );
         }
 
-        // Shape validation, reserved-name rejection, and compilation. Compiling
-        // does NOT execute the body — see core/creation.ts.
-        const definition = createDynamicTool(configuration, { reserved: RESERVED_TOOL_NAMES });
+        // 3. PUBLISH implementation + metadata + schema together as one object.
+        const previousRevision = toolSourceRecords.get(name)?.revision;
+        tools[name] = prepared.tool;
 
-        // Compare case-insensitively: "fileread" beside a preset "fileRead" would
-        // make the catalogue ambiguous for the model even though the keys differ.
-        // (Reserved names were already rejected above, in the same comparison.)
-        const collision = Object.keys(tools).find(
-            (name) => name.toLowerCase() === definition.name.toLowerCase()
-        );
-
-        if (collision) {
-            throw new HarnessError(`Tool "${collision}" is already registered; choose another name.`);
+        if (prepared.record.format === 'module' || prepared.record.source !== undefined) {
+            toolSourceRecords.set(name, prepared.record);
+        } else {
+            toolSourceRecords.delete(name);
         }
 
-        tools[definition.name] = definition;
-        createdTools++;
+        // 4. Persistence bookkeeping. A source registration is recorded when it
+        // creates a new name or replaces a previously-created tool; replacing a
+        // baseline preset/core tool remains runtime-only (the existing persistence
+        // contract does not require carrying built-in replacements across restart).
+        if (!startupPhase && options.baseline !== true) {
+            if (options.record !== undefined && options.record !== false) {
+                // Persist a legacy creation only when it owns the name. Replacing a
+                // baseline preset/core tool is runtime-only: recording it would make
+                // a snapshot restore collide with the fresh harness's baseline.
+                if (!existed || replacingCreated) {
+                    createdToolRecords.set(name, cloneToolCreation(options.record));
+                }
+            } else if (prepared.record.format === 'module' || prepared.record.source !== undefined) {
+                if (!existed || replacingCreated) {
+                    createdToolRecords.set(name, creationRecordOf(prepared));
+                }
+            }
+            // A definition replacement of a created tool keeps the old persisted
+            // revision: runtime-only replacements are not promised across restart,
+            // and dropping the record would desynchronise createdToolCount.
 
-        // Retain the creation request (source included) so snapshot() can persist
-        // it. Clone now: the caller owns `configuration` and may reuse/mutate it,
-        // while the registry record must stay exactly what was compiled.
-        createdToolRecords.set(definition.name, cloneToolCreation(configuration));
+            if (!existed && intent.countAgainstBudget !== false) createdTools++;
 
-        // Registered searchable AND enabled immediately: the model just asked for
-        // this tool, so making it spend a toolRequest round trip to call it would be
-        // wasteful. It stays in the searchable catalogue, so it remains
-        // discoverable (and a reset() only clears the enabled set).
-        activeTools.add(definition.name);
+            // A newly registered/replaced tool is immediately usable by the
+            // registering agent without another discovery round.
+            if (!existed || prepared.tool.visibility !== 'core') activeTools.add(name);
 
-        // The registry, the enabled set, and the lifetime budget all changed.
-        notifyStateChange('tool_create', { tool: definition.name });
+            notifyStateChange('tool_create', { tool: name });
+        }
 
-        return definition;
+        return {
+            prepared,
+            result: {
+                name,
+                revision: prepared.revision,
+                created: !existed,
+                replaced: existed,
+                ...(previousRevision === undefined ? {} : { previousRevision }),
+                ...(prepared.record.sourcePath === undefined
+                    ? {}
+                    : { sourcePath: prepared.record.sourcePath }),
+                checks: [...prepared.record.checks]
+            }
+        };
+    };
+
+    // Startup helper: the kernel may be called directly before any model-facing
+    // registration tool exists, but it uses the same acceptance operation.
+    const registerAtStartup = (intent: RegistrationIntent): PreparedTool =>
+        acceptTool(intent, { record: false }).prepared;
+
+    // Conditional BASELINE tools (threadSend/threadList) are registered after
+    // startup but are catalogue state, not user creations: they neither spend the
+    // creation budget nor enter the snapshot's createdTools set.
+    const registerBaselineAtRuntime = (intent: RegistrationIntent): PreparedTool =>
+        acceptTool(intent, { record: false, baseline: true }).prepared;
+
+    // Explicit compiler capability boundary. The aliased browser stub exports
+    // false; Node exports true even when its editable roots are missing, so a
+    // mispackaged Node build FAILS startup compilation instead of silently using
+    // prepared definitions. Runtime source registration always goes through
+    // prepareToolCandidate and fails actionable when unsupported.
+    const sourceStartupSupported = supportsToolCompilation;
+
+    const registerBaselineSource = (
+        intent: RegistrationIntent,
+        fallback: () => Tool
+    ): PreparedTool =>
+        sourceStartupSupported
+            ? registerAtStartup(intent)
+            : registerAtStartup({ definition: fallback() });
+
+    // Runtime registration. The compile/publish work is synchronous; the returned
+    // promise only represents the already-decided outcome. A rejection therefore
+    // cannot leave a partially published candidate.
+    const registerTool = (
+        candidate: HarnessToolRegistrationCandidate
+    ): Promise<HarnessToolRegistrationResult> => {
+        try {
+            return Promise.resolve(acceptTool(candidate, { record: false }).result);
+        } catch (error) {
+            return Promise.reject(error);
+        }
+    };
+
+    // Inspect one installed source revision. Returns a detached copy; a caller
+    // cannot mutate the captured record through it.
+    const toolSource = (name: string): HarnessToolSource | undefined => {
+        const record = toolSourceRecords.get(name);
+        return record === undefined ? undefined : cloneToolSourceRecord(record);
+    };
+
+    const toolSources = (): HarnessToolSource[] =>
+        Object.keys(tools)
+            .map((name) => toolSourceRecords.get(name))
+            .filter((record): record is ToolSourceRecord => record !== undefined)
+            .map(cloneToolSourceRecord);
+
+    // toolRegistry is registered FIRST, because the bootstrap needs a model-facing
+    // entry that delegates to the kernel for every later revision. It is loaded by
+    // compiling its editable source entry through registerAtStartup — the SAME
+    // operation runtime registrations use, not a prepared-definition shortcut.
+    // If the source file is missing, construction fails loudly rather than silently
+    // starting without the self-modification loop.
+    registerBaselineSource(
+        {
+            name: TOOL_REGISTRY_NAME,
+            sourcePath: 'runtime-tools/toolRegistry.ts'
+        },
+        () =>
+            defineTool({
+                ...TOOL_REGISTRY_METADATA,
+                execute: (context) => {
+                    if (context.harness === undefined) {
+                        throw new HarnessError(
+                            'toolRegistry requires the live harness reference.'
+                        );
+                    }
+
+                    return context.harness.registerTool(
+                        (context.parameters ?? {}) as HarnessToolRegistrationCandidate
+                    );
+                }
+            })
+    );
+
+    // The discovery STATE/operation lives on the harness; the model-facing
+    // toolRequest entry is a standalone source module compiled through the kernel.
+    // Keeping the cursor and enabled-set mutation here is what makes the source
+    // entry replaceable without losing harness state.
+    const requestToolsFor = (
+        caller: Agent | undefined,
+        parameters: { tags?: unknown; limit?: unknown } | unknown
+    ): ToolSearchResult => {
+        // Tolerate a bare array (a model ignoring the schema) and a missing
+        // `tags`, so a sloppy call still gets the catalogue vocabulary back.
+        const query = Array.isArray(parameters)
+            ? parameters
+            : Array.isArray((parameters as { tags?: unknown } | undefined)?.tags)
+              ? ((parameters as { tags: string[] }).tags)
+              : [];
+        const limit = Array.isArray(parameters)
+            ? undefined
+            : typeof (parameters as { limit?: unknown } | undefined)?.limit === 'number'
+              ? (parameters as { limit: number }).limit
+              : undefined;
+
+        // Repeat the same query to advance through the omitted tail (R12).
+        const key = discoveryQueryKey(query, limit);
+        const offset = discoveryOffsets.get(key) ?? 0;
+
+        // Pending-only runtime controls are never discoverable: they are declared
+        // only while actionable and have no catalogue identity to hand out.
+        const catalogue = Object.values(tools).filter(
+            (definition) => !pendingOnlyDefinitions.has(definition)
+        );
+        const result = searchTools(catalogue, query, limit, offset, {
+            declared: visibleCoreTools(caller ?? primary)
+        });
+        enableTools(result.enabled);
+
+        // Advance only when this page actually returned matches AND more are
+        // left; when the tail is exhausted the key is dropped so a later
+        // identical query starts a fresh first page instead of an empty one.
+        if (result.remaining > 0 && result.enabled.length > 0) {
+            discoveryOffsets.set(key, offset + result.enabled.length);
+        } else {
+            discoveryOffsets.delete(key);
+        }
+
+        return result;
+    };
+
+    registerBaselineSource(
+        {
+            name: TOOL_REQUEST,
+            sourcePath: 'runtime-tools/toolRequest.ts'
+        },
+        () =>
+            defineTool({
+                ...TOOL_REQUEST_METADATA,
+                execute: (context) => requestToolsFor(context.agent, context.parameters)
+            })
+    );
+
+    // Legacy runtime creation (R2b). This is a THIN COMPATIBILITY ADAPTER over the
+    // same kernel: toolCreate still accepts an async function body, but capture,
+    // compilation, contract validation, publication, budget accounting, and
+    // persistence all run through acceptTool. There is no second pipeline.
+    const createToolFrom = (configuration: ToolCreation): Tool => {
+        const { prepared } = acceptTool(
+            {
+                name: configuration.name,
+                description: configuration.description,
+                tags: configuration.tags,
+                ...(configuration.parameters === undefined
+                    ? {}
+                    : { parameters: configuration.parameters }),
+                ...(configuration.visibility === undefined
+                    ? {}
+                    : { visibility: configuration.visibility }),
+                ...(configuration.source === undefined ? {} : { source: configuration.source }),
+                ...(configuration.moduleText === undefined
+                    ? {}
+                    : { moduleText: configuration.moduleText }),
+                ...(configuration.sourcePath === undefined
+                    ? {}
+                    : { sourcePath: configuration.sourcePath }),
+                ...(configuration.dependencies === undefined
+                    ? {}
+                    : { dependencies: configuration.dependencies })
+            },
+            {
+                // Persist exactly what was compiled. Clone now: the caller owns the
+                // configuration object and may mutate it after this returns.
+                record: cloneToolCreation(configuration)
+            }
+        );
+
+        return prepared.tool;
     };
 
     // The model-facing toolCreate tool (R2b), gated by the creation policy (R12).
@@ -962,36 +1212,55 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // without the capability gives an honest "not registered" instead of a tool
     // that always fails. The host path `harness.createTool` stays available in
     // every policy: an operator action is not a model privilege.
+    const createToolForAgent = (
+        caller: Agent | undefined,
+        configuration: ToolCreation
+    ): ToolCreationResult => {
+        // 'primary' policy: the tool is also not DECLARED to subagents, so this is
+        // the defence-in-depth check for a guessed name.
+        if (toolCreation === 'primary' && roleOf(caller ?? primary) !== 'primary') {
+            throw new HarnessError(
+                `Only the primary agent "${primaryName}" can create tools; "${caller?.name ?? 'a host'}" cannot.`
+            );
+        }
+
+        // Throwing is the error path the harness turns into a readable tool result:
+        // invalid name, budget, a body that does not parse, etc. Publication is
+        // atomic inside the shared kernel.
+        const definition = createToolFrom(configuration);
+
+        const result: ToolCreationResult = {
+            name: definition.name,
+            description: definition.description,
+            tags: [...definition.tags],
+            enabled: true
+        };
+
+        if (definition.parameters) result.parameters = definition.parameters;
+
+        return result;
+    };
+
     if (toolCreation !== false) {
-        tools[TOOL_CREATE] = defineTool<ToolCreation, ToolCreationResult>({
-            ...TOOL_CREATE_METADATA,
-            execute: ({ parameters, agent: caller }) => {
-                // 'primary' policy: the tool is also not DECLARED to subagents
-                // (see declared()), so this is the defence-in-depth check for a
-                // guessed name — same shape as agentDelegate's own guard.
-                if (toolCreation === 'primary' && roleOf(caller ?? primary) !== 'primary') {
-                    throw new HarnessError(
-                        `Only the primary agent "${primaryName}" can create tools; "${caller?.name ?? 'a host'}" cannot.`
-                    );
-                }
+        const preparedToolCreate = registerBaselineSource(
+            {
+                name: TOOL_CREATE,
+                sourcePath: 'runtime-tools/toolCreate.ts'
+            },
+            () =>
+                defineTool({
+                    ...TOOL_CREATE_METADATA,
+                    execute: (context) =>
+                        createToolForAgent(
+                            context.agent,
+                            context.parameters as ToolCreation
+                        )
+                })
+        );
 
-                // Throwing is the error path the harness turns into a readable tool
-                // result: invalid name, reserved name, collision, budget, or a body
-                // that does not parse.
-                const definition = createToolFrom(parameters);
-
-                const result: ToolCreationResult = {
-                    name: definition.name,
-                    description: definition.description,
-                    tags: [...definition.tags],
-                    enabled: true
-                };
-
-                if (definition.parameters) result.parameters = definition.parameters;
-
-                return result;
-            }
-        });
+        // 'primary' policy is a property of THIS definition, not the wire name;
+        // replacing toolCreate publishes a new object with no inherited gate.
+        if (toolCreation === 'primary') primaryOnlyDefinitions.add(preparedToolCreate.tool);
     }
 
     // Session todos (R1/R2). One instance per harness: the tool closes over its
@@ -1000,20 +1269,85 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // tool, so the primary and its subagents see one list. reset() below clears
     // it together with the conversation; nothing is persisted.
     const todo = createTodoTool();
-    tools[TODO_MANAGE] = todo.tool;
+    registerBaselineSource(
+        { name: TODO_MANAGE, sourcePath: 'runtime-tools/todoManage.ts' },
+        () => todo.tool
+    );
 
     // Session records (profiles, chapters, locations). Same lifecycle as the todo
     // list: one factory instance per harness, shared by every agent here, and
     // cleared by reset(). Separate closets and separate id sequences, so a
     // profile id and a chapter id may both be "1" without ambiguity.
     const profile = createProfileTool();
-    tools[PROFILE_MANAGE] = profile.tool;
+    registerBaselineSource(
+        { name: PROFILE_MANAGE, sourcePath: 'runtime-tools/profileManage.ts' },
+        () => profile.tool
+    );
 
     const chapter = createChapterTool();
-    tools[CHAPTER_MANAGE] = chapter.tool;
+    registerBaselineSource(
+        { name: CHAPTER_MANAGE, sourcePath: 'runtime-tools/chapterManage.ts' },
+        () => chapter.tool
+    );
 
     const location = createLocationTool();
-    tools[LOCATION_MANAGE] = location.tool;
+    registerBaselineSource(
+        { name: LOCATION_MANAGE, sourcePath: 'runtime-tools/locationManage.ts' },
+        () => location.tool
+    );
+
+    // Per-harness network closures. They are populated during startup from the
+    // `websearch`/`webfetch` configuration and carry the credentials; the compiled
+    // source entries only reference the operations, never the keys.
+    const webOperations: { webSearch?: Tool; webFetch?: Tool } = {};
+
+    // Live operations used by the standalone core source entries. These are not a
+    // capability substitute: core tools also receive the full `context.harness`.
+    const runtime: HarnessToolRuntime = {
+        requestTools: requestToolsFor,
+        createToolForAgent,
+        agentManage: () => agentManageView(),
+        agentResult: (parameters: Record<string, any>) => agentResultFor(parameters),
+        delegate: (caller, parameters, run, runDepth) =>
+            delegateFor(caller, parameters, run, runDepth),
+        threadSend: (caller, threadId, parameters) => threadSendFor(caller, threadId, parameters),
+        threadList: (threadId) => threadRoster(threadId),
+        webSearch: (context) => {
+            const operation = webOperations.webSearch;
+
+            if (operation === undefined) {
+                throw new HarnessError(
+                    'webSearch is not configured for this harness (no provider key resolved).'
+                );
+            }
+
+            return operation.execute(context);
+        },
+        webFetch: (context) => {
+            const operation = webOperations.webFetch;
+
+            if (operation === undefined) {
+                throw new HarnessError('webFetch is not configured for this harness.');
+            }
+
+            return operation.execute(context);
+        },
+        executeRecordTool: (
+            name: 'todoManage' | 'profileManage' | 'chapterManage' | 'locationManage',
+            context: ToolContext
+        ) => {
+            switch (name) {
+                case 'todoManage':
+                    return todo.tool.execute(context);
+                case 'profileManage':
+                    return profile.tool.execute(context);
+                case 'chapterManage':
+                    return chapter.tool.execute(context);
+                case 'locationManage':
+                    return location.tool.execute(context);
+            }
+        }
+    };
 
     // -----------------------------------------------------------------------
     // Agent inspection (R3): agentManage / agentResult
@@ -1216,9 +1550,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     // Listing. Every configured agent appears (even with no results), so a model
     // can see who exists before anything has run.
-    tools[AGENT_MANAGE] = defineTool<Record<string, never>, unknown>({
-        ...AGENT_MANAGE_METADATA,
-        execute: () => {
+    const agentManageView = (): unknown => {
             const records = [...invocationRecords.values()];
             let listed = 0;
 
@@ -1245,18 +1577,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // agentResult while the record is retained.
                 truncated: records.length > listed
             };
-        }
-    });
+    };
+
+    registerBaselineSource(
+        { name: AGENT_MANAGE, sourcePath: 'runtime-tools/agentManage.ts' },
+        () =>
+            defineTool({
+                ...AGENT_MANAGE_METADATA,
+                execute: () => agentManageView()
+            })
+    );
 
     // Full retrieval by agent (and preferably invocation id). There is no
     // transcript access at all: every branch below reads the recorded answer
     // value only.
-    tools[AGENT_RESULT] = defineTool<
-        { agent: string; invocationId?: string; offset?: number; limit?: number },
-        unknown
-    >({
-        ...AGENT_RESULT_METADATA,
-        execute: ({ parameters }) => {
+    const agentResultFor = (parameters: Record<string, any>): unknown => {
             const name = parameters?.agent;
             const configured = Object.prototype.hasOwnProperty.call(agents, name);
 
@@ -1362,8 +1697,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 hasMore: page.hasMore,
                 ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset })
             };
-        }
-    });
+    };
+
+    registerBaselineSource(
+        { name: AGENT_RESULT, sourcePath: 'runtime-tools/agentResult.ts' },
+        () =>
+            defineTool({
+                ...AGENT_RESULT_METADATA,
+                execute: (context) =>
+                    agentResultFor((context.parameters ?? {}) as Record<string, any>)
+            })
+    );
 
     // Bounded delegation (R4). Registered only when there is somewhere to
     // delegate: a tool that can only fail would cost context on every request.
@@ -1371,93 +1715,273 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // guessed call, so delegation is exactly one level deep. runAgent rejects
     // re-entering an agent that is already running, which closes the ctx.run
     // cycle as well.
+    const delegateFor = async (
+        caller: Agent | undefined,
+        parameters: { agent?: string; input?: string },
+        run: ToolContext['run'],
+        runDepth: number | undefined
+    ): Promise<HarnessDelegationResult> => {
+        // Defence in depth: the tool is not DECLARED to subagents, but a model can
+        // guess a name, so the caller is checked here too.
+        if (roleOf(caller ?? primary) !== 'primary') {
+            throw new HarnessError(
+                `Only the primary agent "${primaryName}" can delegate; "${caller?.name ?? 'a host'}" cannot.`
+            );
+        }
+
+        // Delegation is a top-level capability. A primary reached as a subagent of
+        // another run must not recurse outward. `runDepth` is the calling run's
+        // depth (1 = top level), carried on the context so this rule survives
+        // concurrent runs without a global run stack.
+        if ((runDepth ?? 1) > 1) {
+            throw new HarnessError(
+                'Delegation is only available from the primary agent\'s own run, not from inside another agent.'
+            );
+        }
+
+        // Two schema properties, so `parameters` is the parsed arguments object.
+        const target = parameters?.agent;
+
+        if (typeof target !== 'string' || !subagentNames.includes(target)) {
+            throw new HarnessError(
+                `Agent "${String(target)}" is not a configured subagent. Allowed: ${subagentNames.join(', ')}.`
+            );
+        }
+
+        if (typeof parameters?.input !== 'string' || parameters.input.trim().length === 0) {
+            throw new HarnessError('Delegation requires a non-empty input.');
+        }
+
+        if (!run) {
+            throw new HarnessError('Delegation requires a harness run context.');
+        }
+
+        const message = await run(target, parameters.input);
+
+        // Only the answer crosses back: the subagent keeps its own transcript and
+        // instructions.
+        return { agent: target, content: message.content };
+    };
+
     if (subagentNames.length > 0) {
-        tools[AGENT_DELEGATE] = defineTool<{ agent: string; input: string }, HarnessDelegationResult>({
-            // Description and schema (including the `agent` enum) come from the
-            // shared metadata: the runtime declaration names the allowlist, and the
-            // server catalogue describes the same capability generically.
-            ...agentDelegateMetadata(subagentNames),
-            execute: async ({ agent: caller, run, runDepth, parameters }) => {
-                // Defence in depth: the tool is not declared to subagents, but a
-                // model can guess a name, so the caller is checked here too.
-                if (roleOf(caller ?? primary) !== 'primary') {
-                    throw new HarnessError(
-                        `Only the primary agent "${primaryName}" can delegate; "${caller?.name ?? 'a host'}" cannot.`
-                    );
-                }
+        // The allowlist schema is per-harness, so the candidate overrides the
+        // source entry's generic schema (the editable module still owns the
+        // execution contract and delegates to the live runtime operation).
+        const delegateMetadata = agentDelegateMetadata(subagentNames);
+        const agentDelegateDefinition = registerBaselineSource(
+            {
+                name: AGENT_DELEGATE,
+                description: delegateMetadata.description,
+                tags: delegateMetadata.tags,
+                parameters: delegateMetadata.parameters,
+                sourcePath: 'runtime-tools/agentDelegate.ts'
+            },
+            () =>
+                defineTool({
+                    ...delegateMetadata,
+                    execute: (context) =>
+                        delegateFor(
+                            context.agent,
+                            (context.parameters ?? {}) as {
+                                agent?: string;
+                                input?: string;
+                            },
+                            context.run,
+                            context.runDepth
+                        )
+                })
+        ).tool;
 
-                // Delegation is a top-level capability. A primary reached as a
-                // subagent of another run must not recurse outward. `runDepth` is
-                // the calling run's depth (1 = top level), carried on the tool
-                // context so this rule survives concurrent runs without a global
-                // run stack.
-                if ((runDepth ?? 1) > 1) {
-                    throw new HarnessError(
-                        'Delegation is only available from the primary agent\'s own run, not from inside another agent.'
-                    );
-                }
-
-                // Two schema properties, so `parameters` is the parsed arguments
-                // object (the single-property rule does not apply).
-                const target = parameters?.agent;
-
-                if (typeof target !== 'string' || !subagentNames.includes(target)) {
-                    throw new HarnessError(
-                        `Agent "${String(target)}" is not a configured subagent. Allowed: ${subagentNames.join(', ')}.`
-                    );
-                }
-
-                if (typeof parameters?.input !== 'string' || parameters.input.trim().length === 0) {
-                    throw new HarnessError('Delegation requires a non-empty input.');
-                }
-
-                if (!run) {
-                    throw new HarnessError('Delegation requires a harness run context.');
-                }
-
-                const message = await run(target, parameters.input);
-
-                // Only the answer crosses back: the subagent keeps its own
-                // transcript and instructions. `message` is the run's ANSWER, not
-                // necessarily its literal final turn: when the child's last turn is
-                // a normal stop with blank text, the harness resolves the last
-                // substantive tool-free response of that same run (T2/R1). The child's
-                // transcript and `done` events stay literal.
-                return { agent: target, content: message.content };
-            }
-        });
+        // Primary-only and answer-extraction are properties of THIS definition. A
+        // replacement published under the same wire name inherits neither.
+        primaryOnlyDefinitions.add(agentDelegateDefinition);
+        delegateAnswerDefinitions.add(agentDelegateDefinition);
     }
 
     // -----------------------------------------------------------------------
     // N6 branch controls: threadFork and actionRequest
     // -----------------------------------------------------------------------
     //
-    // Both are runtime-only tools: launchToolCall special-cases them BEFORE the
-    // registry is consulted, because each needs the owning RunState (the exact
-    // transcript snapshot and the owner run) rather than an ordinary tool
-    // context. They are still registered here so declarations, reserved names,
-    // and the host's `tools` view all name one definition, and their execute
-    // bodies fail loudly if some future path calls them directly.
+    // Both need the owning RunState (the exact transcript snapshot and the owner
+    // run) rather than an ordinary tool context, so launchToolCall dispatches them
+    // to runtime handlers. The dispatch is keyed by a MARKER ON THE RESOLVED
+    // DEFINITION, never by wire name before registry lookup: replacing either
+    // tool drops the marker and the replacement executes as an ordinary tool.
+    // Their execute bodies fail loudly if some future path calls them directly.
     if (forks.enabled) {
-        tools[THREAD_FORK] = defineTool<{ input: string; label?: string }, HarnessForkResult>({
-            ...THREAD_FORK_METADATA,
-            execute: () => {
-                throw new HarnessError(
-                    'threadFork requires the harness run that owns the conversation; call it from a model tool call.'
-                );
-            }
-        });
+        const threadForkDefinition = registerBaselineSource(
+            { name: THREAD_FORK, sourcePath: 'runtime-tools/threadFork.ts' },
+            () =>
+                defineTool({
+                    ...THREAD_FORK_METADATA,
+                    execute: () => {
+                        throw new HarnessError(
+                            'threadFork requires the harness run that owns the conversation; call it from a model tool call.'
+                        );
+                    }
+                })
+        ).tool;
+        runtimeControlDefinitions.set(threadForkDefinition, 'threadFork');
     }
 
     if (interaction !== undefined) {
-        tools[ACTION_REQUEST] = defineTool<Record<string, unknown>, HarnessActionResult>({
-            ...ACTION_REQUEST_METADATA,
-            execute: () => {
-                throw new HarnessError(
-                    'actionRequest requires the harness run that owns the conversation; call it from a model tool call.'
-                );
-            }
+        const actionRequestDefinition = registerBaselineSource(
+            { name: ACTION_REQUEST, sourcePath: 'runtime-tools/actionRequest.ts' },
+            () =>
+                defineTool({
+                    ...ACTION_REQUEST_METADATA,
+                    execute: () => {
+                        throw new HarnessError(
+                            'actionRequest requires the harness run that owns the conversation; call it from a model tool call.'
+                        );
+                    }
+                })
+        ).tool;
+        runtimeControlDefinitions.set(actionRequestDefinition, 'actionRequest');
+    }
+
+    // toolCancel is an ordinary registered definition too, but it is DECLARED
+    // only while the calling actor has background work. `pendingOnlyDefinitions`
+    // (not the name) drives that declaration rule; replacing it publishes a normal
+    // tool that is declared according to its own visibility.
+    if (tools[TOOL_CANCEL] === undefined) {
+        const toolCancelDefinition = registerBaselineSource(
+            { name: TOOL_CANCEL, sourcePath: 'runtime-tools/toolCancel.ts' },
+            () =>
+                defineTool({
+                    ...TOOL_CANCEL_METADATA,
+                    execute: () => {
+                        throw new HarnessError(
+                            'toolCancel must be dispatched by the harness run that owns the pending call.'
+                        );
+                    }
+                })
+        ).tool;
+        // The baseline control is not a standing core declaration; it is appended
+        // by offerDeclarations only while actionable. Keeping its visibility
+        // 'searchable' also keeps descriptor core lists honest. A replacement is
+        // unaffected and uses its own visibility.
+        toolCancelDefinition.visibility = 'searchable';
+        runtimeControlDefinitions.set(toolCancelDefinition, 'toolCancel');
+        pendingOnlyDefinitions.add(toolCancelDefinition);
+    }
+
+    // Baseline preset registrations. Each preset is compiled from its EDITABLE
+    // source entry through the same kernel (not from a cached lazy proxy and not
+    // from a prepared definition): the startup path therefore exercises exactly
+    // the compilation/loading/validation operation a runtime replacement uses.
+    // `presets: false` simply skips these baseline rows.
+    const PRESET_SOURCE_ENTRIES: Record<string, string> = {
+        syntaxCheck: 'tools/syntax/syntaxCheck.ts',
+        fileRead: 'tools/files/fileRead.ts',
+        fileWrite: 'tools/files/fileWrite.ts',
+        fileEdit: 'tools/files/fileEdit.ts',
+        fileList: 'tools/files/fileList.ts',
+        fileGlob: 'tools/files/fileGlob.ts',
+        commandRun: 'tools/command/commandRun.ts',
+        gitDiff: 'tools/command/gitDiff.ts'
+    };
+
+    if (configuration.presets !== false) {
+        for (const name of Object.keys(presetTools)) {
+            const source = PRESET_SOURCE_ENTRIES[name];
+            if (source === undefined) continue;
+            // Browser fallback keeps the historical lazy-proxy definitions; no
+            // browser code execution is promised, only the same declaration shape.
+            registerBaselineSource(
+                { name, sourcePath: source },
+                () => presetTools[name as keyof typeof presetTools]
+            );
+        }
+    }
+
+    // Host-configured source entries, committed AFTER the baseline and BEFORE
+    // `tools` overrides. These are genuine compiled/reloaded revisions, not a
+    // prebuilt-definition shortcut: this is the application tool-source map.
+    for (const [name, sourcePath] of Object.entries(configuration.toolSources ?? {})) {
+        if (typeof sourcePath !== 'string' || sourcePath.trim().length === 0) {
+            throw new HarnessError(`Tool source "${name}" must be a non-empty source path.`);
+        }
+
+        registerAtStartup({ name, sourcePath });
+    }
+
+    // User-configured tools are committed AFTER the baseline and toolSources, so a
+    // configured tool of the same name intentionally wins. Function-closure tools
+    // remain compatible, but they are wrapped in a fresh definition instead of
+    // mutating the caller's shared Tool object (`name` is a mutable own property).
+    for (const [name, definition] of Object.entries(configuration.tools ?? {})) {
+        if (!definition || typeof definition.execute !== 'function') {
+            throw new HarnessError(`Tool "${name}" is not a tool: create it with tool({...}).`);
+        }
+
+        const wrapped = defineTool({
+            name,
+            description: definition.description,
+            tags: definition.tags,
+            visibility: definition.visibility,
+            ...(definition.parameters === undefined
+                ? {}
+                : { parameters: definition.parameters }),
+            // Preserve the original receiver in case a host implementation is a
+            // method that relies on `this`; the shared object is never mutated.
+            execute: (context) => definition.execute(context)
         });
+
+        registerAtStartup({ definition: wrapped });
+    }
+
+    // Opt-in web search (W3). The provider closure (and its credentials) stays
+    // harness-owned; the REGISTERED entry is the independently compiled runtime
+    // source revision. Candidate metadata supplies the configured provider surface
+    // (dynamic schema), so no credential or provider list is baked into source.
+    if (
+        configuration.websearch !== undefined &&
+        configuration.websearch !== false &&
+        tools[WEB_SEARCH_TOOL_NAME] === undefined
+    ) {
+        const webSearch = createWebSearchTool(
+            configuration.websearch === true ? {} : configuration.websearch
+        );
+
+        if (webSearch) {
+            webOperations.webSearch = webSearch;
+            registerBaselineSource(
+                {
+                    name: WEB_SEARCH_TOOL_NAME,
+                    sourcePath: 'runtime-tools/webSearch.ts',
+                    description: webSearch.description,
+                    tags: webSearch.tags,
+                    parameters: webSearch.parameters,
+                    visibility: webSearch.visibility
+                },
+                () => webSearch
+            );
+        }
+    }
+
+    // Opt-in page fetch (W4). Same rule: the registered implementation is compiled
+    // source; the provider/credential closure is the live runtime operation.
+    if (
+        configuration.webfetch !== undefined &&
+        configuration.webfetch !== false &&
+        tools[WEB_FETCH_TOOL_NAME] === undefined
+    ) {
+        const webFetch = createWebFetchTool(
+            configuration.webfetch === true ? {} : configuration.webfetch
+        );
+        webOperations.webFetch = webFetch;
+        registerBaselineSource(
+            {
+                name: WEB_FETCH_TOOL_NAME,
+                sourcePath: 'runtime-tools/webFetch.ts',
+                description: webFetch.description,
+                tags: webFetch.tags,
+                parameters: webFetch.parameters,
+                visibility: webFetch.visibility
+            },
+            () => webFetch
+        );
     }
 
     // The tools a request may declare: every core tool first (file tools, a
@@ -1493,24 +2017,49 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // An AUTOANSWER branch is tool-free and single-iteration by contract: it is
     // declared no tools at all (not even toolCancel), so the owner can only
     // produce the directive answer this runtime parses.
-    const declarations = (run: RunState): HarnessStreamTool[] => {
-        if (run.autoAnswer) return [];
+    // The OFFERED DEFINITIONS for one model request. Keeping the exact Tool
+    // objects (not just names/metadata) is what makes the advertised schema and
+    // the implementation that executes a returned call the SAME revision. A
+    // replacement published while this request is in flight is visible to the
+    // NEXT request; calls from this one retain their captured definitions.
+    const offerDeclarations = (
+        run: RunState
+    ): { offered: Map<string, Tool>; declarations: HarnessStreamTool[] } => {
+        const offered = new Map<string, Tool>();
 
-        const list = declared(run.agent).map(({ name, description, parameters }) => ({
-            name,
-            description,
-            parameters
-        }));
+        if (run.autoAnswer) return { offered, declarations: [] };
 
-        if (scheduler.pending(run.actorKey).length > 0) {
+        const definitions = declared(run.agent);
+        const list: HarnessStreamTool[] = [];
+
+        for (const definition of definitions) {
+            offered.set(definition.name, definition);
             list.push({
-                name: TOOL_CANCEL,
-                description: TOOL_CANCEL_METADATA.description,
-                parameters: TOOL_CANCEL_METADATA.parameters
+                name: definition.name,
+                description: definition.description,
+                parameters: definition.parameters
             });
         }
 
-        return list;
+        // toolCancel is declared only while this actor has work in flight. It is a
+        // normal registered definition; the pending-only marker belongs to the
+        // baseline object, so a replacement is declared by its own visibility.
+        const pendingCancel = tools[TOOL_CANCEL];
+
+        if (
+            pendingCancel !== undefined &&
+            pendingOnlyDefinitions.has(pendingCancel) &&
+            scheduler.pending(run.actorKey).length > 0
+        ) {
+            offered.set(pendingCancel.name, pendingCancel);
+            list.push({
+                name: pendingCancel.name,
+                description: pendingCancel.description,
+                parameters: pendingCancel.parameters
+            });
+        }
+
+        return { offered, declarations: list };
     };
 
     // -----------------------------------------------------------------------
@@ -1762,43 +2311,97 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // They are registered TOGETHER: an id is only useful if it can be discovered,
     // so exposing threadSend without its roster would force the server (or the
     // model) to invent targets.
-    const registerThreadTools = (): void => {
-        if (tools[THREAD_LIST] === undefined) {
-            tools[THREAD_LIST] = defineTool<Record<string, never>, HarnessThreadRoster>({
-                ...THREAD_LIST_METADATA,
-                execute: ({ threadId }) => threadRoster(threadId)
-            });
+    const threadSendFor = (
+        caller: Agent | undefined,
+        threadId: string | undefined,
+        parameters: Record<string, unknown>
+    ): HarnessThreadMessageResult => {
+        const target = typeof parameters?.thread === 'string' ? parameters.thread.trim() : '';
+        const message = typeof parameters?.message === 'string' ? parameters.message : '';
+
+        if (target.length === 0) {
+            throw new HarnessError('threadSend requires a non-empty target thread id.');
         }
 
-        if (tools[THREAD_SEND] !== undefined) return;
+        if (message.trim().length === 0) {
+            throw new HarnessError('threadSend requires a non-empty message.');
+        }
 
-        tools[THREAD_SEND] = defineTool<{ thread: string; message: string }, HarnessThreadMessageResult>({
-            ...THREAD_SEND_METADATA,
-            execute: ({ agent: caller, threadId, parameters }) => {
-                const target = typeof parameters?.thread === 'string' ? parameters.thread.trim() : '';
-                const message = typeof parameters?.message === 'string' ? parameters.message : '';
+        // SENDER IDENTITY (R4): derived from the runtime context, never from a
+        // tool argument. A manual executeTool call has no `threadId` and runs as
+        // the primary agent (an operator action).
+        return postThreadMessage(
+            {
+                agent: caller?.name ?? primaryName,
+                ...(threadId === undefined ? {} : { threadId })
+            },
+            target,
+            message
+        );
+    };
 
-                if (target.length === 0) {
-                    throw new HarnessError('threadSend requires a non-empty target thread id.');
+    // Conditional baseline source entries and their order. Kept in one place so
+    // createThread and restore prepare the same revisions.
+    const THREAD_TOOL_SOURCES = [
+        { name: THREAD_LIST, sourcePath: 'runtime-tools/threadList.ts' },
+        { name: THREAD_SEND, sourcePath: 'runtime-tools/threadSend.ts' }
+    ] as const;
+
+    const threadToolFallback = (name: string): Tool =>
+        name === THREAD_LIST
+            ? defineTool({
+                  ...THREAD_LIST_METADATA,
+                  execute: (context) => threadRoster(context.threadId)
+              })
+            : defineTool({
+                  ...THREAD_SEND_METADATA,
+                  execute: (context) =>
+                      threadSendFor(
+                          context.agent,
+                          context.threadId,
+                          (context.parameters ?? {}) as Record<string, unknown>
+                      )
+              });
+
+    // Restore must not compile after Phase 4 has mutated live state. These two
+    // helpers split preparation (may throw, no mutation) from publication (no
+    // remaining I/O/compilation).
+    const prepareMissingThreadTools = (reserved?: ReadonlySet<string>): PreparedTool[] =>
+        THREAD_TOOL_SOURCES.filter(
+            ({ name }) =>
+                reserved?.has(name) !== true &&
+                // "Missing" is against the FINAL registry after Phase 4, not the
+                // pre-restore registry: a currently-created entry is about to be
+                // deleted, so its name must be prepared as a baseline revision.
+                (tools[name] === undefined || createdToolRecords.has(name))
+        ).map(({ name, sourcePath }) =>
+            sourceStartupSupported
+                ? prepareToolCandidate({ name, sourcePath }, { expectedName: name })
+                : prepareDefinition(threadToolFallback(name))
+        );
+
+    const publishPreparedBaseline = (prepared: PreparedTool): void => {
+        tools[prepared.tool.name] = prepared.tool;
+
+        if (prepared.record.format === 'module' || prepared.record.source !== undefined) {
+            toolSourceRecords.set(prepared.tool.name, prepared.record);
+        } else {
+            toolSourceRecords.delete(prepared.tool.name);
+        }
+    };
+
+    const registerThreadTools = (): void => {
+        for (const { name, sourcePath } of THREAD_TOOL_SOURCES) {
+            if (tools[name] === undefined) {
+                if (sourceStartupSupported) {
+                    registerBaselineAtRuntime({ name, sourcePath });
+                } else {
+                    registerBaselineAtRuntime({
+                        definition: threadToolFallback(name)
+                    });
                 }
-
-                if (message.trim().length === 0) {
-                    throw new HarnessError('threadSend requires a non-empty message.');
-                }
-
-                // SENDER IDENTITY (R4): derived from the runtime context, never
-                // from a tool argument. A manual executeTool call has no
-                // `threadId` and runs as the primary agent (an operator action).
-                return postThreadMessage(
-                    {
-                        agent: caller?.name ?? primaryName,
-                        ...(threadId === undefined ? {} : { threadId })
-                    },
-                    target,
-                    message
-                );
             }
-        });
+        }
     };
 
     // Deliver one cross-thread message. The text is attributed explicitly, so the
@@ -2780,7 +3383,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //
     // EXCEPTION: an abort is not a tool failure. It propagates (no result is
     // written for it) so the run rolls back instead of inviting a retry.
-    const launchToolCall = async (run: RunState, call: HarnessToolCall): Promise<void> => {
+    const launchToolCall = async (
+        run: RunState,
+        call: HarnessToolCall,
+        offered?: ReadonlyMap<string, Tool>
+    ): Promise<void> => {
         // ABORT BOUNDARY (R10): no call starts into a cancelled run.
         throwIfAborted(run);
 
@@ -2794,10 +3401,38 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const parseArguments = (schema: Record<string, unknown> | undefined): unknown =>
             parseToolCallArguments(schema, call);
 
-        // toolCancel is a HARNESS control, not a registry entry: it exists only
-        // while this agent has work in flight (see declarations). Call ids are
-        // resolved inside the CALLING run's scope, so a run can never cancel a
-        // sibling's work.
+        // RESOLUTION: a call returned by a model request uses the definition that
+        // request ADVERTISED, even if the name was replaced while the request was
+        // in flight. That keeps schema and implementation on one revision. A later
+        // request captures the replacement. Runtime controls are recognised by a
+        // marker on the resolved definition object, never by name before lookup.
+        const definition = offered?.get(call.name) ?? tools[call.name];
+
+        if (!definition) {
+            // Unknown tool: answer the call so the transcript stays valid for strict
+            // providers, and point the model at discovery.
+            const available = declared(brain).map((tool) => tool.name).join(', ') || 'none';
+            await fail(
+                `Tool "${call.name}" is not registered. Available tools: ${available}. Call ${TOOL_REQUEST} with capability tags to search the catalogue.`
+            );
+            return;
+        }
+
+        // Roles/content policies are attached to the baseline DEFINITION objects,
+        // not to names. A replacement under agentDelegate/toolCreate is an ordinary
+        // tool and does not inherit the old gate.
+        if (primaryOnlyDefinitions.has(definition) && roleOf(brain) !== 'primary') {
+            await fail(
+                `Tool "${call.name}" is only available to the primary agent "${primaryName}".`
+            );
+            return;
+        }
+
+        // toolCancel is a HARNESS control only while the resolved definition is the
+        // baseline control object. A replacement executes through the ordinary path.
+        if (runtimeControlDefinitions.get(definition) === 'toolCancel') {
+            // Call ids are resolved inside the CALLING run's scope, so a run can
+            // never cancel a sibling's work.
         //
         // R2 — IDEMPOTENCE: cancellation is a state to reach, not a transition to
         // perform exactly once. A call that is still pending is released; a call
@@ -2810,7 +3445,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             let parameters: unknown;
 
             try {
-                parameters = parseArguments(TOOL_CANCEL_METADATA.parameters);
+                parameters = parseArguments(definition.parameters);
             } catch (error) {
                 const info = toErrorInfo(error);
                 await fail(
@@ -2877,44 +3512,31 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             );
             return;
         }
+        }
 
         // N6 branch controls. Both need the owning RunState (an exact transcript
-        // snapshot and, for actionRequest, the owner lineage), so they are
-        // handled here instead of through definition.execute. A branch run is
-        // background work like any other tool call: the requester keeps going.
-        if (call.name === THREAD_FORK && forks.enabled) {
+        // snapshot and, for actionRequest, the owner lineage), so a baseline
+        // control definition dispatches to a runtime handler. A replacement has no
+        // marker and therefore executes through definition.execute like any tool.
+        const runtimeControl = runtimeControlDefinitions.get(definition);
+
+        if (runtimeControl === 'threadFork' && forks.enabled) {
             await launchThreadFork(run, call, parseArguments);
             return;
         }
 
-        if (call.name === ACTION_REQUEST && interaction !== undefined) {
+        if (runtimeControl === 'actionRequest' && interaction !== undefined) {
             await launchActionRequest(run, call, parseArguments);
             return;
         }
 
-        const definition = tools[call.name];
-
-        // Unknown tool: answer the call so the transcript stays valid for strict
-        // providers, and point the model at discovery.
-        if (!definition) {
-            const available = declared(brain).map((tool) => tool.name).join(', ') || 'none';
-            await fail(
-                `Tool "${call.name}" is not registered. Available tools: ${available}. Call ${TOOL_REQUEST} with capability tags to search the catalogue.`
-            );
-            return;
-        }
-
-        if (call.name === AGENT_DELEGATE && roleOf(brain) !== 'primary') {
-            await fail(`Tool "${AGENT_DELEGATE}" is only available to the primary agent "${primaryName}".`);
-            return;
-        }
-
-        if (call.name === TOOL_CREATE && toolCreation === 'primary' && roleOf(brain) !== 'primary') {
-            await fail(`Tool "${TOOL_CREATE}" is only available to the primary agent "${primaryName}".`);
-            return;
-        }
-
-        if (definition.visibility !== 'core' && !activeTools.has(call.name)) {
+        // Discovery gates the model: a captured declaration is already authorised,
+        // otherwise the current registry entry must be core or enabled.
+        if (
+            offered?.get(call.name) !== definition &&
+            definition.visibility !== 'core' &&
+            !activeTools.has(call.name)
+        ) {
             const tags = definition.tags.slice(0, 3).map((tag) => `"${tag}"`).join(', ');
             await fail(
                 `Tool "${call.name}" is registered but not enabled yet. Call ${TOOL_REQUEST} with tags like ${tags} to enable it.`
@@ -2949,6 +3571,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     parameters,
                     agent: brain,
                     agents,
+                    // THE live harness reference: strict identity is preserved across
+                    // replacement (the handle is created once, after startup, and is
+                    // never cloned for a tool invocation).
+                    harness: handle,
+                    // Nested calls resolve through the live registry at call time and
+                    // inherit this invocation's cancellation/caller/thread/depth.
+                    callTool: (name: string, nestedParameters: unknown) =>
+                        callToolInternal(name, nestedParameters, {
+                            agent: brain,
+                            signal,
+                            runDepth: run.depth,
+                            ...(run.threadId === undefined ? {} : { threadId: run.threadId })
+                        }),
                     // Always present now: a background call is always cancelable.
                     signal,
                     runDepth: run.depth,
@@ -2976,7 +3611,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                             signal,
                             run,
                             call.id,
-                            call.name === AGENT_DELEGATE ? DELEGATE_ANSWER : undefined
+                            delegateAnswerDefinitions.has(definition) ? DELEGATE_ANSWER : undefined
                         );
                     }
                 };
@@ -3833,7 +4468,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // generator is drained in the background; core/agent's `precommit` guard is
     // what refuses a late commit, so the detached stream cannot touch the
     // transcript (or emit events through `emit`, which is ownership-guarded).
-    const requestTurn = async (run: RunState): Promise<HarnessAssistantMessage> => {
+    const requestTurn = async (
+        run: RunState
+    ): Promise<{ message: HarnessAssistantMessage; offered: Map<string, Tool> }> => {
         const brain = run.agent;
 
         return serializeTurn(run.actorKey, async () => {
@@ -3842,10 +4479,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             throwIfAborted(run);
 
             const projection = projectTranscript(brain, runPending(run));
+            // Capture the exact offered definitions for this request. Tool calls
+            // returned by it execute these objects even if a replacement publishes
+            // before the calls are launched.
+            const { offered, declarations: declarationsForRequest } = offerDeclarations(run);
             const iterator = brain
                 .turn({
                     signal: run.signal,
-                    tools: declarations(run),
+                    tools: declarationsForRequest,
                     transcript: projection,
                     precommit: () => assertCommitAllowed(run)
                 })
@@ -3895,7 +4536,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
             if (signal === undefined) {
                 try {
-                    return await consume;
+                    return { message: await consume, offered };
                 } catch (error) {
                     // Preserve for-await's close-on-early-exit semantics even
                     // though this path has no abort race (e.g. a reporter threw):
@@ -3916,7 +4557,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             else signal.addEventListener('abort', abortHandler, { once: true });
 
             try {
-                return await Promise.race([consume, aborted]);
+                return { message: await Promise.race([consume, aborted]), offered };
             } catch (error) {
                 // Unwind at the next suspension (no await: a provider stuck in a
                 // pending next() may take forever, and that is fine — the
@@ -4069,7 +4710,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // of one round late.
                 drainThreadQueue(run);
 
-                const message = await requestTurn(run);
+                const { message, offered } = await requestTurn(run);
 
                 // P1-A: a completion may have landed WHILE this request was in
                 // flight, and its slow reporter may still be running. Drain the
@@ -4178,7 +4819,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // failure is already a tool result, so the round always completes.
                 for (const call of message.toolCalls) {
                     throwIfAborted(run);
-                    await launchToolCall(run, call);
+                    await launchToolCall(run, call, offered);
                 }
 
                 await settleWindow(run);
@@ -4796,11 +5437,37 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // Phase 1: pure validation. Throws without mutating anything.
         const next = readHarnessSnapshot(value);
 
-        // Phase 2: compile every created tool. createDynamicTool validates the
-        // name/tags/schema/source bounds and compiles the body, but does NOT run
-        // it. A source that cannot compile fails here, before state is replaced.
-        const restoredTools = next.createdTools.map((creation) =>
-            createDynamicTool(creation, { reserved: RESERVED_TOOL_NAMES })
+        // Phase 2: compile EVERY restore candidate through the same shared
+        // prepare operation runtime/startup registration uses. Module revisions
+        // use their captured entry bytes + local dependencies (not a re-read of an
+        // edited path) so the restored revision is exactly the persisted one;
+        // legacy records keep their async-body form. Nothing executes and no live
+        // state is touched until every candidate has prepared.
+        const restoredCandidates = next.createdTools.map((creation) =>
+            prepareToolCandidate(
+                {
+                    name: creation.name,
+                    description: creation.description,
+                    tags: creation.tags,
+                    ...(creation.parameters === undefined
+                        ? {}
+                        : { parameters: creation.parameters }),
+                    ...(creation.visibility === undefined
+                        ? {}
+                        : { visibility: creation.visibility }),
+                    ...(creation.source === undefined ? {} : { source: creation.source }),
+                    ...(creation.moduleText === undefined
+                        ? {}
+                        : { moduleText: creation.moduleText }),
+                    ...(creation.sourcePath === undefined
+                        ? {}
+                        : { sourcePath: creation.sourcePath }),
+                    ...(creation.dependencies === undefined
+                        ? {}
+                        : { dependencies: creation.dependencies })
+                },
+                { expectedName: creation.name }
+            )
         );
 
         // Phase 3: target-specific checks.
@@ -4813,7 +5480,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 .map((name) => name.toLowerCase())
         );
 
-        for (const definition of restoredTools) {
+        for (const prepared of restoredCandidates) {
+            const definition = prepared.tool;
             const key = definition.name.toLowerCase();
 
             if (occupied.has(key)) {
@@ -4857,7 +5525,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             Object.keys(tools).filter((name) => !createdToolRecords.has(name))
         );
 
-        for (const definition of restoredTools) available.add(definition.name);
+        for (const prepared of restoredCandidates) available.add(prepared.tool.name);
 
         for (const name of next.discovery.enabled) {
             if (!available.has(name)) {
@@ -4877,19 +5545,39 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return { entry, threadAgent };
         });
 
+        // Conditional thread tools are restored catalogue state too. PREPARE their
+        // source revisions before Phase 4; publication below performs no remaining
+        // compilation, so a compile failure still aborts with nothing mutated.
+        const pendingThreadTools =
+            next.threads === undefined
+                ? []
+                : prepareMissingThreadTools(
+                      new Set(restoredCandidates.map((prepared) => prepared.tool.name))
+                  );
+
         // Phase 4: apply. Everything above succeeded; from here the snapshot is
         // the new state.
-        for (const name of [...createdToolRecords.keys()]) delete tools[name];
+        for (const name of [...createdToolRecords.keys()]) {
+            delete tools[name];
+            // A removed created tool must not leave a stale inspection record.
+            toolSourceRecords.delete(name);
+        }
 
         createdToolRecords.clear();
 
-        restoredTools.forEach((definition, index) => {
-            tools[definition.name] = definition;
+        restoredCandidates.forEach((prepared, index) => {
+            tools[prepared.tool.name] = prepared.tool;
+            // Keep the captured revision inspectable after a restore. This is the
+            // same source record the compiler just consumed.
+            toolSourceRecords.set(prepared.tool.name, prepared.record);
             createdToolRecords.set(
-                definition.name,
+                prepared.tool.name,
                 cloneToolCreation(next.createdTools[index])
             );
         });
+
+        // Publish the prepared conditional entries WITHOUT compiling here.
+        for (const prepared of pendingThreadTools) publishPreparedBaseline(prepared);
 
         // The lifetime budget is state, not configuration: a resumed session
         // must not regain spent creations. reset() still does not clear it.
@@ -5023,8 +5711,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         threadIdSequence = Math.max(threadIdSequence, next.threadSequence ?? 0);
 
         // The field pair's presence means this session owned host threads at some
-        // point (possibly all deleted), so the conditional chat tool comes back.
-        if (next.threads !== undefined) registerThreadTools();
+        // point (possibly all deleted); those tools were prepared and published
+        // above without compiling after mutation.
 
         todo.restore(next.records.todos);
         profile.restore(next.records.profiles);
@@ -5062,20 +5750,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return brain;
         },
         addTool: (name, toolConfiguration) => {
-            // The harness-owned names stay owned, even when agentDelegate was not
-            // registered (no subagents): a plugin must not claim a reserved name
-            // that would later shadow the harness contract.
-            if ((RESERVED_TOOL_NAMES as readonly string[]).includes(name)) {
-                throw new HarnessError(`Tool "${name}" is reserved by the harness.`);
-            }
-            if (tools[name]) {
-                throw new HarnessError(`Tool "${name}" is already registered.`);
-            }
+            // No reserved names and no "already registered" rejection: a plugin is
+            // an intentional later registration and therefore REPLACES by name.
+            // It commits through the same atomic kernel as every other path.
             const definition = defineTool({ ...toolConfiguration, name });
-            tools[name] = definition;
+            registerAtStartup({ definition });
             return definition;
         }
     });
+
+    // Startup is complete: registrations from here on are runtime registrations
+    // (budget, enabled set, persistence bookkeeping, and state-change reporting).
+    startupPhase = false;
 
     // The host/server-facing execution path (R8): run one REGISTERED tool by name
     // with the session it belongs to, exactly like the model would, but without
@@ -5098,17 +5784,74 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // No progress events are emitted: a manual call is not a conversation turn, so
     // there is no transcript position for a tool_call/tool_result pair. The
     // caller's request/response carries the duration (ToolCallResult).
-    const executeTool = async (name: string, parameters: unknown): Promise<unknown> => {
-        // N6: the branch controls are not host-callable. A manual call has no
-        // requester transcript to fork and no owner run to ask, so it is refused
-        // with a specific error rather than run against the primary agent (which
-        // would answer on the operator's behalf and fabricate owner context).
-        if (name === THREAD_FORK || name === ACTION_REQUEST) {
+    // Nested/registered-tool invocation (R2). The registry is read at CALL time,
+    // so a tool that calls a sibling observes a replacement instead of capturing a
+    // fixed implementation. Arguments are validated with the same schema gate as
+    // the manual path; caller, cancellation, thread, and depth are inherited from
+    // the invocation options. A baseline runtime control is rejected because it
+    // needs the owning RunState, not an ordinary tool context; a replacement under
+    // the same name has no marker and runs normally.
+    const callToolInternal = async (
+        name: string,
+        parameters: unknown,
+        options: HarnessToolCallOptions = {}
+    ): Promise<unknown> => {
+        const definition = tools[name];
+
+        if (!definition) {
+            throw new HarnessError(`Tool "${name}" is not registered in this harness.`);
+        }
+
+        if (runtimeControlDefinitions.has(definition)) {
             throw new HarnessError(
-                `Tool "${name}" is not available through executeTool: it requires the harness run that owns the conversation.`
+                `Tool "${name}" requires the harness run that owns the conversation and cannot be called through callTool.`
             );
         }
 
+        const resolved = resolveToolParameters(definition.parameters, parameters, 'direct');
+        const signal = options.signal;
+
+        const context: ToolContext = {
+            parameters: resolved,
+            agents,
+            harness: handle,
+            callTool: (nestedName: string, nestedParameters: unknown) =>
+                callToolInternal(nestedName, nestedParameters, options),
+            ...(options.agent === undefined ? {} : { agent: options.agent }),
+            ...(signal === undefined ? {} : { signal }),
+            runDepth: options.runDepth ?? 1,
+            ...(options.threadId === undefined ? {} : { threadId: options.threadId }),
+            run: (agentName: string, input: string) => {
+                const target = agents[agentName];
+
+                if (!target) {
+                    throw new HarnessError(`Agent "${agentName}" is not registered.`);
+                }
+
+                return runAgent(
+                    target,
+                    input,
+                    signal,
+                    undefined,
+                    undefined,
+                    delegateAnswerDefinitions.has(definition) ? DELEGATE_ANSWER : undefined
+                );
+            }
+        };
+
+        try {
+            return await definition.execute(context);
+        } finally {
+            // Same advisory boundary as executeTool: nested calls are real tool
+            // executions and may have changed snapshot-managed state.
+            notifyStateChange('tool_execute', {
+                tool: name,
+                ...(options.agent === undefined ? {} : { agent: options.agent.name })
+            });
+        }
+    };
+
+    const executeTool = async (name: string, parameters: unknown): Promise<unknown> => {
         const definition = tools[name];
 
         // The session owns which tools exist: a harness without subagents has no
@@ -5117,6 +5860,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // true of toolCreate under `toolCreation: false`.
         if (!definition) {
             throw new HarnessError(`Tool "${name}" is not registered in this harness.`);
+        }
+
+        // Baseline branch controls are not host-callable. A manual call has no
+        // requester transcript to fork and no owner run to ask. The check uses the
+        // resolved definition MARKER, so a replacement under the same name is an
+        // ordinary tool and is callable here.
+        if (runtimeControlDefinitions.has(definition)) {
+            throw new HarnessError(
+                `Tool "${name}" is not available through executeTool: it requires the harness run that owns the conversation.`
+            );
         }
 
         const resolved = resolveToolParameters(definition.parameters, parameters, 'direct');
@@ -5129,6 +5882,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // still enforced by runAgent.
                 agent: primary,
                 agents,
+                // Manual/nested calls receive the same LIVE harness reference. A tool
+                // must never be handed a clone or a state snapshot as a substitute.
+                harness: handle,
+                callTool: (nestedName: string, nestedParameters: unknown) =>
+                    callToolInternal(nestedName, nestedParameters, { agent: primary, runDepth: 1 }),
                 // A manual call is a top-level action (depth 1), exactly like a
                 // harness invocation; delegation and the depth rule see it that
                 // way.
@@ -5149,7 +5907,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         undefined,
                         undefined,
                         undefined,
-                        name === AGENT_DELEGATE ? DELEGATE_ANSWER : undefined
+                        delegateAnswerDefinitions.has(definition) ? DELEGATE_ANSWER : undefined
                     );
                 }
             });
@@ -5176,17 +5934,32 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // describing exactly that: a complete handle assembled from two sources. Keep
     // this list in step with the Harness type — an omitted accessor typechecks as
     // `never` here and the cast would silently hide it.
-    const handle = Object.assign(run, {
+    let handle!: Harness;
+    handle = Object.assign(run, {
         agent: primary,
         agents,
         subagents,
         tools,
         plugins: pluginNames,
+        // The single kernel registration operation. Runtime source revisions and
+        // the model-facing toolRegistry both go through this exact function.
+        registerTool,
+        toolSource,
+        toolSources,
+        callTool: (name: string, parameters: unknown, options?: HarnessToolCallOptions) =>
+            callToolInternal(name, parameters, options),
+        // Stable, replacement-surviving tool memory.
+        memory,
+        // Live operations behind the standalone core-tool source entries.
+        runtime,
         // Host-side runtime creation: the same path the model's toolCreate tool
         // uses, so validation, budget, collision rules, and immediate enablement
         // are identical. Throws HarnessError, unlike the model path which turns
         // the failure into a tool result.
         createTool: createToolFrom,
+        // The public Harness type names this capability toolCreate; keep both
+        // spellings as the same function for backward compatibility.
+        toolCreate: createToolFrom,
         // Server-facing manual execution (R8): the session-bound tool invocation
         // `POST /tools/:name` uses when a client supplies a sessionId.
         executeTool,

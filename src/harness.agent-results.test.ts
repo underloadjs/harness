@@ -77,6 +77,7 @@ const hasForkResult = (request: HarnessStreamRequest): boolean =>
     );
 
 const CORE_DECLARATIONS = [
+    'toolRegistry',
     'toolRequest',
     'toolCreate',
     'todoManage',
@@ -133,17 +134,19 @@ describe('agentManage / agentResult registration', () => {
         expect(declaredNames(seenHelper[0])).toEqual([...CORE_DECLARATIONS, 'threadFork']);
     });
 
-    it('reserves agentManage and agentResult against other tool sources', () => {
+    it('lets other tool sources replace agentManage and agentResult (no reserved names)', async () => {
         for (const name of ['agentManage', 'agentResult']) {
             const clash = tool({ description: 'Mine.', tags: ['mine'], execute: () => 'ok' });
 
-            expect(() =>
-                harness({
-                    agents: { writer: brain(scripted([answer('hi')])) },
-                    tools: { [name]: clash },
-                    presets: false
-                })
-            ).toThrow(`Tool "${name}" is reserved by the harness.`);
+            const writer = harness({
+                agents: { writer: brain(scripted([answer('hi')])) },
+                tools: { [name]: clash },
+                presets: false
+            });
+
+            expect(writer.tools[name]).not.toBe(clash);
+            expect(writer.tools[name].description).toBe('Mine.');
+            await expect(writer.executeTool(name, {})).resolves.toBe('ok');
         }
     });
 

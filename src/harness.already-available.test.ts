@@ -212,6 +212,7 @@ describe('toolRequest already-available core tools', () => {
         expect(result.truncated).toBe(true);
         expect(result.alreadyAvailable.map((match: { name: string }) => match.name)).toEqual([
             'toolCreate',
+            'toolRegistry',
             'toolRequest'
         ]);
 
@@ -226,6 +227,7 @@ describe('toolRequest already-available core tools', () => {
             'tool-04'
         ]);
         expect(declaredNames(seen[1])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',

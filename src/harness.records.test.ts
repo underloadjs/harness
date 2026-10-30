@@ -56,6 +56,7 @@ const quiet = (entry: Agent, tools: Record<string, any> = {}) =>
     harness({ agents: { writer: entry }, tools, presets: false });
 
 const CORE_ORDER = [
+    'toolRegistry',
     'toolRequest',
     'toolCreate',
     'todoManage',
@@ -172,8 +173,9 @@ describe('session record tools', () => {
 
         // Configured tools precede the harness-owned set; agentDelegate is
         // primary-only, and threadFork follows it in registration order.
-        expect(declaredNames(writerSeen[0])).toEqual(['peek', ...CORE_ORDER_PRIMARY]);
-        expect(declaredNames(researcherSeen[0])).toEqual(['peek', ...CORE_ORDER_SUBAGENT]);
+        // `peek` was configured after the baseline, so it follows it.
+        expect(declaredNames(writerSeen[0])).toEqual([...CORE_ORDER_PRIMARY, 'peek']);
+        expect(declaredNames(researcherSeen[0])).toEqual([...CORE_ORDER_SUBAGENT, 'peek']);
     });
 
     it('keeps records across calls, isolates harnesses, and clears on reset', async () => {
@@ -197,12 +199,12 @@ describe('session record tools', () => {
             summary: 'They land.',
             content: 'The ship settles.'
         });
-        await writerA.tools.locationManage({ action: 'add', name: 'Harbour', description: 'A port.' });
+        await writerA.executeTool('locationManage', { action: 'add', name: 'Harbour', description: 'A port.' });
 
         // A second harness (a second session) sees none of it.
-        expect(await writerB.tools.profileManage({ action: 'list' })).toEqual(emptyProfiles);
-        expect(await writerB.tools.chapterManage({ action: 'list' })).toEqual(emptyChapters);
-        expect(await writerB.tools.locationManage({ action: 'list' })).toEqual(emptyLocations);
+        expect(await writerB.executeTool('profileManage', { action: 'list' })).toEqual(emptyProfiles);
+        expect(await writerB.executeTool('chapterManage', { action: 'list' })).toEqual(emptyChapters);
+        expect(await writerB.executeTool('locationManage', { action: 'list' })).toEqual(emptyLocations);
 
         // The chapter body is only available from `get`, on the same session.
         expect(await writerA.executeTool('chapterManage', { action: 'get', id: '1' })).toEqual({
@@ -214,12 +216,12 @@ describe('session record tools', () => {
         // A reset is a clean start for every store, including the id sequences.
         writerA.reset();
 
-        expect(await writerA.tools.profileManage({ action: 'list' })).toEqual(emptyProfiles);
-        expect(await writerA.tools.chapterManage({ action: 'list' })).toEqual(emptyChapters);
-        expect(await writerA.tools.locationManage({ action: 'list' })).toEqual(emptyLocations);
+        expect(await writerA.executeTool('profileManage', { action: 'list' })).toEqual(emptyProfiles);
+        expect(await writerA.executeTool('chapterManage', { action: 'list' })).toEqual(emptyChapters);
+        expect(await writerA.executeTool('locationManage', { action: 'list' })).toEqual(emptyLocations);
 
         expect(
-            await writerA.tools.profileManage({
+            await writerA.executeTool('profileManage', {
                 action: 'add',
                 name: 'After reset',
                 description: 'Fresh.'
@@ -229,7 +231,7 @@ describe('session record tools', () => {
             counts: { total: 1 }
         });
         expect(
-            await writerA.tools.chapterManage({
+            await writerA.executeTool('chapterManage', {
                 action: 'add',
                 title: 'After reset',
                 summary: 'Fresh.'
@@ -239,7 +241,7 @@ describe('session record tools', () => {
             counts: { total: 1, planned: 1, draft: 0, complete: 0 }
         });
         expect(
-            await writerA.tools.locationManage({
+            await writerA.executeTool('locationManage', {
                 action: 'add',
                 name: 'After reset',
                 description: 'Fresh.'
@@ -250,61 +252,52 @@ describe('session record tools', () => {
         });
     });
 
-    it('reserves the names for configured tools, plugins, and dynamic creation', () => {
+    it('lets configured tools, plugins, and dynamic creation replace the record names', async () => {
         const names = ['profileManage', 'chapterManage', 'locationManage'];
 
         for (const name of names) {
             const custom = tool({ description: 'Mine.', tags: ['records'], execute: () => 'ok' });
 
-            expect(() =>
-                harness({
-                    agents: { writer: brain(scripted([answer('hi')])) },
-                    tools: { [name]: custom },
-                    presets: false
-                })
-            ).toThrow(`Tool "${name}" is reserved by the harness.`);
+            const configured = harness({
+                agents: { writer: brain(scripted([answer('hi')])) },
+                tools: { [name]: custom },
+                presets: false
+            });
+            expect(configured.tools[name]).not.toBe(custom);
+            expect(configured.tools[name].description).toBe('Mine.');
 
-            expect(() =>
-                harness({
-                    agents: { writer: brain(scripted([answer('hi')])) },
-                    presets: false,
-                    plugins: [
-                        {
-                            name: 'claim',
-                            setup: (api) => {
-                                api.addTool(name, {
-                                    description: 'Mine.',
-                                    tags: ['records'],
-                                    execute: () => 'ok'
-                                });
-                            }
+            const plugin = harness({
+                agents: { writer: brain(scripted([answer('hi')])) },
+                presets: false,
+                plugins: [
+                    {
+                        name: 'claim',
+                        setup: (api) => {
+                            api.addTool(name, {
+                                description: 'Mine.',
+                                tags: ['records'],
+                                execute: () => 'plugin'
+                            });
                         }
-                    ]
-                })
-            ).toThrow(`Tool "${name}" is reserved by the harness.`);
+                    }
+                ]
+            });
+            await expect(plugin.executeTool(name, {})).resolves.toBe('plugin');
 
             const writer = quiet(brain(scripted([answer('hi')])));
-
-            expect(() =>
-                writer.createTool({ name, description: 'Mine.', tags: ['records'], source: 'return 1;' })
-            ).toThrow(`Tool name "${name}" is reserved by the harness.`);
-
-            // toolCreate's reservation check is case-insensitive.
-            const capitalised = name.charAt(0).toUpperCase() + name.slice(1);
-
-            expect(() =>
-                writer.createTool({
-                    name: capitalised,
-                    description: 'Mine.',
-                    tags: ['records'],
-                    source: 'return 1;'
-                })
-            ).toThrow(`Tool name "${capitalised}" is reserved by the harness.`);
+            writer.createTool({
+                name,
+                description: 'Mine.',
+                tags: ['records'],
+                source: 'return 1;'
+            });
+            await expect(writer.executeTool(name, {})).resolves.toBe(1);
         }
 
-        // The quiet registry is exactly the core set, in order.
+        // The quiet registry is exactly the core set, in order, plus the
+        // conditional toolCancel baseline.
         const writer = quiet(brain(scripted([answer('hi')])));
-        expect(Object.keys(writer.tools)).toEqual(CORE_ORDER_SUBAGENT);
+        expect(Object.keys(writer.tools)).toEqual([...CORE_ORDER_SUBAGENT, 'toolCancel']);
     });
 
     it('turns invalid record input into recoverable tool results', async () => {
@@ -330,8 +323,8 @@ describe('session record tools', () => {
         ]);
 
         // Nothing was created by the failed calls.
-        expect(await writer.tools.profileManage({ action: 'list' })).toEqual(emptyProfiles);
-        expect(await writer.tools.chapterManage({ action: 'list' })).toEqual(emptyChapters);
-        expect(await writer.tools.locationManage({ action: 'list' })).toEqual(emptyLocations);
+        expect(await writer.executeTool('profileManage', { action: 'list' })).toEqual(emptyProfiles);
+        expect(await writer.executeTool('chapterManage', { action: 'list' })).toEqual(emptyChapters);
+        expect(await writer.executeTool('locationManage', { action: 'list' })).toEqual(emptyLocations);
     });
 });

@@ -143,6 +143,7 @@ describe('agentDelegate', () => {
         // The primary sees toolRequest, toolCreate, delegate. The subagent never sees
         // the delegation control.
         expect(declaredNames(seenWriter[0])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
@@ -155,6 +156,7 @@ describe('agentDelegate', () => {
             'threadFork',
         ]);
         expect(declaredNames(seenResearcher[0])).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',

@@ -81,7 +81,6 @@
 import { agent, harness } from '../../harness';
 import { agentInstruction, AGENT_PROFILES } from '../../agents';
 import type { HarnessPreset, RunnerSettings } from './types';
-import { harnessTools } from './tools';
 import { scriptedDemo } from './demo';
 import {
     PRESET_MAX_ITERATIONS,
@@ -288,7 +287,11 @@ const demo: HarnessPreset = {
                     stream: scriptedDemo()
                 })
             },
-            tools: { timeNow: harnessTools.timeNow },
+            // T19/F1: the scripted fixture is still a shipped exception in its
+            // TOOL SET, but not in how that tool is registered. Compile its one
+            // editable source entry through the same startup kernel instead of
+            // passing a prebuilt definition through `tools`.
+            toolSources: { timeNow: 'server/harnesses/tool-sources/timeNow.ts' },
             presets: false,
             // Explicit entry point, even with one agent: the documented style,
             // and it keeps the harness name independent of key order.
@@ -339,8 +342,11 @@ const failure: HarnessPreset = {
                 agents: agentsFromProfiles(['flaky'], settings),
                 primary: 'flaky',
                 subagents: [],
-                // The one preset-specific tool; excluded from the shared set.
-                extraTools: { testFlaky: harnessTools.testFlaky }
+                // The one preset-specific tool; excluded from the shared set but
+                // still compiled from its editable source entry (T19/F1).
+                extraToolSources: {
+                    testFlaky: 'server/harnesses/tool-sources/testFlaky.ts'
+                }
             },
             settings,
             progress,

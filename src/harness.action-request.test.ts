@@ -198,6 +198,7 @@ describe('actionRequest runtime', () => {
 
         // The root declaration list includes both branch controls.
         expect((seen[0].tools ?? []).map((declaration) => declaration.name)).toEqual([
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',

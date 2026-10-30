@@ -306,7 +306,21 @@ export const cloneToolCreation = (creation: ToolCreation): ToolCreation => ({
     ...(creation.parameters === undefined
         ? {}
         : { parameters: JSON.parse(JSON.stringify(creation.parameters)) as Record<string, unknown> }),
-    source: creation.source
+    // Exactly one source form is required. A source-registered tool persists its
+    // captured module (or path + fallback text) so restore uses the SAME shared
+    // compiler as startup/runtime registration; legacy toolCreate keeps `source`.
+    ...(creation.source === undefined ? {} : { source: creation.source }),
+    ...(creation.moduleText === undefined ? {} : { moduleText: creation.moduleText }),
+    ...(creation.sourcePath === undefined ? {} : { sourcePath: creation.sourcePath }),
+    ...(creation.dependencies === undefined
+        ? {}
+        : {
+              dependencies: creation.dependencies.map((dependency) => ({
+                  path: dependency.path,
+                  text: dependency.text
+              }))
+          }),
+    ...(creation.visibility === undefined ? {} : { visibility: creation.visibility })
 });
 
 // Validate one persisted creation record. Field bounds (name pattern, tag caps,
@@ -315,9 +329,25 @@ export const cloneToolCreation = (creation: ToolCreation): ToolCreation => ({
 // handed to it.
 const readToolCreation = (value: unknown, label: string): ToolCreation => {
     const record = readSnapshotRecord(value, label);
-    readSnapshotKeys(record, ['name', 'description', 'tags', 'parameters', 'source'], label, [
-        'parameters'
-    ]);
+    // `source` is legacy (function body). Source registrations may instead persist
+    // `moduleText` + `sourcePath` + captured local `dependencies`; all are optional
+    // on the schema and validated by the shared compiler during restore.
+    readSnapshotKeys(
+        record,
+        [
+            'name',
+            'description',
+            'tags',
+            'parameters',
+            'source',
+            'moduleText',
+            'sourcePath',
+            'dependencies',
+            'visibility'
+        ],
+        label,
+        ['parameters', 'source', 'moduleText', 'sourcePath', 'dependencies', 'visibility']
+    );
 
     const tags = readSnapshotArray(record.tags, `${label}.tags`).map((tag, index) =>
         readSnapshotString(tag, `${label}.tags[${index}]`, { min: 1 })
@@ -326,8 +356,7 @@ const readToolCreation = (value: unknown, label: string): ToolCreation => {
     const creation: ToolCreation = {
         name: readSnapshotString(record.name, `${label}.name`, { min: 1 }),
         description: readSnapshotString(record.description, `${label}.description`, { min: 1 }),
-        tags,
-        source: readSnapshotString(record.source, `${label}.source`, { min: 1 })
+        tags
     };
 
     if (record.parameters !== undefined) {
@@ -338,6 +367,58 @@ const readToolCreation = (value: unknown, label: string): ToolCreation => {
         }
 
         creation.parameters = parameters;
+    }
+
+    if (record.source !== undefined) {
+        creation.source = readSnapshotString(record.source, `${label}.source`, { min: 1 });
+    }
+
+    if (record.moduleText !== undefined) {
+        creation.moduleText = readSnapshotString(record.moduleText, `${label}.moduleText`, {
+            min: 1
+        });
+    }
+
+    if (record.sourcePath !== undefined) {
+        creation.sourcePath = readSnapshotString(record.sourcePath, `${label}.sourcePath`, {
+            min: 1
+        });
+    }
+
+    if (record.dependencies !== undefined) {
+        creation.dependencies = readSnapshotArray(record.dependencies, `${label}.dependencies`).map(
+            (entry, index) => {
+                const entryLabel = `${label}.dependencies[${index}]`;
+                const dependency = readSnapshotRecord(entry, entryLabel);
+                readSnapshotKeys(dependency, ['path', 'text'], entryLabel);
+                return {
+                    path: readSnapshotString(dependency.path, `${entryLabel}.path`, { min: 1 }),
+                    text: readSnapshotString(dependency.text, `${entryLabel}.text`)
+                };
+            }
+        );
+    }
+
+    if (record.visibility !== undefined) {
+        const visibility = readSnapshotString(record.visibility, `${label}.visibility`, { min: 1 });
+
+        if (visibility !== 'core' && visibility !== 'searchable') {
+            throw new HarnessError(`${label}.visibility must be one of: core, searchable.`);
+        }
+
+        creation.visibility = visibility;
+    }
+
+    // Exactly one source form is required. Enforcing this here keeps a corrupt
+    // snapshot from reaching the compiler with an ambiguous revision.
+    if (creation.source === undefined && creation.moduleText === undefined) {
+        throw new HarnessError(
+            `${label} requires a "source" (legacy body) or "moduleText" (module revision).`
+        );
+    }
+
+    if (creation.source !== undefined && creation.moduleText !== undefined) {
+        throw new HarnessError(`${label} cannot contain both "source" and "moduleText".`);
     }
 
     return creation;

@@ -38,7 +38,8 @@
 //
 // TOOL EXECUTION (R8): every tool runs on the server. GET /tools (and
 // /tools/bootstrap, and the bootstrap document) lists the whole catalogue PLUS the
-// harness-owned core tools — toolRequest, toolCreate, todoManage, agentDelegate — marked
+// harness-owned core tools — toolRegistry, toolRequest, toolCreate, todoManage,
+// agentDelegate — marked
 // `visibility: 'core'` and `sessionBound: true`. R18: only the harness-owned set
 // is sessionBound; core file tools/webSearch keep a real `tool` and run directly.
 // A sessionBound entry has no standalone implementation: POST /tools/:name
@@ -46,8 +47,11 @@
 // without one, 404 for an unknown session or a core tool that session's harness
 // does not register (agentDelegate without subagents), and 409 while the session is
 // busy (a streaming run, a reset, or another manual call) so a manual mutation
-// cannot race an active operation. A directly callable catalogue tool keeps its
-// old session-less runner and simply ignores `sessionId`.
+// cannot race an active operation. When a `sessionId` IS supplied, ANY name runs
+// in that session's LIVE registry (R4 self-modifying tools): a replaced preset,
+// a tool created at runtime, or a session-owned core tool all resolve there. A
+// directly callable catalogue tool keeps its session-less runner when no session
+// is named, so standalone calls still work without a harness.
 //
 // HARNESS REGISTRY: POST/PATCH /harnesses mutate the in-memory registry the store
 // resolves sessions through (see ./harnesses/registry.ts). They affect FUTURE
@@ -594,19 +598,29 @@ export const createHarnessApi = ({
 
     // POST /tools/:name — call one tool.
     //
-    // Two execution paths, because there are two kinds of entry:
+    // ONE request shape, TWO resolution paths:
     //
-    //   sessionBound — the harness-owned core tools toolRequest, toolCreate,
-    //     todoManage, agentDelegate. They have no standalone implementation by
-    //     design; they run inside a session's harness so a manual call changes THAT
-    //     conversation (enabled tools, registered tools, todos, a delegated
-    //     subagent turn). A call must carry `sessionId`, and the store rejects a
-    //     session that is already busy (running, resetting, or another manual call).
-    //   catalogue — the direct runner that predates R8: no harness, no model, no
-    //     loop. A `sessionId` may still be present (one request shape) and is
-    //     ignored. R18: this now includes the core FILE tools and a configured
-    //     webSearch. They are `visibility: 'core'` (always declared to the model)
-    //     but have real implementations, so they must NOT require a session.
+    //   session named — execute against that session's LIVE harness registry via
+    //     store.callTool, for EVERY name (static or not). R4 of the self-modifying
+    //     tools task: a session may replace a known preset (timeNow, fileRead, …)
+    //     or toolCreate/toolRegistry a new name, and the HTTP call must observe the
+    //     implementation, metadata, and schema currently registered in THAT
+    //     session — never a detached copy from the static catalogue. This also
+    //     covers the harness-owned core tools (toolRegistry, toolRequest, toolCreate,
+    //     todoManage, agentDelegate): they have no standalone implementation and only mean
+    //     something inside a harness. The store rejects a session that is already
+    //     busy (running, resetting, or another manual call).
+    //   no session — the direct runner that predates R8: no harness, no model, no
+    //     loop. This is the useful path for standalone app tools and for the core
+    //     FILE tools/webSearch (R18: `visibility: 'core'` but real implementations,
+    //     so they must NOT require a session). A sessionBound entry refuses with
+    //     400 because it cannot run without a harness.
+    //
+    // METADATA stays the static catalogue: GET /tools must be answerable without a
+    // session and must never execute a tool body just to describe it. A session's
+    // replacement is honored at EXECUTION time; enumerating a session's replaced
+    // metadata would need a session-scoped listing surface (the current request
+    // type carries no query string), which is out of this integration's scope.
     //
     // The entry is looked up BEFORE reading the body so an unknown name answers a
     // 404 without consuming a request the adapter may not need to drain.
@@ -630,72 +644,34 @@ export const createHarnessApi = ({
 
         const started = Date.now();
 
-        // R13: a tool that exists only in ONE session's registry (created by
-        // toolCreate, or contributed by a plugin at session construction) is not in
-        // the static catalogue. It is resolved HERE, through the session the caller
-        // named, and never by scanning every session — one session's tools must not
-        // become callable (or even discoverable) through another session's id.
-        // Everything static keeps its existing shape: an unknown name WITHOUT a
-        // session is still a 404, and that 404 is decided before the wrapper rule
-        // (an unknown tool is unknown whatever the body looks like).
-        if (entry === undefined) {
-            if (body.sessionId === undefined || body.sessionId.length === 0) {
-                throw new HttpError(404, `Unknown tool "${name}".`);
-            }
+        // An EMPTY string is "no session" on every path (the core-tool contract
+        // documents this): it must not become a lookup for session "".
+        const sessionId = body.sessionId !== undefined && body.sessionId.length > 0 ? body.sessionId : undefined;
 
-            // A session IS named, so the wrapper rule applies before the call: a
-            // swallowed parse failure must not reach a session tool as `undefined`.
+        // R4: with a session named, resolve the call against its live registry.
+        // This is deliberately checked BEFORE the static entry's `sessionBound` or
+        // `tool` fields: a static descriptor is only a fallback, while the running
+        // session owns what actually executes. New names (created/plugin tools) are
+        // covered by the same branch, and an unknown name WITHOUT a session keeps
+        // the historical "Unknown tool" 404 below.
+        if (sessionId !== undefined) {
+            // The wrapper rule applies before the call: a swallowed parse failure
+            // must not reach a session tool as `undefined`.
             if (!Object.prototype.hasOwnProperty.call(body, 'parameters')) {
                 throw new HttpError(400, TOOL_WRAPPER_MESSAGE);
-            }
-
-            try {
-                const result = await store.callTool(body.sessionId, name, body.parameters as never);
-                return { kind: 'json', status: 200, body: successfulToolResult(result, started) };
-            } catch (error) {
-                // Unknown session, a busy session, or a name absent from THIS
-                // session's registry are request failures (404/409), not tool data.
-                if (error instanceof SessionError) throw error;
-
-                const payload: ToolCallResult = {
-                    ok: false,
-                    error: { message: boundErrorMessage(error) },
-                    durationMs: Date.now() - started
-                };
-                return { kind: 'json', status: 200, body: payload };
-            }
-        }
-
-        if (!Object.prototype.hasOwnProperty.call(body, 'parameters')) {
-            throw new HttpError(400, TOOL_WRAPPER_MESSAGE);
-        }
-
-        // Session-bound core tool: real harness, real session state.
-        if (entry.sessionBound === true) {
-            const sessionId = body.sessionId;
-
-            // An empty string is "no session" for this purpose: the tool cannot run
-            // without a harness, and the message says how to fix it.
-            if (sessionId === undefined || sessionId.length === 0) {
-                throw new HttpError(
-                    400,
-                    `Tool "${name}" runs inside a session; send a "sessionId" with the call.`
-                );
             }
 
             try {
                 const result = await store.callTool(sessionId, name, body.parameters as never);
                 return { kind: 'json', status: 200, body: successfulToolResult(result, started) };
             } catch (error) {
-                // Unknown session (404), a busy session (409, run or another
-                // manual call), and a core tool the session's harness does not
-                // register (agentDelegate without subagents, 404) are REQUEST failures:
-                // the client must be able to distinguish "did not run" from "ran
-                // and failed".
+                // Unknown session, a busy session, or a name absent from THIS
+                // session's registry are request failures (404/409), not tool data.
+                // A statically listed tool the session does not register is
+                // therefore an honest 404 here, not a silent fallback to a detached
+                // catalogue implementation.
                 if (error instanceof SessionError) throw error;
 
-                // A tool that ran and threw is data, exactly like a throwing
-                // catalogue tool below.
                 const payload: ToolCallResult = {
                     ok: false,
                     // R13: the error text is bounded by the shared 64 KiB cap, so a
@@ -706,6 +682,26 @@ export const createHarnessApi = ({
                 };
                 return { kind: 'json', status: 200, body: payload };
             }
+        }
+
+        // No session: a name absent from the static catalogue is unknown. This is
+        // decided before the wrapper rule (an unknown tool is unknown whatever the
+        // body looks like).
+        if (entry === undefined) {
+            throw new HttpError(404, `Unknown tool "${name}".`);
+        }
+
+        if (!Object.prototype.hasOwnProperty.call(body, 'parameters')) {
+            throw new HttpError(400, TOOL_WRAPPER_MESSAGE);
+        }
+
+        // Session-bound core tool without a session: it cannot run without the
+        // harness it is supposed to mutate. The message says how to fix it.
+        if (entry.sessionBound === true) {
+            throw new HttpError(
+                400,
+                `Tool "${name}" runs inside a session; send a "sessionId" with the call.`
+            );
         }
 
         // A listed-but-unconfigured tool is not a 404 and not a fake success: it

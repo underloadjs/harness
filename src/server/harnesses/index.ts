@@ -48,6 +48,7 @@ export {
     CORE_TOOL_NAMES,
     SHARED_APP_TOOL_NAMES,
     SHARED_TOOL_NAMES,
+    SHARED_TOOL_SOURCES,
     SHARED_TOOLS,
     agentFromProfile,
     agentsFromProfiles,

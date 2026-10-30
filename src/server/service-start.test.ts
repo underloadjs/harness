@@ -98,6 +98,7 @@ const PRESET_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner'
 // Core tools lead the catalogue (R8) in every listing surface, including the
 // bootstrap document the service loader serves at GET /v1/harness.
 const TOOL_NAMES = [
+    'toolRegistry',
     'toolRequest',
     'toolCreate',
     'todoManage',

@@ -72,7 +72,6 @@ import type { HarnessPreset } from './types';
 import type { HarnessPresetRecord } from '../persistence';
 import { LEGACY_PRESET_DEFINITIONS, presets } from './presets';
 import type { LegacyPresetDefinition } from './presets';
-import { harnessTools } from './tools';
 import {
     SHARED_TOOL_NAMES,
     agentsFromProfiles,
@@ -383,7 +382,12 @@ const liveFactory = (
                 agents: agentsFromProfiles([primary, ...subagents], settings, agentModels),
                 primary,
                 subagents: [...subagents],
-                extraTools: { testFlaky: harnessTools.testFlaky }
+                // T19/F1: a rebuilt flaky example keeps its extra TOOL SET, but
+                // the extra is supplied as an editable source path so startup uses
+                // the same compiler as every other shipped/app tool.
+                extraToolSources: {
+                    testFlaky: 'server/harnesses/tool-sources/testFlaky.ts'
+                }
             },
             settings,
             progress,

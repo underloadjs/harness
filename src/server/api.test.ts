@@ -17,6 +17,7 @@ import { mkdir, mkdtemp, rm, writeFile as writeTextFile } from 'node:fs/promises
 import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createToolCatalogue, createWebSearchCatalogueEntry, WEBSEARCH_UNCONFIGURED_HINT } from './harnesses';
+import { TOOL_REGISTRY_METADATA } from '../core';
 import { MAX_API_BODY_BYTES } from './api';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
@@ -46,6 +47,9 @@ const RECORD_TOOL_NAMES = ['profileManage', 'chapterManage', 'locationManage'];
 // /tools/bootstrap alias, and the bootstrap document all list them so a client can
 // review and manually execute them against a session.
 const CORE_TOOL_NAMES = [
+    // The source-registration entry is ordinary and session-bound too; the kernel
+    // registers it before every other core tool.
+    'toolRegistry',
     'toolRequest',
     'toolCreate',
     'todoManage',
@@ -241,10 +245,7 @@ describe('canonical bootstrap document', () => {
                 'textSummarize'
             ],
             coreTools: [
-                'fileRead',
-                'fileWrite',
-                'fileEdit',
-                'fileGlob',
+                'toolRegistry',
                 'toolRequest',
                 'toolCreate',
                 'todoManage',
@@ -252,7 +253,11 @@ describe('canonical bootstrap document', () => {
                 'agentManage',
                 'agentResult',
                 'agentDelegate',
-                'threadFork'
+                'threadFork',
+                'fileRead',
+                'fileWrite',
+                'fileEdit',
+                'fileGlob'
             ],
             builtin: true,
             editable: true
@@ -273,7 +278,7 @@ describe('canonical bootstrap document', () => {
             subagents: [],
             agents: ['demo'],
             tools: ['timeNow'],
-            coreTools: ['toolRequest', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES, 'agentManage', 'agentResult', 'threadFork'],
+            coreTools: ['toolRegistry', 'toolRequest', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES, 'agentManage', 'agentResult', 'threadFork'],
             builtin: true,
             editable: true
         });
@@ -341,6 +346,7 @@ describe('preset descriptor tool metadata', () => {
     const REAL = ['instruct', 'research', 'workspace', 'reviewer', 'planner'] as const;
     const FILES = ['fileRead', 'fileWrite', 'fileEdit', 'fileGlob'];
     const CORE_BASE = [
+        'toolRegistry',
         'toolRequest',
         'toolCreate',
         'todoManage',
@@ -367,23 +373,23 @@ describe('preset descriptor tool metadata', () => {
     // the demo do not. A configured host adds webSearch after the file tools (the
     // order coreToolNames emits).
     const CORE_TOOLS = {
-        instruct: [...FILES, ...CORE_BASE, 'agentDelegate', 'threadFork'],
-        research: [...FILES, ...CORE_BASE, 'agentDelegate', 'threadFork'],
-        workspace: [...FILES, ...CORE_BASE, 'agentDelegate', 'threadFork'],
-        reviewer: [...FILES, ...CORE_BASE, 'agentDelegate', 'threadFork'],
-        planner: [...FILES, ...CORE_BASE, 'agentDelegate', 'threadFork'],
+        instruct: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES],
+        research: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES],
+        workspace: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES],
+        reviewer: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES],
+        planner: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES],
         demo: [...CORE_BASE, 'threadFork'],
-        flaky: [...FILES, ...CORE_BASE, 'threadFork']
+        flaky: [...CORE_BASE, 'threadFork', ...FILES]
     };
 
     const CONFIGURED_CORE_TOOLS = {
-        instruct: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate', 'threadFork'],
-        research: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate', 'threadFork'],
-        workspace: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate', 'threadFork'],
-        reviewer: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate', 'threadFork'],
-        planner: [...FILES, 'webSearch', ...CORE_BASE, 'agentDelegate', 'threadFork'],
+        instruct: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES, 'webSearch'],
+        research: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES, 'webSearch'],
+        workspace: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES, 'webSearch'],
+        reviewer: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES, 'webSearch'],
+        planner: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES, 'webSearch'],
         demo: [...CORE_BASE, 'threadFork'],
-        flaky: [...FILES, 'webSearch', ...CORE_BASE, 'threadFork']
+        flaky: [...CORE_BASE, 'threadFork', ...FILES, 'webSearch']
     };
 
     const configuredRuntime = (): HarnessRuntime => {
@@ -1081,9 +1087,22 @@ describe('all-tools manual execution', () => {
         const core = body.tools.slice(0, CORE_TOOL_NAMES.length);
         expect(core.map((tool) => tool.name)).toEqual(CORE_TOOL_NAMES);
 
+        // toolRegistry is first and exact: it is the ordinary session-bound
+        // registration entry, described from the kernel's single metadata copy.
+        expect(core[0]).toEqual({
+            name: 'toolRegistry',
+            group: 'Core tools',
+            description: TOOL_REGISTRY_METADATA.description,
+            tags: TOOL_REGISTRY_METADATA.tags,
+            visibility: 'core',
+            parameters: TOOL_REGISTRY_METADATA.parameters,
+            availability: { state: 'available', hint: coreHint },
+            sessionBound: true
+        });
+
         // toolRequest is exact: its schema is the R7 advertisement (five max,
         // `limit` cap, remaining count in the description).
-        expect(core[0]).toEqual({
+        expect(core[1]).toEqual({
             name: 'toolRequest',
             group: 'Core tools',
             description:
@@ -1114,7 +1133,7 @@ describe('all-tools manual execution', () => {
         });
 
         // The rest are core-marked, session-bound, and carry a real schema.
-        expect(core.slice(1)).toEqual(
+        expect(core.slice(2)).toEqual(
             [
                 'toolCreate',
                 'todoManage',
@@ -1360,9 +1379,9 @@ describe('all-tools manual execution', () => {
         });
         expect(runtime.store.get(session.id).discoveredTools).toEqual(['uppercase']);
 
-        // The policy is still enforced: the same name is now registered, so a
-        // second manual creation fails as data (ok: false) instead of overwriting.
-        const collided = await jsonBody<ToolCallResult>(
+        // An intentional second creation REPLACES the definition through the same
+        // guarded kernel path (no "already registered" rejection).
+        const replaced = await jsonBody<ToolCallResult>(
             await callHandler(runtime, 'POST', '/v1/harness/tools/toolCreate', {
                 body: {
                     sessionId: session.id,
@@ -1376,15 +1395,19 @@ describe('all-tools manual execution', () => {
             })
         );
 
-        expect(collided.status).toBe(200);
-        expect(collided.body.ok).toBe(false);
-        if (!collided.body.ok) {
-            expect(collided.body.error.message).toBe(
-                'Tool "uppercase" is already registered; choose another name.'
-            );
-        }
+        expect(replaced.status).toBe(200);
+        expect(replaced.body).toEqual({
+            ok: true,
+            result: {
+                name: 'uppercase',
+                description: 'Again.',
+                tags: ['text'],
+                enabled: true
+            },
+            durationMs: expect.any(Number)
+        });
 
-        // A reserved name is refused by the same path, never by a bypass.
+        // Built-in names are ordinary replaceable registrations too.
         const reserved = await jsonBody<ToolCallResult>(
             await callHandler(runtime, 'POST', '/v1/harness/tools/toolCreate', {
                 body: {
@@ -1398,9 +1421,9 @@ describe('all-tools manual execution', () => {
                 }
             })
         );
-        expect(reserved.body.ok).toBe(false);
-        if (!reserved.body.ok) {
-            expect(reserved.body.error.message).toBe('Tool name "todoManage" is reserved by the harness.');
+        expect(reserved.body.ok).toBe(true);
+        if (reserved.body.ok) {
+            expect(reserved.body.result.name).toBe('todoManage');
         }
     });
 
@@ -1627,13 +1650,14 @@ describe('all-tools manual execution', () => {
         });
     });
 
-    it('keeps the session-less runner for a directly callable tool', async () => {
+    it('runs a known catalogue tool through the named session without enabling it', async () => {
         const runtime = createRuntime();
         const session = await createDemo(runtime);
 
-        // One request shape: a UI may send the selected session with any call. For
-        // a catalogue tool it is accepted and ignored — the direct runner is
-        // unchanged, with no session state involved.
+        // One request shape: a UI may send the selected session with any call.
+        // R4 (self-modifying tools): a named session resolves the call through its
+        // LIVE registry, so a replaced catalogue tool is honored. The demo registers
+        // timeNow, so the call succeeds there; a manual call never enables discovery.
         const clock = await jsonBody<ToolCallResult>(
             await callHandler(runtime, 'POST', '/v1/harness/tools/timeNow', {
                 body: { sessionId: session.id, parameters: 'UTC' }
@@ -2131,10 +2155,7 @@ describe('harness registry over HTTP', () => {
                 'textSummarize'
             ],
             coreTools: [
-                'fileRead',
-                'fileWrite',
-                'fileEdit',
-                'fileGlob',
+                'toolRegistry',
                 'toolRequest',
                 'toolCreate',
                 'todoManage',
@@ -2142,7 +2163,11 @@ describe('harness registry over HTTP', () => {
                 'agentManage',
                 'agentResult',
                 'agentDelegate',
-                'threadFork'
+                'threadFork',
+                'fileRead',
+                'fileWrite',
+                'fileEdit',
+                'fileGlob'
             ],
             builtin: false,
             editable: true
@@ -2420,10 +2445,7 @@ describe('harness registry over HTTP', () => {
             subagents: ['research'],
             agents: ['workspace', 'research'],
             coreTools: [
-                'fileRead',
-                'fileWrite',
-                'fileEdit',
-                'fileGlob',
+                'toolRegistry',
                 'toolRequest',
                 'toolCreate',
                 'todoManage',
@@ -2431,7 +2453,11 @@ describe('harness registry over HTTP', () => {
                 'agentManage',
                 'agentResult',
                 'agentDelegate',
-                'threadFork'
+                'threadFork',
+                'fileRead',
+                'fileWrite',
+                'fileEdit',
+                'fileGlob'
             ],
             builtin: true,
             editable: true
@@ -2569,17 +2595,18 @@ describe('harness registry over HTTP', () => {
             'textSummarize'
         ]);
         expect(live.body.harness.coreTools).toEqual([
-            'fileRead',
-            'fileWrite',
-            'fileEdit',
-            'fileGlob',
+            'toolRegistry',
             'toolRequest',
             'toolCreate',
             'todoManage',
             ...RECORD_TOOL_NAMES,
             'agentManage',
             'agentResult',
-            'threadFork'
+            'threadFork',
+            'fileRead',
+            'fileWrite',
+            'fileEdit',
+            'fileGlob'
         ]);
 
         // A NEW session runs the live agent configuration with the shared toolbox.
