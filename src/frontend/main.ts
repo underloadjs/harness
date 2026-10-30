@@ -93,9 +93,7 @@ import {
     answerAction,
     callTool,
     cancelSession,
-    cancelSessionThread,
     createHarness,
-    deleteSessionThread,
     createSession,
     deleteSession,
     enqueueTask,
@@ -185,11 +183,18 @@ import type { PanelMedia } from './ui/panels';
 import type { FilePreviewReader, FilePreviewResult } from './ui/file-preview';
 import { createTurnBoard, labelSeedsOf } from './ui/turns';
 import type { AnswerActionInput, TurnHandle } from './ui/turns';
-// Persistent agent threads (R2/R5/R6/R7): roster reading, the routing decision for
-// the next submit and the compact thread strip. See ui/threads.ts for the server
-// contract; every read there is additive (legacy snapshots simply produce no strip).
+// Persistent agent threads (R2/R5/R6/R7): roster reading and the routing decision for
+// the next submit. See ui/threads.ts for the server contract; every read there is
+// additive (legacy snapshots simply produce an empty roster).
+//
+// The compact `.thread-strip` band that used to sit above the transcript is GONE:
+// it duplicated what the transcript already shows (each conversation's `.tile-thread`
+// badge) and cost a permanent row of height. Focus is still fully usable without it —
+// clicking a tile expands/focuses its conversation (ui/turns.ts `expand`), clicking
+// the expanded tile collapses it again (`collapse`, the explicit unfocus), and the
+// composer's notched routing label names the resulting target ("Continuing RR1" /
+// "New thread"). Session-wide cancellation stays on the composer's `.composer-stop`.
 import {
-    createThreadStrip,
     resolveSubmitTarget,
     sessionThreadsOf,
     submitTargetLabel,
@@ -356,9 +361,10 @@ type View = {
     // a tile toggle this is never a user intent to open a new thread, but it must
     // still stop the next submit from targeting the removed id (S3).
     clearFocus: () => void;
-    // Paint the persistent-thread strip from the authoritative roster. Repeated
-    // turns of one thread share a row here (and a badge in the transcript), so the
-    // conversation is never presented as several independent threads.
+    // Hand the authoritative persistent-thread roster to the board. Repeated turns
+    // of one thread share a badge in the transcript, so a conversation is never
+    // presented as several independent threads. (The former strip also rendered
+    // these rows; it is gone, and this is the only consumer.)
     setThreads: (threads: readonly SessionThreadEntry[]) => void;
     clear: () => void;
     notice: (text: string, tone?: 'info' | 'error') => void;
@@ -406,19 +412,12 @@ type View = {
     dispose: () => void;
 };
 
-// Per-thread terminal actions are injected by the shell (main.ts owns every POST):
-// the view may only OFFER them. A standalone/embedded page omits them, and the
-// strip's `×` then reports that the action is not wired (the buttons stay inert
-// instead of pretending to stop a thread nobody can reach).
-type ThreadActions = {
-    stop: (threadId: string) => void;
-    remove: (threadId: string) => void;
-};
-
+// Per-thread terminal actions (stop one thread / delete one thread) lived only in
+// the removed `.thread-strip` rows, so their injection point is gone with it. The
+// session-wide stop remains on the composer (`.composer-stop`, `stopRun`).
 const createView = (
     descriptor: HarnessDescriptor,
-    answer?: (input: AnswerActionInput) => Promise<void>,
-    threadActions?: ThreadActions
+    answer?: (input: AnswerActionInput) => Promise<void>
 ): View => {
     const pane = el('div', 'pane');
     const logWrap = el('div', 'log-wrap');
@@ -439,39 +438,23 @@ const createView = (
     // One tile per user turn. The board owns expansion state (exactly one tile
     // open, newest auto-opened) and keeps every tile's DOM, so reading an older
     // turn is never interrupted by deltas arriving for a newer one.
-    // The roster this view last rendered. Kept here (not in the DOM) so a focus
-    // change can repaint the strip without asking the server again.
-    let lastThreads: readonly SessionThreadEntry[] = [];
-
     const board = createTurnBoard({
         empty,
         // R11: file links in the transcript get the bounded read adapter. Omitted
         // in a standalone/embedded page, where the dialog reports it is unwired.
         readFile: readFileForPreview,
         ...(answer === undefined ? {} : { answerAction: answer }),
-        // Focus follows the single expanded tile. The strip and the composer's
-        // target line repaint from here, so the steering target is visible in the
-        // same tick the reader expands/collapses a conversation.
-        onFocusChange: (threadId) => {
-            strip.render(lastThreads, threadId);
+        // Focus follows the single expanded tile. Only the composer's routing line
+        // has to repaint from here now that the thread strip is gone, so the
+        // steering target stays visible in the same tick the reader
+        // expands/collapses a conversation.
+        onFocusChange: () => {
             // Only the SELECTED view owns the composer; a background harness's
             // reconcile must not repaint the routing line of another conversation.
             // Identity is the view's own pane, the one thing available before the
             // View object exists.
             if (current?.view.pane === pane) paintComposerTarget();
         }
-    });
-
-    // R5/R7: one row per PERSISTENT thread. Clicking a row focuses (expands) it;
-    // the far-right `×` STOPS a running thread or (confirmed) DELETES an idle/stopped
-    // one. `New thread` inside the strip is the explicit unfocus control.
-    const strip = createThreadStrip({
-        onFocus: (threadId) => {
-            if (board.focusThread(threadId)) stick(true);
-        },
-        onUnfocus: () => board.collapse(),
-        onStop: (threadId) => threadActions?.stop(threadId),
-        onDelete: (threadId) => threadActions?.remove(threadId)
     });
 
     const log = el('div', 'log');
@@ -495,10 +478,11 @@ const createView = (
     };
 
     logWrap.append(log);
-    // The strip sits between the session outcome line and the transcript: it is the
-    // thread switcher AND the per-thread stop/delete surface, and it hides itself
-    // when the session has no persistent threads (legacy server => no strip at all).
-    pane.append(sessionNote, strip.element, logWrap);
+    // Only the session outcome line sits between the harness head and the
+    // transcript. The former thread strip band was removed (see the ui/threads
+    // import comment): thread focus is expressed by the expanded tile plus the
+    // composer's routing label, so no extra bar is needed here.
+    pane.append(sessionNote, logWrap);
 
     // Only follow the stream when the reader has not scrolled away from the
     // bottom. Reading history while a run streams is a legitimate thing to do.
@@ -525,13 +509,11 @@ const createView = (
         focusThread: (threadId) => board.focusThread(threadId),
         clearFocus: () => board.collapse(),
         setThreads: (threads) => {
-            lastThreads = threads;
-            // The BOARD gets the roster first: it owns canonical labels (S6), the
-            // persistent-id mapping for child focus (S2) and the roster-only
-            // transcript. It may CLEAR a focus the roster no longer describes, which
-            // reports through `onFocusChange` and repaints the strip below.
+            // The BOARD owns canonical labels (S6), the persistent-id mapping for
+            // child focus (S2) and the roster-only transcript. It may CLEAR a focus
+            // the roster no longer describes, which reports through `onFocusChange`
+            // and repaints the composer's routing line.
             board.setThreads(threads);
-            strip.render(threads, board.focusedThread());
         },
         clear: () => {
             board.clear();
@@ -1636,8 +1618,8 @@ attachmentError.hidden = true;
 // thread (the draft carries `#` references), or the focused thread (continue/steer).
 // It is the visible half of focus: the reader can always see that a focused thread
 // will receive their message before they send it. Not a live region — it changes on
-// every keystroke and must not be announced repeatedly; the focused strip row and
-// this line carry the same state visually.
+// every keystroke and must not be announced repeatedly; the expanded tile's badge
+// and this line carry the same state visually.
 const composerTarget = el('p', 'composer-target');
 composerTarget.hidden = true;
 // R14 (T7): the routing line is also the frame's FLOATING LABEL. It keeps the same
@@ -2837,8 +2819,9 @@ type Instance = {
     records: Map<string, SessionTurn>;
     // The session's PERSISTENT runtime threads (`SessionSnapshot.threads`, additive),
     // in creation order. Empty for a legacy server and for a session that has only
-    // its implicit conversations: the strip then stays hidden and every pre-thread
-    // behaviour is unchanged.
+    // its implicit conversations; every pre-thread behaviour is unchanged then. The
+    // roster feeds the composer's routing decision and the board's label/badge joins
+    // (the former strip that also listed it is gone).
     threads: readonly SessionThreadEntry[];
     // Deletion tombstones (S3). A thread this client deleted — and the descendants
     // and turns removed with it — must never come back from a late SSE `turn`, a
@@ -3016,17 +2999,7 @@ const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
 
     const instance: Instance = {
         descriptor,
-        view: createView(
-            descriptor,
-            (input) => answerActionFor(descriptor.name, input),
-            {
-                // Per-thread terminal actions. Both are scoped to THIS harness view
-                // and re-check the live session id before the request, so a click
-                // that straddles a session switch cannot hit another conversation.
-                stop: (threadId) => stopThreadFor(descriptor.name, threadId),
-                remove: (threadId) => deleteThreadFor(descriptor.name, threadId)
-            }
-        ),
+        view: createView(descriptor, (input) => answerActionFor(descriptor.name, input)),
         activity: new Set<string>(),
         panels: new Map<string, PanelMedia>(),
         pending: false,
@@ -3231,7 +3204,13 @@ const renderHarnessChrome = (): void => {
     const locked = instance.sessionId !== undefined;
 
     headTitle.textContent = display.title;
-    headName.textContent = display.name;
+    // The harness id (`research`, `workspace`, …) is an internal registry key used by
+    // sessions, aliases and the API — not something the reader needs. The chat head
+    // shows ONLY the display title, so the shared badge stays empty and hidden here.
+    // The badge is still used by the tools view for user-facing group labels
+    // (`Files`, `Web search`, `catalogue`); `paintToolsHead`/`selectTool` un-hide it.
+    headName.textContent = '';
+    headName.hidden = true;
     // R21.1: no read-only branch. Editing a harness applies to its NEXT session;
     // a saved chat keeps what it started with (the conversation guarantee).
     headNote.textContent = locked
@@ -3796,6 +3775,9 @@ let toolDialog: DialogHandle | undefined;
 const paintToolsHead = (): void => {
     const count = toolEntries.length;
     headTitle.textContent = 'Tools';
+    // Category label, not a harness id: the chat header hides this badge, the tools
+    // view re-shows it (see renderHarnessChrome).
+    headName.hidden = false;
     headName.textContent = 'catalogue';
     headNote.textContent =
         count === 0
@@ -3880,6 +3862,9 @@ const selectTool = (entry: ToolDescriptor, trigger?: HTMLElement): void => {
 
     const unavailable = entry.availability?.state === 'unconfigured';
     headTitle.textContent = entry.name;
+    // Tool group label (e.g. `Files`) — user-facing category, so the badge is shown
+    // here even though the chat header keeps it hidden.
+    headName.hidden = false;
     headName.textContent = entry.group;
     headNote.textContent = [
         entry.visibility,
@@ -4652,12 +4637,27 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     // captured before a DELETE can never resurrect the deleted thread or its turns.
     instance.view.reconcile(incomingTurns, session.model, undefined, labelSeedsOf(session));
 
-    // Persistent thread roster (R5/R7). Only an authoritative snapshot repaints the
-    // strip (the stale guard above returns first). The board's own reconcile has
-    // already dropped a deleted thread's turns, so a focused thread that is gone
-    // loses focus there and the unfocus path stays honest.
+    // Persistent thread roster (R5/R7). Only an authoritative snapshot updates it
+    // (the stale guard above returns first).
     instance.threads = incomingThreads;
     instance.view.setThreads(instance.threads);
+
+    // A LEARNED deletion must drop the focus, exactly like the in-app delete used to
+    // (that handler owned this clear and is gone with the thread strip).
+    //
+    // The board alone cannot do it: it keeps a thread "known" while a pending
+    // optimistic row still names it, so `reconcile`'s focus-preservation branch
+    // re-focuses a thread the authoritative roster just removed. Without this clear
+    // the composer would keep targeting a thread the server no longer has (every
+    // later submit 404s) instead of falling back to "New thread".
+    //
+    // Only the focused id is consulted, and only when it is TOMBSTONED: a focus on a
+    // thread that merely has no turn (a delegated child, the agent default
+    // conversation) is legitimate and must survive every snapshot.
+    const focusedAfterReconcile = instance.view.focusedThread();
+    if (focusedAfterReconcile !== undefined && instance.threadTombstones.has(focusedAfterReconcile)) {
+        instance.view.clearFocus();
+    }
 
     // Authoritative deletion reconciliation for the DRAFT (R7). A `#` reference chip
     // binds a turn that may no longer exist (its thread was deleted): the wire
@@ -4862,69 +4862,13 @@ const resyncSession = async (instance: Instance, sessionId: string): Promise<voi
     }
 };
 
-// Stop ONE persistent thread (R5/R7) — the far-right `×` on a running thread row.
-//
-// This is deliberately NOT `stopRun`: siblings keep running, the queue is untouched,
-// and the observer stays subscribed (the stop arrives as a turn update/snapshot on
-// the stream already open). The answer carries the post-stop snapshot, which is
-// authoritative; a `cancelled: false` (nothing to abort) still reconciles the
-// roster, so the row flips to its delete affordance instead of lying about being
-// stopped.
-const stopThreadFor = (harnessName: string, threadId: string): void => {
-    const instance = instances.get(harnessName);
-    const sessionId = instance?.sessionId;
-    if (instance === undefined || sessionId === undefined) return;
-
-    void cancelSessionThread(sessionId, threadId)
-        .then((answer) => {
-            // The reader may have switched sessions/harnesses while the POST was in
-            // flight; that answer must not paint into another conversation.
-            if (instance.sessionId !== sessionId) return;
-
-            // `cancelled: false` (nothing to abort) still carries the roster: apply
-            // it so the row shows the server's truth either way.
-            applySnapshot(instance, answer.session);
-        })
-        .catch((error: unknown) => {
-            if (instance.sessionId !== sessionId) return;
-            // A refused stop is reported on the conversation it belongs to (R1/R2),
-            // and the roster is re-read so the row reflects the server's truth.
-            instance.view.notice(`Could not stop the thread: ${messageOf(error)}`);
-            void resyncSession(instance, sessionId);
-        });
-};
-
-// Delete ONE idle/stopped persistent thread (R7) — the confirmed `×` on a row that is
-// not running. The server owns the deletion and answers with a complete snapshot:
-// applying THAT is what removes the thread's turns (and any focus/reference aimed at
-// them) without a stale local frame resurrecting the thread a moment later.
-const deleteThreadFor = (harnessName: string, threadId: string): void => {
-    const instance = instances.get(harnessName);
-    const sessionId = instance?.sessionId;
-    if (instance === undefined || sessionId === undefined) return;
-
-    void deleteSessionThread(sessionId, threadId)
-        .then((answer) => {
-            if (instance.sessionId !== sessionId) return;
-
-            // S3: the deletion is authoritative from THIS moment. Remember the
-            // thread (and its descendants/turns) BEFORE applying the answer so an
-            // in-flight 202/SSE/GET captured earlier cannot bring it back, and so a
-            // late frame cannot re-focus it.
-            tombstoneThread(instance, threadId, instance.threads);
-            applySnapshot(instance, answer.session);
-
-            // A focused conversation that was just deleted loses focus immediately;
-            // `applySnapshot` reconciles the board and roster, and this clears the
-            // composer target even if the roster answer is momentarily stale.
-            if (instance.view.focusedThread() === threadId) instance.view.clearFocus();
-        })
-        .catch((error: unknown) => {
-            if (instance.sessionId !== sessionId) return;
-            instance.view.notice(`Could not delete the thread: ${messageOf(error)}`);
-            void resyncSession(instance, sessionId);
-        });
-};
+// NOTE: the per-thread STOP (`POST .../threads/:id/cancel`) and DELETE
+// (`DELETE .../threads/:id`) handlers that lived here were wired exclusively to the
+// removed `.thread-strip` rows. With no UI surface calling them they are gone;
+// `api.ts` still exports `cancelSessionThread`/`deleteSessionThread` for embedders,
+// and the session-wide stop stays in `stopRun` (`POST /sessions/:id/cancel{all}`).
+// The deletion tombstones below remain live: a server snapshot that drops a thread
+// (deleted by another tab or by the API) is learned and filtered the same way.
 
 const startWatching = (instance: Instance, sessionId: string): void => {
     // One observer per selected session (R4). Enqueueing another task must NOT
@@ -5155,8 +5099,8 @@ const newSession = (): void => {
     instance.panels.clear();
     clearActivity();
     // The conversation (and its thread roster) is gone: clearing the board also
-    // drops the focus, and the empty roster hides the strip instead of leaving the
-    // previous session's threads clickable.
+    // drops the focus, and the emptied roster leaves the composer with "New thread"
+    // instead of a target in the previous session.
     instance.threads = [];
     instance.threadTombstones.clear();
     instance.turnTombstones.clear();
@@ -5296,8 +5240,8 @@ const ensureSession = async (instance: Instance): Promise<string> => {
     instance.turnTombstones.clear();
     instance.records = new Map(session.turns.map((turn) => [turn.id, turn]));
     instance.pending = pendingOf(session);
-    // A brand-new session has no persistent threads yet; painting the empty roster
-    // clears any strip and focus left over from the conversation this card used to
+    // A brand-new session has no persistent threads yet; handing the empty roster to
+    // the board clears any focus left over from the conversation this card used to
     // point at.
     instance.threads = sessionThreadsOf(session);
     instance.view.setThreads(instance.threads);

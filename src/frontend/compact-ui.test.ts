@@ -119,6 +119,9 @@ it('opens and closes the global tools view from the topbar icon only', async () 
     const toggle = byClass('.tools-toggle', 'button');
     const stage = byClass('.stage', 'div');
     const head = byClass('.harness-head', 'header');
+    // The shared badge next to `.main-title` (main.ts:1534 `headName`). It carries
+    // the token-catalogue label in the tools view and stays empty/hidden in chat.
+    const badge = byClass('.harness-id', 'span');
     const agentSlot = byClass('.agent-slot', 'div');
     const composer = byClass('.composer', 'form');
 
@@ -146,6 +149,11 @@ it('opens and closes the global tools view from the topbar icon only', async () 
     expect(toggle.disabled).toBe(false);
     expect(stage.querySelector('.tools-pane')).toBeNull();
     expect(head.querySelector('.main-title')?.textContent).toBe('Instruct');
+    // The chat head shows ONLY the display title: the harness registry id
+    // (`instruct`) is an internal key, so the badge is emptied and hidden
+    // (main.ts:3212-3213 in `renderHarnessChrome`).
+    expect(badge.textContent).toBe('');
+    expect(badge.hidden).toBe(true);
 
     // Press: the catalogue LIST replaces the centre column and the harness-only
     // chrome is hidden, exactly as the removed Tools tab did. The list is ALL that
@@ -162,6 +170,9 @@ it('opens and closes the global tools view from the topbar icon only', async () 
     // List-only head: the head describes the CATALOGUE, not a tool.
     expect(head.querySelector('.main-title')?.textContent).toBe('Tools');
     expect(head.querySelector('.harness-id')?.textContent).toBe('catalogue');
+    // The tools view re-shows the shared badge (`paintToolsHead`, main.ts:3780-3781):
+    // the chat header hid it, so the un-hide is part of the contract.
+    expect(badge.hidden).toBe(false);
     expect(head.querySelector('.harness-note')?.textContent).toBe(
         '1 tool · calls run on the harness server'
     );
@@ -190,6 +201,9 @@ it('opens and closes the global tools view from the topbar icon only', async () 
     // visibility · tags), not the catalogue.
     expect(head.querySelector('.main-title')?.textContent).toBe('fileRead');
     expect(head.querySelector('.harness-id')?.textContent).toBe('Files');
+    // A tool group label, not a harness id: `selectTool` un-hides the badge too
+    // (main.ts:3867-3868) even though the chat header keeps it hidden.
+    expect(badge.hidden).toBe(false);
     expect(head.querySelector('.harness-note')?.textContent).toBe('searchable · tags: files, read');
     expect(toolButton.getAttribute('aria-pressed')).toBe('true');
     // Opening moves focus onto the modal panel, so the close-time focus restore
@@ -221,6 +235,8 @@ it('opens and closes the global tools view from the topbar icon only', async () 
     expect(toolButton.getAttribute('aria-haspopup')).toBe('dialog');
     expect(head.querySelector('.main-title')?.textContent).toBe('Tools');
     expect(head.querySelector('.harness-id')?.textContent).toBe('catalogue');
+    // Dialog close repaints the catalogue head, which keeps the badge shown.
+    expect(badge.hidden).toBe(false);
     expect(head.querySelector('.harness-note')?.textContent).toBe(
         '1 tool · calls run on the harness server'
     );
@@ -239,6 +255,10 @@ it('opens and closes the global tools view from the topbar icon only', async () 
     expect(stage.querySelector('.tools-pane')).toBeNull();
     expect(document.querySelector('.dialog')).toBeNull();
     expect(head.querySelector('.main-title')?.textContent).toBe('Instruct');
+    // Leaving the tools view restores the chat head from `renderHarnessChrome`:
+    // the badge is emptied AND hidden again (main.ts:3212-3213).
+    expect(badge.textContent).toBe('');
+    expect(badge.hidden).toBe(true);
     expect(agentSlot.hidden).toBe(false);
     expect(composer.hidden).toBe(false);
 });

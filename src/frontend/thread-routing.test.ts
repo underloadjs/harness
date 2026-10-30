@@ -1,16 +1,25 @@
 // Thread routing in the live shell (R5/R6/R7).
 //
 // The pure decisions are pinned in ui/threads.test.ts and ui/thread-focus.test.ts.
-// This file proves the WIRING: what the composer actually sends, which thread the
-// strip stops/deletes, and that "stop everything" stays available while a draft
-// exists.
+// This file proves the WIRING: what the composer actually sends, and which
+// conversation the reader's focus routes it to.
+//
+// The compact `.thread-strip` band is GONE (main.ts createView comment), and with
+// it the per-thread stop/delete controls it hosted: focus is expressed by the
+// transcript itself. Clicking a tile header (`.tile-select`) expands/focuses its
+// conversation; clicking the ALREADY-expanded tile collapses it (`ui/turns.ts`
+// `collapse`, which sets `explicitUnfocus`), and the composer's notched
+// `.composer-target` line states the resulting target ("Continuing X" / "Steering
+// X" / "Queued in X" / "New thread").
 //
 //   - a focused thread's id travels as `SubmitTaskRequest.threadId`;
 //   - with no focus the body omits it (the wire's "new thread" signal);
-//   - the strip's far-right `x` posts to `/threads/:id/cancel` while running and
-//     DELETEs `/threads/:id` (after a confirming second click) once stopped;
+//   - a deletion is learned from an authoritative snapshot whose roster/turns no
+//     longer contain the thread (another tab or the API deleted it); the deletion
+//     tombstones make that final against late snapshots, `turn` upserts and
+//     `event` frames, so nothing resurrects the thread or re-focuses it (S3);
 //   - the separate stop-all control cancels the WHOLE session even with text typed,
-//     without submitting that text.
+//     without submitting that text (per-thread stop is no longer a UI feature).
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts thread-routing.test.ts
 
@@ -96,8 +105,6 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(selector: string, tag: K
 type Stub = {
     tasks: Array<Record<string, unknown>>;
     cancels: unknown[];
-    threadCancels: string[];
-    threadDeletes: string[];
     // The snapshot every GET /sessions/s1 answers after a mutation.
     current: SessionSnapshot;
     // Push one frame into the OPEN observer stream (late snapshot/turn/event).
@@ -108,8 +115,6 @@ const stubServer = (initial: SessionSnapshot, options: { steer?: boolean } = {})
     const stub: Stub = {
         tasks: [],
         cancels: [],
-        threadCancels: [],
-        threadDeletes: [],
         current: initial,
         emit: () => undefined
     };
@@ -188,50 +193,6 @@ const stubServer = (initial: SessionSnapshot, options: { steer?: boolean } = {})
                 return json({ cancelled: true });
             }
 
-            const threadCancel = /^\/api\/sessions\/s1\/threads\/([^/]+)\/cancel$/.exec(url);
-            if (threadCancel !== null && method === 'POST') {
-                const threadId = decodeURIComponent(threadCancel[1]);
-                stub.threadCancels.push(threadId);
-                // The runtime marks the thread stopped and reports the roster.
-                const threads = threadsOf(stub.current).map((entry) =>
-                    entry.id === threadId ? { ...entry, status: 'stopped' as const } : entry
-                );
-                // A mutation answer is NEWER than the snapshot that preceded it.
-                stub.current = snapshot({
-                    turns: stub.current.turns,
-                    threads,
-                    updatedAt: (stub.current.updatedAt ?? 0) + 1
-                });
-                return json({ cancelled: true, session: stub.current });
-            }
-
-            const threadDelete = /^\/api\/sessions\/s1\/threads\/([^/]+)$/.exec(url);
-            if (threadDelete !== null && method === 'DELETE') {
-                const threadId = decodeURIComponent(threadDelete[1]);
-                stub.threadDeletes.push(threadId);
-                // Deleting a thread deletes its turns, its roster row and the
-                // threads it owns (the runtime contract).
-                const removed = new Set<string>([threadId]);
-                let grew = true;
-                while (grew) {
-                    grew = false;
-                    for (const entry of threadsOf(stub.current)) {
-                        if (entry.ownerThreadId !== undefined && removed.has(entry.ownerThreadId) && !removed.has(entry.id)) {
-                            removed.add(entry.id);
-                            grew = true;
-                        }
-                    }
-                }
-                stub.current = snapshot({
-                    turns: stub.current.turns.filter(
-                        (entry) => !removed.has((entry as SessionTurn & { threadId?: string }).threadId ?? '')
-                    ),
-                    threads: threadsOf(stub.current).filter((entry) => !removed.has(entry.id)),
-                    updatedAt: (stub.current.updatedAt ?? 0) + 1
-                });
-                return json({ deleted: true, session: stub.current });
-            }
-
             if (url === '/api/sessions/s1') {
                 return json({ session: stub.current });
             }
@@ -252,11 +213,29 @@ const threadsOf = (source: SessionSnapshot): ThreadFixture[] => {
     return value === undefined ? [] : value;
 };
 
-const rows = (): HTMLElement[] => [...document.querySelectorAll<HTMLElement>('.thread-strip-row')];
+// The transcript tile of one server turn. Tiles carry `data-turn-id` once the
+// record is bound (ui/turns.ts `card.dataset.turnId`), so this is the stable way to
+// address the surface the reader expands/collapses now that the strip is gone.
+const tileOf = (turnId: string): HTMLElement => {
+    const found = document.querySelector<HTMLElement>(`.tile[data-turn-id="${turnId}"]`);
+    if (found === null) throw new Error(`missing tile ${turnId}`);
+    return found;
+};
 
-const rowOf = (threadId: string): HTMLElement => {
-    const found = rows().find((row) => row.dataset.threadId === threadId);
-    if (found === undefined) throw new Error(`missing thread row ${threadId}`);
+// The tile header button: clicking it expands/focuses a compact tile and collapses
+// an already-expanded one (ui/turns.ts `select` click handler).
+const selectOf = (turnId: string): HTMLButtonElement => {
+    const found = tileOf(turnId).querySelector<HTMLButtonElement>('.tile-select');
+    if (found === null) throw new Error(`missing tile header ${turnId}`);
+    return found;
+};
+
+// The compact conversation badge of one tile (`.tile-thread`, ui/turns.ts
+// `paintThreadBadge`). Non-null access so a missing badge fails loudly instead of
+// silently passing an optional-chain assertion.
+const badgeOf = (turnId: string): HTMLElement => {
+    const found = tileOf(turnId).querySelector<HTMLElement>('.tile-thread');
+    if (found === null) throw new Error(`missing tile badge ${turnId}`);
     return found;
 };
 
@@ -291,10 +270,21 @@ it('renders the roster, focuses the newest turn thread and continues it with thr
     );
     await mount();
 
-    // One row per PERSISTENT thread; the expanded newest turn (thread-1) is focused.
-    expect(rows().map((row) => row.dataset.threadId)).toEqual(['thread-1', 'thread-2']);
-    expect(rowOf('thread-1').classList.contains('is-focused')).toBe(true);
-    expect(rowOf('thread-2').classList.contains('is-focused')).toBe(false);
+    // The roster's only visible effect is on the transcript: both turns belong to
+    // thread-1, so they share ONE conversation card and ONE badge name.
+    expect(document.querySelector('.thread-strip')).toBeNull();
+    expect([...document.querySelectorAll<HTMLElement>('.conversation')].map((host) => host.dataset.threadId)).toEqual([
+        'thread-1'
+    ]);
+
+    // The newest turn (turn-2) is expanded on first content, and it carries the
+    // roster's label for thread-1 plus the opaque id in `data-thread-id`.
+    const expanded = [...document.querySelectorAll<HTMLElement>('.tile.is-expanded')];
+    expect(expanded.map((tile) => tile.dataset.turnId)).toEqual(['turn-2']);
+    expect(tileOf('turn-2').dataset.threadId).toBe('thread-1');
+    expect(badgeOf('turn-2').textContent).toBe('Writing');
+    expect(badgeOf('turn-2').title).toBe('Thread Writing · instruct · stopped');
+    expect(tileOf('turn-1').classList.contains('is-expanded')).toBe(false);
 
     // The routing line names the target before anything is typed.
     expect(byClass('.composer-target', 'p').textContent).toBe('Continuing Writing');
@@ -320,8 +310,14 @@ it('submits without a threadId when nothing is focused (new thread)', async () =
     );
     await mount();
 
-    // The explicit unfocus control clears the steering target.
-    byClass('.thread-strip-unfocus', 'button').click();
+    // The newest turn is expanded (focused) on first content.
+    expect(byClass('.composer-target', 'p').textContent).toBe('Continuing Writing');
+
+    // Clicking the header of the ALREADY-expanded tile collapses it: that is the
+    // explicit unfocus (ui/turns.ts `collapse` sets `explicitUnfocus`).
+    selectOf('turn-1').click();
+    await flush();
+    expect(tileOf('turn-1').classList.contains('is-expanded')).toBe(false);
     expect(byClass('.composer-target', 'p').textContent).toBe('New thread');
 
     const input = byClass('.composer-input', 'div');
@@ -333,44 +329,6 @@ it('submits without a threadId when nothing is focused (new thread)', async () =
 
     // Absent, not null/empty: the wire's "open a new thread" signal.
     expect(stub.tasks).toEqual([{ input: 'brand new' }]);
-});
-
-it('stops a running thread from its far-right x, and deletes it after it stopped', async () => {
-    const stub = stubServer(
-        snapshot({
-            status: 'running',
-            turns: [turn({ id: 'turn-1', index: 0, status: 'running', threadId: 'thread-1' })],
-            threads: [{ id: 'thread-1', agent: 'instruct', origin: 'host', status: 'running', sequence: 1 }]
-        })
-    );
-    await mount();
-
-    const stop = rowOf('thread-1').querySelector<HTMLButtonElement>('.thread-strip-action');
-    expect(stop?.dataset.action).toBe('stop');
-    expect(stop?.getAttribute('aria-label')).toBe('Stop thread IT1 of instruct');
-    stop?.click();
-    await flush();
-    await flush();
-
-    expect(stub.threadCancels).toEqual(['thread-1']);
-    // The authoritative answer marked the thread stopped: the SAME control is now a
-    // delete, which needs two clicks.
-    const remove = rowOf('thread-1').querySelector<HTMLButtonElement>('.thread-strip-action');
-    expect(remove?.dataset.action).toBe('delete');
-    remove?.click();
-    expect(rowOf('thread-1').querySelector('.thread-strip-action')?.getAttribute('aria-label')).toBe(
-        'Confirm delete thread IT1 of instruct'
-    );
-    expect(stub.threadDeletes).toEqual([]);
-
-    rowOf('thread-1').querySelector<HTMLButtonElement>('.thread-strip-action')?.click();
-    await flush();
-    await flush();
-
-    expect(stub.threadDeletes).toEqual(['thread-1']);
-    // The deletion snapshot removed the thread AND its turn (no stale resurrection).
-    expect(rows().map((row) => row.dataset.threadId)).toEqual([]);
-    expect(document.querySelector('.tile')).toBeNull();
 });
 
 it('never resurrects a deleted thread from a late snapshot, turn or event (S3)', async () => {
@@ -395,46 +353,57 @@ it('never resurrects a deleted thread from a late snapshot, turn or event (S3)',
     const stub = stubServer(initial);
     await mount();
 
-    // Focus is thread-1 (the expanded turn) before the deletion.
+    // Focus is thread-1 (the expanded turn) before the deletion. The roster's only
+    // visible effect is the tile's conversation badge: the strip that used to list
+    // `thread-1`/`thread-child` as rows no longer exists.
     expect(byClass('.composer-target', 'p').textContent).toBe('Steering IT1');
-    expect(rows().map((row) => row.dataset.threadId)).toEqual(['thread-1', 'thread-child']);
+    expect(document.querySelector('.thread-strip')).toBeNull();
+    expect(tileOf('turn-1').dataset.threadId).toBe('thread-1');
+    expect(tileOf('turn-1').getAttribute('data-thread-id')).toBe('thread-1');
+    expect(badgeOf('turn-1').textContent).toBe('IT1');
+    expect(badgeOf('turn-1').title).toBe('Thread IT1 · instruct · running');
+    expect(tileOf('turn-1').classList.contains('is-expanded')).toBe(true);
 
-    rowOf('thread-1').querySelector<HTMLButtonElement>('.thread-strip-action')?.click();
-    await flush();
-    await flush();
-    rowOf('thread-1').querySelector<HTMLButtonElement>('.thread-strip-action')?.click();
-    rowOf('thread-1').querySelector<HTMLButtonElement>('.thread-strip-action')?.click();
+    // The deletion is performed SERVER-SIDE (another tab / the API): the client only
+    // sees an authoritative snapshot whose roster and turns no longer contain
+    // thread-1 (or the child it owned). Its `updatedAt` is NEWER, so it passes the
+    // watermark and is the snapshot that LEARNS the deletion.
+    stub.emit({
+        type: 'snapshot',
+        session: snapshot({ status: 'idle', updatedAt: 20, turns: [], threads: [] })
+    });
     await flush();
     await flush();
 
-    expect(stub.threadDeletes).toEqual(['thread-1']);
     // The thread AND the child it owned are gone — from the answer and from the
     // descendant tombstone, so a late roster that still lists them is filtered.
-    expect(rows()).toEqual([]);
-    expect(document.querySelector('.tile')).toBeNull();
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    expect(document.querySelectorAll('.conversation')).toHaveLength(0);
+    expect(document.querySelectorAll('.thread-strip-row')).toHaveLength(0);
     // The authoritative deletion cleared the steering target.
     expect(byClass('.composer-target', 'p').textContent).toBe('New thread');
 
-    // A LATE snapshot captured before the DELETE (older `updatedAt`, so stale by the
-    // watermark): the deleted thread and its turn must stay gone.
+    // A LATE snapshot captured before the deletion (older `updatedAt`, so stale by
+    // the watermark): the deleted thread and its turn must stay gone.
     stub.emit({ type: 'snapshot', session: { ...initial, updatedAt: 5 } });
     await flush();
     await flush();
 
-    expect(rows()).toEqual([]);
-    expect(document.querySelector('.tile')).toBeNull();
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    expect(document.querySelectorAll('.conversation')).toHaveLength(0);
+    expect(document.querySelectorAll('.thread-strip-row')).toHaveLength(0);
     expect(byClass('.composer-target', 'p').textContent).toBe('New thread');
 
     // A LATE turn upsert for the deleted turn.
     stub.emit({ type: 'turn', turn: initial.turns[0] });
     await flush();
-    expect(document.querySelector('.tile')).toBeNull();
-    expect(rows()).toEqual([]);
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
+    expect(document.querySelectorAll('.conversation')).toHaveLength(0);
 
     // A LATE event frame for the deleted turn.
     stub.emit({ type: 'event', turnId: 'turn-1', event: { type: 'text', agent: 'instruct', delta: 'late' } });
     await flush();
-    expect(document.querySelector('.tile')).toBeNull();
+    expect(document.querySelectorAll('.tile')).toHaveLength(0);
     expect(byClass('.composer-target', 'p').textContent).toBe('New thread');
 });
 
@@ -541,10 +510,14 @@ it('labels a running focus with an unfinished reference as queued, keeping the s
     );
     await mount();
 
-    // The newest turn (thread-2) is focused on load; focus thread-1 explicitly so the
-    // draft addresses a running conversation while its reference is unfinished.
-    rowOf('thread-1').querySelector<HTMLButtonElement>('.thread-strip-focus')?.click();
+    // The newest turn (thread-2) is expanded/focused on first content; focus
+    // thread-1 explicitly by clicking turn-1's header, so the draft addresses a
+    // running conversation while its reference is unfinished.
+    expect(tileOf('turn-2').classList.contains('is-expanded')).toBe(true);
+    selectOf('turn-1').click();
     await flush();
+    expect(tileOf('turn-1').classList.contains('is-expanded')).toBe(true);
+    expect(tileOf('turn-2').classList.contains('is-expanded')).toBe(false);
     expect(byClass('.composer-target', 'p').textContent).toBe('Steering Running');
 
     const input = byClass('.composer-input', 'div');
@@ -573,13 +546,17 @@ it('labels a running focus with an unfinished reference as queued, keeping the s
 it('removes # reference chips whose turn was deleted, without touching surviving labels', async () => {
     const stub = stubServer(
         snapshot({
+            // thread-2 is RUNNING, so the session is pending and the observer stream
+            // is open — the only way this client can learn about another writer's
+            // deletion now that no in-app thread delete exists.
+            status: 'running',
             turns: [
                 turn({ id: 'turn-1', index: 0, threadId: 'thread-1' }),
-                turn({ id: 'turn-2', index: 1, threadId: 'thread-2' })
+                turn({ id: 'turn-2', index: 1, status: 'running', threadId: 'thread-2' })
             ],
             threads: [
                 { id: 'thread-1', agent: 'instruct', origin: 'host', status: 'stopped', sequence: 1 },
-                { id: 'thread-2', agent: 'instruct', origin: 'host', status: 'idle', sequence: 2 }
+                { id: 'thread-2', agent: 'instruct', origin: 'host', status: 'running', sequence: 2 }
             ]
         })
     );
@@ -601,14 +578,24 @@ it('removes # reference chips whose turn was deleted, without touching surviving
     const chips = () => [...input.querySelectorAll<HTMLElement>('[data-chip="reference"]')];
     expect(chips().map((chip) => chip.dataset.referenceTurn)).toEqual(['turn-1']);
 
-    // Delete thread-1 from its row (two clicks: the first only arms).
-    const action = () => rowOf('thread-1').querySelector<HTMLButtonElement>('.thread-strip-action');
-    action()?.click();
-    action()?.click();
+    // The deletion happens SERVER-SIDE (another tab / the API): the client learns it
+    // from an authoritative snapshot that no longer lists thread-1 or turn-1, with a
+    // NEWER `updatedAt` so it passes the watermark and teaches the tombstone.
+    stub.emit({
+        type: 'snapshot',
+        session: snapshot({
+            updatedAt: 20,
+            turns: [turn({ id: 'turn-2', index: 1, threadId: 'thread-2' })],
+            threads: [{ id: 'thread-2', agent: 'instruct', origin: 'host', status: 'idle', sequence: 2 }]
+        })
+    });
     await flush();
     await flush();
 
-    expect(stub.threadDeletes).toEqual(['thread-1']);
+    // The surviving conversation is still on screen; only thread-1's turn is gone.
+    expect([...document.querySelectorAll<HTMLElement>('.tile')].map((tile) => tile.dataset.turnId)).toEqual([
+        'turn-2'
+    ]);
     // The stale binding would 400 the whole submit, so it is removed from the draft
     // and reported; surviving references would keep their labels untouched.
     expect(chips()).toEqual([]);

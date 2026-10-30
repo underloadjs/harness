@@ -1090,6 +1090,62 @@ export type WebSearchResult = {
 };
 
 // ---------------------------------------------------------------------------
+// webFetch — one model-facing page-fetch tool (W4).
+//
+// `native` needs no credential: it is a bounded GET with global `fetch` and a
+// dependency-free HTML-to-markdown/text conversion. `exa` is an optional
+// provider, available only when an Exa key exists (the same EXA_API_KEY
+// webSearch resolves), and reads pages through Exa's /contents endpoint.
+//
+// Cross-references:
+//   - tools/webfetch/index.ts  — createWebFetchTool, the per-harness factory
+//   - harness.ts               — `webfetch` configuration field wiring
+// ---------------------------------------------------------------------------
+export type WebFetchProvider = 'native' | 'exa';
+
+export type WebFetchConfiguration = {
+    // Environment snapshot to read EXA_API_KEY from. Tests and deployments can
+    // inject one; the default is `process.env` (never a dotenv autoload — the
+    // caller owns that). With no key the tool still exists: `native` is the
+    // default provider and needs no credential.
+    env?: Readonly<Record<string, string | undefined>>;
+    // Explicit Exa key override (string or getter, resolved once at
+    // construction). Omitted or blank means "read the environment", and a
+    // getter that yields nothing simply leaves `exa` unoffered.
+    exa?: WebsearchProviderConfiguration;
+};
+
+// The model-facing argument shape. `url` is the only required property; having
+// more than one property keeps the object wrapper intact (see the single-property
+// rule in core/tool.ts), and every optional field is validated in execute.
+export type WebFetchParameters = {
+    url: string;
+    // Output format. Defaults to "markdown". Non-HTML responses are returned
+    // as-is regardless of this field.
+    format?: 'markdown' | 'text' | 'html';
+    // Which provider to use. Omitted = "native"; "exa" is only accepted (and
+    // only offered in the schema) when an Exa key is configured.
+    provider?: WebFetchProvider;
+};
+
+export type WebFetchResult = {
+    provider: WebFetchProvider;
+    // The URL actually fetched, after redirects.
+    url: string;
+    // The response content-type header, verbatim (bounded).
+    contentType: string;
+    format: 'markdown' | 'text' | 'html';
+    // Characters of `content` returned, after the bound.
+    characters: number;
+    // True when the page content was cut at the character bound: more exists.
+    truncated: boolean;
+    // The page content: converted text, untrusted data from the open web.
+    content: string;
+    // Page title when either source can provide one.
+    title?: string;
+};
+
+// ---------------------------------------------------------------------------
 // Harness (the execution loop)
 // ---------------------------------------------------------------------------
 
@@ -1644,6 +1700,13 @@ export type HarnessConfiguration = {
     // the constructed tool closure: no schema value, argument, result, or event
     // carries them. A configured tool named `webSearch` wins over this field.
     websearch?: boolean | WebsearchConfiguration;
+    // Opt-in page fetch (W4). `true` (or a configuration object) registers the
+    // `webFetch` tool: a bounded native GET that needs no credential, plus the
+    // `exa` provider when EXA_API_KEY (or an explicit key) is available. Unlike
+    // `websearch`, this tool is registered even with no key at all, because its
+    // default provider is keyless. Off when absent or false. A configured tool
+    // named `webFetch` wins over this field.
+    webfetch?: boolean | WebFetchConfiguration;
     // N3 fork/branch bounds and the threadFork capability. Omitted = threadFork
     // is not registered and no branch may be created. Values are validated at
     // construction against the frozen defaults in core/branch.ts.

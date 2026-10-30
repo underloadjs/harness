@@ -4504,14 +4504,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // A real session switch: the next reconciled content belongs to a different
         // conversation, so its newest surface may be opened once (see `reconcile`).
         // A first binding (undefined -> id) is the conversation already on screen.
-        if (boundSession !== undefined && sessionId !== undefined) {
-            pendingFirstFocus = true;
-            // R3: invocation ids are unique per SESSION only, so a remembered join from
-            // the conversation being left must not resolve an invocation of the new
-            // one. The new session's roster (`invocationIds`) re-establishes every join
-            // it can prove; anything else stays an invocation-only card.
-            learnedThreads.clear();
-        }
+        if (boundSession !== undefined && sessionId !== undefined) pendingFirstFocus = true;
+
+        // R3: invocation ids are unique per SESSION only, so a remembered join from
+        // the conversation being left must not resolve an invocation of the new one.
+        // This applies to EVERY change after the first binding, including a switch to
+        // `undefined` (session teardown before the next id arrives): the new session's
+        // roster (`invocationIds`) re-establishes every join it can prove, and anything
+        // else stays an invocation-only card instead of pointing at a foreign thread.
+        if (boundSession !== undefined) learnedThreads.clear();
 
         for (const record of answerCards.values()) {
             if (record.session === undefined) {

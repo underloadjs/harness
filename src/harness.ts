@@ -302,7 +302,7 @@ import {
     validateActionRequestParameters
 } from './core';
 import type { AgentBranchMetadata } from './core';
-import { presetTools, createWebSearchTool, WEB_SEARCH_TOOL_NAME } from './tools';
+import { presetTools, createWebSearchTool, WEB_SEARCH_TOOL_NAME, createWebFetchTool, WEB_FETCH_TOOL_NAME } from './tools';
 import { runPlugins } from './plugin';
 import { validateAttachments } from './shared/attachments';
 import type {
@@ -735,6 +735,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         );
 
         if (webSearch) tools[WEB_SEARCH_TOOL_NAME] = webSearch;
+    }
+
+    // Opt-in page fetch (W4). `webfetch: true` (or a configuration object)
+    // registers `webFetch`: a bounded native GET that needs no credential, plus
+    // the `exa` provider when an Exa key is available (the same EXA_API_KEY
+    // webSearch resolves). Rules:
+    //   - a configured tool named `webFetch` wins: the caller brought its own;
+    //   - unlike webSearch, no key still registers the tool — `native` is the
+    //     default provider and is keyless, so opting in means being runnable;
+    //   - the key resolves now, at construction, and lives only in the tool
+    //     closure, so nothing secret reaches the schema, arguments, results, or
+    //     progress events.
+    // The tool stays SEARCHABLE (R18 reserves core for what every request needs;
+    // fetching is the step after searching), so it costs no schema until
+    // toolRequest surfaces it under the web tags.
+    if (
+        configuration.webfetch !== undefined &&
+        configuration.webfetch !== false &&
+        tools[WEB_FETCH_TOOL_NAME] === undefined
+    ) {
+        tools[WEB_FETCH_TOOL_NAME] = createWebFetchTool(
+            configuration.webfetch === true ? {} : configuration.webfetch
+        );
     }
 
     // The harness owns its core names. Checked after presets and configured tools
@@ -5358,6 +5381,8 @@ export {
     createWebSearchTool,
     WEB_SEARCH_METADATA,
     WEB_SEARCH_TOOL_NAME,
+    createWebFetchTool,
+    WEB_FETCH_TOOL_NAME,
     presetTools
 } from './tools';
 export type {

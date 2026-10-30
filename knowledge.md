@@ -760,7 +760,7 @@ searchable remainder (`fileList`, `syntaxCheck`, `commandRun`, `gitDiff`) waits 
 | `syntaxCheck` | `({ code, language: 'javascript' \| 'python' })` | `boolean` |
 | `fileRead` | `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` — non-empty | `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }`; a missing path keeps its entry with `error: { code: 'ENOENT', message }` (empty content, 0 bytes); a malformed request, directory, binary, or other I/O error rejects the call |
 | `fileWrite` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`; all validated first, duplicate targets rejected |
-| `fileEdit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes }[]`; all preflighted before the first write |
+| `fileEdit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes }[]`; exact-first matching (typographic and trailing-whitespace fallbacks, line endings preserved), all preflighted before the first write |
 | `fileList` | `(paths?)` legacy string/string[] or `({ paths?, offset?, limit? })`; defaults to `["."]` | `{ entries: string[], truncated, nextOffset, offset, limit, bytes, contentBudget }` — ONE page of `dir/entry`, directories end with `/`; non-recursive |
 | `fileGlob` | `({ patterns?, paths?, maxResults? })` | `{ files, truncated }` (filename mode) |
 | `fileGlob` | `({ patterns?, paths?, content, maxResults? })` | `{ matches: [{ path, line, text }], truncated, textTruncated, bytes, contentBudget }` (content mode; 1 KiB snippet per line, 64 KiB aggregate) |
@@ -812,9 +812,17 @@ Implementation notes worth keeping:
   is read and match-checked before the first byte is written, so one bad entry leaves
   every file untouched. A filesystem error during the write phase names the completed
   paths: there is **no transaction and no rollback**.
-- **`fileEdit` is exact and guarded.** `oldString` must appear exactly once or
-  `replaceAll: true` must be passed; a missing file is an error (use `fileWrite`
-  for new files), and the result reports `replacements` and the new byte size.
+- **`fileEdit` is exact-first and guarded (opencode v2 matching).** Matching runs a
+  three-tier cascade on an LF view of the file: exact bytes, then typographic
+  quote/dash/space folding, then trailing-whitespace-ignoring whole-line matching —
+  a fallback tier only runs when the tier above found NOTHING, and indentation is
+  never forgiven. CRLF/mixed endings are matched and preserved (replacements are
+  re-joined with the matched region's endings); an oldString/newString pair that
+  differs only in `\r` applies to the exact bytes. `oldString` must appear exactly
+  once or `replaceAll: true` must be passed; a match whose replacement equals the
+  file text is rejected, not reported as applied. A missing file is an error (use
+  `fileWrite` for new files), and the result reports `replacements` and the new
+  byte size.
 - **`fileList` takes a directory array and returns ONE PAGE.** `fileList(['src', 'task'])`
   returns one flat list whose entries are prefixed with their directory (`src/a.ts`,
   `src/nested/`, `task/b.ts`); directories keep the trailing `/`. It stays
@@ -2191,7 +2199,7 @@ Two identities exist and must never be conflated:
   Its id changes on every run and it is what a `#` reference binds to.
 - `SessionTurn.threadId` and `SessionSnapshot.threads[]` = ONE persistent runtime
   conversation. Its id is stable for the thread's life, and repeated turns of it
-  are the same conversation (one badge `RR2`, one strip row). R8: the id is opaque;
+  are the same conversation (one `RR2` badge in the transcript). R8: the id is opaque;
   the DISPLAY name is `<agent code><per-agent conversation ordinal>` (`RR1`, `RR2`,
   …; `IT1` for Instruct), allocated once per CONVERSATION by the server and re-used
   by every run/steer/continuation. It is carried on `SessionTurn.threadLabel` and
@@ -2264,14 +2272,12 @@ not send `threads`/`threadId` renders exactly the old UI (`sessionThreadsOf` →
   would survive every later snapshot as "pending". The owner's `steers` audit is
   rendered as a visible `.turn-steer` user message INSIDE that tile (R9), in record
   order, so steering both replies and shows the typed text in the same conversation.
-- **Strip actions.** One row per roster entry in `sequence` order; the label is the
-  server conversation label (`RR2`/`IT1`). A legacy row without one derives the
-  same agent-prefixed shape from roster order — there is no `T{sequence}` wrapper.
-  The far-right `×` is `stop` while running (POST
-  `.../threads/:id/cancel`, single-flight per row) and `delete` when idle/stopped
-  (DELETE, two clicks: the first only arms, with a 4 s window and a distinct
-  `aria-label`). Pending row state clears when the authoritative roster moves on, so
-  a stop never leaves the delete affordance disabled forever.
+- **Roster order and labels.** The roster is ordered by the server's `sequence`, not
+  array order; the display name is the server conversation label (`RR2`/`IT1`). A
+  legacy entry without one derives the same agent-prefixed shape from roster order —
+  there is no `T{sequence}` wrapper. (The strip that rendered these rows, and with it
+  the per-row `stop`/`delete` controls, is removed; the roster now feeds the routing
+  decision and the board's label/badge joins only.)
 - **Delete reconciliation + tombstones (S3, N1, N2).** The DELETE answer carries the
   full snapshot; applying it drops the turns and the roster row. Deletion is recorded
   in `Instance.threadTombstones`/`turnTombstones` BEFORE the answer is applied, with
@@ -2294,20 +2300,24 @@ not send `threads`/`threadId` renders exactly the old UI (`sessionThreadsOf` →
 - **Labels (S6/R8).** `threadLabelOf` is the ONE display identity: the roster's
   agent-prefixed conversation label (`RR2`) or an agent-prefixed fallback for a
   legacy row, `T?` only when the roster does not describe the id (never digits
-  parsed from the opaque id). It titles the strip row, the tile badge, the root
-  block header and a `#` reference. The strip lists HOST threads only: an
-  `origin: 'agent'` default conversation gets no stop/delete affordance. A deleted
-  conversation's ordinal is retired (the server keeps a per-code high-water), so a
-  later conversation never reuses `RR3`.
-- **Keyboard (S4).** The strip restores the focused control (focus button, action,
-  or unfocus) across every repaint — including the armed delete button — and its
-  hit targets are at least 24px. The unfocus control lives outside the `<ul>` (S5).
+  parsed from the opaque id). It titles the tile badge, the root block header and a
+  `#` reference. A deleted conversation's ordinal is retired (the server keeps a
+  per-code high-water), so a later conversation never reuses `RR3`.
+- **The thread strip is REMOVED.** The compact `.thread-strip` band (one row per
+  HOST thread with focus/stop/delete controls and a `New thread` unfocus button) no
+  longer exists: it duplicated the transcript's own `.tile-thread` badge and cost a
+  permanent row of height. Focus is expressed by the single expanded conversation
+  (clicking a tile/thread header) and by the composer's routing label; unfocus is
+  collapsing that conversation. Per-thread stop/delete are API-only, and a deletion
+  learned from any authoritative snapshot drops the focus even when a pending
+  optimistic row still names the thread (`applySnapshot` → tombstone check →
+  `view.clearFocus`).
 - **Stop-all.** `composerStopOf(action, pending)` adds the separate `.composer-stop`
   only when work is pending and the inline action is not already `stop`; it calls
   the same `stopRun` → `POST /sessions/:id/cancel { all: true }`. A draft in the
   field therefore never hides the session-wide cancellation control.
 
-Tests: `ui/threads.test.ts` (pure roster/routing/strip), `ui/thread-focus.test.ts`
+Tests: `ui/threads.test.ts` (pure roster/routing/labels), `ui/thread-focus.test.ts`
 (board focus/badge/discard/stop-all matrix), `thread-routing.test.ts` (live shell
 wiring: `threadId` in the body, per-thread stop/delete, steering collision,
 stop-all with a draft), `thread-session-scope.test.ts` (N1 cross-session

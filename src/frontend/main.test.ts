@@ -343,6 +343,11 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     expect(harnessNames()).toEqual(['instruct']);
     expect(byClass('.harness-item', 'button').getAttribute('aria-pressed')).toBe('true');
     expect(document.querySelector('.main-title')?.textContent).toBe('Instruct');
+    // The chat head shows ONLY the display title. The harness registry id
+    // (`instruct`) is internal (sessions/aliases/API), so the shared badge next to
+    // the title is emptied and hidden (`renderHarnessChrome`, main.ts:3212-3213).
+    expect(document.querySelector('.harness-id')?.textContent).toBe('');
+    expect(byClass('.harness-id', 'span').hidden).toBe(true);
 
     // The agent row replaced the description wall.
     expect(agentNames()).toEqual(['Instruct']);
@@ -443,6 +448,75 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     expect(modelSelect.title).toBe(
         'Model for Instruct. Applies to the next request in this session.'
     );
+});
+
+// Header badge lifecycle. `<span class="harness-id">` is shared by two heads:
+//   - the CHAT head (`renderHarnessChrome`, main.ts:3206-3213) sets the display
+//     title and BLANKS + HIDES the badge — the harness registry id (`instruct`,
+//     `research`, …) is an internal key for sessions/aliases/API, not reader copy;
+//   - the TOOLS head shows user-facing group labels in it again
+//     (`paintToolsHead` main.ts:3780-3781 → `catalogue`, `selectTool`
+//     main.ts:3867-3868 → the entry's group such as `Files`), so both writers
+//     explicitly un-hide the element the chat head hid.
+// This walks the whole round trip: chat → catalogue → tool → catalogue → chat.
+it('shows the tools badge only in the tools view and keeps it hidden in the chat head', async () => {
+    const tool = {
+        name: 'fileRead',
+        group: 'Files',
+        description: 'Read one or more files.',
+        tags: ['files', 'read'],
+        visibility: 'searchable',
+        parameters: {
+            type: 'object',
+            properties: { paths: { type: 'array', items: { type: 'string' } } },
+            required: ['paths']
+        }
+    };
+
+    stubFetch((url) => {
+        if (url === '/api') return json(bootstrap({ tools: [tool] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    const badge = byClass('.harness-id', 'span');
+
+    // Chat head: display title only, badge empty and hidden.
+    expect(document.querySelector('.main-title')?.textContent).toBe('Instruct');
+    expect(badge.textContent).toBe('');
+    expect(badge.hidden).toBe(true);
+
+    // Tools view: the catalogue label is readable, so the badge is shown.
+    byClass('.tools-toggle', 'button').click();
+    await flush();
+    expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
+    expect(badge.textContent).toBe('catalogue');
+    expect(badge.hidden).toBe(false);
+
+    // Selected tool: the head names the tool and its GROUP in the badge.
+    byClass('.tool-tab-button', 'button').click();
+    await flush();
+    expect(document.querySelector('.main-title')?.textContent).toBe('fileRead');
+    expect(badge.textContent).toBe('Files');
+    expect(badge.hidden).toBe(false);
+
+    // Dialog close re-describes the catalogue, badge still shown.
+    byClass('.dialog-close', 'button').click();
+    await flush();
+    expect(document.querySelector('.main-title')?.textContent).toBe('Tools');
+    expect(badge.textContent).toBe('catalogue');
+    expect(badge.hidden).toBe(false);
+
+    // Back to chat: the title returns and the badge is blanked and hidden again.
+    byClass('.tools-toggle', 'button').click();
+    await flush();
+    expect(document.querySelector('.main-title')?.textContent).toBe('Instruct');
+    expect(badge.textContent).toBe('');
+    expect(badge.hidden).toBe(true);
 });
 
 // Token tally: the row shows TWO scopes. The primary is the LATEST request's
@@ -870,6 +944,10 @@ it('creates a harness from preset agents with an initial primary', async () => {
     const selected = byClass('.harness-item[data-harness="release-captain"]', 'button');
     expect(selected.getAttribute('aria-pressed')).toBe('true');
     expect(document.querySelector('.main-title')?.textContent).toBe('Release captain');
+    // A custom harness keeps the same rule: only the title shows, the badge stays
+    // empty and hidden (the registry id `release-captain` is never rendered).
+    expect(document.querySelector('.harness-id')?.textContent).toBe('');
+    expect(byClass('.harness-id', 'span').hidden).toBe(true);
     expect(agentNames()).toEqual(['Workspace', 'Summarizer']);
     expect(agentRoles()).toEqual(['primary', 'secondary']);
     // R21.2: no right-rail core list follows the new harness; the global tools view
@@ -1228,6 +1306,10 @@ it('filters the sessions rail to the selected harness and opens within it', asyn
         'true'
     );
     expect(document.querySelector('.main-title')?.textContent).toBe('Workspace');
+    // Switching harness (or opening one of its sessions) repaints the chat head,
+    // which always leaves the badge empty and hidden.
+    expect(document.querySelector('.harness-id')?.textContent).toBe('');
+    expect(byClass('.harness-id', 'span').hidden).toBe(true);
     expect(sessionIds()).toEqual(['s2']);
 });
 

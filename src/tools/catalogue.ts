@@ -194,11 +194,13 @@ export const PRESET_TOOLS = {
     // fileEdit is BATCHED (T14): one property, an array of
     // { path, oldString, newString, replaceAll? }. ALL entries are read and
     // match-checked before the first write, so a bad entry leaves every file
-    // untouched; duplicate targets are rejected.
+    // untouched; duplicate targets are rejected. Matching is exact-first with
+    // typographic/trailing-whitespace fallbacks and line-ending preservation
+    // (opencode v2 semantics) — see files/fileEdit.ts.
     fileEdit: {
         name: 'fileEdit',
         description:
-            'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match byte-for-byte and must appear exactly once unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes }. Creates nothing: use fileWrite for new files.',
+            'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes }. Creates nothing: use fileWrite for new files.',
         tags: ['files', 'edit', 'write', 'replace', 'filesystem'],
         // R18: editing files is core, so a model never spends a discovery round on it.
         visibility: 'core',

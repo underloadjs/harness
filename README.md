@@ -763,7 +763,7 @@ with the paths already completed: there is **no transaction and no rollback**.
 | `syntaxCheck` | `({ code, language: 'javascript' \| 'python' })` | `true` when the snippet parses; JavaScript is a classic script (no `import`/`export` or top-level await) |
 | `fileRead` | `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` — non-empty | `{ files, truncated, bytes, contentBudget }`; one window per path, ordered; a missing path is an entry with `error: { code: 'ENOENT', message }` (empty content, 0 bytes), while a malformed request, directory, binary, or other I/O error rejects the whole call |
 | `fileWrite` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`, creating parent directories; duplicate target files rejected |
-| `fileEdit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes }[]`; `oldString` must be unique unless `replaceAll`; all edits preflighted |
+| `fileEdit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes }[]`; `oldString` must be unique unless `replaceAll`; exact-first matching with typographic-variant and trailing-whitespace fallbacks, line endings matched and preserved; all edits preflighted |
 | `fileList` | `(paths?)` — string or string[]; defaults to `["."]` | `string[]` of `dir/entry`, directories end with `/`; non-recursive |
 | `fileGlob` | `({ patterns?, paths?, maxResults? })` | filename mode: `{ files, truncated }`; caps at 100 |
 | `fileGlob` | `({ patterns?, paths?, content, maxResults? })` | content mode: `{ matches: [{ path, line, text }], truncated }`; caps at 100, matching time-bounded |
@@ -1894,17 +1894,19 @@ nobody, which is why a reload or a hidden tab costs nothing.
 
 The UI exposes the runtime's persistent conversations as **threads**, and the
 composer decides which one a message belongs to. Focus is explicit state: it is
-shown by a pressed row in the thread strip and named in the routing line above the
-field, and a background snapshot, another tab's turn or a late record never moves it.
+shown by the single expanded conversation and named in the routing label on the
+composer's frame, and a background snapshot, another tab's turn or a late record
+never moves it. (The old compact thread strip above the transcript was removed: it
+duplicated the tile's own thread badge and cost a permanent row of height.)
 
 - **Only one conversation is open, and it is the focused one.** Opening any turn of
-  a conversation (its compact header, or its strip row) focuses that thread; closing
-  it unfocuses. A CHILD conversation (a delegated thread with no turn of its own)
-  can be focused from its strip row or by clicking its nested invocation row: the
-  parent tile collapses, the child's recorded transcript is shown, and the composer
-  targets the child's own id. Repeated turns of one persistent thread share the same
-  canonical label (the server's label, else `T3`) in their headers and in one strip
-  row, so they never read as independent conversations.
+  a conversation (its compact header) focuses that thread; closing it unfocuses. A
+  CHILD conversation (a delegated thread with no turn of its own) is focused by
+  clicking its nested invocation row: the parent tile collapses, the child's
+  recorded transcript is shown, and the composer targets the child's own id.
+  Repeated turns of one persistent thread share the same canonical label (the
+  server's label, else `T3`) in their headers and in one badge, so they never read
+  as independent conversations.
 - **Routing.** With a thread focused: idle/stopped → the message CONTINUES that
   conversation (a new turn in the same thread); running → the message STEERS it
   (queued as a user message at the thread's next model boundary, possibly answered
@@ -1922,29 +1924,31 @@ field, and a background snapshot, another tab's turn or a late record never move
   the source leaves it intact. Unfocused submits each get their own execution lane
   and run CONCURRENTLY; only a legacy, pre-thread harness handle keeps the old
   serialized backlog.
-- **Unfocus** is the strip's `New thread` control: the next message opens a new
-  standalone thread instead of steering the focused one.
-- **Per-thread stop.** The far-right `×` on a RUNNING thread row stops only that
-  thread (and the children it owns); siblings keep running. Once the thread is
-  stopped/idle the same control becomes a DELETE, which needs a second, confirming
-  click — a destructive action can never be mistaken for a stop, and a running
-  thread is never offered delete (the server answers `409`).
+- **Unfocus** is collapsing the expanded conversation (click its header again): the
+  routing label then reads `New thread` and the next message opens a new standalone
+  thread instead of steering the focused one.
+- **Per-thread stop/delete** are API-only now (`POST /sessions/:id/threads/:id/cancel`,
+  `DELETE /sessions/:id/threads/:id`); the browser shell no longer offers a control
+  per thread — the composer's stop-all covers cancellation.
 - **Stop everything** stays available while a draft exists: with text in the field
   the composer paints submit + a separate `×` (`Stop all tasks`), which sends
   `POST /sessions/:id/cancel { all: true }`. With an empty field the inline action
   is already that stop, so only one control is shown.
 - **Deletion is authoritative at once.** `DELETE /sessions/:id/threads/:threadId`
-  returns the whole snapshot; the UI applies it, so the thread's turns disappear,
-  its focus is dropped, and any `#` reference chip that pointed at one of those
-  turns is removed from the draft (the reader is told) instead of failing the next
-  submit (a failed submit restores its draft without any dead reference). The
-  deletion is also remembered locally — scoped to its session — so a late snapshot,
-  SSE turn or in-flight answer cannot bring the thread back, re-focus it or delete a
-  newer row. Labels of surviving blocks never change.
+  returns the whole snapshot, and the client treats any authoritative snapshot that
+  no longer lists a thread the same way (so an API/other-tab deletion is learned
+  identically): the thread's turns disappear, its focus is dropped — even while a
+  pending optimistic row still names it — and any `#` reference chip that pointed at
+  one of those turns is removed from the draft (the reader is told) instead of
+  failing the next submit (a failed submit restores its draft without any dead
+  reference). The deletion is also remembered locally — scoped to its session — so a
+  late snapshot, SSE turn or in-flight answer cannot bring the thread back,
+  re-focus it or delete a newer row. Labels of surviving blocks never change.
 
 Wire additions are optional and additive, so an older server keeps working: a
-snapshot without `threads` renders no strip, a turn without `threadId` renders no
-badge, and a submit with no target omits `threadId` (the pre-thread body).
+snapshot without `threads` leaves the routing decision to focus alone, a turn
+without `threadId` renders no badge, and a submit with no target omits `threadId`
+(the pre-thread body).
 
 ```
 POST   /sessions/:id/tasks                    { input, attachments?, references?, threadId? }

@@ -8,6 +8,8 @@
 //   command/  commandRun, gitDiff
 //   websearch/ webSearch — opt-in, per-harness (NOT in `presetTools`: it needs a
 //             provider key, which belongs to one harness; see createWebSearchTool)
+//   webfetch/  webFetch — opt-in, per-harness (native GET by default, the `exa`
+//             provider only when a key exists; see createWebFetchTool)
 //
 // NAMING (T14): every wire name is `<namespace><action>`. The four file tools and
 // commandRun/webSearch were renamed; there are no aliases, because two names for
@@ -125,6 +127,18 @@ export type {
     WebsearchProvider,
     WebsearchProviderConfiguration,
     WebSearchResult
+} from '../types';
+
+// Page fetch sits beside web search for the same reason: it is opt-in per
+// harness (the `exa` provider closes over that harness's key). Unlike search,
+// the factory always returns a tool, because its default provider (`native`)
+// needs no credential. harness.ts registers it only when `webfetch` is set.
+export { createWebFetchTool, WEB_FETCH_TOOL_NAME } from './webfetch';
+export type {
+    WebFetchConfiguration,
+    WebFetchParameters,
+    WebFetchProvider,
+    WebFetchResult
 } from '../types';
 
 // The preload catalogue, keyed by the name the model calls. `harness()` spreads

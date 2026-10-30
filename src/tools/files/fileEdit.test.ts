@@ -1,4 +1,4 @@
-// fileEdit — exact, batched replacement semantics (T14).
+// fileEdit — exact-first, batched replacement semantics (T14).
 //
 // Runs against real files in a temporary directory under the repo-root `Temp/`,
 // using absolute paths so it never chdir's. Every assertion is the full result
@@ -6,11 +6,18 @@
 // an ambiguous edit cannot happen and that a bad entry in a batch changes nothing,
 // so a partial assert would test nothing.
 //
-// The batch guarantees are the new part:
+// The matching cascade (ported from opencode v2) is pinned alongside the batch
+// guarantees: exact match on the LF view, then typographic-variant folding, then
+// trailing-whitespace line matching — and NEVER indentation flexibility, so a
+// wrong-indent oldString fails loudly instead of rewriting code at the model's
+// indentation. Line endings are matched and preserved; a pair differing only in
+// carriage returns edits the exact bytes.
+//
+// The batch guarantees:
 //   - all edits are validated and every resolved target must be unique BEFORE any
 //     read;
-//   - every file is then read and match-checked BEFORE the first write, so a
-//     failure on the LAST entry leaves the FIRST file untouched;
+//   - every file is then read, match-checked, and fully computed BEFORE the first
+//     write, so a failure on the LAST entry leaves the FIRST file untouched;
 //   - the result is ordered and reports replacements + resulting byte size.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -114,6 +121,107 @@ describe('fileEdit', () => {
         await fileEdit([{ path, oldString: '10', newString: '$& $1 $`' }]);
 
         await expect(readTextFile(path, 'utf8')).resolves.toBe('price $& $1 $`\n');
+    });
+
+    it('matches an LF oldString in a CRLF file and keeps the file CRLF', async () => {
+        // The model copies text out of fileRead, which reports CRLF byte-for-byte,
+        // but a retyped "\n" must not block the edit — matching runs on the LF view.
+        const path = await seed('crlf.txt', 'one\r\ntwo\r\nthree\r\n');
+
+        const result = await fileEdit([{ path, oldString: 'two\nthree', newString: 'TWO\nTHREE' }]);
+
+        expect(result).toEqual([
+            { path, replacements: 1, bytes: Buffer.byteLength('one\r\nTWO\r\nTHREE\r\n', 'utf8') }
+        ]);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('one\r\nTWO\r\nTHREE\r\n');
+    });
+
+    it('keeps unchanged context lines byte-for-byte in a mixed-ending file', async () => {
+        // The replacement is written with LF endings, but the matched region decides:
+        // the kept line keeps its CRLF, the changed line takes the ending of the
+        // line it replaces, and nothing outside the match is touched.
+        const path = await seed('mixed.txt', 'a\r\nb\n');
+
+        await fileEdit([{ path, oldString: 'a\nb', newString: 'a\nB' }]);
+
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('a\r\nB\n');
+    });
+
+    it('matches typographic quotes when the model writes ASCII ones', async () => {
+        const path = await seed('quotes.txt', 'don’t stop\n');
+
+        await fileEdit([{ path, oldString: "don't", newString: "can't" }]);
+
+        // newString is written as given — the fold only finds the match.
+        await expect(readTextFile(path, 'utf8')).resolves.toBe("can't stop\n");
+    });
+
+    it('matches across lines when only trailing whitespace differs', async () => {
+        const path = await seed('trailing.txt', 'one   \ntwo\t\n');
+
+        await fileEdit([{ path, oldString: 'one\ntwo', newString: 'ONE\nTWO' }]);
+
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('ONE\nTWO\n');
+    });
+
+    it('never forgives wrong indentation', async () => {
+        // opencode v1's indentation-flexible replacers silently rewrote code at the
+        // model's indentation; the exact cascade here must simply fail instead.
+        const path = await seed('indent.txt', 'if (x) {\n  return 1;\n}\n');
+
+        await expect(
+            fileEdit([{ path, oldString: 'if (x) {\n    return 1;\n}', newString: 'if (x) {\n    return 2;\n}' }])
+        ).rejects.toThrow(
+            new RegExp(`fileEdit found no match for oldString in ${escapeRegExp(path)}\\.`)
+        );
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('if (x) {\n  return 1;\n}\n');
+    });
+
+    it('applies an oldString/newString pair that differs only in carriage returns to the exact bytes', async () => {
+        // The one edit kind that DOES change line endings: it skips the LF view and
+        // matches the raw source bytes.
+        const path = await seed('endings.txt', 'a\nb\n');
+
+        await fileEdit([{ path, oldString: 'a\nb', newString: 'a\r\nb' }]);
+
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('a\r\nb\n');
+    });
+
+    it('rejects a fallback match whose replacement is already the file text', async () => {
+        // The unicode tier matches, but the replacement equals the matched region,
+        // so "the edit applied" would be a lie.
+        const path = await seed('noop-unicode.txt', 'don’t stop\n');
+
+        await expect(
+            fileEdit([{ path, oldString: "don't", newString: 'don’t' }])
+        ).rejects.toThrow(
+            new RegExp(
+                `fileEdit did not change ${escapeRegExp(path)}: the replacement text is identical to the text it matched\\.`
+            )
+        );
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('don’t stop\n');
+    });
+
+    it('reports ambiguity found through a fallback tier', async () => {
+        const path = await seed('ambiguous-unicode.txt', '“x” “x”\n');
+
+        await expect(fileEdit([{ path, oldString: '"x"', newString: '"y"' }])).rejects.toThrow(
+            new HarnessError(
+                `fileEdit found 2 matches for oldString in ${path}. Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
+            )
+        );
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('“x” “x”\n');
+    });
+
+    it('replaces every match in a CRLF file when replaceAll is set', async () => {
+        const path = await seed('all-crlf.txt', 'a\r\na\r\n');
+
+        const result = await fileEdit([{ path, oldString: 'a', newString: 'b', replaceAll: true }]);
+
+        expect(result).toEqual([
+            { path, replacements: 2, bytes: Buffer.byteLength('b\r\nb\r\n', 'utf8') }
+        ]);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('b\r\nb\r\n');
     });
 
     it('rejects a missing match', async () => {

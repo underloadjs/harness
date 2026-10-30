@@ -89,9 +89,19 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(selector: string, tag: K
     return found;
 };
 
-const rows = (): HTMLElement[] => [...document.querySelectorAll<HTMLElement>('.thread-strip-row')];
+// Visible conversation cards in board order, keyed by the persistent thread each one
+// groups (ui/turns.ts `conversationHost` writes `data-thread-id` on the `.conversation`
+// section). This replaces the removed `.thread-strip-row` list: one entry per
+// persistent thread the session really has, so a tombstoned id shows up as a MISSING
+// entry and a resurrected one as an extra entry.
+const conversations = (): Array<string | undefined> =>
+    [...document.querySelectorAll<HTMLElement>('.conversation')].map((node) => node.dataset.threadId);
 const tiles = (): HTMLElement[] => [...document.querySelectorAll<HTMLElement>('.tile')];
 const target = (): string => byClass('.composer-target', 'p').textContent ?? '';
+// The routing line can be textually present but `hidden` (main.ts `paintComposerTarget`:
+// a `new` target in a session with no threads hides the label). Both facts matter for
+// N3, so the assertions read them separately.
+const targetHidden = (): boolean => byClass('.composer-target', 'p').hidden;
 
 type Stub = {
     sessions: Map<string, SessionSnapshot>;
@@ -181,26 +191,6 @@ const stubServer = (sessions: SessionSnapshot[], options: { holdTasks?: boolean 
                 return json({ session: answer, turn: opening }, 202);
             }
 
-            const threadDelete = /^\/api\/sessions\/([^/]+)\/threads\/([^/]+)$/.exec(url);
-            if (threadDelete !== null && method === 'DELETE') {
-                const id = decodeURIComponent(threadDelete[1]);
-                const threadId = decodeURIComponent(threadDelete[2]);
-                const current = stub.sessions.get(id) as SessionSnapshot;
-                const remaining = ((current as SessionSnapshot & { threads?: ThreadFixture[] }).threads ?? []).filter(
-                    (entry) => entry.id !== threadId
-                );
-                const answer = {
-                    ...current,
-                    updatedAt: (current.updatedAt ?? 0) + 1,
-                    turns: current.turns.filter(
-                        (entry) => (entry as SessionTurn & { threadId?: string }).threadId !== threadId
-                    ),
-                    threads: remaining
-                } as SessionSnapshot;
-                stub.sessions.set(id, answer);
-                return json({ deleted: true, session: answer });
-            }
-
             const one = /^\/api\/sessions\/([^/]+)$/.exec(url);
             if (one !== null && method === 'GET') {
                 const id = decodeURIComponent(one[1]);
@@ -263,11 +253,30 @@ it('does not poison the next session with the previous session thread ids (N1)',
     ]);
     await mount();
 
+    // s1 rendered both of its conversations before the switch.
+    expect(conversations()).toEqual(['thread-1', 'thread-2']);
+    expect(tiles().map((tile) => tile.dataset.turnId)).toEqual(['turn-1', 'turn-2']);
+
     document.querySelector<HTMLButtonElement>('.session[data-session-id="s2"]')?.click();
     await flush(3);
-    expect(rows().map((row) => row.dataset.threadId)).toEqual(['thread-1']);
 
-    // s2 mints its own `thread-2`: the id used to be tombstoned by the switch.
+    // Only s2's own conversation is on screen: the previous session's tiles and
+    // cards are gone, so nothing of s1 can be the baseline for deletion learning.
+    expect(conversations()).toEqual(['thread-1']);
+    expect(tiles().map((tile) => tile.dataset.turnId)).toEqual(['turn-9']);
+    expect(tiles().map((tile) => tile.dataset.threadId)).toEqual(['thread-1']);
+
+    // Focus s2's conversation the way a reader does (clicking the tile header, i.e.
+    // ui/turns.ts `expand`). This is the explicit focus the deleted strip used to
+    // offer, and it is what the composer's routing line reports.
+    byClass('.tile[data-turn-id="turn-9"] .tile-select', 'button').click();
+    await flush(1);
+    expect(document.querySelector('.tile.is-expanded')?.getAttribute('data-turn-id')).toBe('turn-9');
+    expect(target()).toBe('Steering IT1');
+
+    // s2 mints its own `thread-2`: the id used to be tombstoned by the switch, so
+    // the roster row and the turn were dropped on arrival and only `thread-1`
+    // survived. The transcript must now show BOTH conversations, in recorded order.
     stub.emit('s2', {
         type: 'snapshot',
         session: snapshot({
@@ -286,8 +295,13 @@ it('does not poison the next session with the previous session thread ids (N1)',
     });
     await flush(3);
 
-    expect(rows().map((row) => row.dataset.threadId)).toEqual(['thread-1', 'thread-2']);
+    expect(conversations()).toEqual(['thread-1', 'thread-2']);
     expect(tiles().map((tile) => tile.dataset.threadId)).toEqual(['thread-1', 'thread-2']);
+    // The adopted turn is a REAL tile, not just a roster row: `thread-2` is alive.
+    expect(tiles().map((tile) => tile.dataset.turnId)).toEqual(['turn-9', 'turn-10']);
+    // The background adoption of `thread-2` must not steal the reader's focus (S1).
+    expect(document.querySelector('.tile.is-expanded')?.getAttribute('data-turn-id')).toBe('turn-9');
+    expect(target()).toBe('Steering IT1');
 });
 
 it('keeps a live turn that an older snapshot no longer lists (N2)', async () => {
@@ -337,8 +351,13 @@ it('does not restore a # chip whose target was deleted while the submit was in f
     localStorage.setItem(SESSION_KEY, 's2');
     const stub = stubServer(
         [
+            // `status: 'running'` keeps the session pending with NO running turn, which
+            // is what opens the observer stream (openSession -> startWatching). Without
+            // it the client could not learn about another writer's deletion at all now
+            // that no in-app thread delete exists.
             snapshot({
                 id: 's2',
+                status: 'running',
                 turns: [turn({ id: 'turn-1', threadId: 'thread-1' })],
                 threads: [{ id: 'thread-1', agent: 'instruct', origin: 'host', status: 'idle', sequence: 1 }]
             })
@@ -367,12 +386,50 @@ it('does not restore a # chip whose target was deleted while the submit was in f
         }
     ]);
 
-    // Delete the referenced conversation while the POST is held open.
-    const action = () => document.querySelector<HTMLButtonElement>('.thread-strip-action');
-    action()?.click();
-    action()?.click();
+    // The referenced conversation is deleted SERVER-SIDE (another tab / the API)
+    // while the POST is held open: the client only sees an authoritative snapshot
+    // whose `turns`/`threads` no longer contain thread-1. Its `updatedAt` is NEWER,
+    // so it passes the watermark and is the snapshot that LEARNS the deletion (and
+    // tombstones the thread, so no later frame can resurrect it).
+    stub.emit('s2', {
+        type: 'snapshot',
+        session: snapshot({ id: 's2', status: 'running', updatedAt: 3, turns: [], threads: [] })
+    });
     await flush(3);
-    expect(rows()).toEqual([]);
+
+    // The deleted conversation's TURN tile is gone. (The in-flight optimistic row
+    // has no server id yet, so it is not a turn tile; the routing label is asserted
+    // below, after the rejected submit settles.)
+    expect([...document.querySelectorAll<HTMLElement>('.tile[data-turn-id="turn-1"]')]).toEqual([]);
+    // Only the optimistic row is left: unbound (the server never assigned an id),
+    // attributed to the deleted `thread-1`, and still `queued` while the POST is held.
+    expect(tiles().map((tile) => [tile.dataset.turnId, tile.dataset.threadId, tile.dataset.state])).toEqual([
+        [undefined, 'thread-1', 'queued']
+    ]);
+    // Its conversation shell survives the deletion (the optimistic row is still
+    // projected into thread-1's group); no other `.conversation` does.
+    expect(conversations()).toEqual(['thread-1']);
+    // The LEARNED deletion drops the focus (main.ts `applySnapshot`, immediately after
+    // `reconcile`): the board re-focuses `thread-1` because that pending optimistic row
+    // names it, and the shell then clears that focus because the roster diff
+    // TOMBSTONED the id. With no focus, `resolveSubmitTarget` reports `{ mode: 'new' }`,
+    // so the routing text is the literal `New thread`. `paintComposerTarget` also
+    // hides the line here: a `new` target in a session whose roster is now empty is
+    // exactly the "nothing to distinguish from" case (`hidden` + `data-target=false`).
+    expect(target()).toBe('New thread');
+    expect(targetHidden()).toBe(true);
+    expect(byClass('.composer-target', 'p').dataset.mode).toBe('new');
+    // The held POST is untouched by the deletion snapshot: still one request.
+    expect(stub.tasks).toEqual([
+        {
+            sessionId: 's2',
+            body: {
+                input: '#IN1 follow up',
+                references: [{ turnId: 'turn-1', label: 'IN1' }],
+                threadId: 'thread-1'
+            }
+        }
+    ]);
 
     // The server then rejects the submit: its target no longer exists.
     stub.failTasks = 'Unknown thread "thread-1".';
@@ -383,9 +440,52 @@ it('does not restore a # chip whose target was deleted while the submit was in f
     // surviving text stays, and a retry sends no reference.
     expect(input.querySelectorAll('[data-chip="reference"]')).toHaveLength(0);
     expect(input.textContent?.trim()).toBe('follow up');
+
+    // The rejection does not resurrect the focus either: its optimistic row is marked
+    // `error` rather than re-focused, so the routing line still reads `New thread` and
+    // the line stays hidden (empty roster + `new` mode).
     expect(target()).toBe('New thread');
+    expect(targetHidden()).toBe(true);
+
+    // Exactly one tile survives: the revoked submit's optimistic row. It is still
+    // unbound (`data-turn-id` absent — the server never assigned an id), still
+    // attributed to `thread-1` in `data-thread-id`, and now terminal `error`.
+    expect(tiles().map((tile) => [tile.dataset.turnId, tile.dataset.threadId, tile.dataset.state])).toEqual([
+        [undefined, 'thread-1', 'error']
+    ]);
+    // ...and its conversation shell stays too, because the error row is still projected
+    // into thread-1's group. No other `.conversation` survives the deletion snapshot.
+    expect(conversations()).toEqual(['thread-1']);
+    // The failure adds no request: the rejected POST is still the only one.
+    expect(stub.tasks).toEqual([
+        {
+            sessionId: 's2',
+            body: {
+                input: '#IN1 follow up',
+                references: [{ turnId: 'turn-1', label: 'IN1' }],
+                threadId: 'thread-1'
+            }
+        }
+    ]);
 
     await submit('follow up');
     await flush(2);
-    expect(stub.tasks[1]).toEqual({ sessionId: 's2', body: { input: 'follow up' } });
+    // The retry carries NO `references` (the dead chip was purged) AND NO `threadId`:
+    // the clear above left `focusedThread()` undefined, so `resolveSubmitTarget` returns
+    // `{ mode: 'new' }` and `run()` omits the id — the server mints a fresh thread
+    // instead of 404ing on the deleted one. Assert both requests in full, in order.
+    expect(stub.tasks).toEqual([
+        {
+            sessionId: 's2',
+            body: {
+                input: '#IN1 follow up',
+                references: [{ turnId: 'turn-1', label: 'IN1' }],
+                threadId: 'thread-1'
+            }
+        },
+        {
+            sessionId: 's2',
+            body: { input: 'follow up' }
+        }
+    ]);
 });
