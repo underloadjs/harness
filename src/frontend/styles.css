@@ -3843,6 +3843,17 @@ button {
     outline: 2px solid var(--accent-soft);
 }
 
+/* Seamless chat field. The visible box is the frame `.composer-field` (border +
+   background, R9/R10), so a ring on the inner text column draws a second, faint
+   (--accent-soft) box just inside that frame and the composer reads as a box-in-a-box
+   instead of one input. A text field's focus cue is its caret, so the ring is dropped
+   here only. The selector is one class deeper than `.composer-input:focus`, so the
+   tool-runner arguments textarea (`.composer-input.tool-args`, a real bordered box
+   outside `.composer-field`) keeps its ring. */
+.composer-field .composer-input:focus {
+    outline: none;
+}
+
 /* R10: ONE action, anchored bottom-right inside the field. It is a real button
    (keyboard + pointer); the glyph is decorative, the accessible name is set in
    main.ts (`aria-label`/`title`). The outline keeps it visible on the dark input

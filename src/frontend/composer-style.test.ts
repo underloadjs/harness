@@ -176,3 +176,21 @@ it('keeps the composer column additive and compact, with no attachment chooser r
     expect(blockOf('.attachment-name {')).toContain('text-overflow: ellipsis');
     expect(blockOf('.turn-attachments[hidden] {')).toContain('display: none');
 });
+
+it('drops the inner focus ring on the chat field but keeps it on the shared input', () => {
+    // The visible box of the composer IS the `.composer-field` frame (border +
+    // background), so a 2px `--accent-soft` ring on the inner text column drew a
+    // second faint box inside that frame (styles.css: `.composer-field .composer-input:focus`).
+    // The deeper selector (0,3,0 vs 0,2,0) resolves the inner column to `outline: none`,
+    // leaving the caret (and the frame) as the focus cue.
+    const fieldFocus = blockOf('.composer-field .composer-input:focus {');
+    expect(fieldFocus).toContain('outline: none');
+    expect(fieldFocus).not.toContain('outline: 2px solid var(--accent-soft)');
+
+    // The base rule is unchanged: the tool-runner arguments textarea
+    // (`.composer-input.tool-args`) lives outside `.composer-field` and is a real
+    // bordered box, so it must keep both its accent border and its ring.
+    const baseFocus = blockOf('.composer-input:focus {');
+    expect(baseFocus).toContain('border-color: var(--accent)');
+    expect(baseFocus).toContain('outline: 2px solid var(--accent-soft)');
+});
