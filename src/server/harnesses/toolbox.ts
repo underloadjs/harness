@@ -128,14 +128,14 @@ export const SHARED_TOOL_NAMES: readonly string[] = Object.freeze(Object.keys(SH
 // deployed editable `tool-sources/` copy in production); see core/tool-source.ts.
 export const SHARED_TOOL_SOURCES: Readonly<Record<string, string>> = Object.freeze({
     // Package preset entries, in the same order as `SHARED_TOOLS`.
-    syntaxCheck: 'tools/syntax/syntaxCheck.ts',
-    fileRead: 'tools/files/fileRead.ts',
-    fileWrite: 'tools/files/fileWrite.ts',
-    fileEdit: 'tools/files/fileEdit.ts',
-    fileList: 'tools/files/fileList.ts',
-    fileGlob: 'tools/files/fileGlob.ts',
-    commandRun: 'tools/command/commandRun.ts',
-    gitDiff: 'tools/command/gitDiff.ts',
+    syntaxCheck: 'tools/syntax/syntaxCheck.tool.ts',
+    fileRead: 'tools/files/fileRead.tool.ts',
+    fileWrite: 'tools/files/fileWrite.tool.ts',
+    fileEdit: 'tools/files/fileEdit.tool.ts',
+    fileList: 'tools/files/fileList.tool.ts',
+    fileGlob: 'tools/files/fileGlob.tool.ts',
+    commandRun: 'tools/command/commandRun.tool.ts',
+    gitDiff: 'tools/command/gitDiff.tool.ts',
     // App tool entries (R2 extraction), in registration order.
     timeNow: 'server/harnesses/tool-sources/timeNow.ts',
     textCount: 'server/harnesses/tool-sources/textCount.ts',
@@ -167,9 +167,14 @@ export const SHARED_TOOL_SOURCES: Readonly<Record<string, string>> = Object.free
 // threadFork is appended unconditionally AFTER agentDelegate: forks are enabled by
 // default in the harness (N6), so every preset's runs declare it, but its runtime
 // registration follows agentDelegate and the descriptor must keep that order.
+// toolList/toolManage are always-registered core entries: inventory and active
+// source management respectively. They sit after toolRequest and before toolCreate
+// in the runtime's registration order.
 export const CORE_TOOL_NAMES = [
     'toolRegistry',
     'toolRequest',
+    'toolList',
+    'toolManage',
     'toolCreate',
     'todoManage',
     'profileManage',

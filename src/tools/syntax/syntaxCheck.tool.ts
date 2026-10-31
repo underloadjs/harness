@@ -10,12 +10,13 @@
 //     await syntaxCheck({ code: 'const a = 1;', language: 'javascript' }); // true
 //     harness({ tools: { syntaxCheck } });                                // model calls it
 //
-// Metadata (name, description, tags, schema) lives in ../catalogue so the preset
-// can be enumerated without importing this module — and so text can't drift.
+// Metadata (name, description, tags, schema) is declared below and is authoritative
+// for T13. ../catalogue projects the same data synchronously for lazy enumeration
+// and a consistency test proves the projection equal.
 
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
-import { PRESET_TOOLS } from '../catalogue';
+import type { PresetToolMetadata } from '../catalogue';
 
 // The two languages the tool understands. Exported so the wire schema, the
 // implementation, and consumers all describe the same union.
@@ -28,8 +29,34 @@ export type SyntaxCheckParameters = {
     language: SyntaxCheckLanguage;
 };
 
+// Authoritative registration/details for this preset (T13): the catalogue keeps
+// a synchronous data projection for lazy enumeration and a consistency test
+// asserts the two stay equal. Edit the metadata HERE.
+export const SYNTAX_CHECK_METADATA: PresetToolMetadata = {
+    name: 'syntaxCheck',
+    description:
+        'Check whether a code snippet parses, without executing it. Pass language "javascript" (JavaScript as a classic script: no import/export and no top-level await) or "python" (Python; needs a Python 3 interpreter on PATH). Returns true when the syntax is valid, false otherwise.',
+    tags: ['code', 'syntax', 'javascript', 'python', 'validation'],
+    // Two properties, so the single-property rule does not apply: execute
+    // receives the whole { code, language } object, exactly what a direct
+    // call passes.
+    parameters: {
+        type: 'object',
+        properties: {
+            code: { type: 'string', description: 'Source code to check.' },
+            language: {
+                type: 'string',
+                enum: ['javascript', 'python'],
+                description: 'Language to parse the snippet as.'
+            }
+        },
+        required: ['code', 'language'],
+        additionalProperties: false
+    }
+};
+
 export const syntaxCheck = tool<SyntaxCheckParameters, boolean>({
-    ...PRESET_TOOLS.syntaxCheck,
+    ...SYNTAX_CHECK_METADATA,
     execute: async (context) => {
         const parameters = context.parameters;
 

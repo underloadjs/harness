@@ -79,6 +79,8 @@ const hasForkResult = (request: HarnessStreamRequest): boolean =>
 const CORE_DECLARATIONS = [
     'toolRegistry',
     'toolRequest',
+    'toolList',
+    'toolManage',
     'toolCreate',
     'todoManage',
     'profileManage',

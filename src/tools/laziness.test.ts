@@ -16,7 +16,7 @@ const loads = vi.hoisted(() => ({ fileRead: 0, fileEdit: 0 }));
 // A fake implementation is just the callable the proxy delegates to. Keeping it
 // minimal avoids re-implementing Tool metadata here (a function's `name` is
 // read-only, so Object.assign would throw for example).
-vi.mock('./files/fileRead', () => {
+vi.mock('./files/fileRead.tool', () => {
     loads.fileRead += 1;
 
     return {
@@ -48,7 +48,7 @@ vi.mock('./files/fileRead', () => {
 
 // fileEdit also needs an `execute`, because the harness calls that property
 // directly instead of invoking the callable.
-vi.mock('./files/fileEdit', () => {
+vi.mock('./files/fileEdit.tool', () => {
     loads.fileEdit += 1;
 
     const fileEdit = async (edits: { oldString: string }[]) =>

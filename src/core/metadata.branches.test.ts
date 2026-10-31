@@ -132,6 +132,8 @@ describe('conditional core registration', () => {
     it('does not put the conditional tools in the always-registered core set', () => {
         expect(coreToolMetadata().map((metadata) => metadata.name)).toEqual([
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',

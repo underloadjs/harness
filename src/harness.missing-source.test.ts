@@ -15,7 +15,7 @@ vi.mock('./core', async (importOriginal) => {
         TOOL_SOURCE_PACKAGE_ROOT: '',
         prepareToolCandidate: () => {
             throw new Error(
-                'Tool source import "runtime-tools/toolRegistry.ts" could not be resolved.'
+                'Tool source import "runtime-tools/toolRegistry.tool.ts" could not be resolved.'
             );
         }
     };

@@ -87,6 +87,8 @@ describe('toolCreation policy', () => {
         expect(declaredNames(seenResearcher[0])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'todoManage',
             'profileManage',
             'chapterManage',

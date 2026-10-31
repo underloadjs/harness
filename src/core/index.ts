@@ -2,11 +2,13 @@
 //
 //   agent()      — the brain. One turn at a time (`stream` / `turn`).
 //   tool()       — an action the model can request, and that you can call directly.
-//   searchTools() — rank a tool catalogue against capability tags (what toolRequest
-//                  uses). Pure, so tooling and UIs can reuse the ranking. Optional
+//   selectTools() — explicit, UNCAPPED name/regex/tag selection (what toolRequest
+//                  uses). Pure, so tooling and UIs can reuse the selector. Optional
 //                  `declared` core tools are reported as `alreadyAvailable` (never
-//                  enabled), so a query naming a tool the caller already has does
-//                  not come back as "no match".
+//                  selected/enabled), so a query naming a tool the caller already
+//                  has does not come back as "no match".
+//   searchTools() — the legacy paged, tag-only ranking retained for existing hosts.
+//                  MAX_DISCOVERY_MATCHES is its five-match cap, not toolRequest's.
 //   createDynamicTool() — validate + compile a tool from an async function body.
 //                  The primitive behind the harness's toolCreate tool.
 //   createTodoTool() — the harness's per-session todoManage state, as a factory.
@@ -21,8 +23,9 @@
 //                  ../harness.ts and the server catalogue both read this copy.
 //                  Includes the agentManage/agentResult inspection pair and their
 //                  preview/page bounds.
-//   MAX_DISCOVERY_MATCHES — the discovery cap (R7) the toolRequest schema
-//                  advertises and searchTools enforces.
+//   MAX_DISCOVERY_MATCHES - the legacy searchTools five-match cap. toolRequest
+//                  uses the uncapped selectTools and the harness's maxEnabledTools
+//                  bound instead.
 //   boundToolResult()/MODEL_TOOL_RESULT_BUDGET_BYTES — the model-facing 64 KiB
 //                  tool-result/error cap (R10). Reusable by a server that
 //                  serializes a manual result for a client.
@@ -51,20 +54,33 @@
 // schema, and are not re-exported from the package root.
 export { agent } from './agent';
 export { tool, toolParameterKey, normalizeTags } from './tool';
-export { MAX_DISCOVERY_MATCHES, searchTools } from './discovery';
+export { MAX_DISCOVERY_MATCHES, searchTools, selectTools } from './discovery';
+export type {
+    ToolSelectionOptions,
+    ToolSelectionQuery,
+    ToolSelectionResult
+} from './discovery';
 export { compileToolSource, createDynamicTool, DEFAULT_CREATED_TOOLS_LIMIT } from './creation';
 // The synchronous module compiler behind startup/runtime source registration.
 // Exported for focused tests and for a host that wants to validate a candidate
 // without publishing it; the harness owns the only publish path.
 export {
+    TOOL_SOURCE_EXTENSION,
     TOOL_SOURCE_PACKAGE_ROOT,
     TOOL_SOURCE_ROOTS,
     cloneToolSourceRecord,
+    deleteToolSourceFile,
+    discoverToolFolderSources,
     prepareToolCandidate,
-    supportsToolCompilation
+    readToolSourceFile,
+    resolveToolFolderTarget,
+    resolveToolFolders,
+    supportsToolCompilation,
+    writeToolSourceFile
 } from './tool-source';
 export type {
     PreparedTool,
+    ToolFolderTarget,
     ToolRegistrationCandidate,
     ToolSourceDependency,
     ToolSourceRecord
@@ -118,6 +134,10 @@ export type {
 export {
     TOOL_CREATE_METADATA,
     TOOL_CREATE_NAME,
+    TOOL_LIST_METADATA,
+    TOOL_LIST_NAME,
+    TOOL_MANAGE_METADATA,
+    TOOL_MANAGE_NAME,
     TOOL_REGISTRY_METADATA,
     TOOL_REGISTRY_NAME,
     AGENT_DELEGATE_NAME,

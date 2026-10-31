@@ -186,10 +186,29 @@ export type PreparedTool = {
 // Node runtime loader (guarded top-level import; never evaluated in a browser)
 // ---------------------------------------------------------------------------
 
+type SourceDirectoryEntry = {
+    name: string;
+    isDirectory: () => boolean;
+    isFile: () => boolean;
+    isSymbolicLink: () => boolean;
+};
+
 type SourceRuntime = {
     existsSync: (candidate: string) => boolean;
     readFileSync: (candidate: string, encoding: 'utf8') => string;
-    statSync: (candidate: string) => { isFile: () => boolean };
+    writeFileSync: (candidate: string, text: string, encoding: 'utf8') => void;
+    mkdirSync: (candidate: string, options: { recursive: true }) => void;
+    unlinkSync: (candidate: string) => void;
+    readdirSync: (
+        candidate: string,
+        options: { withFileTypes: true }
+    ) => SourceDirectoryEntry[];
+    realpathSync: (candidate: string) => string;
+    statSync: (candidate: string) => {
+        isFile: () => boolean;
+        isDirectory: () => boolean;
+    };
+    lstatSync: (candidate: string) => { isSymbolicLink: () => boolean };
     createHash: (algorithm: 'sha256') => {
         update: (value: string) => { digest: (encoding: 'hex') => string };
     };
@@ -229,7 +248,13 @@ const loadSourceRuntime = async (): Promise<SourceRuntime> => {
     return {
         existsSync: fs.existsSync,
         readFileSync: fs.readFileSync as SourceRuntime['readFileSync'],
+        writeFileSync: fs.writeFileSync as SourceRuntime['writeFileSync'],
+        mkdirSync: fs.mkdirSync as SourceRuntime['mkdirSync'],
+        unlinkSync: fs.unlinkSync,
+        readdirSync: fs.readdirSync as SourceRuntime['readdirSync'],
+        realpathSync: fs.realpathSync,
         statSync: fs.statSync,
+        lstatSync: fs.lstatSync,
         createHash: crypto.createHash as SourceRuntime['createHash'],
         createRequire: moduleApi.createRequire,
         dirname: pathApi.dirname,
@@ -463,6 +488,291 @@ const resolveCandidatePath = (candidate: ToolRegistrationCandidate): string | un
     if (fromCwd) return fromCwd;
 
     return undefined;
+};
+
+// ---------------------------------------------------------------------------
+// Configured external tool folders (`toolFolders`)
+// ---------------------------------------------------------------------------
+//
+// A host can point the harness at one or more folders of editable `*.tool.ts`
+// modules. This is deliberately a separate, narrow surface from the package
+// source roots:
+//   - discovery is recursive and deterministic (folders in configuration order,
+//     then a global byte-wise sort of each folder's relative POSIX paths);
+//   - later folders win by tool name because the harness publishes in discovery
+//     order through the same last-registration-wins kernel;
+//   - writes are allowed ONLY through `resolveToolFolderTarget`/`writeToolSourceFile`
+//     below, which reject paths outside the configured folders, traversal, and
+//     symlink escapes. The compiler itself still reads a trusted entry with the
+//     process's permissions: folder code is trusted code.
+//
+// The extension is part of the contract: a folder tool entry MUST end in
+// `.tool.ts`. Other `.ts` helpers beside it are ordinary captured dependencies.
+export const TOOL_SOURCE_EXTENSION = '.tool.ts';
+
+// The canonical on-disk location of one writable folder entry. `folder` is the
+// canonical root, `path` the canonical target file.
+export type ToolFolderTarget = {
+    folder: string;
+    path: string;
+};
+
+const isPathInside = (root: string, target: string): boolean => {
+    const runtime = source();
+    const relative = runtime.relative(root, target);
+    return (
+        relative.length === 0 ||
+        (!relative.startsWith('..') && !runtime.isAbsolute(relative))
+    );
+};
+
+const folderError = (folder: unknown, detail: string): HarnessError =>
+    new HarnessError(`toolFolders entry ${JSON.stringify(folder)} is invalid: ${detail}`);
+
+// Resolve and validate the configured folders ONCE. Relative entries resolve
+// against the process cwd (the documented external-folder convenience); absolute
+// entries are used verbatim. Missing paths, non-directories, and duplicate
+// canonical roots fail loudly instead of silently scanning the wrong place.
+export const resolveToolFolders = (folders: readonly string[]): string[] => {
+    if (!Array.isArray(folders)) {
+        throw new HarnessError('toolFolders must be an array of folder paths.');
+    }
+
+    const runtime = source();
+    const resolved: string[] = [];
+
+    for (const folder of folders) {
+        if (typeof folder !== 'string' || folder.trim().length === 0) {
+            throw folderError(folder, 'expected a non-empty string path.');
+        }
+
+        const absolute = runtime.isAbsolute(folder)
+            ? runtime.resolve(folder)
+            : runtime.resolve(process.cwd(), folder);
+
+        if (!runtime.existsSync(absolute)) {
+            throw folderError(folder, `folder does not exist (resolved to "${toPosix(absolute)}").`);
+        }
+
+        if (!runtime.statSync(absolute).isDirectory()) {
+            throw folderError(folder, `path is not a directory (resolved to "${toPosix(absolute)}").`);
+        }
+
+        let canonical: string;
+        try {
+            canonical = runtime.realpathSync(absolute);
+        } catch (error) {
+            throw folderError(folder, `folder could not be resolved: ${toErrorInfo(error).message}`);
+        }
+
+        if (!resolved.includes(canonical)) resolved.push(canonical);
+    }
+
+    return resolved;
+};
+
+// Recursively collect every `*.tool.ts` entry under one canonical folder. Sort
+// for determinism and skip symlinks entirely: a folder whose meaning depends on
+// an external link would make both discovery order and later-folder-wins
+// unpredictable, and a symlinked file is outside this feature's write fence.
+export const discoverToolFolderSources = (folders: readonly string[]): string[] => {
+    const runtime = source();
+    const sources: string[] = [];
+
+    const walk = (directory: string): void => {
+        let entries: SourceDirectoryEntry[];
+
+        try {
+            entries = runtime.readdirSync(directory, { withFileTypes: true });
+        } catch (error) {
+            throw new HarnessError(
+                `Tool folder "${toPosix(directory)}" could not be read: ${toErrorInfo(error).message}`,
+                { cause: error }
+            );
+        }
+
+        entries.sort((left, right) =>
+            left.name < right.name ? -1 : left.name > right.name ? 1 : 0
+        );
+
+        for (const entry of entries) {
+            // Do not follow symlinks in either direction. A symlinked directory can
+            // escape the configured folder or create a cycle; a symlinked entry is
+            // not a stable on-disk module this feature owns.
+            if (entry.isSymbolicLink()) continue;
+
+            const absolute = runtime.join(directory, entry.name);
+
+            if (entry.isDirectory()) {
+                walk(absolute);
+                continue;
+            }
+
+            if (entry.isFile() && entry.name.endsWith(TOOL_SOURCE_EXTENSION)) {
+                sources.push(absolute);
+            }
+        }
+    };
+
+    // Folder order is configuration order (later folders must win collisions).
+    // WITHIN one folder the order is a global byte-wise sort of the relative
+    // POSIX path, not raw depth-first traversal: `a/b.tool.ts` sorts before
+    // `a.tool.ts`, so the documented rule is what actually runs.
+    for (const folder of resolveToolFolders(folders)) {
+        const before = sources.length;
+        walk(folder);
+
+        const discovered = sources
+            .splice(before)
+            .map((absolute) => ({ absolute, relative: toPosix(runtime.relative(folder, absolute)) }))
+            .sort((left, right) =>
+                left.relative < right.relative ? -1 : left.relative > right.relative ? 1 : 0
+            )
+            .map((entry) => entry.absolute);
+
+        sources.push(...discovered);
+    }
+
+    return sources;
+};
+
+// Resolve an EXPLICIT write target into a configured folder. The checks are
+// intentionally conservative:
+//   - `path` is required (no implicit file name and no implicit folder);
+//   - a relative path is relative to `folder` when supplied, otherwise the first
+//     configured folder;
+//   - the target must stay under a configured canonical root after resolving the
+//     nearest existing ancestor with `realpath`, which catches `..` traversal and
+//     symlinked directories/files that point outside;
+//   - the file name must end in `.tool.ts`.
+export const resolveToolFolderTarget = (
+    candidatePath: string,
+    folders: readonly string[],
+    folder?: string
+): ToolFolderTarget => {
+    if (typeof candidatePath !== 'string' || candidatePath.trim().length === 0) {
+        throw new HarnessError('A tool source write requires a non-empty explicit `path`.');
+    }
+
+    const roots = resolveToolFolders(folders);
+
+    if (roots.length === 0) {
+        throw new HarnessError(
+            'No toolFolders are configured. Add `toolFolders` to the harness configuration to write `*.tool.ts` files, or register runtime-only moduleText.'
+        );
+    }
+
+    const runtime = source();
+    let selected: string | undefined;
+
+    if (folder !== undefined) {
+        if (typeof folder !== 'string' || folder.trim().length === 0) {
+            throw new HarnessError('`folder` must be a non-empty configured folder path when supplied.');
+        }
+
+        const absolute = runtime.isAbsolute(folder)
+            ? runtime.resolve(folder)
+            : runtime.resolve(process.cwd(), folder);
+        const canonical = runtime.existsSync(absolute)
+            ? runtime.realpathSync(absolute)
+            : absolute;
+        selected = roots.find((root) => root === canonical);
+
+        if (selected === undefined) {
+            throw new HarnessError(
+                `Folder "${folder}" is not one of this harness's configured toolFolders.`
+            );
+        }
+    }
+
+    const absoluteTarget = runtime.isAbsolute(candidatePath)
+        ? runtime.resolve(candidatePath)
+        : runtime.resolve(selected ?? roots[0], candidatePath);
+
+    if (selected === undefined) {
+        selected = roots.find((root) => isPathInside(root, absoluteTarget));
+    }
+
+    if (selected === undefined) {
+        throw new HarnessError(
+            `Tool source path "${candidatePath}" is outside the configured toolFolders.`
+        );
+    }
+
+    if (!absoluteTarget.endsWith(TOOL_SOURCE_EXTENSION)) {
+        throw new HarnessError(
+            `Tool source path "${candidatePath}" must end in "${TOOL_SOURCE_EXTENSION}".`
+        );
+    }
+
+    // Walk up to the nearest existing ancestor. Its real path is the only stable
+    // containment evidence before the target file exists; `mkdir` is performed
+    // later by writeToolSourceFile and re-checked after creation.
+    let existing = absoluteTarget;
+
+    while (!runtime.existsSync(existing)) {
+        const parent = runtime.dirname(existing);
+        if (parent === existing) {
+            throw new HarnessError(
+                `Tool source path "${candidatePath}" has no existing ancestor inside the configured folder.`
+            );
+        }
+        existing = parent;
+    }
+
+    const canonicalExisting = runtime.realpathSync(existing);
+
+    if (!isPathInside(selected, canonicalExisting)) {
+        throw new HarnessError(
+            `Tool source path "${candidatePath}" escapes the configured toolFolders (resolved through a symlink or traversal).`
+        );
+    }
+
+    const suffix = runtime.relative(existing, absoluteTarget);
+    const canonicalTarget = suffix.length === 0
+        ? canonicalExisting
+        : runtime.join(canonicalExisting, suffix);
+
+    if (!isPathInside(selected, canonicalTarget)) {
+        throw new HarnessError(
+            `Tool source path "${candidatePath}" escapes the configured toolFolders.`
+        );
+    }
+
+    if (runtime.existsSync(canonicalTarget) && runtime.lstatSync(canonicalTarget).isSymbolicLink()) {
+        throw new HarnessError(
+            `Tool source path "${candidatePath}" is a symlink; write the real file inside the configured toolFolders instead.`
+        );
+    }
+
+    return { folder: selected, path: canonicalTarget };
+};
+
+// Read one editable source file. Reads are not fenced by toolFolders: the registry
+// may legitimately reload a package-built-in revision. Writes are fenced below.
+export const readToolSourceFile = (path: string): string => source().readFileSync(path, 'utf8');
+
+// Write one folder entry after re-validating the target through the same fence.
+// The caller owns rollback when a later compile/contract step fails.
+export const writeToolSourceFile = (
+    path: string,
+    text: string,
+    folders: readonly string[]
+): string => {
+    const target = resolveToolFolderTarget(path, folders);
+    const runtime = source();
+    runtime.mkdirSync(runtime.dirname(target.path), { recursive: true });
+
+    // Re-check after mkdir: the nearest ancestor may now be a newly created
+    // directory, and a concurrent symlink swap must not turn this into an escape.
+    const checked = resolveToolFolderTarget(target.path, folders, target.folder);
+    runtime.writeFileSync(checked.path, text, 'utf8');
+    return checked.path;
+};
+
+export const deleteToolSourceFile = (path: string, folders: readonly string[]): void => {
+    const target = resolveToolFolderTarget(path, folders);
+    if (source().existsSync(target.path)) source().unlinkSync(target.path);
 };
 
 // Flatten TypeScript diagnostics into one actionable line. Semantic diagnostics

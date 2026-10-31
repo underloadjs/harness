@@ -33,7 +33,7 @@ import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { toolParameterKey } from '../../core';
 import { HarnessError } from '../../util';
-import { fileEdit } from './fileEdit';
+import { fileEdit } from './fileEdit.tool';
 
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../../Temp', import.meta.url));
 
@@ -87,7 +87,7 @@ describe('fileEdit', () => {
 
         await expect(fileEdit([{ path, oldString: 'a', newString: 'b' }])).rejects.toThrow(
             new HarnessError(
-                `fileEdit found 3 matches for oldString in ${path}. Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
+                `fileEdit found 3 matches for oldString in ${path} (lines 1, 1, 1). Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
             )
         );
         await expect(readTextFile(path, 'utf8')).resolves.toBe('a a a\n');
@@ -207,7 +207,7 @@ describe('fileEdit', () => {
 
         await expect(fileEdit([{ path, oldString: '"x"', newString: '"y"' }])).rejects.toThrow(
             new HarnessError(
-                `fileEdit found 2 matches for oldString in ${path}. Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
+                `fileEdit found 2 matches for oldString in ${path} (lines 1, 1). Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
             )
         );
         await expect(readTextFile(path, 'utf8')).resolves.toBe('“x” “x”\n');
@@ -252,38 +252,62 @@ describe('fileEdit', () => {
         await expect(readTextFile(second, 'utf8')).resolves.toBe('beta\n');
     });
 
-    it('rejects the same resolved target twice before reading anything', async () => {
-        const path = await seed('duplicate.txt', 'same\n');
+    it('applies several entries for ONE file in array order, in one write', async () => {
+        // T20: a second entry naming the same file is matched against the text the
+        // first entry produced, so a multi-hunk change needs one call, not one call
+        // per hunk and never a whole-file rewrite.
+        const path = await seed('multi-hunk.txt', 'one\ntwo\nthree\nfour\n');
 
-        await expect(
-            fileEdit([
-                { path, oldString: 'same', newString: 'one' },
-                { path: join(workdir, '.', 'duplicate.txt'), oldString: 'same', newString: 'two' }
-            ])
-        ).rejects.toThrow(
-            `fileEdit received the same target path twice (${path}); make one edit per file per call.`
-        );
-        await expect(readTextFile(path, 'utf8')).resolves.toBe('same\n');
+        const result = await fileEdit([
+            { path, oldString: 'one', newString: 'ONE' },
+            { path, oldString: 'four', newString: 'FOUR' }
+        ]);
+
+        const final = 'ONE\ntwo\nthree\nFOUR\n';
+        const bytes = Buffer.byteLength(final, 'utf8');
+
+        expect(result).toEqual([
+            { path, replacements: 1, bytes },
+            { path, replacements: 1, bytes }
+        ]);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe(final);
     });
 
-    it('rejects two spellings of one file, judged by this platform', async () => {
-        // T16: the duplicate check uses FILE IDENTITY, so on Windows
-        // "alias.txt"/"ALIAS.TXT" are one file and the batch is rejected before the
-        // file is even read; on Linux they are two files and both edits apply.
+    it('matches a later entry against the earlier entry\'s output, not the original text', async () => {
+        // Order is real: entry 2 sees "beta" where the file said "alpha". Reversing
+        // the entries would fail, which is what proves the running text is used.
+        const path = await seed('chained.txt', 'alpha\n');
+
+        const result = await fileEdit([
+            { path, oldString: 'alpha', newString: 'beta' },
+            { path, oldString: 'beta', newString: 'gamma' }
+        ]);
+
+        expect(result).toEqual([
+            { path, replacements: 1, bytes: Buffer.byteLength('gamma\n', 'utf8') },
+            { path, replacements: 1, bytes: Buffer.byteLength('gamma\n', 'utf8') }
+        ]);
+        await expect(readTextFile(path, 'utf8')).resolves.toBe('gamma\n');
+    });
+
+    it('groups two spellings of one file as one file with a defined order', async () => {
+        // T16/T20: grouping uses FILE IDENTITY, so on Windows "alias.txt"/
+        // "ALIAS.TXT" are one file and both edits apply in order; on Linux they are
+        // two distinct files and both are edited independently.
         const lower = await seed('alias.txt', 'same\n');
         const upper = join(workdir, 'ALIAS.TXT');
 
         if (process.platform === 'win32') {
-            await expect(
-                fileEdit([
-                    { path: lower, oldString: 'same', newString: 'one' },
-                    { path: upper, oldString: 'same', newString: 'two' }
-                ])
-            ).rejects.toThrow(
-                `fileEdit received the same target path twice (${upper}); make one edit per file per call.`
-            );
+            const result = await fileEdit([
+                { path: lower, oldString: 'same', newString: 'one' },
+                { path: upper, oldString: 'one', newString: 'two' }
+            ]);
 
-            await expect(readTextFile(lower, 'utf8')).resolves.toBe('same\n');
+            expect(result).toEqual([
+                { path: lower, replacements: 1, bytes: Buffer.byteLength('two\n', 'utf8') },
+                { path: upper, replacements: 1, bytes: Buffer.byteLength('two\n', 'utf8') }
+            ]);
+            await expect(readTextFile(lower, 'utf8')).resolves.toBe('two\n');
             return;
         }
 
@@ -302,7 +326,7 @@ describe('fileEdit', () => {
         await expect(readTextFile(other, 'utf8')).resolves.toBe('two\n');
     });
 
-    it('rejects a second spelling that reaches the file through a symlink', async () => {
+    it('applies entries that reach one file through a symlink, in order', async () => {
         // Creating a symlink is privileged on Windows (Developer Mode or elevated),
         // so the guard is "could we create it", not the platform name.
         const real = await seed('linked/target.txt', 'original\n');
@@ -317,16 +341,16 @@ describe('fileEdit', () => {
 
         const throughLink = join(alias, 'target.txt');
 
-        await expect(
-            fileEdit([
-                { path: real, oldString: 'original', newString: 'one' },
-                { path: throughLink, oldString: 'original', newString: 'two' }
-            ])
-        ).rejects.toThrow(
-            `fileEdit received the same target path twice (${throughLink}); make one edit per file per call.`
-        );
+        const result = await fileEdit([
+            { path: real, oldString: 'original', newString: 'one' },
+            { path: throughLink, oldString: 'one', newString: 'two' }
+        ]);
 
-        await expect(readTextFile(real, 'utf8')).resolves.toBe('original\n');
+        expect(result).toEqual([
+            { path: real, replacements: 1, bytes: Buffer.byteLength('two\n', 'utf8') },
+            { path: throughLink, replacements: 1, bytes: Buffer.byteLength('two\n', 'utf8') }
+        ]);
+        await expect(readTextFile(real, 'utf8')).resolves.toBe('two\n');
     });
 
     it('rejects an empty oldString, a no-op edit, and a non-boolean replaceAll', async () => {
@@ -403,7 +427,7 @@ describe('fileEdit', () => {
                         required: ['path', 'oldString', 'newString'],
                         additionalProperties: false
                     },
-                    description: 'Edits to apply, one per file, in the order the results are returned.'
+                    description: 'Edits to apply, in the order the results are returned. Several entries may name the same file; they are applied in array order.'
                 }
             },
             required: ['edits'],

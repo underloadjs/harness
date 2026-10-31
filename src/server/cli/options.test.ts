@@ -57,6 +57,8 @@ describe('CLI preset selection', () => {
         expect(Object.keys(offline.tools)).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',

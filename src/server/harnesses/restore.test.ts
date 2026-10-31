@@ -184,6 +184,8 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         expect(Object.keys(restoredDemo.create(SETTINGS, progress).tools)).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',

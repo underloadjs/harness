@@ -19,15 +19,19 @@
 // runCommand, websearch) are gone: there are no compatibility aliases, because a
 // catalogue with two names for one tool makes discovery ambiguous.
 //
-// Single source of truth
-// ----------------------
-// Each implementation spreads its entry from `PRESET_TOOLS` into `tool({...})`,
-// e.g. `files/fileRead.ts`:
+// Data projection, not the owner (T13)
+// ------------------------------------
+// The authoritative registration/details for each preset live in that preset's
+// own `*.tool.ts` entry, e.g. `FILE_READ_METADATA` in
+// `files/fileRead.tool.ts`, and the implementation spreads that local constant
+// into `tool({ ...FILE_READ_METADATA, execute })`. This module cannot import those
+// entries: that would eagerly evaluate `node:fs`, `node:child_process`, and the
+// rest, defeating the lazy/browser contract this file exists to preserve.
 //
-//     tool<string[], FileReadResult>({ ...PRESET_TOOLS.fileRead, execute: ... })
-//
-// So the text a model reads and the tool that runs can never drift apart. Edit a
-// description HERE, not in the implementation file.
+// `PRESET_TOOLS` is therefore a synchronous DATA PROJECTION of those per-entry
+// constants. A focused metadata consistency test imports every entry and asserts
+// the projection deep-equals it; add or edit metadata in the entry, never only
+// here. The projection is what ./lazy and ./index read at module-evaluation time.
 //
 // Cross-references:
 //   - ./lazy        — the callable proxy built from one entry
@@ -192,15 +196,16 @@ export const PRESET_TOOLS = {
         }
     },
     // fileEdit is BATCHED (T14): one property, an array of
-    // { path, oldString, newString, replaceAll? }. ALL entries are read and
-    // match-checked before the first write, so a bad entry leaves every file
-    // untouched; duplicate targets are rejected. Matching is exact-first with
-    // typographic/trailing-whitespace fallbacks and line-ending preservation
-    // (opencode v2 semantics) — see files/fileEdit.ts.
+    // { path, oldString, newString, replaceAll? }. Several entries may name one
+    // file and are applied in array order against the running text, so one call can
+    // change several hunks; ALL entries are read and match-checked before the first
+    // write, so a bad entry leaves every file untouched, and each file is written
+    // once. Matching is exact-first with typographic/trailing-whitespace fallbacks
+    // and line-ending preservation (opencode v2 semantics) - see files/fileEdit.tool.ts.
     fileEdit: {
         name: 'fileEdit',
         description:
-            'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes }. Creates nothing: use fileWrite for new files.',
+            'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used ("typographic" or "trailing-whitespace"), so a fuzzy match is never silent. Creates nothing: use fileWrite for new files.',
         tags: ['files', 'edit', 'write', 'replace', 'filesystem'],
         // R18: editing files is core, so a model never spends a discovery round on it.
         visibility: 'core',
@@ -236,7 +241,8 @@ export const PRESET_TOOLS = {
                         required: ['path', 'oldString', 'newString'],
                         additionalProperties: false
                     },
-                    description: 'Edits to apply, one per file, in the order the results are returned.'
+                    description:
+                        'Edits to apply, in the order the results are returned. Several entries may name the same file; they are applied in array order.',
                 }
             },
             required: ['edits'],
@@ -409,20 +415,20 @@ export const PRESET_TOOL_NAMES = Object.keys(PRESET_TOOLS) as PresetToolName[];
 export const loadPresetTool = (name: PresetToolName): Promise<Tool> => {
     switch (name) {
         case 'syntaxCheck':
-            return import('./syntax/syntaxCheck').then((module) => module.syntaxCheck);
+            return import('./syntax/syntaxCheck.tool').then((module) => module.syntaxCheck);
         case 'fileRead':
-            return import('./files/fileRead').then((module) => module.fileRead);
+            return import('./files/fileRead.tool').then((module) => module.fileRead);
         case 'fileWrite':
-            return import('./files/fileWrite').then((module) => module.fileWrite);
+            return import('./files/fileWrite.tool').then((module) => module.fileWrite);
         case 'fileEdit':
-            return import('./files/fileEdit').then((module) => module.fileEdit);
+            return import('./files/fileEdit.tool').then((module) => module.fileEdit);
         case 'fileList':
-            return import('./files/fileList').then((module) => module.fileList);
+            return import('./files/fileList.tool').then((module) => module.fileList);
         case 'fileGlob':
-            return import('./files/fileGlob').then((module) => module.fileGlob);
+            return import('./files/fileGlob.tool').then((module) => module.fileGlob);
         case 'commandRun':
-            return import('./command/commandRun').then((module) => module.commandRun);
+            return import('./command/commandRun.tool').then((module) => module.commandRun);
         case 'gitDiff':
-            return import('./command/gitDiff').then((module) => module.gitDiff);
+            return import('./command/gitDiff.tool').then((module) => module.gitDiff);
     }
 };

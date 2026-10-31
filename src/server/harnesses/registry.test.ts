@@ -164,6 +164,8 @@ describe('creating a harness', () => {
         expect(Object.keys(harness.tools)).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -444,6 +446,8 @@ describe('updating a harness', () => {
         expect(Object.keys(demoAfter.create(SETTINGS, progress).tools)).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -493,6 +497,8 @@ describe('updating a harness', () => {
         expect(Object.keys(scripted.tools)).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',

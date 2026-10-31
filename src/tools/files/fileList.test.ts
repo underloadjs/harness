@@ -34,7 +34,7 @@ import {
     FILE_LIST_MAX_LIMIT,
     fileList,
     paginateEntries
-} from './fileList';
+} from './fileList.tool';
 
 // Repo-root Temp/ (six levels up from src/tools/files/).
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../../Temp', import.meta.url));

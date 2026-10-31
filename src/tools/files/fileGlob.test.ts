@@ -33,7 +33,7 @@ import { mkdir, mkdtemp, rm, symlink, writeFile as writeTextFile } from 'node:fs
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { globToRegExp, matchGlob } from './glob';
-import { FILE_GLOB_CONTENT_BUDGET, FILE_GLOB_MATCH_TEXT_BYTES, fileGlob } from './fileGlob';
+import { FILE_GLOB_CONTENT_BUDGET, FILE_GLOB_MATCH_TEXT_BYTES, fileGlob } from './fileGlob.tool';
 
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../../Temp', import.meta.url));
 

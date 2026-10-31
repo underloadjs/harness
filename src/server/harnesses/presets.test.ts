@@ -92,6 +92,8 @@ const TOOLBOX = [
 const CORE = [
     'toolRegistry',
     'toolRequest',
+    'toolList',
+    'toolManage',
     'toolCreate',
     'todoManage',
     'profileManage',

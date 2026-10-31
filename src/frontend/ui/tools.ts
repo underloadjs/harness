@@ -327,6 +327,10 @@ export const createToolCallCard = (
 
     let current: ToolState = 'running';
     let settled = false;
+    // The complete result text (or the pending/interruption note) shown in the
+    // dialog. Copy reads this at CLICK time, so a call that settles while its dialog
+    // is open copies the settled payload, not the earlier pending placeholder.
+    let resultText = 'Waiting for the harness to run this call…';
 
     // The open dialog handle, if any. Cleared in `onClose` so a close via Escape,
     // backdrop or the close button is indistinguishable from `handle.close()`.
@@ -336,6 +340,21 @@ export const createToolCallCard = (
     // `fileRead · ok`. The chip remains the compact surface for scanning; the
     // modal title repeats the state in text because the modal covers the chip.
     const dialogTitle = (): string => `${name} · ${STATE_TEXT[current]}`;
+
+    // R5: one self-describing text payload for the dialog's Copy action. It is the
+    // same data the boxes render (pretty-printed JSON when applicable) and never a
+    // summary: arguments, state and the whole result/error/interruption reason.
+    const copyPayload = (): string =>
+        [
+            `Tool: ${name}`,
+            `State: ${STATE_TEXT[current]}`,
+            '',
+            'Arguments:',
+            prettyJson(rawArguments),
+            '',
+            'Result:',
+            prettyJson(resultText)
+        ].join('\n');
 
     // Open (or re-focus) the shared detail dialog. The summary is the explicit
     // return-focus target: it exists for the whole life of the card, so focus can
@@ -350,6 +369,10 @@ export const createToolCallCard = (
             title: dialogTitle(),
             // `dialog.ts` ADOPTS this node: the live body moves into `.dialog-body`.
             content: body,
+            // R5: copy the complete call record. The function is evaluated on each
+            // activation, so a call that resolves while the dialog is open yields
+            // the settled result instead of the pending placeholder.
+            copy: copyPayload,
             returnFocus: summary,
             onClose: () => {
                 if (dialog === handle) dialog = undefined;
@@ -459,6 +482,7 @@ export const createToolCallCard = (
         // available payload/error is shown — no display truncation. An empty answer
         // still gets an explicit placeholder rather than an empty code block.
         const text = content.length > 0 ? content : '(empty result)';
+        resultText = text;
 
         // Mutating the shared body is what makes an ALREADY-OPEN dialog update while
         // the call finishes: the node is inside `.dialog-body` at this moment.
@@ -514,6 +538,7 @@ export const createToolCallCard = (
         note.className = 'tool-pending';
         note.textContent = reason;
         resultHolder.replaceChildren(note);
+        resultText = reason;
 
         peek.textContent = `${previewArguments(rawArguments)} · cancelled`;
 

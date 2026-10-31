@@ -371,7 +371,7 @@ describe('self-modifying tool kernel', () => {
         const writer = harness({ agents: { writer: brain(scripted([answer('ok')])) } });
 
         const preset = writer.toolSource('fileRead');
-        expect(preset?.sourcePath).toBe('tools/files/fileRead.ts');
+        expect(preset?.sourcePath).toBe('tools/files/fileRead.tool.ts');
         expect(preset?.checks).toEqual([
             'transpile:syntax',
             'load:module',
@@ -383,11 +383,11 @@ describe('self-modifying tool kernel', () => {
         expect(preset?.dependencies).toEqual([]);
 
         const registry = writer.toolSource('toolRegistry');
-        expect(registry?.sourcePath).toBe('runtime-tools/toolRegistry.ts');
+        expect(registry?.sourcePath).toBe('runtime-tools/toolRegistry.tool.ts');
         expect(registry?.revision).toMatch(/^[0-9a-f]{16}$/);
         // Harness-owned controls are source entries too.
-        expect(writer.toolSource('todoManage')?.sourcePath).toBe('runtime-tools/todoManage.ts');
-        expect(writer.toolSource('toolCancel')?.sourcePath).toBe('runtime-tools/toolCancel.ts');
+        expect(writer.toolSource('todoManage')?.sourcePath).toBe('runtime-tools/todoManage.tool.ts');
+        expect(writer.toolSource('toolCancel')?.sourcePath).toBe('runtime-tools/toolCancel.tool.ts');
     });
 
     it('captures and compiles local virtual dependencies for moduleText revisions', async () => {
@@ -637,10 +637,10 @@ describe('self-modifying tool kernel', () => {
     it('registers configuration.toolSources after the baseline and before configured tool overrides', async () => {
         const sourced = harness({
             agents: { writer: brain(scripted([answer('ok')])) },
-            toolSources: { customList: 'tools/files/fileList.ts' }
+            toolSources: { customList: 'tools/files/fileList.tool.ts' }
         });
 
-        expect(sourced.toolSource('customList')?.sourcePath).toBe('tools/files/fileList.ts');
+        expect(sourced.toolSource('customList')?.sourcePath).toBe('tools/files/fileList.tool.ts');
         expect(sourced.tools.customList.name).toBe('customList');
         await expect(
             sourced.executeTool('customList', ['not-a-real-directory'])
@@ -654,7 +654,7 @@ describe('self-modifying tool kernel', () => {
         });
         const overridden = harness({
             agents: { writer: brain(scripted([answer('ok')])) },
-            toolSources: { customList: 'tools/files/fileList.ts' },
+            toolSources: { customList: 'tools/files/fileList.tool.ts' },
             tools: { customList: override }
         });
 
@@ -672,8 +672,8 @@ describe('self-modifying tool kernel', () => {
             webfetch: { env: {} }
         });
 
-        expect(writer.toolSource('webSearch')?.sourcePath).toBe('runtime-tools/webSearch.ts');
-        expect(writer.toolSource('webFetch')?.sourcePath).toBe('runtime-tools/webFetch.ts');
+        expect(writer.toolSource('webSearch')?.sourcePath).toBe('runtime-tools/webSearch.tool.ts');
+        expect(writer.toolSource('webFetch')?.sourcePath).toBe('runtime-tools/webFetch.tool.ts');
 
         // Dynamic per-harness provider surface is supplied as registration
         // metadata; no key appears in the captured source.
@@ -764,7 +764,7 @@ describe('self-modifying tool kernel', () => {
         // The name stays enabled/restorable; the replacement itself is
         // runtime-only, so the fresh baseline implementation is loaded.
         expect(restored.discoveredTools).toContain('fileList');
-        expect(restored.toolSource('fileList')?.sourcePath).toBe('tools/files/fileList.ts');
+        expect(restored.toolSource('fileList')?.sourcePath).toBe('tools/files/fileList.tool.ts');
         expect(restored.tools.fileList.description).not.toBe('runtime replacement');
 
         // Restoring a snapshot that does not contain a created tool removes both
@@ -791,8 +791,8 @@ describe('self-modifying tool kernel', () => {
 
         expect(restored.tools.threadSend).toBeDefined();
         expect(restored.tools.threadList).toBeDefined();
-        expect(restored.toolSource('threadSend')?.sourcePath).toBe('runtime-tools/threadSend.ts');
-        expect(restored.toolSource('threadList')?.sourcePath).toBe('runtime-tools/threadList.ts');
+        expect(restored.toolSource('threadSend')?.sourcePath).toBe('runtime-tools/threadSend.tool.ts');
+        expect(restored.toolSource('threadList')?.sourcePath).toBe('runtime-tools/threadList.tool.ts');
     });
 
     it('prepares baseline thread tools when a target-created control is absent from the snapshot', async () => {
@@ -818,8 +818,8 @@ describe('self-modifying tool kernel', () => {
         // Phase 4 deleted the target-created entry; the pre-prepared baseline
         // source must have been published, with no stale target record.
         expect(target.tools.threadList.description).not.toBe('target-created control');
-        expect(target.toolSource('threadList')?.sourcePath).toBe('runtime-tools/threadList.ts');
-        expect(target.toolSource('threadSend')?.sourcePath).toBe('runtime-tools/threadSend.ts');
+        expect(target.toolSource('threadList')?.sourcePath).toBe('runtime-tools/threadList.tool.ts');
+        expect(target.toolSource('threadSend')?.sourcePath).toBe('runtime-tools/threadSend.tool.ts');
 
         const roster = (await target.executeTool('threadList', {})) as {
             threads: Array<{ id: string }>;

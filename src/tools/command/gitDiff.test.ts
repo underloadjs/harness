@@ -12,7 +12,7 @@ import { mkdir, mkdtemp, rm, writeFile as writeTextFile } from 'node:fs/promises
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
-import { gitDiff } from './gitDiff';
+import { gitDiff } from './gitDiff.tool';
 import { HarnessError } from '../../util';
 
 // Fixtures live under the repo-root Temp/ (five levels up from

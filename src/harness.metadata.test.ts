@@ -2,15 +2,17 @@
 // PUBLIC surface.
 //
 // These are the facts a model and an operator actually see: the toolRequest
-// schema (the R7 five-match cap and the `remaining` count), the toolCreate
-// security statement, the todoManage actions, the record tools' schemas and
-// partial-update contract, and the agentDelegate allowlist. The server describes
-// the same tools in its catalogue from `src/core/metadata.ts` - the copy these
-// registrations use - so pinning the registered text here also pins what a
-// descriptor advertises; `server/api.test.ts` asserts that projection end to end.
+// schema (names/regex/tags, uncapped selection, an optional per-query limit), the
+// toolList inventory contract, the toolManage operations, the toolCreate security
+// statement, the todoManage actions, the record tools' schemas and partial-update
+// contract, and the agentDelegate allowlist. The server describes the same tools
+// in its catalogue from `src/core/metadata.ts` - the copy these registrations use
+// - so pinning the registered text here also pins what a descriptor advertises;
+// `server/api.test.ts` asserts that projection end to end.
 //
-// T14: the wire names are toolRequest / toolCreate / todoManage / profileManage /
-// chapterManage / locationManage / agentManage / agentResult / agentDelegate.
+// T14: the wire names are toolRequest / toolList / toolManage / toolCreate /
+// todoManage / profileManage / chapterManage / locationManage / agentManage /
+// agentResult / agentDelegate.
 
 import { describe, expect, it } from 'vitest';
 import { agent, harness } from '@underload/harness';
@@ -22,12 +24,23 @@ const provider = { baseURL: 'http://provider.test/v1' };
 const solo = () => harness({ agents: { solo: agent({ model: 'test/model', provider }) } });
 
 describe('core tool metadata', () => {
-    it('advertises the five-match discovery cap and the remaining count', () => {
+    it('advertises names/regex/tags selection with only a per-query limit', () => {
         const writer = solo();
 
         expect(writer.tools.toolRequest.parameters).toEqual({
             type: 'object',
             properties: {
+                names: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description:
+                        'Exact wire names to enable, case-sensitive (e.g. ["fileList"]).'
+                },
+                regex: {
+                    type: 'string',
+                    description:
+                        'JavaScript regex tested against tool names; bare source or /source/flags.'
+                },
                 tags: {
                     type: 'array',
                     items: { type: 'string' },
@@ -36,22 +49,41 @@ describe('core tool metadata', () => {
                 limit: {
                     type: 'integer',
                     minimum: 1,
-                    maximum: 5,
                     description:
-                        'How many matches to enable: 1-5. Defaults to 5 (the maximum); a lower value gives a tighter shortlist.'
+                        "Optional per-query narrowing: return at most this many of THIS query's matches. It is not a global request cap."
                 }
             },
-            required: ['tags'],
+            required: [],
             additionalProperties: false
         });
 
-        // The model reads the description, not this file: the cap and `remaining`
-        // have to be stated there too.
+        // The model reads the description, not this file: uncapped selection, the
+        // host-configured enabled bound, and newest-request precedence have to be
+        // stated there too.
         expect(writer.tools.toolRequest.description).toBe(
-            'Find tools by capability tag and enable them, and check which tools you already have. The searchable catalogue holds the list, shell, git, syntax, time, text, notes, and other tools; the everyday file tools (fileRead, fileWrite, fileEdit, fileGlob) are already available, as is webSearch when the host configured it. Pass the tags you need (for example ["files", "list"] or ["shell"] or ["git", "diff"]) and up to 5 of the closest matches become available on your next turn. The result\'s "remaining" field counts any further tools that matched but were not listed, so add a more specific tag to drill into the rest. The "alreadyAvailable" list names the tools you can call directly right now without enabling anything - for example agentDelegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. Call this before concluding that something cannot be done.'
+            'Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example ["files", "list"], ["shell"], or ["git", "diff"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example agentDelegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.'
         );
         expect(writer.tools.toolRequest.tags).toEqual(['discovery', 'tools', 'catalogue']);
         expect(writer.tools.toolRequest.visibility).toBe('core');
+
+        expect(writer.tools.toolList.parameters).toEqual({
+            type: 'object',
+            properties: {},
+            required: [],
+            additionalProperties: false
+        });
+        expect(writer.tools.toolList.tags).toEqual([
+            'tools',
+            'list',
+            'catalogue',
+            'inventory'
+        ]);
+        expect((writer.tools.toolManage.parameters as any).properties.operation).toEqual({
+            type: 'string',
+            enum: ['list', 'details', 'source', 'path', 'create', 'update', 'reload'],
+            description: 'What to do.'
+        });
+        expect((writer.tools.toolManage.parameters as any).required).toEqual(['operation']);
     });
 
     it('keeps every core tool core and declares the toolCreate security statement', () => {
@@ -60,6 +92,8 @@ describe('core tool metadata', () => {
         expect(
             [
                 'toolRequest',
+                'toolList',
+                'toolManage',
                 'toolCreate',
                 'todoManage',
                 'profileManage',
@@ -68,7 +102,18 @@ describe('core tool metadata', () => {
                 'agentManage',
                 'agentResult'
             ].map((name) => writer.tools[name].visibility)
-        ).toEqual(['core', 'core', 'core', 'core', 'core', 'core', 'core', 'core']);
+        ).toEqual([
+            'core',
+            'core',
+            'core',
+            'core',
+            'core',
+            'core',
+            'core',
+            'core',
+            'core',
+            'core'
+        ]);
 
         expect(writer.tools.toolCreate.description).toBe(
             "Create a tool for yourself from JavaScript source. `source` is the BODY of an async function, for example `return args.toUpperCase();`: it receives `args` (the call arguments; a one-property schema passes the value itself) and `context` (agent, agents, run). Registering validates and compiles the source and enables the tool for your next turn, without running it. The body runs with this process's full permissions - there is no sandbox - so only create tools you are willing to run, and keep them small."

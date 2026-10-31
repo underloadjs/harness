@@ -36,7 +36,7 @@ import {
     FILE_READ_DEFAULT_MAX_LINES,
     FILE_READ_MAX_LINES,
     FILE_READ_MAX_TARGETS
-} from './fileRead';
+} from './fileRead.tool';
 
 // Repo-root Temp/ (six levels up from src/tools/files/: files -> tools -> src ->
 // harness -> underload -> packages -> repo root).

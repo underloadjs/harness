@@ -107,12 +107,16 @@ describe('descriptor extensions', () => {
         // adding delegate when the local team has a second member.
         expect(coreToolsOf(descriptor(), 2)).toEqual([
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'agentDelegate'
         ]);
         expect(coreToolsOf(descriptor(), 1)).toEqual([
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage'
         ]);

@@ -133,9 +133,12 @@
 //     describe a turn whose optimistic tile is still unbound (`claim`).
 
 import type {
+    DeleteThreadResult,
     HarnessEvent,
     HarnessUsage,
+    SessionSnapshot,
     SessionSteerRecord,
+    SessionThread,
     SessionTurn,
     SessionTurnStatus
 } from '../../server/protocol';
@@ -152,6 +155,12 @@ import { enhanceFileLinks } from './file-links';
 import { openFilePreview } from './file-preview';
 import type { FilePreviewReader } from './file-preview';
 import { openAttachmentDialog, enhanceImages, openImageDialog } from './preview';
+import {
+    closeThreadTranscript,
+    openThreadTranscript,
+    refreshOpenThreadTranscript
+} from './thread-transcript';
+import type { ThreadTranscriptRefresh } from './thread-transcript';
 import {
     actionAnswerEventOf,
     actionRequestEventOf,
@@ -278,6 +287,12 @@ export type TurnHandle = {
     // Number of `events` this tile has applied (live + recorded). Exposed for the
     // reconciliation tests and for callers that want to prove no double-apply.
     applied: () => number;
+    // The last authoritative `SessionTurn` record this tile merged (queued/running/
+    // terminal). Used ONLY as the standalone fallback for the JSON transcript when
+    // the embedding shell does not provide a full session snapshot; live event
+    // frames are not written back here, so the shell snapshot remains the richer
+    // source whenever it exists.
+    source: () => SessionTurn | undefined;
     // Render every pending incremental update immediately. Called when a turn
     // settles so the final text is never one frame behind the status.
     flush: () => void;
@@ -320,6 +335,9 @@ export type TurnHandle = {
     // persistent markers on its child rows (S2). Called when the roster arrives or
     // changes, so a tile and the strip always agree on the conversation's name.
     refreshThreadRoster: () => void;
+    // Re-evaluate the R7/R8 transcript/delete action bar: visible while THIS tile
+    // is the expanded surface and the roster names its thread.
+    syncTranscriptAction: () => void;
     // Does a nested invocation of THIS turn belong to `threadId`? (S2 tie-break for
     // the board's focus resolution.)
     knowsThread: (threadId: string) => boolean;
@@ -429,6 +447,17 @@ export type TurnBoardOptions = {
     // the composer's routing line from it; nothing is sent to the server until a
     // submit targets the focused thread (ui/threads.ts `resolveSubmitTarget`).
     onFocusChange?: (threadId: string | undefined) => void;
+    // R7 freshness: invoked ONCE on an explicit transcript open. The shell reads
+    // `getSession` (never per streamed event), applies it through its normal
+    // tombstone-guarded snapshot path, and returns the snapshot for that board. A
+    // rejected/undefined answer keeps the last applied snapshot visible; a snapshot
+    // for another session/thread is ignored by the transcript module.
+    refreshSessionSnapshot?: (sessionId: string) => Promise<SessionSnapshot | undefined>;
+    // R9 deletion transport. The board owns confirmation, dedupe, protection and
+    // feedback; the shell owns the existing DELETE API plus tombstone/snapshot
+    // reconciliation. Omitted in an embedding that does not expose thread delete:
+    // the control is rendered disabled rather than silently pretending to work.
+    deleteThread?: (sessionId: string, threadId: string) => Promise<DeleteThreadResult>;
 };
 
 export type TurnBoard = {
@@ -474,6 +503,11 @@ export type TurnBoard = {
     // tiles with the SAME canonical name/sequence as the strip (S6), to resolve a
     // child's persistent identity, and to render a roster-only child transcript.
     setThreads: (threads: readonly SessionThreadEntry[]) => void;
+    // Raw authoritative snapshot for THIS board (exact threads + turns + session
+    // fields, tombstone-filtered by the shell). Observed by the R7 JSON transcript
+    // and by delete protection; `setThreads` alone remains enough for every
+    // pre-R7 label/focus behaviour.
+    setSessionSnapshot: (snapshot: SessionSnapshot | undefined) => void;
     // Drop one tile without applying anything: used by the submit path when a
     // server answer describes a turn this browser already has (steering returns the
     // OWNING turn), so the optimistic steering row must not linger unbound.
@@ -931,6 +965,15 @@ type ThreadEntry = {
     prompt: HTMLElement | undefined;
     outcome: HTMLElement | undefined;
     childrenHost: HTMLElement | undefined;
+    // R7/R8: transcript + delete toolbar of an expanded child CONVERSATION.
+    // Undefined for a row-less root/inline section.
+    transcriptAction: HTMLElement | undefined;
+    transcriptButton: HTMLButtonElement | undefined;
+    // Repaint the shared toolbar from board state (expansion/roster/snapshot,
+    // protection, confirmation, in-flight). Removed from the board's sync set when
+    // the entry's projection is rebuilt.
+    syncActionBar: () => void;
+    disposeActionBar: () => void;
     expanded: boolean;
 };
 
@@ -980,6 +1023,64 @@ type PendingTool = {
     startedAt: number | undefined;
 };
 
+// Every thread id in `threadId`'s ownership subtree (the thread plus every
+// descendant linked through `ownerThreadId`). A seen-set terminates a corrupt or
+// cyclic roster chain instead of looping or attributing a sibling.
+export const threadSubtreeIdsOf = (
+    threadId: string,
+    threads: readonly SessionThreadEntry[]
+): Set<string> => {
+    const subtree = new Set<string>([threadId]);
+    const queue: string[] = [threadId];
+
+    while (queue.length > 0) {
+        const owner = queue.shift() as string;
+        for (const candidate of threads) {
+            if (candidate.ownerThreadId !== owner || subtree.has(candidate.id)) continue;
+
+            subtree.add(candidate.id);
+            queue.push(candidate.id);
+        }
+    }
+
+    return subtree;
+};
+
+// Why a thread's Delete control must not send a request:
+//   - 'default' — an `agent:<name>` conversation is not deletable at all (the
+//     server answers 400; use Reset session), so the control is hidden;
+//   - 'active'  — the thread (or any descendant it would cascade into) has a
+//     running/queued turn, or the roster itself says running. The server answers
+//     409; the UI disables the control until the work settles. It never auto-stops
+//     work on the user's behalf.
+// The server remains the authority; this is the same protection computed from the
+// last applied snapshot so a stale frame cannot enable a destructive request.
+export type ThreadDeleteProtection = 'default' | 'active';
+
+export const threadDeleteProtectionOf = (
+    entry: SessionThreadEntry,
+    threads: readonly SessionThreadEntry[],
+    turns: readonly SessionTurn[]
+): ThreadDeleteProtection | undefined => {
+    if (entry.origin === 'agent') return 'default';
+
+    if (entry.status === 'running') return 'active';
+
+    const doomed = threadSubtreeIdsOf(entry.id, threads);
+    for (const thread of threads) {
+        if (doomed.has(thread.id) && thread.status === 'running') return 'active';
+    }
+
+    for (const turn of turns) {
+        if (turn.status !== 'running' && turn.status !== 'queued') continue;
+
+        const threadId = turnThreadIdOf(turn);
+        if (threadId !== undefined && doomed.has(threadId)) return 'active';
+    }
+
+    return undefined;
+};
+
 export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const element = el('div', 'turns');
 
@@ -1012,6 +1113,377 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // Authoritative roster (S2/S6). Used for canonical labels, for resolving a
     // child invocation to its persistent id, and for a roster-only transcript.
     let roster: readonly SessionThreadEntry[] = [];
+    // The raw snapshot last applied by the shell. It is the R7 JSON source; the
+    // normalized roster above intentionally drops fields (references, raw
+    // messages) that a lossless transcript must keep.
+    let sessionSnapshot: SessionSnapshot | undefined;
+    // The session this board is bound to (N3 answer routing + transcript/delete
+    // provenance). Declared here because the transcript fallback and the delete
+    // transport both consult it.
+    let boundSession: string | undefined;
+    // Identity for this board's open transcript. Only this board's roster updates
+    // refresh it; another view with a coincidentally equal thread id cannot.
+    const transcriptScope = {};
+
+    // R9 destructive-action state. Confirmation is board state (not per tile) so a
+    // rebuilt tile cannot resurrect a stale confirm; in-flight ids dedupe a double
+    // pointer/confirm into exactly one request.
+    let confirmingThread: string | undefined;
+    // In-flight deletes are keyed by SESSION + THREAD. Thread ids are only unique
+    // per session, and a session switch may show the same id in the new roster; a
+    // late resolution of the old request must not clear the new session's dedupe.
+    const deletingRequests = new Set<string>();
+    let deleteRequestSequence = 0;
+    // One token per in-flight confirmed delete. A successful delete closes the
+    // transcript through the missing-roster path; that is expected, not a "thread
+    // vanished unexpectedly" error. A Set (not a boolean) keeps a stale request's
+    // finally from clearing the suppression owned by a newer request.
+    const activeDeleteSuppressions = new Set<number>();
+
+    const deletionKey = (sessionId: string, threadId: string): string =>
+        `${sessionId}\u0000${threadId}`;
+
+    const currentSessionId = (): string | undefined => sessionSnapshot?.id ?? boundSession;
+
+    const isDeleting = (threadId: string): boolean => {
+        const sessionId = currentSessionId();
+        return sessionId !== undefined && deletingRequests.has(deletionKey(sessionId, threadId));
+    };
+    // Every live action bar's sync callback. Expansion, roster, snapshot,
+    // confirmation and in-flight changes repaint all of them from one source.
+    const actionBarSyncs = new Set<() => void>();
+    const refreshActionBars = (): void => {
+        for (const sync of actionBarSyncs) sync();
+    };
+
+    // A roster entry for the target thread (labels/protection). The transcript
+    // action remains available even when a legacy roster omitted `messages`: the
+    // JSON document states the limitation instead of hiding recorded run history.
+    const transcriptEntryOf = (threadId: string | undefined): SessionThreadEntry | undefined => {
+        if (threadId === undefined || threadId.length === 0) return undefined;
+
+        return roster.find((candidate) => candidate.id === threadId);
+    };
+
+    // Raw `SessionThread` for a roster entry, used by the standalone fallback when
+    // the host does not provide a snapshot. The normalized entry keeps messages.
+    const rawThreadOf = (entry: SessionThreadEntry): SessionThread => ({
+        id: entry.id,
+        agent: entry.agent,
+        origin: entry.origin,
+        status: entry.status,
+        sequence: entry.sequence,
+        ...(entry.label === undefined ? {} : { label: entry.label }),
+        ...(entry.ownerThreadId === undefined ? {} : { ownerThreadId: entry.ownerThreadId }),
+        ...(entry.invocationId === undefined ? {} : { invocationId: entry.invocationId }),
+        ...(entry.originTurnId === undefined ? {} : { originTurnId: entry.originTurnId }),
+        ...(entry.originInvocationId === undefined
+            ? {}
+            : { originInvocationId: entry.originInvocationId }),
+        ...(entry.invocationIds === undefined ? {} : { invocationIds: [...entry.invocationIds] }),
+        messages: Array.isArray(entry.messages)
+            ? (entry.messages as unknown as SessionThread['messages'])
+            : []
+    });
+
+    // The newest source available to this board. The shell's raw snapshot wins; an
+    // embedder that only calls `setThreads` still gets a truthful roster/turn
+    // fallback (turns are the last records the tiles merged, and the document's
+    // limitations disclose that live frames are not folded in).
+    const transcriptSnapshotNow = (): SessionSnapshot | undefined => {
+        if (sessionSnapshot !== undefined) return sessionSnapshot;
+        if (roster.length === 0) return undefined;
+
+        const sourceTurns = turns
+            .map((turn) => turn.source())
+            .filter((turn): turn is SessionTurn => turn !== undefined);
+
+        return {
+            id: boundSession ?? '',
+            harness: '',
+            status: 'idle',
+            model: '',
+            createdAt: 0,
+            updatedAt: 0,
+            messages: [],
+            threads: roster.map(rawThreadOf),
+            turns: sourceTurns
+        };
+    };
+
+    // The raw turns this board currently knows, for delete protection when no full
+    // snapshot was wired.
+    const transcriptTurnsNow = (): readonly SessionTurn[] =>
+        sessionSnapshot?.turns ??
+        turns
+            .map((turn) => turn.source())
+            .filter((turn): turn is SessionTurn => turn !== undefined);
+
+    // Delete protection is recomputed from the freshest roster/turns the board
+    // holds. A missing entry is not deletable through this surface.
+    const deleteProtectionFor = (threadId: string): ThreadDeleteProtection | undefined => {
+        const entry = roster.find((candidate) => candidate.id === threadId);
+        if (entry === undefined) return 'default';
+
+        const protection = threadDeleteProtectionOf(entry, roster, transcriptTurnsNow());
+        if (protection !== undefined) return protection;
+
+        // Optimistic/local work the last snapshot cannot describe yet: a tile that
+        // is queued/waiting/streaming for this thread (or a descendant) is live.
+        const doomed = threadSubtreeIdsOf(threadId, roster);
+        for (const turn of turns) {
+            const turnThread = turn.threadId();
+            if (turnThread === undefined || !doomed.has(turnThread)) continue;
+
+            const state = turn.state();
+            if (state === 'queued' || state === 'waiting' || state === 'streaming') return 'active';
+        }
+
+        return undefined;
+    };
+
+    // First click: open/close the inline confirmation. No request is sent.
+    const requestThreadDelete = (threadId: string): void => {
+        if (isDeleting(threadId)) return;
+
+        const entry = roster.find((candidate) => candidate.id === threadId);
+        if (entry === undefined || deleteProtectionFor(threadId) !== undefined) return;
+
+        confirmingThread = confirmingThread === threadId ? undefined : threadId;
+        refreshActionBars();
+    };
+
+    // Second click: exactly one DELETE. The shell callback owns the existing API
+    // and reconciles its returned snapshot/tombstones; this board only closes the
+    // surfaces that are provably gone and reports failure without dropping data.
+    const confirmThreadDelete = async (threadId: string): Promise<void> => {
+        const sessionId = currentSessionId();
+        if (sessionId !== undefined && isDeleting(threadId)) return;
+
+        const entry = roster.find((candidate) => candidate.id === threadId);
+        if (
+            entry === undefined ||
+            entry.origin === 'agent' ||
+            deleteProtectionFor(threadId) !== undefined ||
+            options.deleteThread === undefined ||
+            sessionId === undefined
+        ) {
+            confirmingThread = undefined;
+            refreshActionBars();
+            return;
+        }
+
+        // Capture the subtree BEFORE the request: once the shell reconciles its
+        // answer the roster no longer names it, but these are the ids whose focus/
+        // transcript the successful deletion must retire.
+        const doomed = threadSubtreeIdsOf(threadId, roster);
+        const originSession = sessionId;
+        const requestKey = deletionKey(originSession, threadId);
+        if (deletingRequests.has(requestKey)) return;
+
+        const suppressionToken = (deleteRequestSequence += 1);
+
+        confirmingThread = undefined;
+        deletingRequests.add(requestKey);
+        activeDeleteSuppressions.add(suppressionToken);
+        refreshActionBars();
+
+        try {
+            await options.deleteThread(sessionId, threadId);
+            if (boundSession !== originSession) return;
+
+            // The shell's applySnapshot normally closes/updates through setThreads;
+            // closing here keeps an embedding that only resolves its promise honest
+            // too. Focus/panel cleanup is idempotent.
+            closeThreadTranscript(transcriptScope, [...doomed]);
+            if (focusedThreadId !== undefined && doomed.has(focusedThreadId)) {
+                dropFocusState();
+                notifyFocus();
+            }
+            if (focusPanel !== undefined && doomed.has(focusPanel.dataset.threadId ?? '')) {
+                hideFocusPanel();
+            }
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            notice(`delete thread: ${message}`, 'error');
+            refreshActionBars();
+        } finally {
+            // Identity/token-scoped cleanup: a late answer from another session (or
+            // an earlier request) can only remove its OWN entry/suppression.
+            deletingRequests.delete(requestKey);
+            activeDeleteSuppressions.delete(suppressionToken);
+            refreshActionBars();
+        }
+    };
+
+    // One action bar shared by the expanded tile, every nested child card and the
+    // roster-only focus panel. It owns the R7 Transcript control (left) and the R9
+    // Delete control (right). Labels are desktop text, mobile glyphs; `aria-label`
+    // always carries the full accessible name.
+    type ThreadActionBar = {
+        element: HTMLElement;
+        transcriptButton: HTMLButtonElement;
+        deleteButton: HTMLButtonElement;
+        sync: () => void;
+        dispose: () => void;
+    };
+
+    const createThreadActionBar = (input: {
+        className: string;
+        transcriptClass?: string;
+        visible: () => boolean;
+        target: () => string | undefined;
+        open: () => void;
+    }): ThreadActionBar => {
+        const bar = el('div', input.className);
+        bar.hidden = true;
+
+        const transcriptButton = el('button', 'transcript-open action-transcript');
+        transcriptButton.type = 'button';
+        if (input.transcriptClass !== undefined) {
+            transcriptButton.classList.add(input.transcriptClass);
+        }
+        const transcriptLabel = el('span', 'action-label', 'Transcript');
+        const transcriptGlyph = el('span', 'action-glyph', '{}');
+        transcriptButton.append(transcriptLabel, transcriptGlyph);
+        transcriptButton.addEventListener('click', input.open);
+
+        const deleteButton = el('button', 'thread-delete');
+        deleteButton.type = 'button';
+        const deleteLabel = el('span', 'action-label', 'Delete');
+        const deleteGlyph = el('span', 'action-glyph', 'X');
+        deleteButton.append(deleteLabel, deleteGlyph);
+        deleteButton.addEventListener('click', () => {
+            const threadId = input.target();
+            if (threadId !== undefined) requestThreadDelete(threadId);
+        });
+
+        const confirm = el('div', 'thread-delete-confirm');
+        confirm.hidden = true;
+        confirm.setAttribute('role', 'group');
+        const confirmText = el('p', 'thread-delete-confirm-text');
+        const confirmTextBody = el('span', 'thread-delete-confirm-body');
+        confirmText.append(confirmTextBody);
+        const confirmDelete = el('button', 'thread-delete-confirm-delete');
+        confirmDelete.type = 'button';
+        const confirmCancel = el('button', 'thread-delete-confirm-cancel', 'Cancel');
+        confirmCancel.type = 'button';
+        confirm.append(confirmText, confirmDelete, confirmCancel);
+        confirmCancel.addEventListener('click', () => {
+            confirmingThread = undefined;
+            refreshActionBars();
+        });
+        confirmDelete.addEventListener('click', () => {
+            const threadId = input.target();
+            if (threadId !== undefined) void confirmThreadDelete(threadId);
+        });
+
+        bar.append(transcriptButton, deleteButton, confirm);
+
+        const sync = (): void => {
+            const threadId = input.target();
+            const entry = threadId === undefined ? undefined : transcriptEntryOf(threadId);
+            if (threadId === undefined || entry === undefined || !input.visible()) {
+                bar.hidden = true;
+                return;
+            }
+
+            bar.hidden = false;
+            const name = threadNameOf(entry);
+            const transcriptBusy = isDeleting(threadId);
+
+            transcriptButton.setAttribute('aria-label', `Open the JSON transcript of ${name}`);
+            transcriptButton.title = `Open the complete JSON transcript of ${name}`;
+            transcriptButton.disabled = transcriptBusy;
+
+            const protection = deleteProtectionFor(threadId);
+            const confirmationOpen =
+                confirmingThread === threadId && protection === undefined && !transcriptBusy;
+
+            // The agent's default conversation is never deletable (Reset session
+            // clears it); a live/queued thread is temporarily protected. Both keep
+            // the toolbar honest instead of sending a request the server refuses.
+            deleteButton.hidden = protection === 'default';
+            deleteButton.disabled =
+                protection !== undefined ||
+                transcriptBusy ||
+                options.deleteThread === undefined;
+            deleteButton.setAttribute('aria-label', `Delete thread ${name}`);
+            deleteButton.title =
+                protection === 'active'
+                    ? 'Stop the active or queued work in this thread before deleting it.'
+                    : protection === 'default'
+                      ? 'The default agent conversation cannot be deleted; reset the session instead.'
+                      : transcriptBusy
+                        ? 'Deleting this thread...'
+                        : options.deleteThread === undefined
+                          ? 'Thread deletion is not wired in this host.'
+                          : 'Delete this thread permanently';
+
+            confirm.hidden = !confirmationOpen;
+            if (confirmationOpen) {
+                const description = `Delete thread ${name} permanently? Its turns and transcript are removed.`;
+                confirm.setAttribute('aria-label', `Confirm deleting thread ${name}`);
+                confirmTextBody.textContent = description;
+                confirmDelete.textContent = 'Delete thread';
+                confirmDelete.disabled = transcriptBusy;
+            }
+        };
+
+        actionBarSyncs.add(sync);
+        return {
+            element: bar,
+            transcriptButton,
+            deleteButton,
+            sync,
+            dispose: () => {
+                actionBarSyncs.delete(sync);
+            }
+        };
+    };
+
+    const notifyTranscriptRefresh = (result: ThreadTranscriptRefresh): void => {
+        if (result !== 'closed' || activeDeleteSuppressions.size > 0) return;
+
+        notice('Thread transcript closed: this thread no longer exists.', 'error');
+    };
+
+    // Open the JSON transcript for one persistent thread. The click is the only
+    // trigger; the initial document comes from the latest applied snapshot and a
+    // shell-provided single `getSession` refresh runs in the background.
+    const openTranscriptOf = (threadId: string | undefined): void => {
+        const entry = transcriptEntryOf(threadId);
+        const source = transcriptSnapshotNow();
+        if (threadId === undefined || entry === undefined || source === undefined) return;
+
+        // The standalone fallback has no session id; bind the board's id so a later
+        // async refresh with the real snapshot is accepted as the SAME session.
+        const snapshot =
+            source.id.length > 0 || boundSession === undefined
+                ? source
+                : { ...source, id: boundSession };
+        const handle = openThreadTranscript(snapshot, threadId, transcriptScope);
+        if (handle === undefined) return;
+
+        const sessionId = snapshot.id.length > 0 ? snapshot.id : boundSession;
+        if (options.refreshSessionSnapshot === undefined || sessionId === undefined) return;
+
+        void options
+            .refreshSessionSnapshot(sessionId)
+            .then((fresh) => {
+                // Guard the READER's state, not just the request: closed dialog,
+                // another transcript, another board, or a session switch all make
+                // this answer stale. The transcript module also compares session id
+                // and the tracked handle identity.
+                if (fresh === undefined || fresh.id !== sessionId) return;
+
+                notifyTranscriptRefresh(refreshOpenThreadTranscript(fresh, transcriptScope));
+            })
+            .catch(() => {
+                // A failed freshness read is not a transcript error: the last
+                // applied snapshot is still truthful and remains on screen.
+            });
+    };
     // DURABLE invocation → persistent-thread cache (R3), BOARD-scoped so a session
     // switch can drop it (`bindSession`) instead of letting one session's invocation
     // ids resolve against another's roster. Each tile writes here from
@@ -1022,6 +1494,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const learnedThreads = new Map<string, string>();
     // The roster-only conversation surface (a runtime child with no turn of its own).
     let focusPanel: HTMLElement | undefined;
+    // The focus panel is rebuilt whenever focus changes; its toolbar must leave
+    // the board-wide sync set with the old DOM instead of refreshing detached nodes.
+    let focusActionDispose: (() => void) | undefined;
 
     // --- conversation projection (T12b, revised for the one-card rule) ---
     //
@@ -1282,6 +1757,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // Cards THIS focus opened automatically, so ending the focus closes only them
     // (a card the reader opened by hand is their own state, not ours to collapse).
     const openedCards: HTMLElement[] = [];
+    // R4/T6: the nested-card model behind each `.thread-row`. `openEnclosingCards`
+    // must update the SAME entry state as a click (`expanded`, tile class,
+    // `aria-expanded`, transcript action) without recording an automatic open as a
+    // user preference. `remember=false` is that distinction.
+    const threadRowSync = new WeakMap<HTMLElement, (expanded: boolean, remember?: boolean) => void>();
 
     // Open every NESTED card that contains this turn's row. A continuation routed
     // into a child card (see `placeTurn`) is only visible while that card is open, so
@@ -1294,11 +1774,22 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         while (host !== null) {
             if (!host.classList.contains('is-expanded') && !openedCards.includes(host)) openedCards.push(host);
 
-            host.classList.add('is-expanded');
-            host.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-select')?.setAttribute(
-                'aria-expanded',
-                'true'
-            );
+            // T6: drive the card's MODEL, not just its DOM. A directly-added class
+            // left `entry.expanded` false and its transcript action hidden, so an
+            // implicitly opened card looked expanded without offering its thread
+            // transcript. `remember=false` keeps the auto-open out of
+            // `expandedThreads`, so a projection rebuild does not turn it into a
+            // reader preference.
+            const applyExpanded = threadRowSync.get(host);
+            if (applyExpanded !== undefined) {
+                applyExpanded(true, false);
+            } else {
+                host.classList.add('is-expanded');
+                host.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-select')?.setAttribute(
+                    'aria-expanded',
+                    'true'
+                );
+            }
             // Continue from the card's ROW, not the card body: the next enclosing
             // card (a grandparent invocation) is an ancestor of the row.
             host = host.parentElement?.closest<HTMLElement>('.thread-row') ?? null;
@@ -1312,11 +1803,18 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // Cards opened only to reveal a focused exchange are closed with it; the tile
         // itself is a separate surface and is handled below.
         for (const card of openedCards.splice(0)) {
-            card.classList.remove('is-expanded');
-            card.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-select')?.setAttribute(
-                'aria-expanded',
-                'false'
-            );
+            // Mirror the open path: close the MODEL too, so the action hides and a
+            // later rebuild sees the card as collapsed.
+            const applyExpanded = threadRowSync.get(card);
+            if (applyExpanded !== undefined) {
+                applyExpanded(false, false);
+            } else {
+                card.classList.remove('is-expanded');
+                card.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-select')?.setAttribute(
+                    'aria-expanded',
+                    'false'
+                );
+            }
         }
 
         if (expandedTurn === undefined) return;
@@ -1325,6 +1823,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         expandedTurn.element
             .querySelector<HTMLButtonElement>('.tile-select')
             ?.setAttribute('aria-expanded', 'false');
+        // R4: the action belongs to the expanded surface only.
+        expandedTurn.syncTranscriptAction();
         // The whole CONVERSATION was open (all its exchanges), not just this tile.
         hostOfTurn(expandedTurn)?.classList.remove('is-expanded');
         expandedTurn = undefined;
@@ -1334,6 +1834,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // is what lets a child conversation (whose work is recorded INSIDE its parent's
     // turn and which has no `SessionTurn` of its own) be read and steered.
     const hideFocusPanel = (): void => {
+        focusActionDispose?.();
+        focusActionDispose = undefined;
         focusPanel?.remove();
         focusPanel = undefined;
     };
@@ -1364,6 +1866,18 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             );
         }
 
+        // R7/R8: a roster-only thread has no turn tile to expand, so this panel IS
+        // its expanded surface and gets the SAME toolbar: Transcript on the left,
+        // Delete on the right (default/running protection still applies).
+        const actionBar = createThreadActionBar({
+            className: 'thread-transcript-action thread-focus-actions',
+            transcriptClass: 'thread-focus-transcript',
+            visible: () => focusPanel !== undefined,
+            target: () => entry.id,
+            open: () => openTranscriptOf(entry.id)
+        });
+        focusActionDispose = actionBar.dispose;
+
         const transcript = el('div', 'thread-focus-messages');
         const messages = Array.isArray(entry.messages) ? entry.messages : [];
         if (messages.length === 0) {
@@ -1383,11 +1897,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             transcript.append(row);
         }
 
-        panel.append(head, transcript);
+        panel.append(head, actionBar.element, transcript);
         // First child of the board: the focused conversation reads at the top of the
         // transcript while the compact turn rows below stay navigable.
         element.prepend(panel);
         focusPanel = panel;
+        actionBar.sync();
         // A steer audit recorded by an active run must be reachable here when its
         // target has no visible invocation of its own.
         renderCrossSteers();
@@ -1471,10 +1986,6 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         hideFocusPanel();
         focusedThreadId = undefined;
     };
-    // N3 session binding for answer routing. Cards capture this value when created
-    // (see create/action handler), never read it at click time, so a switch cannot
-    // retarget an answer that was rendered for another conversation.
-    let boundSession: string | undefined;
     // Live cards across every tile, with the session they were rendered under. Used
     // by `bindSession` to expire a question the reader has navigated away from
     // instead of letting a stale answer reach the next conversation. `undefined`
@@ -1507,6 +2018,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
         turn.element.classList.add('is-expanded');
         turn.element.querySelector<HTMLButtonElement>('.tile-select')?.setAttribute('aria-expanded', 'true');
+        // R4: the newly expanded tile is the one surface that offers its complete
+        // thread transcript. The previous expansion hid its action in
+        // `detachTileExpansion`.
+        turn.syncTranscriptAction();
         // R3: a continuation routed into a nested child card lives inside that card's
         // body, so the card has to be open for the expanded exchange to be visible.
         openEnclosingCards(turn);
@@ -1730,7 +2245,19 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const flow = el('div', 'tile-flow');
         body.append(promptBlock, flow);
 
-        card.append(select, body);
+        // R7/R8: the expanded tile's toolbar. Transcript sits on the left and opens
+        // the lossless JSON document; Delete sits on the right for host threads that
+        // are not live/protected. It lives between the header and body so it is
+        // immediately visible without scrolling and disappears with expansion.
+        const actionBar = createThreadActionBar({
+            className: 'tile-transcript-action',
+            visible: () => expandedTurn?.element === card && card.classList.contains('is-expanded'),
+            target: () => runtimeThreadId,
+            open: () => openTranscriptOf(runtimeThreadId)
+        });
+        const transcriptAction = actionBar.element;
+
+        card.append(select, transcriptAction, body);
 
         // --- per-turn state ------------------------------------------------
         let state: TurnState = 'queued';
@@ -1769,6 +2296,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             tileAgent.hidden = duplicate || tileAgent.textContent === '';
         };
 
+        // R7/R8: repaint the shared toolbar. Visibility is board expansion state,
+        // so `expand`/`detachTileExpansion` and every roster/snapshot update call it.
+        const syncTranscriptAction = actionBar.sync;
+
         const paintThreadBadge = (): void => {
             if (runtimeThreadId === undefined) {
                 threadBadge.hidden = true;
@@ -1776,6 +2307,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 threadBadge.title = '';
                 delete card.dataset.threadId;
                 syncRootAgentVisibility();
+                syncTranscriptAction();
                 return;
             }
 
@@ -1785,6 +2317,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             threadBadge.title = threadTitleOf(runtimeThreadId, roster) ?? '';
             card.dataset.threadId = runtimeThreadId;
             syncRootAgentVisibility();
+            syncTranscriptAction();
         };
         // Set once the handle exists so a thread identity learned during `merge`
         // can move this tile into its conversation container (T12b). Before then
@@ -1826,6 +2359,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             if (placedTurn !== undefined) placeTurn(placedTurn);
         };
         setThreadId(undefined);
+        // The last authoritative record merged into this tile. The JSON transcript
+        // fallback uses it when the shell did not provide a full session snapshot.
+        let sourceTurn: SessionTurn | undefined;
         // How many of the server turn's `events` this tile has applied. Live
         // frames and replayed records both count, so `merge()` can skip the
         // prefix it already rendered instead of appending it twice.
@@ -2168,16 +2704,28 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // opening one child never closes another. The class is mirrored onto the
         // nested tile as well, so the shared `:is(.tile, .thread-tile)` CSS can key
         // the expanded frame off one selector for both block owners (R3).
-        const setThreadExpanded = (entry: ThreadEntry, expanded: boolean): void => {
+        // R7/R8: the nested child card shows its Transcript/Delete toolbar only
+        // while expanded and joined to a persistent roster entry. A pure invocation
+        // detail (no persistent thread) stays honest: no action.
+        const syncThreadTranscriptAction = (entry: ThreadEntry): void => {
+            entry.syncActionBar();
+        };
+
+        const setThreadExpanded = (entry: ThreadEntry, expanded: boolean, remember = true): void => {
             if (entry.row === undefined) return;
 
             entry.expanded = expanded;
             entry.row.classList.toggle('is-expanded', expanded);
             entry.tile?.classList.toggle('is-expanded', expanded);
             entry.select?.setAttribute('aria-expanded', String(expanded));
+            syncThreadTranscriptAction(entry);
 
             // Remember the reader's choice by canonical key so a projection rebuild
             // can restore it (the entry objects are recreated, the keys are stable).
+            // An IMPLICIT open (`openEnclosingCards`) passes remember=false: it is a
+            // temporary reveal of the focused exchange, closed by `detachTileExpansion`
+            // and never re-opened as if the reader had chosen it.
+            if (!remember) return;
             if (expanded) expandedThreads.add(entry.key);
             else expandedThreads.delete(entry.key);
         };
@@ -2307,6 +2855,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 if (persistent === undefined) {
                     delete entry.row.dataset.persistentThread;
                     entry.row.classList.remove('is-persistent-focused');
+                    syncThreadTranscriptAction(entry);
                     continue;
                 }
 
@@ -2315,6 +2864,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 entry.row.title = match === undefined ? `Thread ${persistent}` : `${threadNameOf(match)} · ${match.agent}`;
                 // S6/R8: the row's own header names the child CONVERSATION.
                 if (match !== undefined) paintEntryLabel(entry, threadNameOf(match));
+                syncThreadTranscriptAction(entry);
             }
 
             paintRootLabel();
@@ -2668,7 +3218,20 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             outcome.hidden = true;
             body.append(outcome);
 
-            tile.append(select, body);
+            // R7/R8: a delegated/forked child conversation has no SessionTurn of its
+            // own, so its JSON transcript comes from the roster entry joined to this
+            // invocation. The toolbar is hidden until the entry is expanded; a pure
+            // invocation detail (no persistent thread) never shows an action.
+            const actionBar = createThreadActionBar({
+                className: 'thread-transcript-action',
+                visible: () => entry.expanded && entry.row !== undefined,
+                target: () => persistentIdOf(entry),
+                open: () => openTranscriptOf(persistentIdOf(entry))
+            });
+            const transcriptAction = actionBar.element;
+            const transcriptButton = actionBar.transcriptButton;
+
+            tile.append(select, transcriptAction, body);
 
             // Children live outside the body so collapsing THIS entry never hides
             // its descendants (R2).
@@ -2702,8 +3265,19 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 prompt: undefined,
                 outcome,
                 childrenHost,
+                transcriptAction,
+                transcriptButton,
+                syncActionBar: actionBar.sync,
+                disposeActionBar: actionBar.dispose,
                 expanded: false
             };
+
+            // T6: expose the SAME state transition to the board's implicit
+            // `openEnclosingCards` pass, so an auto-opened card updates
+            // `entry.expanded`, ARIA and the transcript action exactly like a click.
+            threadRowSync.set(threadRow, (expanded, remember = true) => {
+                setThreadExpanded(entry, expanded, remember);
+            });
 
             // S2: clicking a child that maps to a PERSISTENT conversation focuses
             // that conversation (the composer then targets the child's true id), not
@@ -2775,6 +3349,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             syncRootAgentVisibility();
             threads.set(ROOT_KEY, {
                 key: ROOT_KEY,
+                // Root/inline sections have no row toolbar of their own; the tile's
+                // action bar is created by `create` and owns Transcript/Delete.
+                syncActionBar: () => undefined,
+                disposeActionBar: () => undefined,
                 agent: agentName,
                 label,
                 input: undefined,
@@ -2799,6 +3377,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 prompt: undefined,
                 outcome: undefined,
                 childrenHost: undefined,
+                transcriptAction: undefined,
+                transcriptButton: undefined,
                 expanded: false
             });
 
@@ -2829,6 +3409,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             threads.set(key, {
                 key,
                 agent: agentName,
+                // A flat legacy section has no row header/action surface.
+                syncActionBar: () => undefined,
+                disposeActionBar: () => undefined,
                 label,
                 input: undefined,
                 callId: undefined,
@@ -2852,6 +3435,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 prompt: undefined,
                 outcome: undefined,
                 childrenHost: undefined,
+                transcriptAction: undefined,
+                transcriptButton: undefined,
                 expanded: false
             });
 
@@ -3523,6 +4108,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // prefix matches and only the remainder is appended.
         const resetProjection = (): void => {
             for (const entry of threads.values()) {
+                // The entry's action bar DOM is about to be discarded; remove its
+                // board-wide sync callback with it instead of refreshing detached
+                // controls after every later roster/snapshot change.
+                entry.disposeActionBar();
                 if (entry.section.text !== undefined) cancel(entry.section.text);
                 for (const tool of entry.section.tools) tool.destroy();
                 // Stop the nested clock too: the rebuilt projection creates new
@@ -3981,6 +4570,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             }
             if (stamp !== undefined) recordAt = stamp;
             recordStatus = source.status;
+            // Keep the raw record for the standalone JSON fallback; live event
+            // frames are not written back here on purpose (the shell snapshot is
+            // the richer source while it exists).
+            sourceTurn = source;
 
             bind(source);
             // Adopt the record's persistent thread identity AND its conversation
@@ -4133,6 +4726,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             forgetRemovedThreads();
             paintThreadBadge();
             paintPersistentMarkers();
+            syncTranscriptAction();
             // T12b/T12d: a steer addressed to a child may have arrived before its
             // invocation entry was known (or lives in another turn); render it now
             // in the TARGET conversation/panel.
@@ -4153,10 +4747,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             apply,
             merge,
             applied: () => appliedCount,
+            source: () => sourceTurn,
             flush,
             id: () => serverId,
             threadId: () => runtimeThreadId,
             refreshThreadRoster,
+            syncTranscriptAction,
             knowsThread,
             focusChildThread,
             clearThreadFocus,
@@ -4210,6 +4806,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             turn.element.parentElement?.remove();
         }
         turns.length = 0;
+        // R7/R8: action bars are owned by the tile/panel DOM that was just removed.
+        // Drop their sync callbacks with it; `hideFocusPanel` below disposes the
+        // focus panel's own closure before this set is cleared again.
+        actionBarSyncs.clear();
         // F2: the focus-owned expansion list must not outlive the rows. `clear` is the
         // one teardown that does NOT run `detachTileExpansion`, so without this the
         // array kept references to the cards it had opened (detached nodes for the
@@ -4233,6 +4833,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         expandedTurn = undefined;
         hideFocusPanel();
         focusedThreadId = undefined;
+        // A confirm/in-flight delete belongs to the projection being torn down.
+        confirmingThread = undefined;
+        deletingRequests.clear();
+        activeDeleteSuppressions.clear();
         // A cleared board is a NEW conversation surface: the next content may be
         // auto-opened (`reconcile` first-content rule). The explicit "no focus" flag
         // is reset with the session, not inherited across it.
@@ -4514,6 +5118,20 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // else stays an invocation-only card instead of pointing at a foreign thread.
         if (boundSession !== undefined) learnedThreads.clear();
 
+        // A transcript/confirmation from the conversation being left cannot be
+        // updated or acted on here. The raw snapshot belonged to the old session;
+        // the shell will install the new one through `setSessionSnapshot`.
+        if (boundSession !== undefined) {
+            closeThreadTranscript(transcriptScope);
+            sessionSnapshot = undefined;
+            confirmingThread = undefined;
+            // In-flight deletes belong to the session being left. A late resolution
+            // removes only its own composite key/token, so the new binding's state
+            // cannot be cleared by the old request.
+            deletingRequests.clear();
+            activeDeleteSuppressions.clear();
+        }
+
         for (const record of answerCards.values()) {
             if (record.session === undefined) {
                 record.session = sessionId;
@@ -4534,6 +5152,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // which is what keeps a late/stale roster from re-opening a deleted conversation.
     const setThreads = (entries: readonly SessionThreadEntry[]): void => {
         roster = [...entries];
+
+        // R7 snapshot semantics: an open transcript is a snapshot of the latest
+        // applied authority. Every snapshot frame already calls this method, so
+        // update the dialog and its Copy payload in place. If the raw snapshot no
+        // longer names the thread, the dialog CLOSES rather than keeping stale
+        // content under a thread identity the server just removed.
+        const transcriptSnapshot = transcriptSnapshotNow();
+        if (transcriptSnapshot !== undefined) {
+            notifyTranscriptRefresh(refreshOpenThreadTranscript(transcriptSnapshot, transcriptScope));
+        }
+        refreshActionBars();
 
         // A roster can reveal that a thread is a CHILD of another (ownerThreadId) and
         // can JOIN an invocation entry to its persistent id — including a HISTORICAL
@@ -4561,6 +5190,21 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         }
     };
 
+    // Install the raw authority used by the JSON transcript and delete protection.
+    // Kept separate from `setThreads` so every pre-R7 embedding keeps working with
+    // the roster-only fallback and the exact raw shape lives in ONE place.
+    const setSessionSnapshot = (snapshot: SessionSnapshot | undefined): void => {
+        sessionSnapshot = snapshot;
+
+        if (snapshot === undefined) {
+            // Session teardown: no snapshot, no transcript surface.
+            closeThreadTranscript(transcriptScope);
+        } else {
+            notifyTranscriptRefresh(refreshOpenThreadTranscript(snapshot, transcriptScope));
+        }
+        refreshActionBars();
+    };
+
     return {
         element,
         bindSession,
@@ -4574,6 +5218,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         focusedThread: () => focusedThreadId,
         focusThread,
         setThreads,
+        setSessionSnapshot,
         discard,
         find,
         claim,

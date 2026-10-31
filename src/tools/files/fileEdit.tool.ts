@@ -45,17 +45,28 @@
 // The one exception: oldString and newString that differ ONLY in carriage returns
 // ask to change the line endings themselves, so that edit applies to exact bytes.
 //
+// SEVERAL HUNKS PER FILE (T20)
+// ----------------------------
+// Entries are applied in REQUEST ORDER, and a later entry naming the same file is
+// matched against the text the previous one produced, so one call can change
+// several places in one file instead of forcing a whole-file rewrite. Entries are
+// grouped by FILE IDENTITY (./identity.ts), so on Windows two case spellings of
+// one file — or a symlink alias — are one file with a defined order rather than
+// two writes where the last would silently win.
+//
 // PREFLIGHT — ALL-OR-NOTHING (this is what makes batching safe)
 // ------------------------------------------------------------
 // Before the first byte is written, EVERY edit is validated (shape, non-empty
-// oldString, distinct oldString/newString, no NUL, UNIQUE target file) and EVERY
-// file is read, match-checked, and fully computed. A failure anywhere — including
-// on the last entry — therefore leaves every file untouched, which is why the
-// batch can be trusted. Duplicate targets are rejected rather than merged: two
-// edits to one file would both be computed from the same original text, so the
-// second write would silently discard the first. Uniqueness is by FILE IDENTITY
-// (./identity.ts), so on Windows two case spellings of one file — or a symlink
-// alias — are caught as well.
+// oldString, distinct oldString/newString, no NUL) and EVERY file is read,
+// match-checked, and fully computed — a failure anywhere, including on the last
+// entry, therefore leaves every file untouched, which is why the batch can be
+// trusted. Each file is then written exactly ONCE with its final text.
+//
+// The result reports, per entry, HOW the oldString matched: exact byte-for-byte
+// (nothing extra in the result), or one of the two fallback tiers, which is named
+// in `match`. A model that retyped a quote instead of copying it still gets its
+// edit, but it is told the match was not byte-exact, so the difference is visible
+// instead of silent.
 //
 // FAILURE SEMANTICS (honest, not transactional)
 // ---------------------------------------------
@@ -70,14 +81,15 @@
 //
 //     await fileEdit([{ path: 'notes.md', oldString: '# Notes', newString: '# Log' }]);
 //
-// Metadata comes from ../catalogue so the description a model reads cannot drift
-// from the tool that runs (see the note at the top of ../catalogue.ts).
+// Metadata (name, description, tags, schema) is declared below and is authoritative
+// for T13. ../catalogue projects the same data synchronously for lazy enumeration
+// and a consistency test proves the projection equal.
 
-import { readFile as readTextFile, writeFile as writeTextFile } from 'node:fs/promises';
+import { readFile, writeFile as writeTextFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
-import { PRESET_TOOLS } from '../catalogue';
+import type { PresetToolMetadata } from '../catalogue';
 import { fileIdentity } from './identity';
 
 // One replacement to apply.
@@ -99,11 +111,21 @@ export type FileEditParameters = FileEditEntry[];
 export type FileEditResultEntry = {
     // The absolute path that was edited.
     path: string;
-    // How many occurrences were replaced (1 unless replaceAll matched more).
+    // How many occurrences this entry replaced (1 unless replaceAll matched more).
     replacements: number;
-    // Size of the resulting UTF-8 payload, in bytes.
+    // Size of the file's UTF-8 payload after this call, in bytes. Entries that
+    // share a file report the same final size, because a file is written once.
     bytes: number;
+    // HOW oldString matched. Omitted when the match was byte-exact, which is the
+    // normal case; present when a fallback tier had to be used, so a model learns
+    // that it retyped a quote or trailing whitespace instead of copying it. The
+    // edit still applied - the file now holds newString.
+    match?: FileEditMatch;
 };
+
+// The matching tier that produced an edit: typographic folding, or whole-line
+// matching that ignored trailing whitespace. An exact byte match reports nothing.
+export type FileEditMatch = 'typographic' | 'trailing-whitespace';
 
 // The ordered result: one entry per requested edit, never a subset.
 export type FileEditResult = FileEditResultEntry[];
@@ -259,6 +281,12 @@ const withRegionEndings = (region: string, replacement: string, fallback: string
         .join('');
 };
 
+// 1-based line numbers of each match start, so an ambiguity error can say WHERE
+// the candidates are instead of only how many. Cheap: the text is already in
+// memory, and only the newlines before each start are counted.
+const lineNumbers = (content: string, matches: Match[]): number[] =>
+    matches.map((match) => content.slice(0, match.start).split('\n').length);
+
 // Number of sorted positions strictly before `offset`.
 const countBefore = (positions: number[], offset: number): number => {
     let low = 0;
@@ -276,12 +304,13 @@ const countBefore = (positions: number[], offset: number): number => {
 // Match against the LF view, then map offsets back to the source, so CRLF and
 // mixed line endings neither block matches nor leak into untouched regions. The
 // fallback tiers only run when the tier above found NOTHING, so an exact match is
-// never displaced by a looser one.
+// never displaced by a looser one. `tier` names the tier that produced the match,
+// so the result can report that a fallback was used; undefined means exact bytes.
 const matchView = (
     source: string,
     oldString: string,
     newString: string
-): { matches: Match[]; replace: (match: Match) => string } => {
+): { matches: Match[]; tier?: FileEditMatch; replace: (match: Match) => string } => {
     // split/join, not replaceAll: the declared `lib` predates ES2021.
     const view = source.split('\r\n').join('\n');
     // View offset of every CRLF; adding the count strictly before an offset maps
@@ -298,12 +327,15 @@ const matchView = (
         exact.length > 0 || unicode.length > 0 ? [] : findLineOccurrences(view, search);
 
     const found = exact.length > 0 ? exact : unicode.length > 0 ? unicode : trailing;
+    const tier: FileEditMatch | undefined =
+        exact.length > 0 ? undefined : unicode.length > 0 ? 'typographic' : 'trailing-whitespace';
 
     return {
         matches: found.map((match) => ({
             start: match.start + countBefore(removed, match.start),
             end: match.end + countBefore(removed, match.end)
         })),
+        tier,
         replace: (match: Match) => {
             const region = source.slice(match.start, match.end);
             return withRegionEndings(region, replacement, lineEnding(region, fileEnding));
@@ -314,25 +346,36 @@ const matchView = (
 // A validated edit whose target has been resolved: what the read/match pass needs.
 type NormalizedEdit = {
     target: string;
+    // Canonical file identity (./identity.ts), so two spellings of one file group
+    // together and are written once.
+    identity: string;
     oldString: string;
     newString: string;
     replaceAll: boolean;
 };
 
-// A validated, match-checked edit: everything the write phase needs. The full
-// updated text is computed during the preflight, so the write phase never
-// re-reads or re-matches.
+// A validated, match-checked edit: what the write phase needs. The text is
+// computed during the preflight, so the write phase never re-reads or re-matches.
 type PreparedEdit = {
     target: string;
-    updated: string;
+    identity: string;
     replacements: number;
+    match?: FileEditMatch;
 };
 
-// Validate the shape of every entry, resolve every target, and reject duplicates.
-// Kept separate from the read/match pass so shape errors are reported before any
-// filesystem work at all. The duplicate check does read (`realpath`), because two
-// spellings of one existing file must collide on every platform — see
-// ./identity.ts for the rule and for why only win32 folds case.
+// One distinct file's final text. A file appears once however many entries named
+// it, because it is written once.
+type PreparedFile = {
+    target: string;
+    identity: string;
+    updated: string;
+};
+
+// Validate the shape of every entry and resolve every target. Kept separate from
+// the read/match pass so shape errors are reported before any filesystem work at
+// all. The identity lookup does read (`realpath`), because two spellings of one
+// existing file must group together on every platform — see ./identity.ts for the
+// rule and for why only win32 folds case.
 const normalizeEdits = async (edits: FileEditParameters): Promise<NormalizedEdit[]> => {
     if (!Array.isArray(edits)) {
         throw new HarnessError(
@@ -345,7 +388,6 @@ const normalizeEdits = async (edits: FileEditParameters): Promise<NormalizedEdit
     }
 
     const normalized: NormalizedEdit[] = [];
-    const seen = new Set<string>();
 
     for (const entry of edits) {
         if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
@@ -388,34 +430,47 @@ const normalizeEdits = async (edits: FileEditParameters): Promise<NormalizedEdit
 
         const target = resolve(path);
 
-        // Two edits to one file would both be computed from the same original text,
-        // so the second write would discard the first. Reject rather than guess.
-        // The message names the resolved path; the comparison uses the real file
-        // identity, so `a.txt`/`A.TXT` (Windows) and symlink aliases collide too.
+        // Group entries by REAL FILE IDENTITY (./identity.ts): `a.txt`/`A.TXT` on
+        // Windows, or a symlink alias, are one file with one write. Request order is
+        // preserved inside the group, so a later entry is matched against the text
+        // the earlier one produced — several hunks in one file in one call.
         const identity = await fileIdentity(target);
 
-        if (seen.has(identity)) {
-            throw new HarnessError(
-                `fileEdit received the same target path twice (${target}); make one edit per file per call.`
-            );
-        }
-
-        seen.add(identity);
-        normalized.push({ target, oldString, newString, replaceAll: replaceAll === true });
+        normalized.push({
+            target,
+            identity,
+            oldString,
+            newString,
+            replaceAll: replaceAll === true
+        });
     }
 
     return normalized;
 };
 
 // Read, match-check, and fully compute every edit. Nothing is written here, so a
-// failure on the last entry still leaves the first file untouched.
-const prepareEdits = async (edits: NormalizedEdit[]): Promise<PreparedEdit[]> => {
+// failure on the last entry still leaves the first file untouched. Each file is
+// read ONCE; its entries are applied in request order to the text the previous one
+// produced, so several hunks in one file need one call and one write.
+const prepareEdits = async (
+    edits: NormalizedEdit[]
+): Promise<{ prepared: PreparedEdit[]; files: PreparedFile[] }> => {
+    // Current text per file identity, filled on first use. Kept separate from the
+    // result array so a later entry sees the earlier entry's output.
+    const texts = new Map<string, { target: string; content: string }>();
     const prepared: PreparedEdit[] = [];
 
     for (const edit of edits) {
-        // A missing or unreadable file throws straight out of the read: editing is
-        // for existing files, and fileWrite is the tool that creates.
-        const content = await readTextFile(edit.target, 'utf8');
+        let state = texts.get(edit.identity);
+
+        if (state === undefined) {
+            // A missing, unreadable, or non-file target fails here, before anything
+            // is written. Editing is for existing files; fileWrite creates.
+            state = { target: edit.target, content: await readFile(edit.target, 'utf8') };
+            texts.set(edit.identity, state);
+        }
+
+        const content = state.content;
 
         // oldString and newString that differ ONLY in carriage returns ask to change
         // the file's line endings themselves, so that edit applies to the exact
@@ -424,8 +479,8 @@ const prepareEdits = async (edits: NormalizedEdit[]): Promise<PreparedEdit[]> =>
         const endingsOnly =
             edit.oldString.split('\r').join('') === edit.newString.split('\r').join('');
 
-        const { matches, replace } = endingsOnly
-            ? { matches: findOccurrences(content, edit.oldString), replace: () => edit.newString }
+        const { matches, replace, tier } = endingsOnly
+            ? { matches: findOccurrences(content, edit.oldString), replace: () => edit.newString, tier: undefined }
             : matchView(content, edit.oldString, edit.newString);
 
         if (matches.length === 0) {
@@ -435,8 +490,10 @@ const prepareEdits = async (edits: NormalizedEdit[]): Promise<PreparedEdit[]> =>
         }
 
         if (matches.length > 1 && !edit.replaceAll) {
+            // Naming the lines is what makes the failure actionable: a model can
+            // copy more surrounding text from a line it can actually locate.
             throw new HarnessError(
-                `fileEdit found ${matches.length} matches for oldString in ${edit.target}. Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
+                `fileEdit found ${matches.length} matches for oldString in ${edit.target} (lines ${lineNumbers(content, matches).join(', ')}). Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
             );
         }
 
@@ -460,41 +517,120 @@ const prepareEdits = async (edits: NormalizedEdit[]): Promise<PreparedEdit[]> =>
             );
         }
 
-        prepared.push({ target: edit.target, updated, replacements: chosen.length });
+        prepared.push({ target: edit.target, identity: edit.identity, replacements: chosen.length, match: tier });
+
+        // Feed the result back so the next entry for this file matches against it.
+        state.content = updated;
     }
 
-    return prepared;
+    // One write per distinct file, in first-appearance order.
+    const files: PreparedFile[] = [...texts.entries()].map(([identity, state]) => ({
+        target: state.target,
+        identity,
+        updated: state.content
+    }));
+
+    return { prepared, files };
+};
+
+// Authoritative registration/details for this preset (T13): the catalogue keeps
+// a synchronous data projection for lazy enumeration and a consistency test
+// asserts the two stay equal. Edit the metadata HERE.
+export const FILE_EDIT_METADATA: PresetToolMetadata = {
+    name: 'fileEdit',
+    description:
+        'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used ("typographic" or "trailing-whitespace"), so a fuzzy match is never silent. Creates nothing: use fileWrite for new files.',
+    tags: ['files', 'edit', 'write', 'replace', 'filesystem'],
+    // R18: editing files is core, so a model never spends a discovery round on it.
+    visibility: 'core',
+    parameters: {
+        type: 'object',
+        properties: {
+            edits: {
+                type: 'array',
+                items: {
+                    type: 'object',
+                    properties: {
+                        path: {
+                            type: 'string',
+                            description:
+                                'Path to an existing file, absolute or relative to the working directory.'
+                        },
+                        oldString: {
+                            type: 'string',
+                            description:
+                                'Exact text to replace. Must be unique unless replaceAll is true.'
+                        },
+                        newString: {
+                            type: 'string',
+                            description:
+                                'Replacement text. May be empty to delete the matched text.'
+                        },
+                        replaceAll: {
+                            type: 'boolean',
+                            description:
+                                'Replace every occurrence instead of requiring oldString to be unique. Defaults to false.'
+                        }
+                    },
+                    required: ['path', 'oldString', 'newString'],
+                    additionalProperties: false
+                },
+                description:
+                    'Edits to apply, in the order the results are returned. Several entries may name the same file; they are applied in array order.',
+            }
+        },
+        required: ['edits'],
+        additionalProperties: false
+    }
 };
 
 export const fileEdit = tool<FileEditParameters, FileEditResult>({
-    ...PRESET_TOOLS.fileEdit,
+    ...FILE_EDIT_METADATA,
     execute: async ({ parameters: edits }) => {
         const normalized = await normalizeEdits(edits);
-        const prepared = await prepareEdits(normalized);
-        const results: FileEditResultEntry[] = [];
+        // Everything below this line has been validated and matched; nothing has been
+        // written yet, so any throw above left every file untouched.
+        const { prepared, files } = await prepareEdits(normalized);
 
-        for (const edit of prepared) {
+        // Byte size per file IDENTITY, so entries sharing a file (including two
+        // spellings of one path) report the same final size rather than each other's
+        // intermediate text.
+        const sizes = new Map<string, number>();
+        const written: string[] = [];
+
+        for (const file of files) {
             try {
                 // No mkdir: the parent must already exist, because the file did.
-                await writeTextFile(edit.target, edit.updated, 'utf8');
+                await writeTextFile(file.target, file.updated, 'utf8');
             } catch (error) {
                 // Partial success is reported honestly: the completed paths are
                 // named, and there is no claim of a transaction or rollback.
-                const completed = results.length === 0 ? 'none' : results.map((entry) => entry.path).join(', ');
+                const completed = written.length === 0 ? 'none' : written.join(', ');
                 const reason = error instanceof Error ? error.message : String(error);
 
                 throw new HarnessError(
-                    `fileEdit failed on ${edit.target}: ${reason} Edits already applied: ${completed}. No rollback was performed.`
+                    `fileEdit failed on ${file.target}: ${reason} Edits already applied: ${completed}. No rollback was performed.`
                 );
             }
 
-            results.push({
-                path: edit.target,
-                replacements: edit.replacements,
-                bytes: Buffer.byteLength(edit.updated, 'utf8')
-            });
+            written.push(file.target);
+            sizes.set(file.identity, Buffer.byteLength(file.updated, 'utf8'));
         }
 
-        return results;
+        // One entry per requested edit, in request order: entries that share a file
+        // each report their own replacement count against that file's final size.
+        return prepared.map((edit) => {
+            const entry: FileEditResultEntry = {
+                path: edit.target,
+                replacements: edit.replacements,
+                bytes: sizes.get(edit.identity) ?? 0
+            };
+
+            // Only mention the tier when it was not exact, so the common case stays
+            // terse and a fuzzy match is never silent.
+            if (edit.match !== undefined) entry.match = edit.match;
+
+            return entry;
+        });
     }
 });

@@ -106,15 +106,16 @@
 //     await fileRead(['package.json']);
 //     await fileRead([{ path: 'README.md', startLine: 20, maxLines: 40 }]);
 //
-// Metadata (name, description, tags, schema) lives in ../catalogue so the preset
-// can be enumerated without importing this module — and so text can't drift.
+// Metadata (name, description, tags, schema) is declared below and is authoritative
+// for T13. ../catalogue projects the same data synchronously for lazy enumeration
+// and a consistency test proves the projection equal.
 
 import { open, stat } from 'node:fs/promises';
 import type { FileHandle } from 'node:fs/promises';
 import { resolve } from 'node:path';
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
-import { PRESET_TOOLS } from '../catalogue';
+import type { PresetToolMetadata } from '../catalogue';
 
 // Default and hard limits. These are exported so docs/tests can quote the same
 // numbers the implementation enforces (and so a host cannot quietly disagree).
@@ -569,10 +570,68 @@ const fileError = async (path: string, error: unknown): Promise<HarnessError> =>
     return new HarnessError(`fileRead failed to read "${path}": ${message}`);
 };
 
-// Metadata (name, description, tags, schema) lives in ../catalogue so the preset
-// can be enumerated without importing this module — and so text can't drift.
+// Authoritative registration/details for this preset (T13): the catalogue keeps
+// a synchronous data projection for lazy enumeration and a consistency test
+// asserts the two stay equal. Edit the metadata HERE.
+export const FILE_READ_METADATA: PresetToolMetadata = {
+    name: 'fileRead',
+    description:
+        'Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }. Defaults: startLine 1, startColumn 0, maxLines 200 (hard maximum 5000). `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. When an entry is truncated, request { path, startLine: nextLine, startColumn: nextColumn } to continue; nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. The whole batch shares a fixed 64 KiB UTF-8 CONTENT budget (not counting JSON escaping), split fairly between the requested files, and reading stops at that budget instead of loading huge files or lines wholesale. A call accepts at most 100 paths. A path that does not exist is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code: "ENOENT", message }`; it consumes no content budget and the other files are still read. Every other failure - an invalid request, a directory (use fileList or fileGlob for those), binary bytes (NUL or invalid UTF-8) encountered while streaming the file, or any other filesystem error - rejects the whole call, so a short answer never looks complete. Binary detection covers decoded chunks, not the whole file beyond the last chunk read. A window at a deep line rescans from the start to count lines. Paths are absolute or relative to the working directory.',
+    tags: ['files', 'read', 'filesystem'],
+    // R18: everyday file access is core — always declared, never discovered.
+    visibility: 'core',
+    parameters: {
+        type: 'object',
+        properties: {
+            paths: {
+                type: 'array',
+                maxItems: 100,
+                items: {
+                    oneOf: [
+                        { type: 'string' },
+                        {
+                            type: 'object',
+                            properties: {
+                                path: {
+                                    type: 'string',
+                                    description:
+                                        'File to read, absolute or relative to the working directory.'
+                                },
+                                startLine: {
+                                    type: 'integer',
+                                    minimum: 1,
+                                    description: '1-based first line to return. Defaults to 1.'
+                                },
+                                startColumn: {
+                                    type: 'integer',
+                                    minimum: 0,
+                                    description:
+                                        '0-based UTF-8 byte offset within startLine, for continuing a giant line. Defaults to 0.'
+                                },
+                                maxLines: {
+                                    type: 'integer',
+                                    minimum: 1,
+                                    maximum: 5000,
+                                    description:
+                                        'Maximum lines to return. Defaults to 200 and is capped at 5000.'
+                                }
+                            },
+                            required: ['path'],
+                            additionalProperties: false
+                        }
+                    ]
+                },
+                description:
+                    'Files to read, in the order the results are returned. A string reads a default window; an object selects a line/byte range.'
+            }
+        },
+        required: ['paths'],
+        additionalProperties: false
+    }
+};
+
 export const fileRead = tool<FileReadParameters, FileReadResult>({
-    ...PRESET_TOOLS.fileRead,
+    ...FILE_READ_METADATA,
     execute: async ({ parameters: paths }) => {
         const requested = normalizeTargets(paths);
 

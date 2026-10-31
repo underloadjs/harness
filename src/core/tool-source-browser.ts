@@ -12,7 +12,7 @@
 // --------------------------
 // A browser cannot compile a tool source revision in-process. The harness kernel
 // still publishes prebuilt tool definitions, but its startup sequence registers
-// the model-facing controls from editable source (`runtime-tools/*.ts`), so
+// the model-facing controls from editable source (`runtime-tools/*.tool.ts`), so
 // constructing a full harness in a browser rejects with the actionable error
 // below instead of pretending source registration worked. A browser host that
 // needs a harness must either run the kernel on Node or supply a prepared
@@ -25,6 +25,7 @@
 import { HarnessError } from '../util';
 import type {
     PreparedTool,
+    ToolFolderTarget,
     ToolRegistrationCandidate,
     ToolSourceRecord
 } from './tool-source';
@@ -37,6 +38,33 @@ export const supportsToolCompilation = false;
 // A stable placeholder: there is no package/source tree to inspect in a browser.
 export const TOOL_SOURCE_PACKAGE_ROOT = '';
 export const TOOL_SOURCE_ROOTS: readonly string[] = [];
+
+// The folder extension is pure data, so a browser can still describe the
+// convention even though it cannot scan or write a folder.
+export const TOOL_SOURCE_EXTENSION = '.tool.ts';
+
+const noFolderSupport = (): never => {
+    throw new HarnessError(
+        'toolFolders require the Node source compiler. The browser root exposes prebuilt tool definitions only; construct the harness on Node to scan or edit *.tool.ts folders.'
+    );
+};
+
+export const resolveToolFolders = (_folders: readonly string[]): string[] => noFolderSupport();
+export const discoverToolFolderSources = (_folders: readonly string[]): string[] =>
+    noFolderSupport();
+export const resolveToolFolderTarget = (
+    _path: string,
+    _folders: readonly string[],
+    _folder?: string
+): ToolFolderTarget => noFolderSupport();
+export const readToolSourceFile = (_path: string): string => noFolderSupport();
+export const writeToolSourceFile = (
+    _path: string,
+    _text: string,
+    _folders: readonly string[]
+): string => noFolderSupport();
+export const deleteToolSourceFile = (_path: string, _folders: readonly string[]): void =>
+    noFolderSupport();
 
 // Same exported name and signature as the Node compiler, so the aliased browser
 // graph links. Failure is a capability result, not a silent no-op.
@@ -72,6 +100,7 @@ export const cloneToolSourceRecord = (record: ToolSourceRecord): ToolSourceRecor
 
 export type {
     PreparedTool,
+    ToolFolderTarget,
     ToolRegistrationCandidate,
     ToolSourceDependency,
     ToolSourceLiveDependency,

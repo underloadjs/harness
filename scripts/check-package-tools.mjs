@@ -57,7 +57,7 @@
 //   - ./check-package-runtime.mjs — non-self-modifying package smoke
 //   - ../src/core/tool-source.ts — compiler and source-record contract
 //   - ../src/harness.ts          — registerTool/executeTool/callTool kernel
-//   - ../src/runtime-tools/toolRegistry.ts — ordinary registration tool
+//   - ../src/runtime-tools/toolRegistry.tool.ts — ordinary registration tool
 
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -93,25 +93,27 @@ const EXPECTED_CHECKS = ['transpile:syntax', 'load:module', 'contract:tool', 'sc
 // reports dynamically discovered files, so they are counted when they land without
 // this script inventing their final names.
 const RUNTIME_SOURCE_ENTRIES = [
-    'actionRequest.ts',
-    'agentDelegate.ts',
-    'agentManage.ts',
-    'agentResult.ts',
-    'chapterManage.ts',
-    'locationManage.ts',
-    'profileManage.ts',
-    'threadFork.ts',
-    'threadList.ts',
-    'threadSend.ts',
-    'todoManage.ts',
-    'toolCancel.ts',
-    'toolCreate.ts',
-    'toolRegistry.ts',
-    'toolRequest.ts',
-    'webFetch.ts',
-    'webSearch.ts'
+    'actionRequest.tool.ts',
+    'agentDelegate.tool.ts',
+    'agentManage.tool.ts',
+    'agentResult.tool.ts',
+    'chapterManage.tool.ts',
+    'locationManage.tool.ts',
+    'profileManage.tool.ts',
+    'threadFork.tool.ts',
+    'threadList.tool.ts',
+    'threadSend.tool.ts',
+    'todoManage.tool.ts',
+    'toolCancel.tool.ts',
+    'toolCreate.tool.ts',
+    'toolList.tool.ts',
+    'toolManage.tool.ts',
+    'toolRegistry.tool.ts',
+    'toolRequest.tool.ts',
+    'webFetch.tool.ts',
+    'webSearch.tool.ts'
 ];
-const WEB_SOURCE_ENTRIES = ['webFetch.ts', 'webSearch.ts'];
+const WEB_SOURCE_ENTRIES = ['webFetch.tool.ts', 'webSearch.tool.ts'];
 const APP_SOURCE_ENTRIES = [
     'diceRoll.ts',
     'noteSearch.ts',
@@ -125,28 +127,30 @@ const APP_SOURCE_ENTRIES = [
 // revisions, so this check inventories their files without claiming a startup
 // source record for them.
 const PRESET_SOURCE_ENTRIES = [
-    'tools/command/commandRun.ts',
-    'tools/command/gitDiff.ts',
-    'tools/files/fileEdit.ts',
-    'tools/files/fileGlob.ts',
-    'tools/files/fileList.ts',
-    'tools/files/fileRead.ts',
-    'tools/files/fileWrite.ts',
-    'tools/syntax/syntaxCheck.ts'
+    'tools/command/commandRun.tool.ts',
+    'tools/command/gitDiff.tool.ts',
+    'tools/files/fileEdit.tool.ts',
+    'tools/files/fileGlob.tool.ts',
+    'tools/files/fileList.tool.ts',
+    'tools/files/fileRead.tool.ts',
+    'tools/files/fileWrite.tool.ts',
+    'tools/syntax/syntaxCheck.tool.ts'
 ];
 // Runtime-tools entries that this no-subagent/no-interaction harness registers at
 // startup. Each must have a source record captured by the SAME operation runtime
 // registration uses.
 const STARTUP_SOURCE_ENTRIES = {
-    toolRegistry: 'runtime-tools/toolRegistry.ts',
-    toolRequest: 'runtime-tools/toolRequest.ts',
-    toolCreate: 'runtime-tools/toolCreate.ts',
-    todoManage: 'runtime-tools/todoManage.ts',
-    profileManage: 'runtime-tools/profileManage.ts',
-    chapterManage: 'runtime-tools/chapterManage.ts',
-    locationManage: 'runtime-tools/locationManage.ts',
-    agentManage: 'runtime-tools/agentManage.ts',
-    agentResult: 'runtime-tools/agentResult.ts'
+    toolRegistry: 'runtime-tools/toolRegistry.tool.ts',
+    toolRequest: 'runtime-tools/toolRequest.tool.ts',
+    toolList: 'runtime-tools/toolList.tool.ts',
+    toolManage: 'runtime-tools/toolManage.tool.ts',
+    toolCreate: 'runtime-tools/toolCreate.tool.ts',
+    todoManage: 'runtime-tools/todoManage.tool.ts',
+    profileManage: 'runtime-tools/profileManage.tool.ts',
+    chapterManage: 'runtime-tools/chapterManage.tool.ts',
+    locationManage: 'runtime-tools/locationManage.tool.ts',
+    agentManage: 'runtime-tools/agentManage.tool.ts',
+    agentResult: 'runtime-tools/agentResult.tool.ts'
 };
 
 const FIXTURE_ROOT = 'self-modify-fixture';
@@ -474,10 +478,10 @@ writeSource(REGISTRY_BROKEN_PATH, 'export const toolRegistry = (\n');
 
 await check('published shape ships editable src beside built dist', () => {
     const sourceEntry = path.join(copiedSourceRoot, 'index.ts');
-    const registrySourcePath = path.join(copiedSourceRoot, 'runtime-tools', 'toolRegistry.ts');
+    const registrySourcePath = path.join(copiedSourceRoot, 'runtime-tools', 'toolRegistry.tool.ts');
 
     assert.ok(existsSync(sourceEntry), 'copied src/index.ts is missing');
-    assert.ok(existsSync(registrySourcePath), 'copied src/runtime-tools/toolRegistry.ts is missing');
+    assert.ok(existsSync(registrySourcePath), 'copied src/runtime-tools/toolRegistry.tool.ts is missing');
     assert.ok(existsSync(copiedDistEntry), 'copied dist production entry is missing');
     assert.equal(path.dirname(copiedSourceRoot), path.dirname(path.join(packageRoot, BUILD_ROOT)));
 
@@ -610,7 +614,7 @@ await check('production harness exposes the self-modification API', () => {
 
     const registrySource = H.toolSource('toolRegistry');
     assert.ok(registrySource, 'toolRegistry has no captured source revision');
-    assert.equal(registrySource.sourcePath, 'runtime-tools/toolRegistry.ts');
+    assert.equal(registrySource.sourcePath, 'runtime-tools/toolRegistry.tool.ts');
     assert.deepEqual(registrySource.dependencies, []);
 
     return { tool: 'toolRegistry', source: registrySource.sourcePath };
@@ -720,7 +724,7 @@ await check('opt-in web source entries compile and keep source records', async (
     const installed = [];
 
     for (const file of WEB_SOURCE_ENTRIES) {
-        const name = file.replace(/\.ts$/, '');
+        const name = file.replace(/\.tool\.ts$/, '');
         const sourcePath = `runtime-tools/${file}`;
         const result = await H.executeTool('toolRegistry', { name, sourcePath });
 
@@ -1249,7 +1253,7 @@ await check('replacement registry V2 replaces itself with V3, then V3 registers 
     assert.ok(sources.some((source) => source.name === 'registryChildThree'));
 
     return {
-        registry: ['runtime-tools/toolRegistry.ts', REGISTRY_V2_PATH, REGISTRY_V3_PATH],
+        registry: ['runtime-tools/toolRegistry.tool.ts', REGISTRY_V2_PATH, REGISTRY_V3_PATH],
         children: ['registryChild', 'registryChildTwo', 'registryChildThree']
     };
 });

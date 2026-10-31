@@ -62,8 +62,9 @@ export const CORE_TOOL_SESSION_HINT =
 
 // Build the core entries: toolRegistry FIRST (it is the self-modifying runtime's
 // registration entry and the harness registers it before every other core tool),
-// then the eight always-registered harness tools from coreToolMetadata(), then the
-// CONDITIONAL harness-owned tools. `agentDelegate`, `actionRequest`, and
+// then the always-registered harness tools from coreToolMetadata() (including
+// toolRequest/toolList/toolManage), then the CONDITIONAL harness-owned tools.
+// `agentDelegate`, `actionRequest`, and
 // `threadFork` are always LISTED with generic metadata: the catalogue is
 // host-wide, while whether each is registered is a property of the selected
 // session's harness (subagents declared, an owner answerer configured, a fork

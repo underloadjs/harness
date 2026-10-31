@@ -51,14 +51,15 @@
 //
 //     await fileWrite([{ path: 'notes.md', content: '# Notes' }]);
 //
-// Metadata (name, description, tags, schema) lives in ../catalogue so the preset
-// can be enumerated without importing this module — and so text can't drift.
+// Metadata (name, description, tags, schema) is declared below and is authoritative
+// for T13. ../catalogue projects the same data synchronously for lazy enumeration
+// and a consistency test proves the projection equal.
 
 import { mkdir, writeFile as writeTextFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
-import { PRESET_TOOLS } from '../catalogue';
+import type { PresetToolMetadata } from '../catalogue';
 import { fileIdentity } from './identity';
 
 // One file to write.
@@ -165,10 +166,47 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
     return prepared;
 };
 
-// Metadata (name, description, tags, schema) lives in ../catalogue so the preset
-// can be enumerated without importing this module — and so text can't drift.
+// Authoritative registration/details for this preset (T13): the catalogue keeps
+// a synchronous data projection for lazy enumeration and a consistency test
+// asserts the two stay equal. Edit the metadata HERE.
+export const FILE_WRITE_METADATA: PresetToolMetadata = {
+    name: 'fileWrite',
+    description:
+        'Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. Every entry is validated before anything is written, and the same target path twice is rejected. A write error part-way through is reported with the paths already completed: there is no rollback.',
+    tags: ['files', 'write', 'filesystem'],
+    // R18: writing files is core, like the rest of the everyday file set.
+    visibility: 'core',
+    parameters: {
+        type: 'object',
+        properties: {
+            files: {
+                type: 'array',
+                items: {
+                    type: 'object',
+                    properties: {
+                        path: {
+                            type: 'string',
+                            description:
+                                'Path to the file, absolute or relative to the working directory.'
+                        },
+                        content: {
+                            type: 'string',
+                            description: 'Full text to write. Replaces the previous contents.'
+                        }
+                    },
+                    required: ['path', 'content'],
+                    additionalProperties: false
+                },
+                description: 'Files to write, in the order the results are returned.'
+            }
+        },
+        required: ['files'],
+        additionalProperties: false
+    }
+};
+
 export const fileWrite = tool<FileWriteParameters, FileWriteResult>({
-    ...PRESET_TOOLS.fileWrite,
+    ...FILE_WRITE_METADATA,
     execute: async ({ parameters: files }) => {
         const prepared = await prepareWrites(files);
         const written: FileWriteResultEntry[] = [];

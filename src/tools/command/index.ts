@@ -7,7 +7,7 @@
 // Both tools bound their output (./boundedText) and end runaway runs through
 // ./processTree: a timeout, or an AbortSignal on the ToolContext, terminates the
 // child process tree rather than leaving it holding the pipes.
-export { commandRun } from './commandRun';
-export type { CommandRunParameters, CommandRunResult } from './commandRun';
-export { gitDiff } from './gitDiff';
-export type { GitDiffParameters, GitDiffResult } from './gitDiff';
+export { commandRun } from './commandRun.tool';
+export type { CommandRunParameters, CommandRunResult } from './commandRun.tool';
+export { gitDiff } from './gitDiff.tool';
+export type { GitDiffParameters, GitDiffResult } from './gitDiff.tool';

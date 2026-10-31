@@ -41,12 +41,29 @@ import type {
 // renders the server's complete catalogue, core entries included. The constants are
 // kept (exported for callers that only need the historical names) but nothing in
 // the shell renders them.
-export const HARNESS_CORE_TOOL_NAMES = ['toolRequest', 'toolCreate', 'todoManage'] as const;
+//
+// T14 discovery upgrade: the wire inventory is toolRequest / toolList / toolManage /
+// toolCreate / todoManage (see src/runtime-tools/*.tool.ts and
+// src/harness.metadata.test.ts), so the fallback lists them in that order. A
+// pre-T14 server only ever declared the old three names; listing the new pair here
+// is what keeps an old payload's derived core set matching today's catalogue.
+export const HARNESS_CORE_TOOL_NAMES = [
+    'toolRequest',
+    'toolList',
+    'toolManage',
+    'toolCreate',
+    'todoManage'
+] as const;
 
 // One-line explanations for the historical core set. Retained as documentation
-// data; no UI location lists core tools any more (R21.2).
+// data; no UI location lists core tools any more (R21.2). The toolList/toolManage
+// lines summarize the canonical descriptions in src/runtime-tools/toolList.tool.ts
+// and src/runtime-tools/toolManage.tool.ts (that module is authoritative; these are
+// only the one-line form kept here for callers that render a hint).
 export const HARNESS_CORE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
     toolRequest: 'Find tools by capability tag and enable them for this chat.',
+    toolList: 'List every registered tool by name and description.',
+    toolManage: 'Inspect and edit registered tools: details, source, path, create, update, reload.',
     toolCreate: 'Add a small session-local tool when the catalogue cannot help.',
     todoManage: 'Keep a task list for the current work.',
     agentDelegate: 'Hand a self-contained task to one of this harness’s agents.',

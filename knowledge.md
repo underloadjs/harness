@@ -488,10 +488,10 @@ created with `presets: false`. **Four file tools are core (R18)** —
 request and need no discovery. `fileList`, `syntaxCheck`, `commandRun`, and
 `gitDiff` stay searchable: a model that needs a directory listing asks for
 `files`/`list`. A configured tool replaces a preloaded preset of the same name.
-The harness-owned toolRequest/toolCreate/todoManage/profileManage/chapterManage/
-locationManage/agentManage/agentResult (plus delegate for a primary with
-subagents) are core too, and a
-configured `webSearch` is core as well. `actionRequest` is core only when
+The harness-owned toolRequest/toolList/toolManage/toolCreate/todoManage/
+profileManage/chapterManage/locationManage/agentManage/agentResult (plus delegate
+for a primary with subagents) are core too, and a configured `webSearch` is core
+as well. `actionRequest` is core only when
 `interaction` is configured; `threadFork` is core when `forks.enabled` (the
 default). Both are registered as standalone definitions whose `execute` refuses a
 direct call, because the runtime handles them with the owning run.
@@ -511,40 +511,47 @@ reserved (`harness()` throws if the config or a preset already has `toolRequest`
 (when subagents exist) `agentDelegate` are reserved the same way, as are
 `actionRequest` and `threadFork` when their configuration registers them.
 
-- Signature: `toolRequest({ tags: string[], limit?: number })` — two properties, so
-  the single-property rule hands `execute` the parsed object. A bare array or a
-  missing `tags` is tolerated and treated as `[]`, so a malformed call still
-  returns the vocabulary. Name, description, tags, and schema live in
-  `core/metadata.ts` (one copy the server catalogue also reads); the description
-  itself states the five-match cap and the `remaining` count.
-- Result: `{ enabled, tools: [{ name, description, tags }], remaining,
-  unmatchedTags?, availableTags?, offset?, truncated?, alreadyAvailable? }`.
-  `enabled` doubles as the ranking order.
-- `searchTools(tools, tags, limit?, offset?, options?)` (`core/discovery.ts`) is
-  the pure ranking and is exported from the package root so a UI or a test can
-  reuse it. Only `visibility: 'searchable'` tools are candidates for ENABLING —
-  core tools are already declared.
+- Signature: `toolRequest({ names?: string[], regex?: string, tags?: string[],
+  limit?: number })`. The three query fields are OR-ed into one UNCAPPED union by
+  `selectTools` (`core/discovery.ts`); an exact name is case-sensitive, a regex may
+  be bare source or `/source/flags`, and tags keep the fuzzy ranking. A bare array
+  or a missing `tags` is tolerated as a legacy tags-only call. Name, description,
+  tags, and schema live in the tool's own `runtime-tools/toolRequest.tool.ts` entry;
+  `core/metadata.ts` is a data-free compatibility re-export the server catalogue
+  also reads. `limit` narrows only the current query; it is not a global request cap.
+- Result: `{ enabled, tools: [{ name, description, tags }], matched, omitted,
+  evicted?, unmatchedTags?, availableTags?, alreadyAvailable? }`.
+  `enabled`/`tools` are THIS call's matches admitted by `maxEnabledTools`
+  (default 32, core tools excluded), `matched` is the whole union, `omitted` is
+  the selected matches beyond the cap/limit, and `evicted` names prior enabled
+  tools displaced by this call. `enabled` doubles as the ranking order.
+- The harness owns the per-turn bound. Every selector kind switches the set:
+  this call's ordered matches lead (`maxEnabledTools` maximum), prior enabled
+  entries fill leftover capacity, overflow is reported as `omitted`, and displaced
+  prior names as `evicted`. `declared()`, tool authorization, `discoveredTools`,
+  and snapshot all read the same capped set, so a restored snapshot cannot exceed
+  the current configuration. Core tools are always declared and never count.
+- `selectTools(tools, query, options?)` is the pure uncapped selector; the legacy
+  `searchTools(tools, tags, limit?, offset?, options?)` remains for existing hosts.
+  Both are exported from the package root. Only `visibility: 'searchable'` tools are
+  candidates for ENABLING — core tools are already declared.
 - Scoring is **OR-style, best-match**: each query tag scores a tool (exact tag 4,
   tag prefix 3, tag contains query 2, query contains tag 2, name/description
   contains query 1), and the tool's rank is its **best single-tag score**. More
   matching tags only breaks ties (then name), so breadth can never outrank an
-  exact hit. Prefix needs two characters, fuzzy needs three.
-- `MAX_DISCOVERY_MATCHES = 5` (R7) is both the default and the hard cap: `limit`
-  may only narrow it (1–5). `remaining` is the number of matches the cap excluded —
-  a count, never names — and `truncated: true` mirrors it for older clients.
-  Results sort by best score, then hit count, then name, so which five survive is
-  deterministic. A broad tag is refined (`["files"]` then `["files", "write"]`),
-  and repeating an IDENTICAL query advances to the next page (`offset` reports
-  where it starts), so the omitted tail is reachable without a name list.
+  exact hit. Prefix needs two characters, fuzzy needs three. Exact requested names
+  rank first in caller order, then regex name hits, then tag matches.
+- `MAX_DISCOVERY_MATCHES = 5` belongs to the legacy `searchTools` answer only.
+  `toolRequest` never uses it.
 - `alreadyAvailable` reports CORE tools the CALLER already has declared
   (`options.declared`, supplied by the harness from `visibleCoreTools`). This is a
-  report only: they are never enabled, never counted against the cap, and their
+  report only: they are never enabled, never counted against the bound, and their
   query tags are added to the matched set so `unmatchedTags` cannot claim an
   already-callable capability is absent. Core matching is deliberately stricter:
-  wire NAME and TAGS only — never the description, whose everyday words would
-  match almost every query. The caller's view is what makes it honest:
-  `agentDelegate` is never advertised to a subagent, and absent entirely in a
-  one-agent harness.
+  wire NAME, TAGS, and exact/regex NAME only — never the description, whose
+  everyday words would match almost every query. The caller's view is what makes
+  it honest: `agentDelegate` is never advertised to a subagent, and absent
+  entirely in a one-agent harness.
 - `availableTags` (the sorted vocabulary of searchable tools) is returned when
   nothing matched or when the query was empty, so a failed query teaches the model
   the real tags.
@@ -554,9 +561,20 @@ reserved (`harness()` throws if the config or a preset already has `toolRequest`
 - An **undiscovered** tool is not callable: the harness answers the call with a
   tool result naming tags that would enable it. The model cannot bypass discovery
   by guessing a name.
-- `declared()` builds the request list core-first, then discovered, and is rebuilt
-  for every request, so a toolRequest round shows up on the very next turn. `agentDelegate`
-  is skipped for every agent except the primary.
+- `declared()` builds the request list core-first, then the current capped enabled
+  set, and is rebuilt for every request, so a toolRequest round shows up on the very
+  next turn. Authorization reads that same set; a same-turn call evicted by an
+  earlier toolRequest is rejected. `agentDelegate` is skipped for every agent except
+  the primary.
+
+**toolManage persistence:** `create`/`update` default to `persist: "folder"`.
+A pathless create requires `name` and writes `<name>.tool.ts` under the LAST
+configured folder; a pathless update reuses the captured absolute owning path when
+it is inside a configured folder. Explicit `path` must be inside one of those
+folders. `persist: "runtime"` is the explicit no-disk mode and cannot combine with
+`path`/`folder`. Disk-backed publications bypass `createdToolRecords` and
+`maxCreatedTools`; restart re-scans the folder. Failed writes restore the prior
+bytes (or delete the new file) and surface rollback failure.
 
 ---
 
@@ -1638,18 +1656,32 @@ are different facts. The transport reads it from `prompt_tokens_details.cached_t
 (OpenAI-compatible, and what the workspace's Lightning adapter emits) or
 `prompt_cache_hit_tokens` (DeepSeek-compatible), and clamps it to `input`.
 
-## ToolVisibility / ToolSearchResult
+## ToolVisibility / selectTools / searchTools
 
 ```ts
 type ToolVisibility = 'core' | 'searchable';
 
-type ToolSearchResult = {
-    enabled: string[];                  // ranked; also what the next turn declares
+// The uncapped selector behind toolRequest. Every matched tool is returned; the
+// harness applies maxEnabledTools when it decides what to enable/declare.
+type ToolSelectionResult = {
+    names: string[];
     tools: { name: string; description: string; tags: string[] }[];
-    remaining: number;                  // matched but excluded by the five-match cap
+    alreadyAvailable?: { name: string; description: string; tags: string[] }[];
+                                        // core tools the caller already has; never selected
+};
+
+// The harness's model-facing answer: the bound admits enabled/tools, while
+// matched counts the whole union and omitted is the difference.
+// { enabled, tools, matched, omitted, unmatchedTags?, availableTags?, alreadyAvailable? }
+
+// Legacy tag-only paged answer still returned by searchTools (not toolRequest).
+type ToolSearchResult = {
+    enabled: string[];                  // ranked; legacy paged shortlist
+    tools: { name: string; description: string; tags: string[] }[];
+    remaining: number;                  // matched but excluded by MAX_DISCOVERY_MATCHES
     unmatchedTags?: string[];           // query tags that matched nothing
     availableTags?: string[];           // vocabulary, when nothing matched
-    offset?: number;                    // start of a later page (progressive discovery)
+    offset?: number;                    // start of a later page (legacy progressive discovery)
     truncated?: boolean;                // remaining > 0 (compatibility mirror)
     alreadyAvailable?: { name: string; description: string; tags: string[] }[];
                                         // core tools the caller already has; reported, never enabled
@@ -1825,12 +1857,16 @@ normalizer and the exported `TOOL_UI_LIMITS`.
   own tags and whether it is core; the harness owns the active set and the
   declarations. That split is what lets discovery change between turns while the
   registry stays immutable after construction.
-- **Tags are required, scored, and capped.** A tool without tags could never be
-  found, so construction rejects it. Ranking is OR-style best-match (a tool's rank
-  is its strongest single-tag hit; hit count only breaks ties), deterministic
-  (score, hits, name), and capped at five matches — default AND maximum —
-  because discovery exists to save context; the excluded tail is reported only as
-  `remaining`. A caller may ask for fewer, never more.
+- **Tags are required, scored, and page-capped (legacy `searchTools` only).** A
+  tool without tags could never be found, so construction rejects it. Ranking is
+  OR-style best-match (a tool's rank is its strongest single-tag hit; hit count
+  only breaks ties), deterministic (score, hits, name), and each legacy
+  `searchTools` page is capped at five matches — default AND maximum — because
+  paged tag discovery exists to save context; the excluded tail is reported only as
+  `remaining`. A caller may ask for fewer, never more. The live `toolRequest` tool
+  does NOT use that cap: `selectTools` returns every match and the harness's
+  `maxEnabledTools` (default 32, core tools excluded) bounds the enabled set, with
+  the newest request displacing older enabled tools when the bound is full.
 - **Presets are lazy proxies, not implementations.** `src/tools/index.ts` exports
   callable `Tool`s whose metadata is static and whose body is a dynamic import.
   Building a harness, listing the catalogue, or ranking a preset therefore never

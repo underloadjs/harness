@@ -145,6 +145,8 @@ describe('agentDelegate', () => {
         expect(declaredNames(seenWriter[0])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -158,6 +160,8 @@ describe('agentDelegate', () => {
         expect(declaredNames(seenResearcher[0])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',

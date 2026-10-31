@@ -58,6 +58,8 @@ const quiet = (entry: Agent, tools: Record<string, any> = {}) =>
 const CORE_ORDER = [
     'toolRegistry',
     'toolRequest',
+    'toolList',
+    'toolManage',
     'toolCreate',
     'todoManage',
     'profileManage',

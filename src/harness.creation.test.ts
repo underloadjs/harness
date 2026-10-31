@@ -83,6 +83,8 @@ describe('toolCreate', () => {
         expect(declaredNames(seen[0])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -114,6 +116,8 @@ describe('toolCreate', () => {
         expect(declaredNames(seen[0])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -126,6 +130,8 @@ describe('toolCreate', () => {
         expect(declaredNames(seen[1])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -215,7 +221,8 @@ describe('toolCreate', () => {
         expect(await writer.executeTool('toolRequest', { tags: ['summary'] })).toEqual({
             enabled: ['digest'],
             tools: [{ name: 'digest', description: 'Summarise text.', tags: ['text', 'summary'] }],
-            remaining: 0
+            matched: 1,
+            omitted: 0
         });
     });
 
@@ -256,6 +263,8 @@ describe('toolCreate', () => {
         expect(Object.keys(writer.tools)).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -332,10 +341,11 @@ describe('toolCreate', () => {
             });
         }
 
-        // Eleven harness-owned baseline entries (toolRegistry, toolRequest,
-        // toolCreate, the four record tools, agentManage/agentResult, threadFork,
-        // and the pending-only toolCancel) plus the 32 creations.
-        expect(Object.keys(writer.tools)).toHaveLength(43);
+        // Thirteen harness-owned baseline entries (toolRegistry, toolRequest,
+        // toolList, toolManage, toolCreate, the four record tools,
+        // agentManage/agentResult, threadFork, and the pending-only toolCancel)
+        // plus the 32 creations.
+        expect(Object.keys(writer.tools)).toHaveLength(45);
         expect(() =>
             writer.createTool({
                 name: 'generated32',

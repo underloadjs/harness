@@ -2398,6 +2398,238 @@ button {
     display: none;
 }
 
+/* R7/R8: the transcript/delete toolbar of an EXPANDED block, shared by a turn
+   tile, a nested invocation card and the roster-only focus panel. Transcript is
+   the leading action, Delete the trailing one; the inline confirmation wraps onto
+   its own full-width row so neither button moves. ui/turns.ts toggles `hidden`
+   with expansion, so a collapsed row never shows a permanent second row. */
+:is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions) {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 7px 12px;
+    border-top: 1px solid var(--border);
+    background: var(--bg-bar);
+}
+
+:is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions)[hidden] {
+    display: none;
+}
+
+.transcript-open,
+.thread-delete {
+    padding: 4px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--bg-elevated);
+    color: var(--text);
+    font: 500 11.5px/1.4 var(--sans);
+    cursor: pointer;
+}
+
+/* R8: Delete is the trailing action; `margin-left: auto` keeps it on the right
+   even if the transcript button is the only other child. */
+.thread-delete {
+    margin-left: auto;
+    border-color: rgba(248, 113, 113, 0.45);
+    color: var(--danger);
+}
+
+.transcript-open:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+.thread-delete:hover:not(:disabled) {
+    border-color: var(--danger);
+    background: rgba(248, 113, 113, 0.12);
+}
+
+.transcript-open:focus-visible,
+.thread-delete:focus-visible,
+.thread-delete-confirm-delete:focus-visible,
+.thread-delete-confirm-cancel:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.transcript-open:disabled,
+.thread-delete:disabled,
+.thread-delete-confirm-delete:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+}
+
+/* R8: desktop labels, mobile glyphs. Both nodes are always in the DOM so the
+   accessible name (set via aria-label in ui/turns.ts) never depends on CSS. */
+.action-label {
+    display: inline;
+}
+
+.action-glyph {
+    display: none;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1;
+}
+
+/* R9: inline two-step confirmation. It occupies the full toolbar width below the
+   two actions; Cancel sends no request (ui/turns.ts). */
+.thread-delete-confirm {
+    display: flex;
+    flex: 1 0 100%;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding-top: 7px;
+    border-top: 1px solid var(--border);
+}
+
+.thread-delete-confirm[hidden] {
+    display: none;
+}
+
+.thread-delete-confirm-text {
+    flex: 1 1 220px;
+    margin: 0;
+    color: var(--muted);
+    font: 11.5px/1.4 var(--sans);
+}
+
+.thread-delete-confirm-delete,
+.thread-delete-confirm-cancel {
+    padding: 4px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--bg-elevated);
+    color: var(--text);
+    font: 500 11.5px/1.4 var(--sans);
+    cursor: pointer;
+}
+
+.thread-delete-confirm-delete {
+    border-color: rgba(248, 113, 113, 0.55);
+    color: var(--danger);
+}
+
+.thread-focus-transcript {
+    flex: 0 0 auto;
+}
+
+/* Full-thread transcript dialog content (R4). The dialog shell owns scrolling and
+   the Copy control; these rules only lay out the role-tagged messages. */
+.thread-transcript {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.thread-transcript-meta {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+/* R7: the lossless pretty JSON document. `pre-wrap` keeps the payload readable
+   on a phone without changing the copied text; the dialog body owns scrolling. */
+.thread-transcript-json {
+    margin: 0;
+    padding: 12px 14px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-deep);
+    color: var(--text);
+    font: 11.5px/1.5 var(--mono);
+    tab-size: 2;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.thread-transcript-empty {
+    margin: 0;
+    color: var(--muted);
+    font-size: 13px;
+}
+
+.thread-transcript-message {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+}
+
+.thread-transcript-message:first-of-type {
+    padding-top: 0;
+    border-top: 0;
+}
+
+.thread-transcript-message-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+}
+
+.thread-transcript-role {
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+}
+
+.thread-transcript-text {
+    color: var(--text);
+    font-size: 13px;
+    line-height: 1.55;
+}
+
+.thread-transcript-attachments {
+    margin: 0;
+    padding-left: 18px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.thread-transcript-tool {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.thread-transcript-tool-name,
+.thread-transcript-reasoning-label {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+.thread-transcript-tool-arguments,
+.thread-transcript-reasoning {
+    margin: 0;
+    padding: 9px 11px;
+    overflow: auto;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-deep);
+    color: var(--text);
+    font: 11.5px/1.5 var(--mono);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+}
+
+.thread-transcript-reasoning {
+    color: var(--muted);
+}
+
 .thread-flow > .agent:first-child {
     padding-top: 0;
     border-top: 0;
@@ -2429,6 +2661,18 @@ button {
 @media (max-width: 600px) {
     .thread-children {
         --thread-indent: 10px;
+    }
+
+    /* R8/T10: sm/mobile action bars show `{}` (Transcript) and `X` (Delete)
+       glyphs. aria-label still supplies the full accessible name. */
+    :is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions)
+        .action-label {
+        display: none;
+    }
+
+    :is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions)
+        .action-glyph {
+        display: inline;
     }
 }
 

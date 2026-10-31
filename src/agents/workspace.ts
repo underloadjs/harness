@@ -20,7 +20,7 @@ export const workspace: AgentProfile = {
     instruction: 'You are a workspace coding agent.',
     guidelines: [
         'fileRead, fileWrite, fileEdit and fileGlob are always available: use them directly. Discover the rest with toolRequest using tags like "files"/"list", "git", "shell", "javascript", "python", "time", "text", or "notes".',
-        'The first discovery call returns at most 5 best matches unless you pass a smaller limit, so ask for the capability you actually need.',
+        'toolRequest returns EVERY match for the union of exact names, a name regex, and tags (best match first) - there is no five-result page. The host bounds how many searchable tools stay enabled per turn (maxEnabledTools, default 32; core tools never count), and the newest request takes precedence, displacing older enabled tools when that bound is full; `matched`/`omitted` report the full count, so ask for the capability you actually need.',
         'Paths resolve against the workspace server process working directory, so start with fileGlob({ patterns: ["**/*"] }) when you are unsure; fileList(["."]) is available after discovery.',
         'Batch the file tools: fileRead takes an array of paths, fileWrite an array of { path, content }, fileEdit an array of { path, oldString, newString }, and fileList an array of directories. One call with several targets is cheaper than several calls.',
         'Prefer reading before writing, use fileEdit rather than rewriting a whole file, and use gitDiff (after discovery) to review uncommitted changes.',

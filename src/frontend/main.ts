@@ -79,6 +79,7 @@
 import './styles.css';
 import type {
     AgentDescriptor,
+    DeleteThreadResult,
     HarnessDescriptor,
     RunnerSettings,
     SessionSnapshot,
@@ -96,6 +97,7 @@ import {
     createHarness,
     createSession,
     deleteSession,
+    deleteSessionThread,
     enqueueTask,
     getSession,
     listProviderModels,
@@ -366,6 +368,9 @@ type View = {
     // presented as several independent threads. (The former strip also rendered
     // these rows; it is gone, and this is the only consumer.)
     setThreads: (threads: readonly SessionThreadEntry[]) => void;
+    // R7: the tombstone-filtered raw snapshot the JSON transcript copies. Called
+    // after every applied snapshot; `undefined` on session teardown.
+    setSessionSnapshot: (snapshot: SessionSnapshot | undefined) => void;
     clear: () => void;
     notice: (text: string, tone?: 'info' | 'error') => void;
     // Session-scoped outcome line (a failed/cancelled run's detail), rendered in
@@ -412,12 +417,17 @@ type View = {
     dispose: () => void;
 };
 
-// Per-thread terminal actions (stop one thread / delete one thread) lived only in
-// the removed `.thread-strip` rows, so their injection point is gone with it. The
-// session-wide stop remains on the composer (`.composer-stop`, `stopRun`).
+// R8 re-introduces per-thread actions on the EXPANDED thread surfaces themselves
+// (ui/turns.ts action bars): Transcript and Delete ride between each block's header
+// and body, and the roster-only focus panel gets the same toolbar. The session-wide
+// stop remains on the composer (`.composer-stop`, `stopRun`).
 const createView = (
     descriptor: HarnessDescriptor,
-    answer?: (input: AnswerActionInput) => Promise<void>
+    answer?: (input: AnswerActionInput) => Promise<void>,
+    // R7: one explicit-open `getSession` read, guarded by the shell before it is
+    // applied. R9: the board's Delete confirmation delegates the actual DELETE here.
+    refreshTranscript?: (sessionId: string) => Promise<SessionSnapshot | undefined>,
+    removeThread?: (sessionId: string, threadId: string) => Promise<DeleteThreadResult>
 ): View => {
     const pane = el('div', 'pane');
     const logWrap = el('div', 'log-wrap');
@@ -444,6 +454,10 @@ const createView = (
         // in a standalone/embedded page, where the dialog reports it is unwired.
         readFile: readFileForPreview,
         ...(answer === undefined ? {} : { answerAction: answer }),
+        ...(refreshTranscript === undefined
+            ? {}
+            : { refreshSessionSnapshot: refreshTranscript }),
+        ...(removeThread === undefined ? {} : { deleteThread: removeThread }),
         // Focus follows the single expanded tile. Only the composer's routing line
         // has to repaint from here now that the thread strip is gone, so the
         // steering target stays visible in the same tick the reader
@@ -514,6 +528,11 @@ const createView = (
             // the roster no longer describes, which reports through `onFocusChange`
             // and repaints the composer's routing line.
             board.setThreads(threads);
+        },
+        setSessionSnapshot: (snapshot) => {
+            // The board owns the JSON transcript and delete protection; the shell
+            // only supplies the tombstone-filtered authority (see applySnapshot).
+            board.setSessionSnapshot(snapshot);
         },
         clear: () => {
             board.clear();
@@ -761,6 +780,10 @@ type ToolRunner = {
     // Repaint the session-context line (selection or session changed underneath
     // an already-open runner).
     sync: () => void;
+    // R5/T6: the CURRENT result-box data for the dialog Copy action. Evaluated at
+    // click time so a call that settles while the dialog is open copies its latest
+    // result, not the initial placeholder.
+    copyText: () => string;
 };
 
 // The cap the server applies to `toolRequest` (5). Kept here only to explain
@@ -843,6 +866,12 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     const outputBody = el('pre', 'card-body', '');
     output.append(outputHead, outputBody);
 
+    // The raw text behind the rendered result box. Copy uses this instead of the
+    // highlighted DOM so no syntax spans, truncation or decoration leak into the
+    // clipboard; it is updated by every `setOutput`, including errors/prompts.
+    let outputText = '';
+    let outputLabel = 'result';
+
     // Guidance for a truncated toolRequest answer. Separate from the raw result:
     // the structured payload is never rewritten.
     const resultHint = el('p', 'field-hint tool-hint', '');
@@ -871,10 +900,23 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     // markup comes from `highlightCode`, which escapes its input, so assigning it
     // to `innerHTML` cannot execute anything.
     const setOutput = (text: string, isError: boolean): void => {
-        outputHead.textContent = isError ? 'error' : 'result';
+        outputText = text;
+        outputLabel = isError ? 'error' : 'result';
+        outputHead.textContent = outputLabel;
         output.className = isError ? 'card tool-output is-error' : 'card tool-output';
         outputBody.innerHTML = highlightCode(prettyJson(text), looksLikeJson(text) ? 'json' : undefined);
         outputBody.dataset.language = looksLikeJson(text) ? 'json' : 'text';
+    };
+
+    // The runner's current useful data. The input controls are deliberately not
+    // copied: they are editable arguments, not a result. The tool identity and the
+    // result-box label give a pasted answer enough context to stand alone.
+    const copyText = (): string => {
+        const label = outputHead.textContent !== null && outputHead.textContent.length > 0
+            ? outputHead.textContent
+            : outputLabel;
+
+        return [`Tool: ${active?.name ?? 'tool'}`, `Result: ${label}`, '', outputText].join('\n');
     };
 
     // Delegation is the one core tool whose VALIDITY depends on the selected
@@ -1068,6 +1110,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     return {
         pane,
         sync,
+        copyText,
         show: (entry) => {
             active = entry;
 
@@ -2942,6 +2985,11 @@ type Instance = {
     // Per-turn records are guarded separately by their own `updatedAt`. The tag is
     // required because pointing the instance at another session resets the clock.
     snapshotMark?: { sessionId: string; at: number };
+    // R7: the last tombstone-filtered authoritative snapshot (raw threads + raw
+    // turns + session fields). Not used for rendering (the board owns that); it is
+    // the source the JSON transcript copies and the baseline delete protection
+    // reads. Cleared whenever the instance points at a different/no session.
+    snapshot?: SessionSnapshot;
 };
 
 const instances = new Map<string, Instance>();
@@ -3105,7 +3153,12 @@ const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
 
     const instance: Instance = {
         descriptor,
-        view: createView(descriptor, (input) => answerActionFor(descriptor.name, input)),
+        view: createView(
+            descriptor,
+            (input) => answerActionFor(descriptor.name, input),
+            refreshTranscriptSnapshot,
+            deleteThreadForSession
+        ),
         activity: new Set<string>(),
         panels: new Map<string, PanelMedia>(),
         pending: false,
@@ -3913,6 +3966,10 @@ const openToolDialog = (entry: ToolDescriptor, trigger?: HTMLElement): void => {
         // dialog, so repeating it in the title would only wrap long names.
         title: entry.name,
         content: slot,
+        // R5/T6: the runner is also a data-inspection surface for its CURRENT result.
+        // The provider reads the live output box, so Copy after a call yields the
+        // settled payload even though the same dialog also contains input controls.
+        copy: () => runner.copyText(),
         // `returnFocus` is the tool button that opened this dialog, so Escape/close
         // lands the reader back on the entry they picked (never the composer).
         ...(trigger === undefined ? {} : { returnFocus: trigger }),
@@ -4249,9 +4306,11 @@ const forgetDeletedSession = (id: string): void => {
         instance.discovered = undefined;
         instance.pending = false;
         instance.records.clear();
-        // The watermark belonged to the deleted conversation's clock.
+        // The watermark and raw JSON authority belonged to the deleted conversation.
         instance.snapshotMark = undefined;
+        instance.snapshot = undefined;
         instance.panels.clear();
+        instance.view.setSessionSnapshot(undefined);
         instance.view.clear();
         // The conversation (and its outcome detail) is gone; nothing is left to
         // report.
@@ -4709,6 +4768,21 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     }
     instance.records = records;
 
+    // R7 authority for the JSON transcript/delete protection. Built from the RAW
+    // snapshot (not the normalized roster) so exact `SessionThread`/`SessionTurn`
+    // fields survive, and from the MONOTONIC records map so a newer turn revision
+    // already adopted from a stream is not regressed. Tombstone-filtered exactly
+    // like the render path: a late answer can never make a deleted thread
+    // inspectable again.
+    const rawIncomingThreads = Array.isArray(session.threads)
+        ? session.threads.filter((entry) => !instance.threadTombstones.has(entry.id))
+        : undefined;
+    instance.snapshot = {
+        ...session,
+        turns: [...records.values()],
+        ...(rawIncomingThreads === undefined ? {} : { threads: rawIncomingThreads })
+    };
+
     // Pending: a live (running/queued) RECORD or the session-level flags of this
     // authoritative snapshot. No stale snapshot can reach here to leave Stop enabled
     // after the queue drained.
@@ -4747,6 +4821,7 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     // (the stale guard above returns first).
     instance.threads = incomingThreads;
     instance.view.setThreads(instance.threads);
+    instance.view.setSessionSnapshot(instance.snapshot);
 
     // A LEARNED deletion must drop the focus, exactly like the in-app delete used to
     // (that handler owned this clear and is gone with the thread strip).
@@ -4799,6 +4874,116 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     paintPanels();
     runner.sync();
     setBusy(instance.pending);
+};
+
+// R7 explicit-open freshness. The board asks for ONE read when the reader opens a
+// transcript; every streamed event is deliberately ignored. The answer is applied
+// through the normal tombstone-guarded snapshot path (so roster/turns/tiles stay
+// coherent) and then returned as the authority the dialog copies. A session switch
+// or an already-deleted session makes the read stale: return undefined and let the
+// board keep its last applied snapshot instead of retargeting another conversation.
+const refreshTranscriptSnapshot = async (
+    sessionId: string
+): Promise<SessionSnapshot | undefined> => {
+    if (deletedSessions.has(sessionId)) return undefined;
+
+    const instance = [...instances.values()].find(
+        (candidate) => candidate.sessionId === sessionId
+    );
+    if (instance === undefined) return undefined;
+
+    try {
+        const session = await getSession(sessionId);
+        if (deletedSessions.has(sessionId) || instance.sessionId !== sessionId) return undefined;
+
+        applySnapshot(instance, session);
+        return instance.snapshot;
+    } catch {
+        // A failed freshness read never invalidates the snapshot already on screen.
+        return undefined;
+    }
+};
+
+// R9 thread deletion. The board owns confirmation/feedback; this function owns the
+// EXISTING DELETE endpoint plus the destructive reconciliation the shell already
+// uses for learned deletions:
+//   1. tombstone the thread (and descendants/turns) BEFORE applying the answer, so
+//      a late stream upsert cannot resurrect it;
+//   2. apply the returned snapshot through the ordinary path;
+//   3. even when that snapshot is stale for the watermark, the DELETE answer is
+//      authoritative for THIS thread, so drop its roster rows and clear a focus
+//      that pointed at it. Transcript dialogs close from the missing roster/source.
+// A 404 "Unknown thread" is the desired end state (another tab/API already removed
+// it): resync the session and return a successful deletion. A 409/400/500 throws:
+// the caller keeps the row/data and shows the server's message.
+const reconcileDeletedThread = (
+    instance: Instance,
+    sessionId: string,
+    threadId: string,
+    session: SessionSnapshot
+): void => {
+    if (instance.sessionId !== sessionId) return;
+
+    tombstoneThread(instance, threadId, instance.threads);
+    applySnapshot(instance, session);
+
+    // The answer is authoritative even if `applySnapshot` rejected it as older
+    // than a newer streamed frame. Filtering through the tombstones is safe in both
+    // cases, and repainting the board closes the deleted surfaces immediately.
+    instance.records = new Map(
+        [...instance.records].filter(([, turn]) => !turnTombstoned(instance, turn))
+    );
+    // Tool panels are derived state, exactly like `applySnapshot`: recompute them
+    // from the surviving records so a deleted thread's `tool_result.ui` cards do
+    // not survive a stale DELETE answer that the watermark guard rejected.
+    instance.panels = mediaOfTurns([...instance.records.values()]);
+    instance.view.reconcile([...instance.records.values()], instance.sessionModel);
+    instance.threads = instance.threads.filter((entry) => !instance.threadTombstones.has(entry.id));
+    instance.view.setThreads(instance.threads);
+    if (instance.snapshot !== undefined) {
+        const rawThreads = Array.isArray(instance.snapshot.threads)
+            ? instance.snapshot.threads.filter((entry) => !instance.threadTombstones.has(entry.id))
+            : undefined;
+        instance.snapshot = {
+            ...instance.snapshot,
+            turns: instance.snapshot.turns.filter((turn) => !turnTombstoned(instance, turn)),
+            ...(rawThreads === undefined ? {} : { threads: rawThreads })
+        };
+    }
+    instance.view.setSessionSnapshot(instance.snapshot);
+
+    const focused = instance.view.focusedThread();
+    if (focused !== undefined && instance.threadTombstones.has(focused)) {
+        instance.view.clearFocus();
+    }
+
+    // Same app-facing effect as the normal snapshot path: the selected view paints
+    // the current instance's derived panels (or hides empty hosts).
+    if (current === instance) paintPanels();
+};
+
+const deleteThreadForSession = async (
+    sessionId: string,
+    threadId: string
+): Promise<DeleteThreadResult> => {
+    const instance = [...instances.values()].find(
+        (candidate) => candidate.sessionId === sessionId
+    );
+    if (instance === undefined) throw new Error('Unknown session');
+
+    try {
+        const result = await deleteSessionThread(sessionId, threadId);
+        reconcileDeletedThread(instance, sessionId, threadId, result.session);
+        return result;
+    } catch (error) {
+        if (!messageOf(error).includes('Unknown thread')) throw error;
+
+        // Already gone: the caller's intended end state holds. Re-read so the
+        // roster/turns/focus reconcile to whatever the server holds now.
+        const session = await getSession(sessionId);
+        reconcileDeletedThread(instance, sessionId, threadId, session);
+        return { deleted: true, session };
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -5122,9 +5307,19 @@ const openSession = async (id: string): Promise<void> => {
 
     const target = ensureInstance(descriptor);
 
-    // One session, one card: release any other card pointed at this id.
+    // One session, one card: release any other card pointed at this id. The release
+    // must invalidate that card's raw transcript authority and close any transcript
+    // opened from it; otherwise the stale source can reopen after the session moved.
     for (const instance of instances.values()) {
-        if (instance !== target && instance.sessionId === id) instance.sessionId = undefined;
+        if (instance !== target && instance.sessionId === id) {
+            instance.sessionId = undefined;
+            instance.snapshot = undefined;
+            instance.snapshotMark = undefined;
+            instance.threads = [];
+            instance.view.bindSession(undefined);
+            instance.view.setThreads([]);
+            instance.view.setSessionSnapshot(undefined);
+        }
     }
 
     // N1: everything the instance holds about the conversation being LEFT is stale
@@ -5142,6 +5337,8 @@ const openSession = async (id: string): Promise<void> => {
         target.records = new Map<string, SessionTurn>();
         target.threads = [];
         target.snapshotMark = undefined;
+        target.snapshot = undefined;
+        target.view.setSessionSnapshot(undefined);
     }
 
     target.sessionId = id;
@@ -5196,9 +5393,11 @@ const newSession = (): void => {
     // belongs to the previous session and keeps running there.
     instance.pending = false;
     instance.records.clear();
-    // The watermark belonged to the previous conversation; a new session's
-    // snapshots start a fresh clock.
+    // The watermark and raw authority belonged to the previous conversation; a new
+    // session's snapshots start a fresh clock/source.
     instance.snapshotMark = undefined;
+    instance.snapshot = undefined;
+    instance.view.setSessionSnapshot(undefined);
     // A new conversation has no tool output yet: clearing the instance state and
     // repainting is what drops the previous session's board and any manual panels
     // that lived only in the browser (R21.3).
@@ -5351,6 +5550,13 @@ const ensureSession = async (instance: Instance): Promise<string> => {
     // point at.
     instance.threads = sessionThreadsOf(session);
     instance.view.setThreads(instance.threads);
+    // Creation answer is the initial raw JSON authority for this new session.
+    instance.snapshot = {
+        ...session,
+        turns: session.turns,
+        ...(Array.isArray(session.threads) ? { threads: session.threads } : {})
+    };
+    instance.view.setSessionSnapshot(instance.snapshot);
     // A freshly created session starts with an empty turn list, so recomputing from
     // it both empties the board and guarantees nothing from a previously viewed
     // session survives a New session.
@@ -5547,6 +5753,14 @@ const run = async (): Promise<void> => {
             instance.records.clear();
             instance.snapshotMark = undefined;
             instance.pending = false;
+            instance.snapshot = undefined;
+            instance.threads = [];
+            // Bind teardown expires answer cards AND closes the tracked transcript;
+            // clearing the roster/snapshot also stops the board's standalone
+            // fallback from reopening that transcript from stale tile records.
+            instance.view.bindSession(undefined);
+            instance.view.setThreads([]);
+            instance.view.setSessionSnapshot(undefined);
             instance.panels.clear();
             // The conversation is gone from the server; any outcome detail from it
             // would describe a session this card no longer points at.

@@ -11,7 +11,9 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join, relative, resolve } from 'node:path';
 import { afterEach, beforeEach, expect, it } from 'vitest';
-import { fileGlob } from '../../tools/files/fileGlob';
+// T14: the file tools are the canonical `*.tool.ts` modules (fileGlob.ts was
+// renamed to fileGlob.tool.ts by the tool-inventory upgrade).
+import { fileGlob } from '../../tools/files/fileGlob.tool';
 import { fileGlobPattern } from './references';
 
 // Locate the repo root regardless of whether vitest runs from the package root

@@ -57,13 +57,12 @@
 // single-property rule used to hand `execute` the array itself; it cannot express
 // paging, so a caller that needs page 2 uses the object form.
 //
-// SCHEMA NOTE (catalogue migration, integration worker owns ../catalogue.ts):
-// the catalogue still declares ONE `paths` array, which cannot carry `offset` or
-// `limit`. It must become an object schema with three optional properties —
-// `paths` (array of strings, default ['.']), `offset` (integer, minimum 0) and
-// `limit` (integer, 1..1000) — and no `required` list. This implementation accepts
-// that shape already; it also keeps accepting the legacy array so direct callers
-// and existing tests do not need a flag day.
+// SCHEMA NOTE (T13): FILE_LIST_METADATA below is the authoritative schema — an
+// object with three optional properties (`paths` array of strings defaulting to
+// ['.'], `offset` integer minimum 0, `limit` integer 1..1000) and NO `required`
+// list. ../catalogue.ts projects the same row synchronously for lazy enumeration.
+// This implementation accepts that shape and also keeps accepting the legacy
+// string/array form so direct callers and existing tests do not need a flag day.
 //
 // WHAT IS DELIBERATELY UNCHANGED (and distinct from fileGlob)
 // -----------------------------------------------------------
@@ -101,7 +100,7 @@ import { readdir } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
-import { PRESET_TOOLS } from '../catalogue';
+import type { PresetToolMetadata } from '../catalogue';
 
 // Page-size and byte bounds. Exported so docs/tests can quote the same numbers the
 // implementation enforces (and so a host cannot quietly disagree).
@@ -351,10 +350,43 @@ export const paginateEntries = (
     };
 };
 
-// Metadata (name, description, tags, schema) lives in ../catalogue so the preset
-// can be enumerated without importing this module — and so text can't drift.
+// Authoritative registration/details for this preset (T13): the catalogue keeps
+// a synchronous data projection for lazy enumeration and a consistency test
+// asserts the two stay equal. Edit the metadata HERE.
+export const FILE_LIST_METADATA: PresetToolMetadata = {
+    name: 'fileList',
+    description:
+        'List the immediate entries of one or more directories, non-recursively, ONE PAGE at a time. Every entry is prefixed with the directory it came from (e.g. ["src/a.ts", "src/nested/", "task/b.ts"]), directories end with a trailing slash so they are distinguishable from files, and entries are sorted. Pass several directories to survey them in one call; the default is ["."], which returns bare entry names. The result is { entries, truncated, nextOffset, offset, limit, bytes, contentBudget }: a page holds at most 200 entries by default (maximum 1000) and at most 64 KiB of UTF-8 entry text, so when `truncated` is true pass `nextOffset` back as `offset` to read the rest. A missing or unreadable directory fails the whole call rather than returning a partial list.',
+    tags: ['files', 'list', 'filesystem'],
+    parameters: {
+        type: 'object',
+        properties: {
+            paths: {
+                type: 'array',
+                items: { type: 'string' },
+                default: ['.'],
+                description:
+                    'Directories to list, absolute or relative to the working directory, in the order the results are grouped. Defaults to ["."].'
+            },
+            offset: {
+                type: 'integer',
+                minimum: 0,
+                description:
+                    '0-based index into the flat entry list. Defaults to 0; use nextOffset from the previous page.'
+            },
+            limit: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 1000,
+                description: 'Maximum entries in this page, 1-1000. Defaults to 200.'
+            }
+        },
+        additionalProperties: false
+    }
+};
+
 export const fileList = tool<FileListParameters, FileListResult>({
-    ...PRESET_TOOLS.fileList,
+    ...FILE_LIST_METADATA,
     execute: async ({ parameters }) => {
         const { directories, offset, limit } = normalizeRequest(parameters);
         const entries: string[] = [];

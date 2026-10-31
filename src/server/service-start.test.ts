@@ -100,6 +100,8 @@ const PRESET_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner'
 const TOOL_NAMES = [
     'toolRegistry',
     'toolRequest',
+    'toolList',
+    'toolManage',
     'toolCreate',
     'todoManage',
     'profileManage',

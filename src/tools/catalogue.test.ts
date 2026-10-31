@@ -211,7 +211,8 @@ describe('preset catalogue', () => {
                         required: ['path', 'oldString', 'newString'],
                         additionalProperties: false
                     },
-                    description: 'Edits to apply, one per file, in the order the results are returned.'
+                    description:
+                        'Edits to apply, in the order the results are returned. Several entries may name the same file; they are applied in array order.'
                 }
             },
             required: ['edits'],

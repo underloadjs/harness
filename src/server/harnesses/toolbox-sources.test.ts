@@ -45,14 +45,14 @@ afterEach(() => {
 
 // The exact shipped source map: package presets then app tools.
 const EXPECTED_SOURCE_PATHS = {
-    syntaxCheck: 'tools/syntax/syntaxCheck.ts',
-    fileRead: 'tools/files/fileRead.ts',
-    fileWrite: 'tools/files/fileWrite.ts',
-    fileEdit: 'tools/files/fileEdit.ts',
-    fileList: 'tools/files/fileList.ts',
-    fileGlob: 'tools/files/fileGlob.ts',
-    commandRun: 'tools/command/commandRun.ts',
-    gitDiff: 'tools/command/gitDiff.ts',
+    syntaxCheck: 'tools/syntax/syntaxCheck.tool.ts',
+    fileRead: 'tools/files/fileRead.tool.ts',
+    fileWrite: 'tools/files/fileWrite.tool.ts',
+    fileEdit: 'tools/files/fileEdit.tool.ts',
+    fileList: 'tools/files/fileList.tool.ts',
+    fileGlob: 'tools/files/fileGlob.tool.ts',
+    commandRun: 'tools/command/commandRun.tool.ts',
+    gitDiff: 'tools/command/gitDiff.tool.ts',
     timeNow: 'server/harnesses/tool-sources/timeNow.ts',
     textCount: 'server/harnesses/tool-sources/textCount.ts',
     diceRoll: 'server/harnesses/tool-sources/diceRoll.ts',
@@ -79,7 +79,7 @@ describe('production toolbox source compilation', () => {
         const fileRead = harness.toolSource('fileRead');
         expect(fileRead).toMatchObject({
             name: 'fileRead',
-            sourcePath: 'tools/files/fileRead.ts',
+            sourcePath: 'tools/files/fileRead.tool.ts',
             format: 'module',
             dependencies: [],
             checks: ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']

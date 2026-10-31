@@ -65,8 +65,8 @@ const callTool = (id: string, name: string, args: string): HarnessStreamEvent[] 
     { type: 'done', stopReason: 'tool_calls', toolCalls: [{ id, name, arguments: args }] }
 ];
 
-// 11 searchable tools with one shared tag. One toolRequest call therefore returns
-// the capped page 1 (5) and leaves a progressive-discovery offset of 5.
+// 11 searchable tools with one shared tag. Selection is uncapped, so one
+// toolRequest call enables all eleven and records no legacy paging offset.
 const bulkName = (index: number): string => `bulk${String(index).padStart(2, '0')}`;
 
 const bulkTools = (): Record<string, ReturnType<typeof tool>> =>
@@ -158,9 +158,24 @@ const buildExpectedSnapshot = (): HarnessSnapshot => ({
         researcher: { model: 'research/model', messages: seededResearcherMessages }
     },
     discovery: {
-        enabled: ['bulk01', 'bulk02', 'bulk03', 'bulk04', 'bulk05', 'repeat'],
-        // discoveryQueryKey(['bulk'], undefined) === JSON.stringify([['bulk'], null])
-        offsets: [{ query: '[["bulk"],null]', offset: 5 }]
+        enabled: [
+            // toolCreate is the newest mutation, so it leads the current order.
+            'repeat',
+            'bulk01',
+            'bulk02',
+            'bulk03',
+            'bulk04',
+            'bulk05',
+            'bulk06',
+            'bulk07',
+            'bulk08',
+            'bulk09',
+            'bulk10',
+            'bulk11'
+        ],
+        // selectTools is uncapped, so the legacy progressive-discovery offset map
+        // stays empty.
+        offsets: []
     },
     createdTools: [repeatCreation],
     createdToolCount: 1,
@@ -317,12 +332,18 @@ describe('harness snapshot/restore', () => {
 
         expect(target.snapshot()).toEqual(snapshot);
         expect(target.discoveredTools).toEqual([
+            'repeat',
             'bulk01',
             'bulk02',
             'bulk03',
             'bulk04',
             'bulk05',
-            'repeat'
+            'bulk06',
+            'bulk07',
+            'bulk08',
+            'bulk09',
+            'bulk10',
+            'bulk11'
         ]);
         expect(target.agents.writer.model()).toBe('merge/ds4-flash');
         expect(target.agents.researcher.model()).toBe('research/model');
@@ -369,20 +390,28 @@ describe('harness snapshot/restore', () => {
         // execution happens only because this test asks for it).
         expect(await target.executeTool('repeat', 'ab')).toBe('ab');
 
-        // The persisted progressive-discovery offset continues the NEXT tranche of
-        // the identical query instead of restarting at page 1.
+        // The persisted enabled set survives restore. An identical query is
+        // idempotent: the uncapped selector returns all eleven every time.
         expect(await target.executeTool('toolRequest', { tags: ['bulk'] })).toEqual({
-            enabled: ['bulk06', 'bulk07', 'bulk08', 'bulk09', 'bulk10'],
-            tools: [
-                { name: 'bulk06', description: 'Bulk tool bulk06.', tags: ['bulk'] },
-                { name: 'bulk07', description: 'Bulk tool bulk07.', tags: ['bulk'] },
-                { name: 'bulk08', description: 'Bulk tool bulk08.', tags: ['bulk'] },
-                { name: 'bulk09', description: 'Bulk tool bulk09.', tags: ['bulk'] },
-                { name: 'bulk10', description: 'Bulk tool bulk10.', tags: ['bulk'] }
+            enabled: [
+                'bulk01',
+                'bulk02',
+                'bulk03',
+                'bulk04',
+                'bulk05',
+                'bulk06',
+                'bulk07',
+                'bulk08',
+                'bulk09',
+                'bulk10',
+                'bulk11'
             ],
-            remaining: 1,
-            offset: 5,
-            truncated: true
+            tools: Array.from({ length: 11 }, (_, index) => {
+                const name = `bulk${String(index + 1).padStart(2, '0')}`;
+                return { name, description: `Bulk tool ${name}.`, tags: ['bulk'] };
+            }),
+            matched: 11,
+            omitted: 0
         });
         expect(target.discoveredTools).toEqual([
             'bulk01',
@@ -390,12 +419,13 @@ describe('harness snapshot/restore', () => {
             'bulk03',
             'bulk04',
             'bulk05',
-            'repeat',
             'bulk06',
             'bulk07',
             'bulk08',
             'bulk09',
-            'bulk10'
+            'bulk10',
+            'bulk11',
+            'repeat'
         ]);
     });
 
@@ -418,6 +448,8 @@ describe('harness snapshot/restore', () => {
         expect((seen[0].tools ?? []).map((declaration) => declaration.name)).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -427,12 +459,18 @@ describe('harness snapshot/restore', () => {
             'agentResult',
             'agentDelegate',
             'threadFork',
+            'repeat',
             'bulk01',
             'bulk02',
             'bulk03',
             'bulk04',
             'bulk05',
-            'repeat'
+            'bulk06',
+            'bulk07',
+            'bulk08',
+            'bulk09',
+            'bulk10',
+            'bulk11'
         ]);
     });
 

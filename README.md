@@ -427,20 +427,23 @@ model's context on schemas it will never call, so a request declares only:
 - every `visibility: 'core'` tool, and
 - every searchable tool that `toolRequest` has already enabled.
 
-`toolRequest` is a core tool the harness always registers. It takes capability tags,
-ranks the catalogue, enables the closest matches, and the next request declares
-them:
+`toolRequest` is a core tool the harness always registers. It accepts exact
+`names`, a name `regex`, and/or capability `tags`, selects the **union** of those
+criteria, enables the matches for the next request, and returns the matched
+metadata. Selection is uncapped; the host bounds the persistent enabled set with
+`maxEnabledTools` (default 32), and core tools never spend that bound.
 
 Every harness also preloads the bundled preset catalogue by default (`presets:
 true`), so its tools are available with no imports at all. The four core file tools
 (`fileRead`, `fileWrite`, `fileEdit`, `fileGlob`) plus a configured `webSearch` are
 declared from the first request, together with the harness-owned `toolRequest`,
-`toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`,
-`agentManage`, and `agentResult`
+`toolList`, `toolManage`, `toolCreate`, `todoManage`, `profileManage`,
+`chapterManage`, `locationManage`, `agentManage`, and `agentResult`
 (and `agentDelegate` when subagents exist). `actionRequest` joins that set when
 `interaction` is configured, and `threadFork` when `forks.enabled` is true
 (the default). `fileList`, `commandRun`, `gitDiff`, `syntaxCheck`, and the app tools
-stay searchable.
+stay searchable. `toolList` is the name+description inventory of the live registry
+(enabled or not); `toolManage` is the source/path/edit surface described below.
 
 ```ts
 tools: {
@@ -456,42 +459,100 @@ tools: {
 ```text
 round 1  model -> fileRead({ "paths": ["README.md"] })     // core, no discovery
 round 2  model -> toolRequest({ "tags": ["files", "list"] })
-         result -> { enabled: ["fileList"], tools: [...], remaining: 0 }
+         result -> { enabled: ["fileList"], tools: [...], matched: 1, omitted: 0 }
 round 3  model -> fileList(["src"])                         // now declared
-round 4  model -> toolRequest({ "tags": ["shell"] })
-         result -> { enabled: ["commandRun"], tools: [{ name: "commandRun", ... }], remaining: 0 }
+round 4  model -> toolRequest({ "names": ["commandRun"] })
+         result -> { enabled: ["commandRun"], tools: [{ name: "commandRun", ... }], matched: 1, omitted: 0 }
 round 5  model -> commandRun({ "command": "git status" })   // now declared
 ```
 
-A discovery call returns **at most five** matches. `remaining` is the number of
-further tools that matched but were not listed (no names are exposed), so a broad
-query is refined by adding a tag — `["files"]` leaves a sixth match out,
-`["files", "write", ...]` brings it in. Repeating an **identical** query walks the
-next page instead (the result carries `offset`), so the cap is never a dead end.
+Selection returns **every** match for the union of `names`/`regex`/`tags`; there
+is no five-result cap. `enabled` and `tools` are the matches the configured
+`maxEnabledTools` bound admitted, `matched` is the whole union, and `omitted` is
+the difference. `limit` narrows only the current query and is not a global cap;
+repeating an identical query is idempotent (no hidden paging cursor).
 
 Core tools the caller already has are reported separately in `alreadyAvailable`
 (metadata only). The motivating case is `agentDelegate` in a harness with
-subagents: an exact wire-name or tag query names the tool instead of claiming
-nothing matched. These entries are never enabled, never count against the cap,
-and their tags are not reported in `unmatchedTags`.
+subagents: an exact wire-name, regex, or tag query names the tool instead of
+claiming nothing matched. These entries are never enabled, never count against
+`maxEnabledTools`, and their tags are not reported in `unmatchedTags`.
 
 | Rule | Behaviour |
 |---|---|
-| Tags | Required. Trimmed, lowercased, deduplicated. |
-| Default visibility | `'searchable'`. The core set is `fileRead`/`fileWrite`/`fileEdit`/`fileGlob`, a configured `webSearch`, the harness-owned `toolRequest`/`toolCreate`/`todoManage`/`profileManage`/`chapterManage`/`locationManage`/`agentManage`/`agentResult`, plus `agentDelegate` on a primary with subagents, `actionRequest` when `interaction` is configured, and `threadFork` when forks are enabled. `fileList` is searchable. |
+| Query shape | `names` (exact, case-sensitive), `regex` (bare source or `/source/flags`), and `tags` are OR-ed into one union; each match appears once. An empty query enables nothing and returns the vocabulary. |
+| Tags | Trimmed, lowercased, deduplicated. Not required when `names` or `regex` is supplied. |
+| Default visibility | `'searchable'`. The core set is `fileRead`/`fileWrite`/`fileEdit`/`fileGlob`, a configured `webSearch`, the harness-owned `toolRequest`/`toolList`/`toolManage`/`toolCreate`/`todoManage`/`profileManage`/`chapterManage`/`locationManage`/`agentManage`/`agentResult`, plus `agentDelegate` on a primary with subagents, `actionRequest` when `interaction` is configured, and `threadFork` when forks are enabled. `fileList` is searchable. |
 | Core vs session-bound | `core` means always declared. Only the harness-owned set is `sessionBound` (needs a `sessionId` for a manual server call); core file tools and webSearch run directly. |
-| Ranking | OR-style: a tool needs only one query tag to be a candidate, and its rank is its **best single-tag score** — exact tag (4) > tag prefix (3) > tag substring (2) > name/description hit (1). More matching tags only breaks ties, so a broad tool cannot outrank an exact hit. |
-| Cap | 5 matches — the default AND the maximum. `limit` may only ask for fewer (1–5). `remaining` counts the matches the cap excluded; `truncated: true` mirrors it for older clients. |
-| Already available | Core tools the caller already has (`agentDelegate` with subagents, `todoManage`, the file tools, …) that match the query are listed in `alreadyAvailable` — metadata only, never enabled, never counted against the cap. They are scored by wire name and tags only (never description), and a match is not reported as unmatched. |
-| No match | when neither a searchable nor an already-available core tool matches, the result carries `unmatchedTags` and the full `availableTags`, so the model retries with real vocabulary. |
+| Ranking | Exact requested names keep caller order. Name-regex hits follow, then tag matches ranked OR-style: a tool's rank is its **best single-tag score** — exact tag (4) > tag prefix (3) > tag substring (2) > name/description hit (1). More matching tags only breaks ties. |
+| Enabled bound | `maxEnabledTools` (default **32**) bounds the persistent SEARCHABLE enabled set at the model-turn boundary. Every selector kind (names, regex, tags) switches the set: this request's ordered matches lead, prior entries fill leftover capacity, overflow is `omitted`, and displaced prior names are `evicted`. Core tools are always declared and never count. |
+| Already available | Core tools the caller already has (`agentDelegate` with subagents, `todoManage`, the file tools, …) that match the query are listed in `alreadyAvailable` — metadata only, never enabled, never counted against the bound. They are scored by wire name and tags only (never description), and a match is not reported as unmatched. |
+| No match | when neither a searchable nor an already-available core tool matches, the result carries `unmatchedTags` and the full searchable `availableTags`, so the model retries with real vocabulary. |
 | Undiscovered tool | calling one returns a tool result naming tags that would enable it — it does not run. |
 | Lifetime | discovery is per harness and kept across calls; `reset()` forgets it with the conversation. `harness.discoveredTools` exposes the enabled names. |
-| Reserved names | `toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, and `agentResult` belong to the harness, and `agentDelegate`, `actionRequest`, and `threadFork` too when they are registered; using one throws. |
+| Reserved names | `toolRequest`, `toolList`, `toolManage`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, and `agentResult` belong to the harness, and `agentDelegate`, `actionRequest`, and `threadFork` too when they are registered; using one throws. |
 | Manual call | an operator may run any registered tool through `harness.executeTool()` / `POST /tools/:name`; discovery gates the model, not the user. Core file tools need no session; the harness-owned set does. `actionRequest` and `threadFork` are the exception: they need the run that owns the conversation and are refused by the manual path. |
 
-`searchTools(tools, tags, limit?, offset?, options?)` is the same ranking without
-a harness — useful for a catalogue UI or for checking that a tag vocabulary
-resolves the way you expect. Pass `{ declared }` to reproduce `alreadyAvailable`.
+`selectTools(tools, query, options?)` is the uncapped selector without a harness;
+`searchTools(tools, tags, limit?, offset?, options?)` keeps the legacy paged
+tag-only answer for existing hosts. Both are useful for a catalogue UI. Pass
+`{ declared }` to reproduce `alreadyAvailable`.
+
+### External tool folders and `*.tool.ts`
+
+`toolFolders` is an ordered list of directories — absolute, or relative to the
+process cwd — scanned recursively for editable `*.tool.ts` entries. Discovery is
+deterministic (folder order, then a byte-wise sort of each folder's relative
+POSIX paths), and a later folder wins
+a name collision because every entry publishes through the normal registration
+kernel. An invalid folder or module fails construction with its path. **Folder code
+is trusted code:** compilation/loading runs it with the process's permissions, and
+there is no sandbox.
+
+A canonical entry is self-contained: metadata plus `execute` in the
+`metadata + execute` module shape the compiler already supports.
+
+```ts
+// tools/example.tool.ts
+export const metadata = {
+    name: 'example',
+    description: 'Return a greeting.',
+    tags: ['example', 'greeting'],
+    parameters: {
+        type: 'object',
+        properties: { name: { type: 'string' } },
+        required: ['name'],
+        additionalProperties: false
+    }
+};
+
+export const execute = ({ parameters }: ToolContext) => `Hello, ${parameters.name}!`;
+```
+
+```ts
+const writer = harness({
+    agents: { writer: agent({...}) },
+    toolFolders: ['./tools', '/srv/shared-tools']
+});
+```
+
+Mutations go through the core `toolManage` tool (or `harness.runtime.manageTool`
+from a trusted host):
+
+| Operation | Behaviour |
+|---|---|
+| `list`, `details`, `source` | Inspect registry metadata, one tool's details (including a cloned `parameters` schema and any preserved `owningPath`), or its captured `moduleText`/dependencies/revision. |
+| `path` | Report configured folders, an installed tool's `sourcePath`/`owningPath`, or the deterministic `createPath` a pathless create would use; with an explicit `path`, validate it inside the fence. Never writes. |
+| `create`, `update` | Compile/validate/publish through the same kernel as `toolCreate`/`toolRegistry`. **Persist to disk by default:** a pathless `create` requires `name` and writes `<name>.tool.ts` in the LAST configured `toolFolders` root; a pathless `update` reuses the tool's captured owning `sourcePath` when it is inside a configured root. An explicit `path` (inside a root, ending in `.tool.ts`) overrides. `persist: "runtime"` is the explicit no-disk mode and cannot be combined with `path`/`folder`. No configured root is a clear error for persistent operations. |
+| `reload` | Recompile the installed source revision. A disk-backed revision re-reads its file; a captured-only revision recompiles its captured bytes. |
+
+Disk-write security is a path fence, not a sandbox: traversal and symlink escapes
+are rejected, and a pathless create uses only its deterministic `<name>.tool.ts`
+target. A failed registration rolls the just-written file back (or removes the new
+file) and reports a rollback failure explicitly; the previous module stays usable.
+Disk-backed create/update does not enter `createdToolRecords` or spend
+`maxCreatedTools` because a restart re-scans the folder. Runtime-only revisions
+survive snapshot/restore but are not persisted to disk by the harness.
 
 ### Session todos (`todoManage`)
 
@@ -945,6 +1006,9 @@ const writer = harness({
 | `forks` | `{ enabled?, maxDepth?, maxConcurrent?, maxHistoryBytes?, maxBranchRecords? }`. `enabled` defaults **true** and registers the core `threadFork` tool. Defaults: depth 2, 4 live branches, 8 MiB serialized branch history, 64 retained records; every numeric bound must be a positive safe integer. |
 | `interaction` | `{ actionRequest?: (context, signal) => Promise<HarnessActionChoice>, autoAnswer? }`. Presence registers the core `actionRequest` tool. `autoAnswer` defaults true and only governs a child/fork request's automatic owner fork; it never selects an option by itself. |
 | `tools` | Extra tools, keyed by the name the model calls. A configured tool replaces a preloaded preset of the same name. |
+| `toolSources` | Map of wire name → editable source path. Registered after the baseline/presets and before `tools`; each revision is inspectable through `toolSource()`/`toolSources()`. |
+| `toolFolders` | Ordered external folders scanned recursively for `*.tool.ts` modules. Absolute or cwd-relative; later folders win name collisions; invalid folders/modules fail construction. Folder code is trusted code with process permissions. |
+| `maxEnabledTools` | Maximum number of SEARCHABLE tools enabled at once (default **32**). Core tools never count. This is the persistent enabled-set bound, not a per-query match cap; `toolRequest` reports the full union in `matched` and what the bound withheld in `omitted`. |
 | `presets` | Preload `presetTools` into the registry. **True by default**; `false` starts from `tools` alone. |
 | `report.progress` | Awaited for every step — a UI or `console.log`. |
 | `plugins` | Optional programmatic extension (`createAgent`, `addTool`). |
@@ -960,7 +1024,7 @@ repeat the name inside the definition.
 | `writer.agent` | The entry agent. `writer.agent.messages` is the live transcript. |
 | `writer.agents` | Every agent, including the entry one. |
 | `writer.subagents` | The agents the primary may delegate to, keyed by name. Empty when delegation is not configured. |
-| `writer.tools` | The registered tools, including the harness-owned core `toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `agentDelegate` when it exists, `threadFork` when forks are enabled, and `actionRequest` when interaction is configured. |
+| `writer.tools` | The registered tools, including the harness-owned core `toolRequest`, `toolList`, `toolManage`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `agentDelegate` when it exists, `threadFork` when forks are enabled, and `actionRequest` when interaction is configured. |
 | `writer.discoveredTools` | Names `toolRequest` has enabled, in discovery order. Read-only copy; `reset()` empties it. |
 | `writer.toolCreate(config)` | Host-side runtime creation. Same validation/registry/budget as the model's `toolCreate`; throws `HarnessError`. |
 | `writer.executeTool(name, parameters)` | Run one registered tool directly, with this harness's context (`agent`, `agents`, `run`). The server's manual-execution path: discovery gates the model, not the operator, so an un-discovered searchable tool still runs. Reserved policy is kept (`toolCreate` registration, primary-only `agentDelegate`); an unregistered name throws, and `actionRequest`/`threadFork` are refused because they need the owning run. |

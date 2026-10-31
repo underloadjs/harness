@@ -1123,6 +1123,8 @@ describe('cross-thread chat and delegation links (R4)', () => {
         expect(seen[0]!.tools?.map((tool) => tool.name)).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',

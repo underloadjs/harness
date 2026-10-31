@@ -134,6 +134,8 @@ describe('harness', () => {
         expect(declaredNames(seen[0])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -174,6 +176,8 @@ describe('harness', () => {
         expect(declaredNames(seen[0])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -213,8 +217,8 @@ describe('harness', () => {
                 tags: ['files', 'list', 'filesystem']
             }
         ]);
-        expect(fileSearch.remaining).toBe(0);
-        expect(fileSearch.truncated).toBeUndefined();
+        expect(fileSearch.matched).toBe(1);
+        expect(fileSearch.omitted).toBe(0);
 
         // "javascript" finds the searchable syntaxCheck; core fileGlob is excluded
         // even though its description mentions JavaScript.
@@ -227,15 +231,15 @@ describe('harness', () => {
                 tags: ['code', 'syntax', 'javascript', 'python', 'validation']
             }
         ]);
-        expect(syntaxSearch.remaining).toBe(0);
-        expect(syntaxSearch.truncated).toBeUndefined();
+        expect(syntaxSearch.matched).toBe(1);
+        expect(syntaxSearch.omitted).toBe(0);
 
         expect(writer.tools.fileRead.visibility).toBe('core');
         expect(writer.tools.syntaxCheck.visibility).toBe('searchable');
     });
 
-    it('refines a broad query over independent searchable tools to reach the cap leftover', async () => {
-        // The cap test must not depend on the preset catalogue: R18 made its file
+    it('returns the whole tag union and ranks a second-tag hit first', async () => {
+        // Selection must not depend on the preset catalogue: R18 made its file
         // family core, so these fixtures are plain searchable tools. Every one has
         // the exact tag "files"; only file-f carries "write" too.
         const fixtures = ['file-a', 'file-b', 'file-c', 'file-d', 'file-e', 'file-f'].map((name) =>
@@ -264,28 +268,42 @@ describe('harness', () => {
 
         await writer('change a file');
 
-        // Cap 5 of 6: name order decides the ties, and the sixth match is only
-        // counted (never named).
+        // No five-result cap: one query enables all six (the default enabled bound
+        // is 32), in name order because every fixture is an exact tag hit.
         const broad = JSON.parse((entry.messages[2] as { content: string }).content);
-        expect(broad.enabled).toEqual(['file-a', 'file-b', 'file-c', 'file-d', 'file-e']);
-        expect(broad.remaining).toBe(1);
-        expect(broad.truncated).toBe(true);
-
-        // Adding "write" gives the omitted fixture a second hit, which is the
-        // documented tie break: it reaches the shortlist, one other drops, and the
-        // cap stays enforced.
-        const refined = JSON.parse((entry.messages[4] as { content: string }).content);
-        expect(refined.enabled).toEqual(['file-f', 'file-a', 'file-b', 'file-c', 'file-d']);
-        expect(refined.remaining).toBe(1);
-
-        // First-enabled-first order survives the refinement.
-        expect(writer.discoveredTools).toEqual([
+        expect(broad.enabled).toEqual([
             'file-a',
             'file-b',
             'file-c',
             'file-d',
             'file-e',
             'file-f'
+        ]);
+        expect(broad.matched).toBe(6);
+        expect(broad.omitted).toBe(0);
+
+        // Tag breadth remains a tiebreak: file-f has two matching query tags, so
+        // it ranks first while the full union is still returned.
+        const refined = JSON.parse((entry.messages[4] as { content: string }).content);
+        expect(refined.enabled).toEqual([
+            'file-f',
+            'file-a',
+            'file-b',
+            'file-c',
+            'file-d',
+            'file-e'
+        ]);
+        expect(refined.matched).toBe(6);
+        expect(refined.omitted).toBe(0);
+
+        // The newest selection leads the current order; all six still fit.
+        expect(writer.discoveredTools).toEqual([
+            'file-f',
+            'file-a',
+            'file-b',
+            'file-c',
+            'file-d',
+            'file-e'
         ]);
     });
 
@@ -299,6 +317,8 @@ describe('harness', () => {
         expect(Object.keys(writer.tools)).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -337,6 +357,8 @@ describe('harness', () => {
         expect(declaredNames(seen[1])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -387,6 +409,8 @@ describe('harness', () => {
         expect(declaredNames(seen[0])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -399,6 +423,8 @@ describe('harness', () => {
         expect(declaredNames(seen[1])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -648,7 +674,7 @@ describe('harness', () => {
             // so the recovery hint lists exactly those and points at toolRequest
             // for the searchable remainder.
             content:
-                'Tool "nope" is not registered. Available tools: toolRegistry, toolRequest, toolCreate, todoManage, profileManage, chapterManage, locationManage, agentManage, agentResult, threadFork, fileRead, fileWrite, fileEdit, fileGlob. Call toolRequest with capability tags to search the catalogue.'
+                'Tool "nope" is not registered. Available tools: toolRegistry, toolRequest, toolList, toolManage, toolCreate, todoManage, profileManage, chapterManage, locationManage, agentManage, agentResult, threadFork, fileRead, fileWrite, fileEdit, fileGlob. Call toolRequest with capability tags to search the catalogue.'
         });
     });
 
@@ -964,6 +990,8 @@ describe('harness', () => {
         expect(declaredNames(seen[1])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -985,6 +1013,8 @@ describe('harness', () => {
         expect(declaredNames(seen[2])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -1026,6 +1056,8 @@ describe('harness', () => {
         expect(declaredNames(seen[1])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -1045,6 +1077,8 @@ describe('harness', () => {
         expect(declaredNames(seen[3])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -1404,6 +1438,8 @@ describe('executeTool', () => {
         expect(declaredNames(seen[0])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -1426,7 +1462,8 @@ describe('executeTool', () => {
         expect(result).toMatchObject({
             enabled: [],
             tools: [],
-            remaining: 0,
+            matched: 0,
+            omitted: 0,
             alreadyAvailable: [
                 {
                     name: 'todoManage',

@@ -17,7 +17,7 @@
 
 import { afterAll, beforeAll, describe, expect, it, vi } from 'vitest';
 import { spawn, spawnSync } from 'node:child_process';
-import { syntaxCheck } from './syntaxCheck';
+import { syntaxCheck } from './syntaxCheck.tool';
 import { checkJavaScript } from './javascript';
 import { checkPython, PYTHON_CHECK_SCRIPT, PYTHON_CHECK_TIMEOUT_MS } from './python';
 import { HarnessError } from '../../util';

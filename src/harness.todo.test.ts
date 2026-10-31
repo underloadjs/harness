@@ -80,6 +80,8 @@ describe('todoManage', () => {
         expect(declaredNames(seen[0])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -172,6 +174,8 @@ describe('todoManage', () => {
         expect(declaredNames(writerSeen[0])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -186,6 +190,8 @@ describe('todoManage', () => {
         expect(declaredNames(researcherSeen[0])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -265,6 +271,8 @@ describe('todoManage', () => {
         expect(Object.keys(writer.tools)).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',

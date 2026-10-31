@@ -112,6 +112,34 @@ describe('agent profiles', () => {
     });
 });
 
+// The workspace prompt is model-visible production text, so a stale discovery
+// claim reaches every coding session. The old wording said the first toolRequest
+// returned "at most 5 best matches"; that contradicts the uncapped selectTools
+// union plus the harness's maxEnabledTools bound (harness.ts:58-67, 399-404) and
+// would teach the model to expect a page it will never receive. This pins the
+// replacement line exactly and proves the stale sentence is gone from the whole
+// composed prompt, not just from the profile object.
+describe('workspace discovery prompt', () => {
+    it('describes the uncapped selector and the newest-request enabled bound', () => {
+        // Index 1 is the discovery guideline, directly after the always-available
+        // file tools line; asserted in full so any reword is a deliberate edit.
+        expect(workspace.guidelines[1]).toBe(
+            'toolRequest returns EVERY match for the union of exact names, a name regex, and tags (best match first) - there is no five-result page. The host bounds how many searchable tools stay enabled per turn (maxEnabledTools, default 32; core tools never count), and the newest request takes precedence, displacing older enabled tools when that bound is full; `matched`/`omitted` report the full count, so ask for the capability you actually need.'
+        );
+
+        const prompt = agentInstruction(workspace).join('\n');
+
+        // The exact stale claim, in the forms the old text used.
+        expect(prompt).not.toMatch(/at most 5 best matches/);
+        expect(prompt).not.toMatch(/unless you pass a smaller limit/);
+        expect(prompt).not.toMatch(/first discovery call returns/);
+
+        // The accurate contract the model must see instead.
+        expect(prompt).toContain('maxEnabledTools, default 32');
+        expect(prompt).toContain('newest request takes precedence');
+    });
+});
+
 describe('agentInstruction', () => {
     it('composes the instruction and one guideline block', () => {
         expect(agentInstruction(summarizer)).toEqual([

@@ -25,7 +25,7 @@ import {
     COMMAND_MAX_TIMEOUT_MS,
     commandRun,
     type CommandRunParameters
-} from './commandRun';
+} from './commandRun.tool';
 import { COMMAND_STDERR_MAX_BYTES, COMMAND_STDOUT_MAX_BYTES } from './boundedText';
 import { HarnessError } from '../../util';
 

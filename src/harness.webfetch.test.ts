@@ -169,6 +169,8 @@ describe('live toolbox harness', () => {
         expect(Object.keys(writer.tools)).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -204,6 +206,8 @@ describe('live toolbox harness', () => {
         expect(declaredNames(seen[0])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -224,6 +228,8 @@ describe('live toolbox harness', () => {
         expect(declaredNames(seen[1])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -252,7 +258,8 @@ describe('live toolbox harness', () => {
                     tags: ['web', 'fetch', 'internet', 'read', 'url', 'research']
                 }
             ],
-            remaining: 0
+            matched: 1,
+            omitted: 0
         });
     });
 });

@@ -17,7 +17,7 @@ import { mkdir, mkdtemp, rm, writeFile as writeTextFile } from 'node:fs/promises
 import { join, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createToolCatalogue, createWebSearchCatalogueEntry, WEBSEARCH_UNCONFIGURED_HINT } from './harnesses';
-import { TOOL_REGISTRY_METADATA } from '../core';
+import { TOOL_REGISTRY_METADATA, TOOL_REQUEST_METADATA } from '../core';
 import { MAX_API_BODY_BYTES } from './api';
 import { createHarnessRuntime } from './runtime';
 import type { HarnessRuntime } from './runtime';
@@ -51,6 +51,8 @@ const CORE_TOOL_NAMES = [
     // registers it before every other core tool.
     'toolRegistry',
     'toolRequest',
+    'toolList',
+    'toolManage',
     'toolCreate',
     'todoManage',
     ...RECORD_TOOL_NAMES,
@@ -247,6 +249,8 @@ describe('canonical bootstrap document', () => {
             coreTools: [
                 'toolRegistry',
                 'toolRequest',
+                'toolList',
+                'toolManage',
                 'toolCreate',
                 'todoManage',
                 ...RECORD_TOOL_NAMES,
@@ -278,7 +282,7 @@ describe('canonical bootstrap document', () => {
             subagents: [],
             agents: ['demo'],
             tools: ['timeNow'],
-            coreTools: ['toolRegistry', 'toolRequest', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES, 'agentManage', 'agentResult', 'threadFork'],
+            coreTools: ['toolRegistry', 'toolRequest', 'toolList', 'toolManage', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES, 'agentManage', 'agentResult', 'threadFork'],
             builtin: true,
             editable: true
         });
@@ -348,6 +352,8 @@ describe('preset descriptor tool metadata', () => {
     const CORE_BASE = [
         'toolRegistry',
         'toolRequest',
+        'toolList',
+        'toolManage',
         'toolCreate',
         'todoManage',
         ...RECORD_TOOL_NAMES,
@@ -1100,34 +1106,15 @@ describe('all-tools manual execution', () => {
             sessionBound: true
         });
 
-        // toolRequest is exact: its schema is the R7 advertisement (five max,
-        // `limit` cap, remaining count in the description).
+        // toolRequest is exact: the same declarative copy the runtime registers
+        // (names/regex/tags, uncapped selection, per-query limit only).
         expect(core[1]).toEqual({
             name: 'toolRequest',
             group: 'Core tools',
-            description:
-                'Find tools by capability tag and enable them, and check which tools you already have. The searchable catalogue holds the list, shell, git, syntax, time, text, notes, and other tools; the everyday file tools (fileRead, fileWrite, fileEdit, fileGlob) are already available, as is webSearch when the host configured it. Pass the tags you need (for example ["files", "list"] or ["shell"] or ["git", "diff"]) and up to 5 of the closest matches become available on your next turn. The result\'s "remaining" field counts any further tools that matched but were not listed, so add a more specific tag to drill into the rest. The "alreadyAvailable" list names the tools you can call directly right now without enabling anything - for example agentDelegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. Call this before concluding that something cannot be done.',
-            tags: ['discovery', 'tools', 'catalogue'],
+            description: TOOL_REQUEST_METADATA.description,
+            tags: TOOL_REQUEST_METADATA.tags,
             visibility: 'core',
-            parameters: {
-                type: 'object',
-                properties: {
-                    tags: {
-                        type: 'array',
-                        items: { type: 'string' },
-                        description: 'Capability tags to look for, e.g. ["files", "read", "shell"].'
-                    },
-                    limit: {
-                        type: 'integer',
-                        minimum: 1,
-                        maximum: 5,
-                        description:
-                            'How many matches to enable: 1-5. Defaults to 5 (the maximum); a lower value gives a tighter shortlist.'
-                    }
-                },
-                required: ['tags'],
-                additionalProperties: false
-            },
+            parameters: TOOL_REQUEST_METADATA.parameters,
             availability: { state: 'available', hint: coreHint },
             sessionBound: true
         });
@@ -1135,6 +1122,8 @@ describe('all-tools manual execution', () => {
         // The rest are core-marked, session-bound, and carry a real schema.
         expect(core.slice(2)).toEqual(
             [
+                'toolList',
+                'toolManage',
                 'toolCreate',
                 'todoManage',
                 ...RECORD_TOOL_NAMES,
@@ -1338,7 +1327,8 @@ describe('all-tools manual execution', () => {
                         tags: ['time', 'clock', 'date']
                     }
                 ],
-                remaining: 0
+                matched: 1,
+                omitted: 0
             },
             durationMs: expect.any(Number)
         });
@@ -2157,6 +2147,8 @@ describe('harness registry over HTTP', () => {
             coreTools: [
                 'toolRegistry',
                 'toolRequest',
+                'toolList',
+                'toolManage',
                 'toolCreate',
                 'todoManage',
                 ...RECORD_TOOL_NAMES,
@@ -2447,6 +2439,8 @@ describe('harness registry over HTTP', () => {
             coreTools: [
                 'toolRegistry',
                 'toolRequest',
+                'toolList',
+                'toolManage',
                 'toolCreate',
                 'todoManage',
                 ...RECORD_TOOL_NAMES,
@@ -2597,6 +2591,8 @@ describe('harness registry over HTTP', () => {
         expect(live.body.harness.coreTools).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             ...RECORD_TOOL_NAMES,

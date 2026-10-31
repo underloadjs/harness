@@ -33,29 +33,29 @@
 //     case aliases, symlink aliases, aliased roots) cannot slip through;
 //   - ./bounded-regex — content matching inside node:vm with a timeout, so a
 //     catastrophic pattern fails instead of hanging the process.
-export { fileRead } from './fileRead';
-export type { FileReadEntry, FileReadParameters, FileReadResult, FileReadTarget } from './fileRead';
-export { fileWrite } from './fileWrite';
+export { fileRead } from './fileRead.tool';
+export type { FileReadEntry, FileReadParameters, FileReadResult, FileReadTarget } from './fileRead.tool';
+export { fileWrite } from './fileWrite.tool';
 export type {
     FileWriteEntry,
     FileWriteParameters,
     FileWriteResult,
     FileWriteResultEntry
-} from './fileWrite';
-export { fileEdit } from './fileEdit';
+} from './fileWrite.tool';
+export { fileEdit } from './fileEdit.tool';
 export type {
     FileEditEntry,
     FileEditParameters,
     FileEditResult,
     FileEditResultEntry
-} from './fileEdit';
-export { fileList, FILE_LIST_CONTENT_BUDGET, FILE_LIST_DEFAULT_LIMIT, FILE_LIST_MAX_LIMIT } from './fileList';
-export type { FileListParameters, FileListQuery, FileListResult } from './fileList';
-export { fileGlob, FILE_GLOB_CONTENT_BUDGET, FILE_GLOB_MATCH_TEXT_BYTES } from './fileGlob';
+} from './fileEdit.tool';
+export { fileList, FILE_LIST_CONTENT_BUDGET, FILE_LIST_DEFAULT_LIMIT, FILE_LIST_MAX_LIMIT } from './fileList.tool';
+export type { FileListParameters, FileListQuery, FileListResult } from './fileList.tool';
+export { fileGlob, FILE_GLOB_CONTENT_BUDGET, FILE_GLOB_MATCH_TEXT_BYTES } from './fileGlob.tool';
 export type {
     FileGlobFilesResult,
     FileGlobMatch,
     FileGlobMatchesResult,
     FileGlobParameters,
     FileGlobResult
-} from './fileGlob';
+} from './fileGlob.tool';

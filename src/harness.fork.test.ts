@@ -183,6 +183,8 @@ describe('threadFork runtime', () => {
         expect(toolNames(seen[seen.length - 1])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',

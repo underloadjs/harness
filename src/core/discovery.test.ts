@@ -8,6 +8,10 @@
 import { describe, expect, it } from 'vitest';
 import { searchTools, tool } from '@underload/harness';
 import type { ToolVisibility } from '@underload/harness';
+// The new selector is exercised at the engine boundary directly: the package root
+// export is wired by the integration change, while this file owns the engine's
+// exact behaviour and must not depend on that wiring.
+import { selectTools } from './discovery';
 
 const make = (
     name: string,
@@ -388,5 +392,276 @@ describe('searchTools with declared core tools', () => {
         const result = searchTools([], [], undefined, 0, { declared: [delegate] });
 
         expect(result).toEqual({ enabled: [], tools: [], remaining: 0, availableTags: [] });
+    });
+});
+
+// selectTools() - explicit names / regex / tags for the configurable tool
+// surface. Unlike searchTools there is no five-match cap and no paging: the
+// selector returns the whole union and the harness applies the per-turn enable
+// cap. Exact-name matching is case-sensitive; regexes compile through RegExp, so
+// an invalid source or flag set is a clear error rather than a silent empty result.
+describe('selectTools', () => {
+    it('selects exact names case-sensitively in the order the caller listed them', () => {
+        const alpha = make('alpha', ['files']);
+        const beta = make('beta', ['shell']);
+
+        // Query order is preserved for exact names: the caller asked for beta
+        // first, so beta is first. Nothing fuzzy matches "alph".
+        expect(selectTools([alpha, beta], { names: ['beta', 'alpha'] })).toEqual({
+            names: ['beta', 'alpha'],
+            tools: [
+                { name: 'beta', description: 'beta capability.', tags: ['shell'] },
+                { name: 'alpha', description: 'alpha capability.', tags: ['files'] }
+            ]
+        });
+
+        // Case is significant: ALPHA is not the registered alpha.
+        expect(selectTools([alpha, beta], { names: ['ALPHA'] })).toEqual({
+            names: [],
+            tools: []
+        });
+        expect(selectTools([alpha, beta], { names: ['alph'] })).toEqual({
+            names: [],
+            tools: []
+        });
+    });
+
+    it('matches a name regex and accepts the /source/flags literal form', () => {
+        const read = make('fileRead', ['files']);
+        const write = make('fileWrite', ['files']);
+        const shell = make('shellRun', ['shell']);
+
+        // Case-insensitive literal: only fileRead matches the anchored source.
+        expect(selectTools([write, read, shell], { regex: '/^fileread$/i' })).toEqual({
+            names: ['fileRead'],
+            tools: [{ name: 'fileRead', description: 'fileRead capability.', tags: ['files'] }]
+        });
+
+        // A bare source is also accepted; both file tools match, name order wins.
+        expect(selectTools([write, read, shell], { regex: '^file' }).names).toEqual([
+            'fileRead',
+            'fileWrite'
+        ]);
+    });
+
+    it('resets a global/sticky regex between names so one hit cannot hide the next', () => {
+        // RegExp.test is stateful with /g: without resetting lastIndex, the second
+        // tool would be skipped even though it matches the same pattern.
+        const tools = [make('tool-a', ['files']), make('tool-b', ['files'])];
+
+        expect(selectTools(tools, { regex: '/^tool-/g' }).names).toEqual(['tool-a', 'tool-b']);
+    });
+
+    it('throws a clear error for invalid or empty regex input', () => {
+        expect(() => selectTools([], { regex: '[' })).toThrow(/Invalid tool selection regex/);
+        expect(() => selectTools([], { regex: '/foo/z' })).toThrow(/Invalid tool selection regex/);
+        expect(() => selectTools([], { regex: '' })).toThrow(/pattern must not be empty/);
+        expect(() => selectTools([], { regex: '//' })).toThrow(/pattern must not be empty/);
+    });
+
+    it('returns no matches for an empty query', () => {
+        const tools = [make('alpha', ['files'])];
+
+        expect(selectTools(tools, {})).toEqual({ names: [], tools: [] });
+        expect(selectTools(tools, { names: [], tags: [] })).toEqual({ names: [], tools: [] });
+        expect(selectTools(tools, { names: [''], tags: ['  '] })).toEqual({
+            names: [],
+            tools: []
+        });
+    });
+
+    it('unions names, regex and tags, returning each tool once', () => {
+        const alpha = make('alpha', ['files']);
+        const beta = make('beta', ['files']);
+        const delta = make('delta', ['files']);
+        const gamma = make('gamma', ['filesystem']);
+
+        // alpha is requested by exact name (and also matches the tag), beta by
+        // regex (and also matches the tag), delta/gamma by tag only. Exact names
+        // rank first, then the regex group, then the existing tag ranking:
+        // exact "files" (4) before prefix "filesystem" (3).
+        expect(
+            selectTools([gamma, delta, beta, alpha], {
+                names: ['alpha'],
+                regex: '^beta$',
+                tags: ['files']
+            }).names
+        ).toEqual(['alpha', 'beta', 'delta', 'gamma']);
+    });
+
+    it('keeps the existing tag ranking: exact, prefix, substring, name hit', () => {
+        const exact = make('exact', ['files']);
+        const prefix = make('prefix', ['filesystem']);
+        const substring = make('substring', ['myfiles']);
+        const named = make('named-files', ['unrelated'], { description: 'Unrelated.' });
+
+        expect(selectTools([named, substring, prefix, exact], { tags: ['files'] }).names).toEqual([
+            'exact',
+            'prefix',
+            'substring',
+            'named-files'
+        ]);
+    });
+
+    it('uses tag breadth only as a tiebreak, as searchTools does', () => {
+        const both = make('both', ['files', 'read']);
+        const one = make('one', ['files']);
+
+        // Both score 4 through "files"; "both" also matched "read".
+        expect(selectTools([one, both], { tags: ['files', 'read'] }).names).toEqual([
+            'both',
+            'one'
+        ]);
+    });
+
+    it('ranks regex hits by tag score before falling back to name order', () => {
+        const weak = make('toolAlpha', ['unrelated'], { description: 'Unrelated.' });
+        const strong = make('toolBeta', ['files']);
+
+        // Both match /^tool/ (group 1); strong also has the exact tag (4), weak
+        // has no tag hit (0), so the tag ranking decides within the regex group.
+        expect(selectTools([weak, strong], { regex: '^tool', tags: ['files'] }).names).toEqual([
+            'toolBeta',
+            'toolAlpha'
+        ]);
+    });
+
+    it('returns every match without the five-match discovery cap', () => {
+        const tools = Array.from({ length: 12 }, (_, index) =>
+            make(`tool-${String.fromCharCode(97 + index)}`, ['files'])
+        );
+
+        const result = selectTools(tools, { tags: ['files'] });
+        const expected = Array.from({ length: 12 }, (_, index) =>
+            `tool-${String.fromCharCode(97 + index)}`
+        );
+
+        // Twelve exact tag hits, all returned in name order. No `remaining` and no
+        // `truncated`: the selector is deliberately uncapped, and the harness owns
+        // the per-turn enable cap.
+        expect(result.names).toEqual(expected);
+        expect(result.tools.map((entry) => entry.name)).toEqual(expected);
+        expect(Object.keys(result)).toEqual(['names', 'tools']);
+    });
+
+    it('leaves excluded names out of the selectable result', () => {
+        const alpha = make('alpha', ['files']);
+        const beta = make('beta', ['files']);
+
+        expect(selectTools([alpha, beta], { tags: ['files'] }, { excludeNames: ['alpha'] })).toEqual({
+            names: ['beta'],
+            tools: [{ name: 'beta', description: 'beta capability.', tags: ['files'] }]
+        });
+
+        // Exclusion is exact and case-sensitive, like name selection.
+        expect(
+            selectTools([alpha, beta], { tags: ['files'] }, { excludeNames: ['ALPHA'] }).names
+        ).toEqual(['alpha', 'beta']);
+    });
+});
+
+// Declared core tools are already callable. selectTools reports them as
+// alreadyAvailable and never adds them to the selectable names/tools, so they
+// cannot consume the harness's per-turn enable budget.
+describe('selectTools with declared core tools', () => {
+    const delegate = make(
+        'agentDelegate',
+        ['agents', 'delegate', 'delegation', 'subagent', 'team'],
+        { visibility: 'core' }
+    );
+
+    it('reports a core tool matched by exact name without selecting it', () => {
+        expect(selectTools([], { names: ['agentDelegate'] }, { declared: [delegate] })).toEqual({
+            names: [],
+            tools: [],
+            alreadyAvailable: [
+                {
+                    name: 'agentDelegate',
+                    description: 'agentDelegate capability.',
+                    tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
+                }
+            ]
+        });
+    });
+
+    it('reports a core tool matched by name regex without selecting it', () => {
+        expect(selectTools([], { regex: '/^agentdel/i' }, { declared: [delegate] })).toEqual({
+            names: [],
+            tools: [],
+            alreadyAvailable: [
+                {
+                    name: 'agentDelegate',
+                    description: 'agentDelegate capability.',
+                    tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
+                }
+            ]
+        });
+    });
+
+    it('reports core tag hits next to a selectable match', () => {
+        const summary = make('agentSummary', ['agents', 'summary']);
+
+        expect(
+            selectTools([summary], { tags: ['agents'] }, { declared: [delegate] })
+        ).toEqual({
+            names: ['agentSummary'],
+            tools: [
+                {
+                    name: 'agentSummary',
+                    description: 'agentSummary capability.',
+                    tags: ['agents', 'summary']
+                }
+            ],
+            alreadyAvailable: [
+                {
+                    name: 'agentDelegate',
+                    description: 'agentDelegate capability.',
+                    tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
+                }
+            ]
+        });
+    });
+
+    it('never matches a declared core tool by its description', () => {
+        const reader = make('fileRead', ['files', 'read'], {
+            visibility: 'core',
+            description: 'Read a text file.'
+        });
+
+        // Name and tags only, as in searchTools: "text" appears in the description
+        // but names no declared capability.
+        expect(selectTools([], { tags: ['text'] }, { declared: [reader] })).toEqual({
+            names: [],
+            tools: []
+        });
+    });
+
+    it('does not let a declared core tool consume the uncapped selector or hide behind excludes', () => {
+        const core = make('filesCore', ['files'], { visibility: 'core' });
+        const tools = Array.from({ length: 6 }, (_, index) =>
+            make(`file-${String(index).padStart(2, '0')}`, ['files'])
+        );
+
+        const result = selectTools(
+            [core, ...tools],
+            { tags: ['files'] },
+            { declared: [core], excludeNames: [core.name] }
+        );
+
+        // The core tool is in the catalogue but is never selectable. The exclusion
+        // applies to the selectable list only, so the alreadyAvailable report still
+        // tells the caller the capability is present.
+        expect(result.names).toEqual([
+            'file-00',
+            'file-01',
+            'file-02',
+            'file-03',
+            'file-04',
+            'file-05'
+        ]);
+        expect(result.tools.map((entry) => entry.name)).toEqual(result.names);
+        expect(result.alreadyAvailable).toEqual([
+            { name: 'filesCore', description: 'filesCore capability.', tags: ['files'] }
+        ]);
     });
 });

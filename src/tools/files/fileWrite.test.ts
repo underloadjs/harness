@@ -28,7 +28,7 @@ import {
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { toolParameterKey } from '../../core';
-import { fileWrite } from './fileWrite';
+import { fileWrite } from './fileWrite.tool';
 
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../../Temp', import.meta.url));
 

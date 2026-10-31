@@ -55,32 +55,30 @@
 // the tool session-bound. The harness-owned tools below are the session-bound set,
 // and the server gates only those on a sessionId.
 //
-// toolRequest is itself core and is always registered here. It ranks the catalogue
-// against the tags the model passes (core/discovery), enables the best matches,
-// and the next request declares them. Ranking is OR-style — a tool needs only one
-// query tag to be a candidate, and its rank is its best single-tag score — so the
-// order is deterministic and a broad tool cannot outrank an exact tag hit.
-// Matches are capped at MAX_DISCOVERY_MATCHES (5) per request (R7): the model may
-// pass a SMALLER `limit`, never a larger one, and the result reports `remaining`
-// — the count of additional tools that matched but were not listed. Refining the
-// tags is the main way to drill deeper, and (R12) repeating the SAME query
-// advances to the next capped tranche: the harness tracks an offset per identical
-// query (normalized tags + limit), so the omitted tail is reachable instead of the
-// cap being a stationary dead end. `remaining` always counts the matches still
-// unseen AFTER the returned page. Undiscovered tools are not callable, so the model
-// cannot skip discovery by guessing a name. The enabled set is per harness and
-// survives across calls (turns), so a capability discovered once stays declared
+// toolRequest is itself core and is always registered here. It selects the UNION
+// of exact `names`, a name `regex`, and capability `tags` (core/discovery's
+// selectTools), enables the matches, and the next request declares them. There is
+// no five-result cap: selection returns every match, and `maxEnabledTools` (default
+// 32) bounds the persistent SEARCHABLE enabled set at the model-turn boundary.
+// `matched` is the whole union, `enabled`/`tools` are what the bound admitted, and
+// `omitted` is the difference. `limit` narrows only the current query. Undiscovered
+// tools are not callable, so the model cannot skip discovery by guessing a name.
+// The enabled set is per harness and survives across calls (turns), so a capability
+// discovered once stays declared across turns until it is displaced (the newest
+// request takes precedence when `maxEnabledTools` is full, reported as `evicted`) or
 // until reset().
 //
 // A query that names an already-declared CORE capability is answered too: the
 // result's `alreadyAvailable` lists those tools (metadata only) so the model does
 // not conclude "no match" for something it can call directly, and such a tag is not
-// reported in `unmatchedTags`. Nothing is enabled for them and the 5-match budget
-// is untouched. The list is the caller's own view: a subagent never sees
+// reported in `unmatchedTags`. Nothing is enabled for them and the searchable
+// bound is untouched. The list is the caller's own view: a subagent never sees
 // agentDelegate there, and a harness without subagents never has it to report.
 //
 // Harness-owned names sit outside that scheme:
 //   - toolRequest  — discovery, described above.     (every agent, core)
+//   - toolList     — name+description registry view. (every agent, core)
+//   - toolManage   — source/path/edit/reload.        (every agent, core)
 //   - toolCreate   — compile-and-register a tool.    (every agent, core)
 //   - todoManage   — the session todo list.          (every agent, core)
 //   - profileManage — session character profiles.    (every agent, core)
@@ -245,7 +243,7 @@ import { HarnessError, isInstanceOf, toErrorInfo } from './util';
 import {
     agent as createAgent,
     tool as defineTool,
-    searchTools,
+    selectTools,
     normalizeTags,
     toolUiOf,
     resolveToolParameters,
@@ -263,9 +261,19 @@ import {
     readHarnessSnapshot,
     TOOL_CREATE_METADATA,
     TOOL_CREATE_NAME,
+    TOOL_LIST_METADATA,
+    TOOL_LIST_NAME,
+    TOOL_MANAGE_METADATA,
+    TOOL_MANAGE_NAME,
     TOOL_REGISTRY_METADATA,
     TOOL_REGISTRY_NAME,
     prepareToolCandidate,
+    deleteToolSourceFile,
+    discoverToolFolderSources,
+    readToolSourceFile,
+    resolveToolFolderTarget,
+    resolveToolFolders,
+    writeToolSourceFile,
     AGENT_DELEGATE_NAME,
     AGENT_MANAGE_METADATA,
     AGENT_MANAGE_NAME,
@@ -359,6 +367,8 @@ import type {
     HarnessToolCall,
     HarnessToolCallOptions,
     HarnessToolOutcome,
+    HarnessToolListEntry,
+    HarnessToolManageParameters,
     HarnessToolRegistrationCandidate,
     HarnessToolRegistrationResult,
     HarnessToolSource,
@@ -369,7 +379,6 @@ import type {
     ToolCreation,
     ToolCreationPolicy,
     ToolCreationResult,
-    ToolSearchResult,
     ToolUiPanel
 } from './types';
 import type { PreparedTool, ToolSourceRecord } from './core';
@@ -388,6 +397,25 @@ const DEFAULT_MAX_ITERATIONS = 16;
 // model decides, via toolCancel). Configurable through `wakeIntervalMs` so tests
 // can exercise it in milliseconds; the timer exists only while work is pending.
 const DEFAULT_WAKE_INTERVAL_MS = 600_000;
+
+// Bound on the enabled SEARCHABLE set. The old toolRequest capped a single call at
+// five and accumulated forever; selection is now uncapped and this configured
+// bound is the context guard. Core tools never count. 32 is deliberately larger
+// than the old per-call page so one explicit query can surface a real capability
+// family, while still bounding declarations on every request.
+const DEFAULT_MAX_ENABLED_TOOLS = 32;
+
+const resolveMaxEnabledTools = (value: number | undefined): number => {
+    if (value === undefined) return DEFAULT_MAX_ENABLED_TOOLS;
+
+    if (!Number.isSafeInteger(value) || value < 1) {
+        throw new HarnessError(
+            `maxEnabledTools must be a positive safe integer; received ${String(value)}.`
+        );
+    }
+
+    return value;
+};
 
 const resolveWakeInterval = (value: number | undefined): number => {
     if (value === undefined) return DEFAULT_WAKE_INTERVAL_MS;
@@ -486,6 +514,10 @@ const parseToolCallArguments = (
 // The discovery entry point. The harness owns this name: the whole visibility
 // scheme depends on there being exactly one tool that can enable the rest.
 const TOOL_REQUEST = TOOL_REQUEST_NAME;
+// Inventory + active management. Both are always-registered core tools; management
+// mutations still flow through `acceptTool`, never a second pipeline.
+const TOOL_LIST = TOOL_LIST_NAME;
+const TOOL_MANAGE = TOOL_MANAGE_NAME;
 
 // Runtime tool creation (R2b), the session todo list, the session record tools,
 // and bounded delegation (R4). All are model-facing core tools, so their wire
@@ -616,6 +648,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // `maxCreatedTools` fails here rather than after a run has started spending.
     const toolCreation = resolveToolCreation(configuration.toolCreation);
     const maxCreatedTools = resolveMaxCreatedTools(configuration.maxCreatedTools);
+    // The enabled searchable set is bounded per turn, never per match result.
+    const maxEnabledTools = resolveMaxEnabledTools(configuration.maxEnabledTools);
+
+    // Configured external tool folders are validated before any registration, so a
+    // typo fails construction instead of after half a catalogue was published.
+    // A browser build cannot scan/compile folders; asking for one is a clear
+    // capability error, never a silent empty folder.
+    const sourceStartupSupported = supportsToolCompilation;
+    const configuredToolFolders =
+        configuration.toolFolders === undefined
+            ? []
+            : sourceStartupSupported
+              ? resolveToolFolders(configuration.toolFolders)
+              : (() => {
+                    throw new HarnessError(
+                        'toolFolders require the Node source compiler; the browser build exposes prebuilt tool definitions only.'
+                    );
+                })();
 
     // N6 fork bounds and owner interaction, both resolved before any run can
     // start. `interaction` presence is what registers actionRequest; `forks`
@@ -727,6 +777,38 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // runtime truth; these maps only feed inspection and snapshot()/restore().
     const toolSourceRecords = new Map<string, ToolSourceRecord>();
     const createdToolRecords = new Map<string, ToolCreation>();
+    // Canonical folder file that owns this tool name for future persistent
+    // toolManage updates. Kept SEPARATE from ToolSourceRecord.sourcePath: after a
+    // runtime-only update the captured moduleText no longer matches the disk
+    // bytes, so the source record must stay honest (no sourcePath), yet a later
+    // default update can still target the owning file. Startup folder scans and
+    // disk-backed mutations populate this map.
+    const toolOwningPaths = new Map<string, string>();
+
+    // Captured source labels are POSIX-normalized. Only an ABSOLUTE owning label
+    // can be fenced reliably; a package-relative built-in path must never be
+    // re-interpreted as a path under the first configured folder.
+    const isAbsoluteSourceLabel = (value: string): boolean =>
+        value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
+
+    // Resolve an absolute captured source path to a canonical file inside a
+    // configured folder. Relative package paths and outside paths return
+    // undefined: they are not writable owning files.
+    const fencedOwningPathOf = (sourcePath: string | undefined): string | undefined => {
+        if (
+            sourcePath === undefined ||
+            !isAbsoluteSourceLabel(sourcePath) ||
+            configuredToolFolders.length === 0
+        ) {
+            return undefined;
+        }
+
+        try {
+            return resolveToolFolderTarget(sourcePath, configuredToolFolders).path;
+        } catch {
+            return undefined;
+        }
+    };
 
     // Definitions whose declaration/execution is role-gated or runtime-special.
     // Keyed by the DEFINITION, not by name: replacing the definition drops the
@@ -777,29 +859,100 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
-    // Tools toolRequest has enabled, in discovery order. Searchable tools stay
+    // Tools toolRequest has enabled. Order is the CURRENT cap order: the newest
+    // selection's matches first, then retained prior entries. Searchable tools stay
     // in the registry but are not declared — and not callable — until they land
-    // here. Core tools bypass the set entirely. The set is per harness, so a
-    // discovered tool stays available for the rest of the conversation.
+    // here. Core tools never enter this set and never occupy a cap slot.
     const activeTools = new Set<string>();
 
-    // Progressive discovery (R12). The cap keeps one query to five matches, so a
-    // broad query used to be stationary: the omitted tail was unreachable. This
-    // map remembers, per identical query (normalized tags + limit), how many ranked
-    // matches have already been shown, so repeating the query returns the NEXT
-    // tranche. It is harness state, cleared by reset() with the discovery set.
+    // A name may occupy a searchable cap slot only while it resolves to a live,
+    // non-core, non-pending-only definition. This one predicate is shared by
+    // enablement, declarations, authorization, snapshot, and restore so those
+    // views can never disagree.
+    const occupiesSearchableSlot = (name: string): boolean => {
+        const definition = tools[name];
+        return (
+            definition !== undefined &&
+            definition.visibility !== 'core' &&
+            !pendingOnlyDefinitions.has(definition)
+        );
+    };
+
+    const activeSearchableNames = (): string[] =>
+        [...activeTools].filter(occupiesSearchableSlot);
+
+    // The authoritative capped set. Order is already newest-selection-first, so
+    // an over-cap legacy snapshot is trimmed from the FRONT (the newest retained
+    // entries), not from the tail.
+    const currentEnabledNames = (): string[] =>
+        activeSearchableNames().slice(0, maxEnabledTools);
+
+    const currentEnabledSet = (): Set<string> => new Set(currentEnabledNames());
+
+    // Replace the set with an already ordered list. Defensive validation keeps a
+    // stale/invalid snapshot name out of declarations and authorization.
+    const setActiveTools = (names: readonly string[]): void => {
+        activeTools.clear();
+
+        for (const name of names) {
+            if (!occupiesSearchableSlot(name)) continue;
+            if (activeTools.size >= maxEnabledTools) break;
+            activeTools.add(name);
+        }
+    };
+
+    // Legacy snapshot compatibility. The old selector paged a five-match cap with
+    // a per-query offset; selectTools is uncapped, so no new offset is recorded.
+    // The field remains in snapshots (empty here) so older readers keep their
+    // exact shape and a restored old snapshot's offsets are harmlessly accepted.
     const discoveryOffsets = new Map<string, number>();
 
-    // Key that makes "the same query" exact: normalized and ORDER-INDEPENDENT
-    // (two tag orders are the same question), with the limit included because a
-    // narrower shortlist is a different page size.
-    const discoveryQueryKey = (query: readonly string[], limit: number | undefined): string =>
-        JSON.stringify([[...normalizeTags(query)].sort(), limit ?? null]);
+    // Apply one selector call's ordered matches to the enabled set.
+    //
+    // Switching semantics (all selector kinds, not just exact names):
+    //   - deduplicate matches, take the first `maxEnabledTools` as the NEWEST set;
+    //   - fill any remaining capacity with retained prior entries, in their old
+    //     order;
+    //   - the resulting order is newest matches first, then retained;
+    //   - every previous entry not in the new set is explicitly reported as
+    //     evicted, and selector matches beyond the cap are omitted.
+    //
+    // `enabled` contains only the current call's matches that got a slot (not the
+    // retained prior entries); `retained` exposes those prior entries for callers
+    // that need the full active set.
+    const enableTools = (
+        names: readonly string[]
+    ): { enabled: string[]; omitted: string[]; evicted: string[]; retained: string[] } => {
+        const selected: string[] = [];
+        const omitted: string[] = [];
+        const seen = new Set<string>();
 
-    const enableTools = (names: readonly string[]): void => {
         for (const name of names) {
-            if (tools[name]) activeTools.add(name);
+            if (!occupiesSearchableSlot(name) || seen.has(name)) continue;
+            seen.add(name);
+
+            if (selected.length < maxEnabledTools) selected.push(name);
+            else omitted.push(name);
         }
+
+        const previous = currentEnabledNames();
+        const selectedSet = new Set(selected);
+        const retained = previous
+            .filter((name) => !selectedSet.has(name))
+            .slice(0, maxEnabledTools - selected.length);
+        const retainedSet = new Set(retained);
+        const next = [...selected, ...retained];
+
+        setActiveTools(next);
+
+        const result = currentEnabledSet();
+
+        return {
+            enabled: selected.filter((name) => result.has(name)),
+            omitted,
+            evicted: previous.filter((name) => !result.has(name) && !retainedSet.has(name)),
+            retained: retained.filter((name) => result.has(name))
+        };
     };
 
     // The core tools a given agent may actually see: every 'core' definition, minus
@@ -973,7 +1126,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // The synchronous commit half. Returns everything the public paths need.
     const acceptTool = (
         intent: RegistrationIntent,
-        options: { record?: ToolCreation | false; baseline?: boolean } = {}
+        options: {
+            record?: ToolCreation | false;
+            baseline?: boolean;
+            // A folder-backed toolManage mutation: disk is the persistence source,
+            // so it must not enter createdToolRecords or spend the creation budget.
+            diskBacked?: boolean;
+            // toolManage persist:"runtime" update: the old owning path remains a
+            // useful future target even though this revision's bytes are not disk.
+            preserveOwningPath?: boolean;
+        } = {}
     ): { prepared: PreparedTool; result: HarnessToolRegistrationResult } => {
         // 1. CAPTURE + COMPILE + LOAD + VALIDATE. Nothing below runs on failure.
         const prepared =
@@ -992,6 +1154,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             !existed &&
             !startupPhase &&
             options.baseline !== true &&
+            options.diskBacked !== true &&
             intent.countAgainstBudget !== false &&
             createdTools >= maxCreatedTools
         ) {
@@ -1010,32 +1173,67 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             toolSourceRecords.delete(name);
         }
 
+        // Owning-path association is separate from the captured revision. A
+        // folder-backed registration (startup scan or disk-backed mutation) sets
+        // it; an explicit runtime-only toolManage update preserves it; any other
+        // replacement detaches the name because its current revision no longer
+        // originates from that file.
+        if (options.preserveOwningPath !== true) {
+            const owningPath = fencedOwningPathOf(prepared.record.sourcePath);
+
+            if (owningPath === undefined) toolOwningPaths.delete(name);
+            else toolOwningPaths.set(name, owningPath);
+        }
+
         // 4. Persistence bookkeeping. A source registration is recorded when it
         // creates a new name or replaces a previously-created tool; replacing a
         // baseline preset/core tool remains runtime-only (the existing persistence
         // contract does not require carrying built-in replacements across restart).
         if (!startupPhase && options.baseline !== true) {
-            if (options.record !== undefined && options.record !== false) {
-                // Persist a legacy creation only when it owns the name. Replacing a
-                // baseline preset/core tool is runtime-only: recording it would make
-                // a snapshot restore collide with the fresh harness's baseline.
-                if (!existed || replacingCreated) {
-                    createdToolRecords.set(name, cloneToolCreation(options.record));
+            if (options.diskBacked === true) {
+                // Disk is the source of truth: a restart re-scans toolFolders, so a
+                // folder-backed tool must NOT also live in createdToolRecords (that
+                // would duplicate the baseline on restore) or spend maxCreatedTools.
+                // If this persistent edit takes ownership of a previously
+                // runtime-created name, drop that record; createdTools is a lifetime
+                // budget/record-count pair, so decrement it to keep snapshot
+                // validation (and future creations) consistent.
+                if (replacingCreated) {
+                    createdToolRecords.delete(name);
+                    createdTools = Math.max(0, createdTools - 1);
                 }
-            } else if (prepared.record.format === 'module' || prepared.record.source !== undefined) {
-                if (!existed || replacingCreated) {
-                    createdToolRecords.set(name, creationRecordOf(prepared));
+            } else {
+                if (options.record !== undefined && options.record !== false) {
+                    // Persist a legacy creation only when it owns the name. Replacing a
+                    // baseline preset/core tool is runtime-only: recording it would make
+                    // a snapshot restore collide with the fresh harness's baseline.
+                    if (!existed || replacingCreated) {
+                        createdToolRecords.set(name, cloneToolCreation(options.record));
+                    }
+                } else if (
+                    prepared.record.format === 'module' ||
+                    prepared.record.source !== undefined
+                ) {
+                    if (!existed || replacingCreated) {
+                        createdToolRecords.set(name, creationRecordOf(prepared));
+                    }
                 }
+                // A definition replacement of a created tool keeps the old persisted
+                // revision: runtime-only replacements are not promised across restart,
+                // and dropping the record would desynchronise createdToolCount.
+
+                if (!existed && intent.countAgainstBudget !== false) createdTools++;
             }
-            // A definition replacement of a created tool keeps the old persisted
-            // revision: runtime-only replacements are not promised across restart,
-            // and dropping the record would desynchronise createdToolCount.
 
-            if (!existed && intent.countAgainstBudget !== false) createdTools++;
-
-            // A newly registered/replaced tool is immediately usable by the
-            // registering agent without another discovery round.
-            if (!existed || prepared.tool.visibility !== 'core') activeTools.add(name);
+            // A newly registered/replaced searchable tool is immediately usable by
+            // the registering agent. Disk-backed mutations are calls too, so they
+            // follow the same newest-first capped switch as toolRequest.
+            if (prepared.tool.visibility === 'core') {
+                // Core tools are always declared and never occupy a cap slot.
+                activeTools.delete(name);
+            } else {
+                enableTools([name]);
+            }
 
             notifyStateChange('tool_create', { tool: name });
         }
@@ -1071,8 +1269,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // false; Node exports true even when its editable roots are missing, so a
     // mispackaged Node build FAILS startup compilation instead of silently using
     // prepared definitions. Runtime source registration always goes through
-    // prepareToolCandidate and fails actionable when unsupported.
-    const sourceStartupSupported = supportsToolCompilation;
+    // prepareToolCandidate and fails actionable when unsupported. This is resolved
+    // near the top (before folder validation) and reused here.
 
     const registerBaselineSource = (
         intent: RegistrationIntent,
@@ -1108,6 +1306,540 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             .filter((record): record is ToolSourceRecord => record !== undefined)
             .map(cloneToolSourceRecord);
 
+    // -----------------------------------------------------------------------
+    // toolList / toolManage runtime
+    // -----------------------------------------------------------------------
+    //
+    // toolList is intentionally a registry projection with ONLY name+description.
+    // It answers "what exists?" without implying that a searchable tool is
+    // enabled/callable; toolRequest is still the grant, and toolManage carries the
+    // richer metadata/source view.
+    const listToolsFor = (): HarnessToolListEntry[] =>
+        Object.keys(tools).map((name) => ({
+            name,
+            description: tools[name].description
+        }));
+
+    // Slash-normalized inspectable path (the same spelling source records use).
+    const toPosixPath = (value: string): string => value.replace(/\\/g, '/');
+
+    const toolDetailsFor = (name: string): Record<string, unknown> => {
+        const definition = tools[name];
+
+        if (definition === undefined) {
+            throw new HarnessError(
+                `Tool "${name}" is not registered in this harness. Use operation "list" for the inventory.`
+            );
+        }
+
+        const record = toolSourceRecords.get(name);
+        // Safe cloned schema: a caller must never be able to mutate the installed
+        // schema through a details inspection.
+        const parameters =
+            definition.parameters === undefined
+                ? undefined
+                : (JSON.parse(JSON.stringify(definition.parameters)) as Record<string, unknown>);
+        // A runtime-only update detaches the captured revision from disk, but the
+        // owning folder file is still the future persistence target. Report it
+        // separately so the association is visible without claiming bytes match.
+        const owningPath = toolOwningPaths.get(name);
+
+        return {
+            name,
+            description: definition.description,
+            tags: [...definition.tags],
+            visibility: definition.visibility,
+            enabled:
+                definition.visibility === 'core' ||
+                currentEnabledSet().has(definition.name),
+            hasSource: record !== undefined,
+            ...(parameters === undefined ? {} : { parameters }),
+            ...(record?.sourcePath === undefined ? {} : { sourcePath: record.sourcePath }),
+            // Suppressed only when the captured revision already reports the same
+            // disk path; after a runtime-only update (no sourcePath) it is the
+            // extra association worth reporting.
+            ...(owningPath === undefined ||
+            (record?.sourcePath !== undefined &&
+                toPosixPath(owningPath) === toPosixPath(record.sourcePath))
+                ? {}
+                : { owningPath: toPosixPath(owningPath) }),
+            ...(record?.revision === undefined ? {} : { revision: record.revision }),
+            ...(record?.format === undefined ? {} : { format: record.format }),
+            ...(record?.checks === undefined ? {} : { checks: [...record.checks] })
+        };
+    };
+
+    const toolSourceForManage = (name: string): Record<string, unknown> => {
+        const record = toolSourceRecords.get(name);
+
+        if (record === undefined) {
+            throw new HarnessError(
+                `Tool "${name}" has no editable source revision. It was registered from a prepared definition; configure a source entry or create/update one first.`
+            );
+        }
+
+        const inspection = cloneToolSourceRecord(record);
+
+        return {
+            name,
+            ...(inspection.sourcePath === undefined ? {} : { sourcePath: inspection.sourcePath }),
+            ...(inspection.moduleText === undefined
+                ? {}
+                : { moduleText: inspection.moduleText }),
+            ...(inspection.source === undefined ? {} : { source: inspection.source }),
+            dependencies: inspection.dependencies,
+            format: inspection.format,
+            revision: inspection.revision,
+            checks: [...inspection.checks]
+        };
+    };
+
+    // One mutation candidate from toolManage parameters. Metadata overrides are
+    // applied exactly as they are for toolRegistry/toolCreate, and the shared
+    // kernel validates the resulting contract before publication.
+    const manageCandidate = (
+        parameters: HarnessToolManageParameters,
+        sourcePath?: string,
+        moduleText?: string
+    ): HarnessToolRegistrationCandidate => ({
+        ...(parameters.name === undefined ? {} : { name: parameters.name }),
+        ...(parameters.description === undefined
+            ? {}
+            : { description: parameters.description }),
+        ...(parameters.tags === undefined ? {} : { tags: parameters.tags }),
+        ...(parameters.parameters === undefined
+            ? {}
+            : { parameters: parameters.parameters }),
+        ...(parameters.visibility === undefined
+            ? {}
+            : { visibility: parameters.visibility }),
+        ...(sourcePath === undefined ? {} : { sourcePath }),
+        ...(moduleText === undefined ? {} : { moduleText }),
+        // Captured dependencies belong to moduleText only; a disk path reads its
+        // real local graph and the kernel rejects the hybrid shape.
+        ...(moduleText !== undefined && parameters.dependencies !== undefined
+            ? { dependencies: parameters.dependencies }
+            : {})
+    });
+
+    // Persisted create/update target selection. "folder" is the default. A create
+    // without a path writes <name>.tool.ts in the LAST configured folder (later
+    // folders win startup collisions). An update without a path only reuses the
+    // tool's captured absolute owning path when it is inside a configured folder.
+    const persistentTargetFor = (
+        values: HarnessToolManageParameters,
+        operation: 'create' | 'update'
+    ): { path: string; folder: string; rejectExisting: boolean; requireExisting: boolean } => {
+        if (configuredToolFolders.length === 0) {
+            throw new HarnessError(
+                `toolManage ${operation} cannot persist: no toolFolders are configured. Add a toolFolders entry or pass persist: "runtime".`
+            );
+        }
+
+        if (values.path !== undefined) {
+            if (typeof values.path !== 'string' || values.path.length === 0) {
+                throw new HarnessError('toolManage `path` must be a non-empty string.');
+            }
+
+            const target = resolveToolFolderTarget(
+                values.path,
+                configuredToolFolders,
+                values.folder
+            );
+
+            return {
+                ...target,
+                rejectExisting: operation === 'create',
+                // Explicit update semantics stay strict: the named file must exist.
+                requireExisting: operation === 'update'
+            };
+        }
+
+        if (values.folder !== undefined) {
+            throw new HarnessError(
+                'toolManage `folder` requires an explicit `path`; a pathless create targets the last configured folder.'
+            );
+        }
+
+        if (typeof values.name !== 'string' || values.name.length === 0) {
+            throw new HarnessError(
+                `toolManage ${operation} without a path requires an explicit \`name\`.`
+            );
+        }
+
+        if (operation === 'create') {
+            if (!WIRE_NAME_PATTERN.test(values.name)) {
+                throw new HarnessError(
+                    `Tool name "${values.name}" is not safe for a *.tool.ts file name; use a letter followed by letters, digits, "_" or "-", at most 64 characters.`
+                );
+            }
+
+            const lastFolder = configuredToolFolders[configuredToolFolders.length - 1];
+            const target = resolveToolFolderTarget(
+                `${values.name}.tool.ts`,
+                configuredToolFolders,
+                lastFolder
+            );
+
+            return {
+                ...target,
+                rejectExisting: true,
+                requireExisting: false
+            };
+        }
+
+        // Prefer the owning-path association (survives a runtime-only update),
+        // then the captured revision's absolute sourcePath.
+        const owning = toolOwningPaths.get(values.name);
+        const record = toolSourceRecords.get(values.name);
+        const candidate = owning ?? fencedOwningPathOf(record?.sourcePath);
+
+        if (candidate === undefined) {
+            if (record?.sourcePath !== undefined && !isAbsoluteSourceLabel(record.sourcePath)) {
+                throw new HarnessError(
+                    `Tool "${values.name}" is backed by package source "${record.sourcePath}", not a configured toolFolders file. Pass an explicit \`path\` inside toolFolders or use persist: "runtime".`
+                );
+            }
+
+            throw new HarnessError(
+                `Tool "${values.name}" has no folder-backed owning source path. Pass an explicit \`path\` inside toolFolders or use persist: "runtime".`
+            );
+        }
+
+        const target = resolveToolFolderTarget(candidate, configuredToolFolders);
+
+        return {
+            ...target,
+            rejectExisting: false,
+            // A pathless update may recreate a missing owning file; the disk path
+            // itself is the intended persistence target.
+            requireExisting: false
+        };
+    };
+
+    // Write + validate + publish, preserving the old file and registry on failure.
+    // `acceptTool` is still the only publication path; diskBacked keeps the
+    // revision out of createdToolRecords and the creation budget.
+    const persistAndRegister = (
+        values: HarnessToolManageParameters,
+        operation: 'create' | 'update',
+        target: { path: string; folder: string; rejectExisting: boolean; requireExisting: boolean }
+    ): Record<string, unknown> => {
+        const existed = (() => {
+            try {
+                return readToolSourceFile(target.path);
+            } catch {
+                return undefined;
+            }
+        })();
+
+        if (target.rejectExisting && existed !== undefined) {
+            throw new HarnessError(
+                `Tool source "${target.path}" already exists; use operation "update" to overwrite it.`
+            );
+        }
+
+        if (target.requireExisting && existed === undefined) {
+            throw new HarnessError(
+                `Tool source "${target.path}" does not exist; use operation "create" first.`
+            );
+        }
+
+        try {
+            writeToolSourceFile(
+                target.path,
+                values.moduleText as string,
+                configuredToolFolders
+            );
+
+            // The compiler re-reads the written file and its real local imports;
+            // the registry publishes only after the shared validation succeeds.
+            const { result } = acceptTool(manageCandidate(values, target.path), {
+                record: false,
+                diskBacked: true
+            });
+
+            return {
+                ...result,
+                operation,
+                persisted: true,
+                path: target.path,
+                folder: target.folder
+            };
+        } catch (error) {
+            // The registry never partially published (acceptTool is atomic). Roll
+            // the file back and EXPOSE a rollback failure instead of hiding it.
+            let rollbackError: string | undefined;
+
+            try {
+                if (existed === undefined) {
+                    deleteToolSourceFile(target.path, configuredToolFolders);
+                } else {
+                    writeToolSourceFile(
+                        target.path,
+                        existed,
+                        configuredToolFolders
+                    );
+                }
+            } catch (rollbackFailure) {
+                rollbackError = toErrorInfo(rollbackFailure).message;
+            }
+
+            const primary =
+                error instanceof HarnessError
+                    ? error
+                    : new HarnessError(
+                          `Tool source "${target.path}" could not be registered: ${toErrorInfo(error).message}`,
+                          { cause: error }
+                      );
+
+            if (rollbackError !== undefined) {
+                throw new HarnessError(
+                    `${primary.message} Disk rollback also failed: ${rollbackError}`,
+                    { cause: error }
+                );
+            }
+
+            throw primary;
+        }
+    };
+
+    const manageToolFor = (
+        _caller: Agent | undefined,
+        parameters: HarnessToolManageParameters | unknown
+    ): unknown => {
+        if (parameters === null || typeof parameters !== 'object' || Array.isArray(parameters)) {
+            throw new HarnessError('toolManage requires an object with an `operation`.');
+        }
+
+        const values = parameters as HarnessToolManageParameters;
+        const operation = values.operation;
+
+        switch (operation) {
+            case 'list':
+                return {
+                    tools: Object.keys(tools).map((name) => toolDetailsFor(name))
+                };
+
+            case 'details':
+                if (typeof values.name !== 'string' || values.name.length === 0) {
+                    throw new HarnessError('toolManage details requires `name`.');
+                }
+                return toolDetailsFor(values.name);
+
+            case 'source':
+                if (typeof values.name !== 'string' || values.name.length === 0) {
+                    throw new HarnessError('toolManage source requires `name`.');
+                }
+                return toolSourceForManage(values.name);
+
+            case 'path': {
+                // Inspect the configured write fence without mutating anything.
+                if (typeof values.path === 'string' && values.path.length > 0) {
+                    if (!sourceStartupSupported) {
+                        throw new HarnessError(
+                            'toolManage path resolution requires the Node source compiler.'
+                        );
+                    }
+                    return resolveToolFolderTarget(
+                        values.path,
+                        configuredToolFolders,
+                        values.folder
+                    );
+                }
+
+                const configured =
+                    configuredToolFolders.length === 0
+                        ? { folders: [] as string[] }
+                        : { folders: [...configuredToolFolders] };
+
+                if (typeof values.name === 'string' && values.name.length > 0) {
+                    const record = toolSourceRecords.get(values.name);
+                    const owningPath = toolOwningPaths.get(values.name);
+                    const target = owningPath ?? fencedOwningPathOf(record?.sourcePath);
+
+                    // An unowned name has no installed file yet: report where a
+                    // pathless create/update WOULD write (deterministic
+                    // <name>.tool.ts in the LAST configured folder). Pure
+                    // inspection — no write, no directory creation.
+                    const createPath = ((): string | undefined => {
+                        if (target !== undefined) return undefined;
+                        if (configuredToolFolders.length === 0) return undefined;
+                        if (!WIRE_NAME_PATTERN.test(values.name as string)) return undefined;
+
+                        try {
+                            return resolveToolFolderTarget(
+                                `${values.name}.tool.ts`,
+                                configuredToolFolders,
+                                configuredToolFolders[configuredToolFolders.length - 1]
+                            ).path;
+                        } catch {
+                            return undefined;
+                        }
+                    })();
+
+                    return {
+                        ...configured,
+                        name: values.name,
+                        ...(record?.sourcePath === undefined
+                            ? {}
+                            : { sourcePath: record.sourcePath }),
+                        ...(owningPath === undefined ||
+                        (record?.sourcePath !== undefined &&
+                            toPosixPath(owningPath) === toPosixPath(record.sourcePath))
+                            ? {}
+                            : { owningPath: toPosixPath(owningPath) }),
+                        ...(createPath === undefined
+                            ? {}
+                            : { createPath: toPosixPath(createPath) })
+                    };
+                }
+
+                return configured;
+            }
+
+            case 'create':
+            case 'update': {
+                const hasModule = typeof values.moduleText === 'string';
+                const hasLegacySource = typeof values.source === 'string';
+
+                if (hasModule && hasLegacySource) {
+                    throw new HarnessError(
+                        'toolManage create/update accepts moduleText OR the legacy source body, not both.'
+                    );
+                }
+
+                if (!hasModule && !hasLegacySource) {
+                    throw new HarnessError(
+                        'toolManage create/update requires `moduleText` (or the legacy `source` body).'
+                    );
+                }
+
+                const persist = (values as { persist?: unknown }).persist ?? 'folder';
+
+                if (persist !== 'folder' && persist !== 'runtime') {
+                    throw new HarnessError(
+                        'toolManage `persist` must be "folder" or "runtime".'
+                    );
+                }
+
+                if (persist === 'runtime') {
+                    // Explicit runtime-only mode: no disk write, and path/folder are
+                    // ambiguous with it rather than silently ignored.
+                    if (values.path !== undefined || values.folder !== undefined) {
+                        throw new HarnessError(
+                            'toolManage persist: "runtime" cannot be combined with `path` or `folder`.'
+                        );
+                    }
+
+                    if (operation === 'update') {
+                        if (typeof values.name !== 'string' || values.name.length === 0) {
+                            throw new HarnessError(
+                                'toolManage update requires `name` in persist: "runtime" mode.'
+                            );
+                        }
+                        if (tools[values.name] === undefined) {
+                            throw new HarnessError(
+                                `Tool "${values.name}" is not registered; use operation "create" for a new runtime tool.`
+                            );
+                        }
+                    }
+
+                    // Runtime revisions keep the historical snapshot/budget path.
+                    // An UPDATE preserves the previous owning-path association so a
+                    // later default update can still target the folder file, while
+                    // the captured source record itself stays honest (moduleText,
+                    // no sourcePath). A runtime CREATE has no owning file.
+                    const { result } = acceptTool(
+                        hasModule
+                            ? manageCandidate(values, undefined, values.moduleText)
+                            : {
+                                  ...manageCandidate(values),
+                                  source: values.source
+                              },
+                        {
+                            record: false,
+                            preserveOwningPath: operation === 'update'
+                        }
+                    );
+
+                    return {
+                        ...result,
+                        operation,
+                        persisted: false
+                    };
+                }
+
+                // Persistent mode. Disk entries must be full modules; a legacy
+                // function body has no meaningful *.tool.ts representation.
+                if (!hasModule) {
+                    throw new HarnessError(
+                        'toolManage persistent create/update requires moduleText; a legacy function body is runtime-only (persist: "runtime").'
+                    );
+                }
+
+                const target = persistentTargetFor(values, operation);
+                return persistAndRegister(values, operation, target);
+            }
+
+            case 'reload': {
+                if (typeof values.name !== 'string' || values.name.length === 0) {
+                    throw new HarnessError('toolManage reload requires `name`.');
+                }
+
+                const record = toolSourceRecords.get(values.name);
+                if (record === undefined) {
+                    throw new HarnessError(
+                        `Tool "${values.name}" has no editable source revision to reload.`
+                    );
+                }
+
+                // Disk-backed revisions are re-read deliberately: reload means
+                // "compile what is on disk now". Captured-only revisions reuse the
+                // exact captured bytes so a deleted path cannot silently restore a
+                // different file.
+                if (record.sourcePath !== undefined && sourceStartupSupported) {
+                    const { result } = acceptTool(
+                        { name: values.name, sourcePath: record.sourcePath },
+                        { record: false }
+                    );
+                    return { ...result, operation, reloaded: true, fromDisk: true };
+                }
+
+                if (record.moduleText !== undefined) {
+                    const { result } = acceptTool(
+                        {
+                            name: values.name,
+                            moduleText: record.moduleText,
+                            ...(record.dependencies.length === 0
+                                ? {}
+                                : { dependencies: record.dependencies })
+                        },
+                        { record: false }
+                    );
+                    return { ...result, operation, reloaded: true, fromDisk: false };
+                }
+
+                if (record.source !== undefined) {
+                    const { result } = acceptTool(
+                        { name: values.name, source: record.source },
+                        { record: false }
+                    );
+                    return { ...result, operation, reloaded: true, fromDisk: false };
+                }
+
+                throw new HarnessError(
+                    `Tool "${values.name}" has no reloadable source revision.`
+                );
+            }
+
+            default:
+                throw new HarnessError(
+                    `toolManage operation ${JSON.stringify(String(operation))} is not supported. Use list, details, source, path, create, update, or reload.`
+                );
+        }
+    };
+
     // toolRegistry is registered FIRST, because the bootstrap needs a model-facing
     // entry that delegates to the kernel for every later revision. It is loaded by
     // compiling its editable source entry through registerAtStartup — the SAME
@@ -1117,7 +1849,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     registerBaselineSource(
         {
             name: TOOL_REGISTRY_NAME,
-            sourcePath: 'runtime-tools/toolRegistry.ts'
+            sourcePath: 'runtime-tools/toolRegistry.tool.ts'
         },
         () =>
             defineTool({
@@ -1138,47 +1870,99 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     // The discovery STATE/operation lives on the harness; the model-facing
     // toolRequest entry is a standalone source module compiled through the kernel.
-    // Keeping the cursor and enabled-set mutation here is what makes the source
-    // entry replaceable without losing harness state.
+    // Keeping selection, the enabled bound, and the caller-specific core view here
+    // is what makes the source entry replaceable without losing harness state.
+    //
+    // `selectTools` (core/discovery) is deliberately uncapped: exact names,
+    // name regex, and ranked tags form a UNION. This function applies the
+    // configured PER-TURN enabled bound to that union, never a five-result cap.
+    // Core tools are reported through `alreadyAvailable` and never enabled.
     const requestToolsFor = (
         caller: Agent | undefined,
-        parameters: { tags?: unknown; limit?: unknown } | unknown
-    ): ToolSearchResult => {
-        // Tolerate a bare array (a model ignoring the schema) and a missing
-        // `tags`, so a sloppy call still gets the catalogue vocabulary back.
-        const query = Array.isArray(parameters)
-            ? parameters
-            : Array.isArray((parameters as { tags?: unknown } | undefined)?.tags)
-              ? ((parameters as { tags: string[] }).tags)
-              : [];
-        const limit = Array.isArray(parameters)
-            ? undefined
-            : typeof (parameters as { limit?: unknown } | undefined)?.limit === 'number'
-              ? (parameters as { limit: number }).limit
-              : undefined;
+        parameters: { names?: unknown; regex?: unknown; tags?: unknown; limit?: unknown } | unknown
+    ): unknown => {
+        // Tolerate a bare array (a legacy/model call that sends only tags) and
+        // non-string members; selectTools performs its own query validation
+        // (including a clear error for an invalid regex).
+        const record =
+            parameters !== null && typeof parameters === 'object' && !Array.isArray(parameters)
+                ? (parameters as { names?: unknown; regex?: unknown; tags?: unknown; limit?: unknown })
+                : undefined;
 
-        // Repeat the same query to advance through the omitted tail (R12).
-        const key = discoveryQueryKey(query, limit);
-        const offset = discoveryOffsets.get(key) ?? 0;
+        const query = {
+            names: Array.isArray(record?.names)
+                ? record.names.filter((name): name is string => typeof name === 'string')
+                : [],
+            ...(typeof record?.regex === 'string' ? { regex: record.regex } : {}),
+            tags: Array.isArray(record?.tags)
+                ? record.tags.filter((tag): tag is string => typeof tag === 'string')
+                : Array.isArray(parameters)
+                  ? parameters.filter((tag): tag is string => typeof tag === 'string')
+                  : []
+        };
+
+        // `limit` narrows THIS query only. It can never raise the global enabled
+        // bound, and it does not exist as a match cap in selectTools.
+        const limit =
+            typeof record?.limit === 'number' && Number.isFinite(record.limit)
+                ? Math.max(0, Math.floor(record.limit))
+                : undefined;
 
         // Pending-only runtime controls are never discoverable: they are declared
         // only while actionable and have no catalogue identity to hand out.
         const catalogue = Object.values(tools).filter(
             (definition) => !pendingOnlyDefinitions.has(definition)
         );
-        const result = searchTools(catalogue, query, limit, offset, {
-            declared: visibleCoreTools(caller ?? primary)
-        });
-        enableTools(result.enabled);
+        const declared = visibleCoreTools(caller ?? primary);
+        const selection = selectTools(catalogue, query, { declared });
+        const narrowed =
+            limit === undefined ? selection.tools : selection.tools.slice(0, limit);
 
-        // Advance only when this page actually returned matches AND more are
-        // left; when the tail is exhausted the key is dropped so a later
-        // identical query starts a fresh first page instead of an empty one.
-        if (result.remaining > 0 && result.enabled.length > 0) {
-            discoveryOffsets.set(key, offset + result.enabled.length);
-        } else {
-            discoveryOffsets.delete(key);
+        // Enabling mutates the persistent set. The newest call's matches lead the
+        // capped set; prior entries fill leftover capacity and are evicted only when
+        // this call's ordered matches need their slots. `enabled`/`tools` are the
+        // matches from THIS call that got a slot; `evicted` names prior tools lost.
+        const enabledResult = enableTools(narrowed.map((match) => match.name));
+        const enabledSet = new Set(enabledResult.enabled);
+        const returned = narrowed.filter((match) => enabledSet.has(match.name));
+
+        // Vocabulary is only useful when nothing matched; keep the historical
+        // "retry with real tags" affordance. Only SEARCHABLE tools contribute:
+        // core tools are already declared and their tags would bloat a no-match
+        // answer with capabilities the catalogue cannot enable.
+        const availableTags =
+            selection.tools.length === 0
+                ? [
+                      ...new Set(
+                          catalogue
+                              .filter((definition) => definition.visibility === 'searchable')
+                              .flatMap((definition) => [...definition.tags])
+                      )
+                  ].sort((left, right) => left.localeCompare(right))
+                : undefined;
+
+        // A tag is unmatched only when it matches no searchable tool AND no
+        // already-declared core tool. selectTools normalizes tags the same way.
+        const unmatchedTags = normalizeTags(query.tags).filter((tag) => {
+            const single = selectTools(catalogue, { tags: [tag] }, { declared });
+            return single.names.length === 0 && (single.alreadyAvailable?.length ?? 0) === 0;
+        });
+
+        const result: Record<string, unknown> = {
+            enabled: enabledResult.enabled,
+            tools: returned,
+            // `matched` is the whole union; `tools`/`enabled` are what the bound
+            // admitted. `omitted` is the exact difference, not an arbitrary cap.
+            matched: selection.tools.length,
+            omitted: selection.tools.length - returned.length
+        };
+
+        if (unmatchedTags.length > 0) result.unmatchedTags = unmatchedTags;
+        if (availableTags !== undefined) result.availableTags = availableTags;
+        if (selection.alreadyAvailable !== undefined) {
+            result.alreadyAvailable = selection.alreadyAvailable;
         }
+        if (enabledResult.evicted.length > 0) result.evicted = enabledResult.evicted;
 
         return result;
     };
@@ -1186,12 +1970,39 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     registerBaselineSource(
         {
             name: TOOL_REQUEST,
-            sourcePath: 'runtime-tools/toolRequest.ts'
+            sourcePath: 'runtime-tools/toolRequest.tool.ts'
         },
         () =>
             defineTool({
                 ...TOOL_REQUEST_METADATA,
                 execute: (context) => requestToolsFor(context.agent, context.parameters)
+            })
+    );
+
+    // Inventory + management. Both are baseline core source entries compiled
+    // through the same kernel; a replacement (including their own source file)
+    // publishes a normal tool with its own visibility.
+    registerBaselineSource(
+        {
+            name: TOOL_LIST,
+            sourcePath: 'runtime-tools/toolList.tool.ts'
+        },
+        () =>
+            defineTool({
+                ...TOOL_LIST_METADATA,
+                execute: () => listToolsFor()
+            })
+    );
+
+    registerBaselineSource(
+        {
+            name: TOOL_MANAGE,
+            sourcePath: 'runtime-tools/toolManage.tool.ts'
+        },
+        () =>
+            defineTool({
+                ...TOOL_MANAGE_METADATA,
+                execute: (context) => manageToolFor(context.agent, context.parameters)
             })
     );
 
@@ -1270,7 +2081,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const preparedToolCreate = registerBaselineSource(
             {
                 name: TOOL_CREATE,
-                sourcePath: 'runtime-tools/toolCreate.ts'
+                sourcePath: 'runtime-tools/toolCreate.tool.ts'
             },
             () =>
                 defineTool({
@@ -1295,7 +2106,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // it together with the conversation; nothing is persisted.
     const todo = createTodoTool();
     registerBaselineSource(
-        { name: TODO_MANAGE, sourcePath: 'runtime-tools/todoManage.ts' },
+        { name: TODO_MANAGE, sourcePath: 'runtime-tools/todoManage.tool.ts' },
         () => todo.tool
     );
 
@@ -1305,19 +2116,19 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // profile id and a chapter id may both be "1" without ambiguity.
     const profile = createProfileTool();
     registerBaselineSource(
-        { name: PROFILE_MANAGE, sourcePath: 'runtime-tools/profileManage.ts' },
+        { name: PROFILE_MANAGE, sourcePath: 'runtime-tools/profileManage.tool.ts' },
         () => profile.tool
     );
 
     const chapter = createChapterTool();
     registerBaselineSource(
-        { name: CHAPTER_MANAGE, sourcePath: 'runtime-tools/chapterManage.ts' },
+        { name: CHAPTER_MANAGE, sourcePath: 'runtime-tools/chapterManage.tool.ts' },
         () => chapter.tool
     );
 
     const location = createLocationTool();
     registerBaselineSource(
-        { name: LOCATION_MANAGE, sourcePath: 'runtime-tools/locationManage.ts' },
+        { name: LOCATION_MANAGE, sourcePath: 'runtime-tools/locationManage.tool.ts' },
         () => location.tool
     );
 
@@ -1330,6 +2141,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // capability substitute: core tools also receive the full `context.harness`.
     const runtime: HarnessToolRuntime = {
         requestTools: requestToolsFor,
+        listTools: listToolsFor,
+        manageTool: manageToolFor,
         createToolForAgent,
         agentManage: () => agentManageView(),
         agentResult: (parameters: Record<string, any>) => agentResultFor(parameters),
@@ -1605,7 +2418,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     registerBaselineSource(
-        { name: AGENT_MANAGE, sourcePath: 'runtime-tools/agentManage.ts' },
+        { name: AGENT_MANAGE, sourcePath: 'runtime-tools/agentManage.tool.ts' },
         () =>
             defineTool({
                 ...AGENT_MANAGE_METADATA,
@@ -1725,7 +2538,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     registerBaselineSource(
-        { name: AGENT_RESULT, sourcePath: 'runtime-tools/agentResult.ts' },
+        { name: AGENT_RESULT, sourcePath: 'runtime-tools/agentResult.tool.ts' },
         () =>
             defineTool({
                 ...AGENT_RESULT_METADATA,
@@ -1799,7 +2612,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 description: delegateMetadata.description,
                 tags: delegateMetadata.tags,
                 parameters: delegateMetadata.parameters,
-                sourcePath: 'runtime-tools/agentDelegate.ts'
+                sourcePath: 'runtime-tools/agentDelegate.tool.ts'
             },
             () =>
                 defineTool({
@@ -1835,7 +2648,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // Their execute bodies fail loudly if some future path calls them directly.
     if (forks.enabled) {
         const threadForkDefinition = registerBaselineSource(
-            { name: THREAD_FORK, sourcePath: 'runtime-tools/threadFork.ts' },
+            { name: THREAD_FORK, sourcePath: 'runtime-tools/threadFork.tool.ts' },
             () =>
                 defineTool({
                     ...THREAD_FORK_METADATA,
@@ -1851,7 +2664,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     if (interaction !== undefined) {
         const actionRequestDefinition = registerBaselineSource(
-            { name: ACTION_REQUEST, sourcePath: 'runtime-tools/actionRequest.ts' },
+            { name: ACTION_REQUEST, sourcePath: 'runtime-tools/actionRequest.tool.ts' },
             () =>
                 defineTool({
                     ...ACTION_REQUEST_METADATA,
@@ -1871,7 +2684,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // tool that is declared according to its own visibility.
     if (tools[TOOL_CANCEL] === undefined) {
         const toolCancelDefinition = registerBaselineSource(
-            { name: TOOL_CANCEL, sourcePath: 'runtime-tools/toolCancel.ts' },
+            { name: TOOL_CANCEL, sourcePath: 'runtime-tools/toolCancel.tool.ts' },
             () =>
                 defineTool({
                     ...TOOL_CANCEL_METADATA,
@@ -1897,14 +2710,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // the compilation/loading/validation operation a runtime replacement uses.
     // `presets: false` simply skips these baseline rows.
     const PRESET_SOURCE_ENTRIES: Record<string, string> = {
-        syntaxCheck: 'tools/syntax/syntaxCheck.ts',
-        fileRead: 'tools/files/fileRead.ts',
-        fileWrite: 'tools/files/fileWrite.ts',
-        fileEdit: 'tools/files/fileEdit.ts',
-        fileList: 'tools/files/fileList.ts',
-        fileGlob: 'tools/files/fileGlob.ts',
-        commandRun: 'tools/command/commandRun.ts',
-        gitDiff: 'tools/command/gitDiff.ts'
+        syntaxCheck: 'tools/syntax/syntaxCheck.tool.ts',
+        fileRead: 'tools/files/fileRead.tool.ts',
+        fileWrite: 'tools/files/fileWrite.tool.ts',
+        fileEdit: 'tools/files/fileEdit.tool.ts',
+        fileList: 'tools/files/fileList.tool.ts',
+        fileGlob: 'tools/files/fileGlob.tool.ts',
+        commandRun: 'tools/command/commandRun.tool.ts',
+        gitDiff: 'tools/command/gitDiff.tool.ts'
     };
 
     if (configuration.presets !== false) {
@@ -1929,6 +2742,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
 
         registerAtStartup({ name, sourcePath });
+    }
+
+    // Ordered external tool folders. Files are discovered deterministically
+    // (configured folder order, then relative path) and published through the
+    // normal startup kernel, so a later folder wins a name collision. An invalid
+    // module fails construction with its exact file path; a host should never
+    // discover a half-loaded folder catalogue after a run starts.
+    if (configuredToolFolders.length > 0) {
+        for (const folderSource of discoverToolFolderSources(configuredToolFolders)) {
+            try {
+                registerAtStartup({ sourcePath: folderSource });
+            } catch (error) {
+                throw new HarnessError(
+                    `Tool folder module "${folderSource}" could not be registered: ${toErrorInfo(error).message}`,
+                    { cause: error }
+                );
+            }
+        }
     }
 
     // User-configured tools are committed AFTER the baseline and toolSources, so a
@@ -1974,7 +2805,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             registerBaselineSource(
                 {
                     name: WEB_SEARCH_TOOL_NAME,
-                    sourcePath: 'runtime-tools/webSearch.ts',
+                    sourcePath: 'runtime-tools/webSearch.tool.ts',
                     description: webSearch.description,
                     tags: webSearch.tags,
                     parameters: webSearch.parameters,
@@ -1999,7 +2830,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         registerBaselineSource(
             {
                 name: WEB_FETCH_TOOL_NAME,
-                sourcePath: 'runtime-tools/webFetch.ts',
+                sourcePath: 'runtime-tools/webFetch.tool.ts',
                 description: webFetch.description,
                 tags: webFetch.tags,
                 parameters: webFetch.parameters,
@@ -2018,13 +2849,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // the same under the 'primary' creation policy (R12). That rule lives in
     // visibleCoreTools, which toolRequest also reads — one source for both.
     const declared = (brain: Agent): Tool[] => {
-        const discovered: Tool[] = [];
-
-        for (const definition of Object.values(tools)) {
-            if (definition.visibility !== 'core' && activeTools.has(definition.name)) {
-                discovered.push(definition);
-            }
-        }
+        // "At the model-turn boundary" is exactly here: every request rebuilds this
+        // list from the SAME capped enabled set authorization reads. Core tools are
+        // never counted or truncated; the set is already newest-selection-first.
+        const discovered = currentEnabledNames()
+            .map((name) => tools[name])
+            .filter((definition): definition is Tool => definition !== undefined);
 
         return [...visibleCoreTools(brain), ...discovered];
     };
@@ -2373,8 +3203,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // Conditional baseline source entries and their order. Kept in one place so
     // createThread and restore prepare the same revisions.
     const THREAD_TOOL_SOURCES = [
-        { name: THREAD_LIST, sourcePath: 'runtime-tools/threadList.ts' },
-        { name: THREAD_SEND, sourcePath: 'runtime-tools/threadSend.ts' }
+        { name: THREAD_LIST, sourcePath: 'runtime-tools/threadList.tool.ts' },
+        { name: THREAD_SEND, sourcePath: 'runtime-tools/threadSend.tool.ts' }
     ] as const;
 
     const threadToolFallback = (name: string): Tool =>
@@ -3587,12 +4417,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return;
         }
 
-        // Discovery gates the model: a captured declaration is already authorised,
-        // otherwise the current registry entry must be core or enabled.
+        // Discovery gates the model against the CURRENT capped set, not merely the
+        // declarations captured for this request. Two same-turn tool calls run in
+        // invocation order, so a toolRequest earlier in this turn may have evicted
+        // a later call's searchable tool; that later call must then be rejected.
+        // Core tools and pending-only runtime controls are always authorized.
         if (
-            offered?.get(call.name) !== definition &&
             definition.visibility !== 'core' &&
-            !activeTools.has(call.name)
+            !pendingOnlyDefinitions.has(definition) &&
+            !currentEnabledSet().has(call.name)
         ) {
             const tags = definition.tags.slice(0, 3).map((tag) => `"${tag}"`).join(', ');
             await fail(
@@ -5479,8 +6312,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             version: HARNESS_SNAPSHOT_VERSION,
             agents: agentSnapshots,
             discovery: {
-                // Set iteration order is discovery order and must survive.
-                enabled: [...activeTools],
+                // Current capped order (newest selector matches first) survives.
+                enabled: currentEnabledNames(),
                 offsets: [...discoveryOffsets.entries()].map(([query, offset]) => ({
                     query,
                     offset
@@ -5635,8 +6468,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // the new state.
         for (const name of [...createdToolRecords.keys()]) {
             delete tools[name];
-            // A removed created tool must not leave a stale inspection record.
+            // A removed created tool must not leave a stale inspection record or
+            // a stale owning-path association.
             toolSourceRecords.delete(name);
+            toolOwningPaths.delete(name);
         }
 
         createdToolRecords.clear();
@@ -5646,6 +6481,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // Keep the captured revision inspectable after a restore. This is the
             // same source record the compiler just consumed.
             toolSourceRecords.set(prepared.tool.name, prepared.record);
+            // A restored revision is captured bytes, not a claim about a disk
+            // file: a later default toolManage update must pass an explicit path
+            // unless the same name is (re)adopted by a folder scan.
+            toolOwningPaths.delete(prepared.tool.name);
             createdToolRecords.set(
                 prepared.tool.name,
                 cloneToolCreation(next.createdTools[index])
@@ -5659,8 +6498,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // must not regain spent creations. reset() still does not clear it.
         createdTools = next.createdToolCount;
 
-        activeTools.clear();
-        for (const name of next.discovery.enabled) activeTools.add(name);
+        // Restore enforces the CURRENT maxEnabledTools even when an older/edited
+        // snapshot names more tools. Snapshot order is newest-first for snapshots
+        // this harness wrote, so the first `maxEnabledTools` are retained.
+        setActiveTools(next.discovery.enabled);
 
         discoveryOffsets.clear();
         for (const entry of next.discovery.offsets) {
@@ -6176,7 +7017,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // set through the handle, and a server snapshot can record the list so a
     // reload still knows which capabilities were discovered.
     Object.defineProperty(handle, 'discoveredTools', {
-        get: () => [...activeTools],
+        get: () => currentEnabledNames(),
         enumerable: true,
         configurable: true
     });
@@ -6205,7 +7046,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 // costs no `node:fs`/`child_process`/`vm` load. The result types are exported
 // alongside each tool so a consumer can type a direct call without reaching into
 // an internal path.
-export { agent, tool, searchTools, compileToolSource, createDynamicTool, toolUi, toolUiOf } from './core';
+export {
+    agent,
+    tool,
+    searchTools,
+    selectTools,
+    compileToolSource,
+    createDynamicTool,
+    toolUi,
+    toolUiOf
+} from './core';
+export type { ToolSelectionOptions, ToolSelectionQuery, ToolSelectionResult } from './core';
 // R3a persistence: the schema version a caller stores beside a snapshot. The
 // snapshot types (HarnessSnapshot, HarnessAgentSnapshot, ...) and the per-store
 // state types are part of `export type * from './types'` below.

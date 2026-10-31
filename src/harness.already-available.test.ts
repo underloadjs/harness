@@ -5,7 +5,7 @@
 //     ("agents"/"delegate"/"delegation") report the tool in `alreadyAvailable`
 //     when the CALLER already has it declared, instead of claiming no match;
 //   - that report never enables anything, never appears in `enabled`/`tools`,
-//     never spends the five-match cap, and never enters `discoveredTools`;
+//     never spends the maxEnabledTools bound, and never enters `discoveredTools`;
 //   - a one-agent harness (no agentDelegate at all) and a SUBAGENT (agentDelegate
 //     is primary-only) get no such entry - their absence stays honest, and every
 //     query tag is reported as unmatched;
@@ -83,7 +83,8 @@ describe('toolRequest already-available core tools', () => {
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
             enabled: [],
             tools: [],
-            remaining: 0,
+            matched: 0,
+            omitted: 0,
             alreadyAvailable: [DELEGATE_MATCH],
             availableTags: []
         });
@@ -111,7 +112,8 @@ describe('toolRequest already-available core tools', () => {
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
             enabled: [],
             tools: [],
-            remaining: 0,
+            matched: 0,
+            omitted: 0,
             alreadyAvailable: [DELEGATE_MATCH, ...AGENT_MATCHES],
             availableTags: []
         });
@@ -139,7 +141,8 @@ describe('toolRequest already-available core tools', () => {
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
             enabled: [],
             tools: [],
-            remaining: 0,
+            matched: 0,
+            omitted: 0,
             unmatchedTags: ['agentdelegate', 'delegate'],
             alreadyAvailable: AGENT_MATCHES,
             availableTags: []
@@ -170,14 +173,15 @@ describe('toolRequest already-available core tools', () => {
         expect(JSON.parse(content(researcher.messages[2]))).toEqual({
             enabled: [],
             tools: [],
-            remaining: 0,
+            matched: 0,
+            omitted: 0,
             unmatchedTags: ['agentdelegate', 'delegate'],
             alreadyAvailable: AGENT_MATCHES,
             availableTags: []
         });
     });
 
-    it('reports core matches without spending the cap or changing the declarations', async () => {
+    it('reports core matches without spending the enabled bound or changing declarations', async () => {
         const seen: HarnessStreamRequest[] = [];
         const fixtures = Array.from({ length: 7 }, (_, index) => {
             const name = `tool-${String(index).padStart(2, '0')}`;
@@ -196,39 +200,32 @@ describe('toolRequest already-available core tools', () => {
         await writer('list tools');
 
         const result = JSON.parse(content(entry.messages[2]));
+        const fixtureNames = fixtures.map((definition) => definition.name);
 
-        // Seven searchable matches, the usual five-slot cap, two counted as
-        // remaining. toolCreate and toolRequest are core and match "tools", but they
-        // are REPORTED, not enabled: the shortlist holds only the fixtures.
-        expect(result.enabled).toEqual(['tool-00', 'tool-01', 'tool-02', 'tool-03', 'tool-04']);
-        expect(result.tools.map((match: { name: string }) => match.name)).toEqual([
-            'tool-00',
-            'tool-01',
-            'tool-02',
-            'tool-03',
-            'tool-04'
-        ]);
-        expect(result.remaining).toBe(2);
-        expect(result.truncated).toBe(true);
+        // Seven searchable matches, ALL enabled: selection is uncapped and the
+        // default enabled bound (32) is far above this fixture set. The core tools
+        // carrying the "tools" tag are REPORTED, never enabled and never counted.
+        expect(result.enabled).toEqual(fixtureNames);
+        expect(result.tools.map((match: { name: string }) => match.name)).toEqual(fixtureNames);
+        expect(result.matched).toBe(7);
+        expect(result.omitted).toBe(0);
         expect(result.alreadyAvailable.map((match: { name: string }) => match.name)).toEqual([
             'toolCreate',
+            'toolList',
+            'toolManage',
             'toolRegistry',
             'toolRequest'
         ]);
 
-        // Core exposure semantics are untouched: only the five searchable tools
-        // joined the discovery set, and the next request declares the core set plus
-        // exactly those five (already-available tools were always declared).
-        expect(writer.discoveredTools).toEqual([
-            'tool-00',
-            'tool-01',
-            'tool-02',
-            'tool-03',
-            'tool-04'
-        ]);
+        // Core exposure semantics are untouched: all seven searchable tools joined
+        // the discovery set, and the next request declares the core set plus those
+        // seven (already-available tools were always declared).
+        expect(writer.discoveredTools).toEqual(fixtureNames);
         expect(declaredNames(seen[1])).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',
@@ -237,11 +234,7 @@ describe('toolRequest already-available core tools', () => {
             'agentManage',
             'agentResult',
             'threadFork',
-            'tool-00',
-            'tool-01',
-            'tool-02',
-            'tool-03',
-            'tool-04'
+            ...fixtureNames
         ]);
     });
 });

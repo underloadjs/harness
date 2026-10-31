@@ -371,20 +371,28 @@ export type ToolMatch = {
     tags: string[];
 };
 
-// The result of a toolRequest call, and the return value of the pure
-// `searchTools()` helper. Shaped as data because it travels back to the model as
-// a tool result.
+// The result of a LEGACY toolRequest-style search call, and the return value of the
+// pure `searchTools()` helper. Shaped as data because it travels back to the model
+// as a tool result.
+//
+// LEGACY ONLY (R7 cap, not the live toolRequest contract): this shape belongs to
+// `searchTools()` and to hosts that still page tag-only discovery. The live
+// `toolRequest` tool uses the uncapped `selectTools()` union and returns
+// `{ enabled, tools, matched, omitted, ... }`; the harness's `maxEnabledTools`
+// (default 32, core tools excluded) is what bounds it, not this cap.
 //
 // DISCOVERY CAP (R7): at most MAX_DISCOVERY_MATCHES (5) matches are returned and
-// enabled per request. The cap is deliberately tight: five schemas is a focused
-// shortlist the model can actually weigh, and it keeps one broad tag from
-// re-flooding the context. Anything beyond that is reported as a COUNT only —
-// `remaining` — so the model refines its tags to drill deeper instead of paging
-// through a list of names it cannot see.
+// enabled per `searchTools` page. The cap is deliberately tight: five schemas is a
+// focused shortlist a host can weigh, and it keeps one broad tag from re-flooding
+// the context. Anything beyond that is reported as a COUNT only — `remaining` — so
+// a caller refines its tags (or pages with `offset`) instead of receiving a list of
+// names it cannot see.
 export type ToolSearchResult = {
     // Tools the model can call from the next turn onward, best match first. At
-    // most 5 entries (see MAX_DISCOVERY_MATCHES in core/discovery.ts); a caller
-    // may pass a smaller `limit` but can never raise the cap.
+    // most 5 entries on a legacy `searchTools` page (see MAX_DISCOVERY_MATCHES in
+    // core/discovery.ts); a caller may pass a smaller `limit` but can never raise
+    // the cap. The live toolRequest path is uncapped and bounded by
+    // `maxEnabledTools` instead, so this field there holds the admitted subset.
     enabled: string[];
     // Metadata for the enabled tools, in the same order.
     tools: ToolMatch[];
@@ -412,7 +420,8 @@ export type ToolSearchResult = {
     // Core tools the CALLER already has declared and that match the query — they
     // can be called directly right now. Reported, never enabled: they are already
     // in every request's declarations, so putting them in `enabled`/`tools` would
-    // spend the discovery budget (MAX_DISCOVERY_MATCHES) and imply a new grant.
+    // spend the discovery budget (MAX_DISCOVERY_MATCHES on the legacy page, the
+    // harness's `maxEnabledTools` for toolRequest) and imply a new grant.
     //
     // Present only when at least one core tool matches, so an ordinary result keeps
     // its old exact shape. The harness supplies only the core tools VISIBLE to the
@@ -543,6 +552,47 @@ export type HarnessToolRegistrationResult = {
     checks: readonly string[];
 };
 
+// toolList's model-facing row. Deliberately ONLY these two fields: listing must
+// not imply enabled/callable state, and the model can use toolRequest for tags
+// or toolManage for schema/source.
+export type HarnessToolListEntry = {
+    name: string;
+    description: string;
+};
+
+// toolManage operations. Reads are always available; create/update/reload go
+// through the same kernel as toolCreate/toolRegistry.
+export type HarnessToolManageOperation =
+    | 'list'
+    | 'details'
+    | 'source'
+    | 'path'
+    | 'create'
+    | 'update'
+    | 'reload';
+
+export type HarnessToolManageParameters = {
+    operation: HarnessToolManageOperation;
+    name?: string;
+    // Persistence mode for create/update. 'folder' (default) writes an editable
+    // *.tool.ts entry inside a configured toolFolders root; 'runtime' keeps the
+    // revision only in the registry/snapshot and never touches disk.
+    persist?: 'folder' | 'runtime';
+    // Explicit disk target. A write happens only when this is supplied AND the
+    // path resolves inside one of the harness's configured toolFolders.
+    path?: string;
+    // Configured folder used to resolve a relative path (defaults to the first).
+    folder?: string;
+    moduleText?: string;
+    // Legacy async function body; mutually exclusive with moduleText.
+    source?: string;
+    description?: string;
+    tags?: readonly string[];
+    parameters?: Record<string, unknown>;
+    visibility?: ToolVisibility;
+    dependencies?: readonly HarnessToolSourceDependency[];
+};
+
 // Harness-owned, stable tool memory. It survives implementation replacement and
 // is shared by every agent/tool in this harness. It is intentionally NOT reset by
 // a tool replacement; `reset()` is a session operation and leaves it intact so a
@@ -564,12 +614,22 @@ export type HarnessMemory = {
 // stores), not a restricted capability facade: every tool still receives the
 // unrestricted `context.harness` reference above.
 export type HarnessToolRuntime = {
-    // toolRequest: rank/enable catalogue matches with this harness's discovery
-    // cursor and caller-specific core view. Returns the existing search result.
+    // toolRequest: select/enable catalogue matches with this harness's enabled-set
+    // bound and caller-specific core view.
     requestTools: (
         caller: Agent | undefined,
-        parameters: { tags?: unknown; limit?: unknown } | unknown
-    ) => ToolSearchResult;
+        parameters:
+            | { names?: unknown; regex?: unknown; tags?: unknown; limit?: unknown }
+            | unknown
+    ) => unknown;
+    // toolList: every live registry entry, in insertion order, name+description only.
+    listTools: () => HarnessToolListEntry[];
+    // toolManage: inspect/source/path plus validated create/update/reload through
+    // the same kernel. The result is data only (no executable definitions).
+    manageTool: (
+        caller: Agent | undefined,
+        parameters: HarnessToolManageParameters | unknown
+    ) => unknown;
     // toolCreate: guarded model-facing creation (policy + lifetime budget) through
     // the same registration kernel. The HOST `createTool` path remains unguarded
     // by role policy.
@@ -1741,7 +1801,9 @@ export type HarnessSnapshot = {
     // both directions when the snapshot is applied).
     agents: Record<string, HarnessAgentSnapshot>;
     discovery: {
-        // Enabled searchable tool names, in discovery order (Set order).
+        // Enabled searchable tool names, newest selector match first, then retained
+        // prior entries. Capped at maxEnabledTools by the harness; restore trims an
+        // over-cap list from the end.
         enabled: string[];
         // Per-query offsets for progressive discovery; empty when no query has a
         // continued tail.
@@ -1859,6 +1921,26 @@ export type HarnessConfiguration = {
     // imports are captured); use `harness.registerTool({ moduleText, dependencies })`
     // for an in-memory revision.
     toolSources?: Record<string, string>;
+    // Ordered external folders of editable `*.tool.ts` modules. Each entry is an
+    // absolute path or a path relative to the process cwd; missing/non-directory
+    // entries fail construction. Discovery is recursive and deterministic (folder
+    // order, then relative path). Modules publish through the normal registration
+    // kernel, so a later folder (and a later file within one folder) wins a name
+    // collision. Loading/executing folder code is TRUSTED CODE with this process's
+    // permissions - there is no sandbox.
+    //
+    // toolManage disk writes are fenced to these folders; no other path is writable.
+    // Source compilation is Node-only, so a browser harness with toolFolders fails
+    // with an actionable error instead of silently ignoring them.
+    toolFolders?: string[];
+    // Bound on how many SEARCHABLE tools this harness may have enabled at once.
+    // Core tools are always declared and never count. Defaults to 32 (the previous
+    // design capped one toolRequest call at 5 but accumulated without a global
+    // bound; 32 keeps the catalogue from flooding context while allowing one query
+    // to surface a useful set). Must be a positive safe integer. This is a bound on
+    // the enabled set, NOT a cap on selectTools matches: toolRequest reports/omits
+    // nothing artificially beyond this configured bound.
+    maxEnabledTools?: number;
     // Preload the bundled preset catalogue (src/tools/) into the registry. True by
     // default: discovery exists so a large catalogue costs nothing until it is
     // asked for. Set false to start from `tools` alone. A configured tool wins on
@@ -2005,10 +2087,11 @@ export type Harness = {
     // snapshot is idempotent: tools previously restored here are replaced, not
     // duplicated. Throws HarnessError while an agent run is in progress.
     restore: (snapshot: HarnessSnapshot) => void;
-    // Names of the tools toolRequest has enabled so far, in discovery order.
-    // Persists for the harness's lifetime (not just one call), which is what lets a
-    // later turn call a tool discovered earlier. Copied on read; `reset()` empties
-    // it.
+    // Names of the searchable tools enabled right now: the newest toolRequest /
+    // toolManage selection first, then retained prior entries, capped at
+    // maxEnabledTools. Persists for the harness's lifetime (not just one call),
+    // which is what lets a later turn call a tool discovered earlier. Copied on
+    // read; `reset()` empties it.
     readonly discoveredTools: string[];
     // N3: every branch record this harness knows, newest last. Includes running
     // branches and the bounded newest terminal records (see

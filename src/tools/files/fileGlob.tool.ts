@@ -90,13 +90,15 @@
 //     await fileGlob({ patterns: ['**/*.test.ts'] });
 //     await fileGlob({ patterns: ['*.ts'], content: 'TODO', maxResults: 20 });
 //
-// Metadata comes from ../catalogue so descriptions and schemas cannot drift.
+// Metadata (name, description, tags, schema) is declared below and is authoritative
+// for T13. ../catalogue projects the same data synchronously for lazy enumeration
+// and a consistency test proves the projection equal.
 
 import { readFile as readTextFile } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
-import { PRESET_TOOLS } from '../catalogue';
+import type { PresetToolMetadata } from '../catalogue';
 import { createBoundedLineMatcher } from './bounded-regex';
 import { canonicalPathKey, fileIdentity } from './identity';
 import {
@@ -431,8 +433,50 @@ const searchContents = async (
     return { matches, truncated, bytes, contentBudget: FILE_GLOB_CONTENT_BUDGET };
 };
 
+// Authoritative registration/details for this preset (T13): the catalogue keeps
+// a synchronous data projection for lazy enumeration and a consistency test
+// asserts the two stay equal. Edit the metadata HERE.
+export const FILE_GLOB_METADATA: PresetToolMetadata = {
+    name: 'fileGlob',
+    description:
+        'Find files by glob pattern, and optionally search their contents in the same call. `patterns` (default ["**/*"]) supports *, ?, **, and [abc] classes; a pattern with no slash also matches file names at any depth. Patterns are matched against each file\'s path RELATIVE TO THE ROOT that found it, never against an absolute path, and every result is prefixed with that root: { "paths": ["src"], "patterns": ["**/*.ts"] } returns "src/a.ts" and "src/nested/b.ts". `paths` (default ["."]) lists the roots to walk, in order; overlapping roots and patterns are deduplicated by real file identity (a symlink alias or a case-alias root is walked once), so a file is reported once, under the first root that reached it. WITHOUT `content` the result is { files, truncated }. WITH `content` (a JavaScript regular expression) every file matching the patterns is read and each matching line is returned as { matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }; a pattern that backtracks past the 30-second matching budget is stopped with an error rather than allowed to hang. A matched line is reported as a 1024-byte UTF-8 snippet (that match carries `textTruncated` when the line was cut, and its `bytes` is the returned snippet size), and the whole content result shares a 64 KiB aggregate budget (top-level `bytes` / `contentBudget`). Content mode skips .git, node_modules, symlinks, binary files, and files larger than 1 MiB. Results are capped (100 by default) across all roots. Does not read .gitignore files.',
+    tags: ['files', 'glob', 'search', 'grep', 'find', 'content', 'filesystem'],
+    // R18: fileGlob is core because it is the ONE search surface (filename and
+    // content). There is deliberately no fileSearch alias/tool: the previous
+    // consolidation stays, and its functionality is now always declared.
+    visibility: 'core',
+    parameters: {
+        type: 'object',
+        properties: {
+            patterns: {
+                type: 'array',
+                items: { type: 'string' },
+                description:
+                    'Glob patterns, OR-ed together and matched against each file path relative to its root, e.g. ["**/*.test.ts"] or ["*.md", "*.txt"]. Defaults to ["**/*"].'
+            },
+            paths: {
+                type: 'array',
+                items: { type: 'string' },
+                description:
+                    'Root directories to walk, absolute or relative to the working directory, in the order they are visited. Results are prefixed with the root that found them. Defaults to ["."].'
+            },
+            content: {
+                type: 'string',
+                description:
+                    'JavaScript regular expression to match inside each file, e.g. "TODO|FIXME". Providing it switches the result from file paths to matching lines. Matching is time-bounded.'
+            },
+            maxResults: {
+                type: 'number',
+                description:
+                    'Maximum files or matches to return across all roots. Defaults to 100 and is clamped to 1-100.'
+            }
+        },
+        additionalProperties: false
+    }
+};
+
 export const fileGlob = tool<FileGlobParameters, FileGlobResult>({
-    ...PRESET_TOOLS.fileGlob,
+    ...FILE_GLOB_METADATA,
     execute: async ({ parameters }) => {
         // The schema declares four properties, so `parameters` is the whole object
         // (the single-property rule does not apply). A direct caller may still pass

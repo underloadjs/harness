@@ -48,6 +48,8 @@ const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor 
             'fileEdit',
             'fileGlob',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage'
         ],
@@ -732,6 +734,8 @@ it('restores a remembered session with its frozen team and server timings', asyn
             'fileEdit',
             'fileGlob',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'agentDelegate'
@@ -887,6 +891,8 @@ it('creates a harness from preset agents with an initial primary', async () => {
                             'fileEdit',
                             'fileGlob',
                             'toolRequest',
+                            'toolList',
+                            'toolManage',
                             'toolCreate',
                             'todoManage',
                             ...(request.subagents.length > 0 ? ['agentDelegate'] : [])
@@ -976,6 +982,8 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
                     'fileEdit',
                     'fileGlob',
                     'toolRequest',
+                    'toolList',
+                    'toolManage',
                     'toolCreate',
                     'todoManage',
                     ...(request.subagents.length > 0 ? ['agentDelegate'] : [])
@@ -1189,6 +1197,8 @@ it('fronts a card of a frozen team and keeps that card across the live model PAT
             'fileEdit',
             'fileGlob',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'agentDelegate'

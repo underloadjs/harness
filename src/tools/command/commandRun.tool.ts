@@ -10,8 +10,9 @@
 //
 //     const { exitCode, stdout } = await commandRun({ command: 'git status' });
 //
-// Metadata (name, description, tags, schema) lives in ../catalogue so the preset
-// can be enumerated without importing this module — and so text can't drift.
+// Metadata (name, description, tags, schema) is declared below and is authoritative
+// for T13. ../catalogue projects the same data synchronously for lazy enumeration
+// and a consistency test proves the projection equal.
 //
 // Execution contract (R1):
 //   - output is captured through BoundedText, so a chunk boundary never corrupts
@@ -37,7 +38,7 @@
 import { spawn } from 'node:child_process';
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
-import { PRESET_TOOLS } from '../catalogue';
+import type { PresetToolMetadata } from '../catalogue';
 import { BoundedText, COMMAND_STDERR_MAX_BYTES, COMMAND_STDOUT_MAX_BYTES } from './boundedText';
 import { processGroupOptions, terminateTree } from './processTree';
 
@@ -111,10 +112,38 @@ const validate = (parameters: CommandRunParameters): { command: string; cwd?: st
     return { command, cwd, timeoutMs: resolveTimeout(timeoutMs) };
 };
 
-// Metadata (name, description, tags, schema) lives in ../catalogue so the preset
-// can be enumerated without importing this module — and so text can't drift.
+// Authoritative registration/details for this preset (T13): the catalogue keeps
+// a synchronous data projection for lazy enumeration and a consistency test
+// asserts the two stay equal. Edit the metadata HERE.
+export const COMMAND_RUN_METADATA: PresetToolMetadata = {
+    name: 'commandRun',
+    description:
+        'Run a shell command and return its exit code, stdout, and stderr. The command string is passed to the platform shell, so pipes, redirects, and quoting work. A non-zero exit code is returned as data, not thrown. `timeoutMs` bounds the run (integer milliseconds, 1-600000, default 120000); a command that exceeds it is killed together with its process tree on a best-effort basis and the result reports `timedOut: true`. Output is capped at 128 KiB of stdout and 16 KiB of stderr, with `truncated: true` when either cap was applied, and an aborted run reports `aborted: true`.',
+    tags: ['shell', 'command', 'process'],
+    parameters: {
+        type: 'object',
+        properties: {
+            command: { type: 'string', description: 'Shell command to run, e.g. "git status --short".' },
+            cwd: {
+                type: 'string',
+                description: 'Working directory. Defaults to the directory the harness was started in.'
+            },
+            timeoutMs: {
+                type: 'integer',
+                minimum: 1,
+                maximum: 600000,
+                default: 120000,
+                description:
+                    'Wall-clock limit in milliseconds, 1-600000. Defaults to 120000 (2 minutes); the process tree is killed when it is exceeded.'
+            }
+        },
+        required: ['command'],
+        additionalProperties: false
+    }
+};
+
 export const commandRun = tool<CommandRunParameters, CommandRunResult>({
-    ...PRESET_TOOLS.commandRun,
+    ...COMMAND_RUN_METADATA,
     execute: (context) => {
         const { command, cwd, timeoutMs } = validate(context.parameters);
 

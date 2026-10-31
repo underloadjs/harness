@@ -27,13 +27,15 @@
 //
 //     const { stdout } = await gitDiff({ ref: 'HEAD~1' });
 //
-// Metadata comes from ../catalogue so descriptions and schemas cannot drift.
+// Metadata (name, description, tags, schema) is declared below and is authoritative
+// for T13. ../catalogue projects the same data synchronously for lazy enumeration
+// and a consistency test proves the projection equal.
 
 import { spawn } from 'node:child_process';
 import { resolve } from 'node:path';
 import { tool } from '../../core';
 import { HarnessError } from '../../util';
-import { PRESET_TOOLS } from '../catalogue';
+import type { PresetToolMetadata } from '../catalogue';
 import { BoundedText, COMMAND_STDERR_MAX_BYTES, COMMAND_STDOUT_MAX_BYTES } from './boundedText';
 import { processGroupOptions, terminateTree } from './processTree';
 
@@ -135,8 +137,45 @@ const normalizePaths = (paths: string | string[] | undefined): string[] => {
     return normalized;
 };
 
+// Authoritative registration/details for this preset (T13): the catalogue keeps
+// a synchronous data projection for lazy enumeration and a consistency test
+// asserts the two stay equal. Edit the metadata HERE.
+export const GIT_DIFF_METADATA: PresetToolMetadata = {
+    name: 'gitDiff',
+    description:
+        'Show the unified diff of uncommitted changes in a git repository, with colour, external diff drivers, and textconv disabled. Optionally diff against a ref, the staged index, or a set of paths. Read-only: nothing is staged, committed, or written. Returns exit code, stdout, stderr, and truncation/timeout flags; a non-zero exit is data, not an error. `stderrTruncated` reports that stderr was capped (16 KiB) and `aborted` that the run was cancelled.',
+    tags: ['git', 'diff', 'vcs', 'review', 'command'],
+    parameters: {
+        type: 'object',
+        properties: {
+            ref: {
+                type: 'string',
+                description: 'Commit, branch, or range to diff against, e.g. "HEAD~1", "main", or "main...HEAD". Must not start with "-".'
+            },
+            staged: {
+                type: 'boolean',
+                description: 'Diff the staged index instead of the working tree (git diff --staged). Defaults to false.'
+            },
+            paths: {
+                // Non-empty by contract: an empty pathspec list would read as
+                // "no restriction" while the caller asked for one.
+                oneOf: [
+                    { type: 'string', minLength: 1 },
+                    { type: 'array', items: { type: 'string' }, minItems: 1 }
+                ],
+                description: 'Path or paths to restrict the diff to (at least one). Passed after "--" so they are always pathspecs.'
+            },
+            cwd: {
+                type: 'string',
+                description: 'Repository working directory. Defaults to the directory the harness was started in.'
+            }
+        },
+        additionalProperties: false
+    }
+};
+
 export const gitDiff = tool<GitDiffParameters, GitDiffResult>({
-    ...PRESET_TOOLS.gitDiff,
+    ...GIT_DIFF_METADATA,
     execute: (context) => {
         const { ref, staged, paths, cwd } = context.parameters;
 

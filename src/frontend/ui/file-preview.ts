@@ -113,21 +113,29 @@ const messageOfEntry = (entry: FilePreviewEntry): string | undefined => {
     return typeof message === 'string' && message.length > 0 ? message : 'The file could not be read.';
 };
 
+// The preview body plus the exact text its Copy action should write. `copyText`
+// is undefined for loading/error/empty states (there is nothing meaningful to
+// copy), which removes the Copy control from the dialog.
+type PreviewBody = {
+    element: HTMLElement;
+    copyText?: string;
+};
+
 // Build the full preview body for one successful/error result.
-const previewBody = (path: string, result: FilePreviewResult): HTMLElement => {
+const previewBody = (path: string, result: FilePreviewResult): PreviewBody => {
     const host = document.createElement('div');
     host.className = 'preview preview-file';
 
     const entry = firstEntryOf(result);
     if (entry === undefined) {
         host.append(statusNode('preview-error', `The server did not return a readable entry for ${path}.`));
-        return host;
+        return { element: host };
     }
 
     const failure = messageOfEntry(entry);
     if (failure !== undefined) {
         host.append(statusNode('preview-error', failure));
-        return host;
+        return { element: host };
     }
 
     const content = typeof entry.content === 'string' ? entry.content : '';
@@ -169,7 +177,10 @@ const previewBody = (path: string, result: FilePreviewResult): HTMLElement => {
         );
     }
 
-    return host;
+    // Copy the previewed WINDOW exactly as rendered. The range/truncation metadata
+    // is deliberately not prefixed into the text: this is file content, not a log
+    // caption, and the dialog already tells the reader whether the file continues.
+    return content.length === 0 ? { element: host } : { element: host, copyText: content };
 };
 
 // Open the modal and resolve the window asynchronously. Returns the dialog handle
@@ -214,7 +225,13 @@ export const openFilePreview = (path: string, options: FilePreviewOptions = {}):
             // Late result after close: drop it. The modal is gone and there is no
             // focus/DOM to update.
             if (!handle.isOpen) return;
-            handle.update({ content: previewBody(normalized, result) });
+            const body = previewBody(normalized, result);
+            // The Copy action appears with the content: a loading/error/empty
+            // preview has nothing meaningful to copy and keeps no dead control.
+            handle.update({
+                content: body.element,
+                ...(body.copyText === undefined ? { copy: null } : { copy: body.copyText })
+            });
         })
         .catch((error: unknown) => {
             if (!handle.isOpen) return;

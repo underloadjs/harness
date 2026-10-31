@@ -200,6 +200,8 @@ describe('actionRequest runtime', () => {
         expect((seen[0].tools ?? []).map((declaration) => declaration.name)).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',

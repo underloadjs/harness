@@ -8,8 +8,12 @@
 //
 // CONTRACT
 // --------
-//   openDialog({ title, content, returnFocus?, onClose? })
-//       -> { element, isOpen, close(), update({ title?, content? }) }
+//   openDialog({ title, content, copy?, returnFocus?, onClose? })
+//       -> { element, isOpen, close(), update({ title?, content?, copy? }) }
+//
+// `copy` is the opt-in data-inspection action (R5): a string or a click-time
+// provider. The dialog owns the button, clipboard path and success/failure text so
+// tool/transcript/file dialogs do not duplicate handlers.
 //
 // `content` is a DOM Node, never an HTML string. The caller supplies nodes it has
 // already built with createElement/textContent (see ui/panels.ts for the same
@@ -88,6 +92,14 @@ export type DialogOptions = {
     // A DocumentFragment moves its children; a string is rejected by the runtime
     // guard (there is no HTML parse path).
     content: Node;
+    // Optional "Copy" action for a DATA-INSPECTION dialog (tool details, transcripts,
+    // file previews). The source is resolved at CLICK time, so a live dialog (a tool
+    // card still running) copies the data that is on screen now. A function that
+    // throws is reported as a failed copy; it never breaks the dialog.
+    //
+    // Pure confirmation/input dialogs and binary previews omit this: a Copy button
+    // must copy meaningful text, not configuration controls or an image payload.
+    copy?: DialogCopySource;
     // Explicit focus destination on close. `undefined` = restore the element that
     // was focused when the dialog opened. `null` = restore nothing.
     returnFocus?: HTMLElement | null;
@@ -95,11 +107,18 @@ export type DialogOptions = {
     onClose?: () => void;
 };
 
-// Update input for `handle.update`. Both fields are optional; omitted fields keep
-// their current value. Useful when a preview loads its file asynchronously.
+// The text a Copy button writes. A string is a snapshot; a function is evaluated on
+// every activation so an async/live dialog copies its CURRENT contents without a
+// second mutation API.
+export type DialogCopySource = string | (() => string);
+
+// Update input for `handle.update`. Fields are optional; omitted fields keep their
+// current value. `copy: null` removes a previously installed Copy button (used when
+// an async preview settles into an error with no text to copy).
 export type DialogUpdate = {
     title?: string;
     content?: Node;
+    copy?: DialogCopySource | null;
 };
 
 export type DialogHandle = {
@@ -134,6 +153,7 @@ const OVERLAY_CLASS = 'dialog-overlay';
 const PANEL_CLASS = 'dialog';
 const HEAD_CLASS = 'dialog-head';
 const TITLE_CLASS = 'dialog-title';
+const COPY_CLASS = 'dialog-copy';
 const CLOSE_CLASS = 'dialog-close';
 const BODY_CLASS = 'dialog-body';
 
@@ -141,6 +161,14 @@ const BODY_CLASS = 'dialog-body';
 // encoding issues) and the test can assert the exact character.
 const CLOSE_GLYPH = '\u00d7';
 const CLOSE_LABEL = 'Close';
+
+// Copy feedback is TEXT in the button itself (and `aria-live`), never colour-only.
+// It stays until the next activation: no timer can race a closed dialog or leak
+// after the overlay is removed.
+const COPY_LABEL = 'Copy';
+const COPY_SUCCESS_LABEL = 'Copied';
+const COPY_FAILURE_LABEL = 'Copy failed';
+const COPY_ARIA_LABEL = 'Copy dialog contents';
 
 // Elements a Tab press may land on. `[tabindex]` is filtered below: `-1` is
 // programmatic-only and must not join the cycle.
@@ -201,6 +229,98 @@ const assertContent = (content: unknown): Node => {
 };
 
 // ---------------------------------------------------------------------------
+// Copy support (data-inspection dialogs)
+// ---------------------------------------------------------------------------
+//
+// Two paths, in order:
+//   1. the async Clipboard API (`navigator.clipboard.writeText`) — the safe,
+//      permission-aware path a secure browser context exposes;
+//   2. a hidden read-only textarea + `document.execCommand('copy')` — the
+//      documented fallback for older browsers, embedded webviews and pages where
+//      the async API is absent or rejects (permissions policy, insecure origin).
+// Both are best-effort; the caller receives a boolean and the button reports the
+// truth instead of pretending the clipboard write succeeded.
+//
+// The fallback restores focus to whatever was focused before it ran. It is only
+// invoked from the Copy button inside the top dialog, so the focus trap would pull
+// focus back anyway, but restoring the exact control keeps the behaviour stable in
+// jsdom/embedded hosts too.
+const clipboardFallback = (text: string): boolean => {
+    if (typeof document === 'undefined' || document.body === null) return false;
+    if (typeof document.execCommand !== 'function') return false;
+
+    const previousFocus = document.activeElement;
+    const area = document.createElement('textarea');
+    area.className = 'dialog-copy-buffer';
+    area.value = text;
+    area.setAttribute('readonly', '');
+    // Off-screen, not display:none: a hidden element cannot be selected/copied.
+    area.style.position = 'fixed';
+    area.style.top = '-1000px';
+    area.style.left = '-1000px';
+    area.style.opacity = '0';
+    document.body.append(area);
+
+    let copied = false;
+    try {
+        area.select();
+        copied = document.execCommand('copy') === true;
+    } catch {
+        copied = false;
+    } finally {
+        area.remove();
+        if (previousFocus instanceof HTMLElement && previousFocus.isConnected) {
+            previousFocus.focus({ preventScroll: true });
+        }
+    }
+
+    return copied;
+};
+
+const writeClipboardText = async (text: string): Promise<boolean> => {
+    const clipboard = typeof navigator === 'undefined' ? undefined : navigator.clipboard;
+
+    if (clipboard !== undefined && typeof clipboard.writeText === 'function') {
+        try {
+            await clipboard.writeText(text);
+            return true;
+        } catch {
+            // Permission denied / unsupported context: fall through to the
+            // textarea path instead of reporting a failure the user could fix
+            // with the fallback.
+        }
+    }
+
+    return clipboardFallback(text);
+};
+
+// The plain text for one activation. A source that throws or returns a non-string
+// is a failure, never an empty successful copy.
+const copyTextOf = (source: DialogCopySource): string => {
+    const text = typeof source === 'function' ? source() : source;
+    if (typeof text !== 'string') throw new TypeError('dialog copy source must produce a string');
+    return text;
+};
+
+// Paint the button's text/state. `aria-live` is set on the button so a screen
+// reader announces the new label; the visible word is the primary feedback.
+const paintCopyState = (button: HTMLButtonElement, state: 'idle' | 'success' | 'error'): void => {
+    if (state === 'success') {
+        button.dataset.state = 'success';
+        button.textContent = COPY_SUCCESS_LABEL;
+        return;
+    }
+    if (state === 'error') {
+        button.dataset.state = 'error';
+        button.textContent = COPY_FAILURE_LABEL;
+        return;
+    }
+
+    delete button.dataset.state;
+    button.textContent = COPY_LABEL;
+};
+
+// ---------------------------------------------------------------------------
 // Balanced body scroll lock (module-wide)
 // ---------------------------------------------------------------------------
 //
@@ -236,8 +356,12 @@ const unlockBodyScroll = (): void => {
 type DialogEntry = {
     panel: HTMLElement;
     overlay: HTMLElement;
+    head: HTMLElement;
     title: HTMLElement;
+    closeButton: HTMLButtonElement;
     body: HTMLElement;
+    copy: DialogCopySource | undefined;
+    copyButton: HTMLButtonElement | undefined;
     capturedFocus: HTMLElement | null;
     returnFocus: HTMLElement | null | undefined;
     onClose: (() => void) | undefined;
@@ -363,6 +487,59 @@ const resolveFocusTarget = (entry: DialogEntry): HTMLElement | null => {
     return null;
 };
 
+// Resolve the copy source when the user asks for it, so a live tool card or
+// transcript copies what is CURRENTLY rendered. Feedback is written to the button
+// itself (text + aria-live); the entry may close while the async clipboard write is
+// in flight, in which case there is no button left to paint.
+const runCopy = async (entry: DialogEntry, button: HTMLButtonElement): Promise<void> => {
+    let text: string;
+
+    try {
+        if (entry.copy === undefined) throw new Error('no copy source');
+        text = copyTextOf(entry.copy);
+    } catch {
+        paintCopyState(button, 'error');
+        return;
+    }
+
+    const copied = await writeClipboardText(text);
+    if (entry.closed) return;
+    paintCopyState(button, copied ? 'success' : 'error');
+};
+
+// Create the header Copy control lazily, so dialogs that do not opt in keep the
+// historical two-child header (title + close) exactly. It sits before Close, which
+// keeps the dismiss control at the far edge of every dialog.
+const installCopyButton = (entry: DialogEntry, source: DialogCopySource): void => {
+    entry.copy = source;
+
+    if (entry.copyButton !== undefined) {
+        paintCopyState(entry.copyButton, 'idle');
+        return;
+    }
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = COPY_CLASS;
+    button.setAttribute('aria-label', COPY_ARIA_LABEL);
+    // A live region on the control makes the idle -> Copied/Copy failed change
+    // announce itself without adding a second visible status line.
+    button.setAttribute('aria-live', 'polite');
+    button.textContent = COPY_LABEL;
+    button.addEventListener('click', () => {
+        void runCopy(entry, button);
+    });
+
+    entry.head.insertBefore(button, entry.closeButton);
+    entry.copyButton = button;
+};
+
+const removeCopyButton = (entry: DialogEntry): void => {
+    entry.copy = undefined;
+    entry.copyButton?.remove();
+    entry.copyButton = undefined;
+};
+
 // ---------------------------------------------------------------------------
 // Host
 // ---------------------------------------------------------------------------
@@ -460,6 +637,8 @@ export const createDialogHost = (parent?: HTMLElement): DialogHost => {
             // `content` is adopted as-is. No innerHTML path exists in this module.
             body.append(content);
 
+            // Title + close first; `installCopyButton` inserts Copy immediately
+            // before Close, keeping Close at the far edge.
             head.append(title, closeButton);
             panel.append(head, body);
             overlay.append(panel);
@@ -467,13 +646,21 @@ export const createDialogHost = (parent?: HTMLElement): DialogHost => {
             const entry: DialogEntry = {
                 panel,
                 overlay,
+                head,
                 title,
+                closeButton,
                 body,
+                copy: undefined,
+                copyButton: undefined,
                 capturedFocus,
                 returnFocus: returnFocus instanceof HTMLElement ? returnFocus : returnFocus === null ? null : undefined,
                 onClose: options.onClose,
                 closed: false
             };
+
+            // Opt-in inspection dialogs get the shared Copy control. The source is
+            // resolved on activation, never cached here.
+            if (options.copy !== undefined) installCopyButton(entry, options.copy);
 
             const handle: DialogHandle = {
                 get element(): HTMLElement {
@@ -494,6 +681,13 @@ export const createDialogHost = (parent?: HTMLElement): DialogHost => {
 
                     if (next.content !== undefined) {
                         entry.body.replaceChildren(assertContent(next.content));
+                    }
+
+                    // `copy: null` removes the control (an async preview settled
+                    // with nothing to copy); a source adds or retargets it.
+                    if ('copy' in next) {
+                        if (next.copy === null || next.copy === undefined) removeCopyButton(entry);
+                        else installCopyButton(entry, next.copy);
                     }
                 }
             };

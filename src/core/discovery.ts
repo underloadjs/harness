@@ -65,12 +65,19 @@
 // ("session", "tools", "file") and scanning them would append an already-available
 // capability to almost every query, burying the real shortlist.
 //
+// EXPLICIT SELECTION (selectTools, below). searchTools keeps the legacy paged,
+// tag-only answer for existing hosts. The configurable tool surface needs a second
+// selector that can also address tools by exact NAME or by a NAME REGEX, returns
+// the whole union with no 5-match cap, and leaves the per-turn enable cap to the
+// harness. Selection never enables anything: it is pure metadata, like searchTools.
+//
 // Cross-references:
 //   - ../types       — ToolSearchResult, ToolMatch, ToolVisibility
 //   - ./tool         — where tags are normalized
 //   - ../harness     — toolRequest, which enables the matches for the next turn
 
 import type { Tool, ToolMatch, ToolSearchOptions, ToolSearchResult } from '../types';
+import { HarnessError } from '../util';
 import { normalizeTags } from './tool';
 
 // Default cap on one discovery result, and the hard maximum (R7). Discovery
@@ -341,6 +348,311 @@ export const searchTools = (
     if (unmatchedTags.length > 0) result.unmatchedTags = unmatchedTags;
     if (start > 0) result.offset = start;
     if (remaining > 0) result.truncated = true;
+    if (alreadyAvailable.length > 0) result.alreadyAvailable = alreadyAvailable;
+
+    return result;
+};
+
+// ---------------------------------------------------------------------------
+// selectTools — explicit selection for the configurable tool surface
+// ---------------------------------------------------------------------------
+//
+// The legacy searchTools contract above is tag-only and capped at five. The new
+// toolRequest accepts a richer query and must not silently hide matches: it is the
+// harness's job to enforce the enabled-per-turn cap on the returned union, not the
+// selector's job to shorten the list. selectTools therefore:
+//
+//   - selects by exact NAME (case-sensitive), NAME REGEX, or capability TAGS;
+//   - takes the UNION of all three criteria (a tool matching two appears once);
+//   - returns every match, no MAX_DISCOVERY_MATCHES cap and no `remaining`;
+//   - reports declared CORE tools as `alreadyAvailable` instead of selecting them,
+//     exactly as searchTools does, because they are declared already and must not
+//     consume the harness's per-turn enable budget;
+//   - never reads `execute`; metadata only, so lazy presets stay unloaded.
+//
+// Ordering keeps the two useful notions of relevance apart:
+//   1. exact requested names, in the order the caller listed them;
+//   2. regex name hits, then tag matches, both with the existing OR-style tag
+//      ranking (best single-tag score, breadth as tiebreak, then name).
+// A tool that matches several criteria is ranked by its STRONGEST group (exact
+// name, then regex, then tag-only) and never repeated; each name appears once.
+//
+// Query validation is synchronous and explicit: an empty query selects nothing,
+// and an invalid regex (bad source, bad flags, empty pattern) throws a
+// HarnessError whose message names the invalid expression. Patterns are compiled
+// with `new RegExp`, never evaluated as code.
+
+// What the caller can ask for. Every field is optional; the fields that are
+// present are OR-ed together.
+export type ToolSelectionQuery = {
+    // Exact wire names. Case-sensitive: the model copies names from the catalogue,
+    // so a different case is a different, probably nonexistent, tool.
+    names?: readonly string[];
+    // JavaScript regex tested against each wire name. Either a bare source
+    // ("^file") or the literal form "/^file/i" (source + flags). The literal form
+    // is the only way to pass flags without widening the query shape.
+    regex?: string;
+    // Capability tags, scored with the same fuzzy ladder as searchTools.
+    tags?: readonly string[];
+};
+
+// Additive context for a selection. Omitting it keeps the simplest behaviour:
+// only searchable tools are selected and no core report is produced.
+export type ToolSelectionOptions = {
+    // Exact, case-sensitive names to leave OUT of the selectable result. Used by
+    // the harness to avoid re-returning tools already enabled for this turn. It
+    // does not hide `alreadyAvailable`: core tools are not part of the enable
+    // list, so removing them from that report would hide a capability the caller
+    // still has.
+    excludeNames?: readonly string[];
+    // Core tools the CALLER already has declared. They are matched by name, name
+    // regex, or tags (never description) and reported as `alreadyAvailable`; they
+    // are never returned in `names`/`tools`, which are the selectable matches.
+    declared?: readonly Tool[];
+};
+
+// The selector answer. `names` duplicates the metadata names so a host can enable
+// results without reshaping, and `tools` carries the model-facing metadata in the
+// same order.
+export type ToolSelectionResult = {
+    names: string[];
+    tools: ToolMatch[];
+    // Present only when at least one declared tool matched, so an ordinary result
+    // keeps its minimal shape.
+    alreadyAvailable?: ToolMatch[];
+};
+
+// One candidate before metadata is copied. `group` mirrors the ordering contract:
+// 2 exact name, 1 regex name, 0 tag-only. `nameOrder` is the caller's position for
+// an exact name (Number.MAX_SAFE_INTEGER elsewhere). `tagBest`/`tagHits` reuse the
+// searchTools ranking so tags keep their established behaviour.
+type RankedSelection = {
+    tool: Tool;
+    group: number;
+    nameOrder: number;
+    tagBest: number;
+    tagHits: number;
+};
+
+// Normalized query: deduplicated non-empty names (with their caller order), the
+// compiled pattern, and normalized tags. Keeping the map beside the list lets the
+// exact-name group sort by request order without a second scan per tool.
+type NormalizedSelectionQuery = {
+    names: string[];
+    nameOrder: Map<string, number>;
+    pattern?: RegExp;
+    tags: string[];
+};
+
+const compileSelectionRegex = (input: string): RegExp => {
+    if (typeof input !== 'string') {
+        throw new HarnessError('Invalid tool selection regex: expected a string pattern.');
+    }
+
+    // An empty pattern would match every name, which makes an "empty query means
+    // nothing" contract impossible to reason about; reject it instead of silently
+    // turning the selector into a list-everything call.
+    if (input.length === 0) {
+        throw new HarnessError('Invalid tool selection regex: pattern must not be empty.');
+    }
+
+    let source = input;
+    let flags = '';
+
+    // Literal form /source/flags. A string that merely starts with "/" but has no
+    // closing slash is treated as a bare source, so a pattern like "/api" still
+    // means what it looks like.
+    if (input.startsWith('/')) {
+        const closing = input.lastIndexOf('/');
+        if (closing > 0) {
+            source = input.slice(1, closing);
+            flags = input.slice(closing + 1);
+            if (source.length === 0) {
+                throw new HarnessError('Invalid tool selection regex: pattern must not be empty.');
+            }
+        }
+    }
+
+    try {
+        // `new RegExp` validates both the source and the flags. This is pattern
+        // compilation, not evaluation: no query text ever reaches eval/Function.
+        return new RegExp(source, flags);
+    } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        throw new HarnessError(`Invalid tool selection regex ${JSON.stringify(input)}: ${detail}`, {
+            cause: error
+        });
+    }
+};
+
+// `g`/`y` make RegExp.test stateful through lastIndex. Reset around every test so
+// one tool cannot consume the match and hide the next one.
+const matchesSelectionPattern = (pattern: RegExp, name: string): boolean => {
+    pattern.lastIndex = 0;
+    const matched = pattern.test(name);
+    pattern.lastIndex = 0;
+    return matched;
+};
+
+const normalizeSelectionQuery = (query: ToolSelectionQuery | undefined): NormalizedSelectionQuery => {
+    const names: string[] = [];
+    const nameOrder = new Map<string, number>();
+
+    // Runtime tolerance mirrors the harness's model-input tolerance: skip values
+    // that are not strings rather than letting a sloppy request fail selection.
+    // Empty names can never name a registered tool.
+    for (const name of Array.isArray(query?.names) ? query.names : []) {
+        if (typeof name !== 'string' || name.length === 0 || nameOrder.has(name)) continue;
+        nameOrder.set(name, names.length);
+        names.push(name);
+    }
+
+    const tags = normalizeTags(query?.tags);
+    const pattern =
+        query?.regex === undefined ? undefined : compileSelectionRegex(query.regex);
+
+    return { names, nameOrder, pattern, tags };
+};
+
+// Sort in place, then copy metadata in that order. Exact names use caller order;
+// regex and tag groups share the tag ranking (a regex hit with no tag still has
+// tagBest/tagHits of 0, so it falls back to name order).
+const rankSelection = (ranked: RankedSelection[]): ToolMatch[] => {
+    ranked.sort((left, right) => {
+        if (left.group !== right.group) return right.group - left.group;
+
+        if (left.group === 2) {
+            return (
+                left.nameOrder - right.nameOrder ||
+                left.tool.name.localeCompare(right.tool.name)
+            );
+        }
+
+        return (
+            right.tagBest - left.tagBest ||
+            right.tagHits - left.tagHits ||
+            left.tool.name.localeCompare(right.tool.name)
+        );
+    });
+
+    return ranked.map(({ tool }) => toMatch(tool));
+};
+
+// Select every searchable tool that matches ANY supplied criterion.
+//
+// The function is pure and uncapped. `options.excludeNames` removes already-enabled
+// searchable tools from the result; it does not remove `alreadyAvailable` entries
+// (see ToolSelectionOptions). `options.declared` is the caller's own core set, not
+// the whole registry: the harness passes exactly what the calling agent can see.
+export const selectTools = (
+    tools: readonly Tool[],
+    query: ToolSelectionQuery,
+    options?: ToolSelectionOptions
+): ToolSelectionResult => {
+    const normalized = normalizeSelectionQuery(query);
+
+    // No criterion means no matches, matching searchTools' empty-query contract.
+    // Return a fresh object so callers can never mutate a shared empty result.
+    if (
+        normalized.names.length === 0 &&
+        normalized.tags.length === 0 &&
+        normalized.pattern === undefined
+    ) {
+        return { names: [], tools: [] };
+    }
+
+    // Read the option arrays once: `options` is optional, and the runtime array
+    // checks keep a sloppy host from crashing selection on non-array input.
+    const excludeNames = options?.excludeNames;
+    const excluded = new Set<string>();
+    for (const name of Array.isArray(excludeNames) ? excludeNames : []) {
+        if (typeof name === 'string') excluded.add(name);
+    }
+
+    const selectable: RankedSelection[] = [];
+
+    for (const tool of tools) {
+        // Core tools are declared on every request; selecting them would imply a
+        // grant the caller already has. They are reported through `declared`
+        // instead. This also means a caller cannot accidentally enable one.
+        if (tool.visibility !== 'searchable') continue;
+        if (excluded.has(tool.name)) continue;
+
+        const nameOrder = normalized.nameOrder.get(tool.name);
+        const exactName = nameOrder !== undefined;
+        const regexName =
+            normalized.pattern !== undefined &&
+            matchesSelectionPattern(normalized.pattern, tool.name);
+
+        let tagBest = 0;
+        let tagHits = 0;
+
+        for (const needle of normalized.tags) {
+            const points = scoreTool(tool, needle);
+            if (points === 0) continue;
+
+            tagHits += 1;
+            if (points > tagBest) tagBest = points;
+        }
+
+        if (!exactName && !regexName && tagHits === 0) continue;
+
+        selectable.push({
+            tool,
+            group: exactName ? 2 : regexName ? 1 : 0,
+            nameOrder: nameOrder ?? Number.MAX_SAFE_INTEGER,
+            tagBest,
+            tagHits
+        });
+    }
+
+    const toolsMatch = rankSelection(selectable);
+
+    // Declared core tools use the same union and ordering, but their tag scoring
+    // stops at name + tags: core descriptions mention everyday words and would
+    // append an already-available entry to almost every query (see rankDeclared).
+    const declaredRanked: RankedSelection[] = [];
+    const seenDeclared = new Set<string>();
+    const declaredTools = options?.declared;
+
+    for (const tool of Array.isArray(declaredTools) ? declaredTools : []) {
+        if (seenDeclared.has(tool.name)) continue;
+
+        const nameOrder = normalized.nameOrder.get(tool.name);
+        const exactName = nameOrder !== undefined;
+        const regexName =
+            normalized.pattern !== undefined &&
+            matchesSelectionPattern(normalized.pattern, tool.name);
+
+        let tagBest = 0;
+        let tagHits = 0;
+
+        for (const needle of normalized.tags) {
+            const points = scoreDeclaredTool(tool, needle);
+            if (points === 0) continue;
+
+            tagHits += 1;
+            if (points > tagBest) tagBest = points;
+        }
+
+        if (!exactName && !regexName && tagHits === 0) continue;
+
+        seenDeclared.add(tool.name);
+        declaredRanked.push({
+            tool,
+            group: exactName ? 2 : regexName ? 1 : 0,
+            nameOrder: nameOrder ?? Number.MAX_SAFE_INTEGER,
+            tagBest,
+            tagHits
+        });
+    }
+
+    const alreadyAvailable = rankSelection(declaredRanked);
+    const result: ToolSelectionResult = {
+        names: toolsMatch.map((match) => match.name),
+        tools: toolsMatch
+    };
+
     if (alreadyAvailable.length > 0) result.alreadyAvailable = alreadyAvailable;
 
     return result;

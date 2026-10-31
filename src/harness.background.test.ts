@@ -454,6 +454,8 @@ describe('background tool calls', () => {
         expect(seen[0].toolNames).toEqual([
             'toolRegistry',
             'toolRequest',
+            'toolList',
+            'toolManage',
             'toolCreate',
             'todoManage',
             'profileManage',

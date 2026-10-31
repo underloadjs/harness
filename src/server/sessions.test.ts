@@ -1213,6 +1213,8 @@ describe('SessionStore turns', () => {
                 coreTools: [
                     'toolRegistry',
                     'toolRequest',
+                    'toolList',
+                    'toolManage',
                     'toolCreate',
                     'todoManage',
                     'profileManage',
@@ -1638,7 +1640,8 @@ describe('SessionStore manual tool calls', () => {
         expect(await store.callTool(session.id, 'toolRequest', { tags: ['text'] })).toEqual({
             enabled: ['digest'],
             tools: [{ name: 'digest', description: 'Summarise text.', tags: ['text', 'summary'] }],
-            remaining: 0
+            matched: 1,
+            omitted: 0
         });
         expect(store.get(session.id).discoveredTools).toEqual(['digest']);
     });

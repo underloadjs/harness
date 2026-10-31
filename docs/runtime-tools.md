@@ -63,22 +63,78 @@ The published package contains two siblings:
 
 `sourcePath` values are resolved relative to the installed `src/` root (or may be
 absolute). `harness.toolSource(name).sourcePath` therefore reports a package-
-relative label such as `runtime-tools/toolRegistry.ts`, not a generated `dist/`
-module. TypeScript is a runtime dependency of the package because the compiler is
-needed in production.
+relative label such as `runtime-tools/toolRegistry.tool.ts`, not a generated
+`dist/` module. TypeScript is a runtime dependency of the package because the
+compiler is needed in production.
 
 The package `files` allow-list includes `src` and excludes tests. The runtime
 compiler must remain able to read these editable entries after a production
 install; generated `dist/` files are not the editable source model.
 
-The opt-in web tools also ship independently as `runtime-tools/webSearch.ts` and
-`runtime-tools/webFetch.ts`; their editable provider implementations are shipped
+The opt-in web tools also ship independently as `runtime-tools/webSearch.tool.ts`
+and `runtime-tools/webFetch.tool.ts`; their editable provider implementations are shipped
 too. The registered entries delegate provider/credential operations to the
 harness that owns them; startup supplies the configured metadata/runtime closure.
 A replacement registered under those names is an ordinary source revision and
 does not inherit the original harness's configured provider closure. Module-local
 provider state is not migrated between revisions. Credentials remain harness
 configuration, never candidate source or source records.
+
+## External tool folders and `toolManage`
+
+`toolFolders` accepts an ordered list of absolute or cwd-relative directories. The
+harness recursively discovers `*.tool.ts` entries in deterministic order (folder
+order, then a byte-wise sort of each folder's relative POSIX paths) and publishes each through the same kernel; a later
+folder wins a name collision. An invalid folder or module fails harness
+construction with the exact path. Folder modules are trusted code: they load with
+the process's permissions and there is no sandbox.
+
+Canonical `*.tool.ts` entry:
+
+```ts
+// tools/example.tool.ts
+export const metadata = {
+    name: 'example',
+    description: 'Return a greeting.',
+    tags: ['example', 'greeting'],
+    parameters: {
+        type: 'object',
+        properties: { name: { type: 'string' } },
+        required: ['name'],
+        additionalProperties: false
+    }
+};
+
+export const execute = ({ parameters }: ToolContext) => `Hello, ${parameters.name}!`;
+```
+
+`toolManage` is the model-facing management surface (the host can call
+`harness.runtime.manageTool` directly with the same parameters):
+
+- `list` — registry metadata for every live tool;
+- `details` — one tool's metadata, cloned `parameters` schema, enabled/state,
+  source revision, and any preserved `owningPath`;
+- `source` — captured `moduleText`, local dependencies, format, revision, checks;
+- `path` — configured folders plus an installed `sourcePath`/preserved
+  `owningPath`, or the deterministic `createPath` an unowned name would use, or
+  validate an explicit candidate path inside the write fence (never writes);
+- `create` / `update` — compile/validate/publish through the shared kernel.
+  **Persistent by default:** a pathless `create` requires `name` and writes
+  `<name>.tool.ts` in the LAST configured folder (later folders win startup
+  collisions); a pathless `update` reuses the tool's captured owning `sourcePath`
+  when it is inside a configured root. An explicit `path` inside a configured root
+  overrides; the file must end in `.tool.ts`. `persist: "runtime"` is the explicit
+  no-disk mode (snapshot-persisted only) and cannot be combined with `path`/`folder`.
+  No configured root is a clear error for persistent operations;
+- `reload` — re-read a disk-backed revision, or recompile captured bytes.
+
+Traversal, symlink escapes, and implicit outside-folder writes are rejected. A
+failed registration rolls the just-written file back to its previous contents (or
+removes a newly created file), reports a rollback failure explicitly, and leaves the
+prior registry entry untouched. Disk-backed create/update is disk-owned catalogue
+state: it does not enter `createdToolRecords` or spend `maxCreatedTools`; restart
+re-scans the folder. Path fencing is not a sandbox: the compiler still executes
+trusted candidate code with process permissions.
 
 ## API
 
@@ -117,7 +173,7 @@ implementation explicitly:
 ```ts
 const result = await harness.executeTool('toolRegistry', {
     name: 'example',                         // optional if the module exports it
-    sourcePath: 'tools/example.ts'           // relative to installed src/, or absolute
+    sourcePath: 'tools/example.tool.ts'      // relative to installed src/, or absolute
     // moduleText: '...'                     // alternative: full inline module text
     // dependencies: [{ path, text }]        // virtual local helpers for moduleText
 });
@@ -129,7 +185,7 @@ const result = await harness.executeTool('toolRegistry', {
 //   created: false,
 //   replaced: true,
 //   previousRevision?: '...',
-//   sourcePath?: 'tools/example.ts',
+//   sourcePath?: 'tools/example.tool.ts',
 //   checks: ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
 // }
 ```

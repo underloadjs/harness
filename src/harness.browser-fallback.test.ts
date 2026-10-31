@@ -42,6 +42,8 @@ describe('browser baseline fallback', () => {
         // Harness-owned controls and presets are seedable without compiling.
         expect(writer.tools.toolRegistry).toBeDefined();
         expect(writer.tools.toolRequest.visibility).toBe('core');
+        expect(writer.tools.toolList.visibility).toBe('core');
+        expect(writer.tools.toolManage.visibility).toBe('core');
         expect(writer.tools.toolCreate.visibility).toBe('core');
         expect(writer.tools.todoManage.visibility).toBe('core');
         expect(writer.tools.fileRead.name).toBe('fileRead');
@@ -82,8 +84,17 @@ describe('browser baseline fallback', () => {
         expect(() =>
             harness({
                 agents: { writer: agent({ model: 'test/model', stream: scripted() }) },
-                toolSources: { fromMap: 'tools/files/fileList.ts' }
+                toolSources: { fromMap: 'tools/files/fileList.tool.ts' }
             })
         ).toThrow(/unavailable in the browser build/);
+
+        // A folder configuration is an explicit Node capability request; the
+        // browser build rejects it rather than silently scanning nothing.
+        expect(() =>
+            harness({
+                agents: { writer: agent({ model: 'test/model', stream: scripted() }) },
+                toolFolders: ['/tmp/does-not-matter']
+            })
+        ).toThrow(/toolFolders require the Node source compiler/);
     });
 });
