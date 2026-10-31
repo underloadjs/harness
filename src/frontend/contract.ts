@@ -43,7 +43,7 @@ import type {
 // the shell renders them.
 //
 // T14 discovery upgrade: the wire inventory is toolRequest / toolList / toolManage /
-// toolCreate / todoManage (see src/runtime-tools/*.tool.ts and
+// toolCreate / todoManage (see src/tools/runtime/*.tool.ts and
 // src/harness.metadata.test.ts), so the fallback lists them in that order. A
 // pre-T14 server only ever declared the old three names; listing the new pair here
 // is what keeps an old payload's derived core set matching today's catalogue.
@@ -57,8 +57,8 @@ export const HARNESS_CORE_TOOL_NAMES = [
 
 // One-line explanations for the historical core set. Retained as documentation
 // data; no UI location lists core tools any more (R21.2). The toolList/toolManage
-// lines summarize the canonical descriptions in src/runtime-tools/toolList.tool.ts
-// and src/runtime-tools/toolManage.tool.ts (that module is authoritative; these are
+// lines summarize the canonical descriptions in src/tools/runtime/toolList.tool.ts
+// and src/tools/runtime/toolManage.tool.ts (that module is authoritative; these are
 // only the one-line form kept here for callers that render a hint).
 export const HARNESS_CORE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
     toolRequest: 'Find tools by capability tag and enable them for this chat.',

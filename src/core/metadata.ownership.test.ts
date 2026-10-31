@@ -1,18 +1,22 @@
-// T13 metadata ownership + consistency.
+// T19 metadata ownership + discovery contract.
 //
-// This test pins the post-migration contract, not the old central table:
-//   - every runtime-tools/<name>.tool.ts entry owns its metadata, and the
-//     core/metadata.ts compatibility path re-exports the SAME object;
-//   - every preset *.tool.ts entry owns a local metadata constant, and the
-//     synchronous catalogue projection deep-equals it;
-//   - no runtime entry imports core/metadata.ts and no preset entry imports the
-//     catalogue's PRESET_TOOLS value (either would break the cycle/lazy rules);
+// What this file pins (replacing the T13 "same object identity" contract):
+//   - every entry (runtime AND preset) owns a PURE-LITERAL `metadata` export and a
+//     separate PURE-LITERAL `registration` policy export, under the consolidated
+//     `src/tools/` tree (R7: the old top-level `runtime-tools/` folder is gone);
+//   - `core/metadata.ts` is a DATA PROJECTION of the generated manifest: it never
+//     imports a `.tool` module (R9), so the object identities are deliberately
+//     independent of the entry modules;
+//   - the projection still deep-equals the authoritative entry literals, so a
+//     descriptor cannot advertise metadata the entry does not declare;
+//   - the historical `coreToolMetadata()` order and the conditional-tool exclusions
+//     are preserved through `registration.order` / `registration.alwaysDeclared`;
 //   - the cross-contract toolManage persistence schema and toolRequest wording are
 //     present in the authoritative entry modules.
 //
-// The preset checks deliberately import the real entry modules. This is a Node
-// test: loading node:fs here does NOT weaken the package's lazy/browser contract,
-// which is asserted statically against catalogue.ts below.
+// The entry checks deliberately import the real entry modules. This is a Node test:
+// loading node:fs here does NOT weaken the package's lazy/browser contract, which is
+// asserted separately (src/core/tool-discovery.test.ts + tools/laziness.test.ts).
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -40,23 +44,23 @@ import {
     TOOL_REQUEST_METADATA,
     coreToolMetadata
 } from './metadata';
-import * as toolRequestEntry from '../runtime-tools/toolRequest.tool';
-import * as toolListEntry from '../runtime-tools/toolList.tool';
-import * as toolManageEntry from '../runtime-tools/toolManage.tool';
-import * as toolCreateEntry from '../runtime-tools/toolCreate.tool';
-import * as toolRegistryEntry from '../runtime-tools/toolRegistry.tool';
-import * as todoManageEntry from '../runtime-tools/todoManage.tool';
-import * as profileManageEntry from '../runtime-tools/profileManage.tool';
-import * as chapterManageEntry from '../runtime-tools/chapterManage.tool';
-import * as locationManageEntry from '../runtime-tools/locationManage.tool';
-import * as agentManageEntry from '../runtime-tools/agentManage.tool';
-import * as agentResultEntry from '../runtime-tools/agentResult.tool';
-import * as agentDelegateEntry from '../runtime-tools/agentDelegate.tool';
-import * as toolCancelEntry from '../runtime-tools/toolCancel.tool';
-import * as actionRequestEntry from '../runtime-tools/actionRequest.tool';
-import * as threadForkEntry from '../runtime-tools/threadFork.tool';
-import * as threadSendEntry from '../runtime-tools/threadSend.tool';
-import * as threadListEntry from '../runtime-tools/threadList.tool';
+import * as toolRequestEntry from '../tools/runtime/toolRequest.tool';
+import * as toolListEntry from '../tools/runtime/toolList.tool';
+import * as toolManageEntry from '../tools/runtime/toolManage.tool';
+import * as toolCreateEntry from '../tools/runtime/toolCreate.tool';
+import * as toolRegistryEntry from '../tools/runtime/toolRegistry.tool';
+import * as todoManageEntry from '../tools/runtime/todoManage.tool';
+import * as profileManageEntry from '../tools/runtime/profileManage.tool';
+import * as chapterManageEntry from '../tools/runtime/chapterManage.tool';
+import * as locationManageEntry from '../tools/runtime/locationManage.tool';
+import * as agentManageEntry from '../tools/runtime/agentManage.tool';
+import * as agentResultEntry from '../tools/runtime/agentResult.tool';
+import * as agentDelegateEntry from '../tools/runtime/agentDelegate.tool';
+import * as toolCancelEntry from '../tools/runtime/toolCancel.tool';
+import * as actionRequestEntry from '../tools/runtime/actionRequest.tool';
+import * as threadForkEntry from '../tools/runtime/threadFork.tool';
+import * as threadSendEntry from '../tools/runtime/threadSend.tool';
+import * as threadListEntry from '../tools/runtime/threadList.tool';
 
 const sourceOf = (relativePath: string): string =>
     readFileSync(fileURLToPath(new URL(relativePath, import.meta.url)), 'utf8');
@@ -72,139 +76,122 @@ type MetadataRow = {
 type RuntimeEntry = {
     wireName: string;
     sourcePath: string;
-    metadataName: string;
     metadata: MetadataRow;
     moduleMetadata: MetadataRow;
     aggregated: MetadataRow;
 };
 
-// Every runtime entry that historically imported TOOL_*_METADATA from
-// core/metadata.ts. webSearch/webFetch already owned local metadata before T13.
+// Every harness-owned runtime entry, now under tools/runtime (R7). The aggregated
+// row comes from the compatibility facade, which projects the generated manifest.
 const runtimeEntries: RuntimeEntry[] = [
     {
         wireName: 'toolRequest',
-        sourcePath: '../runtime-tools/toolRequest.tool.ts',
-        metadataName: 'TOOL_REQUEST_METADATA',
+        sourcePath: '../tools/runtime/toolRequest.tool.ts',
         metadata: toolRequestEntry.TOOL_REQUEST_METADATA,
         moduleMetadata: toolRequestEntry.metadata,
         aggregated: coreMetadata.TOOL_REQUEST_METADATA
     },
     {
         wireName: 'toolList',
-        sourcePath: '../runtime-tools/toolList.tool.ts',
-        metadataName: 'TOOL_LIST_METADATA',
+        sourcePath: '../tools/runtime/toolList.tool.ts',
         metadata: toolListEntry.TOOL_LIST_METADATA,
         moduleMetadata: toolListEntry.metadata,
         aggregated: coreMetadata.TOOL_LIST_METADATA
     },
     {
         wireName: 'toolManage',
-        sourcePath: '../runtime-tools/toolManage.tool.ts',
-        metadataName: 'TOOL_MANAGE_METADATA',
+        sourcePath: '../tools/runtime/toolManage.tool.ts',
         metadata: toolManageEntry.TOOL_MANAGE_METADATA,
         moduleMetadata: toolManageEntry.metadata,
         aggregated: coreMetadata.TOOL_MANAGE_METADATA
     },
     {
         wireName: 'toolCreate',
-        sourcePath: '../runtime-tools/toolCreate.tool.ts',
-        metadataName: 'TOOL_CREATE_METADATA',
+        sourcePath: '../tools/runtime/toolCreate.tool.ts',
         metadata: toolCreateEntry.TOOL_CREATE_METADATA,
         moduleMetadata: toolCreateEntry.metadata,
         aggregated: coreMetadata.TOOL_CREATE_METADATA
     },
     {
         wireName: 'toolRegistry',
-        sourcePath: '../runtime-tools/toolRegistry.tool.ts',
-        metadataName: 'TOOL_REGISTRY_METADATA',
+        sourcePath: '../tools/runtime/toolRegistry.tool.ts',
         metadata: toolRegistryEntry.TOOL_REGISTRY_METADATA,
         moduleMetadata: toolRegistryEntry.metadata,
         aggregated: coreMetadata.TOOL_REGISTRY_METADATA
     },
     {
         wireName: 'todoManage',
-        sourcePath: '../runtime-tools/todoManage.tool.ts',
-        metadataName: 'TODO_MANAGE_METADATA',
+        sourcePath: '../tools/runtime/todoManage.tool.ts',
         metadata: todoManageEntry.TODO_MANAGE_METADATA,
         moduleMetadata: todoManageEntry.metadata,
         aggregated: coreMetadata.TODO_MANAGE_METADATA
     },
     {
         wireName: 'profileManage',
-        sourcePath: '../runtime-tools/profileManage.tool.ts',
-        metadataName: 'PROFILE_MANAGE_METADATA',
+        sourcePath: '../tools/runtime/profileManage.tool.ts',
         metadata: profileManageEntry.PROFILE_MANAGE_METADATA,
         moduleMetadata: profileManageEntry.metadata,
         aggregated: coreMetadata.PROFILE_MANAGE_METADATA
     },
     {
         wireName: 'chapterManage',
-        sourcePath: '../runtime-tools/chapterManage.tool.ts',
-        metadataName: 'CHAPTER_MANAGE_METADATA',
+        sourcePath: '../tools/runtime/chapterManage.tool.ts',
         metadata: chapterManageEntry.CHAPTER_MANAGE_METADATA,
         moduleMetadata: chapterManageEntry.metadata,
         aggregated: coreMetadata.CHAPTER_MANAGE_METADATA
     },
     {
         wireName: 'locationManage',
-        sourcePath: '../runtime-tools/locationManage.tool.ts',
-        metadataName: 'LOCATION_MANAGE_METADATA',
+        sourcePath: '../tools/runtime/locationManage.tool.ts',
         metadata: locationManageEntry.LOCATION_MANAGE_METADATA,
         moduleMetadata: locationManageEntry.metadata,
         aggregated: coreMetadata.LOCATION_MANAGE_METADATA
     },
     {
         wireName: 'agentManage',
-        sourcePath: '../runtime-tools/agentManage.tool.ts',
-        metadataName: 'AGENT_MANAGE_METADATA',
+        sourcePath: '../tools/runtime/agentManage.tool.ts',
         metadata: agentManageEntry.AGENT_MANAGE_METADATA,
         moduleMetadata: agentManageEntry.metadata,
         aggregated: coreMetadata.AGENT_MANAGE_METADATA
     },
     {
         wireName: 'agentResult',
-        sourcePath: '../runtime-tools/agentResult.tool.ts',
-        metadataName: 'AGENT_RESULT_METADATA',
+        sourcePath: '../tools/runtime/agentResult.tool.ts',
         metadata: agentResultEntry.AGENT_RESULT_METADATA,
         moduleMetadata: agentResultEntry.metadata,
         aggregated: coreMetadata.AGENT_RESULT_METADATA
     },
     {
         wireName: 'toolCancel',
-        sourcePath: '../runtime-tools/toolCancel.tool.ts',
-        metadataName: 'TOOL_CANCEL_METADATA',
+        sourcePath: '../tools/runtime/toolCancel.tool.ts',
         metadata: toolCancelEntry.TOOL_CANCEL_METADATA,
         moduleMetadata: toolCancelEntry.metadata,
         aggregated: coreMetadata.TOOL_CANCEL_METADATA
     },
     {
         wireName: 'actionRequest',
-        sourcePath: '../runtime-tools/actionRequest.tool.ts',
-        metadataName: 'ACTION_REQUEST_METADATA',
+        sourcePath: '../tools/runtime/actionRequest.tool.ts',
         metadata: actionRequestEntry.ACTION_REQUEST_METADATA,
         moduleMetadata: actionRequestEntry.metadata,
         aggregated: coreMetadata.ACTION_REQUEST_METADATA
     },
     {
         wireName: 'threadFork',
-        sourcePath: '../runtime-tools/threadFork.tool.ts',
-        metadataName: 'THREAD_FORK_METADATA',
+        sourcePath: '../tools/runtime/threadFork.tool.ts',
         metadata: threadForkEntry.THREAD_FORK_METADATA,
         moduleMetadata: threadForkEntry.metadata,
         aggregated: coreMetadata.THREAD_FORK_METADATA
     },
     {
         wireName: 'threadSend',
-        sourcePath: '../runtime-tools/threadSend.tool.ts',
-        metadataName: 'THREAD_SEND_METADATA',
+        sourcePath: '../tools/runtime/threadSend.tool.ts',
         metadata: threadSendEntry.THREAD_SEND_METADATA,
         moduleMetadata: threadSendEntry.metadata,
         aggregated: coreMetadata.THREAD_SEND_METADATA
     },
     {
         wireName: 'threadList',
-        sourcePath: '../runtime-tools/threadList.tool.ts',
-        metadataName: 'THREAD_LIST_METADATA',
+        sourcePath: '../tools/runtime/threadList.tool.ts',
         metadata: threadListEntry.THREAD_LIST_METADATA,
         moduleMetadata: threadListEntry.metadata,
         aggregated: coreMetadata.THREAD_LIST_METADATA
@@ -278,19 +265,19 @@ const presetEntries: PresetEntry[] = [
     }
 ];
 
-describe('runtime-tools metadata ownership', () => {
-    it('declares each metadata object in its own entry and re-exports the same identity', () => {
+describe('runtime entry metadata ownership', () => {
+    it('declares a literal metadata export and aliases it from the same file', () => {
         for (const entry of runtimeEntries) {
             expect(entry.metadata.name).toBe(entry.wireName);
+            // Same-file alias: the module's `metadata` IS the historical constant.
             expect(entry.moduleMetadata).toBe(entry.metadata);
-            expect(entry.aggregated).toBe(entry.metadata);
-            expect(sourceOf(entry.sourcePath)).toContain(
-                `export const ${entry.metadataName}`
-            );
+            // The facade is a manifest PROJECTION, so it is a different object that
+            // must still deep-equal the entry's literal.
+            expect(entry.aggregated).toEqual(entry.metadata);
         }
     });
 
-    it('does not import the core/metadata aggregator from any runtime entry', () => {
+    it('does not import core/metadata from any runtime entry', () => {
         for (const entry of runtimeEntries) {
             // An entry may MENTION the historical path in a comment; what must not
             // exist is a module import of it, which would re-create the cycle.
@@ -300,21 +287,65 @@ describe('runtime-tools metadata ownership', () => {
         }
     });
 
-    it('keeps agentDelegate metadata local and pins the inlined bounds', () => {
-        expect(coreMetadata.agentDelegateMetadata).toBe(agentDelegateEntry.agentDelegateMetadata);
+    it('declares a literal registration policy on every runtime entry', () => {
+        for (const entry of runtimeEntries) {
+            const source = sourceOf(entry.sourcePath);
+            expect(source).toContain('export const registration = {');
+            // Harness policy must not reach the model-facing schema.
+            expect(entry.metadata).not.toHaveProperty('group');
+            expect(entry.metadata).not.toHaveProperty('activation');
+            expect(entry.metadata).not.toHaveProperty('order');
+        }
+    });
+
+    it('keeps agentDelegate metadata literal and pins the inlined bounds', () => {
+        // The facade's factory and the entry's factory are different module
+        // instances on purpose (the facade must not import a .tool module), so the
+        // contract is behavioural equality, not object identity.
         expect(agentDelegateEntry.AGENT_DELEGATE_NAME).toBe('agentDelegate');
         expect(agentDelegateEntry.agentDelegateMetadata().name).toBe('agentDelegate');
         expect(agentDelegateEntry.metadata.name).toBe('agentDelegate');
-        // The entry annotates the factory with the leaf type, so a missing type
-        // import would fail type-checking (TS2304) rather than silently widening.
-        //
-        // The type is imported from '../core' rather than '../core/tool-metadata':
-        // a type-only import is erased at transpile and resolves to the LIVE core
-        // module, so the captured revision keeps `dependencies: []` (the shipped
-        // packaging contract in scripts/check-package-tools.mjs). A leaf import
-        // would be captured as a local dependency.
-        expect(sourceOf('../runtime-tools/agentDelegate.tool.ts')).toContain(
-            "import type { CoreToolMetadata } from '../core';"
+        // The zero-allowlist form is the entry literal, projected through the facade.
+        expect(coreMetadata.AGENT_DELEGATE_NAME).toBe('agentDelegate');
+        expect(coreMetadata.agentDelegateMetadata()).toEqual({
+            name: 'agentDelegate',
+            description: agentDelegateEntry.metadata.description,
+            tags: ['agents', 'delegate', 'delegation', 'subagent', 'team'],
+            visibility: 'core',
+            parameters: agentDelegateEntry.metadata.parameters
+        });
+        // The allowlist form is the ONE set-projection function.
+        expect(coreMetadata.agentDelegateMetadata(['alpha', 'beta'])).toEqual(
+            agentDelegateEntry.agentDelegateMetadata(['alpha', 'beta'])
+        );
+        expect(agentDelegateEntry.agentDelegateMetadata(['alpha', 'beta'])).toEqual({
+            name: 'agentDelegate',
+            description:
+                'Delegate a self-contained task to a configured subagent and return its answer. Subagents: alpha, beta. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.',
+            tags: ['agents', 'delegate', 'delegation', 'subagent', 'team'],
+            visibility: 'core',
+            parameters: {
+                type: 'object',
+                properties: {
+                    agent: {
+                        type: 'string',
+                        enum: ['alpha', 'beta'],
+                        description: 'Subagent name, one of the configured allowlist.'
+                    },
+                    input: {
+                        type: 'string',
+                        description: 'The full brief the subagent should act on.'
+                    }
+                },
+                required: ['agent', 'input'],
+                additionalProperties: false
+            }
+        });
+        // The entry annotates the factory with the leaf type through a TYPE-ONLY
+        // import of '../core' (erased at transpile, resolves to the LIVE core
+        // module), so the captured revision keeps `dependencies: []`.
+        expect(sourceOf('../tools/runtime/agentDelegate.tool.ts')).toContain(
+            "import type { CoreToolMetadata } from '../../core';"
         );
 
         expect([
@@ -399,6 +430,14 @@ describe('runtime-tools metadata ownership', () => {
             'agentResult'
         ]);
     });
+
+    it('never imports a .tool module from the compatibility facade', () => {
+        // R9: the facade projects the generated manifest, so a catalogue can be
+        // enumerated without evaluating a single tool body.
+        const source = sourceOf('./metadata.ts');
+        expect(source).not.toMatch(/from '[^']*\.tool'/);
+        expect(source).toContain("from './tool-manifest'");
+    });
 });
 
 describe('preset metadata ownership', () => {
@@ -407,6 +446,15 @@ describe('preset metadata ownership', () => {
             expect(entry.metadata).toEqual(PRESET_TOOLS[entry.key]);
             expect(sourceOf(entry.sourcePath)).toContain(`export const ${entry.metadataName}`);
             expect(sourceOf(entry.sourcePath)).not.toContain('PRESET_TOOLS');
+        }
+    });
+
+    it('aliases `metadata` to the local constant and declares a preset registration', () => {
+        for (const entry of presetEntries) {
+            const source = sourceOf(entry.sourcePath);
+            expect(source).toContain(`export const metadata = ${entry.metadataName};`);
+            expect(source).toContain('export const registration = {');
+            expect(source).toContain("group: 'preset'");
         }
     });
 
@@ -419,12 +467,14 @@ describe('preset metadata ownership', () => {
         }
     });
 
-    it('keeps catalogue.ts a data-only projection with dynamic implementation loads', () => {
+    it('keeps catalogue.ts a data-only projection with generated implementation loads', () => {
         const source = sourceOf('../tools/catalogue.ts');
 
         expect(PRESET_TOOL_NAMES).toEqual(presetEntries.map((entry) => entry.key));
+        // No static import of an implementation module: the bodies are reached
+        // through the GENERATED loader (T19/T21), never named here.
         expect(source).not.toMatch(/from '\.\/(files|command|syntax)\//);
-        expect(source).toContain("import('./files/fileRead.tool')");
+        expect(source).toContain('loadPresetTool');
         expect(Object.keys(catalogue.PRESET_TOOLS)).toEqual(PRESET_TOOL_NAMES);
     });
 });

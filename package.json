@@ -67,7 +67,7 @@
         "registry": "https://registry.npmjs.org"
     },
     "scripts": {
-        "build": "vite build && npm run build:types",
+        "build": "npm run tools:manifest && vite build && npm run build:types",
         "build:types": "node scripts/build-declarations.mjs",
         "build:frontend": "vite build --config src/frontend/vite.config.ts",
         "cli": "vite-node src/server/cli/index.ts",
@@ -75,13 +75,15 @@
         "dev:server": "vite-node src/server/dev.ts",
         "preview:frontend": "vite preview --config src/frontend/vite.config.ts",
         "prepublishOnly": "npm run typecheck && npm run test && npm run build && npm run test:package:files && npm run test:package && npm run test:package:runtime && npm run test:package:tools",
-        "test": "vitest run",
+        "test": "npm run tools:manifest:check && vitest run",
         "test:frontend": "vitest run --config src/frontend/vitest.config.ts",
         "test:package": "node scripts/check-package-types.mjs",
         "test:package:files": "node --test scripts/package-files.test.mjs",
         "test:package:runtime": "node scripts/check-package-runtime.mjs",
         "test:package:tools": "node scripts/check-package-tools.mjs",
-        "typecheck": "tsc --noEmit",
+        "tools:manifest": "vite-node scripts/generate-tool-manifest.mjs",
+        "tools:manifest:check": "vite-node scripts/generate-tool-manifest.mjs --check",
+        "typecheck": "npm run tools:manifest:check && tsc --noEmit",
         "release": "vite-node ../../../scripts/publish-safe.ts"
     },
     "author": "NQQT",

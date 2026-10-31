@@ -73,6 +73,7 @@ import type { HarnessPresetRecord } from '../persistence';
 import { LEGACY_PRESET_DEFINITIONS, presets } from './presets';
 import type { LegacyPresetDefinition } from './presets';
 import {
+    EXAMPLE_APP_TOOL_SOURCES,
     SHARED_TOOL_NAMES,
     agentsFromProfiles,
     createProfiledHarness,
@@ -385,9 +386,9 @@ const liveFactory = (
                 // T19/F1: a rebuilt flaky example keeps its extra TOOL SET, but
                 // the extra is supplied as an editable source path so startup uses
                 // the same compiler as every other shipped/app tool.
-                extraToolSources: {
-                    testFlaky: 'server/harnesses/tool-sources/testFlaky.ts'
-                }
+                // T25: the paths are DISCOVERED from server/tools/examples, so the
+                // example set cannot drift from the files.
+                extraToolSources: { ...EXAMPLE_APP_TOOL_SOURCES }
             },
             settings,
             progress,

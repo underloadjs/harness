@@ -75,8 +75,6 @@ describe('package layout', () => {
             'core',
             'frontend',
             'plugin',
-            // Independently compilable harness-owned tool source entries.
-            'runtime-tools',
             'server',
             'shared',
             'tools',
@@ -333,7 +331,22 @@ describe('package layout', () => {
         // the built-package type check AND the built-package runtime smoke: a release
         // cannot ship declarations a NodeNext consumer cannot read, or a bundle whose
         // own server entry cannot start.
-        expect(manifest.scripts['build']).toBe('vite build && npm run build:types');
+        //
+        // T21: the descriptor manifest is GENERATED from the tool entries, so `build`
+        // refreshes it first and `typecheck`/`test` refuse to run against a stale one
+        // (`--check`). A new `.tool.ts` therefore reaches the catalogue, the server
+        // inventory and the lazy loaders without any hand-maintained table edit.
+        expect(manifest.scripts['tools:manifest']).toBe(
+            'vite-node scripts/generate-tool-manifest.mjs'
+        );
+        expect(manifest.scripts['tools:manifest:check']).toBe(
+            'vite-node scripts/generate-tool-manifest.mjs --check'
+        );
+        expect(manifest.scripts['build']).toBe(
+            'npm run tools:manifest && vite build && npm run build:types'
+        );
+        expect(manifest.scripts['typecheck']).toBe('npm run tools:manifest:check && tsc --noEmit');
+        expect(manifest.scripts['test']).toBe('npm run tools:manifest:check && vitest run');
         expect(manifest.scripts['build:types']).toBe('node scripts/build-declarations.mjs');
         expect(manifest.scripts['test:package']).toBe('node scripts/check-package-types.mjs');
         expect(manifest.scripts['test:package:runtime']).toBe('node scripts/check-package-runtime.mjs');
@@ -352,6 +365,7 @@ describe('package layout', () => {
             'scripts/fix-declaration-specifiers.mjs',
             'scripts/check-package-types.mjs',
             'scripts/check-package-runtime.mjs',
+            'scripts/generate-tool-manifest.mjs',
             'tsconfig.entries.json'
         ]) {
             expect(fs.existsSync(path.join(PACKAGE_ROOT, script))).toBe(true);

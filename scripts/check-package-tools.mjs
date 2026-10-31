@@ -57,7 +57,7 @@
 //   - ./check-package-runtime.mjs — non-self-modifying package smoke
 //   - ../src/core/tool-source.ts — compiler and source-record contract
 //   - ../src/harness.ts          — registerTool/executeTool/callTool kernel
-//   - ../src/runtime-tools/toolRegistry.tool.ts — ordinary registration tool
+//   - ../src/tools/runtime/toolRegistry.tool.ts — ordinary registration tool
 
 import assert from 'node:assert/strict';
 import { createRequire } from 'node:module';
@@ -86,12 +86,12 @@ import { applyScratchEnvironment, resolveScratchRoot } from './scratch.mjs';
 
 const DIST_ENTRY = path.join(PACKAGE_ROOT, BUILD_ROOT, 'underload-harness.mjs');
 const EXPECTED_CHECKS = ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json'];
-// Known shipped source entries. The runtime-tools list is the harness-owned core
-// surface; the app list is the server catalogue's independent entries. The list is
-// kept explicit so a missing published entry is a failure rather than silent
-// coverage loss. T14 web entries are not present yet: the inventory below also
-// reports dynamically discovered files, so they are counted when they land without
-// this script inventing their final names.
+// Known shipped source entries. The runtime list is the harness-owned core
+// surface (src/tools/runtime/, moved out of the old top-level `runtime-tools/`
+// folder by T21); the app list is the server catalogue's independent entries. The
+// list is kept explicit so a missing published entry is a failure rather than
+// silent coverage loss. The inventory below also reports dynamically discovered
+// files, so a newly landed entry is counted without this script inventing its name.
 const RUNTIME_SOURCE_ENTRIES = [
     'actionRequest.tool.ts',
     'agentDelegate.tool.ts',
@@ -114,14 +114,12 @@ const RUNTIME_SOURCE_ENTRIES = [
     'webSearch.tool.ts'
 ];
 const WEB_SOURCE_ENTRIES = ['webFetch.tool.ts', 'webSearch.tool.ts'];
-const APP_SOURCE_ENTRIES = [
-    'diceRoll.ts',
-    'noteSearch.ts',
-    'testFlaky.ts',
-    'textCount.ts',
-    'textSummarize.ts',
-    'timeNow.ts'
-];
+// App tool entries (T25): DERIVED from the server tools folders, never a hand list.
+// The layout is the contract: `src/server/tools/shared` is the shared toolbox and
+// `src/server/tools/examples` is opt-in per harness. A new `*.tool.ts` in either
+// folder is counted here without this script knowing its name.
+const APP_TOOLS_ROOT = ['server', 'tools'];
+const APP_TOOL_FOLDERS = ['shared', 'examples'];
 // Preset implementation entries. These are shipped and independently loadable, but
 // the default harness registers the lazy catalogue proxies rather than source
 // revisions, so this check inventories their files without claiming a startup
@@ -136,21 +134,22 @@ const PRESET_SOURCE_ENTRIES = [
     'tools/files/fileWrite.tool.ts',
     'tools/syntax/syntaxCheck.tool.ts'
 ];
-// Runtime-tools entries that this no-subagent/no-interaction harness registers at
+// Runtime entries that this no-subagent/no-interaction harness registers at
 // startup. Each must have a source record captured by the SAME operation runtime
-// registration uses.
+// registration uses. Paths are relative to the package source root and point at
+// the shipped `src/tools/runtime/` tree (T21 moved them from `runtime-tools/`).
 const STARTUP_SOURCE_ENTRIES = {
-    toolRegistry: 'runtime-tools/toolRegistry.tool.ts',
-    toolRequest: 'runtime-tools/toolRequest.tool.ts',
-    toolList: 'runtime-tools/toolList.tool.ts',
-    toolManage: 'runtime-tools/toolManage.tool.ts',
-    toolCreate: 'runtime-tools/toolCreate.tool.ts',
-    todoManage: 'runtime-tools/todoManage.tool.ts',
-    profileManage: 'runtime-tools/profileManage.tool.ts',
-    chapterManage: 'runtime-tools/chapterManage.tool.ts',
-    locationManage: 'runtime-tools/locationManage.tool.ts',
-    agentManage: 'runtime-tools/agentManage.tool.ts',
-    agentResult: 'runtime-tools/agentResult.tool.ts'
+    toolRegistry: 'tools/runtime/toolRegistry.tool.ts',
+    toolRequest: 'tools/runtime/toolRequest.tool.ts',
+    toolList: 'tools/runtime/toolList.tool.ts',
+    toolManage: 'tools/runtime/toolManage.tool.ts',
+    toolCreate: 'tools/runtime/toolCreate.tool.ts',
+    todoManage: 'tools/runtime/todoManage.tool.ts',
+    profileManage: 'tools/runtime/profileManage.tool.ts',
+    chapterManage: 'tools/runtime/chapterManage.tool.ts',
+    locationManage: 'tools/runtime/locationManage.tool.ts',
+    agentManage: 'tools/runtime/agentManage.tool.ts',
+    agentResult: 'tools/runtime/agentResult.tool.ts'
 };
 
 const FIXTURE_ROOT = 'self-modify-fixture';
@@ -478,10 +477,10 @@ writeSource(REGISTRY_BROKEN_PATH, 'export const toolRegistry = (\n');
 
 await check('published shape ships editable src beside built dist', () => {
     const sourceEntry = path.join(copiedSourceRoot, 'index.ts');
-    const registrySourcePath = path.join(copiedSourceRoot, 'runtime-tools', 'toolRegistry.tool.ts');
+    const registrySourcePath = path.join(copiedSourceRoot, 'tools', 'runtime', 'toolRegistry.tool.ts');
 
     assert.ok(existsSync(sourceEntry), 'copied src/index.ts is missing');
-    assert.ok(existsSync(registrySourcePath), 'copied src/runtime-tools/toolRegistry.tool.ts is missing');
+    assert.ok(existsSync(registrySourcePath), 'copied src/tools/runtime/toolRegistry.tool.ts is missing');
     assert.ok(existsSync(copiedDistEntry), 'copied dist production entry is missing');
     assert.equal(path.dirname(copiedSourceRoot), path.dirname(path.join(packageRoot, BUILD_ROOT)));
 
@@ -614,7 +613,7 @@ await check('production harness exposes the self-modification API', () => {
 
     const registrySource = H.toolSource('toolRegistry');
     assert.ok(registrySource, 'toolRegistry has no captured source revision');
-    assert.equal(registrySource.sourcePath, 'runtime-tools/toolRegistry.tool.ts');
+    assert.equal(registrySource.sourcePath, 'tools/runtime/toolRegistry.tool.ts');
     assert.deepEqual(registrySource.dependencies, []);
 
     return { tool: 'toolRegistry', source: registrySource.sourcePath };
@@ -624,13 +623,24 @@ await check('production harness exposes the self-modification API', () => {
 // rather than an import: the production package is the subject, and a source tree
 // that lost an entry must fail before the synthetic fixtures divert attention.
 await check('shipped source entry inventory is present in the copied package', () => {
-    const runtimeDirectory = path.join(copiedSourceRoot, 'runtime-tools');
-    const appDirectory = path.join(copiedSourceRoot, 'server', 'harnesses', 'tool-sources');
+    const runtimeDirectory = path.join(copiedSourceRoot, 'tools', 'runtime');
     const runtimeEntries = readdirSync(runtimeDirectory)
         .filter((name) => name.endsWith('.ts'))
         .sort();
-    const appEntries = readdirSync(appDirectory)
-        .filter((name) => name.endsWith('.ts'))
+
+    // T25: app entries are discovered, not listed. Each folder is scanned
+    // recursively for `*.tool.ts`; the inventory reports what is actually shipped,
+    // so a new entry needs no edit here and a DELETED one still fails the
+    // non-empty/`*.tool.ts` assertions below.
+    const appDirectories = APP_TOOL_FOLDERS.map((folder) =>
+        path.join(copiedSourceRoot, ...APP_TOOLS_ROOT, folder)
+    );
+    const appEntries = appDirectories
+        .flatMap((directory) =>
+            readdirSync(directory)
+                .filter((name) => name.endsWith('.tool.ts'))
+                .map((name) => `${path.basename(directory)}/${name}`)
+        )
         .sort();
 
     // Known entries must exist. Extra entries are reported, not rejected: a future
@@ -638,17 +648,26 @@ await check('shipped source entry inventory is present in the copied package', (
     for (const name of RUNTIME_SOURCE_ENTRIES) {
         assert.ok(runtimeEntries.includes(name), `runtime source entry is missing: ${name}`);
     }
-    for (const name of APP_SOURCE_ENTRIES) {
-        assert.ok(appEntries.includes(name), `app source entry is missing: ${name}`);
+
+    // The two app folders are the whole exclusion contract: `shared` is the shared
+    // toolbox, `examples` is opt-in. Both must exist and both must ship at least the
+    // entries the presets advertise, or the toolbox silently loses a tool.
+    for (const folder of APP_TOOL_FOLDERS) {
+        const directory = path.join(copiedSourceRoot, ...APP_TOOLS_ROOT, folder);
+        assert.ok(existsSync(directory), `app tools folder is missing: ${folder}`);
+        assert.ok(
+            appEntries.some((entry) => entry.startsWith(`${folder}/`)),
+            `app tools folder ships no *.tool.ts entry: ${folder}`
+        );
     }
+
     const additionalRuntime = runtimeEntries.filter(
         (name) => !RUNTIME_SOURCE_ENTRIES.includes(name)
     );
-    const additionalApp = appEntries.filter((name) => !APP_SOURCE_ENTRIES.includes(name));
 
     for (const relative of [
-        ...RUNTIME_SOURCE_ENTRIES.map((name) => `runtime-tools/${name}`),
-        ...APP_SOURCE_ENTRIES.map((name) => `server/harnesses/tool-sources/${name}`),
+        ...RUNTIME_SOURCE_ENTRIES.map((name) => `tools/runtime/${name}`),
+        ...appEntries.map((name) => `${APP_TOOLS_ROOT.join('/')}/${name}`),
         ...PRESET_SOURCE_ENTRIES
     ]) {
         const file = path.join(copiedSourceRoot, relative);
@@ -664,7 +683,7 @@ await check('shipped source entry inventory is present in the copied package', (
         app: appEntries.length,
         preset: PRESET_SOURCE_ENTRIES.length,
         additionalRuntime,
-        additionalApp,
+        appEntries,
         webEntries
     };
 });
@@ -690,9 +709,10 @@ await check('startup registration exposes source records for harness-owned core 
 
 // Actual shipped app tool source (not a synthetic fixture). It is registered by the
 // ordinary toolRegistry from the copied src path, gets a source record, and executes
-// with its exact standalone result.
+// with its exact standalone result. T25: the path is the discovered app entry
+// (server/tools/shared/textCount.tool.ts), not the old tool-sources copy.
 await check('shipped app source entry compiles, registers, invokes, and keeps its record', async () => {
-    const sourcePath = 'server/harnesses/tool-sources/textCount.ts';
+    const sourcePath = 'server/tools/shared/textCount.tool.ts';
     const result = await H.executeTool('toolRegistry', { name: 'textCount', sourcePath });
 
     assert.equal(result.name, 'textCount');
@@ -725,7 +745,7 @@ await check('opt-in web source entries compile and keep source records', async (
 
     for (const file of WEB_SOURCE_ENTRIES) {
         const name = file.replace(/\.tool\.ts$/, '');
-        const sourcePath = `runtime-tools/${file}`;
+        const sourcePath = `tools/runtime/${file}`;
         const result = await H.executeTool('toolRegistry', { name, sourcePath });
 
         assert.equal(result.name, name);
@@ -746,6 +766,90 @@ await check('opt-in web source entries compile and keep source records', async (
     // The entries are registered but not invoked: execution needs the configured
     // provider closure and would be a network operation.
     return { compiled: installed };
+});
+
+// ---------------------------------------------------------------------------
+// Inventory freedom: a brand-new .tool.ts needs no catalogue/registry edit
+// ---------------------------------------------------------------------------
+//
+// T21: the public preset surface is derived from the generated descriptor
+// manifest, and discovery reads the filesystem. So a tool that simply LANDS in the
+// package's default tools tree must be discoverable — and loadable — without any
+// hand-maintained inventory being touched. This probe writes such a file into the
+// COPIED package (never the repository source tree) and proves both halves.
+const BRAND_NEW_PATH = 'tools/probe-auto/brandNew.tool.ts';
+
+await check('a brand-new .tool.ts is discovered and loadable with no inventory edit', async () => {
+    writeSource(
+        BRAND_NEW_PATH,
+        `// Brand-new package entry written by scripts/check-package-tools.mjs (T21).
+import { tool } from '../../core';
+
+// TWO properties on purpose: the single-property rule would hand \`execute\` the
+// bare \`value\` string, and this fixture asserts the whole-object path.
+export const metadata = {
+    name: 'brandNew',
+    description: 'A tool that only exists because its file exists.',
+    tags: ['fixture', 'inventory-free'],
+    visibility: 'searchable' as const,
+    parameters: {
+        type: 'object',
+        properties: {
+            value: { type: 'string' },
+            note: { type: 'string' }
+        },
+        required: ['value'],
+        additionalProperties: false
+    }
+};
+
+export const registration = { group: 'preset', activation: 'always', order: 950 };
+
+export const execute = async (context: any) => ({ echoed: context.parameters.value });
+
+export const brandNew = tool({ ...metadata, execute });
+
+export default brandNew;
+`
+    );
+
+    // The public preset table is the GENERATED one: it must NOT contain the new
+    // name, which is the proof that nothing regenerated and no inventory was edited.
+    assert.equal(
+        Object.prototype.hasOwnProperty.call(production.presetTools, 'brandNew'),
+        false,
+        'the shipped preset table already contained the fixture name'
+    );
+
+    // THE PROOF: a default harness (presets enabled) SCANS the copied package's
+    // tools tree at construction. If the brand-new entry needed any hand-maintained
+    // inventory — a catalogue row, a name list, a manual import switch — it would be
+    // absent here, because none of those were touched.
+    const scanWriter = production.agent({ model: 'offline/scripted', stream: scriptedStream });
+    const scanning = production.harness({ agents: { writer: scanWriter } });
+
+    const discovered = scanning.tools.brandNew;
+    assert.ok(discovered, 'a brand-new .tool.ts was not discovered by a default harness');
+    assert.equal(discovered.description, 'A tool that only exists because its file exists.');
+    assert.deepEqual(discovered.tags, ['fixture', 'inventory-free']);
+
+    // The source record proves the entry was compiled from ITS OWN path, not from a
+    // generated manifest row (the manifest is a build artifact of the repository and
+    // cannot know about a file added to an installed copy).
+    const record = scanning.toolSource('brandNew');
+    assert.ok(record, 'the brand-new entry has no source record');
+    assert.equal(record.sourcePath, BRAND_NEW_PATH);
+
+    // And it is loadable and callable through the ordinary startup path.
+    assert.deepEqual(await scanning.executeTool('brandNew', { value: 'inventory-free' }), {
+        echoed: 'inventory-free'
+    });
+
+    // A preset the package DOES ship keeps working in the same harness, so the new
+    // row joined the catalogue rather than replacing it.
+    assert.ok(scanning.tools.fileRead, 'the shipped preset catalogue is missing fileRead');
+
+    return { discovered: BRAND_NEW_PATH, executed: 'brandNew' };
 });
 
 // ---------------------------------------------------------------------------
@@ -1253,7 +1357,7 @@ await check('replacement registry V2 replaces itself with V3, then V3 registers 
     assert.ok(sources.some((source) => source.name === 'registryChildThree'));
 
     return {
-        registry: ['runtime-tools/toolRegistry.tool.ts', REGISTRY_V2_PATH, REGISTRY_V3_PATH],
+        registry: ['tools/runtime/toolRegistry.tool.ts', REGISTRY_V2_PATH, REGISTRY_V3_PATH],
         children: ['registryChild', 'registryChildTwo', 'registryChildThree']
     };
 });

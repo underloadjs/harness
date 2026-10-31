@@ -282,37 +282,129 @@ it('keeps the tools toggle disabled until the catalogue has loaded', async () =>
 
 // --- R1: phone disclosures, DOM/state --------------------------------------
 
-it('collapses the harness note behind a disclosure that reports its state', async () => {
+it('opens harness details from the clickable title and keeps tools headings inert', async () => {
     await boot();
 
     const head = byClass('.harness-head', 'header');
-    const disclosure = byClass('.harness-disclosure', 'button');
+    const title = byClass('.main-title', 'h1');
+    const button = byClass('.harness-title-button', 'button');
     const note = byClass('.harness-note', 'p');
 
-    // A real disclosure: named neutrally (F3 — the same head shows a tool name while
-    // the tools view is open), pointing at the note it shows, and closed by default
-    // (`data-expanded` is the CSS hook, `aria-expanded` the AT one).
-    expect(disclosure.type).toBe('button');
-    expect(disclosure.getAttribute('aria-label')).toBe('Details');
-    expect(disclosure.title).toBe('Show or hide details');
-    expect(disclosure.getAttribute('aria-controls')).toBe('harness-note');
-    expect(note.id).toBe('harness-note');
-    expect(disclosure.getAttribute('aria-expanded')).toBe('false');
-    expect(head.dataset.expanded).toBeUndefined();
-    expect(disclosure.querySelector('.harness-disclosure-icon')?.getAttribute('aria-hidden')).toBe(
-        'true'
-    );
+    // R2: the title is a real BUTTON inside the `h1` (heading semantics preserved),
+    // not a disclosure arrow. There is no `.harness-disclosure` control at all.
+    expect(document.querySelector('.harness-disclosure')).toBeNull();
+    expect(title.contains(button)).toBe(true);
+    expect(button.type).toBe('button');
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(button.title).toBe('Show harness details');
+    // The button's accessible name IS the harness title, so it reads as the heading.
+    expect(button.textContent).toBe('Instruct');
+    expect(title.textContent).toBe('Instruct');
 
-    // The note stays in the DOM (and keeps its text); only CSS hides it on a phone.
+    // The desktop note stays in the DOM with its text (the phone block hides it; the
+    // dialog carries the details instead).
     expect(note.textContent).toBe('Edits apply to new sessions');
+    expect(head.dataset.expanded).toBeUndefined();
 
-    disclosure.click();
-    expect(disclosure.getAttribute('aria-expanded')).toBe('true');
-    expect(head.dataset.expanded).toBe('true');
+    // Press: the shared modal opens with the selected harness's own details.
+    button.click();
+    await flush();
 
-    disclosure.click();
-    expect(disclosure.getAttribute('aria-expanded')).toBe('false');
-    expect(head.dataset.expanded).toBe('false');
+    const dialog = byClass('.dialog', 'div');
+    expect(dialog.getAttribute('role')).toBe('dialog');
+    expect(dialog.querySelector('.dialog-title')?.textContent).toBe('Instruct');
+    expect(dialog.querySelector('.harness-details-description')?.textContent).toBe(
+        'A general instruction-following agent.'
+    );
+    // Existing metadata only (the same line the rail rows show): kind · agent count.
+    expect(dialog.querySelector('.harness-details-meta')?.textContent).toBe('template · 1 agent');
+    // The header note is hidden on a phone, so the dialog carries it too.
+    expect(dialog.querySelector('.harness-details-note')?.textContent).toBe(
+        'Edits apply to new sessions'
+    );
+    expect(document.activeElement).toBe(dialog);
+
+    // Closing restores focus to the title button.
+    byClass('.dialog-close', 'button').click();
+    await flush();
+
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(document.activeElement).toBe(button);
+
+    // R2: while the TOOLS view owns the head, the title describes the catalogue (or a
+    // tool), so it must not open a harness dialog — the button is disabled and out of
+    // the tab order, and a programmatic click is a no-op.
+    byClass('.tools-toggle', 'button').click();
+    await flush();
+
+    expect(title.textContent).toBe('Tools');
+    expect(button.disabled).toBe(true);
+    // The disabled heading also drops the popup claim and the action tooltip.
+    expect(button.hasAttribute('aria-haspopup')).toBe(false);
+    expect(button.hasAttribute('title')).toBe(false);
+    button.click();
+    await flush();
+    expect(document.querySelector('.dialog')).toBeNull();
+
+    // Selecting a tool keeps the head inert as well.
+    byClass('.tool-tab-button', 'button').click();
+    await flush();
+    expect(title.textContent).toBe('fileRead');
+    expect(button.disabled).toBe(true);
+    button.click();
+    await flush();
+    // Only the tool runner dialog is open (its title is the tool), never a harness one.
+    expect(document.querySelector('.dialog-title')?.textContent).toBe('fileRead');
+    expect(document.querySelector('.harness-details')).toBeNull();
+
+    // Leaving the tools view restores the chat head and re-enables the trigger.
+    byClass('.dialog-close', 'button').click();
+    await flush();
+    byClass('.tools-toggle', 'button').click();
+    await flush();
+    expect(title.textContent).toBe('Instruct');
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(button.title).toBe('Show harness details');
+});
+
+it('closes the harness details dialog when navigating to another harness', async () => {
+    await boot();
+
+    const button = byClass('.harness-title-button', 'button');
+    button.click();
+    await flush();
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('Instruct');
+
+    // Picking a harness (here: the same row, which is a full selection pass) closes
+    // the dialog rather than leaving stale details on screen (R2).
+    byClass('.harness-item', 'button').click();
+    await flush();
+
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(document.querySelector('.harness-details')).toBeNull();
+    expect(document.activeElement).toBe(button);
+});
+
+it('moves focus to the tools toggle when the details dialog is closed by that switch', async () => {
+    // T4: `setToolsView(true)` closes the harness dialog (returning focus to the
+    // title) and then disables that title, so without an explicit target the reader
+    // would be dropped on <body>. The toggle that performed the switch is the target.
+    await boot();
+
+    const button = byClass('.harness-title-button', 'button');
+    button.click();
+    await flush();
+    expect(document.querySelector('.dialog')).not.toBeNull();
+
+    const toggle = byClass('.tools-toggle', 'button');
+    toggle.click();
+    await flush();
+
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(button.disabled).toBe(true);
+    expect(document.activeElement).toBe(toggle);
 });
 
 it('keeps the agent cards reachable from the composer button at every width', async () => {
@@ -461,23 +553,58 @@ it('lets the topbar cluster shrink so the status pill never scrolls the bar (F1)
     expect(blockOf('.status-text {')).toContain('text-overflow: ellipsis');
 });
 
+it('keeps the status diagnostic in the live region but out of the visible line (R3)', () => {
+    // The concise state is the only VISIBLE text; the diagnostic is a hidden sibling
+    // inside the same live region, using the app's existing sr-only recipe.
+    const detail = blockOf('.status-detail {');
+    expect(detail).toContain('position: absolute');
+    expect(detail).toContain('width: 1px');
+    expect(detail).toContain('height: 1px');
+    expect(detail).toContain('clip-path: inset(50%)');
+    expect(detail).toContain('white-space: nowrap');
+    // It must never take visible room or paint a second line inside the pill.
+    expect(detail).not.toContain('display: none');
+    expect(blockOf('.status-text {')).not.toContain('display: none');
+});
+
+it('does not clip the title button outline (T4 focus-visible regression)', () => {
+    // The heading is the shrinking flex item, but it must NOT clip: the text child
+    // owns the ellipsis and the box would cut the button's focus outline.
+    const heading = blockOf('.main-title {');
+    expect(heading).toContain('flex: 0 1 auto');
+    expect(heading).toContain('min-width: 0');
+    expect(heading).not.toContain('overflow: hidden');
+    expect(heading).not.toContain('text-overflow');
+
+    // The ellipsis still exists, on the element that actually holds the text.
+    const text = blockOf('.harness-title-text {');
+    expect(text).toContain('overflow: hidden');
+    expect(text).toContain('text-overflow: ellipsis');
+    expect(text).toContain('white-space: nowrap');
+});
+
 it('reveals the compact harness head and agent strip only at <=860px', () => {
     const phone = blockOf('@media (max-width: 860px)');
 
     // Hidden outside the breakpoint: desktop/tablet keep the always-visible note and
     // the always-visible card row.
-    expect(blockOf('.harness-disclosure {')).toContain('display: none');
     expect(blockOf('.agent-summary {')).toContain('display: none');
     expect(blockOf('.harness-note {')).not.toContain('display: none');
     expect(blockOf('.agent-row {')).toContain('display: flex');
     expect(blockOf('.agent-row {')).not.toContain('display: none');
 
-    // The phone block turns both into disclosures.
-    expect(phone).toContain('.harness-disclosure {\n        display: inline-flex;\n    }');
+    // R2: the old disclosure arrow owns no CSS at all any more; the title itself is
+    // the (always available) details trigger and is styled as plain heading text.
+    expect(rules).not.toContain('.harness-disclosure');
+    const titleButton = blockOf('.harness-title-button {');
+    expect(titleButton).toContain('border: 0');
+    expect(titleButton).toContain('background: none');
+    expect(titleButton).toContain('font: inherit');
+    expect(titleButton).toContain('cursor: pointer');
+
+    // The phone block keeps one title line: the note is hidden (details live in the
+    // dialog) and the agent strip becomes a summary disclosure.
     expect(phone).toContain('.harness-head .harness-note {\n        display: none;\n    }');
-    expect(phone).toContain(
-        ".harness-head[data-expanded='true'] .harness-note {\n        display: block;\n    }"
-    );
     expect(phone).toContain('.agent-summary {\n        display: flex;\n    }');
     expect(phone).toContain(
         ".agent-row-wrap:not([data-open='true']) .agent-row {\n        display: none;\n    }"
@@ -485,4 +612,7 @@ it('reveals the compact harness head and agent strip only at <=860px', () => {
     // The compact rows are shorter than the desktop padding they replace.
     expect(phone).toContain('.agent-slot {\n        padding: 6px 14px;\n    }');
     expect(phone).toContain('.harness-head {\n        padding: 8px 14px;\n    }');
+    // T4: the phone row centres the title button against the rail toggle, so the
+    // focus outline and the toggle share one baseline.
+    expect(phone).toContain('.harness-title-row {\n        align-items: center;\n    }');
 });

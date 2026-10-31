@@ -516,9 +516,10 @@ reserved (`harness()` throws if the config or a preset already has `toolRequest`
   `selectTools` (`core/discovery.ts`); an exact name is case-sensitive, a regex may
   be bare source or `/source/flags`, and tags keep the fuzzy ranking. A bare array
   or a missing `tags` is tolerated as a legacy tags-only call. Name, description,
-  tags, and schema live in the tool's own `runtime-tools/toolRequest.tool.ts` entry;
-  `core/metadata.ts` is a data-free compatibility re-export the server catalogue
-  also reads. `limit` narrows only the current query; it is not a global request cap.
+  tags, and schema live in the tool's own `tools/runtime/toolRequest.tool.ts` entry;
+  `core/metadata.ts` is a data-only compatibility projection of the generated
+  descriptor manifest (`core/tool-manifest.ts`) that the server catalogue also
+  reads. `limit` narrows only the current query; it is not a global request cap.
 - Result: `{ enabled, tools: [{ name, description, tags }], matched, omitted,
   evicted?, unmatchedTags?, availableTags?, alreadyAvailable? }`.
   `enabled`/`tools` are THIS call's matches admitted by `maxEnabledTools`
@@ -751,14 +752,24 @@ is a standard `tool()` and each is executable standalone. R18: `fileRead`,
 
 The folder is one file per tool, one folder per capability — `tools/syntax/`,
 `tools/files/`, `tools/command/` — and the barrel exports both the named tools and
-`presetTools`, the catalogue the harness preloads. Adding a tool means adding a
-file, a `PRESET_TOOLS` row (`tools/catalogue.ts`), an `import()` branch in
-`loadPresetTool`, and a line in the barrel; nothing else enumerates the catalogue.
+`presetTools`, the catalogue the harness preloads. **Adding a tool means adding one
+`*.tool.ts` file with its `metadata` + `registration` literals — that is all.** No
+`PRESET_TOOLS` row, no `loadPresetTool` import branch, no barrel line is required
+(T21 removed the inventory; T24 removed the stale-manifest gap). `tools/descriptors.ts`
+derives the catalogue from a LIVE `tools/**/*.tool.ts` scan on Node — the same
+`core/tool-scan` reader `harness({})` uses — so a cold process already lists and
+loads a brand-new entry. The generated `core/tool-manifest.ts` is the BROWSER
+inventory (a browser cannot read files or parse TypeScript) and only needs
+regenerating (`yarn tools:manifest`) for the browser surface, never for Node.
+A barrel line is needed only when the tool must also be a named public import
+(`presetTools[name]` reaches it either way).
 
 **The exports are lazy.** `tools/index.ts` builds each named export with
-`lazyTool(name)` (`tools/lazy.ts`) from `PRESET_TOOLS`: name, description, tags,
+`lazyTool(name)` (`tools/lazy.ts`) from the discovered rows: name, description, tags,
 visibility and schema are eager metadata, while `execute` resolves the real
-implementation through `loadPresetTool`'s `import()` on first call. Consequences:
+implementation on first call — through the GENERATED `import()` when the manifest
+knows the entry, and through the runtime source compiler (`prepareToolCandidate`)
+when it is newer than the manifest (T24). Consequences:
 
 - importing the package (or constructing a harness, or listing the server
   catalogue) loads no `node:fs`, `node:child_process`, or `node:vm`;

@@ -383,11 +383,11 @@ describe('self-modifying tool kernel', () => {
         expect(preset?.dependencies).toEqual([]);
 
         const registry = writer.toolSource('toolRegistry');
-        expect(registry?.sourcePath).toBe('runtime-tools/toolRegistry.tool.ts');
+        expect(registry?.sourcePath).toBe('tools/runtime/toolRegistry.tool.ts');
         expect(registry?.revision).toMatch(/^[0-9a-f]{16}$/);
         // Harness-owned controls are source entries too.
-        expect(writer.toolSource('todoManage')?.sourcePath).toBe('runtime-tools/todoManage.tool.ts');
-        expect(writer.toolSource('toolCancel')?.sourcePath).toBe('runtime-tools/toolCancel.tool.ts');
+        expect(writer.toolSource('todoManage')?.sourcePath).toBe('tools/runtime/todoManage.tool.ts');
+        expect(writer.toolSource('toolCancel')?.sourcePath).toBe('tools/runtime/toolCancel.tool.ts');
     });
 
     it('captures and compiles local virtual dependencies for moduleText revisions', async () => {
@@ -672,8 +672,8 @@ describe('self-modifying tool kernel', () => {
             webfetch: { env: {} }
         });
 
-        expect(writer.toolSource('webSearch')?.sourcePath).toBe('runtime-tools/webSearch.tool.ts');
-        expect(writer.toolSource('webFetch')?.sourcePath).toBe('runtime-tools/webFetch.tool.ts');
+        expect(writer.toolSource('webSearch')?.sourcePath).toBe('tools/runtime/webSearch.tool.ts');
+        expect(writer.toolSource('webFetch')?.sourcePath).toBe('tools/runtime/webFetch.tool.ts');
 
         // Dynamic per-harness provider surface is supplied as registration
         // metadata; no key appears in the captured source.
@@ -791,8 +791,8 @@ describe('self-modifying tool kernel', () => {
 
         expect(restored.tools.threadSend).toBeDefined();
         expect(restored.tools.threadList).toBeDefined();
-        expect(restored.toolSource('threadSend')?.sourcePath).toBe('runtime-tools/threadSend.tool.ts');
-        expect(restored.toolSource('threadList')?.sourcePath).toBe('runtime-tools/threadList.tool.ts');
+        expect(restored.toolSource('threadSend')?.sourcePath).toBe('tools/runtime/threadSend.tool.ts');
+        expect(restored.toolSource('threadList')?.sourcePath).toBe('tools/runtime/threadList.tool.ts');
     });
 
     it('prepares baseline thread tools when a target-created control is absent from the snapshot', async () => {
@@ -818,8 +818,8 @@ describe('self-modifying tool kernel', () => {
         // Phase 4 deleted the target-created entry; the pre-prepared baseline
         // source must have been published, with no stale target record.
         expect(target.tools.threadList.description).not.toBe('target-created control');
-        expect(target.toolSource('threadList')?.sourcePath).toBe('runtime-tools/threadList.tool.ts');
-        expect(target.toolSource('threadSend')?.sourcePath).toBe('runtime-tools/threadSend.tool.ts');
+        expect(target.toolSource('threadList')?.sourcePath).toBe('tools/runtime/threadList.tool.ts');
+        expect(target.toolSource('threadSend')?.sourcePath).toBe('tools/runtime/threadSend.tool.ts');
 
         const roster = (await target.executeTool('threadList', {})) as {
             threads: Array<{ id: string }>;

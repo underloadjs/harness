@@ -23,7 +23,7 @@
 //   - ../types            — HarnessSnapshot and its parts
 //   - ./snapshot-validation — primitive readers shared with the store modules
 //   - ./todo.ts / profile.ts / chapter.ts / location.ts — record state readers
-//   - ./metadata.ts       — AGENT_RESULT_RETENTION (the archive bound)
+//   - ./agent-limits.ts   - AGENT_RESULT_RETENTION (the archive bound)
 //   - ../harness.ts       — snapshot()/restore() implementation
 //   - ./creation.ts       — compileToolSource, the trusted-source compiler
 
@@ -39,7 +39,10 @@ import type {
     HarnessToolCall,
     ToolCreation
 } from '../types';
-import { AGENT_RESULT_RETENTION } from './metadata';
+// Leaf import, not the compatibility facade: `./metadata` now projects the
+// generated manifest, and the snapshot reader only needs this bound. Importing the
+// leaf keeps a snapshot read free of any catalogue projection.
+import { AGENT_RESULT_RETENTION } from './agent-limits';
 import { MAX_THREAD_LABEL_CHARS, MAX_THREAD_RECORDS, THREAD_HOST_PREFIX } from './thread';
 import { readChapterStoreState } from './chapter';
 import { readLocationStoreState } from './location';

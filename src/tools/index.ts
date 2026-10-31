@@ -6,6 +6,8 @@
 //   syntax/   syntaxCheck (javascript or python, named by the caller)
 //   files/    fileRead, fileWrite, fileEdit, fileList, fileGlob
 //   command/  commandRun, gitDiff
+//   runtime/  the harness-owned core entries (toolRequest, toolCreate, …) — moved
+//             here from the old top-level `runtime-tools/` folder (T21)
 //   websearch/ webSearch — opt-in, per-harness (NOT in `presetTools`: it needs a
 //             provider key, which belongs to one harness; see createWebSearchTool)
 //   webfetch/  webFetch — opt-in, per-harness (native GET by default, the `exa`
@@ -19,19 +21,32 @@
 // --------------------
 // Importing this module does NOT import any implementation, and therefore does not
 // load `node:fs`, `node:child_process`, `node:vm`, or a Python probe. Each export is
-// a callable Tool proxy whose metadata comes from ./catalogue (static) and whose
-// body is fetched by `import()` on first execution. That keeps a harness cheap to
-// construct and a catalogue cheap to enumerate, while preserving the exact Tool
-// contract the registry relies on:
+// a callable Tool proxy whose metadata comes from the discovered descriptor
+// catalogue (via ./descriptors) and whose body is fetched by a generated `import()`
+// — or compiled from its editable source when the entry is newer than the generated
+// manifest (T24) — on first execution. That keeps a harness cheap to construct and a
+// catalogue cheap to enumerate, while preserving the exact Tool contract the
+// registry relies on:
 //
 //     await syntaxCheck({ code: 'print(1)', language: 'python' }); // true
-//     await fileRead(['package.json']);                            // { files: [{ path, content, … }], truncated, bytes, contentBudget }
+//     await fileRead(['package.json']);                            // { files: […], truncated, bytes, contentBudget }
 //     await fileWrite([{ path: 'a.txt', content: 'hi' }]);         // [{ path, bytes }]
 //     harness({ tools: { syntaxCheck, fileRead } });                // the model calls them
 //
-// Every proxy has writable `name`, `description`, `tags`, `visibility`, `parameters`
-// and a deferred `execute`, so harness registration/rename and the server's direct
-// calls behave exactly as they did with eager tools. See ./lazy.
+// DERIVED TABLE, HAND-WRITTEN API (T21 → T24)
+// -------------------------------------------
+// `presetTools` is BUILT from the discovered descriptors: no row here names a
+// metadata constant or an implementation module. The named exports below are the
+// package's API surface (`@underload/harness` re-exports them by name), so they stay
+// spelled out — they are a contract, not an inventory. Each one reads the SAME proxy
+// instance the table holds, so `presetTools.fileRead === fileRead`.
+//
+// Adding a tool therefore means adding one `.tool.ts` file. T24: `./descriptors`
+// derives its catalogue from a LIVE scan on Node, so a cold process already lists
+// and loads the new entry; the generated manifest is only the browser fallback and
+// no longer has to be regenerated for the Node surface to see the file. This file
+// only needs a named export if the tool is meant to be part of the public import
+// surface.
 //
 // R18: fileRead/fileWrite/fileEdit/fileGlob are **core** and declared up front;
 // fileList, syntaxCheck, commandRun, and gitDiff stay **searchable**, so the model
@@ -43,11 +58,12 @@
 // *policy*: no sandboxing, no confirmation prompts, no allowlists. A harness that
 // needs a fence wraps `execute`, or runs the process inside one.
 //
-// Build note: the dynamic imports in ./catalogue turn into separate chunks. The
+// Build note: the generated dynamic imports turn into separate chunks. The
 // published `dist/` must ship them next to `underload-harness.mjs` (package.json
 // includes all of dist), and `inlineDynamicImports` must stay off — inlining would
 // hoist the Node built-in imports back into the entry and defeat the split.
 import { lazyTool } from './lazy';
+import { PRESET_DESCRIPTORS } from './descriptors';
 import type {
     FileEditParameters,
     FileEditResult,
@@ -63,26 +79,46 @@ import type { CommandRunParameters, CommandRunResult, GitDiffParameters, GitDiff
 import type { SyntaxCheckParameters } from './syntax';
 import type { Tool } from '../types';
 
+// One lazy proxy per discovered preset, keyed by wire name, in descriptor order.
+// Built once at module evaluation: metadata only, so no implementation is loaded.
+const presetProxies: Readonly<Record<string, Tool>> = Object.fromEntries(
+    PRESET_DESCRIPTORS.map((descriptor) => [descriptor.name, lazyTool(descriptor.name)])
+);
+
+// Read a discovered proxy for a NAMED export below. Throws at module evaluation
+// when the generated manifest has no such entry, so a renamed/removed tool fails
+// loudly at import time instead of publishing an undefined export.
+const presetProxy = <TParameters, TResult>(name: string): Tool<TParameters, TResult> => {
+    const proxy = presetProxies[name];
+
+    if (proxy === undefined) {
+        throw new Error(`No tool descriptor was generated for the preset "${name}".`);
+    }
+
+    return proxy as Tool<TParameters, TResult>;
+};
+
 // The named exports. Type parameters are spelled out so a direct call keeps its
 // precise signature even though the implementation is loaded lazily.
-export const syntaxCheck = lazyTool<SyntaxCheckParameters, boolean>('syntaxCheck');
+export const syntaxCheck = presetProxy<SyntaxCheckParameters, boolean>('syntaxCheck');
 
 // The four file tools are BATCHED: each takes the array its single schema property
 // declares, so a direct call and a model call reach `execute` identically.
-export const fileRead = lazyTool<FileReadParameters, FileReadResult>('fileRead');
-export const fileWrite = lazyTool<{ path: string; content: string }[], FileWriteResult>('fileWrite');
-export const fileEdit = lazyTool<FileEditParameters, FileEditResult>('fileEdit');
-export const fileList = lazyTool<FileListParameters, FileListResult>('fileList');
+export const fileRead = presetProxy<FileReadParameters, FileReadResult>('fileRead');
+export const fileWrite = presetProxy<{ path: string; content: string }[], FileWriteResult>('fileWrite');
+export const fileEdit = presetProxy<FileEditParameters, FileEditResult>('fileEdit');
+export const fileList = presetProxy<FileListParameters, FileListResult>('fileList');
 // fileGlob declares four properties, so it receives the whole object and its
 // result shape depends on whether `content` was supplied.
-export const fileGlob = lazyTool<FileGlobParameters, FileGlobResult>('fileGlob');
+export const fileGlob = presetProxy<FileGlobParameters, FileGlobResult>('fileGlob');
 
-export const commandRun = lazyTool<CommandRunParameters, CommandRunResult>('commandRun');
-export const gitDiff = lazyTool<GitDiffParameters, GitDiffResult>('gitDiff');
+export const commandRun = presetProxy<CommandRunParameters, CommandRunResult>('commandRun');
+export const gitDiff = presetProxy<GitDiffParameters, GitDiffResult>('gitDiff');
 
 // NOTE: the bounded-read constants live in ./files/fileRead and are deliberately
-// NOT re-exported here. A value re-export from './files' would statically evaluate
-// the implementation module and destroy the lazy-loading contract this file tests.
+// NOT re-exported here. A VALUE re-export from './files' would statically evaluate
+// the implementation module and destroy the lazy-loading contract this file tests
+// (the folder barrels are therefore type-only — see ./files/index.ts).
 export type { SyntaxCheckLanguage, SyntaxCheckParameters } from './syntax';
 export type {
     FileEditEntry,
@@ -144,14 +180,6 @@ export type {
 // The preload catalogue, keyed by the name the model calls. `harness()` spreads
 // this into its registry by default, and the harness app's server uses it to offer
 // direct calls without building a harness. Values are lazy proxies, so spreading
-// this object costs no implementation imports.
-export const presetTools = {
-    syntaxCheck,
-    fileRead,
-    fileWrite,
-    fileEdit,
-    fileList,
-    fileGlob,
-    commandRun,
-    gitDiff
-} satisfies Record<string, Tool>;
+// this object costs no implementation imports, and the key set is exactly the
+// discovered preset descriptors — never a hand-written list.
+export const presetTools: Readonly<Record<string, Tool>> = presetProxies;

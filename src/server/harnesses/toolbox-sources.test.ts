@@ -16,14 +16,24 @@
 // harness only builds transports).
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { tool } from '../../harness';
+import { mkdir, rm, writeFile } from 'node:fs/promises';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { agent, harness, tool } from '../../harness';
 import type { HarnessProgress } from '../../harness';
+import { discoverToolMetadata } from '../../core';
 import {
+    EXAMPLE_APP_TOOL_SOURCES,
+    SHARED_APP_TOOL_FOLDER,
+    SHARED_APP_TOOL_NAMES,
+    SHARED_APP_TOOL_SOURCES,
     SHARED_TOOL_NAMES,
     SHARED_TOOL_SOURCES,
+    SHARED_TOOLS,
     agentsFromProfiles,
     createToolboxHarness
 } from './toolbox';
+import { EXAMPLE_APP_TOOL_FOLDER, appToolSourcesFrom, scanAppToolDescriptors } from './tools';
 import { createHarnessRegistry, findPreset } from './index';
 
 const SETTINGS = {
@@ -39,11 +49,23 @@ const stubNoSearchKeys = (): void => {
     vi.stubEnv('TAVILY_API_KEY', '');
 };
 
+// POSIX form of an absolute folder path, matching how folder discovery reports
+// descriptor source paths.
+const posix = (value: string): string => value.split(path.sep).join('/');
+
+// A scripted transport that never emits anything: a library harness is only
+// constructed here, never run.
+const scriptedNoop = () =>
+    (async function* stream() {
+        yield { type: 'done' as const, stopReason: 'stop' as const, toolCalls: [] };
+    })();
+
 afterEach(() => {
     vi.unstubAllEnvs();
 });
 
-// The exact shipped source map: package presets then app tools.
+// The exact shipped source map: package presets then app tools (T25: the app half
+// is discovered from `src/server/tools/shared`, so its paths are the new ones).
 const EXPECTED_SOURCE_PATHS = {
     syntaxCheck: 'tools/syntax/syntaxCheck.tool.ts',
     fileRead: 'tools/files/fileRead.tool.ts',
@@ -53,11 +75,11 @@ const EXPECTED_SOURCE_PATHS = {
     fileGlob: 'tools/files/fileGlob.tool.ts',
     commandRun: 'tools/command/commandRun.tool.ts',
     gitDiff: 'tools/command/gitDiff.tool.ts',
-    timeNow: 'server/harnesses/tool-sources/timeNow.ts',
-    textCount: 'server/harnesses/tool-sources/textCount.ts',
-    diceRoll: 'server/harnesses/tool-sources/diceRoll.ts',
-    noteSearch: 'server/harnesses/tool-sources/noteSearch.ts',
-    textSummarize: 'server/harnesses/tool-sources/textSummarize.ts'
+    timeNow: 'server/tools/shared/timeNow.tool.ts',
+    textCount: 'server/tools/shared/textCount.tool.ts',
+    diceRoll: 'server/tools/shared/diceRoll.tool.ts',
+    noteSearch: 'server/tools/shared/noteSearch.tool.ts',
+    textSummarize: 'server/tools/shared/textSummarize.tool.ts'
 };
 
 describe('production toolbox source compilation', () => {
@@ -90,7 +112,7 @@ describe('production toolbox source compilation', () => {
         const timeNow = harness.toolSource('timeNow');
         expect(timeNow).toMatchObject({
             name: 'timeNow',
-            sourcePath: 'server/harnesses/tool-sources/timeNow.ts',
+            sourcePath: 'server/tools/shared/timeNow.tool.ts',
             format: 'module',
             dependencies: [],
             checks: ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
@@ -161,14 +183,14 @@ export const execute = async () => ({ replaced: true });
         expect(harness.toolSource('testFlaky')).toMatchObject({
             name: 'testFlaky',
             revision: expect.stringMatching(/^[0-9a-f]{16}$/),
-            sourcePath: 'server/harnesses/tool-sources/testFlaky.ts',
+            sourcePath: 'server/tools/examples/testFlaky.tool.ts',
             dependencies: [],
             format: 'module',
             checks: ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
         });
         // The shared toolbox is still compiled alongside it.
         expect(harness.toolSource('timeNow')).toMatchObject({
-            sourcePath: 'server/harnesses/tool-sources/timeNow.ts',
+            sourcePath: 'server/tools/shared/timeNow.tool.ts',
             format: 'module'
         });
     });
@@ -183,7 +205,7 @@ export const execute = async () => ({ replaced: true });
         expect(harness.toolSource('testFlaky')).toMatchObject({
             name: 'testFlaky',
             revision: expect.stringMatching(/^[0-9a-f]{16}$/),
-            sourcePath: 'server/harnesses/tool-sources/testFlaky.ts',
+            sourcePath: 'server/tools/examples/testFlaky.tool.ts',
             dependencies: [],
             format: 'module',
             checks: ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
@@ -203,7 +225,7 @@ export const execute = async () => ({ replaced: true });
         expect(harness.toolSource('timeNow')).toMatchObject({
             name: 'timeNow',
             revision: expect.stringMatching(/^[0-9a-f]{16}$/),
-            sourcePath: 'server/harnesses/tool-sources/timeNow.ts',
+            sourcePath: 'server/tools/shared/timeNow.tool.ts',
             dependencies: [],
             format: 'module',
             checks: ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
@@ -236,5 +258,126 @@ export const execute = async () => ({ replaced: true });
         expect(await harness.executeTool('timeNow', {})).toEqual({ host: true });
         expect(harness.toolSource('timeNow')).toBeUndefined();
         expect(harness.toolSource('fileRead')).toBeDefined();
+    });
+});
+
+// T25: the app toolbox is DERIVED from the server tools folders, and those folders
+// are opt-in. These pin both halves of that contract.
+describe('server tools folder derivation (T25)', () => {
+    it('derives the shared source map from the folder scan, not from a hand list', () => {
+        // The scan is the authority: the declared map must equal the discovered
+        // entries of `src/server/tools/shared`, in registration order.
+        const scanned = discoverToolMetadata({
+            folders: [SHARED_APP_TOOL_FOLDER, EXAMPLE_APP_TOOL_FOLDER]
+        }).filter((descriptor) => descriptor.origin === 'folder');
+
+        expect(
+            scanned
+                .filter((descriptor) => descriptor.sourcePath.startsWith(posix(SHARED_APP_TOOL_FOLDER) + '/'))
+                .map((descriptor) => [descriptor.name, descriptor.metadata.description])
+        ).toEqual(
+            SHARED_TOOL_NAMES.filter((name) => SHARED_APP_TOOL_NAMES.includes(name)).map((name) => [
+                name,
+                SHARED_TOOLS[name].description
+            ])
+        );
+
+        // Every app entry lives under the dedicated server folder, and none of them
+        // is under the package's default tools root — that separation is what keeps
+        // them out of a library harness.
+        for (const sourcePath of [
+            ...Object.values(SHARED_APP_TOOL_SOURCES),
+            ...Object.values(EXAMPLE_APP_TOOL_SOURCES)
+        ]) {
+            expect(sourcePath).toMatch(/^server\/tools\/(shared|examples)\/[A-Za-z]+\.tool\.ts$/);
+        }
+    });
+
+    it('keeps the example tools out of the shared toolbox and out of a library harness', () => {
+        stubNoSearchKeys();
+
+        // `testFlaky` is catalogued and directly callable, but the shared set (what
+        // every live preset registers) does not contain it: the examples folder is
+        // the exclusion, not a name filter.
+        expect(SHARED_APP_TOOL_NAMES).toEqual([
+            'timeNow',
+            'textCount',
+            'diceRoll',
+            'noteSearch',
+            'textSummarize'
+        ]);
+        expect(Object.keys(EXAMPLE_APP_TOOL_SOURCES)).toEqual(['testFlaky']);
+        expect(SHARED_TOOL_NAMES).not.toContain('testFlaky');
+
+        // A LIBRARY harness (no server folders configured) never sees them: the app
+        // entries live outside the package's default `src/tools` root.
+        const library = harness({
+            agents: { writer: agent({ model: 'offline/scripted', stream: scriptedNoop() }) }
+        });
+
+        expect(library.tools.timeNow).toBeUndefined();
+        expect(library.tools.testFlaky).toBeUndefined();
+        expect(library.toolSource('timeNow')).toBeUndefined();
+        expect(library.tools.fileRead).toBeDefined();
+    });
+
+    it('derives a catalogue for a folder that gained a brand-new entry, with no map edit', async () => {
+        // A throwaway folder under repo Temp/ (never the shipped source tree, so no
+        // other test can observe the fixture). The entries use the `metadata` +
+        // `execute` export shape, which the compiler supports without any import, so
+        // the fixture is independent of this package's directory depth.
+        const root = fileURLToPath(new URL('../../../../../../Temp/t25-folder-fixture/', import.meta.url));
+        await rm(root, { recursive: true, force: true });
+        await mkdir(root, { recursive: true });
+
+        // Two entries written in the OPPOSITE alphabetical order to their declared
+        // `registration.order`, so the test proves order comes from the metadata and
+        // not from file names.
+        const entry = (name: string, order: number, marker: string): string => `export const metadata = {
+    name: '${name}',
+    description: 'Fixture entry ${marker}.',
+    tags: ['fixture', 'inventory-free'],
+    parameters: { type: 'object', properties: {}, additionalProperties: false }
+};
+
+export const registration = { group: 'external', activation: 'always', order: ${order}, listed: true };
+
+export const execute = async () => ({ marker: '${marker}' });
+`;
+
+        try {
+            await writeFile(path.join(root, 'zzzFirst.tool.ts'), entry('zzzFirst', 1010, 'first'), 'utf8');
+            await writeFile(path.join(root, 'aaaSecond.tool.ts'), entry('aaaSecond', 1020, 'second'), 'utf8');
+
+            const descriptors = scanAppToolDescriptors([root]);
+            const sources = appToolSourcesFrom(descriptors, root);
+
+            // Both entries are discovered, ordered by `registration.order` (zzzFirst
+            // 1010 before aaaSecond 1020), with no hand-maintained inventory involved.
+            expect(descriptors.map((descriptor) => descriptor.name)).toEqual(['zzzFirst', 'aaaSecond']);
+            expect(Object.keys(sources)).toEqual(['zzzFirst', 'aaaSecond']);
+
+            // The new entries are compiled from their own discovered paths and run.
+            const live = createToolboxHarness(
+                {
+                    agents: agentsFromProfiles(['instruct'], SETTINGS),
+                    primary: 'instruct',
+                    extraToolSources: sources
+                },
+                SETTINGS,
+                progress
+            );
+
+            expect(live.toolSource('aaaSecond')).toMatchObject({
+                name: 'aaaSecond',
+                format: 'module',
+                dependencies: [],
+                checks: ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
+            });
+            expect(await live.executeTool('zzzFirst', {})).toEqual({ marker: 'first' });
+            expect(await live.executeTool('aaaSecond', {})).toEqual({ marker: 'second' });
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
     });
 });

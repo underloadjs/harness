@@ -178,7 +178,9 @@ button {
 
 /* The pill is the app's request-lifecycle indicator. Colour is never the only
    signal: the text states the phase, and a pulsing dot (motion, then also text)
-   marks work in flight. */
+   marks work in flight. The visible word is the CONCISE app vocabulary
+   (idle/connecting/saving/error); the full diagnostic (e.g. the rejected PATCH
+   message) is kept in the pill's `title`, never in the visible line (R3). */
 .status {
     display: inline-flex;
     align-items: center;
@@ -219,7 +221,26 @@ button {
     text-overflow: ellipsis;
 }
 
+/* R3 (T4): the full diagnostic is announced by the live region but never rendered.
+   Same sr-only recipe as the collapsed tile metadata (clip-path + 1px box), so it
+   stays in the accessibility tree without taking a line in the pill. */
+.status-detail {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    margin: -1px;
+    padding: 0;
+    border: 0;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+}
+
+/* In-flight app states: connecting (bootstrap) and saving (a config write such as a
+   harness/model PATCH). Both pulse the dot so the pill looks busy only while work is
+   actually in flight. */
 .status[data-state='running'],
+.status[data-state='saving'],
 .status[data-state='connecting'] {
     color: var(--warn);
     border-color: rgba(251, 191, 36, 0.4);
@@ -228,6 +249,7 @@ button {
 /* Only genuine in-flight states animate; a finished or failed run is static so
    the pill cannot look busy when it is not. */
 .status[data-state='running'] .status-dot,
+.status[data-state='saving'] .status-dot,
 .status[data-state='connecting'] .status-dot {
     animation: status-pulse 1.1s ease-in-out infinite;
 }
@@ -257,9 +279,12 @@ button {
 
 /* Rail toggles (R1) ------------------------------------------------------ */
 
-/* Phone-only disclosures for the two rails. Every layout at or above 861px shows
-   both rails permanently, so the controls do nothing there; hiding them keeps the
-   topbar unchanged on desktop/tablet. The mobile block below reveals them. */
+/* Phone-only disclosure for the RIGHT rail. It lives on the harness title row
+   (main.ts `titleRow`), so on a phone it sits to the RIGHT of the harness title and
+   the left rail needs no control at all (the "Harness UI" brand opens the listing).
+   Every layout at or above 861px shows both rails permanently, so the control does
+   nothing there; hiding it keeps the title row unchanged on desktop/tablet. The
+   mobile block below reveals it. */
 .rail-toggles {
     display: none;
     align-items: center;
@@ -855,9 +880,15 @@ button {
     margin: 0;
     font-size: 16px;
     font-weight: 600;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
+    /* R2: the heading now wraps a button, so the heading itself must be the flex
+       item that shrinks (otherwise a long title would push the rail toggle off the
+       row). The inner `.harness-title-text` owns the ellipsis. */
+    flex: 0 1 auto;
+    min-width: 0;
+    /* T4: NO `overflow: hidden` here. The heading used to clip its own text, but the
+       text is now a focusable button and the box would clip that button's
+       `:focus-visible` outline (2px + 2px offset). Ellipsis moved to
+       `.harness-title-text`, which is the element that actually holds the text. */
 }
 
 .harness-name,
@@ -876,43 +907,62 @@ button {
     font-size: 12px;
 }
 
-/* R1: phone-only harness-head disclosure. It is hidden outside the 860px block,
-   where the note is always visible and the header keeps its desktop shape. */
-.harness-disclosure {
-    display: none;
-    align-items: center;
-    justify-content: center;
-    flex: 0 0 auto;
-    margin-left: auto;
-    width: 26px;
-    height: 26px;
+/* R2: the harness title IS the details trigger — no disclosure arrow. The button is
+   reset to look exactly like the plain `h1` text (no border/background/padding), so
+   the header keeps its previous visual shape while gaining a real, keyboard
+   reachable control. It only becomes an affordance on hover/focus (colour + underline
+   cue) and is `disabled` while the tools view owns the head, where the title names
+   the catalogue or a tool rather than a harness. */
+.harness-title-button {
+    display: block;
+    max-width: 100%;
+    margin: 0;
     padding: 0;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: transparent;
-    color: var(--muted);
-    font-size: 10px;
-    line-height: 1;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    text-align: left;
     cursor: pointer;
 }
 
-.harness-disclosure:hover {
-    border-color: var(--accent);
+.harness-title-button:hover:not(:disabled) {
+    color: var(--accent);
+}
+
+.harness-title-button:disabled {
+    cursor: default;
+}
+
+/* The title text is the ellipsized child (the h1/button stay sized by the row). */
+.harness-title-text {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* Harness details dialog body (R2). Plain text, no invented settings: the harness
+   description plus the same metadata the rail rows show. */
+.harness-details-description {
+    margin: 0 0 10px;
     color: var(--text);
+    font-size: 13px;
+    line-height: 1.5;
 }
 
-.harness-disclosure:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
+.harness-details-meta {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11.5px;
 }
 
-/* The chevron turns over when the note is open (attribute set in main.ts). */
-.harness-disclosure-icon {
-    transition: transform 120ms ease;
-}
-
-.harness-head[data-expanded='true'] .harness-disclosure-icon {
-    transform: rotate(180deg);
+/* The header note repeated inside the dialog (it is hidden on a phone). */
+.harness-details-note {
+    margin: 8px 0 0;
+    color: var(--muted);
+    font-size: 12px;
 }
 
 /* Agent row ------------------------------------------------------------ */
@@ -4949,7 +4999,8 @@ button {
         min-width: 0;
     }
 
-    /* Compact topbar on a phone: brand + rail icons + tools icon + pill on one line. */
+    /* Compact topbar on a phone: brand + tools icon + pill on one line (the rail
+       toggle moved to the harness title row — see `.harness-title-row` below). */
     .topbar {
         gap: 8px;
         padding: 8px 12px;
@@ -4980,19 +5031,17 @@ button {
         padding: 8px 14px;
     }
 
-    /* R1: the header is a single title line on a phone. The disclosure button reveals
-       the detail note (it is `display:none` above this breakpoint, where the note is
-       always visible). */
-    .harness-disclosure {
-        display: inline-flex;
+    /* R1: the scratch/sessions rail toggle sits on the harness title row, to the
+       right of the title (`.rail-toggles` carries `margin-left: auto`; its phone
+       `display: flex` lives with the other rail rules above). The title row is a
+       single line on a phone and the always-visible desktop note stays hidden here;
+       the full details live in the title's dialog (R2). */
+    .harness-title-row {
+        align-items: center;
     }
 
     .harness-head .harness-note {
         display: none;
-    }
-
-    .harness-head[data-expanded='true'] .harness-note {
-        display: block;
     }
 }
 

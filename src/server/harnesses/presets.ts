@@ -83,7 +83,9 @@ import { agentInstruction, AGENT_PROFILES } from '../../agents';
 import type { HarnessPreset, RunnerSettings } from './types';
 import { scriptedDemo } from './demo';
 import {
+    EXAMPLE_APP_TOOL_SOURCES,
     PRESET_MAX_ITERATIONS,
+    SHARED_APP_TOOL_SOURCES,
     SHARED_TOOL_NAMES,
     agentsFromProfiles,
     createProfiledHarness,
@@ -94,6 +96,12 @@ import {
 // Re-exported for callers that imported the app-wide tool-loop budget from here
 // (the CLI and server tests did); the value now lives with the shared factory.
 export { PRESET_MAX_ITERATIONS };
+
+// The example-only app tools, in registration order. T25: derived from the discovered
+// `server/tools/examples` folder instead of the literal 'testFlaky', so a second
+// example entry joins this preset with no edit here (and still no name filter in the
+// shared toolbox).
+const EXAMPLE_TOOL_NAMES: readonly string[] = Object.keys(EXAMPLE_APP_TOOL_SOURCES);
 
 // The real specialist roles, in catalogue/descriptor order. This is the ONE list
 // the teams are derived from: changing a role's usefulness here changes every
@@ -291,7 +299,9 @@ const demo: HarnessPreset = {
             // TOOL SET, but not in how that tool is registered. Compile its one
             // editable source entry through the same startup kernel instead of
             // passing a prebuilt definition through `tools`.
-            toolSources: { timeNow: 'server/harnesses/tool-sources/timeNow.ts' },
+            // T25: the path is the DISCOVERED one (server/tools/shared/timeNow.tool.ts),
+            // so moving/renaming the entry cannot leave a stale literal behind.
+            toolSources: { timeNow: SHARED_APP_TOOL_SOURCES.timeNow },
             presets: false,
             // Explicit entry point, even with one agent: the documented style,
             // and it keeps the harness name independent of key order.
@@ -312,13 +322,17 @@ const demo: HarnessPreset = {
 };
 
 // Recoverable failures is a live example, so it gets the shared toolbox too and
-// adds `testFlaky` as an extra. `testFlaky` stays out of the shared table on
-// purpose: it throws two calls out of three and keeps its attempt count per AGENT
-// (a WeakMap keyed by the requesting agent, so two sessions never share a count),
-// which must never be part of what the real presets can call. The example's
-// failure behaviour is its point, so its template is `flaky`: a metadata-only
-// PATCH keeps this factory and its extra tool, while an executable PATCH rebuilds
-// the live toolbox with testFlaky retained. The harness id stays `flaky`.
+// adds the example tools. Those stay out of the shared table on purpose: `testFlaky`
+// throws two calls out of three and keeps its attempt count per AGENT (a WeakMap
+// keyed by the requesting agent, so two sessions never share a count), which must
+// never be part of what the real presets can call. The example's failure behaviour is
+// its point, so its template is `flaky`: a metadata-only PATCH keeps this factory and
+// its extra tools, while an executable PATCH rebuilds the live toolbox with them
+// retained. The harness id stays `flaky`.
+//
+// T25: the tool SET is `[...SHARED_TOOL_NAMES, ...EXAMPLE_TOOL_NAMES]` and the
+// sources are the discovered example map — both derived from the folders, so no name
+// is hardcoded here.
 const failure: HarnessPreset = {
     name: 'flaky',
     title: 'Recoverable failures (example)',
@@ -328,7 +342,7 @@ const failure: HarnessPreset = {
     primary: 'flaky',
     subagents: [],
     agents: ['flaky'],
-    tools: [...SHARED_TOOL_NAMES, 'testFlaky'],
+    tools: [...SHARED_TOOL_NAMES, ...EXAMPLE_TOOL_NAMES],
     // R18: the factory below uses createToolboxHarness, which opts into webSearch
     // exactly like the live presets. Declaring it here keeps descriptor.tools and
     // descriptor.coreTools equal to what the session actually registers.
@@ -342,11 +356,9 @@ const failure: HarnessPreset = {
                 agents: agentsFromProfiles(['flaky'], settings),
                 primary: 'flaky',
                 subagents: [],
-                // The one preset-specific tool; excluded from the shared set but
-                // still compiled from its editable source entry (T19/F1).
-                extraToolSources: {
-                    testFlaky: 'server/harnesses/tool-sources/testFlaky.ts'
-                }
+                // The example tools; excluded from the shared set but still compiled
+                // from their editable source entries (T19/F1, T25).
+                extraToolSources: { ...EXAMPLE_APP_TOOL_SOURCES }
             },
             settings,
             progress,

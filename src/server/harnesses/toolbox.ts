@@ -19,8 +19,10 @@
 //   - package presets  — src/tools: syntaxCheck, fileRead, fileWrite, fileEdit,
 //                        fileList, fileGlob, commandRun, gitDiff
 //                        (lazy proxies, see src/tools/lazy.ts)
-//   - harness tools    — ./tools: timeNow, textCount, diceRoll, noteSearch,
-//                        textSummarize
+//   - harness tools    — src/server/tools/shared: timeNow, textCount, diceRoll,
+//                        noteSearch, textSummarize (T25: discovered from the files,
+//                        registered from their discovered source paths, never
+//                        imported)
 //   - webSearch        — environment-backed (EXA_API_KEY / TAVILY_API_KEY); the
 //                        harness factory registers it only when a key resolves,
 //                        so a keyless host is offline-safe. The global catalogue
@@ -42,10 +44,12 @@
 // DELIBERATE EXCEPTIONS
 // ---------------------
 //   - `testFlaky` is NOT in the shared toolbox. It fails two calls out of three on
-//     purpose and keeps its attempt count per AGENT (a WeakMap in ./tools keyed by
-//     the requesting agent object, plus one module fallback for a direct call), so
-//     sharing the singleton is safe: it belongs to the "Recoverable failures"
-//     example harness, which adds it as an extra tool.
+//     purpose and keeps its attempt count per AGENT (a WeakMap in
+//     src/server/tools/examples/testFlaky.tool.ts, plus one module fallback for a
+//     direct call), so sharing the singleton is safe: it belongs to the "Recoverable
+//     failures" example harness, which adds it as an extra tool. T25: it is excluded
+//     STRUCTURALLY — it lives in the sibling `examples` folder, which the shared
+//     folder scan never reads — rather than by a name list.
 //   - the `demo` preset stays the scripted offline fixture (timeNow only): it is
 //     not a live harness, so the equal-toolbox rule does not apply to it.
 //
@@ -59,16 +63,29 @@
 // uses `presetTools`/`SHARED_TOOLS` directly. "All tools available" means
 // registered/discoverable through a real source revision, not an eager body load.
 //
+// T25: the app half of the toolbox is now DERIVED from `src/server/tools/shared`
+// instead of one hand-written `toolSources` entry per app tool. `./tools.ts` scans
+// the folder (metadata first) and publishes the discovered source paths, so a new
+// file in the folder needs no edit here at all. `toolSources` remains the single
+// startup path for both halves, which is what preserves their declared order.
+//
 // Cross-references:
 //   - ./presets.ts      — the preset catalogue built on this factory
-//   - ./tools.ts        — the app tools (timeNow, …, textSummarize) in the shared set
+//   - ./tools.ts        — the app tools, DERIVED from the server tools folders
 //   - ../src/harness.ts — `presets: false` + `toolSources` startup compilation
 //   - ../api.ts  — descriptors resolved from the same preset metadata
 
 import { agent, harness, presetTools, WEB_SEARCH_TOOL_NAME } from '../../harness';
 import type { Agent, Harness, HarnessConfiguration, HarnessProgress, Tool } from '../../harness';
 import { agentInstruction, agentProfile } from '../../agents';
-import { harnessTools } from './tools';
+import { PRESET_DESCRIPTORS, RUNTIME_DESCRIPTORS, isCoreRegistered } from '../../tools/descriptors';
+import {
+    EXAMPLE_APP_TOOL_SOURCES,
+    SHARED_APP_TOOL_FOLDER,
+    SHARED_APP_TOOL_NAMES,
+    SHARED_APP_TOOL_SOURCES,
+    SHARED_APP_TOOLS
+} from './tools';
 import type { RunnerSettings } from './types';
 import type { HarnessPresetReport } from './types';
 
@@ -78,28 +95,27 @@ import type { HarnessPresetReport } from './types';
 // truncating real work. Exported so the CLI/server can report the same bound.
 export const PRESET_MAX_ITERATIONS = 1000;
 
-// The app-level tools every live harness shares, in registration order. Kept as
-// a named list (not `Object.keys(harnessTools)`) because `testFlaky` is
-// deliberately excluded and the order is part of the descriptor contract tests
-// pin.
-export const SHARED_APP_TOOL_NAMES = [
-    'timeNow',
-    'textCount',
-    'diceRoll',
-    'noteSearch',
-    'textSummarize'
-] as const;
+// Re-exported so the preset/registry modules and the descriptor tests keep ONE
+// import path for the shared app set (T25). Both are derived in ./tools.ts from the
+// files in src/server/tools/shared; nothing here names a tool.
+export {
+    EXAMPLE_APP_TOOL_SOURCES,
+    SHARED_APP_TOOL_FOLDER,
+    SHARED_APP_TOOL_NAMES,
+    SHARED_APP_TOOL_SOURCES,
+    SHARED_APP_TOOLS
+};
 
 // The shared registry. Package presets come first so a duplicate name in the app
-// table is a visible shadow rather than a silent override; `harnessTools` names
-// do not collide with `presetTools` today.
+// table is a visible shadow rather than a silent override; app names do not collide
+// with `presetTools` today.
+//
+// T25: the app half is `SHARED_APP_TOOLS` — the entries discovered in
+// src/server/tools/shared — so the example folder can never leak in, and a new
+// shared entry joins without an edit here.
 export const SHARED_TOOLS: Readonly<Record<string, Tool>> = {
     ...presetTools,
-    timeNow: harnessTools.timeNow,
-    textCount: harnessTools.textCount,
-    diceRoll: harnessTools.diceRoll,
-    noteSearch: harnessTools.noteSearch,
-    textSummarize: harnessTools.textSummarize
+    ...SHARED_APP_TOOLS
 };
 
 // The exact declared names, in registry order: package tools then app tools.
@@ -115,10 +131,10 @@ export const SHARED_TOOL_NAMES: readonly string[] = Object.freeze(Object.keys(SH
 // -------------------------------------------------------
 // The production harness must register startup tools through the SAME
 // compile/load/validate operation runtime replacements use. `SHARED_TOOLS` holds
-// lazy proxy definitions for package presets and already-constructed app tools;
-// passing them via `configuration.tools` takes the non-compiling
-// `prepareDefinition` branch, so `harness.toolSource('fileRead'/'timeNow')` stays
-// undefined and an agent cannot inspect/edit the revision that is actually running.
+// lazy proxy definitions for package presets and app tools; passing them via
+// `configuration.tools` takes the non-compiling `prepareDefinition` branch, so
+// `harness.toolSource('fileRead'/'timeNow')` stays undefined and an agent cannot
+// inspect/edit the revision that is actually running.
 //
 // Every entry here points at the concrete, shipped source file. `createToolboxHarness`
 // passes this map as `toolSources`; the harness compiles each one independently and
@@ -126,70 +142,56 @@ export const SHARED_TOOL_NAMES: readonly string[] = Object.freeze(Object.keys(SH
 //
 // Paths are relative to the package source roots (`src/` during development, the
 // deployed editable `tool-sources/` copy in production); see core/tool-source.ts.
+//
+// DERIVED (T21): the package half is the descriptor manifest's own `sourcePath`, in
+// descriptor order, so adding a `.tool.ts` under src/tools makes it a shared source
+// with no edit here. DERIVED (T25): the app half is the discovered source path of
+// every entry in src/server/tools/shared, so a new shared app entry needs no edit
+// either. Those files are registered through `toolSources` (see
+// createToolboxHarness), which is what keeps their declared order; `toolFolders` is
+// the same folder for hosts that want the live scan instead.
 export const SHARED_TOOL_SOURCES: Readonly<Record<string, string>> = Object.freeze({
     // Package preset entries, in the same order as `SHARED_TOOLS`.
-    syntaxCheck: 'tools/syntax/syntaxCheck.tool.ts',
-    fileRead: 'tools/files/fileRead.tool.ts',
-    fileWrite: 'tools/files/fileWrite.tool.ts',
-    fileEdit: 'tools/files/fileEdit.tool.ts',
-    fileList: 'tools/files/fileList.tool.ts',
-    fileGlob: 'tools/files/fileGlob.tool.ts',
-    commandRun: 'tools/command/commandRun.tool.ts',
-    gitDiff: 'tools/command/gitDiff.tool.ts',
-    // App tool entries (R2 extraction), in registration order.
-    timeNow: 'server/harnesses/tool-sources/timeNow.ts',
-    textCount: 'server/harnesses/tool-sources/textCount.ts',
-    diceRoll: 'server/harnesses/tool-sources/diceRoll.ts',
-    noteSearch: 'server/harnesses/tool-sources/noteSearch.ts',
-    textSummarize: 'server/harnesses/tool-sources/textSummarize.ts'
+    ...Object.fromEntries(
+        PRESET_DESCRIPTORS.map((descriptor) => [descriptor.metadata.name, descriptor.sourcePath])
+    ),
+    // App tool entries (T25), in registration order: discovered from the folder.
+    ...SHARED_APP_TOOL_SOURCES
 });
 
-// Harness-owned core names. toolRegistry comes first because the kernel registers
-// it before every other core tool (the source-registration bootstrap); it is still
-// an ordinary session-bound tool, so the descriptor advertises it like the rest.
-// agentDelegate is capability-by-configuration: the harness registers it only when
-// the harness declares subagents, so a single-agent Instruct has no delegation tool
-// while Research does. That difference is the agent configuration, not a difference
-// in the shareable toolbox. These are the ONLY core tools the server marks
-// sessionBound.
+// The app-tool folders, package-relative, in catalogue order. `shared` is the shared
+// toolbox; `examples` is opt-in per harness. Both are scanned by ./tools.ts, which is
+// why the shared toolbox needs no second list of app names.
+export const SHARED_TOOL_FOLDERS: readonly string[] = Object.freeze([SHARED_APP_TOOL_FOLDER]);
+// Harness-owned core names, DERIVED from the runtime descriptors (T21).
 //
-// R3: agentManage/agentResult are unconditional and available to every agent
-// (primary and subagent alike), so they sit with the record tools before
-// agentDelegate.
+// The rule is the descriptor's own registration policy: a runtime entry that is
+// registered unconditionally at startup is part of the declared core set, in
+// descriptor order (the scan emits the kernel's registration order, toolRegistry
+// first). Entries that are capability-by-configuration — agentDelegate (subagents),
+// actionRequest (owner answerer), threadFork (fork configuration), toolCancel
+// (pending work), the thread pair (independent threads) — are NOT in this list and
+// are projected separately by coreToolNames() below, which is why a single-agent
+// preset never advertises a delegation tool it would not declare.
 //
-// N4 actionRequest is deliberately NOT in this descriptor list: whether it is
-// registered depends on host configuration (an owner answerer) that
-// `describeHarness` cannot see, and a static projection must not promise a tool a
-// direct `preset.create()` would not declare. It IS in the global core catalogue
-// (./core.ts), where the server can list it for the Tools tab and answer a clear
-// 404 in a session that lacks the capability.
-//
-// threadFork is appended unconditionally AFTER agentDelegate: forks are enabled by
-// default in the harness (N6), so every preset's runs declare it, but its runtime
-// registration follows agentDelegate and the descriptor must keep that order.
-// toolList/toolManage are always-registered core entries: inventory and active
-// source management respectively. They sit after toolRequest and before toolCreate
-// in the runtime's registration order.
-export const CORE_TOOL_NAMES = [
-    'toolRegistry',
-    'toolRequest',
-    'toolList',
-    'toolManage',
-    'toolCreate',
-    'todoManage',
-    'profileManage',
-    'chapterManage',
-    'locationManage',
-    'agentManage',
-    'agentResult'
-] as const;
+// N4 note preserved: actionRequest must not be promised by a static projection,
+// because whether it registers depends on host configuration `describeHarness`
+// cannot see. It IS in the global core catalogue (./core.ts) so the server can list
+// it for the Tools tab and answer a clear 404 in a session that lacks it.
+export const CORE_TOOL_NAMES: readonly string[] = Object.freeze(
+    RUNTIME_DESCRIPTORS.filter(isCoreRegistered).map((descriptor) => descriptor.metadata.name)
+);
 
-// Package presets that are declared on every request (R18). Their metadata lives
-// in src/tools/catalogue.ts with `visibility: 'core'`; this list is the descriptor
-// counterpart, so a card can advertise what its runs really declare. fileList is
-// deliberately absent: it stays discoverable. There is no fileSearch entry — the
-// approved consolidation is the one fileGlob tool, now core.
-export const CORE_PRESET_TOOL_NAMES = ['fileRead', 'fileWrite', 'fileEdit', 'fileGlob'] as const;
+// Package presets that are declared on every request (R18), derived from the
+// descriptor metadata: `visibility: 'core'` is what makes a preset declared up
+// front. fileList is deliberately absent from the result because it stays
+// discoverable. There is no fileSearch entry — the approved consolidation is the
+// one fileGlob tool, now core.
+export const CORE_PRESET_TOOL_NAMES: readonly string[] = Object.freeze(
+    PRESET_DESCRIPTORS.filter((descriptor) => descriptor.metadata.visibility === 'core').map(
+        (descriptor) => descriptor.metadata.name
+    )
+);
 
 // The configured environment-backed core tool. It appears only when the runtime
 // catalogue has an executable definition (a provider key resolved), which is why
@@ -314,31 +316,53 @@ export type ToolboxHarnessConfiguration = {
 // Build a live harness from agent configuration + the shared toolbox.
 //
 // STARTUP COMPILATION (T14/F1): every shipped tool is supplied as an editable
-// source PATH through `toolSources`, not as a constructed Tool through `tools`.
-// The harness compiles/loads/validates each entry through the SAME kernel runtime
-// replacements use, so `harness.toolSource('fileRead')` and
-// `harness.toolSource('timeNow')` report a real module revision instead of
-// `undefined`. `presets: false` still keeps the registry exact: the kernel's
-// default baseline is skipped because `SHARED_TOOL_SOURCES` lists precisely the
-// shared set a descriptor advertises.
+// source PATH — `toolSources` for the package presets AND the app tools (T25) — not
+// as a constructed Tool through `tools`. The harness compiles/loads/validates each
+// entry through the SAME kernel runtime replacements use, so
+// `harness.toolSource('fileRead')` and `harness.toolSource('timeNow')` report a real
+// module revision instead of `undefined`. `presets: false` still keeps the registry
+// exact: the kernel's default baseline is skipped because `SHARED_TOOL_SOURCES` lists
+// precisely the shared set a descriptor advertises.
 //
 // `configuration.extraToolSources` is merged AFTER the shared source map and
 // BEFORE `configuration.extraTools`: shipped exceptions (the flaky example's
 // `testFlaky`) are compiled from their editable entries, while a host definition
 // still wins on a name collision exactly as before. Environment tools
 // (webSearch/webFetch) follow the host configuration as usual.
+//
+// FOLDER PRECEDENCE (T25): every app entry is a `toolSources` entry discovered from
+// `src/server/tools/shared`, so the kernel commits it after the package baseline and
+// after the package source map, and before `tools` definitions. The example extra
+// (`testFlaky`) is committed the same way from `src/server/tools/examples`, so it is
+// never part of the shared set. No name is registered twice, because the two folders
+// are disjoint.
 export const createToolboxHarness = (
     configuration: ToolboxHarnessConfiguration,
     settings: RunnerSettings,
     progress: HarnessProgress,
     observer?: HarnessPresetReport
 ): Harness => {
+    // Example-only sources are given as PATHS, exactly like the shared half: the
+    // kernel commits `toolSources` after the baseline and before `tools` overrides,
+    // which preserves the documented "source, then host definition" order. A host
+    // definition of the same name still wins.
     const liveConfiguration: HarnessConfiguration = {
         agents: configuration.agents,
         // Explicit routing: the entry agent is named even with one key, and the
         // allowlist is copied so later mutation cannot change a live harness.
         primary: configuration.primary,
         ...(configuration.subagents === undefined ? {} : { subagents: [...configuration.subagents] }),
+        // ORDER (T25): the app entries come from `SHARED_APP_TOOL_SOURCES`, which
+        // ./tools.ts discovers from `src/server/tools/shared` in `registration.order`
+        // and labels package-relative. Registering them through `toolSources` keeps
+        // that declared order AND the stable `server/tools/shared/<name>.tool.ts`
+        // source path; folder discovery would sort them by file name and label them
+        // absolute.
+        //
+        // COLD-STARTUP DISCOVERY: the scan runs when ./tools.ts is evaluated, i.e. at
+        // process start, so a brand-new `*.tool.ts` in the folder is compiled and
+        // registered by the next startup with no map edit. The folder is the
+        // authority; the map is only its projection.
         toolSources: { ...SHARED_TOOL_SOURCES, ...configuration.extraToolSources },
         // Host/example DEFINITIONS override sources by being registered last.
         tools: { ...configuration.extraTools },

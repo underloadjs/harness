@@ -204,6 +204,21 @@ export const FILE_WRITE_METADATA: PresetToolMetadata = {
         additionalProperties: false
     }
 };
+// Canonical discovery export (T19 / R9). A same-file alias of the literal above:
+// `../../core/tool-discovery.ts` follows the alias through the TypeScript AST, so
+// the constant above stays the single place this metadata is authored.
+export const metadata = FILE_WRITE_METADATA;
+
+// Harness registration policy (T19 / R9). A SEPARATE literal from `metadata`:
+// these fields are harness bookkeeping, not part of the Tool wire contract.
+export const registration = {
+    group: 'preset',
+    activation: 'always',
+    order: 180,
+    sessionBound: false,
+    alwaysDeclared: false,
+    listed: false
+} as const;
 
 export const fileWrite = tool<FileWriteParameters, FileWriteResult>({
     ...FILE_WRITE_METADATA,

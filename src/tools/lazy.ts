@@ -11,6 +11,10 @@
 // What is deferred until the model or a caller invokes the tool:
 //   the implementation module, and therefore every `node:` built-in it imports
 //
+// DERIVED (T21): the metadata comes from the generated descriptor manifest, and the
+// loader is the generated dynamic import. This file names no tool at all, so a new
+// `.tool.ts` is servable through the lazy layer with no edit here.
+//
 // Shape compatibility (do not regress this — T3's toolCreate registration and the
 // server's direct-call path depend on it):
 //   - the proxy is callable: `fileRead(['a.txt'])` runs the real tool's direct path;
@@ -26,26 +30,27 @@
 // synchronously — calling it always returns a promise, matching Tool.
 //
 // Cross-references:
-//   - ./catalogue     — metadata + dynamic import table
+//   - ./descriptors   — generated manifest + generated loader (the single seam)
+//   - ./catalogue     — the metadata table this factory reads
 //   - ../core/tool    — normalizeTags and the eager tool() this mirrors
 //   - ../../types     — the Tool contract
 
 import { normalizeTags } from '../core/tool';
 import type { Tool } from '../types';
-import { loadPresetTool, PRESET_TOOLS } from './catalogue';
-import type { PresetToolMetadata, PresetToolName } from './catalogue';
+import { descriptorMetadata, loadPresetTool } from './descriptors';
+import type { DescriptorMetadata } from './descriptors';
 
-// Build the callable proxy for one catalogue entry.
+// Build the callable proxy for one descriptor row.
 //
 // The explicit generics let each named export keep its parameter/result types
-// (`lazyTool<string[], FileReadResult>('fileRead')`) even though the loader is untyped: the
-// metadata table is schema plumbing, not the public type surface.
+// (`lazyTool<string[], FileReadResult>('fileRead')`) even though the loader is
+// untyped: the descriptor row is schema plumbing, not the public type surface.
 export const lazyTool = <TParameters = any, TResult = any>(
-    name: PresetToolName
+    name: string
 ): Tool<TParameters, TResult> => {
-    // Widen to the row type: the table's literal union does not have a
-    // `visibility` property on every row, and only the contract matters here.
-    const metadata: PresetToolMetadata = PRESET_TOOLS[name];
+    // The row's declarative half. Throws for an unknown name, so a stale named
+    // export fails at module evaluation instead of publishing a blank tool.
+    const metadata: DescriptorMetadata = descriptorMetadata(name);
 
     // One import per proxy, shared by every call. undefined = not started,
     // resolved promise = loaded, cleared on rejection so a retry can succeed.

@@ -1909,8 +1909,8 @@ export type HarnessConfiguration = {
     tools?: Record<string, Tool>;
     // Independently compiled source entries, keyed by wire name. Semantics:
     //   - each value is a source path accepted by the kernel's shared compiler
-    //     (package-source-relative, e.g. `server/harnesses/tool-sources/foo.ts`,
-    //     or absolute);
+    //     (package-source-relative, e.g. `server/tools/shared/foo.tool.ts`, or
+    //     absolute);
     //   - registrations commit after the baseline core/preset set and BEFORE
     //     `tools` overrides, so a configured Tool of the same name wins;
     //   - the installed revision is inspectable through `harness.toolSource()`

@@ -101,6 +101,8 @@ const boot = async (): Promise<HTMLElement> => {
 const toggles = (): HTMLButtonElement[] => [
     ...document.querySelectorAll<HTMLButtonElement>('.rail-toggle')
 ];
+// R1: only the RIGHT rail has a topbar/title-row toggle, so this is a one-element
+// list (the left rail is opened by the brand button).
 const expanded = (): (string | null)[] => toggles().map((button) => button.getAttribute('aria-expanded'));
 
 // A controllable MediaQueryList stand-in. `main.ts` creates ONE query for the whole
@@ -131,50 +133,58 @@ const stubMedia = (matches: boolean): { setMatches(next: boolean): void } => {
     };
 };
 
-it('starts both phone rails collapsed and toggles them one at a time', async () => {
+it('keeps one phone rail toggle, on the harness title row, and toggles the right rail', async () => {
     const shell = await boot();
 
-    const [left, right] = toggles();
-    expect(toggles()).toHaveLength(2);
-    expect(toggles().map((button) => button.getAttribute('aria-controls'))).toEqual([
-        'rail-left',
-        'rail-right'
-    ]);
-    expect(toggles().map((button) => button.getAttribute('aria-label'))).toEqual([
-        'Harnesses panel',
+    // R1: the topbar no longer repeats the harness-listing trigger — the brand button
+    // opens that rail — so exactly ONE rail toggle remains, and it is the scratch/
+    // sessions control.
+    const toggles = [...document.querySelectorAll<HTMLButtonElement>('.rail-toggle')];
+    expect(toggles).toHaveLength(1);
+    const [right] = toggles;
+    expect(toggles.map((button) => button.getAttribute('aria-controls'))).toEqual(['rail-right']);
+    expect(toggles.map((button) => button.getAttribute('aria-label'))).toEqual([
         'Scratch board and sessions panel'
     ]);
-    // R4: icon-only. Each toggle's entire content is ONE decorative glyph; the
-    // accessible name above is the only human-readable label, so the phone topbar
-    // keeps its room for the brand, the tools icon and the status pill.
-    expect(toggles().map((button) => button.textContent)).toEqual(['☰', '▤']);
-    expect(toggles().map((button) => button.children.length)).toEqual([1, 1]);
-    expect(
-        toggles().map((button) => button.firstElementChild?.getAttribute('aria-hidden'))
-    ).toEqual(['true', 'true']);
-    // Collapsed by default: no data state, both `aria-expanded` false.
+    expect(toggles.map((button) => button.title)).toEqual([
+        'Show or hide the scratch board and sessions rail'
+    ]);
+    // R4: icon-only. The toggle's entire content is ONE decorative glyph; the
+    // accessible name above is the only human-readable label.
+    expect(toggles.map((button) => button.textContent)).toEqual(['▤']);
+    expect(toggles.map((button) => button.children.length)).toEqual([1]);
+    expect(toggles.map((button) => button.firstElementChild?.getAttribute('aria-hidden'))).toEqual([
+        'true'
+    ]);
+
+    // R1: the toggle sits on the harness title row, to the RIGHT of the title, not in
+    // the topbar. The row's `margin-left: auto` places it at the far right on a phone.
+    const row = document.querySelector<HTMLElement>('.harness-title-row');
+    if (row === null) throw new Error('missing harness title row');
+    expect(row.contains(right)).toBe(true);
+    expect(right.parentElement?.className).toBe('rail-toggles');
+    expect(document.querySelector('.topbar')?.contains(right)).toBe(false);
+    const rowChildren = [...row.children].map((child) => child.className);
+    expect(rowChildren).toEqual(['main-title', 'harness-id', 'rail-toggles']);
+
+    // Collapsed by default: no data state, `aria-expanded` false.
     expect(shell.dataset.railOpen).toBeUndefined();
-    expect(expanded()).toEqual(['false', 'false']);
+    expect(right.getAttribute('aria-expanded')).toBe('false');
 
     // Both rails are in the DOM (CSS, not JS, collapses them) and carry the ids the
-    // toggles point at.
+    // controls point at.
     expect(document.querySelector('#rail-left')?.className).toBe('rail rail-left');
     expect(document.querySelector('#rail-right')?.className).toBe('rail rail-right');
 
-    // Open left: it becomes the only open rail.
-    left.click();
-    expect(shell.dataset.railOpen).toBe('left');
-    expect(expanded()).toEqual(['true', 'false']);
-
-    // Opening right closes left (exclusive, one rail at a time).
+    // Open right: it becomes the only open rail and reports it.
     right.click();
     expect(shell.dataset.railOpen).toBe('right');
-    expect(expanded()).toEqual(['false', 'true']);
+    expect(right.getAttribute('aria-expanded')).toBe('true');
 
     // Pressing the same toggle again collapses it and removes the data state.
     right.click();
     expect(shell.dataset.railOpen).toBeUndefined();
-    expect(expanded()).toEqual(['false', 'false']);
+    expect(right.getAttribute('aria-expanded')).toBe('false');
 
     // The rails survive every toggle: the collapse is presentational only.
     expect(document.querySelector('#rail-left')).not.toBeNull();
@@ -207,14 +217,15 @@ it('opens the harness sidebar from the Harness UI brand and closes it from the d
     expect(close.textContent).toBe('×');
     expect(close.getAttribute('aria-label')).toBe('Close harnesses panel');
 
-    // Opening from the brand is the same state as the legacy hamburger: one rail
-    // open, both triggers report it, and the listing stays in the DOM. Focus moves
-    // into the drawer so keyboard users can Escape or dismiss immediately.
+    // Opening from the brand is the same state as the (removed) hamburger: the left
+    // rail opens, the brand reports it, the right toggle stays collapsed, and the
+    // listing stays in the DOM. Focus moves into the drawer so keyboard users can
+    // Escape or dismiss immediately.
     brand.focus();
     brand.click();
     expect(shell.dataset.railOpen).toBe('left');
     expect(brand.getAttribute('aria-expanded')).toBe('true');
-    expect(expanded()).toEqual(['true', 'false']);
+    expect(expanded()).toEqual(['false']);
     expect(document.querySelector('#rail-left .harness-list')).not.toBeNull();
     expect(document.activeElement).toBe(close);
 
@@ -223,7 +234,7 @@ it('opens the harness sidebar from the Harness UI brand and closes it from the d
     close.click();
     expect(shell.dataset.railOpen).toBeUndefined();
     expect(brand.getAttribute('aria-expanded')).toBe('false');
-    expect(expanded()).toEqual(['false', 'false']);
+    expect(expanded()).toEqual(['false']);
     expect(document.activeElement).toBe(brand);
     expect(document.querySelector('#rail-left')).not.toBeNull();
 
@@ -290,27 +301,30 @@ it('dismisses an open rail with Escape and with the backdrop', async () => {
     if (backdrop === null) throw new Error('missing backdrop');
     expect(backdrop.getAttribute('aria-hidden')).toBe('true');
 
-    // Escape closes whichever rail is open.
-    toggles()[0].click();
+    const brand = document.querySelector<HTMLButtonElement>('.brand');
+    if (brand === null) throw new Error('missing brand trigger');
+
+    // Escape closes the harness drawer opened from the brand.
+    brand.click();
     expect(shell.dataset.railOpen).toBe('left');
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
     expect(shell.dataset.railOpen).toBeUndefined();
-    expect(expanded()).toEqual(['false', 'false']);
+    expect(expanded()).toEqual(['false']);
 
-    // The backdrop is the pointer dismiss.
-    toggles()[1].click();
+    // The backdrop is the pointer dismiss for the right rail too.
+    toggles()[0].click();
     expect(shell.dataset.railOpen).toBe('right');
     backdrop.click();
     expect(shell.dataset.railOpen).toBeUndefined();
-    expect(expanded()).toEqual(['false', 'false']);
+    expect(expanded()).toEqual(['false']);
 
     // Picking a harness from the open rail is also a dismissal: the chat should be
     // visible immediately, not hidden behind a rail the reader has finished with.
-    toggles()[0].click();
+    brand.click();
     expect(shell.dataset.railOpen).toBe('left');
     document.querySelector<HTMLButtonElement>('.harness-item')?.click();
     expect(shell.dataset.railOpen).toBeUndefined();
-    expect(expanded()).toEqual(['false', 'false']);
+    expect(expanded()).toEqual(['false']);
 });
 
 // --- stylesheet contract ---------------------------------------------------
@@ -348,9 +362,12 @@ const blockOf = (selector: string): string => {
 it('collapses both rails only inside the phone breakpoint', () => {
     const phone = blockOf('@media (max-width: 860px)');
 
-    // The toggles are phone-only; their base rule hides them everywhere else.
+    // The toggle is phone-only; its base rule hides it everywhere else.
     expect(blockOf('.rail-toggles {')).toContain('display: none');
     expect(phone).toContain('.rail-toggles {\n        display: flex;\n    }');
+    // R1: it belongs to the harness title row, pushed to the far right of that row.
+    expect(blockOf('.rail-toggles {')).toContain('margin-left: auto');
+    expect(phone).toContain('.harness-title-row {\n        align-items: center;\n    }');
 
     // Default collapsed: neither rail is displayed without an open state.
     expect(phone).toContain('.rail-left,\n    .rail-right {\n        display: none;\n    }');

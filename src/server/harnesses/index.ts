@@ -46,7 +46,12 @@ export {
     CORE_ENVIRONMENT_TOOL_NAMES,
     CORE_PRESET_TOOL_NAMES,
     CORE_TOOL_NAMES,
+    EXAMPLE_APP_TOOL_SOURCES,
+    SHARED_APP_TOOL_FOLDER,
     SHARED_APP_TOOL_NAMES,
+    SHARED_APP_TOOL_SOURCES,
+    SHARED_APP_TOOLS,
+    SHARED_TOOL_FOLDERS,
     SHARED_TOOL_NAMES,
     SHARED_TOOL_SOURCES,
     SHARED_TOOLS,
@@ -58,6 +63,9 @@ export {
     providerOf
 } from './toolbox';
 export type { ToolboxHarnessConfiguration } from './toolbox';
+// The discovered app catalogue (T25). Exported so a host/test can see the exact
+// folder-derived entries and source paths without importing a tool module.
+export { EXAMPLE_APP_TOOL_FOLDER, SERVER_TOOLS_DIRECTORY, SHARED_APP_TOOLS as HARNESS_APP_TOOLS } from './tools';
 export {
     createHarnessRegistry,
     HarnessRegistryError,

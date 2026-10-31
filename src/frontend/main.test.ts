@@ -198,6 +198,10 @@ const stubFetch = (
 };
 
 const statusText = (): string | null | undefined => document.querySelector('.status-text')?.textContent;
+// R3: the pill shows the concise state word only; the full diagnostic is the pill's
+// `title` tooltip. `null` means no tooltip at all (a bare state).
+const statusTitle = (): string | null | undefined =>
+    document.querySelector('.status')?.getAttribute('title');
 const tileStates = (): (string | null | undefined)[] =>
     [...document.querySelectorAll<HTMLElement>('.tile')].map((tile) => tile.dataset.state);
 const tileElapsed = (): (string | null)[] =>
@@ -2378,8 +2382,12 @@ const expectOfflinePane = (message: string): void => {
     expect(retry[0].textContent).toBe('Retry');
     expect(retry[0].type).toBe('button');
 
-    // The status pill names the same failure and the app-level state is red.
-    expect(statusText()).toBe('server offline');
+    // The status pill names the same failure and the app-level state is red. R3: the
+    // visible word is the concise state; the full message is the tooltip and the
+    // live region's hidden detail.
+    expect(statusText()).toBe('error');
+    expect(statusTitle()).toBe('server offline');
+    expect(document.querySelector('.status-detail')?.textContent).toBe('server offline');
     expect(document.querySelector<HTMLElement>('.status')?.dataset.state).toBe('error');
 
     // No catalogue, no rows and no tools view while offline (R3).
@@ -2399,6 +2407,10 @@ it('renders the connecting pane before the first request settles', async () => {
     expect(emptyText()).toBe('Contacting /api…');
     expect(document.querySelector('.stage .empty')).not.toBeNull();
     expect(statusText()).toBe('connecting');
+    // A bare state carries no tooltip and no accessible detail (nothing to add to the
+    // visible word).
+    expect(statusTitle()).toBeNull();
+    expect(document.querySelector('.status-detail')?.textContent).toBe('');
     expect(document.querySelector<HTMLElement>('.status')?.dataset.state).toBe('connecting');
     expect(document.querySelectorAll('.harness-item')).toHaveLength(0);
 });
@@ -2556,7 +2568,9 @@ it('confirms an inactive session delete once, and cancel sends no request', asyn
     expect(byClass('.agent-main', 'button').disabled).toBe(true);
     // No session was created: a delete is not a submit.
     expect(calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST')).toEqual([]);
-    expect(statusText()).toBe('session s2 deleted');
+    expect(statusText()).toBe('idle');
+    expect(statusTitle()).toBe('session s2 deleted');
+    expect(document.querySelector('.status-detail')?.textContent).toBe('session s2 deleted');
     expect(byClass('.status', 'span').dataset.state).toBe('idle');
 });
 
@@ -2669,7 +2683,9 @@ it('deletes the running current session, stops watching and creates no replaceme
     expect(document.querySelector('.reset')).toBeNull();
     expect(byClass('.new-session', 'button').disabled).toBe(false);
     expect(calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST')).toEqual([]);
-    expect(statusText()).toBe('session s1 deleted');
+    expect(statusText()).toBe('idle');
+    expect(statusTitle()).toBe('session s1 deleted');
+    expect(document.querySelector('.status-detail')?.textContent).toBe('session s1 deleted');
     expect(byClass('.status', 'span').dataset.state).toBe('idle');
 
     // A frame that arrives AFTER the delete is dropped by the session-id guards:
@@ -2716,7 +2732,11 @@ it('keeps the row and reports the error when a delete is rejected', async () => 
     expect(sessionIds()).toEqual(['s1']);
     expect(document.querySelector('.session-confirm')).toBeNull();
     expect(byClass('.status', 'span').dataset.state).toBe('error');
-    expect(statusText()).toBe('delete session: The database is read-only.');
+    expect(statusText()).toBe('error');
+    expect(statusTitle()).toBe('delete session: The database is read-only.');
+    expect(document.querySelector('.status-detail')?.textContent).toBe(
+        'delete session: The database is read-only.'
+    );
     expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
     // The control is usable again, so a transient failure can be retried.
     expect(byClass('.session-delete', 'button').disabled).toBe(false);
@@ -2753,7 +2773,9 @@ it('drops the row when the server answers 404 for an already-deleted session', a
     expect(localStorage.getItem(SESSION_KEY)).toBeNull();
     expect(document.querySelectorAll('.tile')).toHaveLength(0);
     expect(byClass('.status', 'span').dataset.state).toBe('idle');
-    expect(statusText()).toBe('session s1 was already gone');
+    expect(statusText()).toBe('idle');
+    expect(statusTitle()).toBe('session s1 was already gone');
+    expect(document.querySelector('.status-detail')?.textContent).toBe('session s1 was already gone');
 });
 
 it('dedupes a double-confirmed delete and disables the row while it is in flight', async () => {
@@ -2801,7 +2823,9 @@ it('dedupes a double-confirmed delete and disables the row while it is in flight
     await flush();
 
     expect(rowIds()).toEqual([]);
-    expect(statusText()).toBe('session s1 deleted');
+    expect(statusText()).toBe('idle');
+    expect(statusTitle()).toBe('session s1 deleted');
+    expect(document.querySelector('.status-detail')?.textContent).toBe('session s1 deleted');
 });
 
 // R8 regression (reviewer-reproduced race): a directory read that STARTED before a

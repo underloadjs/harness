@@ -259,14 +259,22 @@ import {
     cloneToolCreation,
     readHarnessMessages,
     readHarnessSnapshot,
-    TOOL_CREATE_METADATA,
-    TOOL_CREATE_NAME,
-    TOOL_LIST_METADATA,
-    TOOL_LIST_NAME,
-    TOOL_MANAGE_METADATA,
-    TOOL_MANAGE_NAME,
-    TOOL_REGISTRY_METADATA,
-    TOOL_REGISTRY_NAME,
+    // Descriptor discovery (T19/R8-R9). ONE scan of the package's `tools/**/*.tool.ts`
+    // entries, read through the TypeScript AST (no tool module is imported or
+    // evaluated). The registration loop below consumes this list, so the harness
+    // holds no hand-written registration inventory: a new entry under the default
+    // tools root appears in a new harness with no edit here.
+    discoverToolMetadata,
+    // The GENERATED lazy loader (T19). In a build without the source compiler the
+    // harness registers each baseline row as descriptor metadata + this loader
+    // (a prepared proxy) instead of importing the entry module, so no `.tool.ts`
+    // file is statically imported on either path.
+    loadDiscoveredTool,
+    // Names that remain part of the harness CONTRACT (messages quote them, and the
+    // registry is looked up by them). The declarative halves (description, tags,
+    // schema) come from the discovered descriptor instead of a metadata import.
+    TOOL_REQUEST_NAME,
+    TOOL_CANCEL_NAME,
     prepareToolCandidate,
     deleteToolSourceFile,
     discoverToolFolderSources,
@@ -274,44 +282,26 @@ import {
     resolveToolFolderTarget,
     resolveToolFolders,
     writeToolSourceFile,
-    AGENT_DELEGATE_NAME,
-    AGENT_MANAGE_METADATA,
-    AGENT_MANAGE_NAME,
+    // Agent-inspection bounds (leaf values, no imports). The delegation allowlist
+    // override is a data-only projection of the discovered agentDelegate row.
     AGENT_MANAGE_LIST_PER_AGENT,
     AGENT_MANAGE_PREVIEW_CHARS,
-    AGENT_RESULT_METADATA,
-    AGENT_RESULT_NAME,
     AGENT_RESULT_PAGE_CHARS,
     AGENT_RESULT_PAGE_MAX_CHARS,
     AGENT_RESULT_RETENTION,
-    TOOL_REQUEST_METADATA,
-    TOOL_REQUEST_NAME,
-    TODO_MANAGE_NAME,
-    PROFILE_MANAGE_NAME,
-    CHAPTER_MANAGE_NAME,
-    LOCATION_MANAGE_NAME,
     agentDelegateMetadata,
     createTaskScheduler,
-    TOOL_CANCEL_METADATA,
-    TOOL_CANCEL_NAME,
     // R4 cross-thread chat + R2 thread agents. A host thread is backed by a fresh
     // Agent built from the owner's configuration (core/thread.ts), and the chat
-    // tool is registered lazily once the session owns an independent thread.
-    THREAD_LIST_METADATA,
-    THREAD_LIST_NAME,
-    THREAD_SEND_METADATA,
-    THREAD_SEND_NAME,
+    // tools are registered lazily once the session owns an independent thread —
+    // from their discovered `activation: 'threads'` descriptors.
     THREAD_HOST_PREFIX,
     MAX_THREAD_RECORDS,
     createThreadAgent,
     defaultThreadIdOf,
     normalizeThreadLabel,
-    // N6 runtime: branch identity/creation, action-request parsing, fork bounds,
-    // and the private metadata of the two branch tools.
-    ACTION_REQUEST_METADATA,
-    ACTION_REQUEST_NAME,
-    THREAD_FORK_METADATA,
-    THREAD_FORK_NAME,
+    // N6 runtime: branch identity/creation, action-request parsing, and fork
+    // bounds. The branch tools' metadata is the descriptor's own literal.
     MAX_FORK_CONCURRENT,
     MAX_FORK_DEPTH,
     MAX_FORK_HISTORY_BYTES,
@@ -327,7 +317,11 @@ import {
     validateActionRequestParameters
 } from './core';
 import type { AgentBranchMetadata } from './core';
-import { presetTools, createWebSearchTool, WEB_SEARCH_TOOL_NAME, createWebFetchTool, WEB_FETCH_TOOL_NAME } from './tools';
+import type { DiscoveredTool } from './core';
+// Only the two provider FACTORIES are imported here. The preset table and the web
+// wire names are no longer needed for registration: every baseline row comes from
+// descriptor discovery, so this module holds no inventory of tool names.
+import { createWebSearchTool, createWebFetchTool } from './tools';
 import { runPlugins } from './plugin';
 import { validateAttachments } from './shared/attachments';
 import type {
@@ -512,48 +506,31 @@ const parseToolCallArguments = (
 };
 
 // The discovery entry point. The harness owns this name: the whole visibility
-// scheme depends on there being exactly one tool that can enable the rest.
+// scheme depends on there being exactly one tool that can enable the rest. It is
+// the ONE wire name still spelled out here, because runtime messages quote it
+// (see the "not registered"/"not enabled yet" failures below); every other name
+// comes from the discovered descriptor that registers the tool.
 const TOOL_REQUEST = TOOL_REQUEST_NAME;
-// Inventory + active management. Both are always-registered core tools; management
-// mutations still flow through `acceptTool`, never a second pipeline.
-const TOOL_LIST = TOOL_LIST_NAME;
-const TOOL_MANAGE = TOOL_MANAGE_NAME;
 
-// Runtime tool creation (R2b), the session todo list, the session record tools,
-// and bounded delegation (R4). All are model-facing core tools, so their wire
-// names are part of the harness contract. The names come from core/metadata.ts,
-// which the server's tool catalogue also describes — one copy, so a descriptor
-// cannot advertise a name the runtime does not register.
-const TOOL_CREATE = TOOL_CREATE_NAME;
-const TODO_MANAGE = TODO_MANAGE_NAME;
-const PROFILE_MANAGE = PROFILE_MANAGE_NAME;
-const CHAPTER_MANAGE = CHAPTER_MANAGE_NAME;
-const LOCATION_MANAGE = LOCATION_MANAGE_NAME;
-// Agent inspection (R3): every agent, including a subagent, may read the
-// session's agents and their completed results. Registration order matches
-// coreToolMetadata().
-const AGENT_MANAGE = AGENT_MANAGE_NAME;
-const AGENT_RESULT = AGENT_RESULT_NAME;
-const AGENT_DELEGATE = AGENT_DELEGATE_NAME;
 // Targeted cancellation for a background call (T3/R4). Declared only while the
 // calling agent has work in flight. It is an ordinary registry definition, not a
 // reserved name: a replacement drops the control marker and executes normally.
+// Named here because the dispatch path and the pending-declaration projection both
+// look it up in the live registry.
 const TOOL_CANCEL = TOOL_CANCEL_NAME;
-// N6 branch controls. threadFork is registered whenever forks are enabled
-// (default true); actionRequest is registered whenever `interaction` is
-// configured. Both are core declarations, but both are RUNTIME-ONLY: the manual
-// executeTool path refuses them because a host call has no owning run transcript
-// to fork or ask from.
-const THREAD_FORK = THREAD_FORK_NAME;
-const ACTION_REQUEST = ACTION_REQUEST_NAME;
+
 // R4 cross-thread chat. Registered lazily (the first `createThread`), because a
 // session with one conversation per agent has no second thread to talk to and
 // must keep its historical declaration list. It remains an ordinary replaceable
 // registry entry once present.
-const THREAD_SEND = THREAD_SEND_NAME;
-// R4 roster: the discoverable source of the ids `threadSend` accepts, so neither a
-// model nor the server has to invent or inject them. Registered with threadSend.
-const THREAD_LIST = THREAD_LIST_NAME;
+//
+// DERIVED (T19/R8): these two names are no longer hardcoded. The `threads`
+// activation group is discovered from each entry's `registration` literal, so
+// adding a third cross-thread entry needs no edit here.
+const activationDescriptors = (
+    descriptors: readonly DiscoveredTool[],
+    activation: string
+): DiscoveredTool[] => descriptors.filter((descriptor) => descriptor.activation === activation);
 
 // Budget for toolCreate: registration is cheap but not free, and an unbounded
 // registry defeats the point of discovery. Session-local (no filesystem writes),
@@ -765,6 +742,118 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // primary is allowed to reach.
     const subagents: Record<string, Agent> = {};
     for (const name of subagentNames) subagents[name] = agents[name];
+
+    // -----------------------------------------------------------------------
+    // Descriptor discovery (T19/R8-R9): METADATA FIRST, before any compilation
+    // -----------------------------------------------------------------------
+    //
+    // ONE scan produces every registration row this harness uses. Each row was read
+    // from its `*.tool.ts` entry's `metadata` + `registration` literals through the
+    // TypeScript AST — no tool module has been imported or evaluated at this point —
+    // so a brand-new entry under the default tools root is registered by a new
+    // harness with no registry edit, no static import, and no manual inventory.
+    //
+    // `presets: false` filters the `preset` GROUP and nothing else: the runtime
+    // (harness-owned) entries stay, which is what keeps `presets: false` meaning
+    // "no shipped preset catalogue" rather than "no harness".
+    //
+    // Configured folders are scanned AFTER the package entries (inside discovery),
+    // so a folder entry wins a name collision exactly like the startup registration
+    // order it feeds. A folder module that cannot be parsed fails here, before any
+    // registration, with its exact path.
+    // Configured folders are deliberately NOT passed to the scan: their entries are
+    // registered by the ordered folder loop further down, which is what gives a
+    // later folder precedence over an earlier one and reports a bad module with its
+    // exact file path. Discovery here covers the PACKAGE tree only, so a folder
+    // entry can still override a package row by registering afterwards.
+    const toolDescriptors: readonly DiscoveredTool[] = (() => {
+        try {
+            return discoverToolMetadata({ includePresets: configuration.presets !== false });
+        } catch (error) {
+            throw new HarnessError(`Tool discovery failed: ${toErrorInfo(error).message}`, {
+                cause: error
+            });
+        }
+    })();
+
+    // Descriptor lookup by wire name. Used where the runtime needs the declarative
+    // half of one specific entry (delegation's allowlist projection, the thread
+    // pair) without importing that entry's module.
+    const descriptorOf = (name: string): DiscoveredTool | undefined =>
+        toolDescriptors.find((descriptor) => descriptor.name === name);
+
+    // A discovered row's declarative half, shaped for `tool()`/candidate
+    // registration. `visibility` is defaulted exactly like `tool()` does, so a
+    // preset row that omits it registers as searchable.
+    const metadataOf = (descriptor: DiscoveredTool): {
+        name: string;
+        description: string;
+        tags: readonly string[];
+        parameters: Record<string, unknown>;
+        visibility: 'core' | 'searchable';
+    } => ({
+        name: descriptor.name,
+        description: descriptor.metadata.description,
+        tags: [...descriptor.metadata.tags],
+        parameters: descriptor.metadata.parameters,
+        visibility: descriptor.metadata.visibility ?? 'searchable'
+    });
+
+    // Every descriptor whose activation the CURRENT configuration satisfies. This
+    // is the whole activation policy in one place; the registration loop below just
+    // walks the result in descriptor order. `threads` entries are excluded because
+    // they are registered lazily (first `createThread`), and the web pair because
+    // their provider closure is created later in this function.
+    //
+    // `descriptorsFor` is the group lookup used by the web-tool and thread adapters
+    // below, so a new entry with one of those activations needs no edit here.
+    const descriptorsFor = (activation: string): DiscoveredTool[] =>
+        activationDescriptors(toolDescriptors, activation);
+
+    const activeDescriptors: readonly DiscoveredTool[] = toolDescriptors.filter((descriptor) => {
+        switch (descriptor.activation) {
+            case 'always':
+                return true;
+            case 'creation':
+                // `toolCreation: false` registers no model-facing creation tool; the
+                // host `harness.createTool` path stays available.
+                return toolCreation !== false;
+            case 'subagents':
+                // No allowlist means nowhere to delegate: the tool would only fail.
+                return subagentNames.length > 0;
+            case 'interaction':
+                // `interaction` presence is what makes an owner answer reachable.
+                return interaction !== undefined;
+            case 'forks':
+                return forks.enabled;
+            case 'threads':
+            case 'websearch':
+            case 'webfetch':
+                // Registered on their own trigger, not at startup.
+                return false;
+            default:
+                // An unknown activation is a descriptor bug, not something to guess
+                // at: the entry claims a policy this runtime cannot honour.
+                throw new HarnessError(
+                    `Tool "${descriptor.name}" declares activation ${JSON.stringify(
+                        String(descriptor.activation)
+                    )}, which this harness does not understand. Use always, creation, subagents, interaction, forks, threads, websearch, or webfetch.`
+                );
+        }
+    });
+
+    // The lazily registered cross-thread pair, resolved from the descriptor rows
+    // rather than a hardcoded name list.
+    //
+    // DECLARATION ORDER (preserved): the roster must be declared BEFORE the tool
+    // that addresses its ids — an id is only useful if it can be discovered — so
+    // this group registers in DESCENDING `order`. The entries carry
+    // threadSend=260 / threadList=270 precisely so that the roster sorts first
+    // under that rule; if a future entry is added, give it an `order` below the
+    // roster's and it lands after it. No name map, and no edit to the entries.
+    const threadDescriptors = toolDescriptors
+        .filter((descriptor) => descriptor.activation === 'threads')
+        .sort((left, right) => right.order - left.order);
 
     // The tool registry starts EMPTY. Every entry — the preset catalogue,
     // configured tools, harness-owned controls, plugin contributions, and runtime
@@ -1840,33 +1929,215 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     };
 
-    // toolRegistry is registered FIRST, because the bootstrap needs a model-facing
-    // entry that delegates to the kernel for every later revision. It is loaded by
-    // compiling its editable source entry through registerAtStartup — the SAME
-    // operation runtime registrations use, not a prepared-definition shortcut.
-    // If the source file is missing, construction fails loudly rather than silently
-    // starting without the self-modification loop.
-    registerBaselineSource(
-        {
-            name: TOOL_REGISTRY_NAME,
-            sourcePath: 'runtime-tools/toolRegistry.tool.ts'
-        },
-        () =>
-            defineTool({
-                ...TOOL_REGISTRY_METADATA,
-                execute: (context) => {
-                    if (context.harness === undefined) {
-                        throw new HarnessError(
-                            'toolRegistry requires the live harness reference.'
-                        );
-                    }
+    // -----------------------------------------------------------------------
+    // Descriptor-driven baseline registration (T19 / R7-R9)
+    // -----------------------------------------------------------------------
+    //
+    // ONE loop registers every descriptor whose activation this configuration
+    // satisfies. There is no hand-written inventory here any more: no
+    // `PRESET_SOURCE_ENTRIES`, no per-tool `registerBaselineSource({ name,
+    // sourcePath })` row, and no metadata import used purely to register. A new
+    // `.tool.ts` under the default tools root is therefore live in a new harness
+    // with no edit to this file.
+    //
+    // ORDER is `descriptor.order` (the scan order), which is the historical
+    // registration order: toolRegistry, toolRequest, toolList, toolManage,
+    // toolCreate, todo/profile/chapter/location, agentManage/agentResult,
+    // agentDelegate, threadFork, actionRequest, toolCancel, then the presets.
+    //
+    // LIVE CLOSURES stay exactly where they were: this loop decides WHEN and FROM
+    // WHICH SOURCE a row is registered, while each row's `execute` still reaches a
+    // harness-owned closure through `context.harness.runtime` (record stores, tool
+    // creation, agent inspection, delegation, thread chat). A descriptor never
+    // carries behaviour.
+    //
+    // FLAGS are bound by descriptor, not by wire name:
+    //   - `primaryOnly`  -> primaryOnlyDefinitions (role gate + declaration filter)
+    //   - `answerExtraction` -> delegateAnswerDefinitions (owner-answer parsing)
+    //   - `control`      -> runtimeControlDefinitions (cancel/fork/action dispatch)
+    //   - `pendingOnly`  -> pendingOnlyDefinitions (declared only while actionable)
+    // so replacing any of them publishes an ordinary tool that inherits nothing.
+    //
+    // SOURCE vs DEFINITION: with the compiler available every row is registered by
+    // compiling its editable `sourcePath` (the self-modification contract). Without
+    // it (the aliased browser build) the row is a prepared proxy built from the
+    // descriptor's metadata plus the GENERATED loader — still no static import of
+    // the entry module, and the same declaration shape a model sees.
+    // Resolve one discovered entry to a callable Tool through the GENERATED
+    // loader. Entries come in two shapes and both must work here:
+    //   - a preset module exports a ready `Tool` (its own `tool({...})`);
+    //   - a runtime module exports `metadata` + `execute` (and often `registration`).
+    // The metadata half is already known from the descriptor, so only the
+    // implementation is taken from the loaded module. Nothing is imported at
+    // registration time, and no `.tool.ts` specifier is written by hand.
+    const loadDescriptorTool = async (descriptor: DiscoveredTool): Promise<Tool> => {
+        const module = (await loadDiscoveredTool(descriptor.label)) as Record<string, unknown>;
+        const named = module[descriptor.name];
+        const callable =
+            typeof named === 'function'
+                ? named
+                : typeof module.default === 'function'
+                  ? module.default
+                  : undefined;
 
-                    return context.harness.registerTool(
-                        (context.parameters ?? {}) as HarnessToolRegistrationCandidate
-                    );
-                }
-            })
-    );
+        // A callable export IS the Tool (a preset's own `tool()` result). Its
+        // `execute` is what the harness invokes, so it must be present.
+        if (callable !== undefined) {
+            const tool = callable as Tool;
+            if (typeof tool.execute === 'function') return tool;
+        }
+
+        const execute = module.execute;
+
+        if (typeof execute === 'function') {
+            return defineTool({
+                ...metadataOf(descriptor),
+                execute: (context) => execute(context)
+            });
+        }
+
+        throw new HarnessError(
+            `Discovered tool "${descriptor.name}" (${descriptor.label}) exports neither a Tool nor an execute function.`
+        );
+    };
+
+    const lazyBaselineTool = (descriptor: DiscoveredTool): Tool => {
+        const definition = defineTool({
+            ...metadataOf(descriptor),
+            execute: async (context) => {
+                // Resolve through the generated loader at CALL time: the same
+                // indirection the preset lazy layer uses, so no tool body is
+                // evaluated until something actually invokes it.
+                const resolved = await loadDescriptorTool(descriptor);
+                return resolved.execute(context);
+            }
+        });
+
+        return definition;
+    };
+
+    // Prepare + publish one descriptor row through the ONE kernel operation.
+    //
+    // `overrides` is the ONE place a per-harness declaration may replace the
+    // entry's literal: the web pair supplies the configured provider's dynamic
+    // schema (and its description/tags), because that surface closes over a
+    // credential and cannot live in editable source. Everything else uses the
+    // descriptor literal, so an installed declaration cannot drift from the one
+    // discovery reported.
+    const registerDescriptor = (
+        descriptor: DiscoveredTool,
+        fallback: () => Tool,
+        overrides: {
+            description?: string;
+            tags?: readonly string[];
+            parameters?: Record<string, unknown>;
+            visibility?: 'core' | 'searchable';
+        } = {}
+    ): PreparedTool =>
+        registerBaselineSource(
+            {
+                name: descriptor.name,
+                description: overrides.description ?? descriptor.metadata.description,
+                tags: [...(overrides.tags ?? descriptor.metadata.tags)],
+                parameters: overrides.parameters ?? descriptor.metadata.parameters,
+                visibility:
+                    overrides.visibility ?? descriptor.metadata.visibility ?? 'searchable',
+                sourcePath: descriptor.sourcePath
+            },
+            fallback
+        );
+
+    // A row's declared control, mapped onto the runtime dispatch marker. The
+    // vocabulary is the descriptor's (`cancel`/`fork`/`action`); the marker names
+    // the dispatch handler, so the mapping lives here rather than in metadata.
+    const controlMarkerOf = (
+        control: DiscoveredTool['control']
+    ): 'toolCancel' | 'threadFork' | 'actionRequest' | undefined =>
+        control === 'cancel'
+            ? 'toolCancel'
+            : control === 'fork'
+              ? 'threadFork'
+              : control === 'action'
+                ? 'actionRequest'
+                : undefined;
+
+    // The wire name of the delegation row, resolved once from discovery. Used to
+    // project the per-harness allowlist schema at registration time without a
+    // hardcoded name constant.
+    const delegateDescriptorName = descriptorOf('agentDelegate')?.name;
+
+    // Register every active descriptor in scan order and bind its flags to the
+    // published DEFINITION object.
+    //
+    // WHY THIS RUNS LAST (after the runtime closures below): the registered entry's
+    // `execute` reaches a harness closure through `context.harness.runtime`, and the
+    // fallback proxy resolves the entry through the generated loader. Both are
+    // resolved at CALL time, so only the ORDER of registration matters here — the
+    // historical order is `descriptor.order`. The call itself is deferred to
+    // `registerBaselineDescriptors()` at the bottom of the startup sequence.
+    const registerBaselineDescriptors = (): void => {
+        for (const descriptor of activeDescriptors) {
+            // Per-harness declaration override for the delegation allowlist: the
+            // enum IS the session's subagent list, so the installed declaration is
+            // projected from the discovered baseline literal (core/metadata.ts is
+            // data-only) at registration time. Nothing else overrides a literal.
+            const overrides =
+                descriptor.name === delegateDescriptorName && subagentNames.length > 0
+                    ? (() => {
+                          const projected = agentDelegateMetadata(subagentNames);
+                          return {
+                              description: projected.description,
+                              tags: projected.tags,
+                              parameters: projected.parameters
+                          };
+                      })()
+                    : {};
+
+            // A control row's fallback body fails loudly: the real dispatch needs
+            // the owning RunState, which only launchToolCall has. A replacement
+            // publishes its own definition and inherits no marker.
+            const fallback = (): Tool =>
+                descriptor.control === undefined
+                    ? lazyBaselineTool(descriptor)
+                    : defineTool({
+                          ...metadataOf(descriptor),
+                          ...overrides,
+                          execute: () => {
+                              throw new HarnessError(
+                                  `${descriptor.name} requires the harness run that owns the conversation; call it from a model tool call.`
+                              );
+                          }
+                      });
+
+            const prepared = registerDescriptor(descriptor, fallback, overrides);
+            const definition = prepared.tool;
+
+            // The baseline toolCancel row is not a standing core declaration: it is
+            // appended by offerDeclarations only while actionable. Its own literal
+            // says `visibility: 'core'` for the descriptor's sake, so the
+            // pending-only marker is what actually keeps it out of the ordinary core
+            // list — keeping its visibility 'searchable' here as well keeps
+            // `toolList`/details honest.
+            if (descriptor.pendingOnly === true) definition.visibility = 'searchable';
+
+            if (descriptor.primaryOnly === true) primaryOnlyDefinitions.add(definition);
+            if (descriptor.answerExtraction === true) delegateAnswerDefinitions.add(definition);
+            if (descriptor.pendingOnly === true) pendingOnlyDefinitions.add(definition);
+
+            const marker = controlMarkerOf(descriptor.control);
+            if (marker !== undefined) runtimeControlDefinitions.set(definition, marker);
+        }
+
+        // The 'primary' creation policy is a property of the REGISTERED toolCreate
+        // DEFINITION, not its wire name, so a replacement inherits no gate.
+        if (toolCreation === 'primary') {
+            const createName = descriptorOf('toolCreate')?.name;
+            if (createName !== undefined && tools[createName] !== undefined) {
+                primaryOnlyDefinitions.add(tools[createName]);
+            }
+        }
+    };
+
 
     // The discovery STATE/operation lives on the harness; the model-facing
     // toolRequest entry is a standalone source module compiled through the kernel.
@@ -1967,44 +2238,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return result;
     };
 
-    registerBaselineSource(
-        {
-            name: TOOL_REQUEST,
-            sourcePath: 'runtime-tools/toolRequest.tool.ts'
-        },
-        () =>
-            defineTool({
-                ...TOOL_REQUEST_METADATA,
-                execute: (context) => requestToolsFor(context.agent, context.parameters)
-            })
-    );
+    // toolRequest/toolList/toolManage/toolCreate and the session record tools are
+    // all registered by the descriptor loop above (activation `always`/`creation`).
+    // Their bodies are the live closures below, reached through
+    // `context.harness.runtime`. Nothing here names a source path: the descriptor's
+    // `sourcePath` is the editable entry, and the compiled entry's `execute` calls
+    // back into `runtime`.
 
-    // Inventory + management. Both are baseline core source entries compiled
-    // through the same kernel; a replacement (including their own source file)
-    // publishes a normal tool with its own visibility.
-    registerBaselineSource(
-        {
-            name: TOOL_LIST,
-            sourcePath: 'runtime-tools/toolList.tool.ts'
-        },
-        () =>
-            defineTool({
-                ...TOOL_LIST_METADATA,
-                execute: () => listToolsFor()
-            })
-    );
-
-    registerBaselineSource(
-        {
-            name: TOOL_MANAGE,
-            sourcePath: 'runtime-tools/toolManage.tool.ts'
-        },
-        () =>
-            defineTool({
-                ...TOOL_MANAGE_METADATA,
-                execute: (context) => manageToolFor(context.agent, context.parameters)
-            })
-    );
 
     // Legacy runtime creation (R2b). This is a THIN COMPATIBILITY ADAPTER over the
     // same kernel: toolCreate still accepts an async function body, but capture,
@@ -2077,26 +2317,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return result;
     };
 
-    if (toolCreation !== false) {
-        const preparedToolCreate = registerBaselineSource(
-            {
-                name: TOOL_CREATE,
-                sourcePath: 'runtime-tools/toolCreate.tool.ts'
-            },
-            () =>
-                defineTool({
-                    ...TOOL_CREATE_METADATA,
-                    execute: (context) =>
-                        createToolForAgent(
-                            context.agent,
-                            context.parameters as ToolCreation
-                        )
-                })
-        );
-
-        // 'primary' policy is a property of THIS definition, not the wire name;
-        // replacing toolCreate publishes a new object with no inherited gate.
-        if (toolCreation === 'primary') primaryOnlyDefinitions.add(preparedToolCreate.tool);
+    // The 'primary' creation policy is a property of the REGISTERED toolCreate
+    // DEFINITION, not its wire name. The descriptor loop registered the row (its
+    // `activation: 'creation'` row is present whenever `toolCreation !== false`);
+    // this binds the policy gate to that published object, so replacing toolCreate
+    // publishes a new definition that inherits no gate.
+    if (toolCreation === 'primary') {
+        const createName = descriptorOf('toolCreate')?.name;
+        if (createName !== undefined && tools[createName] !== undefined) {
+            primaryOnlyDefinitions.add(tools[createName]);
+        }
     }
 
     // Session todos (R1/R2). One instance per harness: the tool closes over its
@@ -2105,32 +2335,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // tool, so the primary and its subagents see one list. reset() below clears
     // it together with the conversation; nothing is persisted.
     const todo = createTodoTool();
-    registerBaselineSource(
-        { name: TODO_MANAGE, sourcePath: 'runtime-tools/todoManage.tool.ts' },
-        () => todo.tool
-    );
 
     // Session records (profiles, chapters, locations). Same lifecycle as the todo
     // list: one factory instance per harness, shared by every agent here, and
     // cleared by reset(). Separate closets and separate id sequences, so a
     // profile id and a chapter id may both be "1" without ambiguity.
     const profile = createProfileTool();
-    registerBaselineSource(
-        { name: PROFILE_MANAGE, sourcePath: 'runtime-tools/profileManage.tool.ts' },
-        () => profile.tool
-    );
 
     const chapter = createChapterTool();
-    registerBaselineSource(
-        { name: CHAPTER_MANAGE, sourcePath: 'runtime-tools/chapterManage.tool.ts' },
-        () => chapter.tool
-    );
 
     const location = createLocationTool();
-    registerBaselineSource(
-        { name: LOCATION_MANAGE, sourcePath: 'runtime-tools/locationManage.tool.ts' },
-        () => location.tool
-    );
 
     // Per-harness network closures. They are populated during startup from the
     // `websearch`/`webfetch` configuration and carry the credentials; the compiled
@@ -2417,14 +2631,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             };
     };
 
-    registerBaselineSource(
-        { name: AGENT_MANAGE, sourcePath: 'runtime-tools/agentManage.tool.ts' },
-        () =>
-            defineTool({
-                ...AGENT_MANAGE_METADATA,
-                execute: () => agentManageView()
-            })
-    );
+    // agentManage is registered by the descriptor loop above; its body is this
+    // view function, reached through `context.harness.runtime.agentManage()`.
 
     // Full retrieval by agent (and preferably invocation id). There is no
     // transcript access at all: every branch below reads the recorded answer
@@ -2537,15 +2745,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             };
     };
 
-    registerBaselineSource(
-        { name: AGENT_RESULT, sourcePath: 'runtime-tools/agentResult.tool.ts' },
-        () =>
-            defineTool({
-                ...AGENT_RESULT_METADATA,
-                execute: (context) =>
-                    agentResultFor((context.parameters ?? {}) as Record<string, any>)
-            })
-    );
+    // agentResult is registered by the descriptor loop above; its body is this
+    // function, reached through `context.harness.runtime.agentResult(...)`.
 
     // Bounded delegation (R4). Registered only when there is somewhere to
     // delegate: a tool that can only fail would cost context on every request.
@@ -2601,137 +2802,26 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         return { agent: target, content: message.content };
     };
 
-    if (subagentNames.length > 0) {
-        // The allowlist schema is per-harness, so the candidate overrides the
-        // source entry's generic schema (the editable module still owns the
-        // execution contract and delegates to the live runtime operation).
-        const delegateMetadata = agentDelegateMetadata(subagentNames);
-        const agentDelegateDefinition = registerBaselineSource(
-            {
-                name: AGENT_DELEGATE,
-                description: delegateMetadata.description,
-                tags: delegateMetadata.tags,
-                parameters: delegateMetadata.parameters,
-                sourcePath: 'runtime-tools/agentDelegate.tool.ts'
-            },
-            () =>
-                defineTool({
-                    ...delegateMetadata,
-                    execute: (context) =>
-                        delegateFor(
-                            context.agent,
-                            (context.parameters ?? {}) as {
-                                agent?: string;
-                                input?: string;
-                            },
-                            context.run,
-                            context.runDepth
-                        )
-                })
-        ).tool;
+    // Delegation's per-harness allowlist schema was applied to the registered
+    // agentDelegate declaration by the descriptor loop above. The primary-only and
+    // answer-extraction flags are descriptor-driven too (`primaryOnly: true`,
+    // `answerExtraction: true` on the entry), so a replacement under the same wire
+    // name inherits neither.
 
-        // Primary-only and answer-extraction are properties of THIS definition. A
-        // replacement published under the same wire name inherits neither.
-        primaryOnlyDefinitions.add(agentDelegateDefinition);
-        delegateAnswerDefinitions.add(agentDelegateDefinition);
-    }
+    // N6 branch controls (threadFork / actionRequest) and the pending-only
+    // toolCancel control are all registered by the descriptor loop above: their
+    // `activation` (forks / interaction / always), `control` marker, and
+    // `pendingOnly` flag come from the entries' own `registration` literals. The
+    // dispatch below is keyed by the marker on the RESOLVED definition, never by
+    // wire name before registry lookup, so replacing either tool drops the marker
+    // and the replacement executes as an ordinary tool.
 
-    // -----------------------------------------------------------------------
-    // N6 branch controls: threadFork and actionRequest
-    // -----------------------------------------------------------------------
-    //
-    // Both need the owning RunState (the exact transcript snapshot and the owner
-    // run) rather than an ordinary tool context, so launchToolCall dispatches them
-    // to runtime handlers. The dispatch is keyed by a MARKER ON THE RESOLVED
-    // DEFINITION, never by wire name before registry lookup: replacing either
-    // tool drops the marker and the replacement executes as an ordinary tool.
-    // Their execute bodies fail loudly if some future path calls them directly.
-    if (forks.enabled) {
-        const threadForkDefinition = registerBaselineSource(
-            { name: THREAD_FORK, sourcePath: 'runtime-tools/threadFork.tool.ts' },
-            () =>
-                defineTool({
-                    ...THREAD_FORK_METADATA,
-                    execute: () => {
-                        throw new HarnessError(
-                            'threadFork requires the harness run that owns the conversation; call it from a model tool call.'
-                        );
-                    }
-                })
-        ).tool;
-        runtimeControlDefinitions.set(threadForkDefinition, 'threadFork');
-    }
-
-    if (interaction !== undefined) {
-        const actionRequestDefinition = registerBaselineSource(
-            { name: ACTION_REQUEST, sourcePath: 'runtime-tools/actionRequest.tool.ts' },
-            () =>
-                defineTool({
-                    ...ACTION_REQUEST_METADATA,
-                    execute: () => {
-                        throw new HarnessError(
-                            'actionRequest requires the harness run that owns the conversation; call it from a model tool call.'
-                        );
-                    }
-                })
-        ).tool;
-        runtimeControlDefinitions.set(actionRequestDefinition, 'actionRequest');
-    }
-
-    // toolCancel is an ordinary registered definition too, but it is DECLARED
-    // only while the calling actor has background work. `pendingOnlyDefinitions`
-    // (not the name) drives that declaration rule; replacing it publishes a normal
-    // tool that is declared according to its own visibility.
-    if (tools[TOOL_CANCEL] === undefined) {
-        const toolCancelDefinition = registerBaselineSource(
-            { name: TOOL_CANCEL, sourcePath: 'runtime-tools/toolCancel.tool.ts' },
-            () =>
-                defineTool({
-                    ...TOOL_CANCEL_METADATA,
-                    execute: () => {
-                        throw new HarnessError(
-                            'toolCancel must be dispatched by the harness run that owns the pending call.'
-                        );
-                    }
-                })
-        ).tool;
-        // The baseline control is not a standing core declaration; it is appended
-        // by offerDeclarations only while actionable. Keeping its visibility
-        // 'searchable' also keeps descriptor core lists honest. A replacement is
-        // unaffected and uses its own visibility.
-        toolCancelDefinition.visibility = 'searchable';
-        runtimeControlDefinitions.set(toolCancelDefinition, 'toolCancel');
-        pendingOnlyDefinitions.add(toolCancelDefinition);
-    }
-
-    // Baseline preset registrations. Each preset is compiled from its EDITABLE
-    // source entry through the same kernel (not from a cached lazy proxy and not
-    // from a prepared definition): the startup path therefore exercises exactly
-    // the compilation/loading/validation operation a runtime replacement uses.
-    // `presets: false` simply skips these baseline rows.
-    const PRESET_SOURCE_ENTRIES: Record<string, string> = {
-        syntaxCheck: 'tools/syntax/syntaxCheck.tool.ts',
-        fileRead: 'tools/files/fileRead.tool.ts',
-        fileWrite: 'tools/files/fileWrite.tool.ts',
-        fileEdit: 'tools/files/fileEdit.tool.ts',
-        fileList: 'tools/files/fileList.tool.ts',
-        fileGlob: 'tools/files/fileGlob.tool.ts',
-        commandRun: 'tools/command/commandRun.tool.ts',
-        gitDiff: 'tools/command/gitDiff.tool.ts'
-    };
-
-    if (configuration.presets !== false) {
-        for (const name of Object.keys(presetTools)) {
-            const source = PRESET_SOURCE_ENTRIES[name];
-            if (source === undefined) continue;
-            // Browser fallback keeps the historical lazy-proxy definitions; no
-            // browser code execution is promised, only the same declaration shape.
-            registerBaselineSource(
-                { name, sourcePath: source },
-                () => presetTools[name as keyof typeof presetTools]
-            );
-        }
-    }
+    // THE BASELINE: every discovered descriptor this configuration activates, in
+    // scan order, through the one kernel operation. This replaces the historical
+    // hand-written registration list (toolRegistry → presets) and the
+    // `PRESET_SOURCE_ENTRIES` map. `presets: false` already filtered the preset
+    // group out of `activeDescriptors`.
+    registerBaselineDescriptors();
 
     // Host-configured source entries, committed AFTER the baseline and BEFORE
     // `tools` overrides. These are genuine compiled/reloaded revisions, not a
@@ -2787,58 +2877,55 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         registerAtStartup({ definition: wrapped });
     }
 
-    // Opt-in web search (W3). The provider closure (and its credentials) stays
-    // harness-owned; the REGISTERED entry is the independently compiled runtime
-    // source revision. Candidate metadata supplies the configured provider surface
-    // (dynamic schema), so no credential or provider list is baked into source.
-    if (
-        configuration.websearch !== undefined &&
-        configuration.websearch !== false &&
-        tools[WEB_SEARCH_TOOL_NAME] === undefined
-    ) {
-        const webSearch = createWebSearchTool(
-            configuration.websearch === true ? {} : configuration.websearch
-        );
+    // Opt-in web tools (W3/W4). The provider closure (and its credentials) stays
+    // harness-owned; the REGISTERED entry is the discovered `websearch`/`webfetch`
+    // descriptor, compiled from its editable source. Candidate metadata supplies the
+    // configured provider surface (dynamic schema), so no credential or provider
+    // list is baked into source.
+    //
+    // DERIVED (T19/R8): the two names are no longer hardcoded. The descriptors with
+    // those activations ARE the rows, so adding another provider-backed tool needs
+    // no edit here.
+    const registerWebTool = (
+        activation: 'websearch' | 'webfetch',
+        configured: unknown,
+        create: () => Tool | undefined
+    ): void => {
+        // `undefined`/`false` means the capability was not requested at all.
+        if (configured === undefined || configured === false) return;
 
-        if (webSearch) {
-            webOperations.webSearch = webSearch;
-            registerBaselineSource(
-                {
-                    name: WEB_SEARCH_TOOL_NAME,
-                    sourcePath: 'runtime-tools/webSearch.tool.ts',
-                    description: webSearch.description,
-                    tags: webSearch.tags,
-                    parameters: webSearch.parameters,
-                    visibility: webSearch.visibility
-                },
-                () => webSearch
-            );
-        }
-    }
+        const descriptor = descriptorsFor(activation)[0];
+        if (descriptor === undefined) return;
 
-    // Opt-in page fetch (W4). Same rule: the registered implementation is compiled
-    // source; the provider/credential closure is the live runtime operation.
-    if (
-        configuration.webfetch !== undefined &&
-        configuration.webfetch !== false &&
-        tools[WEB_FETCH_TOOL_NAME] === undefined
-    ) {
-        const webFetch = createWebFetchTool(
-            configuration.webfetch === true ? {} : configuration.webfetch
-        );
-        webOperations.webFetch = webFetch;
-        registerBaselineSource(
-            {
-                name: WEB_FETCH_TOOL_NAME,
-                sourcePath: 'runtime-tools/webFetch.tool.ts',
-                description: webFetch.description,
-                tags: webFetch.tags,
-                parameters: webFetch.parameters,
-                visibility: webFetch.visibility
-            },
-            () => webFetch
-        );
-    }
+        // A configured tool of the same wire name wins (host override): the
+        // historical check, expressed against the descriptor's own name.
+        if (tools[descriptor.name] !== undefined) return;
+
+        const operation = create();
+        if (operation === undefined) return;
+
+        if (activation === 'websearch') webOperations.webSearch = operation;
+        else webOperations.webFetch = operation;
+
+        // The provider surface (description, tags, dynamic schema) replaces the
+        // entry's generic literal. That is the documented contract: the credential
+        // and provider list belong to ONE harness, so they cannot live in editable
+        // source — but the registered IMPLEMENTATION is still the compiled entry.
+        registerDescriptor(descriptor, () => operation, {
+            description: operation.description,
+            tags: operation.tags,
+            parameters: operation.parameters,
+            visibility: operation.visibility
+        });
+    };
+
+    registerWebTool('websearch', configuration.websearch, () =>
+        createWebSearchTool(configuration.websearch === true ? {} : (configuration.websearch as never))
+    );
+
+    registerWebTool('webfetch', configuration.webfetch, () =>
+        createWebFetchTool(configuration.webfetch === true ? {} : (configuration.webfetch as never))
+    );
 
     // The tools a request may declare: every core tool first (file tools, a
     // configured webSearch, and the harness-owned set), then everything discovered
@@ -3200,45 +3287,40 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         );
     };
 
-    // Conditional baseline source entries and their order. Kept in one place so
-    // createThread and restore prepare the same revisions.
-    const THREAD_TOOL_SOURCES = [
-        { name: THREAD_LIST, sourcePath: 'runtime-tools/threadList.tool.ts' },
-        { name: THREAD_SEND, sourcePath: 'runtime-tools/threadSend.tool.ts' }
-    ] as const;
-
-    const threadToolFallback = (name: string): Tool =>
-        name === THREAD_LIST
-            ? defineTool({
-                  ...THREAD_LIST_METADATA,
-                  execute: (context) => threadRoster(context.threadId)
-              })
-            : defineTool({
-                  ...THREAD_SEND_METADATA,
-                  execute: (context) =>
-                      threadSendFor(
-                          context.agent,
-                          context.threadId,
-                          (context.parameters ?? {}) as Record<string, unknown>
-                      )
-              });
+    // Conditional cross-thread entries, resolved from their DISCOVERED descriptor
+    // rows (`activation: 'threads'`) instead of a hardcoded name/source map. Both
+    // are registered together — an id is only useful if it can be discovered — and
+    // in descriptor order, so the historical declaration sequence is preserved.
+    //
+    // The fallback (a build without the source compiler) is the SAME descriptor
+    // metadata + generated-loader proxy every other baseline row uses, so there is
+    // no per-tool branch here and no entry module import: the loaded entry's own
+    // `execute` reaches `context.harness.runtime.threadSend`/`threadList`.
+    const threadToolFallback = (descriptor: DiscoveredTool): Tool =>
+        lazyBaselineTool(descriptor);
 
     // Restore must not compile after Phase 4 has mutated live state. These two
     // helpers split preparation (may throw, no mutation) from publication (no
     // remaining I/O/compilation).
     const prepareMissingThreadTools = (reserved?: ReadonlySet<string>): PreparedTool[] =>
-        THREAD_TOOL_SOURCES.filter(
-            ({ name }) =>
-                reserved?.has(name) !== true &&
-                // "Missing" is against the FINAL registry after Phase 4, not the
-                // pre-restore registry: a currently-created entry is about to be
-                // deleted, so its name must be prepared as a baseline revision.
-                (tools[name] === undefined || createdToolRecords.has(name))
-        ).map(({ name, sourcePath }) =>
-            sourceStartupSupported
-                ? prepareToolCandidate({ name, sourcePath }, { expectedName: name })
-                : prepareDefinition(threadToolFallback(name))
-        );
+        threadDescriptors
+            .filter(
+                (descriptor) =>
+                    reserved?.has(descriptor.name) !== true &&
+                    // "Missing" is against the FINAL registry after Phase 4, not the
+                    // pre-restore registry: a currently-created entry is about to be
+                    // deleted, so its name must be prepared as a baseline revision.
+                    (tools[descriptor.name] === undefined ||
+                        createdToolRecords.has(descriptor.name))
+            )
+            .map((descriptor) =>
+                sourceStartupSupported
+                    ? prepareToolCandidate(
+                          { name: descriptor.name, sourcePath: descriptor.sourcePath },
+                          { expectedName: descriptor.name }
+                      )
+                    : prepareDefinition(threadToolFallback(descriptor))
+            );
 
     const publishPreparedBaseline = (prepared: PreparedTool): void => {
         tools[prepared.tool.name] = prepared.tool;
@@ -3251,15 +3333,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     const registerThreadTools = (): void => {
-        for (const { name, sourcePath } of THREAD_TOOL_SOURCES) {
-            if (tools[name] === undefined) {
-                if (sourceStartupSupported) {
-                    registerBaselineAtRuntime({ name, sourcePath });
-                } else {
-                    registerBaselineAtRuntime({
-                        definition: threadToolFallback(name)
-                    });
-                }
+        for (const descriptor of threadDescriptors) {
+            if (tools[descriptor.name] !== undefined) continue;
+
+            if (sourceStartupSupported) {
+                registerBaselineAtRuntime({
+                    name: descriptor.name,
+                    sourcePath: descriptor.sourcePath
+                });
+            } else {
+                registerBaselineAtRuntime({ definition: threadToolFallback(descriptor) });
             }
         }
     };
@@ -4785,7 +4868,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         let parameters: unknown;
 
         try {
-            parameters = parseArguments(THREAD_FORK_METADATA.parameters);
+            // Schema validation uses the ADVERTISED definition for this call (the
+            // one the request offered), which is the descriptor's literal unless a
+            // replacement was published. No static metadata import is needed.
+            parameters = parseArguments(tools[call.name]?.parameters);
         } catch (error) {
             const info = toErrorInfo(error);
             await failBranchTool(
@@ -4977,7 +5063,9 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         let parameters: unknown;
 
         try {
-            parameters = parseArguments(ACTION_REQUEST_METADATA.parameters);
+            // Same rule as threadFork: validate against the definition the request
+            // offered, not a statically imported metadata copy.
+            parameters = parseArguments(tools[call.name]?.parameters);
         } catch (error) {
             const info = toErrorInfo(error);
             await failBranchTool(

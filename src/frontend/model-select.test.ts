@@ -311,12 +311,127 @@ it('shows a model-change error and keeps the last server-confirmed selection', a
     await flush();
 
     expect(byClass('.status', 'span').dataset.state).toBe('error');
-    expect(document.querySelector('.status-text')?.textContent).toBe(
+    // R3: concise visible state; the rejected model message is the tooltip.
+    expect(document.querySelector('.status-text')?.textContent).toBe('error');
+    expect(document.querySelector('.status')?.getAttribute('title')).toBe(
         'agent models: That model is not available to this provider.'
     );
     // The row is redrawn from the descriptor the server last confirmed, so it does
     // not pretend the rejected change stuck.
     expect(modelSelects()[0].value).toBe('');
+});
+
+// R3 (T4): the SAVING window must be observable while the PATCH is in flight. The
+// visible word is the concise state, `data-state` drives the busy styling, and the
+// diagnostic is BOTH the tooltip and the live-region detail (a title is not
+// announced by `role="status"`).
+it('shows the saving state and diagnostic while a model PATCH is in flight', async () => {
+    let releasePatch: (() => void) | undefined;
+    const patchStarted = new Promise<void>((resolveStarted) => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+                const url = String(input);
+
+                if (url === '/api') return json(bootstrap({ presets: [descriptor()] }));
+                if (url === '/api/models') return json({ models: ['m1', 'm2'] });
+
+                if (url === '/api/harnesses/instruct' && init?.method === 'PATCH') {
+                    // Hold the answer open so the in-flight pill can be asserted.
+                    resolveStarted();
+                    await new Promise<void>((resolvePatch) => {
+                        releasePatch = resolvePatch;
+                    });
+                    // Wire shape: the updated harness is nested under `harness`.
+                    return json({ harness: descriptor({ agentModels: { instruct: 'm2' } }) });
+                }
+
+                throw new Error(`unexpected request: ${url}`);
+            })
+        );
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    const pill = byClass('.status', 'span');
+    // Idle before the change: no diagnostic in either channel.
+    expect(pill.dataset.state).toBe('idle');
+    expect(document.querySelector('.status-text')?.textContent).toBe('idle');
+    expect(pill.getAttribute('title')).toBeNull();
+    expect(document.querySelector('.status-detail')?.textContent).toBe('');
+
+    modelSelects()[0].value = 'm2';
+    modelSelects()[0].dispatchEvent(new Event('change', { bubbles: true }));
+    await patchStarted;
+    await flush();
+
+    // In flight: concise visible word, busy state, full diagnostic in the tooltip AND
+    // in the hidden live-region child.
+    expect(pill.dataset.state).toBe('saving');
+    expect(document.querySelector('.status-text')?.textContent).toBe('saving');
+    expect(pill.getAttribute('title')).toBe('saving agent models');
+    expect(document.querySelector('.status-detail')?.textContent).toBe('saving agent models');
+
+    if (releasePatch === undefined) throw new Error('the PATCH never started');
+    releasePatch();
+    await flush();
+    await flush();
+
+    // Settled: the diagnostic is replaced (not appended) and the state is ready.
+    // This harness has no session yet, so the harness PATCH reports the
+    // "applies to new sessions" wording (the session PATCH says "next request").
+    expect(pill.dataset.state).toBe('idle');
+    expect(document.querySelector('.status-text')?.textContent).toBe('idle');
+    expect(pill.getAttribute('title')).toBe('agent models saved · applies to new sessions');
+    expect(document.querySelector('.status-detail')?.textContent).toBe(
+        'agent models saved · applies to new sessions'
+    );
+});
+
+it('clears the accessible status diagnostic when the state resets', async () => {
+    // A rejected PATCH writes a diagnostic; a later bare `setStatus('idle')`
+    // (selecting a harness) must EMPTY the live-region detail so the stale failure
+    // cannot be re-read.
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+
+            if (url === '/api') return json(bootstrap({ presets: [descriptor()] }));
+            if (url === '/api/models') return json({ models: ['m1', 'm2'] });
+
+            if (url === '/api/harnesses/instruct' && init?.method === 'PATCH') {
+                return json({ error: { message: 'That model is not available to this provider.' } }, 400);
+            }
+
+            throw new Error(`unexpected request: ${url}`);
+        })
+    );
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    modelSelects()[0].value = 'm2';
+    modelSelects()[0].dispatchEvent(new Event('change', { bubbles: true }));
+    await flush();
+
+    const pill = byClass('.status', 'span');
+    expect(pill.dataset.state).toBe('error');
+    expect(document.querySelector('.status-detail')?.textContent).toBe(
+        'agent models: That model is not available to this provider.'
+    );
+
+    // Picking the harness resets the app pill to the bare `idle` state.
+    byClass('.harness-item', 'button').click();
+    await flush();
+
+    expect(pill.dataset.state).toBe('idle');
+    expect(document.querySelector('.status-text')?.textContent).toBe('idle');
+    expect(pill.getAttribute('title')).toBeNull();
+    expect(document.querySelector('.status-detail')?.textContent).toBe('');
 });
 
 it('edits a saved session’s live models through PATCH /sessions/:id and keeps its team frozen', async () => {
@@ -423,7 +538,9 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     // and m2 (no longer effective) disappears from the options.
     expect(modelSelects().map((select) => select.value)).toEqual(['m3', '']);
     expect(optionTexts(modelSelects()[0])).toEqual(['m1', 'm3']);
-    expect(document.querySelector('.status-text')?.textContent).toBe(
+    // R3: concise visible state; the save confirmation is the pill's tooltip.
+    expect(document.querySelector('.status-text')?.textContent).toBe('idle');
+    expect(document.querySelector('.status')?.getAttribute('title')).toBe(
         'agent models saved · next request'
     );
     expect(byClass('.status', 'span').dataset.state).toBe('idle');
@@ -516,7 +633,8 @@ it('changes a RUNNING session’s model without cancelling the stream', async ()
     expect(modelSelects().map((select) => select.value)).toEqual(['m3', '']);
     // The save is config feedback; the session's run state stays on its tile, so the
     // header does not claim "session running".
-    expect(document.querySelector('.status-text')?.textContent).toBe(
+    expect(document.querySelector('.status-text')?.textContent).toBe('idle');
+    expect(document.querySelector('.status')?.getAttribute('title')).toBe(
         'agent models saved · next request'
     );
     expect(byClass('.status', 'span').dataset.state).toBe('idle');
@@ -566,7 +684,8 @@ it('shows a session model-change error and keeps the last confirmed value', asyn
     await flush();
 
     expect(byClass('.status', 'span').dataset.state).toBe('error');
-    expect(document.querySelector('.status-text')?.textContent).toBe(
+    expect(document.querySelector('.status-text')?.textContent).toBe('error');
+    expect(document.querySelector('.status')?.getAttribute('title')).toBe(
         'agent models: That model is not available to this session.'
     );
     // The rejected value did not stick; the last server-confirmed map is redrawn.

@@ -1214,7 +1214,14 @@ statusPill.setAttribute('aria-atomic', 'true');
 const statusDot = el('span', 'status-dot');
 statusDot.setAttribute('aria-hidden', 'true');
 const statusText = el('span', 'status-text', 'idle');
-statusPill.append(statusDot, statusText);
+// R3 (T4): the CONCISE state is the only visible text, but the full diagnostic must
+// still reach assistive tech — a `title` tooltip is mouse/hover only and is NOT
+// announced by a `role="status"` live region. This visually hidden sibling lives
+// INSIDE the live region, so `aria-atomic` announces "state + diagnostic" together.
+// It is emptied (not just hidden) whenever there is no extra detail, so a stale
+// diagnostic can never be read after the state resets.
+const statusDetail = el('span', 'status-detail', '');
+statusPill.append(statusDot, statusText, statusDetail);
 
 // R3: Tools is a GLOBAL icon-only toggle in the top-right corner, not a centre tab.
 // It opens the same full-width catalogue + manual runner in `stage`; the harness
@@ -1239,24 +1246,25 @@ toolsGlyph.setAttribute('aria-hidden', 'true');
 toolsToggle.append(toolsGlyph);
 
 // The right cluster keeps the live status pill and the Tools toggle together at the
-// top-right on every width. `.rail-toggles` keeps `margin-left: auto`, so on a phone
-// the two rail icons sit immediately left of this cluster instead of between it and
-// the brand.
+// top-right on every width. There is NO rail control in the topbar any more (R1): the
+// harness listing is opened by the "Harness UI" brand button, and the scratch/sessions
+// rail toggle lives on the harness title row (`.harness-title-row`, built below), so
+// the phone topbar spends no room repeating a trigger that already exists.
 const topbarRight = el('div', 'topbar-right');
 topbarRight.append(statusPill, toolsToggle);
 
-// Mobile rail toggles (R1/R4). Below 860px both rails are collapsed by default, so
-// the topbar carries one independent disclosure per rail. On every wider layout the
-// rails are permanently visible and `.rail-toggles` is `display:none` (styles.css),
-// which is why the state below is inert there — it only drives the phone layout.
+// Mobile rail toggle (R1/R4). Below 860px the right rail is collapsed by default, so
+// the harness title row carries ONE independent disclosure for it. On every wider
+// layout the rails are permanently visible and `.rail-toggles` is `display:none`
+// (styles.css), which is why the state below is inert there — it only drives the
+// phone layout.
 //
-// R4: both are ICON-ONLY. The glyph is decorative (`aria-hidden`); the accessible
-// name is the `aria-label` below, so a screen reader still announces which rail the
-// button opens and the `title` explains the action on hover.
+// The LEFT rail needs no toggle: the brand button above already opens the harness
+// listing (R1/R2), so a second hamburger would be a redundant control.
 //
-// One rail at a time: the two toggles are siblings, not a segmented control, but
-// `setRailOpen` closes the other side because two open rails would leave no room
-// for the chat on a phone.
+// R4: it is ICON-ONLY. The glyph is decorative (`aria-hidden`); the accessible name
+// is the `aria-label` below, so a screen reader still announces which rail the button
+// opens and the `title` explains the action on hover.
 const railToggles = el('div', 'rail-toggles');
 
 const railIcon = (glyph: string): HTMLSpanElement => {
@@ -1265,13 +1273,6 @@ const railIcon = (glyph: string): HTMLSpanElement => {
     return icon;
 };
 
-const leftRailToggle = el('button', 'button small rail-toggle rail-toggle-left');
-leftRailToggle.type = 'button';
-leftRailToggle.setAttribute('aria-controls', 'rail-left');
-leftRailToggle.setAttribute('aria-expanded', 'false');
-leftRailToggle.setAttribute('aria-label', 'Harnesses panel');
-leftRailToggle.title = 'Show or hide the harnesses rail';
-leftRailToggle.append(railIcon('☰'));
 const rightRailToggle = el('button', 'button small rail-toggle rail-toggle-right');
 rightRailToggle.type = 'button';
 rightRailToggle.setAttribute('aria-controls', 'rail-right');
@@ -1279,9 +1280,9 @@ rightRailToggle.setAttribute('aria-expanded', 'false');
 rightRailToggle.setAttribute('aria-label', 'Scratch board and sessions panel');
 rightRailToggle.title = 'Show or hide the scratch board and sessions rail';
 rightRailToggle.append(railIcon('▤'));
-railToggles.append(leftRailToggle, rightRailToggle);
+railToggles.append(rightRailToggle);
 
-topbar.append(brand, railToggles, topbarRight);
+topbar.append(brand, topbarRight);
 
 const shell = el('div', 'shell');
 
@@ -1576,41 +1577,107 @@ renderModelOptions();
 // --- centre: harness head, transcript, composer (agent control right) -------
 const center = el('main', 'center');
 
-// R1: the harness head is a single title line; its detail note lives behind this
-// small disclosure. The button is `display:none` above the 860px breakpoint
-// (styles.css), where the note is always visible, so the desktop header keeps its
-// exact previous shape.
+// R1: the harness head is a single title line. The title is a real BUTTON inside the
+// `h1` (heading semantics preserved) that opens the harness details dialog: there is
+// no disclosure arrow and no inline note toggle on a phone any more.
 //
 // F3: the SAME header band also shows the selected tool's name/group/meta while the
-// tools view is open, so the accessible name must not claim "harness": "Details"
-// describes either content, and the title says what the press does.
+// tools view is open. Clicking a tools heading must NOT open a harness popup (R2), so
+// the button is disabled while `showingTools` is true (paintToolsHead/selectTool set
+// it); a disabled button is also out of the tab order, so the misleading affordance
+// is not even reachable.
 //
-// The open state lives on the header element (`data-expanded`) rather than in a
-// module variable: the header is built once and `renderHarnessChrome` only rewrites
-// the text inside it, so there is no rebuild that could lose it.
+// The note (`.harness-note`) stays in the DOM and keeps its text: it is the desktop
+// always-visible detail line, and the dialog reuses the same vocabulary.
 const mainHead = el('header', 'harness-head');
 const titleRow = el('div', 'harness-title-row');
 const headTitle = el('h1', 'main-title', '');
+// The button carries the visible title text, so `headTitle.textContent` (written by
+// renderHarnessChrome/paintToolsHead/selectTool) always equals the title string and
+// the existing head assertions keep reading the same value.
+const headTitleButton = el('button', 'harness-title-button');
+headTitleButton.type = 'button';
+headTitleButton.setAttribute('aria-haspopup', 'dialog');
+headTitleButton.title = 'Show harness details';
+const headTitleText = el('span', 'harness-title-text', '');
+headTitleButton.append(headTitleText);
+headTitle.append(headTitleButton);
 const headName = el('span', 'harness-id', '');
 const headNote = el('p', 'harness-note', '');
 headNote.id = 'harness-note';
 
-const headDisclosure = el('button', 'harness-disclosure');
-headDisclosure.type = 'button';
-headDisclosure.setAttribute('aria-controls', 'harness-note');
-headDisclosure.setAttribute('aria-expanded', 'false');
-headDisclosure.setAttribute('aria-label', 'Details');
-headDisclosure.title = 'Show or hide details';
-const headChevron = el('span', 'harness-disclosure-icon', '▾');
-headChevron.setAttribute('aria-hidden', 'true');
-headDisclosure.append(headChevron);
-headDisclosure.addEventListener('click', () => {
-    const open = mainHead.dataset.expanded !== 'true';
-    mainHead.dataset.expanded = open ? 'true' : 'false';
-    headDisclosure.setAttribute('aria-expanded', open ? 'true' : 'false');
+// R2: one painter for the title trigger's state. The chat head names a harness, so
+// the button advertises (and opens) the details dialog. The tools view names the
+// catalogue or a tool instead, so the button is disabled, drops `aria-haspopup` and
+// loses its action tooltip: a disabled button must not keep claiming a popup it will
+// never open.
+const paintHeadTitleTrigger = (enabled: boolean): void => {
+    headTitleButton.disabled = !enabled;
+    if (enabled) {
+        headTitleButton.setAttribute('aria-haspopup', 'dialog');
+        headTitleButton.title = 'Show harness details';
+        return;
+    }
+
+    headTitleButton.removeAttribute('aria-haspopup');
+    headTitleButton.removeAttribute('title');
+};
+
+// The open harness-details layer, if any. One at a time (a second open would stack a
+// duplicate description), and every navigation path closes it so a dialog can never
+// describe a harness that is no longer selected (R2).
+let harnessDialog: DialogHandle | undefined;
+
+const closeHarnessDialog = (): void => {
+    harnessDialog?.close();
+};
+
+// Open the details dialog for the harness that is selected RIGHT NOW. Content is the
+// selected display descriptor's description plus the same metadata the rail rows
+// show (`harnessMeta`); nothing else is invented (R2: existing metadata only).
+const openHarnessDetails = (trigger: HTMLElement): void => {
+    const instance = current;
+    if (instance === undefined) return;
+
+    const display = instance.frozen ?? instance.descriptor;
+    const body = el('div', 'harness-details');
+    if (display.description.length > 0) {
+        body.append(el('p', 'harness-details-description', display.description));
+    }
+    body.append(el('p', 'harness-details-meta', harnessMeta(display)));
+    // The header's own note is hidden on a phone (styles.css), so the dialog repeats
+    // it here: it is the existing "edits apply to new sessions" / "saved session"
+    // context, not a new concept.
+    if (headNote.textContent.length > 0) {
+        body.append(el('p', 'harness-details-note', headNote.textContent));
+    }
+
+    let handle: DialogHandle | undefined;
+    handle = openDialog({
+        title: display.title,
+        content: body,
+        returnFocus: trigger,
+        onClose: () => {
+            // Identity check: a replacement open may already own the variable.
+            if (harnessDialog !== handle) return;
+            harnessDialog = undefined;
+        }
+    });
+
+    harnessDialog = handle;
+};
+
+headTitleButton.addEventListener('click', () => {
+    // Tools headings describe the catalogue or a tool, never a harness (R2).
+    if (showingTools) return;
+    if (harnessDialog !== undefined) {
+        closeHarnessDialog();
+        return;
+    }
+    openHarnessDetails(headTitleButton);
 });
 
-titleRow.append(headTitle, headName, headDisclosure);
+titleRow.append(headTitle, headName, railToggles);
 mainHead.append(titleRow, headNote);
 
 const agentSlot = el('div', 'agent-slot');
@@ -2840,7 +2907,8 @@ const setRailOpen = (side: 'left' | 'right' | undefined, trigger?: HTMLElement):
     if (side === undefined) delete shell.dataset.railOpen;
     else shell.dataset.railOpen = side;
 
-    leftRailToggle.setAttribute('aria-expanded', side === 'left' ? 'true' : 'false');
+    // R1: the left rail has no topbar toggle any more (the brand opens it), so only
+    // the right rail's own control reports `aria-expanded` here.
     rightRailToggle.setAttribute('aria-expanded', side === 'right' ? 'true' : 'false');
     // The brand is only a disclosure on a phone; on desktop this disables it and
     // strips the ARIA state rather than publishing a misleading collapsed control.
@@ -2874,12 +2942,8 @@ const setRailOpen = (side: 'left' | 'right' | undefined, trigger?: HTMLElement):
 // the familiar collapsed disclosure state.
 syncBrandTrigger();
 
-// Toggling the open side closes it (the button is a real toggle), and opening one
-// always closes the other: the two rails are exclusive on a phone.
-leftRailToggle.addEventListener('click', () => {
-    setRailOpen(openRail === 'left' ? undefined : 'left', leftRailToggle);
-});
-
+// Toggling the open side closes it (the button is a real toggle), and opening it
+// closes the other side: the two rails are exclusive on a phone.
 rightRailToggle.addEventListener('click', () => {
     setRailOpen(openRail === 'right' ? undefined : 'right', rightRailToggle);
 });
@@ -3254,6 +3318,9 @@ const selectHarness = (name: string): void => {
     // A tool runner is a modal belonging to the view being left; close it before
     // the chat is restored (a programmatic switch may happen while it is open).
     closeToolDialog();
+    // R2: the details dialog describes the harness being LEFT, so selecting another
+    // harness/session closes it rather than leaving stale content on screen.
+    closeHarnessDialog();
 
     // Switching harness closes the global tools view and drops every ring: the
     // activity belonged to the view being left. The deck disclosure also starts
@@ -3362,7 +3429,13 @@ const renderHarnessChrome = (): void => {
 
     const locked = instance.sessionId !== undefined;
 
-    headTitle.textContent = display.title;
+    // The title text lives INSIDE the details button (R2); writing the button's text
+    // node keeps the heading's textContent identical to the visible title, which the
+    // head assertions read, without replacing the button itself.
+    headTitleText.textContent = display.title;
+    // The chat head always describes the selected harness, so its details dialog is
+    // meaningful here (unlike the tools view — see paintToolsHead/selectTool).
+    paintHeadTitleTrigger(true);
     // The harness id (`research`, `workspace`, …) is an internal registry key used by
     // sessions, aliases and the API — not something the reader needs. The chat head
     // shows ONLY the display title, so the shared badge stays empty and hidden here.
@@ -3666,7 +3739,9 @@ const patchAgents = async (
     const includeModels = models !== undefined || Object.keys(nextModels).length > 0;
 
     savingAgents = true;
-    setStatus('running', `saving ${label}`);
+    // R3: `saving` is the visible word; the label says WHAT is being saved in the
+    // tooltip only.
+    setStatus('saving', `saving ${label}`);
 
     try {
         const updated = await updateHarness(display.name, {
@@ -3783,8 +3858,9 @@ const patchSessionModels = async (
     savingAgents = true;
 
     // The pill carries the CONFIG operation (app-scoped action feedback), never the
-    // session's run state — that lives on the tiles (R1).
-    setStatus('running', 'saving agent models');
+    // session's run state — that lives on the tiles (R1). R3: the visible word is
+    // `saving`; the target is tooltip detail.
+    setStatus('saving', 'saving agent models');
 
     try {
         const session = await updateSession(id, { agentModels: { ...models } });
@@ -3933,7 +4009,11 @@ let toolDialog: DialogHandle | undefined;
 // pending-state repaint can never repaint the chat title under the list).
 const paintToolsHead = (): void => {
     const count = toolEntries.length;
-    headTitle.textContent = 'Tools';
+    headTitleText.textContent = 'Tools';
+    // R2: a tools heading is not a harness, so its title must not open a harness
+    // details dialog. `disabled` also removes it from the tab order (no misleading
+    // affordance for keyboard/AT users).
+    paintHeadTitleTrigger(false);
     // Category label, not a harness id: the chat header hides this badge, the tools
     // view re-shows it (see renderHarnessChrome).
     headName.hidden = false;
@@ -4024,7 +4104,9 @@ const selectTool = (entry: ToolDescriptor, trigger?: HTMLElement): void => {
     }
 
     const unavailable = entry.availability?.state === 'unconfigured';
-    headTitle.textContent = entry.name;
+    headTitleText.textContent = entry.name;
+    // R2: a tool heading describes a tool, never a harness — no harness dialog here.
+    paintHeadTitleTrigger(false);
     // Tool group label (e.g. `Files`) — user-facing category, so the badge is shown
     // here even though the chat header keeps it hidden.
     headName.hidden = false;
@@ -4063,8 +4145,12 @@ const setToolsView = (open: boolean): void => {
     if (running || showingTools === open) return;
 
     // Lifecycle: entering the Tools view dismisses the agent dialog; the chat starts
-    // with it closed when the view returns.
-    if (open) closeAgentDialog();
+    // with it closed when the view returns. The harness details dialog is also closed
+    // (R2): its title/description belong to the chat head that is being replaced.
+    if (open) {
+        closeAgentDialog();
+        closeHarnessDialog();
+    }
 
     if (!open) {
         // Close the runner first: its `onClose` still sees the tools view and only
@@ -4101,6 +4187,16 @@ const setToolsView = (open: boolean): void => {
     stage.replaceChildren(toolsPane);
     delete stage.dataset.preset;
     setStatus('idle');
+
+    // T4 focus ordering: `closeHarnessDialog` above returns focus to the title
+    // button, and `paintToolsHead` then DISABLES that button — a disabled control
+    // cannot hold focus, so the press would otherwise drop the reader onto <body>.
+    // Hand focus to the toggle that performed the switch (the only caller of this
+    // branch), which is a stable, meaningful target in the tools view.
+    const active = document.activeElement;
+    if (active === null || active === document.body || active === headTitleButton) {
+        toolsToggle.focus({ preventScroll: true });
+    }
 };
 
 // The topbar icon is a real toggle: pressing it while the tools view is showing
@@ -5418,6 +5514,9 @@ const newSession = (): void => {
     // Lifecycle: the agent dialog belongs to the conversation being left. Closing it
     // here also releases its focus trap/scroll lock before the chrome repaints.
     closeAgentDialog();
+    // R2: the harness details dialog described the SAVED session (frozen team), so it
+    // is dismissed when that conversation is replaced by a fresh one.
+    closeHarnessDialog();
     renderHarnessChrome();
     renderSessions();
     paintPanels();
@@ -5492,18 +5591,45 @@ const setBusy = (value: boolean): void => {
 };
 
 // The topbar pill is the APP's live state (R1), and the only live region:
-//   connecting → startup/bootstrap, `idle` → ready, `error` → an app or config
+//   connecting → startup/bootstrap, `saving` → an app-scoped config write is in
+//   flight (harness/model PATCH), `idle` → ready, `error` → an app or config
 //   operation the reader must act on (offline server, unreadable session list,
 //   rejected harness/config edit).
+//
+// R3: the VISIBLE word is the concise state vocabulary only (idle/connecting/
+// saving/error). The full diagnostic — which used to replace the word entirely and
+// push the topbar wide — is preserved twice: as the pill's `title` tooltip for
+// pointer readers, and as a visually hidden `status-detail` child inside the live
+// region for assistive tech (a `title` is not announced by `role="status"`).
+// Detailed error surfaces (the offline pane, the session note, the dialog's own
+// messages) are untouched.
 //
 // It must NEVER carry session/run outcomes: running, queued, done, cancelled and
 // failed turns are properties of ONE conversation, already rendered by its tiles
 // (status word) and its pane note (`View.setNotice`, error detail). Painting them
 // here made the header lie the moment the reader switched sessions (the cancelled
 // session's "The run was cancelled." outlived it).
-const setStatus = (state: 'idle' | 'running' | 'done' | 'error' | 'connecting', detail?: string): void => {
+type AppStatus = 'idle' | 'connecting' | 'saving' | 'error';
+
+const setStatus = (state: AppStatus, detail?: string): void => {
     statusPill.dataset.state = state;
-    statusText.textContent = detail === undefined ? state : detail;
+    statusText.textContent = state;
+
+    // The tooltip carries the full diagnostic; a bare state has no tooltip at all
+    // (an empty `title` would still show an empty hover bubble).
+    if (detail === undefined || detail === state) {
+        statusPill.removeAttribute('title');
+        // Clear the live-region detail too: an emptied node cannot announce stale
+        // text, and `aria-atomic` then reads just the new state word.
+        statusDetail.textContent = '';
+        return;
+    }
+
+    statusPill.title = detail;
+    // R3 (T4): the SAME diagnostic is exposed to assistive tech through the hidden
+    // live-region child. Text is set (never appended), so repeated identical saves
+    // cannot accumulate and each change announces once.
+    statusDetail.textContent = detail;
 };
 
 // Create a session only when this harness has none. Settings drafts are read here

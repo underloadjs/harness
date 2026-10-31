@@ -28,30 +28,34 @@
 // `offset` (see ./fileList). fileWrite refuses NUL content because it would create
 // a file fileRead rejects as binary.
 //
-// Two private helpers sit beside the tool and are shared by the batch:
+// TYPE-ONLY BARREL (T21)
+// ----------------------
+// This barrel re-exports TYPES only. A value re-export from a `*.tool.ts` entry
+// would statically evaluate that entry — and therefore `node:fs` — at import time,
+// which is exactly what the lazy catalogue (../lazy, ../index) exists to avoid. The
+// tool values are reached through the generated descriptor loader, and their
+// constants (FILE_LIST_CONTENT_BUDGET, …) are imported from the entry file itself by
+// the implementation and its focused tests.
+//
+// Two private helpers sit beside the tools and are shared by the batch:
 //   - ./identity — one canonical key per real file, so duplicate targets (Windows
 //     case aliases, symlink aliases, aliased roots) cannot slip through;
 //   - ./bounded-regex — content matching inside node:vm with a timeout, so a
 //     catastrophic pattern fails instead of hanging the process.
-export { fileRead } from './fileRead.tool';
 export type { FileReadEntry, FileReadParameters, FileReadResult, FileReadTarget } from './fileRead.tool';
-export { fileWrite } from './fileWrite.tool';
 export type {
     FileWriteEntry,
     FileWriteParameters,
     FileWriteResult,
     FileWriteResultEntry
 } from './fileWrite.tool';
-export { fileEdit } from './fileEdit.tool';
 export type {
     FileEditEntry,
     FileEditParameters,
     FileEditResult,
     FileEditResultEntry
 } from './fileEdit.tool';
-export { fileList, FILE_LIST_CONTENT_BUDGET, FILE_LIST_DEFAULT_LIMIT, FILE_LIST_MAX_LIMIT } from './fileList.tool';
 export type { FileListParameters, FileListQuery, FileListResult } from './fileList.tool';
-export { fileGlob, FILE_GLOB_CONTENT_BUDGET, FILE_GLOB_MATCH_TEXT_BYTES } from './fileGlob.tool';
 export type {
     FileGlobFilesResult,
     FileGlobMatch,

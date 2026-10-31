@@ -78,6 +78,31 @@ export {
     supportsToolCompilation,
     writeToolSourceFile
 } from './tool-source';
+// Descriptor discovery (T19/R8-R9). `discoverToolMetadata()` reads every
+// `*.tool.ts` entry's `metadata` + `registration` literals through the TypeScript
+// AST — it never imports or evaluates a tool module — and returns one descriptor
+// per entry (name, metadata, sourcePath, label, origin, group, activation, order,
+// and the control/policy flags). `harness()` registers from this list instead of a
+// hand-written inventory, so a fresh entry under the default tools root is picked
+// up with no registry edit. Re-exported here so focused tests and hosts can inspect
+// the same catalogue the runtime uses.
+export { TOOL_ENTRY_EXTENSION, discoverToolMetadata } from './tool-discovery';
+// The GENERATED lazy loader (T19). One `import()` per discovered entry, keyed by a
+// descriptor's `label`. Exported so the harness can register a real, callable
+// baseline in a build without the source compiler (browser) from descriptor
+// metadata + this loader, instead of importing each tool module itself. Evaluating
+// it imports no tool body.
+export { loadDiscoveredTool } from './tool-manifest';
+export type {
+    BuiltinToolDescriptor,
+    DiscoveredTool,
+    DiscoveredToolOptions,
+    ToolActivation,
+    ToolGroup,
+    ToolMetadata,
+    ToolOrigin,
+    ToolRegistration
+} from './tool-discovery';
 export type {
     PreparedTool,
     ToolFolderTarget,

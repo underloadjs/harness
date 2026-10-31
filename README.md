@@ -184,9 +184,12 @@ src/
   browser.ts        browser root entry (library + shared + client)
   core/             agent, tool, discovery, creation, todo, profile, chapter,
                     location, action, branch   (usable without a harness)
+                    tool-discovery + tool-manifest: the AST descriptor scan and its
+                    generated data-only table (no tool module is imported for it)
   agents/           trusted AgentProfile definitions (instruction + guidelines)
   transport/        openai, models      (the wire protocol + model catalogue)
-  tools/            the preset catalogue     (lazy, executable on their own)
+  tools/            the preset + runtime catalogue, one `*.tool.ts` per entry
+                    (runtime/ holds the harness-owned core entries)
   plugin/           host                     (programmatic extension)
   util/             errors                   (shared leaf helpers)
   types/            every public type
@@ -301,14 +304,18 @@ so ordinary browser imports stay Node-free.
 
 ```
 tools/
-  index.ts              barrel + presetTools (the preload catalogue)
-  catalogue.ts          static metadata + the dynamic-import load table
+  index.ts              barrel + presetTools (the preload catalogue, descriptor-built)
+  catalogue.ts          PRESET_TOOLS / PRESET_TOOL_NAMES, derived from ./descriptors
+  descriptors.ts        the ONE seam: live Node scan (browser: generated manifest)
+                        + the loader (generated import() or source compilation)
   lazy.ts               builds a callable Tool whose body loads on first use
-  syntax/               syntaxCheck.ts (javascript.ts + python.ts load on demand)
-  files/                fileRead.ts, fileWrite.ts, fileEdit.ts, fileGlob.ts
-                        (core, always declared), fileList.ts (searchable by tag),
-                        glob.ts (shared walker)
-  command/              commandRun.ts, gitDiff.ts
+  runtime/              the harness-owned core entries (toolRequest, toolCreate,
+                        todoManage, agentDelegate, threadFork, …) — one *.tool.ts each
+  syntax/               syntaxCheck.tool.ts (javascript.ts + python.ts load on demand)
+  files/                fileRead.tool.ts, fileWrite.tool.ts, fileEdit.tool.ts,
+                        fileGlob.tool.ts (core, always declared), fileList.tool.ts
+                        (searchable by tag), glob.ts (shared walker)
+  command/              commandRun.tool.ts, gitDiff.tool.ts
   websearch/            request.ts (bounds/errors), exa.ts, tavily.ts,
                         index.ts (createWebSearchTool — opt-in, per-harness)
   presets.test.ts       covers every preset, standalone and in a harness
@@ -754,20 +761,38 @@ await commandRun({ command: 'npm test', timeoutMs: 600_000 });      // 1..600000
 ```
 
 Each tool lives in its own file under a capability folder (`tools/syntax/`,
-`tools/files/`, `tools/command/`), and the barrel also exports the whole set as
-`presetTools`. **Every new harness preloads that catalogue**: `fileRead`,
-`fileWrite`, `fileEdit`, and `fileGlob` are declared immediately (core), while
-`fileList`, `syntaxCheck`, `commandRun`, and `gitDiff` cost context only after a
-toolRequest query enables them; `presets: false` turns the preload off.
+`tools/files/`, `tools/command/`, and the harness-owned `tools/runtime/`), and the
+barrel also exports the preset set as `presetTools`. **Every new harness preloads
+that catalogue**: `fileRead`, `fileWrite`, `fileEdit`, and `fileGlob` are declared
+immediately (core), while `fileList`, `syntaxCheck`, `commandRun`, and `gitDiff`
+cost context only after a toolRequest query enables them; `presets: false` turns
+the preload off.
 
-The exports are **lazy proxies**, not implementations. `tools/catalogue.ts` holds
-the static metadata (name, description, tags, schema) and names each
-implementation in its own `import()` branch; the body — and the `node:fs` /
-`node:child_process` / `node:vm` it needs — loads the first time a tool is called.
-Constructing a harness or listing the catalogue therefore costs no Node built-ins,
-and a model that never asks for `commandRun` never loads it. The published build
-turns each branch into a chunk next to `dist/underload-harness.mjs`; all of
-`dist/` is shipped, and `inlineDynamicImports` must stay off or the split is undone.
+Registration is **descriptor-driven** (`R7`-`R9`). `harness({})` scans
+`tools/**/*.tool.ts`, reads each entry's `metadata` + `registration` literals
+through the TypeScript AST, and registers every row whose `activation` the current
+configuration satisfies — in scan `order`. There is no hand-written registration
+list and no static import of a `.tool.ts` module: adding a file is enough for a new
+harness to pick it up. `src/tools/descriptors.ts` uses the SAME scanner for the
+package catalogue (`presetTools`, the server's preset/core groups), so a cold
+process lists and loads a brand-new entry with nothing regenerated. `core/tool-manifest.ts`
+is the generated, data-only mirror of that scan (one `import()` per entry) and is
+the **browser** inventory — the browser cannot scan, so it is the only rows a
+browser can see. See `docs/runtime-tools.md` for the activation
+table and the policy flags (`primaryOnly`, `answerExtraction`, `control`,
+`pendingOnly`).
+
+The preset exports are **lazy proxies**, not implementations. The discovered
+descriptor rows hold the static metadata (name, description, tags, schema) and the
+loader names each implementation in its own `import()` branch; the body —
+and the `node:fs` / `node:child_process` / `node:vm` it needs — loads the first
+time a tool is called. A row the generated manifest does not know yet is compiled
+from its editable source on first call instead of failing on a missing label (T24),
+so a new preset is executable before the manifest is regenerated. Constructing a
+harness or listing the catalogue therefore costs no Node built-ins, and a model that
+never asks for `commandRun` never loads it. The published build turns each branch
+into a chunk next to `dist/underload-harness.mjs`; all of `dist/` is shipped, and
+`inlineDynamicImports` must stay off or the split is undone.
 
 **The file tools are batched.** `fileRead`, `fileWrite`, `fileEdit`, and `fileList`
 each declare exactly ONE array property (`paths` / `files` / `edits`), so the
@@ -1009,7 +1034,7 @@ const writer = harness({
 | `toolSources` | Map of wire name → editable source path. Registered after the baseline/presets and before `tools`; each revision is inspectable through `toolSource()`/`toolSources()`. |
 | `toolFolders` | Ordered external folders scanned recursively for `*.tool.ts` modules. Absolute or cwd-relative; later folders win name collisions; invalid folders/modules fail construction. Folder code is trusted code with process permissions. |
 | `maxEnabledTools` | Maximum number of SEARCHABLE tools enabled at once (default **32**). Core tools never count. This is the persistent enabled-set bound, not a per-query match cap; `toolRequest` reports the full union in `matched` and what the bound withheld in `omitted`. |
-| `presets` | Preload `presetTools` into the registry. **True by default**; `false` starts from `tools` alone. |
+| `presets` | Preload the discovered `preset`-group entries. **True by default**; `false` filters that group out, so the runtime (harness-owned) rows plus `tools` remain. |
 | `report.progress` | Awaited for every step — a UI or `console.log`. |
 | `plugins` | Optional programmatic extension (`createAgent`, `addTool`). |
 
@@ -2433,11 +2458,15 @@ yarn publish    # prepublishOnly runs: typecheck -> test -> build -> test:packag
   declares an **explicit `types` target**; nothing relies on implicit `.d.ts`
   sibling resolution.
 - **Lazy preset chunks.** Each preset's implementation is a dynamic import (see
-  `src/tools/catalogue.ts`), so the build emits one chunk per tool next to the
+  `src/tools/catalogue.ts` → `src/tools/descriptors.ts`, which owns both loaders), so
+  the build emits one chunk per tool next to the
   entry (`fileRead-*.js`, `gitDiff-*.js`, …). The entry keeps no `node:` import
   and no static link to those chunks. `build.lib` must stay ESM-only and must not
   set `inlineDynamicImports`, which would fold every implementation back into the
-  entry.
+  entry. A `.tool.ts` that is newer than the generated manifest has no chunk yet; the
+  catalogue compiles it from its editable source instead (`prepareToolCandidate`), so
+  the Node surface stays honest while `yarn tools:manifest` is only needed for the
+  browser build.
 - `package.json` `files` ships all of `dist/` (entry, `.d.ts` tree, and the chunks),
   so a consumer's `import { fileRead }` still resolves its body after publishing.
 - `package.json` points `main` / `module` / `types` / `exports` at `dist/`;

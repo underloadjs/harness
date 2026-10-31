@@ -12,7 +12,7 @@
 // --------------------------
 // A browser cannot compile a tool source revision in-process. The harness kernel
 // still publishes prebuilt tool definitions, but its startup sequence registers
-// the model-facing controls from editable source (`runtime-tools/*.tool.ts`), so
+// the model-facing controls from editable source (`tools/runtime/*.tool.ts`), so
 // constructing a full harness in a browser rejects with the actionable error
 // below instead of pretending source registration worked. A browser host that
 // needs a harness must either run the kernel on Node or supply a prepared

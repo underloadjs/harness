@@ -4,8 +4,8 @@
 // ----------------------------------------------
 // `createToolCatalogue()` (./index.ts) lists tools a host can call DIRECTLY: no
 // harness, no model, no session. The harness-owned core tools are the opposite —
-// toolRegistry, toolRequest, toolCreate, todoManage, profileManage, chapterManage,
-// locationManage, agentManage, agentResult, agentDelegate, actionRequest, and
+// toolRegistry, toolRequest, todoManage, profileManage, chapterManage,
+// locationManage, agentManage, agentResult, agentDelegate, actionRequest,
 // threadFork only mean something inside one session's harness, because they mutate
 // that harness's registry, enabled set, todo list, record stores, or agent
 // team/result registry (or need that session's owner/fork configuration). Adding
@@ -29,23 +29,31 @@
 // the harness registers for the session — and the server reaches it through the
 // session.
 //
-// Metadata comes from ../../src/core/metadata.ts, the same copy the harness
-// registration reads, so a descriptor cannot advertise a name, description, tags,
-// or schema the runtime does not use.
+// DERIVED FROM THE DESCRIPTOR MANIFEST (T21)
+// ------------------------------------------
+// This module used to import a hand-written list of metadata constants
+// (TOOL_REGISTRY_METADATA, coreToolMetadata(), agentDelegateMetadata(),
+// ACTION_REQUEST_METADATA, THREAD_FORK_METADATA). That list was a second inventory
+// of the runtime entries and had to be edited whenever one was added.
+//
+// The rows are now DERIVED from the generated descriptor manifest: every descriptor
+// whose group is 'runtime' and which is advertised (`listed !== false`) is a
+// harness-owned, session-bound catalogue entry, in descriptor order. Metadata comes
+// from the same generated copy the runtime registration reads, so a descriptor can
+// never advertise a name, description, tags, or schema the runtime does not use.
+//
+// Order is the descriptor `order` (the scan's registration order). The generated
+// manifest is responsible for emitting it in the kernel's registration order
+// (toolRegistry first, then the always-declared set, then the conditional tools);
+// that is what keeps the Tools tab stable.
 //
 // Cross-references:
 //   - ./types.ts            — CatalogueEntry (sessionBound), ToolGroup ('Core tools')
-//   - ../src/core/metadata  — the single source of the core metadata
+//   - ../../tools/descriptors — RUNTIME_DESCRIPTORS (the generated projection)
 //   - ../api.ts      — compose + session-bound call routing
 //   - ../sessions.ts — SessionStore.callTool → harness.executeTool
 
-import {
-    ACTION_REQUEST_METADATA,
-    THREAD_FORK_METADATA,
-    TOOL_REGISTRY_METADATA,
-    agentDelegateMetadata,
-    coreToolMetadata
-} from '../../core/metadata';
+import { RUNTIME_DESCRIPTORS } from '../../tools/descriptors';
 import type { CatalogueEntry } from './types';
 
 // The display group for the core set. A distinct group (rather than 'Harness
@@ -60,42 +68,22 @@ export const CORE_TOOL_GROUP = 'Core tools' as const;
 export const CORE_TOOL_SESSION_HINT =
     'Runs inside a session harness: send a sessionId with the call.';
 
-// Build the core entries: toolRegistry FIRST (it is the self-modifying runtime's
-// registration entry and the harness registers it before every other core tool),
-// then the always-registered harness tools from coreToolMetadata() (including
-// toolRequest/toolList/toolManage), then the CONDITIONAL harness-owned tools.
-// `agentDelegate`, `actionRequest`, and
-// `threadFork` are always LISTED with generic metadata: the catalogue is
-// host-wide, while whether each is registered is a property of the selected
-// session's harness (subagents declared, an owner answerer configured, a fork
-// configuration supplied). A session without that capability answers a clear 404
-// rather than inventing it.
-//
-// toolRegistry is imported directly instead of from coreToolMetadata(): the
-// kernel keeps it out of that "always-declared set" projection because it is the
-// registration surface itself, but it is a real ordinary tool and must still be
-// listed for session-scoped manual execution. The metadata comes from the same
-// kernel copy the source-registration entry reads, so the descriptor cannot drift.
-//
-// Order is stable: the always-declared core set keeps its previous relative order
-// after toolRegistry; N4 appends the interaction and fork tools after agentDelegate.
+// Build the core entries from the generated runtime descriptors, in descriptor
+// order. Every row is session-bound by definition (see the header), so the flag is
+// set here rather than being read off the descriptor: the descriptor says the tool
+// lives in the runtime group, and the SERVER's rule is that the whole group needs a
+// session.
 export const createCoreToolEntries = (): CatalogueEntry[] =>
-    [
-        TOOL_REGISTRY_METADATA,
-        ...coreToolMetadata(),
-        agentDelegateMetadata(),
-        ACTION_REQUEST_METADATA,
-        THREAD_FORK_METADATA
-    ].map((metadata) => ({
-        name: metadata.name,
+    RUNTIME_DESCRIPTORS.map((descriptor) => ({
+        name: descriptor.metadata.name,
         group: CORE_TOOL_GROUP,
         // No `tool`: the session's harness owns the implementation (see header).
-        description: metadata.description,
-        tags: [...metadata.tags],
+        description: descriptor.metadata.description,
+        tags: [...descriptor.metadata.tags],
         // Marked exactly as the harness declares it: core, not searchable. The
         // Tools tab can therefore separate "always declared" from "discovered".
-        visibility: metadata.visibility,
-        parameters: metadata.parameters,
+        visibility: descriptor.metadata.visibility ?? 'core',
+        parameters: descriptor.metadata.parameters,
         sessionBound: true,
         availability: { state: 'available', hint: CORE_TOOL_SESSION_HINT }
     }));

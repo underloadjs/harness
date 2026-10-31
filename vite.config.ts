@@ -86,6 +86,15 @@ const external = [/^node:/, new RegExp(`^(?:${nodeBuiltins.join('|')})$`), ...de
 // source registration), then the Node/shared build fills the rest of dist.
 // Splitting the graph is what keeps the browser import genuinely free of Node
 // builtins and TypeScript while preserving the rest of the browser public surface.
+//
+// T21 note: tool DISCOVERY needs no alias here. `core/tool-discovery` reaches its
+// Node runtime through `core/tool-scan`, which loads `node:fs`/`typescript` via a
+// single dynamic `import(/* @vite-ignore */ specifier)` and reports
+// `supportsToolScan === false` in a browser. Discovery then returns the GENERATED
+// `core/tool-manifest.ts` data (the T19 browser fallback), so the browser graph
+// contains the manifest and the generated loaders, never a Node built-in. Do not
+// alias `./tool-discovery` to the manifest: the manifest exports DATA + the loader,
+// not the `discoverToolMetadata` function a caller imports.
 const root = fileURLToPath(new URL('.', import.meta.url));
 
 const browserConfig: UserConfig = {

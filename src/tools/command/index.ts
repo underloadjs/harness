@@ -7,7 +7,10 @@
 // Both tools bound their output (./boundedText) and end runaway runs through
 // ./processTree: a timeout, or an AbortSignal on the ToolContext, terminates the
 // child process tree rather than leaving it holding the pipes.
-export { commandRun } from './commandRun.tool';
+//
+// TYPE-ONLY BARREL (T21): re-exporting the tool VALUES here would statically
+// evaluate `node:child_process` for every importer of the folder barrel, which is
+// what the lazy catalogue (../lazy, ../index) avoids. Values are reached through the
+// generated descriptor loader; only the public TYPES live on this barrel.
 export type { CommandRunParameters, CommandRunResult } from './commandRun.tool';
-export { gitDiff } from './gitDiff.tool';
 export type { GitDiffParameters, GitDiffResult } from './gitDiff.tool';

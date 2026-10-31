@@ -476,7 +476,16 @@ it('still surfaces a bootstrap failure in the app header and the offline pane', 
 
     // R3: a real app/network failure is NOT swallowed by scoping run errors away.
     expect(statusState()).toBe('error');
-    expect(statusText()).toBe('server offline');
+    // The visible word is the concise state; the message is exposed twice — as the
+    // pointer tooltip AND as the live region's hidden detail (a `title` alone is not
+    // announced by `role="status"`).
+    expect(statusText()).toBe('error');
+    expect(document.querySelector('.status')?.getAttribute('title')).toBe('server offline');
+    expect(document.querySelector('.status-detail')?.textContent).toBe('server offline');
+    // The detail lives INSIDE the live region, so `aria-atomic` announces it.
+    expect(document.querySelector('.status')?.contains(document.querySelector('.status-detail'))).toBe(
+        true
+    );
     expect(document.querySelector('.empty-title')?.textContent).toBe('Harness server unavailable');
     expect(document.querySelector('.empty-text')?.textContent).toBe(
         'The harness server is unreachable: connect ECONNREFUSED 127.0.0.1:5181'

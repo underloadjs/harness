@@ -28,8 +28,9 @@ before relying on it.
   source therefore fails loudly instead of falling back to a stale definition.
   `toolRegistry` source registration and `toolSource`/`toolSources` are
   unavailable in the browser and return an actionable error; the browser alias
-  keeps importing/harness construction on the prepared legacy baseline
-  definitions and never fabricates browser source records.
+  keeps harness construction on descriptor metadata plus the GENERATED lazy loader
+  (one `import()` per entry), so it registers the same declaration shape without
+  compiling source and never fabricates browser source records.
 - **Compiler:** synchronous TypeScript transpilation only
   (`ts.transpileModule`), not semantic type checking. Syntax is checked; type
   errors that TypeScript would report in a project build are not. Before loading,
@@ -51,6 +52,48 @@ before relying on it.
 - **Authority:** loaded code runs with the process's permissions. There is no
   per-tool isolation or security boundary. Sandboxing is separate work.
 
+## Baseline registration (metadata first)
+
+`harness({})` holds **no hand-written registration inventory**. Construction
+scans the package's `tools/**/*.tool.ts` entries and reads each entry's exported
+`metadata` and `registration` literals through the TypeScript AST
+(`core/tool-discovery.ts`). No `.tool.ts` module is imported or evaluated to build
+that list, so a metadata-only entry (or one whose imports would fail) is still
+discoverable — the failure only matters when the body is loaded for execution.
+
+Each discovered row carries `{ name, metadata, sourcePath, label, origin, group,
+activation, order, pendingOnly?, control?, primaryOnly?, answerExtraction?,
+sessionBound?, listed? }`. One loop in `src/harness.ts` registers every row whose
+`activation` the current configuration satisfies, in `order` (scan order):
+
+| `activation` | registered when |
+| --- | --- |
+| `always` | every harness |
+| `creation` | `toolCreation !== false` |
+| `subagents` | the harness has a non-empty allowlist |
+| `interaction` | `interaction` is configured |
+| `forks` | `forks.enabled` |
+| `threads` | the session opens its first independent thread |
+| `websearch` / `webfetch` | that provider was configured and resolved |
+
+The policy flags are bound to the published **definition object**, not the wire
+name, so replacing a tool publishes an ordinary tool that inherits nothing:
+`primaryOnly` (role gate + declaration filter), `answerExtraction` (delegation
+answer parsing), `control` (`cancel`/`fork`/`action` run dispatch), `pendingOnly`
+(declared only while the agent has work in flight).
+
+`presets: false` filters the `preset` **group** and nothing else; the runtime
+(harness-owned) rows stay registered. Configured `toolSources`, `toolFolders`,
+`tools`, and plugins keep their historical precedence: they are committed after
+the baseline, so an override of a baseline name intentionally wins.
+
+Adding a tool therefore means adding one `*.tool.ts` entry with its `metadata`
+and `registration` literals. No registry edit, no static import, and no manual
+inventory. `src/tools/descriptors.ts` derives the package catalogue from the SAME
+scanner `harness({})` uses (T24), so a cold Node process already lists and loads a
+brand-new entry; regenerating the data-only manifest (`yarn tools:manifest`) is
+only needed for the BROWSER build, which cannot scan or parse TypeScript.
+
 ## Production source model
 
 The published package contains two siblings:
@@ -63,7 +106,7 @@ The published package contains two siblings:
 
 `sourcePath` values are resolved relative to the installed `src/` root (or may be
 absolute). `harness.toolSource(name).sourcePath` therefore reports a package-
-relative label such as `runtime-tools/toolRegistry.tool.ts`, not a generated
+relative label such as `tools/runtime/toolRegistry.tool.ts`, not a generated
 `dist/` module. TypeScript is a runtime dependency of the package because the
 compiler is needed in production.
 
@@ -71,8 +114,8 @@ The package `files` allow-list includes `src` and excludes tests. The runtime
 compiler must remain able to read these editable entries after a production
 install; generated `dist/` files are not the editable source model.
 
-The opt-in web tools also ship independently as `runtime-tools/webSearch.tool.ts`
-and `runtime-tools/webFetch.tool.ts`; their editable provider implementations are shipped
+The opt-in web tools also ship independently as `tools/runtime/webSearch.tool.ts`
+and `tools/runtime/webFetch.tool.ts`; their editable provider implementations are shipped
 too. The registered entries delegate provider/credential operations to the
 harness that owns them; startup supplies the configured metadata/runtime closure.
 A replacement registered under those names is an ordinary source revision and
