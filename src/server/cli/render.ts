@@ -42,6 +42,34 @@ const pendingOf = (event: HarnessEvent): HarnessPendingTool[] | undefined => {
     return pendingListOf(event.pending);
 };
 
+// One model-request retry, validated (F6). A persisted/older/hand-written frame
+// is untrusted input: a missing `error`, a non-numeric `attempt` or a NaN
+// `delayMs` would print "retry NaN/undefined in NaNms · undefined" or throw on
+// `event.error.message`. The rules mirror src/frontend/contract.ts `retryOf`
+// (the browser's accessor) so the terminal and the tile accept exactly the same
+// frames; a malformed frame prints NOTHING rather than a fabricated notice.
+const retryOf = (
+    event: HarnessEvent
+): { agent: string; attempt: number; maxAttempts: number; delayMs: number; message: string } | undefined => {
+    if (event.type !== 'retry') return undefined;
+    if (typeof event.agent !== 'string' || event.agent.length === 0) return undefined;
+
+    const attempt = event.attempt;
+    const maxAttempts = event.maxAttempts;
+    const delayMs = event.delayMs;
+
+    if (typeof attempt !== 'number' || !Number.isFinite(attempt) || attempt < 1) return undefined;
+    if (typeof maxAttempts !== 'number' || !Number.isFinite(maxAttempts) || maxAttempts < attempt) {
+        return undefined;
+    }
+    if (typeof delayMs !== 'number' || !Number.isFinite(delayMs) || delayMs < 0) return undefined;
+
+    const message = (event.error as { message?: unknown } | undefined)?.message;
+    if (typeof message !== 'string') return undefined;
+
+    return { agent: event.agent, attempt, maxAttempts, delayMs, message };
+};
+
 const durationOf = (event: HarnessEvent): number | undefined => {
     if (event.type !== 'tool_result') return undefined;
 
@@ -155,6 +183,30 @@ export const createRenderer = ({ json, color }: RenderOptions): Renderer => {
                         ? 'pending tools finished · continuing'
                         : `${pending.length} still running · ${describePending(pending)}`;
                 process.stdout.write(`${dim(`~ ${agent} woke · ${detail}`)}\n`);
+                break;
+            }
+
+            // R1: a failed model attempt was abandoned and the same request is
+            // re-sent after `delayMs`. One dim line; `--json` carries the event
+            // itself for anything that tallies retries. A frame without a usable
+            // attempt/delay/error is malformed and prints nothing (F6).
+            case 'retry': {
+                const frame = retryOf(event);
+                if (frame === undefined) break;
+
+                endLine();
+                process.stdout.write(
+                    `${dim(`~ ${frame.agent} retry ${frame.attempt}/${frame.maxAttempts} in ${formatMs(frame.delayMs)} · ${frame.message}`)}\n`
+                );
+                break;
+            }
+
+            // R3: one model request committed its answer (a tool-calling round ends
+            // with no `done`, so this is the only visible boundary it has). The
+            // terminal needs no line of its own: the committed prose is already on
+            // screen and `--json` carries the frame for anything that tallies
+            // attempts.
+            case 'attempt_commit': {
                 break;
             }
 

@@ -150,16 +150,21 @@ describe('invocation identity (T3 UI threads)', () => {
 
         // Root run = 1, then one child run per delegation (2, 3). The id is stable
         // across every frame of its invocation; `input` appears on `start` only, and
-        // `parentId` is absent because both children hang off the root.
+        // `parentId` is absent because both children hang off the root. Each
+        // tool-calling request also closes with `attempt_commit` (R3/F1: a tool round
+        // never gets a `done`), emitted once the round's call is launched and before
+        // its result.
         expect(events.map(shape)).toEqual([
             'lead:start:-',
             'lead:tool_call:-',
             'helper:start:2/-/c1/first task',
+            'lead:attempt_commit:-',
             'helper:text:2/-/c1/-',
             'helper:done:2/-/c1/-',
             'lead:tool_result:-',
             'lead:tool_call:-',
             'helper:start:3/-/c2/second task',
+            'lead:attempt_commit:-',
             'helper:text:3/-/c2/-',
             'helper:done:3/-/c2/-',
             'lead:tool_result:-',
@@ -220,6 +225,7 @@ describe('invocation identity (T3 UI threads)', () => {
             'lead:start:-',
             'lead:tool_call:-',
             'helper:start:2/-/c9/inner prompt',
+            'lead:attempt_commit:-',
             'helper:text:2/-/c9/-',
             'helper:done:2/-/c9/-',
             'lead:tool_result:-',
@@ -272,11 +278,13 @@ describe('invocation identity (T3 UI threads)', () => {
         await flush();
 
         // The child has answered while its `hold` call is still running, so it is
-        // PAUSED: start/tool_call/text/done all already carry the same thread id.
+        // PAUSED: start/tool_call/attempt_commit/text/done all already carry the same
+        // thread id (the tool-calling round closes with `attempt_commit` — R3/F1).
         expect(gate.settled).toBe(false);
         expect(events.filter((event) => event.agent === 'helper').map(shape)).toEqual([
             'helper:start:2/-/c1/wait for it',
             'helper:tool_call:2/-/c1/-',
+            'helper:attempt_commit:2/-/c1/-',
             'helper:text:2/-/c1/-',
             'helper:done:2/-/c1/-'
         ]);
@@ -300,10 +308,12 @@ describe('invocation identity (T3 UI threads)', () => {
         await running;
 
         // The completion drives the child's last turn; the same thread id follows it
-        // through tool_result, text, and the final done.
+        // through tool_result, text, and the final done. The child's tool-calling
+        // request also closes with `attempt_commit` (R3/F1: no `done` for that round).
         expect(events.filter((event) => event.agent === 'helper').map(shape)).toEqual([
             'helper:start:2/-/c1/wait for it',
             'helper:tool_call:2/-/c1/-',
+            'helper:attempt_commit:2/-/c1/-',
             'helper:text:2/-/c1/-',
             'helper:done:2/-/c1/-',
             'helper:tool_result:2/-/c1/-',

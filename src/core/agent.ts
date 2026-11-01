@@ -4,11 +4,30 @@
 //   1. the model name,
 //   2. the seeded system instruction(s),
 //   3. the message history,
-//   4. exactly one transport call per turn().
+//   4. the model-request retry sequence for one turn().
 //
-// It owns no policy: no tool execution, no retries beyond the transport's, no
-// compaction, no planning. That line is what keeps a brain reusable. The same
-// agent can be driven by a writer harness, a research harness, or a test.
+// It owns no other policy: no tool execution, no compaction, no planning. That
+// line is what keeps a brain reusable. The same agent can be driven by a writer
+// harness, a research harness, or a test.
+//
+// RETRY OWNERSHIP (R1). The agent is the ONE retry owner for model calls, at the
+// generic `request` boundary below. That placement is deliberate:
+//   - it covers EVERY transport (the built-in `openAICompatible`, a custom
+//     `stream`, a test double), because retrying lives above the transport;
+//   - it covers every failure shape the transport can produce: a returned
+//     `error` frame (any HTTP status, a provider error attached to a 200 stream,
+//     a malformed frame), a thrown network error, and a stream that throws
+//     mid-flight;
+//   - it retries ONLY the current model request. Tools, tool results and the
+//     rest of the run are never replayed: those live above this boundary in
+//     harness.ts, which never sees a retry as a new turn.
+//
+// Policy: one initial attempt plus `maxRetries` (default 10) retries, with a
+// doubling wait of `baseDelayMs * 2 ** (n - 1)` (default 1s, 2s, ... 512s).
+// Success ends the sequence; when the final retry fails, the ORIGINAL error of
+// that attempt is rethrown/yielded unchanged, so a caller keeps the real cause.
+// Cancellation is never an error to retry: an aborted signal (in flight or
+// during a backoff wait) ends the request immediately.
 //
 // Standalone use is real, and it is the reason the two methods are split:
 //
@@ -55,11 +74,13 @@ import { registerAgentThreader } from './thread';
 import type {
     Agent,
     AgentConfiguration,
+    AgentRequestCommit,
     AgentStreamEvent,
     AgentStreamOptions,
     HarnessAssistantMessage,
     HarnessAttachment,
     HarnessMessage,
+    HarnessRetryConfiguration,
     HarnessStopReason,
     HarnessStream,
     HarnessToolCall
@@ -124,6 +145,124 @@ const copyBaselineMessage = (message: HarnessMessage): HarnessMessage => {
             return { ...message };
     }
 };
+
+// ---------------------------------------------------------------------------
+// Retry policy (R1)
+// ---------------------------------------------------------------------------
+
+// One initial attempt plus TEN retries. The count and the base wait are the
+// documented defaults (README "Retries", knowledge.md "agent").
+const DEFAULT_MAX_RETRIES = 10;
+const DEFAULT_RETRY_BASE_DELAY_MS = 1_000;
+
+// The retry sequence for one agent. Resolved ONCE at construction so a bad
+// configuration fails where the agent was created, not on the first provider
+// hiccup (the same rule the transport's own resolution follows).
+type RetryPolicy = {
+    // Retries AFTER the initial attempt. 0 means one attempt only.
+    maxRetries: number;
+    // Wait before retry n (1-based) is `baseDelayMs * 2 ** (n - 1)`.
+    baseDelayMs: number;
+};
+
+const resolveRetryPolicy = (configuration: HarnessRetryConfiguration | undefined): RetryPolicy => {
+    // `false` is the explicit opt-out: exactly one attempt, first failure wins.
+    if (configuration === false) return { maxRetries: 0, baseDelayMs: DEFAULT_RETRY_BASE_DELAY_MS };
+
+    const maxRetries = configuration?.maxRetries ?? DEFAULT_MAX_RETRIES;
+    const baseDelayMs = configuration?.baseDelayMs ?? DEFAULT_RETRY_BASE_DELAY_MS;
+
+    if (!Number.isSafeInteger(maxRetries) || maxRetries < 0) {
+        throw new HarnessError(
+            `retry.maxRetries must be a non-negative safe integer; received ${String(maxRetries)}.`
+        );
+    }
+
+    if (!Number.isSafeInteger(baseDelayMs) || baseDelayMs < 1) {
+        throw new HarnessError(
+            `retry.baseDelayMs must be a positive safe integer; received ${String(baseDelayMs)}.`
+        );
+    }
+
+    return { maxRetries, baseDelayMs };
+};
+
+// The wait before retry `attempt` (1-based): 1000, 2000, 4000 ... by default.
+const retryDelayOf = (policy: RetryPolicy, attempt: number): number =>
+    policy.baseDelayMs * 2 ** (attempt - 1);
+
+// What ONE attempt accumulated. Declared outside the factory because both the
+// attempt generator and the retry wrapper return it.
+type AttemptOutcome = {
+    content: string;
+    reasoning: string;
+    stopReason: HarnessStopReason;
+    toolCalls: HarnessToolCall[];
+    usage: HarnessAssistantMessage['usage'];
+};
+
+// Abort check for a request (R2). The caller's own reason is thrown, exactly like
+// the harness's `throwIfAborted`, so a cancelled run keeps its identity.
+const throwIfAborted = (signal: AbortSignal | undefined): void => {
+    if (signal?.aborted === true) {
+        throw signal.reason ?? new DOMException('This operation was aborted', 'AbortError');
+    }
+};
+
+// An abort is a CONTROL OUTCOME, never a failure to retry (R1/R2). The reason the
+// signal carries is the caller's own value, so it is what ends the request; only
+// the "is this an abort" decision is made here.
+const isAbortError = (error: unknown, signal: AbortSignal | undefined): boolean => {
+    // A signal that fired is authoritative even when the transport threw a
+    // wrapper error (`AbortError` vs. a provider's own "request aborted" text).
+    if (signal?.aborted === true) return true;
+
+    try {
+        if (error instanceof Error && error.name === 'AbortError') return true;
+    } catch {
+        // A hostile thrown value may make `instanceof` throw; it is not an abort.
+        return false;
+    }
+
+    return false;
+};
+
+// Sleep for `ms`, but settle IMMEDIATELY when `signal` aborts (R2).
+//
+// Cleanup rules:
+//   - the timer is cleared on abort, so a cancelled request never waits out a
+//     backoff. The harness aborts a run's signal on cancellation, so this is the
+//     path every cancelled run takes;
+//   - the listener is removed on both paths (settle and abort), so no listener
+//     leaks into a later run.
+//
+// A caller that walks away from the stream WITHOUT aborting cannot be detected from
+// inside a generator suspended on this wait, which is why the harness always owns a
+// signal: cancellation is the supported way to abandon a request.
+const waitForRetry = (ms: number, signal: AbortSignal | undefined): Promise<void> =>
+    new Promise<void>((resolve, reject) => {
+        // Already cancelled: no timer is created at all.
+        if (signal?.aborted === true) {
+            reject(signal.reason ?? new DOMException('This operation was aborted', 'AbortError'));
+            return;
+        }
+
+        let timer: ReturnType<typeof setTimeout> | undefined;
+
+        const onAbort = (): void => {
+            if (timer !== undefined) clearTimeout(timer);
+            timer = undefined;
+            reject(signal?.reason ?? new DOMException('This operation was aborted', 'AbortError'));
+        };
+
+        timer = setTimeout(() => {
+            timer = undefined;
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+        }, ms);
+
+        signal?.addEventListener('abort', onAbort, { once: true });
+    });
 
 // ---------------------------------------------------------------------------
 // Factory
@@ -204,6 +343,12 @@ const createAgent = (
 
     seed();
 
+    // The retry policy for this agent, resolved once (see resolveRetryPolicy).
+    const retryPolicy = resolveRetryPolicy(configuration.retry);
+    // Total attempts = the initial one plus its retries. `maxAttempts` is what the
+    // `retry` event reports so a consumer can render "2 of 11" without guessing.
+    const maxAttempts = retryPolicy.maxRetries + 1;
+
     // Assigned below; the appending helpers close over it so they can chain.
     let self: Agent;
 
@@ -233,23 +378,30 @@ const createAgent = (
 
     // One transport call against the current history. Shared by both turn() and
     // stream() so there is exactly one place that knows how a turn is built.
-    const request = async function* (options: AgentStreamOptions | undefined): AsyncGenerator<AgentStreamEvent> {
-        let content = '';
-        let reasoning = '';
-        let stopReason: HarnessStopReason = 'stop';
-        let toolCalls: HarnessToolCall[] = [];
-        let usage: HarnessAssistantMessage['usage'];
-
+    //
+    // RETRY STRUCTURE (R1/R3). `request` owns the retry loop; `attemptRequest`
+    // owns ONE attempt. Everything an attempt accumulates (content, reasoning,
+    // tool calls, usage) lives INSIDE `attemptRequest`, so a failed attempt's
+    // partial output can never leak into the committed message or into the next
+    // attempt. Only the model request is re-sent: nothing above this boundary
+    // (tools, tool results, run state) is touched, and the harness sees one
+    // turn() no matter how many transport calls it took.
+    const request = async function* (options: AgentStreamOptions | undefined): AsyncGenerator<
+        AgentStreamEvent,
+        AgentRequestCommit
+    > {
         // Capture the model for THIS request. The accessor is mutable (a session
         // can retarget an agent mid-conversation, see server/sessions.ts
         // setAgentModels), so reading it again at the end would let a change that
         // arrives while the transport is streaming relabel a message the OLD model
         // actually produced. One snapshot keeps the request, the transport payload,
-        // and the committed attribution identical.
+        // and the committed attribution identical. A retry re-sends the SAME model:
+        // it is the same request, not a new one.
         const requestModel = model;
 
-        // Copy the transcript: a transport must never see a live array it could
-        // mutate, and later appends must not appear mid-request.
+        // Copy the transcript ONCE: every attempt of this request sends exactly the
+        // same payload. A transport must never see a live array it could mutate, and
+        // later appends must not appear mid-request.
         //
         // A `transcript` override (background tools) replaces the COMMITTED
         // history for this request only. It is already a projection the harness
@@ -269,78 +421,229 @@ const createAgent = (
                 : { ...message }
         );
 
-        for await (const event of transport({
-            model: requestModel,
-            messages: transcript,
-            tools: options?.tools,
-            signal: options?.signal
-        })) {
-            switch (event.type) {
-                case 'text':
-                    content += event.delta;
-                    yield { type: 'text', delta: event.delta };
-                    break;
+        // One attempt. Its accumulators are local, so a throw discards them.
+        //
+        // COMPLETION IS TERMINAL FOR OUTPUT (F3). A transport `done` frame is the
+        // model's whole answer: from that moment nothing else is rendered or
+        // accumulated, and a THROW from the stream afterwards (a provider wrapper
+        // rejecting from its own cleanup) is swallowed instead of reaching the retry
+        // loop. A retry there would re-send a request whose answer the UI has already
+        // committed, so both answers would render.
+        //
+        // The ONE thing still observed after `done` is an explicit `error` FRAME: that
+        // is the transport DECLARING the generation failed (the pre-existing contract,
+        // see harness.retry "never executes a tool call from a failed attempt"). It
+        // still fails the attempt, because committing it would launch tool calls the
+        // provider never completed. A throw is not that signal: it is cleanup noise.
+        //
+        // The iterator is driven by hand (not `for await`) because this attempt owns
+        // when it stops and must own the `return()` that unwinds it.
+        const attemptRequest = async function* (): AsyncGenerator<AgentStreamEvent, AttemptOutcome> {
+            let content = '';
+            let reasoning = '';
+            let stopReason: HarnessStopReason = 'stop';
+            let toolCalls: HarnessToolCall[] = [];
+            let usage: HarnessAssistantMessage['usage'];
+            // A transport that ends WITHOUT a terminal `done` frame (a socket that
+            // closed mid-stream) has not completed the request: committing that as an
+            // empty answer would silently swallow the failure. It is reported like any
+            // other model-call failure, so the retry loop re-sends the request (R1).
+            let completed = false;
+            // The attempt's own failure, captured instead of thrown straight out of
+            // the loop so cleanup can run first without ever masking it.
+            let failure: unknown;
+            let failed = false;
 
-                case 'reasoning':
-                    reasoning += event.delta;
-                    yield { type: 'reasoning', delta: event.delta };
-                    break;
+            const iterator = transport({
+                model: requestModel,
+                messages: transcript,
+                tools: options?.tools,
+                signal: options?.signal
+            })[Symbol.asyncIterator]();
 
-                case 'error':
-                    // Error frames are terminal: abort the turn.
-                    throw new HarnessError(event.message);
+            try {
+                while (true) {
+                    const next = await iterator.next();
+                    // The transport returned without a `done` frame: leave the loop
+                    // and report the truncated stream below.
+                    if (next.done === true) break;
 
-                case 'done':
-                    stopReason = event.stopReason;
-                    toolCalls = event.toolCalls;
-                    usage = event.usage;
-                    break;
+                    const event = next.value;
+
+                    // Post-completion: see the header comment. Nothing is yielded,
+                    // accumulated or attributed any more.
+                    if (completed) {
+                        if (event.type === 'error') {
+                            failed = true;
+                            failure = new HarnessError(event.message);
+                        }
+                        continue;
+                    }
+
+                    switch (event.type) {
+                        case 'text':
+                            content += event.delta;
+                            yield { type: 'text', delta: event.delta };
+                            break;
+
+                        case 'reasoning':
+                            reasoning += event.delta;
+                            yield { type: 'reasoning', delta: event.delta };
+                            break;
+
+                        case 'error':
+                            // Error frames are terminal FOR THIS ATTEMPT: they surface
+                            // as a thrown error so the retry loop above can decide
+                            // whether to re-send the request. The frame's message is
+                            // the original, useful error text and is preserved
+                            // verbatim.
+                            throw new HarnessError(event.message);
+
+                        case 'done':
+                            stopReason = event.stopReason;
+                            toolCalls = event.toolCalls;
+                            usage = event.usage;
+                            completed = true;
+                            break;
+                    }
+                }
+            } catch (error) {
+                // A throw AFTER completion is cleanup noise, never a failed request
+                // (F3). Before completion it is the attempt's real failure.
+                if (!completed) {
+                    failed = true;
+                    failure = error;
+                }
             }
-        }
+
+            // Unwind the transport exactly once. Its `return()` may itself throw (a
+            // provider wrapper that rejects from its own finally); that must not
+            // turn a completed answer into a retried request, and must not replace
+            // the attempt's real error when the attempt failed.
+            try {
+                await iterator.return?.(undefined);
+            } catch {
+                // Deliberately ignored: see above.
+            }
+
+            if (failed) throw failure;
+
+            if (!completed) {
+                throw new HarnessError(
+                    `The model stream ended without a completion frame${content.length > 0 ? ' after partial output' : ''}.`
+                );
+            }
+
+            return { content, reasoning, stopReason, toolCalls, usage };
+        };
+
+        // Retry sequence: attempt 1, then `maxRetries` further attempts. Returns the
+        // FIRST successful attempt's outcome plus the attempt index that produced it
+        // (reported by the success boundary below); a final failure rethrows the
+        // original error of the last attempt (R1: useful original error, not a
+        // wrapper).
+        const attemptWithRetries = async function* (): AsyncGenerator<
+            AgentStreamEvent,
+            { outcome: AttemptOutcome; attempt: number }
+        > {
+            for (let attempt = 1; ; attempt++) {
+                // ABORT BOUNDARY (R2): never start another attempt for a cancelled
+                // request, and never wait out a backoff for one.
+                throwIfAborted(options?.signal);
+
+                try {
+                    return { outcome: yield* attemptRequest(), attempt };
+                } catch (error) {
+                    // Cancellation is not an error to retry: the run stopped.
+                    if (isAbortError(error, options?.signal)) throw error;
+
+                    // Out of retries: the last attempt's own error is the answer.
+                    if (attempt >= maxAttempts) throw error;
+
+                    const delayMs = retryDelayOf(retryPolicy, attempt);
+
+                    // Tell the consumer this attempt failed and what comes next. The
+                    // event precedes the wait, so a UI can show the backoff while it
+                    // happens; the message is the failed attempt's error, and every
+                    // delta streamed since the previous boundary belongs to that
+                    // failed attempt (consumers discard them).
+                    yield {
+                        type: 'retry',
+                        attempt,
+                        maxAttempts,
+                        delayMs,
+                        error: toErrorInfo(error)
+                    };
+
+                    // Waits abort-immediately; the timer and listener are cleaned up
+                    // inside `waitForRetry`.
+                    await waitForRetry(delayMs, options?.signal);
+                }
+            }
+        };
+
+        const { outcome, attempt: committedAttempt } = yield* attemptWithRetries();
 
         // Pre-commit guard (harness ownership/cancellation). This is the ONLY
         // synchronous mutation point of a turn, so a caller that lost ownership
         // while the transport was in flight can stop here without a partial
         // commit. A throw propagates exactly like a transport error; stream()
-        // rolls its own user message back.
+        // rolls its own user message back. It is deliberately OUTSIDE the retry
+        // loop: lost ownership is not a model-call error and must never be
+        // retried.
         options?.precommit?.();
 
         const message: HarnessAssistantMessage = {
             role: 'assistant',
-            content,
-            reasoning,
-            toolCalls,
+            content: outcome.content,
+            reasoning: outcome.reasoning,
+            toolCalls: outcome.toolCalls,
             // The captured request model, not the live accessor: attribution must
             // describe the request that ran (see requestModel above).
             model: requestModel,
-            stopReason,
-            usage
+            stopReason: outcome.stopReason,
+            usage: outcome.usage
         };
 
         // Commit to history. reasoning is kept for replay/UI but never sent back
         // to the model, so it is not part of the wire payload.
         messages.push({
             role: 'assistant',
-            content,
-            ...(toolCalls.length > 0 ? { toolCalls } : {}),
-            ...(reasoning ? { reasoning } : {})
+            content: outcome.content,
+            ...(outcome.toolCalls.length > 0 ? { toolCalls: outcome.toolCalls } : {}),
+            ...(outcome.reasoning ? { reasoning: outcome.reasoning } : {})
         });
 
+        // SUCCESS BOUNDARY (R3/F1). Everything this request streamed is now
+        // committed, so it can never be discarded by a retry of a LATER request.
+        //
+        // Reported as the generator's RETURN value, not as an event: the harness
+        // decides whether the boundary is visible (it forwards `attempt_commit` only
+        // when its own `done` will not follow, i.e. a tool-calling round), and every
+        // existing AgentStreamEvent sequence stays byte-identical.
         yield { type: 'done', message };
+
+        return { attempt: committedAttempt, maxAttempts };
     };
 
     // Low-level: one turn against the current history. Throws on failure. The
     // `transcript` option is the harness's provider-safe projection; standalone
-    // callers omit it and the committed history is used.
-    const turn = async function* (options?: AgentStreamOptions): AsyncGenerator<AgentStreamEvent> {
-        yield* request(options);
+    // callers omit it and the committed history is used. `return yield*` forwards
+    // `request`'s return value (the success boundary) to the caller.
+    const turn = async function* (
+        options?: AgentStreamOptions
+    ): AsyncGenerator<AgentStreamEvent, AgentRequestCommit> {
+        return yield* request(options);
     };
 
     // High-level: append a user message, then run one turn. Atomic on failure.
+    // Returns the same success boundary as `turn` for a caller that needs it; the
+    // `Agent.stream` TYPE stays a plain AsyncIterable, so nothing that consumes
+    // events observes the change.
     const stream = async function* (
         input: string,
         options?: AgentStreamOptions
-    ): AsyncGenerator<AgentStreamEvent> {
+    ): AsyncGenerator<AgentStreamEvent, AgentRequestCommit | undefined> {
         // Validate before mutating: a malformed attachment yields an `error`
         // event (stream never throws) and leaves history exactly as it was.
         let attachments: HarnessAttachment[];
@@ -359,10 +662,11 @@ const createAgent = (
         );
 
         try {
-            yield* request(options);
+            return yield* request(options);
         } catch (error) {
             messages.splice(commitIndex);
             yield { type: 'error', error: toErrorInfo(error) };
+            return undefined;
         }
     };
 
@@ -396,12 +700,15 @@ const createAgent = (
         // The child shares the resolved transport (so provider credentials and
         // external side effects are shared, not sandboxed). Its instructions are
         // the source's snapshot, while its seed/baseline is the cloned transcript.
+        // The retry policy is inherited too: a branch makes the same kind of model
+        // calls, so it must not silently fall back to a different retry budget.
         const child = createAgent(
             {
                 name: self.name,
                 model,
                 instruction: [...instructions],
-                stream: transport
+                stream: transport,
+                retry: retryPolicy
             },
             materialized.messages
         );
@@ -489,7 +796,10 @@ const createAgent = (
             model,
             instruction: [...instructions],
             ...(configuration.messages === undefined ? {} : { messages: configuration.messages }),
-            stream: transport
+            stream: transport,
+            // A thread is another conversation of the SAME brain, so it inherits the
+            // retry policy (R1) rather than reverting to the default budget.
+            retry: retryPolicy
         })
     );
 

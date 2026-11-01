@@ -41,6 +41,14 @@
 //     work and wake-driven turns — or a transport failure ends the run: history is
 //     truncated back to where the call started and the harness throws.
 //
+// Retries (R1): a failed model request is retried by the AGENT (core/agent.ts),
+// not here — one initial attempt plus ten retries with doubling waits. The harness
+// sees one `turn()` per model request however many transport calls it took, and it
+// forwards the agent's `retry` frame as a progress event so a recorded turn and a
+// live UI can show the retry count, the backoff and the failed attempt's error. A
+// retried attempt is never committed, so its tool calls never reach `launchToolCall`
+// and no tool is ever re-run.
+//
 // Tool visibility:
 //
 // A registry can hold thousands of tools, so a request declares only:
@@ -5461,7 +5469,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // transcript (or emit events through `emit`, which is ownership-guarded).
     const requestTurn = async (
         run: RunState
-    ): Promise<{ message: HarnessAssistantMessage; offered: Map<string, Tool> }> => {
+    ): Promise<{
+        message: HarnessAssistantMessage;
+        offered: Map<string, Tool>;
+        // The request's own success boundary (R3/F1), reported by the agent after it
+        // committed the answer. The caller decides whether to surface it: it is
+        // forwarded ONLY for a response that ends in tool calls, because that is the
+        // one the harness never closes with `done`. `undefined` for a transport that
+        // predates the frame.
+        commit: { attempt: number; maxAttempts: number } | undefined;
+    }> => {
         const brain = run.agent;
 
         return serializeTurn(run.actorKey, async () => {
@@ -5484,11 +5501,21 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 [Symbol.asyncIterator]();
 
             let message: HarnessAssistantMessage | undefined;
+            // Captured, not forwarded here: see the `attempt_commit` case below.
+            let attemptCommit: { attempt: number; maxAttempts: number } | undefined;
 
-            const consume = (async (): Promise<HarnessAssistantMessage> => {
+            const consume = (async (): Promise<{
+                message: HarnessAssistantMessage;
+                commit: { attempt: number; maxAttempts: number } | undefined;
+            }> => {
                 while (true) {
                     const next = await iterator.next();
-                    if (next.done === true) break;
+                    if (next.done === true) {
+                        // R3/F1: the agent's success boundary rides on the generator's
+                        // RETURN value, so it never appears in the event stream.
+                        attemptCommit = next.value;
+                        break;
+                    }
 
                     const event = next.value;
 
@@ -5499,6 +5526,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                         case 'reasoning':
                             await emit(run, { type: 'reasoning', agent: brain.name, delta: event.delta });
+                            break;
+
+                        // R1/R3/R4: the agent abandoned this attempt and re-sends the
+                        // SAME request after `delayMs`. Forwarded verbatim so a
+                        // recorded turn and a live UI both see the retry count, the
+                        // backoff and the failed attempt's own error. The failed
+                        // attempt's streamed deltas are already out (they precede this
+                        // frame); consumers discard them, and no tool from that
+                        // attempt can exist because the agent commits nothing.
+                        case 'retry':
+                            await emit(run, {
+                                type: 'retry',
+                                agent: brain.name,
+                                attempt: event.attempt,
+                                maxAttempts: event.maxAttempts,
+                                delayMs: event.delayMs,
+                                error: event.error
+                            });
                             break;
 
                         case 'done':
@@ -5514,7 +5559,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     throw new HarnessError(`Agent "${brain.name}" ended without producing a message.`);
                 }
 
-                return message;
+                return { message, commit: attemptCommit };
             })();
 
             // A losing consumer settles after the race is decided; it must never
@@ -5527,7 +5572,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
             if (signal === undefined) {
                 try {
-                    return { message: await consume, offered };
+                    const settled = await consume;
+                    return { message: settled.message, offered, commit: settled.commit };
                 } catch (error) {
                     // Preserve for-await's close-on-early-exit semantics even
                     // though this path has no abort race (e.g. a reporter threw):
@@ -5548,7 +5594,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             else signal.addEventListener('abort', abortHandler, { once: true });
 
             try {
-                return { message: await Promise.race([consume, aborted]), offered };
+                const settled = await Promise.race([consume, aborted]);
+                return { message: settled.message, offered, commit: settled.commit };
             } catch (error) {
                 // Unwind at the next suspension (no await: a provider stuck in a
                 // pending next() may take forever, and that is fine — the
@@ -5701,7 +5748,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // of one round late.
                 drainThreadQueue(run);
 
-                const { message, offered } = await requestTurn(run);
+                const { message, offered, commit } = await requestTurn(run);
 
                 // P1-A: a completion may have landed WHILE this request was in
                 // flight, and its slow reporter may still be running. Drain the
@@ -5742,6 +5789,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 // `done`; persist that append before any tool work or the next turn.
                 notifyRunStateChange(run, 'agent_message', { agent: brain.name });
 
+                // R3/F1: this request's SUCCESS boundary. It is emitted whenever this
+                // response gets NO `done` — a tool-calling round (closed after its
+                // tool_call frames, see the launch loop below) and a text response that
+                // is superseded before it can be reported (see the three `continue`
+                // branches below). A response that DOES get `done` needs no extra frame:
+                // its `done` already closes the window, so an ordinary answer keeps its
+                // exact old sequence.
+                //
+                // Why it matters: history commits EVERY successful response, but a
+                // consumer that saw only `retry`/`done` could not tell committed output
+                // from the partial output of a request about to be retried, and deleted
+                // it. A missing boundary is silent data loss, not a display quirk.
+                const emitCommit = async (): Promise<void> => {
+                    if (commit === undefined) return;
+
+                    await emit(run, {
+                        type: 'attempt_commit',
+                        agent: brain.name,
+                        attempt: commit.attempt,
+                        maxAttempts: commit.maxAttempts
+                    });
+                };
+
                 if (message.usage !== undefined) {
                     await emit(run, { type: 'usage', agent: brain.name, usage: message.usage });
                 }
@@ -5775,19 +5845,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                     // Work arrived while the request was in flight: take another
                     // turn so the model sees the new results. No `done` is emitted
-                    // for this superseded response.
-                    if (changedDuringRequest) continue;
+                    // for this superseded response, so its committed prose would be
+                    // indistinguishable from abandoned output: close it first (T8).
+                    if (changedDuringRequest) {
+                        await emitCommit();
+                        continue;
+                    }
 
                     // Final guard: the mailbox is drained and dirty is clear right
                     // before the run is allowed to resolve. A delivery that raced
                     // this check re-dirties the run and gets its own turn; an abort
                     // that raced it must still fail/roll back rather than resolve.
                     await drainMailbox(run.actorKey);
-                    if (run.dirty) continue;
+                    if (run.dirty) {
+                        await emitCommit();
+                        continue;
+                    }
 
                     // R5: guidance that arrived WHILE this final turn was in flight
                     // must not be swallowed by the return — it buys one more turn.
-                    if (drainThreadQueue(run)) continue;
+                    if (drainThreadQueue(run)) {
+                        await emitCommit();
+                        continue;
+                    }
                     throwIfAborted(run);
 
                     await emit(run, { type: 'done', agent: brain.name, message });
@@ -5811,6 +5891,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 for (const call of message.toolCalls) {
                     throwIfAborted(run);
                     await launchToolCall(run, call, offered);
+                }
+
+                // R3/F1: close this request's output AFTER its tool_call frames (a
+                // launch failure is a `tool_result`, so the round always completes).
+                // A consumer that saw only `retry`/`done` used to treat this round as
+                // abandoned output and deleted it when the NEXT request retried.
+                if (message.toolCalls.length > 0) {
+                    await emitCommit();
                 }
 
                 await settleWindow(run);

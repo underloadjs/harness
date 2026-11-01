@@ -66,6 +66,12 @@ export const applyActivity = (active: Set<string>, event: HarnessEvent): void =>
         // its request settles, before any tool it asked for runs), so it keeps the
         // ring lit exactly like the other in-flight events.
         case 'usage':
+        // R1: a retried model request is still this agent working (it abandoned one
+        // attempt and re-sent the same request), so the ring stays lit. R3: a
+        // committed request is likewise mid-run (the harness may still launch its
+        // tools), and a tool-calling round has no `done` to fall back on.
+        case 'retry':
+        case 'attempt_commit':
             active.add(event.agent);
             return;
 

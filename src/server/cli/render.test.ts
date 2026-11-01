@@ -83,6 +83,17 @@ const wakeupWith = (fields: Record<string, unknown> = {}): HarnessEvent =>
         ...fields
     }) as unknown as HarnessEvent;
 
+const retryWith = (fields: Record<string, unknown> = {}): HarnessEvent =>
+    ({
+        type: 'retry',
+        agent: 'writer',
+        attempt: 1,
+        maxAttempts: 11,
+        delayMs: 1_000,
+        error: { message: 'HTTP 500: overloaded' },
+        ...fields
+    }) as unknown as HarnessEvent;
+
 afterEach(() => {
     vi.restoreAllMocks();
 });
@@ -199,5 +210,76 @@ describe('createRenderer', () => {
         ]);
 
         expect(out).toEqual([]);
+    });
+
+    // R1/R4: one dim line per retried model request, naming the attempt, the budget,
+    // the backoff and the failed attempt's own error.
+    it('prints a model-request retry', () => {
+        const { out } = renderAll([
+            retryWith({ attempt: 2, maxAttempts: 11, delayMs: 2_000, error: { message: 'HTTP 500: down' } })
+        ]);
+
+        expect(out).toEqual(['~ writer retry 2/11 in 2.0s · HTTP 500: down\n']);
+    });
+
+    it('closes an open stream line before a retry', () => {
+        const { out } = renderAll([
+            { type: 'text', agent: 'writer', delta: 'partial' },
+            retryWith()
+        ]);
+
+        expect(out).toEqual(['partial', '\n', '~ writer retry 1/11 in 1.0s · HTTP 500: overloaded\n']);
+    });
+
+    // F6: a persisted/older/hand-written frame is untrusted input. A malformed retry
+    // must print NOTHING — never "retry undefined/NaN in NaNms", and never throw on a
+    // missing `error` object. The browser's `retryOf` (src/frontend/contract.ts)
+    // applies exactly these rules; the terminal must agree with it.
+    it('ignores every malformed retry frame instead of throwing or inventing a line', () => {
+        const malformed: HarnessEvent[] = [
+            // No `error` at all: `event.error.message` used to throw here.
+            retryWith({ error: undefined }),
+            retryWith({ error: { message: 42 } }),
+            retryWith({ attempt: undefined }),
+            retryWith({ attempt: 0 }),
+            retryWith({ attempt: Number.NaN }),
+            retryWith({ attempt: Number.POSITIVE_INFINITY }),
+            // Budget below the attempt it reports.
+            retryWith({ attempt: 5, maxAttempts: 2 }),
+            retryWith({ maxAttempts: undefined }),
+            retryWith({ delayMs: Number.NaN }),
+            retryWith({ delayMs: -1 }),
+            retryWith({ delayMs: undefined }),
+            // An unnamed frame says nothing about a retry sequence.
+            retryWith({ agent: '' })
+        ];
+
+        for (const frame of malformed) {
+            const { out, err } = renderAll([frame]);
+            expect(out).toEqual([]);
+            expect(err).toEqual([]);
+        }
+    });
+
+    // R3/F1: the per-request success boundary a tool round needs. It is state, not
+    // prose, so the terminal prints nothing for it; `--json` still emits the frame.
+    it('prints nothing for an attempt_commit boundary', () => {
+        const { out, err } = renderAll([
+            { type: 'attempt_commit', agent: 'writer', attempt: 1, maxAttempts: 11 }
+        ]);
+
+        expect(out).toEqual([]);
+        expect(err).toEqual([]);
+    });
+
+    it('emits attempt_commit unchanged under --json', () => {
+        const { out } = renderAll(
+            [{ type: 'attempt_commit', agent: 'writer', attempt: 1, maxAttempts: 11 }],
+            { json: true, color: false }
+        );
+
+        expect(out).toEqual([
+            '{"type":"attempt_commit","agent":"writer","attempt":1,"maxAttempts":11}\n'
+        ]);
     });
 });

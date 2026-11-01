@@ -503,8 +503,11 @@ describe('agentResult', () => {
     it('reports a failed invocation without inventing content', async () => {
         const writer = harness({
             agents: {
+                // R1: one attempt (`retry: false`) — this pins the terminal failure
+                // path, not the retry sequence.
                 writer: brain(
-                    scripted([[{ type: 'error', message: 'transport exploded' }]])
+                    scripted([[{ type: 'error', message: 'transport exploded' }]]),
+                    { retry: false }
                 )
             },
             presets: false
@@ -944,7 +947,10 @@ describe('snapshot durability (R3)', () => {
     it('persists failed results and restores their error', async () => {
         const source = harness({
             agents: {
-                writer: brain(scripted([[{ type: 'error', message: 'transport exploded' }]]))
+                // R1: one attempt — the terminal failure shape is what is pinned here.
+                writer: brain(scripted([[{ type: 'error', message: 'transport exploded' }]]), {
+                    retry: false
+                })
             },
             presets: false
         });

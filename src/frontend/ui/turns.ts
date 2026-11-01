@@ -164,12 +164,14 @@ import type { ThreadTranscriptRefresh } from './thread-transcript';
 import {
     actionAnswerEventOf,
     actionRequestEventOf,
+    attemptCommitOf,
     branchEndEventOf,
     branchStartEventOf,
     callIdOf,
     eventTimesOf,
     finiteOf,
     pendingOf,
+    retryOf,
     threadOf,
     toolDurationOf,
     usageOf,
@@ -896,6 +898,36 @@ type AgentSection = {
     // delegated child can be pending while the parent is idle.
     pending: HTMLElement | undefined;
     pendingCalls: Map<string, HarnessPendingTool>;
+    // R1/R3 attempt boundary: what the CURRENT model attempt appended. A `retry`
+    // frame discards exactly this, because the agent never commits a failed
+    // attempt and its partial prose/calls must not appear as part of the answer.
+    // `undefined` means no attempt output is live (nothing to discard).
+    //
+    // OWNERSHIP BY IDENTITY, NOT BY POSITION (F2/F4). Everything the attempt added
+    // is recorded as the node/card/entry it created, so a discard can never reach
+    // output that belongs to something else in the same flow: a concurrently
+    // streaming sibling agent, a steer node, an action card, a wakeup marker, or a
+    // previously committed turn of THIS agent (which the harness legitimately does
+    // not announce with `done` — see `commitAttempt`).
+    attempt:
+        | {
+              // Flow children this attempt appended (prose block, reasoning block,
+              // tool rows). Only these are removed; every other child stays.
+              nodes: HTMLElement[];
+              // Tool cards this attempt minted (each counted in `toolCount`).
+              cards: ToolCallCard[];
+              // The `pendingTools` entries those cards created, by identity: pruning
+              // only these is what keeps a sibling invocation's pending call (or a
+              // parent delegation) listed after a retry (F2).
+              pendingEntries: PendingTool[];
+              lastText: string | undefined;
+              // Thread keys THIS attempt minted (a `tool_call` for a delegation
+              // queues a placeholder entry). Tracked by creation rather than by a
+              // snapshot diff: a concurrently streaming sibling agent may mint its
+              // own placeholders in the meantime, and those are not ours to remove.
+              createdThreads: string[];
+          }
+        | undefined;
 };
 
 // Lifecycle of one INVOCATION (a thread entry). It is deliberately smaller than
@@ -2695,7 +2727,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 tools: [],
                 toolGroup: undefined,
                 pending: undefined,
-                pendingCalls: new Map()
+                pendingCalls: new Map(),
+                attempt: undefined
             };
         };
 
@@ -3703,12 +3736,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         };
 
         // Return the row consecutive calls should join, creating it lazily so no
-        // empty `.tool-group` ever sits in the flow between two prose blocks.
+        // empty `.tool-group` ever sits in the flow between two prose blocks. A row
+        // created by the CURRENT attempt is tracked as attempt output, so a retry
+        // removes the (then empty) row with the cards it held.
         const toolGroupOf = (section: AgentSection): HTMLElement => {
             if (section.toolGroup === undefined) {
                 const group = el('div', 'tool-group');
                 section.flow.append(group);
                 section.toolGroup = group;
+                trackNode(section, group);
             }
 
             return section.toolGroup;
@@ -3902,7 +3938,159 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             updateMeta();
         };
 
+        // --- model-request retries (R1/R3/R4) --------------------------------
+        //
+        // The agent retries ONE model request after a failed attempt. Its streamed
+        // prose/reasoning/tool calls from that attempt were already forwarded, and
+        // none of it is in the committed history: the retried attempt is discarded.
+        //
+        // The UI therefore remembers WHAT the current attempt appended (identity, not
+        // a position/count snapshot) and truncates exactly that on a `retry`. The
+        // attempt window opens at the attempt's FIRST visible output and is closed by
+        // a `retry` (discard) or by a commit frame (`request_commit` on a new server,
+        // `done` on an older one). See F2/F4 in the section comment above
+        // `AgentSection.attempt`: a positional discard used to delete committed tool
+        // rounds and sibling/parent output, because the harness emits `done` only for
+        // a tool-free response.
+        const beginAttempt = (section: AgentSection): void => {
+            if (section.attempt !== undefined) return;
+            section.attempt = {
+                nodes: [],
+                cards: [],
+                pendingEntries: [],
+                lastText: section.lastText,
+                createdThreads: []
+            };
+        };
+
+        // Register one flow child as attempt output. Called by every appender that
+        // the MODEL's current attempt produces; UI chrome that another source owns
+        // (steer/action/wakeup/error markers) deliberately does not call it.
+        const trackNode = (section: AgentSection, node: HTMLElement): void => {
+            section.attempt?.nodes.push(node);
+        };
+
+        // Discard everything the abandoned attempt appended. Timers on its text block
+        // are cancelled, its tool cards are destroyed and any delegation placeholder
+        // it minted is removed, so nothing of a failed attempt keeps working or stays
+        // visible in the background. Everything ELSE in the flow is untouched.
+        const discardAttempt = (section: AgentSection): void => {
+            const boundary = section.attempt;
+            if (boundary === undefined) return;
+
+            if (section.text !== undefined) cancel(section.text);
+            section.text = undefined;
+
+            // Remove only the cards THIS attempt minted, and only their own pending
+            // entries. A sibling invocation's call (or a parent's delegation) that
+            // happens to be pending at the same time is not ours to prune (F2).
+            const dropped = new Set(boundary.cards);
+            for (const card of boundary.cards) {
+                card.destroy();
+                // F5: the meta line counts calls, so a discarded card must not keep
+                // inflating it.
+                toolCount = Math.max(0, toolCount - 1);
+            }
+            if (dropped.size > 0) {
+                section.tools = section.tools.filter((card) => !dropped.has(card));
+                const entrySet = new Set(boundary.pendingEntries);
+                for (let index = pendingTools.length - 1; index >= 0; index--) {
+                    if (entrySet.has(pendingTools[index])) pendingTools.splice(index, 1);
+                }
+            }
+
+            // A discarded call never ran, so the runtime emits no `tool_result` for
+            // it. Its id is deliberately NOT added to `settledCalls`: a retried
+            // request may legitimately re-issue the same id, and pre-settling it
+            // would make that new card's result look like a duplicate.
+
+            // A delegation placeholder is minted when the CALL is seen, so a failed
+            // attempt can leave one behind. Only the entries THIS attempt created
+            // are removed: a concurrently streaming sibling agent's placeholder is
+            // recorded on ITS section, never here.
+            for (const key of boundary.createdThreads) {
+                const entry = threads.get(key);
+                if (entry === undefined) continue;
+                threads.delete(key);
+                entry.row?.remove();
+            }
+
+            // Remove exactly the flow children this attempt appended. A steer, action
+            // card, wakeup marker or error notice that landed meanwhile stays (F4),
+            // and so does every committed turn of this agent.
+            for (const node of boundary.nodes) {
+                if (node.parentNode === section.flow) section.flow.removeChild(node);
+            }
+
+            // The status line is not attempt output, so it survived the removal above;
+            // re-appending an attached node MOVES it, which keeps it last exactly as
+            // `renderPending` expects.
+            if (section.pending !== undefined) section.flow.append(section.pending);
+
+            section.reasoning = undefined;
+            section.toolGroup = undefined;
+            section.lastText = boundary.lastText;
+            // Nothing from this attempt is live any more; the next attempt takes its
+            // own boundary at its first output.
+            section.attempt = undefined;
+            updateMeta();
+        };
+
+        // Close the attempt window WITHOUT discarding it: the attempt's output is
+        // committed, so a later retry of a LATER request must never touch it. This is
+        // what a `done` frame used to be the only signal for, which is why a
+        // completed tool round was being deleted (F1).
+        //
+        // It ALSO detaches the incremental stream writers. The committed nodes stay
+        // in the flow (and keep their content), but `section.text`/`section.reasoning`
+        // must not point at them any more: the next request would otherwise append
+        // its own deltas INTO the committed block, fusing two requests' output into
+        // one node — and that fused node is unowned, so a retry could not remove the
+        // failed half (T8 defect 1). Closing here means every request streams into
+        // blocks of its own.
+        const commitAttempt = (section: AgentSection): void => {
+            if (section.attempt === undefined) return;
+
+            // `closeText` flushes and retains `lastText` for the # descriptor, then
+            // clears the pointer; the committed node itself is untouched.
+            closeText(section);
+            // Reasoning has no `lastText` contract: the committed `<details>` keeps
+            // its text, only the writer is dropped so the next request mints its own.
+            section.reasoning = undefined;
+            section.toolGroup = undefined;
+
+            // The committed nodes/cards/placeholders stay live and stay owned by the
+            // section; only the discard bookkeeping is dropped.
+            section.attempt = undefined;
+        };
+
+        // One retry notice. Concise by design: the count, the backoff and the failed
+        // attempt's error, in the same quiet mono register as a wakeup marker.
+        const appendRetry = (
+            section: AgentSection,
+            attempt: number,
+            maxAttempts: number,
+            delayMs: number,
+            message: string
+        ): void => {
+            closeText(section);
+            closeToolGroup(section);
+
+            const node = el('div', 'agent-retry');
+            node.dataset.attempt = String(attempt);
+            node.append(el('span', 'agent-retry-label', 'retry'));
+            node.append(
+                el(
+                    'span',
+                    'agent-retry-text',
+                    `attempt ${attempt} of ${maxAttempts} failed · retrying in ${formatDuration(delayMs)} · ${message}`
+                )
+            );
+            section.flow.append(node);
+        };
+
         const appendText = (section: AgentSection, delta: string): void => {
+            beginAttempt(section);
             // Prose after a call ends the tool row: the next call must start below
             // this text rather than float back up into the previous group.
             closeToolGroup(section);
@@ -3911,6 +4099,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 const node = el('div', 'markdown agent-text');
                 section.flow.append(node);
                 section.text = { node, buffer: '', handle: undefined, viaFrame: false };
+                // Attempt output: a retry removes this block with the rest.
+                trackNode(section, node);
             }
 
             // The pending summary is a status line: it stays after any new prose.
@@ -3922,6 +4112,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         };
 
         const appendReasoning = (section: AgentSection, delta: string): void => {
+            beginAttempt(section);
             // Reasoning is its own flow block, so it breaks the chip row exactly
             // like assistant prose does.
             closeToolGroup(section);
@@ -3933,6 +4124,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 details.append(summary, reasoningBody);
                 section.flow.append(details);
                 section.reasoning = { details, summary, body: reasoningBody, buffer: '' };
+                // Attempt output: a retry removes the whole block.
+                trackNode(section, details);
             }
 
             // Status line last, exactly like prose.
@@ -3980,6 +4173,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             origin: ApplyOrigin
         ): void => {
             const section = entry.section;
+            // A tool call is attempt output: a failed attempt's call is discarded
+            // with the rest of its stream and was never executed (R3).
+            beginAttempt(section);
 
             // Text written before a tool call is finished text: close it so the
             // card lands *after* it, and so post-tool prose starts a new block.
@@ -3997,8 +4193,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             toolGroupOf(section).append(card.element);
             // A new call must appear ABOVE the pending summary line, never below it.
             if (section.pending !== undefined) section.flow.append(section.pending);
-            pendingTools.push({ card, section, entry, name, callId, startedAt });
+            const pendingEntry: PendingTool = { card, section, entry, name, callId, startedAt };
+            pendingTools.push(pendingEntry);
             toolCount += 1;
+            // Record the card (and its own pending entry) as THIS attempt's output,
+            // so a discard removes exactly this call and never a sibling's (F2/F5).
+            section.attempt?.cards.push(card);
+            section.attempt?.pendingEntries.push(pendingEntry);
 
             // Queued delegation placeholder (legacy fallback, R3): the entry appears
             // WHEN the call is made, under the invocation that made it, and is
@@ -4021,6 +4222,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                             started: false,
                             state: 'queued'
                         });
+                        // Record the placeholder on the ATTEMPT that minted it, so a
+                        // retry removes exactly this attempt's rows.
+                        section.attempt?.createdThreads.push(key);
                     }
                 }
             }
@@ -4098,6 +4302,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             toolGroupOf(section).append(card.element);
             section.tools.push(card);
             toolCount += 1;
+            // F5: this card is attempt output when the attempt window is open, so a
+            // retry removes it AND decrements the count it just incremented.
+            section.attempt?.cards.push(card);
             updateMeta();
             return { entry: owner, section, callId: undefined };
         };
@@ -4259,6 +4466,45 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     appendText(route().section, event.delta);
                     break;
 
+                // R1/R3/R4: a failed model attempt was abandoned and the same
+                // request is re-sent. The failed attempt's partial output is removed
+                // (the agent never committed it), then a one-line notice records the
+                // retry count, the backoff and the original error. The NEXT attempt
+                // gets a fresh boundary, so its output survives normally.
+                case 'retry': {
+                    const frame = retryOf(event);
+                    if (frame === undefined) break;
+
+                    const entry = route();
+                    const section = entry.section;
+                    discardAttempt(section);
+                    appendRetry(
+                        section,
+                        frame.attempt,
+                        frame.maxAttempts,
+                        frame.delayMs,
+                        frame.error.message
+                    );
+                    break;
+                }
+
+                // R3/F1: the request SUCCEEDED and its answer is committed. Close the
+                // attempt window so a retry of a LATER request can never discard this
+                // turn's output. This is the boundary a tool-calling round needs: the
+                // harness emits `done` only for a tool-free response, so without this
+                // frame the NEXT request's `retry` deleted an already committed round.
+                //
+                // An OLDER recording has no such frame; there the historical `done`
+                // case below still closes the window, which is exactly the old
+                // behaviour for the sequences those recordings contain.
+                case 'attempt_commit': {
+                    const frame = attemptCommitOf(event);
+                    if (frame === undefined) break;
+
+                    commitAttempt(route().section);
+                    break;
+                }
+
                 case 'tool_call':
                     appendTool(route(), event.call.name, event.call.arguments, event.call.id, at, origin);
                     break;
@@ -4358,6 +4604,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     const section = entry.section;
                     const message = event.message;
                     closeText(section);
+                    // R1/R3: a completed response closes the attempt window. Anything a
+                    // LATER attempt appends is its own, so a retry must never discard
+                    // this turn's committed output. (On a server that emits
+                    // `attempt_commit`, the window was already closed there — this is
+                    // the older-recording path and stays a no-op then.)
+                    commitAttempt(section);
                     // A provider can omit streamed deltas and put the answer only on
                     // the terminal message. Keep that answer as the block content too.
                     if (message.content.length > 0) section.lastText = message.content;

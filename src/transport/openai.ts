@@ -248,7 +248,16 @@ const dataPayload = (line: string): string | undefined => {
 
 // Turn a response body into the sequence of `data:` payloads it carries.
 // Stops when the provider sends the [DONE] sentinel.
-async function* dataFrames(body: ReadableStream<Uint8Array>): AsyncGenerator<string> {
+//
+// `state.sentinel` records whether that sentinel was actually seen: a body that
+// closes WITHOUT it is a TRUNCATED stream (a dropped connection or a proxy that
+// ended the response early), which the caller reports as a failure rather than
+// committing a half answer. The flag is the only thing the caller needs, so it
+// travels by reference instead of changing the yielded payload type.
+async function* dataFrames(
+    body: ReadableStream<Uint8Array>,
+    state: { sentinel: boolean }
+): AsyncGenerator<string> {
     const reader = body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
@@ -267,14 +276,21 @@ async function* dataFrames(body: ReadableStream<Uint8Array>): AsyncGenerator<str
             for (const line of lines) {
                 const payload = dataPayload(line);
                 if (payload === undefined) continue;
-                if (payload === '[DONE]') return;
+                if (payload === '[DONE]') {
+                    state.sentinel = true;
+                    return;
+                }
                 yield payload;
             }
         }
 
         // Flush a final line that arrived without a trailing newline.
         const trailing = dataPayload(buffer);
-        if (trailing !== undefined && trailing !== '[DONE]') yield trailing;
+        if (trailing === '[DONE]') {
+            state.sentinel = true;
+            return;
+        }
+        if (trailing !== undefined) yield trailing;
     } finally {
         // Consumers stop early on [DONE]; cancel so the socket is not held open.
         await reader.cancel().catch(() => {});
@@ -468,8 +484,10 @@ export const openAICompatible = (configuration: HarnessProviderConfiguration): H
         let finishReason: unknown = null;
         let usage: HarnessUsage | undefined;
         const pendingToolCalls = new Map<number, PendingToolCall>();
+        // Whether the provider actually terminated the stream (`[DONE]`).
+        const streamState = { sentinel: false };
 
-        for await (const frame of dataFrames(response.body)) {
+        for await (const frame of dataFrames(response.body, streamState)) {
             let chunk: any;
             try {
                 chunk = JSON.parse(frame);
@@ -515,6 +533,18 @@ export const openAICompatible = (configuration: HarnessProviderConfiguration): H
             if (chunk.usage) {
                 usage = usageOf(chunk.usage);
             }
+        }
+
+        // Truncation guard (R1): a body that ends WITHOUT the `[DONE]` sentinel and
+        // without a finish_reason never reported a completed generation, so whatever
+        // arrived is half a response (a dropped socket, a proxy closing the body).
+        // It is a FAILED request, not an empty answer: the agent retries it.
+        if (!streamState.sentinel && !finishReason) {
+            yield {
+                type: 'error',
+                message: 'The model stream ended before reporting a completion.'
+            };
+            return;
         }
 
         const toolCalls = finishToolCalls(pendingToolCalls);

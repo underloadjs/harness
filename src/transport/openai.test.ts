@@ -578,4 +578,29 @@ describe('openAICompatible', () => {
             { type: 'error', message: 'Request to http://x/v1/chat/completions failed: ECONNREFUSED' }
         ]);
     });
+
+    // R1: a body that closes WITHOUT `[DONE]` and without a finish_reason is a
+    // truncated stream, not an empty answer. Reporting it as an error frame is what
+    // lets the agent retry it instead of committing half a response.
+    it('reports a truncated stream that never reported a completion', async () => {
+        stubFetch([sse({ choices: [{ delta: { content: 'half' } }] })]);
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(events).toEqual([
+            { type: 'text', delta: 'half' },
+            { type: 'error', message: 'The model stream ended before reporting a completion.' }
+        ]);
+    });
+
+    it('accepts a stream terminated by finish_reason without [DONE]', async () => {
+        stubFetch([sse({ choices: [{ delta: { content: 'complete' }, finish_reason: 'stop' }] })]);
+
+        const events = await collect(openAICompatible({ baseURL: 'http://x/v1' })(request));
+
+        expect(events).toEqual([
+            { type: 'text', delta: 'complete' },
+            { type: 'done', stopReason: 'stop', toolCalls: [], usage: undefined }
+        ]);
+    });
 });

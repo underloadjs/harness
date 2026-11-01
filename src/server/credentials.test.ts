@@ -42,9 +42,14 @@ type Provider = {
 };
 
 // A stub provider that records exactly what it received. `/models` answers a
-// one-model catalogue; anything else (the chat transport) answers 500, which is
-// enough: the request header is recorded before the failure, and the harness
-// turns the failure into a `failed` frame.
+// one-model catalogue; anything else (the chat transport) answers a MINIMAL VALID
+// SSE completion.
+//
+// WHY A SUCCESSFUL STREAM: the agent retries a failed model request (R1) with real
+// doubling backoff, so a 500 here would make this credential test wait out the
+// entire retry sequence. The subject of this file is the `authorization` header on
+// the wire, so the stub completes on the first attempt and the assertion stays
+// about the recorded request.
 const startProvider = async (): Promise<Provider> => {
     const requests: ProviderRequest[] = [];
 
@@ -55,16 +60,20 @@ const startProvider = async (): Promise<Provider> => {
             authorization: request.headers.authorization
         });
 
-        response.setHeader('Content-Type', 'application/json');
-
         if ((request.url ?? '').endsWith('/models')) {
+            response.setHeader('Content-Type', 'application/json');
             response.statusCode = 200;
             response.end(JSON.stringify({ object: 'list', data: [{ id: 'stub-model' }] }));
             return;
         }
 
-        response.statusCode = 500;
-        response.end(JSON.stringify({ error: 'provider unavailable' }));
+        response.setHeader('Content-Type', 'text/event-stream');
+        response.statusCode = 200;
+        response.end(
+            `data: ${JSON.stringify({
+                choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }]
+            })}\n\ndata: [DONE]\n\n`
+        );
     });
 
     await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -126,9 +135,9 @@ const requestModels = async (settings?: unknown): Promise<ModelIndex> => {
 };
 
 // Create a preset session (through the legacy `writer` alias), submit one task,
-// and fully drain the SSE stream so the run finishes before assertions. The
-// terminal frame is always `failed` here because the stub answers 500; only the
-// recorded request matters.
+// and fully drain the SSE stream so the run finishes before assertions. The stub
+// provider completes on the first attempt (see startProvider), so the terminal
+// frame is `snapshot`/`turn`; only the recorded request matters here.
 const runWriter = async (settings: unknown): Promise<void> => {
     const created = await post('/api/sessions', { harness: 'writer', settings });
     expect(created.status).toBe(201);
@@ -137,7 +146,7 @@ const runWriter = async (settings: unknown): Promise<void> => {
     const stream = await post(`/api/sessions/${session.id}/messages`, { input: 'hello' });
     expect(stream.status).toBe(200);
     expect(stream.headers.get('content-type')).toBe('text/event-stream; charset=utf-8');
-    expect(await stream.text()).toContain('"type":"failed"');
+    expect(await stream.text()).toContain('"type":"snapshot"');
 };
 
 describe('server credential containment', () => {

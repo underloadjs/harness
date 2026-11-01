@@ -14,6 +14,7 @@ import type {
 import {
     agentModelsOf,
     agentsFromDescriptors,
+    attemptCommitOf,
     builtinOf,
     callIdOf,
     canonicalHarnessName,
@@ -27,6 +28,7 @@ import {
     modelsForMembers,
     pendingOf,
     primaryOf,
+    retryOf,
     subagentsOf,
     toolDurationOf,
     uniqueNames,
@@ -450,5 +452,89 @@ describe('background tool fields (R6)', () => {
         // Malformed: no agent means the frame cannot be attributed to a section.
         expect(wakeupOf(wakeupWith({ agent: '' }))).toBeUndefined();
         expect(wakeupOf(resultWith({}))).toBeUndefined();
+    });
+});
+
+// R1/R4: a retried model request must be renderable from its frame alone, and a
+// malformed frame must render NOTHING rather than a fabricated "retry 0 in 0ms".
+describe('model-request retries (R1)', () => {
+    const retryWith = (fields: Record<string, unknown> = {}): HarnessEvent =>
+        ({
+            type: 'retry',
+            agent: 'writer',
+            attempt: 1,
+            maxAttempts: 11,
+            delayMs: 1_000,
+            error: { message: 'HTTP 500: overloaded' },
+            ...fields
+        }) as unknown as HarnessEvent;
+
+    it('accepts a well-formed retry frame unchanged', () => {
+        expect(retryOf(retryWith())).toEqual({
+            type: 'retry',
+            agent: 'writer',
+            attempt: 1,
+            maxAttempts: 11,
+            delayMs: 1_000,
+            error: { message: 'HTTP 500: overloaded' }
+        });
+    });
+
+    it('rejects a frame that says nothing usable about the sequence', () => {
+        expect(retryOf(retryWith({ agent: '' }))).toBeUndefined();
+        expect(retryOf(retryWith({ attempt: 0 }))).toBeUndefined();
+        expect(retryOf(retryWith({ attempt: undefined }))).toBeUndefined();
+        expect(retryOf(retryWith({ attempt: 'one' }))).toBeUndefined();
+        // A budget smaller than the failed attempt is incoherent.
+        expect(retryOf(retryWith({ maxAttempts: 0 }))).toBeUndefined();
+        expect(retryOf(retryWith({ delayMs: -1 }))).toBeUndefined();
+        expect(retryOf(retryWith({ delayMs: undefined }))).toBeUndefined();
+        expect(retryOf(retryWith({ error: undefined }))).toBeUndefined();
+        // Every other event type is not a retry.
+        expect(retryOf(resultWith({}))).toBeUndefined();
+        expect(retryOf(wakeupWith())).toBeUndefined();
+    });
+});
+
+// R3/F1: the per-request SUCCESS boundary. It is the frame a consumer needs to stop
+// discarding output, because the harness emits `done` only for a tool-free response
+// (so a committed tool round has no `done` at all).
+describe('model-request success boundary (R3)', () => {
+    const commitWith = (fields: Record<string, unknown> = {}): HarnessEvent =>
+        ({
+            type: 'attempt_commit',
+            agent: 'writer',
+            attempt: 1,
+            maxAttempts: 11,
+            ...fields
+        }) as unknown as HarnessEvent;
+
+    it('accepts a well-formed commit frame unchanged', () => {
+        expect(attemptCommitOf(commitWith())).toEqual({
+            type: 'attempt_commit',
+            agent: 'writer',
+            attempt: 1,
+            maxAttempts: 11
+        });
+        // A later successful attempt is equally valid.
+        expect(attemptCommitOf(commitWith({ attempt: 3 }))).toEqual({
+            type: 'attempt_commit',
+            agent: 'writer',
+            attempt: 3,
+            maxAttempts: 11
+        });
+    });
+
+    it('rejects a frame that cannot name a committed attempt', () => {
+        expect(attemptCommitOf(commitWith({ agent: '' }))).toBeUndefined();
+        expect(attemptCommitOf(commitWith({ attempt: 0 }))).toBeUndefined();
+        expect(attemptCommitOf(commitWith({ attempt: undefined }))).toBeUndefined();
+        expect(attemptCommitOf(commitWith({ attempt: Number.NaN }))).toBeUndefined();
+        // A budget below the attempt it reports is incoherent.
+        expect(attemptCommitOf(commitWith({ attempt: 5, maxAttempts: 2 }))).toBeUndefined();
+        expect(attemptCommitOf(commitWith({ maxAttempts: undefined }))).toBeUndefined();
+        // Every other event type is not a boundary.
+        expect(attemptCommitOf(resultWith({}))).toBeUndefined();
+        expect(attemptCommitOf(wakeupWith())).toBeUndefined();
     });
 });

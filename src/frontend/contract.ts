@@ -605,6 +605,54 @@ export const wakeupOf = (event: HarnessEvent): HarnessWakeupEvent | undefined =>
     return { type: 'wakeup', agent: event.agent, reason: event.reason, pending };
 };
 
+// --- Model-request retries (R1/R4) -------------------------------------------
+//
+// A retried request is ONE request: the failed attempt's streamed output is
+// discarded and the same payload is re-sent after `delayMs`. The frame carries the
+// failed attempt index, the total attempt budget and that attempt's own error, so a
+// client can render "2 of 11" without guessing. Everything from the previous
+// boundary belongs to the failed attempt.
+//
+// Validation mirrors `wakeupOf`: a frame with no usable attempt/delay says nothing
+// about the retry sequence, so it renders NOTHING rather than a fabricated
+// "retry 0 in 0ms".
+export type HarnessRetryEvent = Extract<HarnessEvent, { type: 'retry' }>;
+
+export const retryOf = (event: HarnessEvent): HarnessRetryEvent | undefined => {
+    if (event.type !== 'retry') return undefined;
+    if (typeof event.agent !== 'string' || event.agent.length === 0) return undefined;
+
+    const attempt = finiteOf(event.attempt);
+    const maxAttempts = finiteOf(event.maxAttempts);
+    const delayMs = finiteOf(event.delayMs);
+
+    if (attempt === undefined || attempt < 1) return undefined;
+    if (maxAttempts === undefined || maxAttempts < attempt) return undefined;
+    if (delayMs === undefined || delayMs < 0) return undefined;
+    if (typeof event.error?.message !== 'string') return undefined;
+
+    return event;
+};
+
+// The SUCCESS boundary of one model request (R3/F1), or undefined for every other
+// event type. Validated like `retryOf`: a frame whose attempt/budget is not a
+// usable number says nothing about a committed request, so it is ignored rather
+// than closing the wrong attempt window.
+export type HarnessAttemptCommitEvent = Extract<HarnessEvent, { type: 'attempt_commit' }>;
+
+export const attemptCommitOf = (event: HarnessEvent): HarnessAttemptCommitEvent | undefined => {
+    if (event.type !== 'attempt_commit') return undefined;
+    if (typeof event.agent !== 'string' || event.agent.length === 0) return undefined;
+
+    const attempt = finiteOf(event.attempt);
+    const maxAttempts = finiteOf(event.maxAttempts);
+
+    if (attempt === undefined || attempt < 1) return undefined;
+    if (maxAttempts === undefined || maxAttempts < attempt) return undefined;
+
+    return event;
+};
+
 // Agent presets from descriptor data, for an older server with no agents list.
 // The seed is intentionally minimal: the picker still works, and the detail panel
 // says the server did not advertise an instruction.

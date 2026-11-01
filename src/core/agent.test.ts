@@ -276,10 +276,14 @@ describe('agent', () => {
         ]);
     });
 
+    // R1: retries are opt-out, and these three pin the FAILURE contract itself, so
+    // they run with a single attempt (`retry: false`). The retry sequence has its
+    // own suite below.
     it('turn() throws instead of yielding an error event', async () => {
         const brain = agent({
             model: 'm',
-            stream: fakeStream([{ type: 'error', message: 'boom' }])
+            stream: fakeStream([{ type: 'error', message: 'boom' }]),
+            retry: false
         });
 
         await expect(collect(brain.turn())).rejects.toThrow('boom');
@@ -289,7 +293,8 @@ describe('agent', () => {
         const brain = agent({
             model: 'm',
             instruction: 'You are a writer.',
-            stream: fakeStream([{ type: 'text', delta: 'partial' }, { type: 'error', message: 'boom' }])
+            stream: fakeStream([{ type: 'text', delta: 'partial' }, { type: 'error', message: 'boom' }]),
+            retry: false
         });
 
         const events = await collect(brain.stream('Say hello'));
@@ -308,7 +313,7 @@ describe('agent', () => {
             throw new Error('socket hang up');
         };
 
-        const brain = agent({ model: 'm', stream: throwing });
+        const brain = agent({ model: 'm', stream: throwing, retry: false });
 
         const events = await collect(brain.stream('Say hello'));
 

@@ -331,8 +331,8 @@ surface, so consumers only ever import from `@underload/harness`.
 
 ### `agent()` — the brain
 
-Model, instruction, message history, and exactly one transport call per turn.
-It owns no policy: no tool execution, no compaction, no planning.
+Model, instruction, message history, and the model-request retry sequence for one
+turn. It owns no other policy: no tool execution, no compaction, no planning.
 
 ```ts
 import { agent } from '@underload/harness';
@@ -380,6 +380,35 @@ for calls that were still pending; it shares the transport (and therefore creden
 and external tool side effects), so it is a conversation copy, **not a sandbox**.
 `agent.messages` on the source is never touched. In a harness, the same primitive
 backs the `threadFork` tool.
+
+#### Retries
+
+The agent is the **single retry owner** for model calls. One `stream()` / `turn()`
+may call the transport more than once, and a retry re-sends **only the current
+request** — never a tool, never the whole run.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| attempts | 1 + 10 retries | `retry: { maxRetries }` (default `10`); `retry: false` disables retries |
+| waits | `1000 * 2 ** n` ms, n = 0..9 | 1s, 2s, 4s, … 512s (`retry: { baseDelayMs }` changes the base) |
+| success | first successful attempt | later retries are never made |
+| exhaustion | 11th call fails | the **last attempt's own error** is thrown / yielded |
+
+Every model-call failure is retried, not just 5xx: a returned `error` frame (any
+HTTP status, a provider error attached to a `200` stream, a malformed frame, a
+truncated stream), a thrown network error, and a stream that throws mid-flight.
+**Cancellation is not retried**: an abort before an attempt, during a backoff, or
+while a request is in flight ends the request immediately.
+
+A failed attempt's partial text, reasoning and tool calls are discarded — they are
+never committed to history, so no tool from an abandoned attempt can run. The
+`retry` event (and `AgentStreamEvent`'s `retry` frame) reports the attempt, the
+budget, the backoff and the failed attempt's error, which is what a UI/CLI renders.
+
+```ts
+agent({ model: 'x', provider: { baseURL }, retry: { maxRetries: 3, baseDelayMs: 500 } });
+agent({ model: 'x', provider: { baseURL }, retry: false });   // one attempt, fail fast
+```
 
 ### `tool()` — an action the model can request, or you can call
 
@@ -1372,6 +1401,12 @@ terminal frame — partial arguments are not executable.
 Usage is captured when a provider reports it and left `undefined` when it does
 not.
 
+The transport never retries: it reports every failure as an `error` frame (any HTTP
+status, a provider error on a `200` stream, a malformed frame, a truncated stream
+that never reported a completion) or by throwing. Retries belong to the **agent**
+(see [`agent()` → Retries](#retries)), so there is exactly one retry owner and a
+custom transport gets the same behaviour for free.
+
 ### Model catalogue
 
 `listModels()` performs the sibling lookup the UI needs for a model dropdown:
@@ -1423,6 +1458,8 @@ try {
 | `usage` | `agent`, `usage` (`input`, `output`, `total`, optional `cached`) — one per model request, tool rounds included |
 | `done` | `agent`, `message`, optional `pending` |
 | `wakeup` | `agent`, `reason: 'pending-tools'`, `pending` |
+| `retry` | `agent`, `attempt`, `maxAttempts`, `delayMs`, `error: { message }` — the failed model attempt was discarded and the same request is re-sent |
+| `attempt_commit` | `agent`, `attempt`, `maxAttempts` — one model request SUCCEEDED and its answer is committed. Emitted for every committed response that does NOT get a `done`: a tool-calling round (closed after its tool calls) and a text response superseded before it could be reported. Everything before it is final, so a later `retry` of a NEWER request must not discard it |
 | `action_request` | `agent`, `callId`, `request` (parsed `HarnessActionRequest`) |
 | `action_answer` | `agent`, `requestId`, `answer` (`source: 'owner' \| 'auto'`, optional `branchId`) |
 | `branch_start` | `agent`, `branch` (`HarnessBranchSummary`) |

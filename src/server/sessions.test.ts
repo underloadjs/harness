@@ -473,7 +473,8 @@ describe('SessionStore turns', () => {
             return item.event;
         });
 
-        // One start, one usage per request, the tool round in between, then the
+        // One start, one usage per request, the tool round in between (closed by its
+        // `attempt_commit`, since a tool round gets no `done` — R3/F1), then the
         // answer. Each request's usage precedes its own terminal message.
         expect(events).toEqual([
             { type: 'start', agent: 'rounds', model: 'scripted/test' },
@@ -483,6 +484,7 @@ describe('SessionStore turns', () => {
                 agent: 'rounds',
                 call: { id: 'c1', name: 'todoManage', arguments: '{"action":"list"}' }
             },
+            { type: 'attempt_commit', agent: 'rounds', attempt: 1, maxAttempts: 11 },
             {
                 type: 'tool_result',
                 agent: 'rounds',
@@ -524,11 +526,13 @@ describe('SessionStore turns', () => {
         expect(terminal.session.turns[0].usage).toEqual({ input: 6, output: 4, total: 10 });
 
         // The final event frame carries the same running tally after the second sum.
+        // Index 7 is the last event now: the tool round's `attempt_commit` (R3/F1)
+        // shifted the final `done` one slot later.
         expect(items.at(-2)).toEqual({
             type: 'event',
             turnId: opening.turn.id,
             at: 2_000,
-            event: events[6],
+            event: events[7],
             usage: { input: 6, output: 4, total: 10 }
         });
     });
@@ -714,6 +718,11 @@ describe('SessionStore turns', () => {
                 // prompt travels on this frame only.
                 thread: { id: '2', callId: 'call_1', input: 'find it' }
             },
+            // R3/F1: the lead's tool-calling request committed its answer. It gets no
+            // `done` (the harness emits `done` only for a tool-free response), so this
+            // is the only frame that closes the round — emitted once the call is
+            // launched, before the delegated child's remaining output.
+            { type: 'attempt_commit', agent: 'lead', attempt: 1, maxAttempts: 11 },
             {
                 type: 'text',
                 agent: 'helper',
@@ -1024,7 +1033,9 @@ describe('SessionStore turns', () => {
                         instruction: 'Fail.',
                         stream: async function* (): AsyncGenerator<HarnessStreamEvent> {
                             yield { type: 'error', message: 'provider exploded' };
-                        }
+                        },
+                        // R1: one attempt — this pins the terminal error turn.
+                        retry: false
                     })
                 },
                 primary: 'broken',

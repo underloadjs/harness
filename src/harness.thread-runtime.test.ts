@@ -49,7 +49,8 @@ const callTool = (id: string, name: string, args: string): HarnessStreamEvent[] 
     { type: 'done', stopReason: 'tool_calls', toolCalls: [{ id, name, arguments: args }] }
 ];
 
-const brain = (stream: HarnessStream): Agent => agent({ model: 'merge/ds4-flash', stream });
+const brain = (stream: HarnessStream, extra: Record<string, unknown> = {}): Agent =>
+    agent({ model: 'merge/ds4-flash', stream, ...extra });
 
 const quiet = (entry: Agent, tools: Record<string, any> = {}) =>
     harness({ agents: { writer: entry }, tools, presets: false });
@@ -1638,6 +1639,8 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
 
             if (requests === 3) {
                 yield { type: 'text', delta: 'partial' };
+                // R1: one attempt — this pins the failed-run steering preservation,
+                // so the retry backoff must not sit between the two requests.
                 yield { type: 'error', message: 'boom' };
                 return;
             }
@@ -1647,7 +1650,7 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
         };
 
         const writer = harness({
-            agents: { writer: brain(stream) },
+            agents: { writer: brain(stream, { retry: false }) },
             tools: { hold: holdTool },
             presets: false
         });

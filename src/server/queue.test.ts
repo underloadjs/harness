@@ -185,13 +185,16 @@ const failingFixture = (): HarnessPreset =>
                         const prompt = lastUser(request.messages);
 
                         if (prompt === 'boom') {
+                            // R1: one attempt — the queue's failed-task path is what is
+                            // pinned here, not the retry backoff.
                             yield { type: 'error', message: 'provider exploded' };
                             return;
                         }
 
                         yield { type: 'text', delta: `ok:${prompt}` };
                         yield { type: 'done', stopReason: 'stop', toolCalls: [] };
-                    }
+                    },
+                    retry: false
                 })
             },
             primary: 'flaky',

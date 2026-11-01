@@ -374,7 +374,21 @@ describeService('service endpoint discovery and canonical API', () => {
             events
                 .filter((event) => event.type !== 'text' && event.type !== 'reasoning')
                 .map((event) => event.type)
-        ).toEqual(['start', 'usage', 'tool_call', 'tool_result', 'usage', 'tool_call', 'tool_result', 'usage', 'done']);
+        ).toEqual([
+            'start',
+            'usage',
+            'tool_call',
+            // R3/F1: each tool-calling request closes with `attempt_commit` (a tool
+            // round never gets a `done`).
+            'attempt_commit',
+            'tool_result',
+            'usage',
+            'tool_call',
+            'attempt_commit',
+            'tool_result',
+            'usage',
+            'done'
+        ]);
         // The dispatcher must not reshape frames: every event names its turn.
         for (const item of items) {
             if (item.type === 'event') expect(item.turnId).toBe(first.turn.id);

@@ -2827,6 +2827,29 @@ button {
     font-size: 11px;
 }
 
+/* Model-request retry (R1): the failed attempt was discarded and the same request
+   is re-sent. Same quiet register as a wakeup - status, not prose - and the text
+   is clamped so a long provider error cannot dominate the tile. */
+.agent-retry {
+    display: flex;
+    gap: 8px;
+    padding: 3px 0 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+.agent-retry-label {
+    color: var(--warn);
+    text-transform: uppercase;
+    letter-spacing: 0.09em;
+}
+
+.agent-retry-text {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
 .agent-wakeup-label {
     color: var(--accent);
     text-transform: uppercase;

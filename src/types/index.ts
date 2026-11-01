@@ -171,6 +171,27 @@ export type HarnessUsage = {
 // Transport
 // ---------------------------------------------------------------------------
 
+// Model-request retry policy (R1). The agent is the SINGLE retry owner: one
+// `stream()`/`turn()` may therefore call the transport more than once, and every
+// retry re-sends ONLY this request (never a tool, never a whole run).
+//
+// Defaults (documented in README/knowledge): one initial attempt plus TEN retries
+// with doubling waits of `1000 * 2 ** n` ms for n = 0..9 (1s, 2s, 4s ... 512s).
+// A successful attempt ends the sequence immediately; when the last retry also
+// fails, the original error of that final attempt is what the caller sees.
+//
+// `false` disables retries (one attempt, first failure wins). A host that wants
+// a shorter/longer sequence supplies `maxRetries` / `baseDelayMs`. Values are
+// validated at construction, like every other numeric bound.
+export type HarnessRetryConfiguration =
+    | false
+    | {
+          // Retries AFTER the initial attempt. 0 = one attempt, no retry.
+          maxRetries?: number;
+          // Wait before retry n (1-based) is `baseDelayMs * 2 ** (n - 1)`.
+          baseDelayMs?: number;
+      };
+
 // One request sent to a model. The transcript is passed by value: transports
 // never mutate agent history.
 export type HarnessStreamRequest = {
@@ -253,6 +274,11 @@ export type AgentConfiguration = {
     provider?: HarnessProviderConfiguration;
     // Explicit transport. Takes precedence over `provider`.
     stream?: HarnessStream;
+    // Model-request retry policy (R1). Omit for the default: one initial attempt
+    // plus ten retries with 1s..512s doubling waits. `false` = one attempt only.
+    // Retries re-send ONLY the current model request; tools and the run are never
+    // replayed.
+    retry?: HarnessRetryConfiguration;
 };
 
 // Overload-style accessor so `agent.model()` reads and `agent.model('x')`
@@ -299,11 +325,48 @@ export type AgentStreamOptions = {
 // Events yielded by Agent.stream / Agent.turn. `error` is yielded by stream()
 // (which keeps history clean and lets a caller keep going); turn() throws
 // instead, because the harness owns recovery there.
+//
+// `retry` (R1/R4) is emitted BETWEEN attempts of the same model request: the
+// attempt that just failed is abandoned, and the request is re-sent after
+// `delayMs`. Everything streamed since the previous `retry`/`done` boundary
+// belongs to the FAILED attempt and must be discarded by a consumer that wants
+// the final answer only (the harness/UI do exactly that); the committed history
+// never contains it, because the agent only commits a successful attempt.
+//
+// The SUCCESS end of a request is the generator's RETURN value
+// (`AgentRequestCommit`), never an event: the agent's event stream is unchanged,
+// and the harness — the only layer that knows whether its own `done` will follow —
+// decides whether that boundary becomes a visible `attempt_commit` event.
 export type AgentStreamEvent =
     | { type: 'text'; delta: string }
     | { type: 'reasoning'; delta: string }
+    | {
+          type: 'retry';
+          // The attempt that just failed (1-based).
+          attempt: number;
+          // Total attempts allowed (initial + retries). Attempt `maxAttempts`
+          // failing is terminal: no further retry follows.
+          maxAttempts: number;
+          // Backoff before the next attempt, in milliseconds.
+          delayMs: number;
+          // The failed attempt's error, preserved verbatim.
+          error: HarnessErrorInfo;
+      }
     | { type: 'done'; message: HarnessAssistantMessage }
     | { type: 'error'; error: HarnessErrorInfo };
+
+// The success boundary of one model request (R3). Yielded as the RETURN value of
+// `Agent.turn`/`Agent.stream`, after the answer has been appended to history:
+// everything streamed before it is committed and must never be discarded by a
+// retry of a LATER request. `done` alone cannot carry that meaning because the
+// harness emits `done` only for a tool-free response, so a completed tool round
+// would otherwise have no marker at all.
+export type AgentRequestCommit = {
+    // The attempt that SUCCEEDED (1-based): the request's last one.
+    attempt: number;
+    // Total attempts the request was allowed.
+    maxAttempts: number;
+};
 
 // Serialisable error shape. Events cross CLI/RPC boundaries, so failures travel
 // as data rather than as Error instances.
@@ -334,8 +397,10 @@ export type Agent = {
     stream: (input: string, options?: AgentStreamOptions) => AsyncIterable<AgentStreamEvent>;
     // Run one turn against the current history, without appending a user
     // message. This is the primitive the harness loop re-requests with after a
-    // tool result. Throws on failure.
-    turn: (options?: AgentStreamOptions) => AsyncIterable<AgentStreamEvent>;
+    // tool result. Throws on failure. Its generator RETURNS an
+    // `AgentRequestCommit` naming the attempt that succeeded (see that type), which
+    // is the request's success boundary for a caller that needs one.
+    turn: (options?: AgentStreamOptions) => AsyncGenerator<AgentStreamEvent, AgentRequestCommit | undefined>;
     // N3: create a PRIVATE branch that owns a detached copy of this agent's
     // entire committed history, model value, instructions and reset baseline.
     // It shares the transport (and therefore provider credentials / external
@@ -1581,6 +1646,45 @@ export type HarnessEvent =
           agent: string;
           message: HarnessAssistantMessage;
           pending?: HarnessPendingTool[];
+          thread?: HarnessThread;
+      }
+    // A model-request retry (R1/R4). The agent retried the CURRENT request after
+    // `attempt` failed (any HTTP status, a provider error frame, a malformed/
+    // truncated stream, or a thrown network/midstream error); `delayMs` is the
+    // backoff that precedes attempt `attempt + 1`. `error` is the failed attempt's
+    // own message, preserved.
+    //
+    // R3: the retried attempt is DISCARDED. Text/reasoning/tool calls streamed
+    // between the previous boundary (`start`/`retry`/`done`) and this frame belong
+    // to the FAILED attempt: a consumer must not render them as part of the answer,
+    // and no tool from them is ever executed (the agent never commits a failed
+    // attempt, so the harness never sees its tool calls). Absent for a request that
+    // succeeded on its first attempt, so an ordinary run keeps its old event shape.
+    | {
+          type: 'retry';
+          agent: string;
+          attempt: number;
+          maxAttempts: number;
+          delayMs: number;
+          error: HarnessErrorInfo;
+          thread?: HarnessThread;
+      }
+    // One model request SUCCEEDED (R3). Everything streamed since the previous
+    // boundary (`start`/`retry`/`attempt_commit`/`done`) for this agent is
+    // committed and final: a later `retry` belongs to a NEWER request and must not
+    // discard it.
+    //
+    // This frame exists because `done` cannot mark that boundary: the harness emits
+    // `done` only for a tool-free response, so a completed tool-calling round is
+    // committed with no `done` at all. A consumer that only saw `retry`/`done`
+    // therefore could not tell a committed tool round from abandoned output and
+    // deleted it on the next retry. Absent from older recordings, where consumers
+    // keep their historical `done`-only boundary behaviour.
+    | {
+          type: 'attempt_commit';
+          agent: string;
+          attempt: number;
+          maxAttempts: number;
           thread?: HarnessThread;
       }
     // Recurring heartbeat while background calls are pending (R4): the configured

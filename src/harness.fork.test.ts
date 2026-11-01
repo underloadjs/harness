@@ -584,6 +584,8 @@ describe('threadFork runtime', () => {
         ).toHaveLength(1);
 
         // Failure of a branch's transport is a normal error-shaped tool result.
+        // R1: one attempt — a branch failure is what is pinned here, not the retry
+        // sequence (which would otherwise wait out the real backoff).
         const failing = brain(
             routed((request) => {
                 if (latestUser(request) === 'fail') throw new Error('provider exploded');
@@ -595,7 +597,8 @@ describe('threadFork runtime', () => {
                     return call('f1', 'threadFork', '{"input":"fail"}');
                 }
                 return answer('waiting');
-            })
+            }),
+            { retry: false }
         );
 
         const second = harness({ agents: { writer: failing }, presets: false });

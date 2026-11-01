@@ -527,18 +527,28 @@ describe('harness', () => {
 
         await writer('go');
 
-        expect(events.map((event) => event.type)).toEqual(['start', 'tool_call', 'tool_result', 'text', 'done']);
+        expect(events.map((event) => event.type)).toEqual([
+            'start',
+            'tool_call',
+            // R3/F1: the tool-calling request's SUCCESS boundary. A tool round gets
+            // no `done`, so this is the only frame that says its output is committed.
+            'attempt_commit',
+            'tool_result',
+            'text',
+            'done'
+        ]);
         expect(events[0]).toEqual({ type: 'start', agent: 'writer', model: 'merge/ds4-flash' });
         expect(events[1]).toEqual({
             type: 'tool_call',
             agent: 'writer',
             call: { id: 'c1', name: 'webSearch', arguments: '{}' }
         });
+        expect(events[2]).toEqual({ type: 'attempt_commit', agent: 'writer', attempt: 1, maxAttempts: 11 });
         // The call id lets a UI pair a result with its exact call even when two
         // calls in one turn share a name. `durationMs` is now measured for every
         // executed call; it is wall clock, so assert its shape and pin the rest
         // exactly.
-        expect(events[2]).toMatchObject({
+        expect(events[3]).toMatchObject({
             type: 'tool_result',
             agent: 'writer',
             name: 'webSearch',
@@ -546,10 +556,10 @@ describe('harness', () => {
             content: 'found',
             isError: false
         });
-        expect((events[2] as { durationMs?: unknown }).durationMs).toEqual(expect.any(Number));
-        expect((events[2] as { durationMs?: number }).durationMs).toBeGreaterThanOrEqual(0);
-        expect(events[3]).toMatchObject({ type: 'text', agent: 'writer', delta: 'done' });
-        expect(events[4]).toMatchObject({ type: 'done', agent: 'writer' });
+        expect((events[3] as { durationMs?: unknown }).durationMs).toEqual(expect.any(Number));
+        expect((events[3] as { durationMs?: number }).durationMs).toBeGreaterThanOrEqual(0);
+        expect(events[4]).toMatchObject({ type: 'text', agent: 'writer', delta: 'done' });
+        expect(events[5]).toMatchObject({ type: 'done', agent: 'writer' });
     });
 
     it('awaits progress so a slow reporter paces the run', async () => {
@@ -793,9 +803,11 @@ describe('harness', () => {
     it('truncates history and throws when the transport fails', async () => {
         const events: HarnessEvent[] = [];
 
+        // R1: this pins the terminal FAILURE path, so it runs one attempt only; the
+        // retry sequence is covered by the dedicated retry suite.
         const failing = scripted([[{ type: 'error', message: 'upstream exploded' }]]);
         const writer = harness({
-            agents: { writer: brain(failing) },
+            agents: { writer: brain(failing, { retry: false }) },
             report: {
                 progress: (event) => {
                     events.push(event);
@@ -1241,12 +1253,14 @@ describe('usage reporting', () => {
 
         await writer('go');
 
-        // Round 1: usage BEFORE that round's tool_call/tool_result. Round 2:
-        // usage after the text, before done. No usage is reported twice.
+        // Round 1: usage BEFORE that round's tool_call/tool_result, then the round's
+        // success boundary (R3/F1: a tool round has no `done`). Round 2: usage after
+        // the text, before done. No usage is reported twice.
         expect(events.map((event) => event.type)).toEqual([
             'start',
             'usage',
             'tool_call',
+            'attempt_commit',
             'tool_result',
             'text',
             'usage',
@@ -1299,11 +1313,13 @@ describe('usage reporting', () => {
         await writer('go');
 
         // The tool round reported usage; the final answer did not. No zero-filled
-        // event is invented for the silent request.
+        // event is invented for the silent request. The round's success boundary
+        // (R3/F1) still appears: a tool round has no `done`.
         expect(events.map((event) => event.type)).toEqual([
             'start',
             'usage',
             'tool_call',
+            'attempt_commit',
             'tool_result',
             'text',
             'done'
@@ -1371,12 +1387,16 @@ describe('usage reporting', () => {
 
         // The subagent's whole run (start/text/usage/done) happens INSIDE the
         // primary's tool_call, so its usage lands in the same stream, tagged
-        // with the subagent name, before the primary's tool_result.
+        // with the subagent name, before the primary's tool_result. The primary's
+        // own tool-calling request closes with `attempt_commit` (R3/F1: it gets no
+        // `done`), which lands right after the request's own frames — i.e. once the
+        // call is launched, before the delegated child's remaining output.
         expect(events.map((event) => `${event.agent}:${event.type}`)).toEqual([
             'lead:start',
             'lead:usage',
             'lead:tool_call',
             'helper:start',
+            'lead:attempt_commit',
             'helper:text',
             'helper:usage',
             'helper:done',

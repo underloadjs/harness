@@ -323,7 +323,7 @@ reach into `src/`.
 
 | Layer | Owns | Must not own |
 |---|---|---|
-| `agent` | model, instruction, history, one transport call per turn | tool execution, compaction, planning |
+| `agent` | model, instruction, history, one transport call per turn plus its model-request retry sequence | tool execution, compaction, planning |
 | `tool` | description, JSON Schema, one `execute` function | state (except the harness-owned `todoManage`/record factories), retries, policy |
 | `harness` | agent registry, tool registry, loop, progress | model I/O, prompt policy |
 
@@ -354,6 +354,18 @@ const brain = agent({ model, instruction, provider });   // name optional
 - `turn(options?)` — run one turn against the current history, **no user append
   and no rollback**. Throws on failure. This is the primitive the harness
   re-requests with after a tool result.
+- **Retries (R1).** The agent is the single retry owner for model calls. Default:
+  one initial attempt plus ten retries, waiting `1000 * 2 ** n` ms (n = 0..9, so
+  1s … 512s) between them. A successful attempt ends the sequence; when the last
+  retry also fails, that attempt's own error is what the caller sees. Every
+  model-call failure is retried — a returned `error` frame (any HTTP status, a
+  provider error on a `200` stream, a malformed or truncated stream), a thrown
+  network error, and a mid-stream throw. **Cancellation is never retried.**
+  `retry: false` disables retries; `retry: { maxRetries, baseDelayMs }` tunes them.
+  A retry re-sends ONLY the current request, and the failed attempt's partial
+  text/reasoning/tool calls are discarded, so nothing from it is committed and no
+  tool it named can run. The `retry` event reports `attempt`, `maxAttempts`,
+  `delayMs` and the failed attempt's `error`.
 - `options.tools` forwards tool declarations to the transport. The agent never
   executes them; standalone callers do.
 - `messages` is the live array (not a copy).
@@ -1536,7 +1548,10 @@ const stream = openAICompatible({
 - Ignores non-`data:` lines (`event:`, `id:`, `:` comments). Stops at `[DONE]`.
   Flushes a final frame that arrived without a newline.
 - Failures become `error` events: non-2xx (`HTTP <status>: <body>`), a
-  `chunk.error` on a 200 stream, a malformed frame, or a connection failure.
+  `chunk.error` on a 200 stream, a malformed frame, a TRUNCATED stream (a body that
+  closes without `[DONE]` and without a `finish_reason`), or a connection failure.
+  The agent retries every one of those (see "agent" — R1); the transport itself
+  never retries, so there is exactly one retry owner.
 
 ---
 
@@ -1582,6 +1597,8 @@ const ids = await listModels({ baseURL, apiKey, headers?, signal? });
 | { type: 'usage';         agent: string; usage: HarnessUsage }
 | { type: 'done';           agent: string; message: HarnessAssistantMessage; pending?: HarnessPendingTool[] }
 | { type: 'wakeup';         agent: string; reason: 'pending-tools'; pending: HarnessPendingTool[] }
+| { type: 'retry';          agent: string; attempt: number; maxAttempts: number; delayMs: number; error: { message: string } }
+| { type: 'attempt_commit'; agent: string; attempt: number; maxAttempts: number }
 | { type: 'action_request'; agent: string; callId: string; request: HarnessActionRequest }
 | { type: 'action_answer';  agent: string; requestId: string; answer: HarnessActionAnswer }
 | { type: 'branch_start';   agent: string; branch: HarnessBranchSummary }
@@ -1618,6 +1635,25 @@ pre-concurrency rendering when they are absent (old persisted turns):
 - `wakeup` is a RESUME. It resolves no tool and ends nothing; it says background
   work progressed and the agent continued. Its `pending` list is required: a wake
   without one is malformed and produces no update.
+- `retry` (R1) says the agent abandoned ONE failed model request and re-sent the
+  same one after `delayMs`. Text/reasoning/tool calls streamed since the previous
+  boundary (`start`/`retry`/`attempt_commit`/`done`) belong to the FAILED attempt: a
+  client discards them (the UI truncates back to its attempt boundary) because the
+  agent never commits them. `attempt` is the failed attempt (1-based) and
+  `maxAttempts` its budget (11 by default), so "2 of 11" needs no guessing.
+- `attempt_commit` (R3) is the SUCCESS end of one model request: the answer is in
+  history, so everything streamed since the previous boundary is final and a later
+  `retry` (a NEWER request) must not discard it. It exists because `done` is not
+  always emitted — a completed tool round gets no `done` at all, and a text response
+  superseded by a completion that landed mid-request is committed but never reported.
+  It is therefore emitted for every committed response that does NOT get a `done`; a
+  response that does get one keeps its exact old sequence. Older recordings simply
+  have no such frame, and a client keeps its historical `done`-only boundary
+  behaviour for them.
+- Committing a request also DETACHES the incremental prose/reasoning writers (the
+  committed nodes stay, their buffers do not). Without that, the next request's
+  deltas would be appended into the committed block, fusing two requests into one
+  node that a retry could then neither keep nor remove cleanly.
 
 `usage` is emitted once per **model request**, including the tool rounds that keep
 a run going — `done` only ever reports the final request, so this is the only

@@ -148,6 +148,7 @@ const probeFixture = (): Probe => {
                         requests.push({ agent: 'probe', messages: copyMessages(request.messages) });
 
                         if (prompt.startsWith('BOOM')) {
+                            // R1: one attempt — the rejection path is what is pinned.
                             yield { type: 'error', message: 'scripted failure' };
                             return;
                         }
@@ -173,7 +174,9 @@ const probeFixture = (): Probe => {
                         const answer = `answer ${answered}`;
                         yield { type: 'text', delta: answer };
                         yield { type: 'done', stopReason: 'stop', toolCalls: [] };
-                    }
+                    },
+                    // R1: one attempt — the rejection path above is what is pinned.
+                    retry: false
                 })
             },
             primary: 'probe',
