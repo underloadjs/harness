@@ -13,8 +13,10 @@
 // stubbed empty, and only the scripted demo preset runs.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile as writeTextFile } from 'node:fs/promises';
-import { join, sep } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { basename, dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createToolCatalogue, createWebSearchCatalogueEntry, WEBSEARCH_UNCONFIGURED_HINT } from './harnesses';
 import { TOOL_REGISTRY_METADATA, TOOL_REQUEST_METADATA } from '../core';
@@ -90,11 +92,103 @@ const TOOL_NAMES = [...CORE_TOOL_NAMES, ...CATALOGUE_TOOL_NAMES];
 
 const PRESET_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'demo', 'flaky'];
 
-// Repo-root Temp/ for filesystem fixtures (never OS temp): server/ -> harness ->
-// underload -> packages -> repo root, matching src/server/environment.test.ts.
-// Repo-root Temp/, five levels up from `src/server/` (Temp/ is the only allowed
-// scratch location — see ../../../../../AGENTS.md).
-const TEMP_LIST_ROOT = fileURLToPath(new URL('../../../../../Temp', import.meta.url));
+// Filesystem fixtures live under a `Temp/` directory INSIDE the checkout (never
+// OS temp). The location is resolved by walking the tree instead of counting `..`
+// segments: this package is both a workspace member
+// (`<repo>/packages/underload/harness/src/server`) and its own standalone GitHub
+// repository (`<checkout>/src/server`), so any fixed depth lands outside the
+// repository in one of the two layouts — that is exactly how CI ended up calling
+// `mkdtemp('/home/runner/Temp/...')` and failing with ENOENT.
+const MODULE_DIRECTORY = dirname(fileURLToPath(import.meta.url));
+
+// Nearest ancestor (inclusive) satisfying `matches`; undefined at the filesystem
+// root. Bounded by the parent-equals-self check so it can never loop.
+const findAncestor = (start: string, matches: (directory: string) => boolean): string | undefined => {
+    let directory = start;
+
+    for (;;) {
+        if (matches(directory)) return directory;
+
+        const parent = dirname(directory);
+        if (parent === directory) return undefined;
+
+        directory = parent;
+    }
+};
+
+// Package root: nearest ancestor holding `package.json` (src/server/ -> harness/
+// in the source tree, which is the same answer as src/server/package-root.ts).
+const PACKAGE_ROOT =
+    findAncestor(MODULE_DIRECTORY, (directory) => existsSync(join(directory, 'package.json'))) ??
+    MODULE_DIRECTORY;
+
+// Workspace root: nearest ancestor ABOVE the package that carries the shared agent
+// rules (root AGENTS.md), a `package.json`, AND a `workspaces` manifest that
+// actually covers this package. Present when the package is developed inside the
+// noobscript workspace, absent in the standalone checkout.
+//
+// Why the manifest check: a checkout can be nested inside another repository (a
+// vendored copy, a scratch clone) and inheriting that repository's `Temp/` would
+// put fixtures outside the checkout under test. Requiring the `workspaces`
+// patterns to cover the package keeps the answer "this package's own repository"
+// for anything that is not a real member.
+//
+// `Temp/` itself is NOT required to exist — `createFixture` creates it, so a clean
+// clone works (the CI failure was a missing parent directory, not missing rules).
+const workspaceCovers = (workspaceRoot: string, packageRoot: string): boolean => {
+    try {
+        const manifest = JSON.parse(readFileSync(join(workspaceRoot, 'package.json'), 'utf8')) as {
+            workspaces?: string[] | { packages?: string[] };
+        };
+        const patterns = Array.isArray(manifest.workspaces)
+            ? manifest.workspaces
+            : (manifest.workspaces?.packages ?? []);
+        const relativePath = relative(workspaceRoot, packageRoot).split(sep).join('/');
+
+        // Glob -> anchored regex: '**' spans separators, '*' stays within one
+        // segment. So 'packages/underload/*' and 'packages/*/*' both cover
+        // 'packages/underload/harness', while an unrelated tree does not.
+        return patterns.some((pattern) => {
+            const expression = pattern
+                .split('**')
+                .map((part) => part.split('*').map((piece) => piece.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('[^/]*'))
+                .join('.*');
+            return new RegExp(`^${expression}$`).test(relativePath);
+        });
+    } catch {
+        // Unreadable/invalid manifest is not a workspace we can trust.
+        return false;
+    }
+};
+
+const WORKSPACE_ROOT = findAncestor(
+    dirname(PACKAGE_ROOT),
+    (directory) =>
+        existsSync(join(directory, 'AGENTS.md')) &&
+        existsSync(join(directory, 'package.json')) &&
+        workspaceCovers(directory, PACKAGE_ROOT)
+);
+
+// Scratch root for this file's fixtures: the workspace `Temp/` in the monorepo,
+// otherwise the package `Temp/` (ignored by the package's own `.gitignore`). Both
+// answers sit directly under a directory that holds `package.json`, i.e. inside
+// the checkout — see the `fixture scratch root` test below. Same policy as
+// scripts/scratch.mjs, which the packaging checks already use.
+const CHECKOUT_ROOT = WORKSPACE_ROOT ?? PACKAGE_ROOT;
+const TEMP_LIST_ROOT = join(CHECKOUT_ROOT, 'Temp');
+
+// Create one unique fixture directory under TEMP_LIST_ROOT. The recursive mkdir
+// is the fix for CI: `mkdtemp` does not create its parent, so a clean checkout
+// (where nothing has created `Temp/` yet) failed with ENOENT. Callers still own
+// removal through their `finally` blocks.
+//
+// `root` is a parameter only so the regression test below can point the same
+// behaviour at a nested, definitely-absent parent without touching the shared
+// root or anything another agent already left in `Temp/`.
+const createFixture = async (prefix: string, root: string = TEMP_LIST_ROOT): Promise<string> => {
+    await mkdir(root, { recursive: true });
+    return mkdtemp(join(root, prefix));
+};
 
 // fileList reports posix separators on every platform, so an absolute Windows
 // fixture path has to be compared in that same form.
@@ -188,6 +282,64 @@ const createDemo = async (runtime: HarnessRuntime): Promise<SessionSnapshot> => 
 
 afterEach(() => {
     vi.unstubAllEnvs();
+});
+
+// Regression guard for the CI failure (GitHub Actions, ubuntu, standalone
+// checkout): the four fixture-using tests below called
+// `mkdtemp('/home/runner/Temp/...')` because `../../../../../Temp` counted five
+// levels up from `src/server/` — correct only inside the noobscript monorepo, one
+// level ABOVE the standalone repository root. `mkdtemp` does not create its
+// parent, so a clean checkout (no `Temp/` anywhere yet) died with ENOENT.
+//
+// These assertions pin the two properties that fix it, without depending on the
+// machine: the scratch root sits directly inside the checkout, and fixture
+// creation succeeds even when its parent directory does not exist yet.
+describe('fixture scratch root', () => {
+    it('resolves Temp/ inside the checkout, not outside it', () => {
+        // `basename` is the same on every platform: `Temp`, not the OS temp name.
+        expect(basename(TEMP_LIST_ROOT)).toBe('Temp');
+
+        // Inside the checkout: CHECKOUT_ROOT is the workspace root in the monorepo
+        // and the package root standalone, and both hold package.json. A one-level
+        // relative path proves the fixture root travels with the repository, and
+        // that it never climbs out of the checkout (the old fixed depth resolved to
+        // `<repo>/../Temp` on the standalone CI runner). No `os.tmpdir()` comparison
+        // here: the repo policy itself points TEMP/TMP/TMPDIR at this same `Temp/`,
+        // so such an assertion would be a false negative on a correctly configured
+        // developer machine.
+        expect(existsSync(join(CHECKOUT_ROOT, 'package.json'))).toBe(true);
+        expect(relative(CHECKOUT_ROOT, TEMP_LIST_ROOT)).toBe('Temp');
+    });
+
+    it('creates the Temp/ parent chain on a clean checkout before making a fixture', async () => {
+        // A path that cannot exist yet: unique name, two levels of absent parents.
+        // Nothing is written at the shared TEMP_LIST_ROOT itself, so other agents'
+        // scratch directories are untouched.
+        const root = join(TEMP_LIST_ROOT, `harness-clean-parent-${randomUUID()}`);
+        const absentParent = join(root, 'missing', 'deeper');
+
+        try {
+            // The old code path, kept as the failure being regressed: mkdtemp alone
+            // cannot create `missing/deeper/`, which is exactly the CI ENOENT.
+            await expect(mkdtemp(join(absentParent, 'fixture-'))).rejects.toMatchObject({
+                code: 'ENOENT'
+            });
+
+            // The fix: createFixture creates the parent chain, then the unique dir.
+            const fixture = await createFixture('fixture-', absentParent);
+
+            // Exact shape: `<absentParent>/fixture-XXXXXX`.
+            expect(dirname(fixture)).toBe(absentParent);
+            expect(basename(fixture).startsWith('fixture-')).toBe(true);
+            expect(existsSync(absentParent)).toBe(true);
+            expect(existsSync(fixture)).toBe(true);
+        } finally {
+            // Only this test's own unique directory is removed.
+            await rm(root, { recursive: true, force: true });
+        }
+
+        expect(existsSync(root)).toBe(false);
+    });
 });
 
 describe('canonical bootstrap document', () => {
@@ -971,8 +1123,8 @@ describe('canonical sessions', () => {
         // is legal for both a model and a client.
         expect(fileListEntry !== undefined && 'required' in fileListEntry.parameters).toBe(false);
 
-        // Real fixture directories under the repo-root Temp/ (never OS temp).
-        const fixture = await mkdtemp(join(TEMP_LIST_ROOT, 'harness-list-api-'));
+        // Real fixture directories under the checkout-local Temp/ (never OS temp).
+        const fixture = await createFixture('harness-list-api-');
         try {
             await mkdir(join(fixture, 'src', 'nested'), { recursive: true });
             await mkdir(join(fixture, 'task'), { recursive: true });
@@ -1253,7 +1405,7 @@ describe('all-tools manual execution', () => {
         expect(webSearch?.sessionBound).toBeUndefined();
 
         // The manual call needs no `sessionId`: it is an ordinary direct call.
-        const fixture = await mkdtemp(join(TEMP_LIST_ROOT, 'api-core-file-'));
+        const fixture = await createFixture('api-core-file-');
         const path = join(fixture, 'note.txt');
 
         try {
@@ -1748,7 +1900,7 @@ describe('body policy and bounds', () => {
         // manual cap: fileRead's own 64 KiB content budget fills the page, and the
         // JSON envelope around it crosses the cap. That is exactly the "huge value"
         // case the manual route must not return verbatim.
-        const fixture = await mkdtemp(join(TEMP_LIST_ROOT, 'harness-bounds-api-'));
+        const fixture = await createFixture('harness-bounds-api-');
         try {
             const path = join(fixture, 'big.txt');
             await writeTextFile(path, 'x'.repeat(70_000), 'utf8');
@@ -1820,7 +1972,7 @@ describe('body policy and bounds', () => {
     it('accepts the legacy and wrapped direct argument shapes identically', async () => {
         const runtime = createRuntime();
 
-        const fixture = await mkdtemp(join(TEMP_LIST_ROOT, 'harness-parity-api-'));
+        const fixture = await createFixture('harness-parity-api-');
         try {
             const path = join(fixture, 'note.txt');
             await writeTextFile(path, 'one line\n', 'utf8');
@@ -2750,4 +2902,3 @@ describe('recorded run timing', () => {
         expect(runtime.store.get(session.id).discoveredTools).toEqual(['timeNow']);
     });
 });
-
