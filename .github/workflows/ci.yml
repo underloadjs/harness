@@ -1,10 +1,15 @@
-# Typecheck, test, and build the package and the harness app.
+# Typecheck, test, and build the package and the harness app, then publish the
+# built UI (src/frontend/dist) to GitHub Pages on pushes to main.
 #
-# There is no static deployment any more: the normal host is the @underload/service
-# gateway (`yarn start-service`), which discovers the harness endpoint modules.
-# The UI is a separate Vite launch (`yarn dev:frontend`); the optional standalone
-# API launcher is `yarn dev:server`. This workflow verifies that the library, the
-# server tests, the UI tests, and the client bundle all compile.
+# The normal host remains the @underload/service gateway (`yarn start-service`),
+# which discovers the harness endpoint modules; the UI is a separate Vite launch
+# (`yarn dev:frontend`) and the optional standalone API launcher is
+# `yarn dev:server`. This workflow verifies that the library, the server tests,
+# the UI tests, and the client bundle all compile, and additionally deploys the
+# static UI bundle to Pages (https://underloadjs.github.io/harness/).
+#
+# One-time repo setting (required once, not per-deploy):
+#   Settings → Pages → Build and deployment → Source: "GitHub Actions"
 
 name: CI
 
@@ -13,6 +18,16 @@ on:
         branches: [main]
     pull_request:
     workflow_dispatch:
+
+permissions:
+    contents: read
+    pages: write
+    id-token: write
+
+# One deploy at a time; new pushes cancel in-flight deploys
+concurrency:
+    group: pages
+    cancel-in-progress: true
 
 jobs:
     build:
@@ -46,3 +61,34 @@ jobs:
 
             - name: Build UI
               run: npm run build:frontend
+              # Pages serves this repo under the /harness/ project path, so the
+              # bundle's asset URLs must be prefixed (src/frontend/vite.config.ts
+              # reads PLAYGROUND_BASE for exactly this). Default '/' would 404
+              # every asset at https://underloadjs.github.io/harness/.
+              env:
+                  PLAYGROUND_BASE: harness
+
+            - name: Configure Pages
+              if: github.event_name != 'pull_request'
+              uses: actions/configure-pages@v5
+
+            - name: Upload Pages artifact
+              if: github.event_name != 'pull_request'
+              uses: actions/upload-pages-artifact@v3
+              with:
+                  # The UI app build (NOT the root dist/, which is the npm
+                  # library output of `vite build` and has no index.html).
+                  path: src/frontend/dist
+
+    deploy:
+        # PRs only verify the build; pushes to main (and manual runs) publish.
+        if: github.event_name != 'pull_request'
+        runs-on: ubuntu-latest
+        needs: build
+        environment:
+            name: github-pages
+            url: ${{ steps.deployment.outputs.page_url }}
+        steps:
+            - name: Deploy to GitHub Pages
+              id: deployment
+              uses: actions/deploy-pages@v4
