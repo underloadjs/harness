@@ -73,8 +73,9 @@
 // cancelling the stream (R2).
 //
 // API root: `./api.ts` resolves it at runtime (?apiRoot → injected config →
-// build-time VITE_HARNESS_API → /api) and `loadBootstrap` works against the
-// canonical `/v1/harness` root document or the standalone `/api` routes.
+// build-time VITE_HARNESS_API → the local/LAN chain on a GitHub Pages host → /api)
+// and `loadBootstrap` works against the canonical `/v1/harness` root document or
+// the standalone `/api` routes.
 
 import './styles.css';
 import type {
@@ -92,6 +93,7 @@ import { validateAttachments } from '../shared/attachments';
 import {
     API_ROOT,
     answerAction,
+    apiRootCandidates,
     callTool,
     cancelSession,
     createHarness,
@@ -6209,9 +6211,20 @@ const showConnecting = (): void => {
     // state FIRST, so the reader always has a visible, accessible status while the
     // first request is in flight. `setStatus('connecting')` names the same phase in
     // the topbar pill, which is the live region.
+    //
+    // A static host (GitHub Pages) has no API of its own, so the client walks its
+    // compiled local/LAN chain (./deployment.ts) and keeps the first gateway that
+    // answers. Naming every candidate BEFORE the probe starts is what makes a slow
+    // boot legible instead of looking like a hang on one host; an empty list means
+    // the root is pinned, so exactly one host is contacted.
+    const candidates = apiRootCandidates();
+
     box.append(
         el('h2', 'empty-title', 'Connecting to the harness server…'),
         el('p', 'empty-text', `Contacting ${API_ROOT.length > 0 ? API_ROOT : '(origin)'}…`),
+        ...(candidates.length > 1
+            ? [el('p', 'empty-text', `Trying in order: ${candidates.join('  →  ')}…`)]
+            : []),
         el(
             'p',
             'empty-hint',
@@ -6229,6 +6242,12 @@ const showOffline = (message: string): void => {
     const wrap = el('div', 'log-wrap');
     const box = el('div', 'empty');
 
+    // On a static host the failure is "none of the compiled servers answered", and
+    // the single root in `message` would hide which hosts were eligible. Listing the
+    // chain is the actionable part: it tells the reader which machine to start the
+    // service on (or which one to point `?apiRoot=` at).
+    const candidates = apiRootCandidates();
+
     box.append(
         el('h2', 'empty-title', 'Harness server unavailable'),
         // The server/proxy text is rendered with textContent by `el`, so an error
@@ -6237,7 +6256,9 @@ const showOffline = (message: string): void => {
         el(
             'p',
             'empty-hint',
-            'Start the API with `yarn start-service` (repo root, /v1/harness on :5000), then reload. `yarn dev:frontend` is the Vite UI only; it does not start an API.'
+            candidates.length > 0
+                ? `This page is hosted on a static host, so it dialed its own chain of harness servers in order — ${candidates.join(', ')} — and none answered. Start the service on one of those machines (\`yarn start-service\`, /v1/harness on :5000) and Retry, or open the UI from the server itself. A plain-HTTP LAN address can also be blocked by the browser as mixed content on an HTTPS page; \`?apiRoot=\` pins one host instead.`
+                : 'Start the API with `yarn start-service` (repo root, /v1/harness on :5000), then reload. `yarn dev:frontend` is the Vite UI only; it does not start an API.'
         )
     );
 

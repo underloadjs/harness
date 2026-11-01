@@ -10,6 +10,12 @@
 #
 # One-time repo setting (required once, not per-deploy):
 #   Settings → Pages → Build and deployment → Source: "GitHub Actions"
+#
+# The deployed UI is only the client: Pages serves no API, so the bundle resolves
+# its server at runtime from the compiled local/LAN chain
+# (src/frontend/deployment.ts) and the service's Origin gate admits this
+# https://*.github.io page (src/shared/origin.ts `isPagesOrigin`). README
+# “GitHub Pages” documents the mixed-content limit of the LAN entry.
 
 name: CI
 
@@ -65,6 +71,12 @@ jobs:
               # bundle's asset URLs must be prefixed (src/frontend/vite.config.ts
               # reads PLAYGROUND_BASE for exactly this). Default '/' would 404
               # every asset at https://underloadjs.github.io/harness/.
+              #
+              # VITE_HARNESS_API is deliberately NOT set: this host serves the
+              # bundle and no API, so the client resolves the local/LAN gateway
+              # chain at runtime instead (src/frontend/deployment.ts) — localhost
+              # first, then the standard LAN host. Pinning one absolute root here
+              # would freeze every visitor onto that single machine.
               env:
                   PLAYGROUND_BASE: harness
 

@@ -92,6 +92,28 @@ describe('resolveApiRoot', () => {
         expect(module.API_ROOT).toBe('/api');
     });
 
+    it('never probes off a Pages host', async () => {
+        // This page's host serves the API itself (or the Vite proxy does), so the
+        // relative fallback is correct and the local/LAN chain of
+        // ./api-static-host.test.ts must stay out of the way: no candidates, and
+        // `ensureApiRoot` makes no request.
+        const calls: string[] = [];
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL) => {
+                calls.push(String(input));
+
+                throw new TypeError('Failed to fetch');
+            })
+        );
+
+        const module = await import('./api');
+
+        expect(module.apiRootCandidates()).toEqual([]);
+        expect(await module.ensureApiRoot()).toBe('/api');
+        expect(calls).toEqual([]);
+    });
+
     it('takes a rooted path from ?apiRoot', async () => {
         window.history.replaceState(null, '', '/?apiRoot=%2Fv1%2Fharness%2F');
         const module = await import('./api');

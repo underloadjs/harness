@@ -193,7 +193,7 @@ src/
   plugin/           host                     (programmatic extension)
   util/             errors                   (shared leaf helpers)
   types/            every public type
-  shared/           isomorphic helpers both trees evaluate (origin/loopback rules)
+  shared/           isomorphic helpers both trees evaluate (origin/loopback/Pages rules)
   server/           HTTP API, sessions, SSE, catalogue presets, CLI, discovered routes
   frontend/         browser client + the app shell it renders
 ```
@@ -223,7 +223,9 @@ src/frontend/
   index.ts              the reusable client: api + contract + ui panels
                         -> @underload/harness/frontend
   main.ts               the app shell (imports styles.css, mounts the DOM on load)
-  api.ts                root resolution (query/injected/build/api) + fetch + SSE
+  api.ts                root resolution (query/injected/build/Pages-chain/api) +
+                        fetch + SSE
+  deployment.ts         the local/LAN gateway chain a GitHub Pages host probes
   contract.ts           wire validation/presentation helpers
   ui/                   turns, agents, create form, markdown, panels, tools, tokens,
                         action-request (owner question card)
@@ -2378,18 +2380,20 @@ permissive CORS, so a custom header is not an access boundary there.
 **Access control is an Origin gate, not authentication.** The service app is built
 with `cors({ origin: '*', allowHeaders: '*' })`, and it listens on `0.0.0.0` by
 default. The harness endpoint therefore rejects a browser request whose `Origin`
-is neither the request's own host nor a loopback hostname (`localhost`,
-`127.0.0.1`, `[::1]`); requests with no `Origin` (curl, server-to-server) are
-allowed. That stops a public web page from reading transcripts or driving tools
-**through a browser**, but it does not authenticate anyone who can reach the port
-directly. Combined with unsandboxed tools (`commandRun`, `fileWrite`,
-`toolCreate`), that means: bind the service to a trusted network only, and prefer
-loopback (`host: '127.0.0.1'`) when the port is reachable from elsewhere. No
-global service host/CORS settings are changed by this package.
+is none of: the request's own host, a loopback hostname (`localhost`,
+`127.0.0.1`, `[::1]`), or an **https `*.github.io`** origin (this package's
+deployed UI — see “GitHub Pages” below). Requests with no `Origin` (curl,
+server-to-server) are allowed. That stops an arbitrary public web page from
+reading transcripts or driving tools **through a browser**, but it does not
+authenticate anyone who can reach the port directly. Combined with unsandboxed
+tools (`commandRun`, `fileWrite`, `toolCreate`), that means: bind the service to a
+trusted network only, and prefer loopback (`host: '127.0.0.1'`) when the port is
+reachable from elsewhere. No global service host/CORS settings are changed by this
+package.
 
 **Connecting the UI to the service.** The browser chooses its API root at runtime
-(`?apiRoot=` → injected config → `VITE_HARNESS_API` → `/api`), so the same built
-bundle works against either mount:
+(`?apiRoot=` → injected config → `VITE_HARNESS_API` → the local/LAN chain on a
+GitHub Pages host → `/api`), so the same built bundle works against either mount:
 
 ```text
 http://localhost:5180/?apiRoot=http://localhost:5000/v1/harness
@@ -2403,18 +2407,66 @@ dev proxy stamps the target's origin on its server-to-server request (the gate
 still rejects a foreign origin that reaches the service without that proxy).
 For a LAN browser keep the default relative `/api` root; an absolute
 `?apiRoot=http://<LAN-IP>:5000/...` is a different page origin and the runtime
-gate ignores it. The UI never sees the API key — it posts only the base URL and model,
-and `defaults.hasApiKey` is a boolean.
+gate ignores it — the one exception is a root that names an entry of the compiled
+Pages chain exactly (see “GitHub Pages” below). The UI never sees the API key — it
+posts only the base URL and model, and `defaults.hasApiKey` is a boolean.
 
 A **runtime** absolute root (`?apiRoot=` or injected `__HARNESS_CONFIG__`/meta)
-must be the page's own origin or a loopback hostname (`localhost`, `127.0.0.1`,
-`[::1]`); anything else is silently ignored and the next source is used. This is
+must be the page's own origin, a loopback hostname (`localhost`, `127.0.0.1`,
+`[::1]`), or one of those compiled chain entries; anything else is silently
+ignored and the next source is used. This is
 deliberate: the UI posts the provider key saved in this browser to that root, so a
 crafted `?apiRoot=https://evil.example/api` link must not receive it. A rooted path
 such as `/v1/harness` is same-origin by construction. Build-time
 `VITE_HARNESS_API` is operator-controlled and may name another origin; it cannot
 be changed by a URL a user is tricked into opening. The loopback list is shared
 with the service Origin gate (`src/server/origin.ts`), so "local" has one definition.
+
+**GitHub Pages (`https://underloadjs.github.io/harness/`).** `.github/workflows/ci.yml`
+publishes `src/frontend/dist` to Pages, a host that serves the bundle and **no API**.
+A relative root cannot work there: `/api` resolved to
+`https://underloadjs.github.io/api/…` and returned GitHub's 404 HTML page, so the UI
+booted and then reported “The harness server returned a non-JSON response”. When the
+page is served from a `*.github.io` host and nothing is pinned by `?apiRoot=`,
+injected config, or `VITE_HARNESS_API`, the client therefore dials the absolute chain
+compiled into `src/frontend/deployment.ts`, in order, and keeps the first gateway that
+answers `GET <root>/health`:
+
+```text
+http://localhost:5000/v1/harness        # the service gateway on this machine
+http://127.0.0.1:5000/v1/harness        # the same gateway, IPv4 spelling
+http://192.168.50.109:5000/v1/harness   # the standard LAN host
+```
+
+Both loopback spellings are probed because the gateway binds `0.0.0.0` (IPv4) while a
+Windows browser resolves `localhost` to `::1` first — a `localhost`-only candidate
+refused connections on a machine whose gateway was up. The LAN host is last so a
+machine with its own server never reads a stale shared transcript, and it keeps the
+provider key saved in this browser on the viewer's own host whenever possible.
+
+What the client cannot do alone:
+
+- **Origin gate** — the service accepts an https `*.github.io` origin
+  (`isPagesOrigin` in `src/shared/origin.ts`); every other public origin is still 403.
+- **CORS / Private Network Access** — already satisfied by the service loader
+  (`cors({ origin: '*', allowHeaders: '*' })` plus
+  `Access-Control-Allow-Private-Network: true`), which is why the Pages UI must dial
+  the **service** mount, not the standalone `:5181` server (that one has no CORS
+  answer for its `X-Harness-Client` header, so a cross-origin preflight fails).
+- **Mixed content** — Pages serves HTTPS while the harness serves plain HTTP.
+  Browsers exempt `localhost`/`127.0.0.1`, but Chrome blocks an HTTPS page fetching a
+  plain-HTTP LAN address, so the third entry needs relaxed mixed-content blocking or an
+  HTTPS-terminating proxy in front of `:5000`. A blocked candidate just fails its
+  probe and the next one is tried.
+
+If nothing answers, the offline pane lists every host that was tried; `Retry` is a
+full reload, which re-probes. Pin one host with
+`https://underloadjs.github.io/harness/?apiRoot=http://192.168.50.109:5000/v1/harness`
+(a root that names a compiled chain entry exactly is trusted; any other foreign
+absolute root is still ignored), or bake one in with `VITE_HARNESS_API` at build time.
+The host/port constants mirror the monorepo's `config/environment` (`src/host.ts`,
+`src/port.ts`); that package is not published, so they are restated here — update both
+when the LAN address changes.
 
 **Credentials stay with the configured provider.** `POST /models` and
 `POST /sessions` both merge client settings through `src/server/config.ts`

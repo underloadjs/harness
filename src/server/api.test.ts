@@ -2176,6 +2176,49 @@ describe('service origin gate', () => {
         });
         expect(lanOrigin.status).toBe(403);
     });
+
+    it('allows the deployed GitHub Pages UI to dial the service cross-origin', async () => {
+        // The Pages bundle (ci.yml publishes src/frontend/dist) has no API on its
+        // own origin, so it dials a loopback or LAN gateway directly with
+        // `Origin: https://<user>.github.io` (../frontend/deployment.ts). Before
+        // that chain existed this request was the 403 that made the deployed UI
+        // look offline.
+        const runtime = createRuntime();
+
+        const pagesHealth = await jsonBody<{ ok: boolean }>(
+            await callHandler(runtime, 'GET', '/v1/harness/health', {
+                headers: { origin: 'https://underloadjs.github.io', host: '127.0.0.1:5000' }
+            })
+        );
+        expect(pagesHealth).toEqual({ status: 200, body: { ok: true, sessions: 0 } });
+
+        // The LAN host is the chain's last entry, and the bootstrap root document is
+        // the request the deployed UI makes first.
+        const pagesRoot = await callHandler(runtime, 'GET', '/v1/harness', {
+            headers: { origin: 'https://underloadjs.github.io', host: '192.168.50.109:5000' }
+        });
+        expect(pagesRoot.status).toBe(200);
+    });
+
+    it('keeps the Pages allowance to an https github.io origin', async () => {
+        const runtime = createRuntime();
+
+        const rejected = [
+            'http://underloadjs.github.io', // Pages serves the UI over https only
+            'https://github.io', // the zone itself is not a Pages site
+            'https://github.io.attacker.test', // label-boundary lookalike
+            'https://underloadjs.github.io.attacker.test', // same, with a subdomain
+            'https://evil.example' // any other public page
+        ];
+
+        for (const origin of rejected) {
+            const result = await callHandler(runtime, 'GET', '/v1/harness/health', {
+                headers: { origin, host: '127.0.0.1:5000' }
+            });
+
+            expect(result.status, origin).toBe(403);
+        }
+    });
 });
 
 describe('standalone /api compatibility', () => {

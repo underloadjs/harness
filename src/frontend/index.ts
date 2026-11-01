@@ -9,9 +9,13 @@
 //     shell), which is intentionally not exported here.
 //   - No element is created by any exported module at import time. The `ui/*`
 //     modules build DOM only when their `create*`/`apply*` functions are called.
-//   - The one module-scope computation is `API_ROOT` in `./api.ts` (the resolved
-//     API root). It reads `globalThis.location`/`globalThis.document` defensively
-//     through optional chaining, so evaluating it in Node does not touch the DOM.
+//   - The module-scope computations are `API_ROOT` in `./api.ts` (the resolved API
+//     root) and the chain it may later probe (./deployment.ts). Both read
+//     `globalThis.location`/`globalThis.document` defensively through optional
+//     chaining, so evaluating them in Node does not touch the DOM. Neither issues
+//     a request: the static-host probe runs only when `loadBootstrap` (or
+//     `ensureApiRoot`) is called, and `API_ROOT` is a live binding that moves to
+//     the gateway that answered.
 //
 // The wire types come from `../server/protocol` **type-only**, which is erased at
 // build time; only `origin.ts` is a runtime dependency on the other tree, and it
@@ -19,6 +23,7 @@
 //
 // Cross-references:
 //   - ./api.ts       — API root resolution, fetch client, SSE parser
+//   - ./deployment.ts — the local/LAN server chain a GitHub Pages host probes
 //   - ./contract.ts  — wire validation/presentation helpers
 //   - ./ui/*.ts      — turn board, agent row, create form, markdown, panels, tools,
 //                      dialog shell, attachment/file/image previews

@@ -19,12 +19,14 @@
 // The service loader installs permissive CORS (`origin: '*'`, `allowHeaders:
 // '*'`) on every app, so the standalone API's `X-Harness-Client` header is NOT a
 // boundary here: any page can send it. Instead this endpoint rejects a browser
-// request whose `Origin` is neither the same host as the service nor a loopback
-// origin:
+// request whose `Origin` is not one of the hosts it knows:
 //
 //   - no Origin (curl, server-to-server, same-origin GET)      → allowed
 //   - Origin host === Host header (same origin)                → allowed
 //   - Origin hostname is localhost/127.0.0.1/[::1]             → allowed (dev UI)
+//   - https Origin on the github.io zone                       → allowed (the
+//     deployed Pages UI — see ./frontend/deployment.ts — which has no API on its
+//     own origin and must dial this gateway directly)
 //   - anything else                                            → 403
 //
 // This keeps `yarn dev:frontend` (Vite on localhost) able to proxy `/api` to
@@ -71,7 +73,7 @@
 
 import { bodyLimitFor, SERVICE_MOUNT } from './api';
 import type { HarnessApiEmit, HarnessApiStream } from './api';
-import { isLoopbackHostname } from '../shared/origin';
+import { isLoopbackHostname, isPagesOrigin } from '../shared/origin';
 import type { HarnessRuntime } from './runtime';
 import { getHarnessRuntime } from './runtime';
 import { HarnessPersistenceError, normalizeHarnessDatabaseRoot } from './persistence';
@@ -112,9 +114,25 @@ export type ServiceEndpointHandler = (
     variables?: Record<string, unknown>
 ) => Promise<ServiceEndpointResult>;
 
-// Same-host (including port) OR a loopback hostname. The loopback list is
-// shared with the frontend's runtime API-root gate (./origin.ts), so "which
-// origins count as local" has exactly one definition in the package.
+// Same-host (including port) OR a loopback hostname OR this package's own GitHub
+// Pages UI. The loopback list and the Pages rule are shared with the frontend's
+// runtime API-root gate (./origin.ts), so "which origins count as local, and which
+// count as the deployed static UI" has exactly one definition in the package.
+//
+// The Pages entry exists because the deployed bundle (`.github/workflows/ci.yml`
+// publishes src/frontend/dist to `https://<user>.github.io/harness/`) has no API on
+// its own origin and therefore dials a loopback or LAN gateway directly
+// (../frontend/deployment.ts). Without it the static deployment could only ever
+// reach the service as a 403: the Origin is neither the gateway's host nor
+// loopback. HTTPS is required — Pages serves the UI over https only, so an
+// `http://…github.io` Origin is a redirect artifact or a spoofed header.
+//
+// This widens the browser-facing gate to ONE known zone, not to the world: the
+// trust model is unchanged for every other public Origin (still 403), and the
+// service's CORS is already `origin: '*'`, so this gate never claimed to stop a
+// non-browser client — it stops an arbitrary web page from reading transcripts.
+// A Pages page is a page the operator deployed, which is the same trust the
+// loopback dev UI already gets.
 const isAllowedOrigin = (origin: string, host: string | undefined): boolean => {
     let parsed: URL;
 
@@ -127,7 +145,9 @@ const isAllowedOrigin = (origin: string, host: string | undefined): boolean => {
 
     if (host !== undefined && parsed.host.toLowerCase() === host.toLowerCase()) return true;
 
-    return isLoopbackHostname(parsed.hostname);
+    if (isLoopbackHostname(parsed.hostname)) return true;
+
+    return isPagesOrigin(origin);
 };
 
 // Build the canonical SSE response. Frames use the same `data: <json>\n\n`

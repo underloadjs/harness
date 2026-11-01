@@ -9,21 +9,26 @@
 //   - `/api`        — standalone node server, whose root is a 404 and whose
 //     per-resource routes (`/harnesses`, `/tools`, `/sessions`) are the source.
 //
-// The root is chosen at runtime, in this order (see `resolveApiRoot`):
+// The root is chosen at runtime, in this order (see `resolveRoot`):
 //   1. `?apiRoot=` on the page URL (validated; a bad value falls back silently);
 //   2. server-injected config (`window.__HARNESS_CONFIG__.apiRoot` or a
 //      `<meta name="harness-api-root">` element), for a host that serves this
 //      bundle and knows where its API lives;
 //   3. build-time `VITE_HARNESS_API`;
-//   4. `/api`.
+//   4. on a GitHub Pages host (a static host with no API of its own): the
+//      local/LAN gateway chain in ./deployment.ts, probed in order by
+//      `ensureApiRoot` — localhost first, then the standard LAN host;
+//   5. `/api`.
 //
 // The root is only ever a base URL/prefix. No credential, query string or hash
 // is accepted on it, so a secret can never be pushed into a URL by this module.
 //
 // TRUST: sources 1 and 2 are RUNTIME and therefore untrusted. The UI posts the
 // provider key saved in this browser to whatever root it resolves, so an absolute
-// root from a query string or injected config must be same-origin with the page
-// or a loopback host (src/server/origin.ts, shared with the service's Origin gate).
+// root from a query string or injected config must be same-origin with the page,
+// a loopback host, or one of the compiled chain entries (src/shared/origin.ts,
+// shared with the service's Origin gate). The chain is baked into this bundle by
+// the build, so naming one exactly is no wider a trust than dialing it by default.
 // Otherwise a crafted link such as `?apiRoot=https://evil.example/api` would
 // receive the saved credential on the next model lookup or session creation.
 // Source 3 is compiled into the bundle by the operator and is deliberately
@@ -31,6 +36,7 @@
 // cannot be changed by a URL the user is tricked into opening.
 
 import { isTrustedRuntimeOrigin } from '../shared/origin';
+import { STATIC_API_CANDIDATES, isStaticPagesHost } from './deployment';
 import type { HarnessActionChoice, HarnessAttachment } from '../types';
 import type { HarnessTurnReference } from './ui/references';
 import type {
@@ -146,7 +152,22 @@ const injectedRoot = (): string | undefined => {
 // Resolve once at module load: every later request uses the same root, and the
 // query parameter is not consulted per request (a change means a reload, which
 // also resets the transient view — the server snapshot is re-fetched on boot).
-export const resolveApiRoot = (): string => {
+//
+// The one exception is the STATIC-HOST chain (./deployment.ts): on a GitHub Pages
+// host the documented sources name nothing, and the answer is not knowable
+// synchronously — it is whichever local/LAN gateway actually answers. `resolveRoot`
+// therefore returns the chain to probe, `ensureApiRoot` walks it, and `API_ROOT`
+// moves to the winner before the first catalogue request.
+type ResolvedRoot = {
+    root: string;
+    // The ordered roots to probe, or `undefined` when the root is explicit (a
+    // query/injected/build-time value) or same-origin. Those are pinned by the
+    // operator or the URL, so probing somewhere else would silently replace a
+    // deliberate choice with a guess.
+    candidates: readonly string[] | undefined;
+};
+
+const resolveRoot = (): ResolvedRoot => {
     const query = new URLSearchParams(globalThis.location?.search ?? '').get('apiRoot') ?? undefined;
 
     // An absolute (origin+path) root is the only kind that can point somewhere
@@ -173,7 +194,19 @@ export const resolveApiRoot = (): string => {
         try {
             const root = normalizeApiRoot(value, FALLBACK_ROOT);
 
-            if (!trusted && isAbsolute(root) && !isTrustedRuntimeOrigin(root, globalThis.location?.origin)) {
+            // A root that names one of the compiled static candidates exactly is
+            // operator data too — it is baked into this bundle by the build, so a
+            // link cannot point the saved key at a host the deployment does not
+            // already dial. Without this, the LAN entry (neither same-origin nor
+            // loopback) could never be selected by hand.
+            const compiled = STATIC_API_CANDIDATES.includes(root);
+
+            if (
+                !trusted &&
+                !compiled &&
+                isAbsolute(root) &&
+                !isTrustedRuntimeOrigin(root, globalThis.location?.origin)
+            ) {
                 return undefined;
             }
 
@@ -183,17 +216,106 @@ export const resolveApiRoot = (): string => {
         }
     };
 
-    return (
+    const explicit =
         attempt(query, false) ??
         attempt(injectedRoot(), false) ??
-        attempt(import.meta.env.VITE_HARNESS_API, true) ??
-        FALLBACK_ROOT
-    );
+        attempt(import.meta.env.VITE_HARNESS_API, true);
+
+    if (explicit !== undefined) return { root: explicit, candidates: undefined };
+
+    // Nothing was pinned. A Pages host has no API of its own, so `/api` is a
+    // guaranteed 404 there; the local/LAN chain is the honest default, and the
+    // first entry doubles as the root the connecting pane names while the probe
+    // runs. Every other host (the harness server itself, the Vite dev/preview
+    // proxy, the service gateway) serves the API on its own origin, so the
+    // documented relative fallback stays correct there.
+    if (isStaticPagesHost()) return { root: STATIC_API_CANDIDATES[0], candidates: STATIC_API_CANDIDATES };
+
+    return { root: FALLBACK_ROOT, candidates: undefined };
 };
 
-export const API_ROOT = resolveApiRoot();
+// The public resolution surface: the root this page would use before the static
+// probe moves it. Kept as a function so a caller (or a test) can re-resolve
+// without re-importing the module graph.
+export const resolveApiRoot = (): string => resolveRoot().root;
+
+const initialRoot = resolveRoot();
+
+// `let`, not `const`: `ensureApiRoot` moves the live binding to the candidate that
+// answered. Every request URL is built through `url` below, which reads the current
+// value, and an ESM live binding means importers (and the test namespace) observe
+// the move too. The name stays exported because it is the published "which root am
+// I talking to" surface — the connecting pane prints it.
+export let API_ROOT = initialRoot.root;
+
+const staticCandidates = initialRoot.candidates;
+
+// The chain this page probes, in order, or `[]` when its root is pinned and
+// nothing is probed. The startup/offline panes render it so a failure names every
+// host that was tried, not just the one the last request went to.
+export const apiRootCandidates = (): readonly string[] => staticCandidates ?? [];
 
 const url = (path: string): string => `${API_ROOT}${path}`;
+
+// One bounded `GET <root>/health` per candidate. A dead loopback port refuses
+// instantly, but a dead LAN address can hang on an unanswered SYN, so the probe is
+// capped — otherwise a Pages page waits for a TCP timeout before reaching the next
+// candidate. `AbortSignal.timeout` is used when the engine has it; without it the
+// probe is still correct, just uncapped.
+const PROBE_TIMEOUT_MS = 2500;
+const HEALTH_PATH = '/health';
+
+const probeRoot = async (root: string): Promise<boolean> => {
+    const signal = typeof AbortSignal?.timeout === 'function' ? AbortSignal.timeout(PROBE_TIMEOUT_MS) : undefined;
+
+    try {
+        const response = await fetch(`${root}${HEALTH_PATH}`, {
+            headers: { 'Content-Type': 'application/json', 'X-Harness-Client': 'ui' },
+            ...(signal === undefined ? {} : { signal })
+        });
+
+        if (!response.ok) return false;
+
+        // A 200 is not proof of the contract: a captive portal or a proxy error
+        // page answers HTML with a success status. The health body is
+        // `{ ok: true, sessions: n }` (../server/api.ts), so require the marker.
+        const body = (await response.json()) as { ok?: unknown };
+
+        return body.ok === true;
+    } catch {
+        // Refused, blocked (mixed content / CORS / PNA), timed out, or not JSON.
+        return false;
+    }
+};
+
+// Walk the static-host chain and pin the root to the first gateway that answers.
+// Returns the root every later request uses.
+//
+// Called by `loadBootstrap` — the first thing the shell does — so every consumer of
+// this client gets the failover without knowing about it, and the SSE/session
+// requests that follow are already pointed at the live host. When the root is
+// pinned (a query, injected config, `VITE_HARNESS_API`, or any non-Pages host)
+// this is a no-op that performs NO request: a deliberate root is never replaced by
+// a guess, and a same-origin deployment pays nothing for this fix.
+export const ensureApiRoot = async (): Promise<string> => {
+    if (staticCandidates === undefined) return API_ROOT;
+
+    for (const candidate of staticCandidates) {
+        if (await probeRoot(candidate)) {
+            API_ROOT = candidate;
+
+            return candidate;
+        }
+    }
+
+    // Nothing answered. Stay on the FIRST candidate (this machine's gateway): it is
+    // the host the offline pane should name, because starting a server locally is
+    // the action that fixes it. The pane lists the whole chain, and Retry is a full
+    // reload, which re-probes.
+    API_ROOT = staticCandidates[0];
+
+    return API_ROOT;
+};
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -302,7 +424,13 @@ export const listSessions = async (): Promise<SessionSnapshot[]> => {
 // 404) — so it runs for any bootstrap failure, including a reverse proxy that
 // strips or rewrites the root document. If both fail, the fallback's error is the
 // one worth reporting: it names the route the UI actually needs.
+//
+// This is also where the static-host chain is walked (see `ensureApiRoot`): the
+// Pages deployment has no API on its own origin, so the first catalogue request
+// must go to whichever local/LAN gateway answers, not to a pinned guess.
 export const loadBootstrap = async (): Promise<HarnessBootstrap> => {
+    await ensureApiRoot();
+
     try {
         return await getBootstrap();
     } catch {
