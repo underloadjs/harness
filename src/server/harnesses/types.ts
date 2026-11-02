@@ -76,6 +76,15 @@ export type HarnessPreset = {
     // touching the others. Only ids are overridable — never a provider, base URL,
     // or credential. Empty/absent means "the session model for every member".
     agentModels?: Readonly<Record<string, string>>;
+    // Per-agent INSTRUCTION overrides (T3 editable configuration): agent id →
+    // instruction text. Same replace/key-membership rules as `agentModels`, and the
+    // same capture rule: the factory closure holds the map, so a later PATCH cannot
+    // rewrite what an existing session was built with. A member absent from the map
+    // runs the trusted `AgentProfile.instruction`; the profile itself is never
+    // mutated. This is what makes the UI's instruction editor a REAL edit: the text
+    // is validated, persisted on the registry entry, projected onto the descriptor,
+    // and consumed by `agentInstruction()` when the agent is built.
+    agentInstructions?: Readonly<Record<string, string>>;
     // Shipped with the application (`true`) or registered by a client through
     // POST /harnesses (`false`). Informational provenance only: both are editable
     // application entries, and the registry never uses this to gate a mutation.

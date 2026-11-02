@@ -94,6 +94,14 @@ export const describeHarness = (
         ...(Object.keys(preset.agentModels ?? {}).length > 0
             ? { agentModels: { ...preset.agentModels } }
             : {}),
+        // T3: the instruction OVERRIDE map, emitted only when the harness actually
+        // overrides something — exactly the `agentModels` rule, so a card that
+        // changes nothing keeps its pre-T3 shape. It is the OVERRIDE map, not the
+        // effective text: a member it omits runs the trusted `GET /agents`
+        // instruction, and the UI pairs the two to show what an agent really runs.
+        ...(Object.keys(preset.agentInstructions ?? {}).length > 0
+            ? { agentInstructions: { ...preset.agentInstructions } }
+            : {}),
         builtin: preset.builtin,
         editable: preset.editable
     };

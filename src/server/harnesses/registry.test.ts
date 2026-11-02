@@ -18,11 +18,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HarnessProgress } from '../../harness';
 import type { HarnessPreset } from './types';
-import { createHarnessRegistry } from './registry';
+import {
+    createHarnessRegistry,
+    isLegacyShippedDefinition,
+    presetFromRecord,
+    presetRecordEquals,
+    presetToRecord
+} from './registry';
 import { describeHarness } from './descriptor';
-import { presets } from './presets';
+import { LEGACY_PRESET_DEFINITIONS, presets } from './presets';
 import { SHARED_TOOL_NAMES } from './toolbox';
-import { AGENT_PROFILE_NAMES } from '../../agents';
+import { AGENT_PROFILE_NAMES, AGENT_PROFILES } from '../../agents';
 
 // The exact tool-order assertions below assume a KEYLESS host: search is
 // registered only when EXA_API_KEY/TAVILY_API_KEY resolves (harness.ts:728-738),
@@ -725,6 +731,281 @@ describe('per-agent model overrides', () => {
         // The descriptor carries the OVERRIDE map, not a resolved model per agent:
         // a UI shows "default" for the agents it omits.
         expect(describeHarness(mapped).agentModels).toEqual({ instruct: 'big/model' });
+    });
+});
+
+// T3 editable configuration — the harness-scoped sibling of `agentModels`. These
+// tests are deliberately the same SHAPE as the block above: an instruction override
+// is validated, stored, projected and executed by the same machinery, and the only
+// intended differences are the value rules (prose bounds instead of id bounds) and
+// the fact that the trusted profile stays untouched.
+describe('per-agent instruction overrides', () => {
+    // The summarizer's own shipped text, so the assertions below name the exact
+    // words an agent is seeded with rather than re-deriving them from the helper.
+    const TRUSTED_SUMMARIZER_INSTRUCTION = 'You compress technical notes into at most two sentences.';
+    const TRUSTED_GUIDELINES =
+        'Guidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.';
+
+    it('applies an override to that agent only and keeps the trusted guidelines', () => {
+        const registry = createHarnessRegistry();
+        const preset = registry.create({
+            name: 'voiced',
+            primary: 'research',
+            subagents: ['summarizer'],
+            agentInstructions: { summarizer: 'Condense to one line.' }
+        });
+
+        expect(preset.agentInstructions).toEqual({ summarizer: 'Condense to one line.' });
+
+        const harness = preset.create(SETTINGS, progress);
+
+        // The override replaces ONLY the identity sentence; the policy lines stay,
+        // which is what keeps a saved configuration from dropping shared rules.
+        expect(harness.agents.summarizer.instructions).toEqual([
+            'Condense to one line.',
+            TRUSTED_GUIDELINES
+        ]);
+
+        // A member the map omits runs the trusted profile exactly as before.
+        expect(harness.agents.research.instructions[0]).toBe(AGENT_PROFILES.research.instruction);
+    });
+
+    it('never mutates the trusted profile it overrides', () => {
+        const registry = createHarnessRegistry();
+        const preset = registry.create({
+            name: 'voiced',
+            primary: 'summarizer',
+            agentInstructions: { summarizer: 'Rewrite it as a haiku.' }
+        });
+
+        expect(preset.create(SETTINGS, progress).agents.summarizer.instructions[0]).toBe(
+            'Rewrite it as a haiku.'
+        );
+
+        // The catalogue is still the shipped text: the override lives on the harness
+        // entry, and a second harness built from the same profile is unaffected.
+        expect(AGENT_PROFILES.summarizer.instruction).toBe(TRUSTED_SUMMARIZER_INSTRUCTION);
+        expect(
+            registry.create({ name: 'plain', primary: 'summarizer' }).create(SETTINGS, progress)
+                .agents.summarizer.instructions[0]
+        ).toBe(TRUSTED_SUMMARIZER_INSTRUCTION);
+    });
+
+    it('accepts multi-line prose and trims the stored text', () => {
+        const registry = createHarnessRegistry();
+        const preset = registry.create({
+            name: 'multiline',
+            primary: 'instruct',
+            agentInstructions: { instruct: '  Lead with the answer.\n\nThen show the evidence.  ' }
+        });
+
+        expect(preset.agentInstructions).toEqual({
+            instruct: 'Lead with the answer.\n\nThen show the evidence.'
+        });
+
+        const harness = preset.create(SETTINGS, progress);
+        expect(harness.agents.instruct.instructions[0]).toBe(
+            'Lead with the answer.\n\nThen show the evidence.'
+        );
+    });
+
+    it('validates the map shape, its keys, and its values', () => {
+        const registry = createHarnessRegistry();
+
+        // Not a plain object.
+        expect(
+            registryError(() =>
+                registry.create({ name: 'x', primary: 'instruct', agentInstructions: [] as never })
+            )
+        ).toEqual({
+            status: 400,
+            message: '`agentInstructions` must be an object mapping agent ids to instruction text.'
+        });
+
+        // A key that is not a final member: an override for an agent this harness
+        // does not contain could never apply.
+        expect(
+            registryError(() =>
+                registry.create({
+                    name: 'x',
+                    primary: 'instruct',
+                    agentInstructions: { summarizer: 'Condense.' }
+                })
+            )
+        ).toEqual({
+            status: 400,
+            message:
+                '`agentInstructions` names "summarizer", which is not a member of this harness. Members: instruct.'
+        });
+
+        // Values: a non-string, a blank string, an over-long body, and a control
+        // character are all rejected with the agent named.
+        expect(
+            registryError(() =>
+                registry.create({
+                    name: 'x',
+                    primary: 'instruct',
+                    agentInstructions: { instruct: 7 as never }
+                })
+            )
+        ).toEqual({ status: 400, message: '`agentInstructions.instruct` must be an instruction string.' });
+
+        expect(
+            registryError(() =>
+                registry.create({ name: 'x', primary: 'instruct', agentInstructions: { instruct: '   ' } })
+            )
+        ).toEqual({
+            status: 400,
+            message:
+                '`agentInstructions.instruct` cannot be empty. Omit the key to run the trusted instruction.'
+        });
+
+        expect(
+            registryError(() =>
+                registry.create({
+                    name: 'x',
+                    primary: 'instruct',
+                    agentInstructions: { instruct: 'a'.repeat(8_001) }
+                })
+            )
+        ).toEqual({
+            status: 400,
+            message: '`agentInstructions.instruct` cannot exceed 8000 characters.'
+        });
+
+        expect(
+            registryError(() =>
+                registry.create({
+                    name: 'x',
+                    primary: 'instruct',
+                    agentInstructions: { instruct: 'null\u0000byte' }
+                })
+            )
+        ).toEqual({
+            status: 400,
+            message: '`agentInstructions.instruct` contains control characters.'
+        });
+    });
+
+    it('replaces the map on update, drops removed members, and clears on {}', () => {
+        const registry = createHarnessRegistry();
+        registry.create({
+            name: 'voiced',
+            primary: 'research',
+            subagents: ['summarizer'],
+            agentInstructions: { research: 'Ask before acting.', summarizer: 'Two lines max.' }
+        });
+
+        // A stated map REPLACES: the primary is back on its trusted instruction.
+        const replaced = registry.update('voiced', { agentInstructions: { summarizer: 'One line.' } });
+        expect(replaced.agentInstructions).toEqual({ summarizer: 'One line.' });
+
+        const rebuilt = replaced.create(SETTINGS, progress);
+        expect(rebuilt.agents.research.instructions[0]).toBe(AGENT_PROFILES.research.instruction);
+        expect(rebuilt.agents.summarizer.instructions[0]).toBe('One line.');
+
+        // Narrowing the team drops the override of the agent that left, so a later
+        // re-add cannot silently resurrect an old prompt. `summarizer`'s entry is the
+        // only one standing, so the map ends up empty.
+        const narrowed = registry.update('voiced', { subagents: [] });
+        expect(narrowed.agentInstructions).toEqual({});
+
+        // An explicit empty map clears every override.
+        registry.update('voiced', {
+            subagents: ['summarizer'],
+            agentInstructions: { summarizer: 'One line.' }
+        });
+        expect(registry.update('voiced', { agentInstructions: {} }).agentInstructions).toEqual({});
+        expect(
+            registry.find('voiced')!.create(SETTINGS, progress).agents.summarizer.instructions[0]
+        ).toBe(TRUSTED_SUMMARIZER_INSTRUCTION);
+    });
+
+    it('treats an instruction edit as executable and keeps a captured factory frozen', () => {
+        const registry = createHarnessRegistry();
+        const before = registry.create({
+            name: 'voiced',
+            primary: 'research',
+            subagents: ['summarizer'],
+            agentInstructions: { summarizer: 'Two lines max.' }
+        });
+        const oldHarness = before.create(SETTINGS, progress);
+
+        const after = registry.update('voiced', { agentInstructions: { summarizer: 'One line.' } });
+
+        // A NEW preset object with a NEW closure: a session built from `before` keeps
+        // the words its agents were created with (the frozen-session guarantee).
+        expect(oldHarness.agents.summarizer.instructions[0]).toBe('Two lines max.');
+        expect(before.agentInstructions).toEqual({ summarizer: 'Two lines max.' });
+        expect(before.create(SETTINGS, progress).agents.summarizer.instructions[0]).toBe(
+            'Two lines max.'
+        );
+        expect(after.agentInstructions).toEqual({ summarizer: 'One line.' });
+        expect(after.create(SETTINGS, progress).agents.summarizer.instructions[0]).toBe('One line.');
+    });
+
+    it('upgrades the scripted demo on an instruction edit, exactly like a model edit', () => {
+        const registry = createHarnessRegistry();
+
+        // The demo's shipped factory is the offline script, which ignores prompts. An
+        // instruction edit is executable, so it must not be stored against a factory
+        // that would silently ignore it: the entry becomes a live profiled harness.
+        const patched = registry.update('demo', { agentInstructions: { demo: 'Be brief.' } });
+
+        expect(patched.template).toBe('live');
+        expect(patched.requiresEndpoint).toBe(true);
+        expect(patched.agentInstructions).toEqual({ demo: 'Be brief.' });
+    });
+
+    it('describes the override map only when it is non-empty', () => {
+        const registry = createHarnessRegistry();
+
+        expect(describeHarness(registry.create({ name: 'bare2', primary: 'instruct' })).agentInstructions).toBeUndefined();
+
+        const mapped = registry.create({
+            name: 'voiced2',
+            primary: 'instruct',
+            agentInstructions: { instruct: 'Lead with the answer.' }
+        });
+        // The OVERRIDE map, not the effective text: a UI pairs this with the trusted
+        // `GET /agents` instruction to show what an agent actually runs.
+        expect(describeHarness(mapped).agentInstructions).toEqual({ instruct: 'Lead with the answer.' });
+    });
+
+    it('round-trips through a durable record and stays a customisation', () => {
+        const registry = createHarnessRegistry();
+        const preset = registry.create({
+            name: 'voiced3',
+            primary: 'research',
+            subagents: ['summarizer'],
+            agentInstructions: { summarizer: 'One line.' }
+        });
+
+        // A record carries the map, so a restart rebuilds the same prompts.
+        const record = presetToRecord(preset);
+        expect(record.agentInstructions).toEqual({ summarizer: 'One line.' });
+
+        const restored = presetFromRecord(record);
+        expect(restored.agentInstructions).toEqual({ summarizer: 'One line.' });
+        expect(restored.create(SETTINGS, progress).agents.summarizer.instructions[0]).toBe('One line.');
+
+        // Equality ignores insertion order but not the override itself, and a stored
+        // override proves the row was customised: the shipped-default refresh must
+        // never overwrite it. The record's team already matches the legacy research
+        // definition, so `agentInstructions` is the only variable under test.
+        expect(presetRecordEquals(record, presetToRecord(restored))).toBe(true);
+
+        const asShippedRow = { ...record, name: 'research' };
+
+        expect(isLegacyShippedDefinition(LEGACY_PRESET_DEFINITIONS.research, {
+            ...asShippedRow,
+            agentInstructions: { summarizer: 'One line.' }
+        })).toBe(false);
+
+        expect(isLegacyShippedDefinition(LEGACY_PRESET_DEFINITIONS.research, {
+            ...asShippedRow,
+            agentInstructions: {}
+        })).toBe(true);
     });
 });
 

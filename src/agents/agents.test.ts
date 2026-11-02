@@ -212,4 +212,37 @@ describe('agentInstruction', () => {
             })
         ).toEqual(['You are bare.']);
     });
+
+    // T3 editable configuration. The override is the harness-level text a saved
+    // configuration carries; it replaces ONLY the identity sentence so the shared
+    // policy lines can never be dropped by an edit.
+    it('replaces the identity sentence with a harness override', () => {
+        expect(agentInstruction(summarizer, 'Condense to one line.')).toEqual([
+            'Condense to one line.',
+            'Guidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
+        ]);
+    });
+
+    it('keeps the trusted instruction when the override is absent or blank', () => {
+        // Absent (undefined) and a whitespace-only value are the same thing: no
+        // override. The registry never stores a blank one, so a saved harness cannot
+        // reach the runtime with an empty prompt by this path.
+        expect(agentInstruction(summarizer, undefined)).toEqual(agentInstruction(summarizer));
+        expect(agentInstruction(summarizer, '   \n ')).toEqual(agentInstruction(summarizer));
+    });
+
+    it('applies an override to a guideline-free profile without adding a block', () => {
+        expect(
+            agentInstruction(
+                {
+                    name: 'bare',
+                    title: 'Bare',
+                    description: 'No rules.',
+                    instruction: ' You are bare. ',
+                    guidelines: []
+                },
+                '  You are edited.  '
+            )
+        ).toEqual(['You are edited.']);
+    });
 });

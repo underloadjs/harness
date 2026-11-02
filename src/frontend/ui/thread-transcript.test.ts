@@ -682,7 +682,7 @@ const openTranscriptFrom = (bar: HTMLElement): void => {
 };
 
 describe('responsive thread action bar', () => {
-    it('puts the state beside the thread badge and Delete in the header right (T1/R2)', () => {
+    it('puts the state last on the measurement line and Delete on the badge line (R3/R4)', () => {
         const board = mount();
         const snapshot = snapshotOf({
             threads: [threadOf({ id: 'thread-a', label: 'RR1', messages: [] })],
@@ -692,23 +692,23 @@ describe('responsive thread action bar', () => {
         const turn = board.adopt(snapshot.turns[0]);
         board.expand(turn);
 
-        // R2 half one: the header's FIRST line is identity — the persistent-thread
-        // badge, then the state word immediately to its right.
+        // R2 half one: the header's FIRST line is the identity — the persistent-thread
+        // badge ALONE (R3 took the state word off this line), which is also the line the
+        // header Delete control is centred on (R4).
         const identity = turn.element.querySelector<HTMLElement>('.tile-identity');
         expect(identity).not.toBeNull();
-        expect([...(identity?.children ?? [])].map((node) => node.className)).toEqual([
-            'tile-thread',
-            'tile-status'
-        ]);
+        expect([...(identity?.children ?? [])].map((node) => node.className)).toEqual(['tile-thread']);
         expect(identity?.firstElementChild?.textContent).toBe('RR1');
-        // The fixture's turn is terminal, so the state word is its own (`done`), read
-        // right beside the badge.
-        expect(identity?.querySelector('.tile-status-text')?.textContent).toBe('done');
-        // The measurement cluster keeps only measurements.
+        expect(identity?.querySelector('.tile-status-text')).toBeNull();
+        // R3: the measurement line carries the clock, the tally and, LAST, the state word
+        // — the reader's line is `2.8s | 8,946 - done`; the ` - ` is generated CSS, so the
+        // word's own text node stays exactly `done`.
         expect([...(turn.element.querySelectorAll('.tile-top > *') ?? [])].map((node) => node.className)).toEqual([
             'tile-elapsed',
-            'tile-tokens'
+            'tile-tokens',
+            'tile-status'
         ]);
+        expect(turn.element.querySelector('.tile-top > .tile-status > .tile-status-text')?.textContent).toBe('done');
 
         // R2 half two: Delete occupies the header's right slot, as a sibling of the
         // header button (a <button> can never nest inside one).
@@ -784,12 +784,42 @@ describe('responsive thread action bar', () => {
         expect(identityRule).toContain('order: 0');
         expect(identityRule).toContain('display: inline-flex');
 
+        // R3: the state word closes the measurement line, and the ` - ` in front of it is
+        // GENERATED decoration (never part of the word), painted only when a measurement
+        // precedes it and only on an EXPANDED header — a compact row clips the word, and a
+        // dash in front of a clipped word would be a stray ` - `. Two rules, because the
+        // tally is hidden until a request reports usage and the clock is hidden for a
+        // replayed record with no end stamp; with neither visible the word stands alone.
+        const dashRules = [
+            ...css.matchAll(
+                /(:is\(\.tile\.is-expanded, \.thread-tile\.is-expanded\)[\s\S]*?:is\(\.tile-status, \.thread-status\)::before) \{([^}]*)\}/g
+            )
+        ];
+        expect(dashRules).toHaveLength(2);
+        for (const rule of dashRules) {
+            expect(rule[2]).toContain("content: ' - '");
+        }
+        expect(dashRules.map((rule) => rule[1])).toEqual([
+            expect.stringMatching(/:is\(\.tile-tokens, \.thread-tokens\):not\(\[hidden\]\)/),
+            expect.stringMatching(/:is\(\.tile-tokens, \.thread-tokens\)\[hidden\]/)
+        ]);
+        // The line carries no flex gap, so the generated separators hold ALL the spacing
+        // and the rendered line is exactly `2.8s | 8,946 - done` (and a compact row stays
+        // flush right, because its zero-width status box gets no gap of its own).
+        const blockOf = (selector: string): string => {
+            const at = css.indexOf(selector);
+            if (at < 0) throw new Error(`missing selector ${selector}`);
+            return css.slice(css.indexOf('{', at) + 1, css.indexOf('}', at));
+        };
+        expect(blockOf('\n.tile-top {')).toContain('gap: 0');
+        expect(blockOf('\n.thread-top {')).toContain('gap: 0');
+        // A compact row must not inherit the dash: the only ` - ` rules in the file are
+        // scoped to an expanded header.
+        expect(css).not.toMatch(/:is\(\.tile:not\(\.is-expanded\)[^{}]*::before\s*\{[^}]*content: ' - '/);
+
         // T1/R2: the header slots are positioned over the header of each card owner.
         expect(css).toMatch(
-            /:is\(\.tile-header-action, \.thread-header-action, \.thread-focus-head-action\) \{\s*display: flex;/
-        );
-        expect(css).toMatch(
-            /\.tile\.is-expanded > \.tile-header-action \{\s*position: absolute;[\s\S]*?right: 12px;/
+            /:is\(\.tile-header-action, \.thread-header-action, \.thread-focus-head-action\) \{\s*display: flex;\s*align-items: center;/
         );
         expect(css).toMatch(
             /\.thread-tile > \.thread-header-action \{\s*position: absolute;[\s\S]*?right: 10px;/
@@ -802,11 +832,21 @@ describe('responsive thread action bar', () => {
         // slot. The expanded header must RESERVE the slot's width instead.
         expect(css).toMatch(/\.thread-tile\.is-expanded > \.thread-select \{\s*padding-right: 84px;/);
 
-        // T3/R2 (reviewer finding 3): the turn-tile slot is centred on the identity line
-        // (top tuned inside the header's own padding band), not parked at its lower edge.
+        // T3/R2 + R4 (reviewer finding: "Delete slightly high"): the slot is no longer a
+        // `top` guessed from the button's own height. It gets the BADGE LINE's own box —
+        // the header's padding-top plus the pill's line box — and the shared
+        // `align-items: center` centres whatever the host holds (desktop label or phone
+        // glyph). Measured in real Chrome (`Temp/t2/probe-t2-header.html`, 384 cells): the
+        // two centres coincide to 0.00px on the main tile and 0.13px on a nested card.
         expect(css).toMatch(
-            /\.tile\.is-expanded > \.tile-header-action \{\s*position: absolute;[^}]*?top: 5px;[^}]*?right: 12px;/
+            /\.tile\.is-expanded > \.tile-header-action \{\s*position: absolute;\s*z-index: 1;\s*top: 10px;\s*height: 17px;\s*right: 12px;/
         );
+        expect(css).toMatch(
+            /\.thread-tile > \.thread-header-action \{\s*position: absolute;\s*z-index: 1;\s*top: 6px;\s*height: 16px;\s*right: 10px;/
+        );
+        // R3/R4: the measurement line clears the same slot, because on an exchange that
+        // prints no badge (a conversation continuation) that line IS the header's first.
+        expect(css).toMatch(/\.tile\.is-expanded \.tile-top \{\s*padding-right: 92px;/);
 
         // The glyph swap covers the header slots too, so a phone still gets `X`.
         expect(css).toMatch(
@@ -854,6 +894,28 @@ describe('responsive thread action bar', () => {
         expect(box).toBeDefined();
         expect(box).toContain('flex: 0 1 auto');
         expect(box).toContain('min-width: 1.5em');
+        // R3: the box clips too. The generated ' - ' is a second, non-shrinkable flex
+        // item inside it, so the content can be wider than the box and ~19px of separator
+        // ink reached the Delete slot (real Chrome, Temp/t2/probe-t2-header.html). A
+        // clipped box keeps the promise that a clipped span's ink IS its rect.
+        expect(box).toContain('overflow: hidden');
+
+        // R3: the word now shares the line with the clock and the tally, so the whole
+        // line has to be able to SHRINK and its numbers have to clip — an un-shrinkable
+        // line pushed its ink past the card's own edge on a 300px nested column.
+        const line = css.match(
+            /:is\(\.tile\.is-expanded, \.thread-tile\.is-expanded\) :is\(\.tile-top, \.thread-top\) \{([^}]*)\}/
+        )?.[1];
+        expect(line).toBeDefined();
+        expect(line).toContain('flex: 0 1 auto');
+        expect(line).toContain('min-width: 0');
+        const figures = css.match(
+            /:is\(\.tile\.is-expanded, \.thread-tile\.is-expanded\)\s*:is\(\.tile-elapsed, \.thread-elapsed, \.tile-tokens, \.thread-tokens\) \{([^}]*)\}/
+        )?.[1];
+        expect(figures).toBeDefined();
+        expect(figures).toContain('min-width: 0');
+        expect(figures).toContain('overflow: hidden');
+        expect(figures).toContain('text-overflow: ellipsis');
 
         // Scope: `is-expanded` only, so the compact sr-only clip stays the single
         // treatment for collapsed rows, and the T3 reserve that keeps Delete clear.
@@ -881,12 +943,23 @@ describe('responsive thread action bar', () => {
         expect(board.focusThread('thread-child')).toBe(true);
         expect(childHeader?.hidden).toBe(false);
         expect(childBar?.hidden).toBe(false);
-        // T1/R2: the nested card's identity line is its label then its state word.
+        // R3: the nested card's identity half is its conversation code alone; the state
+        // word sits at the END of the nested measurement line, exactly as it does on the
+        // main tile, so the two headers read as one component.
+        const nestedSelect = childRow?.querySelector<HTMLElement>(':scope > .thread-tile > .thread-select');
         expect(
-            [...(childRow?.querySelectorAll<HTMLElement>(':scope > .thread-tile > .thread-select > *') ?? [])].map(
+            [...(nestedSelect?.children ?? [])]
+                .filter((node) => !node.classList.contains('thread-kind'))
+                .map((node) => node.className)
+        ).toEqual(['thread-name', 'thread-preview', 'thread-top']);
+        expect(
+            [...(nestedSelect?.querySelectorAll<HTMLElement>(':scope > .thread-top > *') ?? [])].map(
                 (node) => node.className
-            ).slice(0, 2)
-        ).toEqual(['thread-name', 'thread-status']);
+            )
+        ).toEqual(['thread-elapsed', 'thread-tokens', 'thread-status']);
+        expect(nestedSelect?.querySelector('.thread-top > .thread-status')?.lastElementChild?.className).toBe(
+            'thread-status-text'
+        );
         expect(childBar?.querySelector('.transcript-open .action-label')?.textContent).toBe('Transcript');
         expect(childBar?.querySelector('.thread-delete')).toBeNull();
         expect(actionButton(childHeader as HTMLElement, '.thread-delete').getAttribute('aria-label')).toBe(

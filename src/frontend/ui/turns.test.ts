@@ -1164,10 +1164,10 @@ describe('token tally', () => {
         usage: { input, output, total: input + output, ...(cached === undefined ? {} : { cached }) }
     });
 
-    // The MEASUREMENT spans, in DOM order. `tile-tokens` follows the elapsed label.
-    // T1/R2: the state word is no longer part of this cluster — it is identity, asserted
-    // with `.tile-identity` below (and in turns-threads.test.ts). The persistent-thread
-    // badge is identity, not a measurement, and leads the header.
+    // The MEASUREMENT spans, in DOM order: `tile-tokens` follows the elapsed label, and
+    // R3 puts the state word LAST (`2.8s | 8,946 - done`) — the state measures this block,
+    // it is not part of the conversation's identity. The persistent-thread badge stays
+    // identity (`.tile-identity`, asserted below and in turns-threads.test.ts).
     const topClasses = (turn: { element: HTMLElement }): (string | null)[] =>
         [...(turn.element.querySelector('.tile-top')?.children ?? [])].map((child) => child.className);
 
@@ -1210,15 +1210,16 @@ describe('token tally', () => {
         );
         // R1: the persistent-thread badge LEADS the header (identity before
         // measurements) and stays hidden (but present) for a turn with no runtime
-        // thread identity; `.tile-top` holds measurements only. T1/R2: the state word
-        // now reads beside the badge inside `.tile-identity`.
-        expect(topClasses(turn)).toEqual(['tile-elapsed', 'tile-tokens']);
+        // thread identity. R3: the state word closes the measurement line, and the badge
+        // line is the badge ALONE — the line the header Delete control is centred on.
+        expect(topClasses(turn)).toEqual(['tile-elapsed', 'tile-tokens', 'tile-status']);
         expect(turn.element.querySelector('.tile-select')?.firstElementChild?.className).toBe('tile-identity');
         expect(
             [...(turn.element.querySelectorAll<HTMLElement>('.tile-identity > *') ?? [])].map(
                 (child) => child.className
             )
-        ).toEqual(['tile-thread', 'tile-status']);
+        ).toEqual(['tile-thread']);
+        expect(turn.element.querySelector('.tile-identity .tile-status-text')).toBeNull();
     });
 
     it('falls back to the cumulative input only when no usage event was recorded', () => {

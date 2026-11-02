@@ -31,10 +31,10 @@
 // tool. The only names spelled out in the package are the public NAMED EXPORTS in
 // `./index` (an API surface, not an inventory).
 //
-// NAMING (T14): every wire name is `<namespace><action>` — read, fileWrite,
-// edit, fileList, fileGlob, shell, gitDiff, syntaxCheck. There are no
-// compatibility aliases, because a catalogue with two names for one tool makes
-// discovery ambiguous.
+// NAMING: every wire name is an action a model types — read, write, edit, fileList,
+// glob, grep, shell, gitDiff, syntax. There are no compatibility aliases (the former
+// fileWrite/fileGlob/syntaxCheck names are gone from the table), because a catalogue
+// with two names for one tool makes discovery ambiguous.
 //
 // Cross-references:
 //   - ./descriptors  — the single seam onto the discovered catalogue + loader

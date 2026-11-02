@@ -200,19 +200,23 @@ it('opens the JSON transcript and deletes a thread through the existing endpoint
     expect(tile.dataset.threadId).toBe('thread-a');
     const bar = byClass('.tile-transcript-action', 'div');
     expect(bar.hidden).toBe(false);
-    // T1/R2 (shell wiring): Delete is a header control of the card, Transcript stays in
-    // the toolbar, and the state word leads beside the thread badge.
+    // T1/R2 (shell wiring): Delete is a header control of the card and Transcript stays
+    // in the toolbar. R3/R4: the identity line is the badge ALONE, and the state word
+    // closes the measurement line (`IN1` on top, `… - done` underneath).
     const header = tile.querySelector<HTMLElement>('.tile-header-action');
     expect(header?.parentElement).toBe(tile);
     expect(header?.querySelector('.thread-delete')).not.toBeNull();
     expect(bar.querySelector('.thread-delete')).toBeNull();
     expect(
         [...(tile.querySelectorAll<HTMLElement>('.tile-identity > *') ?? [])].map((node) => node.className)
-    ).toEqual(['tile-thread', 'tile-status']);
-    // The fixture's thread is `IN1` and its turn is `done`, so the identity line reads
-    // exactly `IN1` + `done` in that order (screenshot R2).
+    ).toEqual(['tile-thread']);
+    // The fixture's thread is `IN1` and its turn is `done`, so the badge reads exactly
+    // `IN1` and the state word is the measurement line's last item (screenshot R3).
     expect(tile.querySelector('.tile-thread')?.textContent).toBe('IN1');
-    expect(tile.querySelector('.tile-identity .tile-status-text')?.textContent).toBe('done');
+    expect(
+        [...(tile.querySelectorAll<HTMLElement>('.tile-top > *') ?? [])].map((node) => node.className)
+    ).toEqual(['tile-elapsed', 'tile-tokens', 'tile-status']);
+    expect(tile.querySelector('.tile-top > .tile-status > .tile-status-text')?.textContent).toBe('done');
 
     // R7: the explicit open fetches the same session once and renders pretty JSON.
     byClass('.tile-transcript-action .transcript-open', 'button').click();

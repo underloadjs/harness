@@ -7,16 +7,16 @@
 // that `link.ts` and `real.ts` are one file through a symlink. Consequences that
 // were real:
 //
-//   - fileWrite/edit accepted a batch that wrote the same file twice under two
-//     spellings, so the second write silently won (fileWrite.ts, edit.ts);
-//   - fileGlob walked the same tree twice for roots `src` and `SRC` (or a symlinked
-//     root) and listed every file twice (fileGlob.ts `collect`).
+//   - write/edit accepted a batch that wrote the same file twice under two
+//     spellings, so the second write silently won (./write.tool.ts, ./edit.tool.ts);
+//   - a search walked the same tree twice for roots `src` and `SRC` (or a symlinked
+//     root) and listed every file twice (./search.ts collectCandidates).
 //
 // THE RULE (documented, not guessed)
 // ----------------------------------
 //   - an EXISTING path is identified by `realpath()`: symlinks and case aliases
 //     collapse onto the same key on every platform;
-//   - a NEW path (fileWrite creates files) is identified by the nearest existing
+//   - a NEW path (write creates files) is identified by the nearest existing
 //     ancestor's realpath plus the segments that are still missing, so two
 //     spellings of one not-yet-created file collide as well. Nothing is created or
 //     probed destructively: only `realpath` (a read) is used, and a missing target
@@ -32,9 +32,9 @@
 // were.
 //
 // Cross-references:
-//   - ./fileWrite   — duplicate targets in one batch
-//   - ./edit    — duplicate targets in one batch
-//   - ./fileGlob    — root aliases that walk one tree twice
+//   - ./write.tool.ts — duplicate targets in one batch
+//   - ./edit.tool.ts  — duplicate targets in one batch
+//   - ./search.ts     — root aliases that walk one tree twice (glob and grep)
 
 import { realpath } from 'node:fs/promises';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -62,7 +62,7 @@ const tryRealpath = async (path: string): Promise<string | undefined> => {
 // identity is not in question): resolve() normalizes "." and "..", and win32 folds
 // case. No filesystem access, so it is safe to call per walked file.
 //
-// fileGlob uses this for its per-file dedupe: the walker never enters a symlink, so
+// The search presets use this for their per-file dedupe: the walker never enters a symlink, so
 // every file it yields is its own real path once the ROOT identity has been
 // resolved (see fileIdentity below).
 export const canonicalPathKey = (path: string): string => canonical(resolve(path));
@@ -71,7 +71,7 @@ export const canonicalPathKey = (path: string): string => canonical(resolve(path
 export const fileIdentity = async (path: string): Promise<string> => {
     const absolute = resolve(path);
 
-    // The common case: the file exists (edit, fileGlob, an overwrite).
+    // The common case: the file exists (edit, a search, an overwrite).
     const direct = await tryRealpath(absolute);
     if (direct !== undefined) return canonical(direct);
 

@@ -167,7 +167,7 @@ export type HarnessDescriptor = {
     agents: string[];
     tools: string[];
     // The core tools this card's runs will declare (R18): the four core file tools
-    // (read/fileWrite/edit/fileGlob) when registered, the harness-owned
+    // (read/write/edit/glob/grep) when registered, the harness-owned
     // toolRequest/toolCreate/todoManage, delegate when a subagent allowlist
     // exists, and search when this host has a provider key. The UI core dropdown
     // renders this exact set, so it reflects runtime visibility rather than a
@@ -178,6 +178,14 @@ export type HarnessDescriptor = {
     // shape. A member absent from the map uses the session's model; the UI labels
     // that no-override choice with the resolved id (R18), never "inherit".
     agentModels?: Record<string, string>;
+    // Per-agent INSTRUCTION overrides (T3 editable configuration): agent id →
+    // instruction text. PRESENT ONLY WHEN the harness actually overrides something,
+    // so every existing card keeps its exact shape. Like `agentModels` it is the
+    // OVERRIDE map, not the effective text: an agent it omits runs the trusted
+    // catalogue instruction from `GET /agents`. The override replaces only the
+    // profile's identity sentence — its `guidelines` still apply — and it never
+    // rewrites the trusted profile itself.
+    agentInstructions?: Record<string, string>;
     // Shipped with the application vs created through POST /harnesses. Informational
     // only: every harness in the in-memory registry is an editable application copy
     // of a template or a client-created harness.
@@ -189,10 +197,12 @@ export type HarnessDescriptor = {
     editable: boolean;
 };
 
-// Body of POST /harnesses. A client selects trusted agents; it cannot supply
-// instruction text, a provider, a model, or a tool list. It CAN pick the model id
-// each selected agent runs (`agentModels`, R9) — an id only, never a provider or
-// credential, because those come from the session settings.
+// Body of POST /harnesses. A client selects trusted agents; it cannot supply a
+// provider, a model, or a tool list. It CAN pick the model id each selected agent
+// runs (`agentModels`, R9) — an id only, never a provider or credential, because
+// those come from the session settings — and it CAN record a per-agent instruction
+// override (`agentInstructions`, T3), which the registry validates against the
+// final member set and the server applies when it builds the agent.
 export type CreateHarnessRequest = {
     name: string;
     title?: string;
@@ -200,6 +210,7 @@ export type CreateHarnessRequest = {
     primary: string;
     subagents?: string[];
     agentModels?: Record<string, string>;
+    agentInstructions?: Record<string, string>;
 };
 
 // Body of PATCH /harnesses/:name. `name` is immutable; an omitted field keeps its
@@ -210,12 +221,19 @@ export type CreateHarnessRequest = {
 // every per-agent model, and every key must name a member of the resulting harness
 // (400 otherwise). An existing override for a member the same patch removes is
 // dropped rather than rejected.
+//
+// `agentInstructions` follows the SAME replace/key-membership rules (T3): `{}`
+// clears every instruction override so every member runs its trusted catalogue
+// instruction again, a value must be non-empty bounded text, and an omitted key
+// means "no override for that agent". A saved override never mutates the trusted
+// profile; it is stored on the harness and projected back on `HarnessDescriptor`.
 export type UpdateHarnessRequest = {
     title?: string;
     description?: string;
     primary?: string;
     subagents?: string[];
     agentModels?: Record<string, string>;
+    agentInstructions?: Record<string, string>;
 };
 
 // Whether the server can actually run a listed tool. Omitted means "available":

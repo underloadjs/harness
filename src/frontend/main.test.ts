@@ -206,9 +206,10 @@ const tileStates = (): (string | null | undefined)[] =>
     [...document.querySelectorAll<HTMLElement>('.tile')].map((tile) => tile.dataset.state);
 const tileElapsed = (): (string | null)[] =>
     [...document.querySelectorAll<HTMLElement>('.tile-elapsed')].map((node) => node.textContent);
-// R11 (T5): the team/model deck now lives inside the shared agent dialog, so every
-// deck read opens it from the composer's SINGLE agent button. A no-op when the modal
-// is already open (a chrome rebuild refreshes it in place).
+// T3: the agent dialog shows the team as plain rows and every member's configuration
+// through one dropdown, so a team read opens the dialog from the composer's SINGLE
+// agent button (a no-op when it is already open — a chrome rebuild refreshes it in
+// place).
 function openAgents(): void {
     if (document.querySelector('.dialog') !== null) return;
     byClass('.agent-control-button', 'button').click();
@@ -216,16 +217,55 @@ function openAgents(): void {
 
 const agentRoles = (): (string | undefined)[] => {
     openAgents();
-    return [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.dataset.role);
+    return [...document.querySelectorAll<HTMLElement>('.agent-dialog-agent')].map(
+        (row) => row.dataset.role
+    );
 };
 const agentNames = (): (string | null)[] => {
     openAgents();
-    return [...document.querySelectorAll<HTMLElement>('.agent-tile-name')].map((node) => node.textContent);
+    return [...document.querySelectorAll<HTMLElement>('.agent-dialog-agent-name')].map(
+        (node) => node.textContent
+    );
 };
-// R2 deck: the FRONT card per tile, in DOM order (`undefined` = hidden card).
-const agentFronts = (): (string | undefined)[] => {
+// The configuration panel's agent, i.e. what the dropdown currently shows.
+const configuredAgent = (): string | undefined => {
     openAgents();
-    return [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.dataset.front);
+
+    return document.querySelector<HTMLElement>('.agent-dialog-config')?.dataset.agent;
+};
+// The dropdown entries' values, in order: "all agents are in one dropdown".
+const agentEntries = (): string[] =>
+    [...byClass('.agent-dialog-agent-select', 'select').options].map((option) => option.value);
+// The dialog's own editors. Each opens the dialog first, because a lifecycle change
+// (a new session, a harness switch) closes it and the next read must not fail.
+const instructionBox = (): HTMLTextAreaElement => {
+    openAgents();
+
+    return byClass('.agent-dialog-instruction', 'textarea');
+};
+const memberToggle = (): HTMLInputElement => {
+    openAgents();
+
+    return byClass('.agent-dialog-member', 'input');
+};
+const dialogNote = (): string | null => {
+    openAgents();
+
+    return document.querySelector('.agent-dialog-note')?.textContent ?? null;
+};
+const applyAction = (): HTMLButtonElement => {
+    openAgents();
+
+    return byClass('.agent-dialog-apply', 'button');
+};
+// Chooses the configured agent through the dropdown (the only way to view another
+// agent's configuration; it sends nothing on its own).
+const selectConfigured = (name: string): void => {
+    openAgents();
+
+    const select = byClass('.agent-dialog-agent-select', 'select');
+    select.value = name;
+    select.dispatchEvent(new Event('change', { bubbles: true }));
 };
 const harnessNames = (): (string | null)[] =>
     [...document.querySelectorAll<HTMLElement>('.harness-item .harness-name')].map((node) => node.textContent);
@@ -355,11 +395,17 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     expect(document.querySelector('.harness-id')?.textContent).toBe('');
     expect(byClass('.harness-id', 'span').hidden).toBe(true);
 
-    // The agent row replaced the description wall.
+    // T3: the team is a list of rows, and every agent is reachable from ONE dropdown
+    // (the old card deck and its `+` picker are gone, so membership is a checkbox).
     expect(agentNames()).toEqual(['Instruct']);
     expect(agentRoles()).toEqual(['primary']);
     expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
-    expect(document.querySelector('.agent-add')).not.toBeNull();
+    expect(document.querySelector('.agent-add')).toBeNull();
+    expect(configuredAgent()).toBe('instruct');
+    expect(agentEntries()).toEqual(['instruct', 'summarizer', 'workspace']);
+    expect(
+        [...byClass('.agent-dialog-agent-select', 'select').options].map((option) => option.textContent)
+    ).toEqual(['Instruct · primary', 'Summarizer · not in the team', 'Workspace · not in the team']);
 
     // R21.1: the rail says template/custom and an agent count — never a
     // read-only/editable distinction.
@@ -405,7 +451,10 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     // The tile exists before the server answers; while the stream is open the
     // request lock is held, so a second submit is ignored.
     expect(document.querySelector('.tile')).not.toBeNull();
-    expect(byClass('.agent-main', 'button').disabled).toBe(true);
+    // T3: while a run is in flight the dialog's team/instruction controls are locked
+    // (the reason is the note inside the dialog, not a disabled guess).
+    expect(instructionBox().disabled).toBe(true);
+    expect(memberToggle().disabled).toBe(true);
     form.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
 
     await flush();
@@ -441,14 +490,19 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     // Empty field, no pending work: the action is gone again (R10).
     expect(composerAction.hidden).toBe(true);
     expect(composerAction.dataset.action).toBe('none');
-    // A session exists now, so the TEAM is frozen: editing needs the rail's own
-    // New session. R7 removed the in-row lock notice and its link.
-    expect(byClass('.agent-main', 'button').disabled).toBe(true);
+    // A session exists now, so the TEAM and the INSTRUCTIONS are frozen: editing them
+    // needs the rail's own New session. R7 removed the in-row lock notice and its
+    // link; T3 states the restriction inside the dialog and locks both editors.
+    expect(instructionBox().disabled).toBe(true);
+    expect(memberToggle().disabled).toBe(true);
+    expect(dialogNote()).toBe(
+        'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.'
+    );
     expect(document.querySelector('.agent-lock')).toBeNull();
     expect(document.querySelector('.agent-row-wrap .link-button')).toBeNull();
     expect(document.querySelector('.new-session')?.textContent).toBe('New session');
     expect(byClass('.new-session', 'button').disabled).toBe(false);
-    // ...but the MODELS are live (R2): the tile dropdown still edits this session.
+    // ...but the MODELS are live (R2): the dialog dropdown still edits this session.
     const modelSelect = byClass('.agent-model-select', 'select');
     expect(modelSelect.disabled).toBe(false);
     expect(modelSelect.title).toBe(
@@ -836,26 +890,37 @@ it('restores a remembered session with its frozen team and server timings', asyn
     // pane is detached while the chat owns the stage — tools-tab.test.ts pins the
     // text). What matters here is that no right-rail core dropdown came back.
     expect(document.querySelector('.core-tools')).toBeNull();
-    for (const button of document.querySelectorAll<HTMLButtonElement>('.agent-main')) {
-        expect(button.disabled).toBe(true);
-    }
-    expect(byClass('.agent-add', 'button').disabled).toBe(true);
-    // R7: the frozen team is visible through its disabled controls only. Neither
-    // the removed notice nor its New session link may come back; the rail keeps
-    // its own independent New session action.
+    // T3: a frozen team locks the promotion (there is no promote button any more —
+    // the action's promotion half is gone), the instruction editor and the membership
+    // toggle. The dialog says why in its note.
+    expect(instructionBox().disabled).toBe(true);
+    expect(memberToggle().disabled).toBe(true);
+    expect(applyAction().textContent).toBe('Save configuration');
+    expect(applyAction().disabled).toBe(true);
+    expect(dialogNote()).toBe(
+        'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.'
+    );
+    // R7: the frozen team is visible through its disabled controls plus that note.
+    // Neither the removed notice nor its New session link may come back; the rail
+    // keeps its own independent New session action.
     expect(document.querySelector('.agent-lock')).toBeNull();
     expect(document.querySelector('.agent-lock-text')).toBeNull();
     expect(document.querySelector('.agent-row-wrap .link-button')).toBeNull();
     expect(byClass('.new-session', 'button').textContent).toBe('New session');
     expect(byClass('.new-session', 'button').disabled).toBe(false);
-    // R2: models are not part of the frozen team, so their controls stay usable on a
-    // saved session and promise the next request in THIS chat.
-    const modelSelects = [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
-    expect(modelSelects.map((select) => select.disabled)).toEqual([false, false]);
-    expect(modelSelects.map((select) => select.title)).toEqual([
-        'Model for Instruct. Applies to the next request in this session.',
+    // R2: models are not part of the frozen team, so the dropdown stays usable on a
+    // saved session and promises the next request in THIS chat — for every member,
+    // which the T3 dropdown reaches one agent at a time.
+    expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
+    expect(byClass('.agent-model-select', 'select').title).toBe(
+        'Model for Instruct. Applies to the next request in this session.'
+    );
+
+    selectConfigured('summarizer');
+    expect(configuredAgent()).toBe('summarizer');
+    expect(byClass('.agent-model-select', 'select').title).toBe(
         'Model for Summarizer. Applies to the next request in this session.'
-    ]);
+    );
 
     // The rail's New session action starts a new conversation, which unlocks
     // editing. It is the ONLY New session affordance on the page (R7).
@@ -866,7 +931,8 @@ it('restores a remembered session with its frozen team and server timings', asyn
     expect(document.querySelectorAll('.tile')).toHaveLength(0);
     expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
     expect(agentNames()).toEqual(['Instruct']);
-    expect(byClass('.agent-main', 'button').disabled).toBe(false);
+    expect(instructionBox().disabled).toBe(false);
+    expect(applyAction().textContent).toBe('Save configuration');
     expect(localStorage.getItem(SESSION_KEY)).toBeNull();
     expect(writes).toBe(0);
 });
@@ -1003,40 +1069,49 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
     await flush();
     await flush();
 
-    // The picker is the trusted preset list, with read-only instructions. The deck
-    // (and its picker) lives in the shared agent dialog now (T5 R11).
+    // T3: ONE dropdown replaces the card deck and its add picker. It lists every
+    // trusted agent the server advertises, each labelled with its team state, and the
+    // selected agent's instruction is on screen as an editor (not a read-only block).
     openAgents();
-    byClass('.agent-add', 'button').click();
-    const picker = byClass('.agent-picker', 'div');
-    expect(picker.hidden).toBe(false);
-    expect(byClass('.agent-add', 'button').getAttribute('aria-expanded')).toBe('true');
+    expect(agentEntries()).toEqual(['instruct', 'summarizer', 'workspace']);
+    expect(
+        [...byClass('.agent-dialog-agent-select', 'select').options].map((option) => option.textContent)
+    ).toEqual(['Instruct · primary', 'Summarizer · not in the team', 'Workspace · not in the team']);
 
-    const options = [...document.querySelectorAll<HTMLElement>('.agent-option')];
-    expect(options.map((option) => option.dataset.agent)).toEqual(['instruct', 'summarizer', 'workspace']);
-    expect(options[0].dataset.state).toBe('member');
-    expect(options[0].querySelector<HTMLButtonElement>('.agent-option-add')?.disabled).toBe(true);
-    expect(options[1].querySelector('.agent-instruction')?.textContent).toBe(
-        'Compress notes into at most two sentences.'
-    );
-    expect(options[1].querySelector('.agent-guideline')?.textContent).toBe('Keep names and numbers.');
+    // 1. Adding is a local draft: tick membership for the outside agent, return to
+    //    the primary, then save. Nothing was sent by the selection or the tick.
+    selectConfigured('summarizer');
+    expect(instructionBox().value).toBe('Compress notes into at most two sentences.');
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.agent-detail .agent-guideline')].map((node) => node.textContent)
+    ).toEqual(['Keep names and numbers.']);
 
-    options[1].querySelector<HTMLButtonElement>('.agent-option-add')?.click();
+    const toggle = memberToggle();
+    toggle.checked = true;
+    toggle.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
+
+    selectConfigured('instruct');
+    applyAction().click();
     await flush();
 
-    // Complete team in one PATCH: primary + every remaining member as subagent.
-    expect(calls.find((call) => call.method === 'PATCH')?.body).toEqual({
+    // Complete team in one PATCH: primary + every remaining member as subagent. No
+    // model/instruction keys are invented for a harness that has none.
+    expect(calls.filter((call) => call.method === 'PATCH')[0]?.body).toEqual({
         primary: 'instruct',
         subagents: ['summarizer']
     });
-    expect(picker.hidden).toBe(true);
     expect(agentNames()).toEqual(['Instruct', 'Summarizer']);
     expect(agentRoles()).toEqual(['primary', 'secondary']);
     // R21.2: the core set is no longer rendered anywhere; the global tools view lists
     // every tool (core entries included) from the server catalogue instead.
     expect(document.querySelector('.core-tool-name')).toBeNull();
 
-    // Selecting a secondary demotes the old primary; the request lists it once.
-    document.querySelectorAll<HTMLButtonElement>('.agent-main')[1].click();
+    // 2. Selecting a secondary arms the promotion ("Save & set primary") and the
+    //    request lists the demoted old primary exactly once.
+    selectConfigured('summarizer');
+    expect(applyAction().textContent).toBe('Save & set primary');
+    applyAction().click();
     await flush();
 
     expect(calls.filter((call) => call.method === 'PATCH')[1]?.body).toEqual({
@@ -1046,8 +1121,15 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
     expect(agentNames()).toEqual(['Summarizer', 'Instruct']);
     expect(agentRoles()).toEqual(['primary', 'secondary']);
 
-    // Removing a secondary keeps exactly one primary and the complete list.
-    document.querySelectorAll<HTMLButtonElement>('.agent-remove')[1].click();
+    // 3. Removing is opt-IN through the same checkbox, and the team never ends up
+    //    without a primary.
+    selectConfigured('instruct');
+    const remove = memberToggle();
+    remove.checked = false;
+    remove.dispatchEvent(new Event('change', { bubbles: true }));
+
+    selectConfigured('summarizer');
+    applyAction().click();
     await flush();
 
     expect(calls.filter((call) => call.method === 'PATCH')[2]?.body).toEqual({
@@ -1055,10 +1137,17 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
         subagents: []
     });
     expect(agentNames()).toEqual(['Summarizer']);
-    expect(byClass('.agent-remove', 'button').disabled).toBe(true);
+
+    // The only member is the primary: its membership box is locked with the reason,
+    // so a harness can never be saved with zero agents.
+    selectConfigured('summarizer');
+    expect(memberToggle().disabled).toBe(true);
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.agent-dialog-field-note')].map((node) => node.textContent)
+    ).toEqual(['The primary agent is always part of the team.']);
 });
 
-it('fronts an agent card for viewing without promoting it or PATCHing the team', async () => {
+it('views another agent configuration without promoting it or PATCHing the team', async () => {
     const base = descriptor({
         agents: ['instruct', 'summarizer'],
         primary: 'instruct',
@@ -1091,54 +1180,43 @@ it('fronts an agent card for viewing without promoting it or PATCHing the team',
     await flush();
     await flush();
 
-    // R2 deck: the primary is the front card; the secondary is a named strip.
-    expect(agentFronts()).toEqual(['true', undefined]);
-    expect(
-        [...document.querySelectorAll<HTMLButtonElement>('.agent-handle')].map((handle) => [
-            handle.dataset.agent,
-            handle.hidden
-        ])
-    ).toEqual([
-        ['instruct', true],
-        ['summarizer', false]
-    ]);
+    // T3: the dialog opens on the primary's configuration, and both members are listed.
+    openAgents();
+    expect(configuredAgent()).toBe('instruct');
+    expect(agentRoles()).toEqual(['primary', 'secondary']);
 
-    // Viewing the secondary sends NOTHING: fronting is local UI state, not a team
-    // edit. The primary and its aria-pressed state are untouched.
-    document.querySelector<HTMLButtonElement>('.agent-handle[data-agent="summarizer"]')?.click();
+    // Viewing the secondary sends NOTHING: selection is local draft state, so the
+    // primary and the team are untouched.
+    selectConfigured('summarizer');
     await flush();
 
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
-    expect(agentFronts()).toEqual([undefined, 'true']);
+    expect(configuredAgent()).toBe('summarizer');
     expect(agentRoles()).toEqual(['primary', 'secondary']);
-    expect(document.querySelectorAll<HTMLButtonElement>('.agent-main')[0].getAttribute('aria-pressed')).toBe(
-        'true'
-    );
 
-    // The fronted card owns the usable controls: its model select is a tab stop,
-    // the covered primary's is not. Editing that secondary's model is what the
-    // front state is for, and the team PATCH keeps the primary unchanged.
-    const selects = [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
-    expect(selects.map((select) => select.getAttribute('tabindex'))).toEqual(['-1', null]);
-    selects[1].value = 'm2';
-    selects[1].dispatchEvent(new Event('change', { bubbles: true }));
+    // The model choice is a draft too. The one explicit action writes it, and the
+    // promotion its label promised for a non-primary travels in the SAME request.
+    const select = byClass('.agent-model-select', 'select');
+    select.value = 'm2';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
+
+    applyAction().click();
     await flush();
 
     expect(calls.filter((call) => call.method === 'PATCH')[0]?.body).toEqual({
-        primary: 'instruct',
-        subagents: ['summarizer'],
+        primary: 'summarizer',
+        subagents: ['instruct'],
         agentModels: { summarizer: 'm2' }
     });
-    // The rebuild the PATCH triggers re-seeds the remembered front card, so the
-    // card being viewed is not yanked away mid-edit (R2).
-    expect(agentFronts()).toEqual([undefined, 'true']);
+    // The rebuild the PATCH triggers keeps the configuration being viewed (it is still
+    // a member) and shows the saved model instead of yanking the reader elsewhere.
+    expect(configuredAgent()).toBe('summarizer');
+    expect(byClass('.agent-model-select', 'select').value).toBe('m2');
     expect(agentRoles()).toEqual(['primary', 'secondary']);
-    expect(
-        [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')].map((select) => select.value)
-    ).toEqual(['', 'm2']);
 });
 
-it('falls back to the primary when the viewed card is removed', async () => {
+it('keeps the configuration the reader is viewing when a member is removed', async () => {
     const base = descriptor({
         agents: ['instruct', 'summarizer'],
         primary: 'instruct',
@@ -1166,31 +1244,48 @@ it('falls back to the primary when the viewed card is removed', async () => {
     await flush();
     await flush();
 
-    // View the secondary, then remove it from its own (now front) card.
+    // Uncheck the secondary, then save from the primary's configuration so nothing is
+    // promoted by the removal.
     openAgents();
-    document.querySelector<HTMLButtonElement>('.agent-handle[data-agent="summarizer"]')?.click();
-    await flush();
-    expect(agentFronts()).toEqual([undefined, 'true']);
+    selectConfigured('summarizer');
+    const toggle = memberToggle();
+    toggle.checked = false;
+    toggle.dispatchEvent(new Event('change', { bubbles: true }));
+    selectConfigured('instruct');
 
-    document.querySelectorAll<HTMLButtonElement>('.agent-remove')[1].click();
+    applyAction().click();
     await flush();
 
     expect(calls.filter((call) => call.method === 'PATCH')[0]?.body).toEqual({
         primary: 'instruct',
         subagents: []
     });
-    // The remembered front name is pruned against the new team, so the surviving
-    // primary becomes front instead of an empty/ghost deck (R2 fallback).
     expect(agentNames()).toEqual(['Instruct']);
-    expect(agentFronts()).toEqual(['true']);
+    expect(agentRoles()).toEqual(['primary']);
+
+    // The agent the reader was configuring is still a trusted agent — it just left
+    // the team — so the view is not yanked back to the primary mid-edit. Its own state
+    // and membership box now say so.
+    expect(configuredAgent()).toBe('instruct');
+    selectConfigured('summarizer');
+    expect(configuredAgent()).toBe('summarizer');
     expect(
-        [...document.querySelectorAll<HTMLButtonElement>('.agent-handle')].map((handle) => handle.hidden)
-    ).toEqual([true]);
-    expect(byClass('.agent-remove', 'button').disabled).toBe(true);
-    expect(byClass('.agent-main', 'button').disabled).toBe(false);
+        [...document.querySelectorAll<HTMLElement>('.agent-dialog-agent')].map((row) => row.dataset.agent)
+    ).toEqual(['instruct']);
+    expect(memberToggle().checked).toBe(false);
+    expect(memberToggle().disabled).toBe(false);
+    expect(applyAction().textContent).toBe('Save & set primary');
+
+    // The one surviving member is the primary: its box is locked, so the team can
+    // never be saved empty.
+    selectConfigured('instruct');
+    expect(memberToggle().disabled).toBe(true);
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.agent-dialog-field-note')].map((node) => node.textContent)
+    ).toEqual(['The primary agent is always part of the team.']);
 });
 
-it('fronts a card of a frozen team and keeps that card across the live model PATCH', async () => {
+it('views a frozen team and saves a model draft through the session PATCH', async () => {
     const frozen = descriptor({
         agents: ['instruct', 'summarizer'],
         primary: 'instruct',
@@ -1236,36 +1331,41 @@ it('fronts a card of a frozen team and keeps that card across the live model PAT
     await flush();
     await flush();
 
-    // R2/R3: the team is frozen, but VIEWING is not a team edit, so the strip works.
+    // R2/T3: the team and the instructions are frozen, but VIEWING another agent is
+    // not a team edit, so the dropdown reaches every member.
     openAgents();
-    document.querySelector<HTMLButtonElement>('.agent-handle[data-agent="summarizer"]')?.click();
+    selectConfigured('summarizer');
     await flush();
 
-    expect(agentFronts()).toEqual([undefined, 'true']);
+    expect(configuredAgent()).toBe('summarizer');
     expect(agentRoles()).toEqual(['primary', 'secondary']);
-    // No team change was attempted; promotion stays disabled while frozen.
+    expect(instructionBox().disabled).toBe(true);
+    expect(memberToggle().disabled).toBe(true);
+    // No team change was attempted, and the action cannot promote here.
     expect(patches).toEqual([]);
-    expect(document.querySelectorAll<HTMLButtonElement>('.agent-main').length).toBe(2);
-    for (const button of document.querySelectorAll<HTMLButtonElement>('.agent-main')) {
-        expect(button.disabled).toBe(true);
-    }
+    expect(applyAction().textContent).toBe('Save configuration');
+    expect(applyAction().disabled).toBe(true);
 
-    // The fronted (still secondary) agent's model is live: the session PATCH is what
-    // a saved chat edits, and it does not touch primary/subagents at all.
-    const selects = [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
-    expect(selects.map((select) => select.disabled)).toEqual([false, false]);
-    expect(selects.map((select) => select.value)).toEqual(['', '']);
-    selects[1].value = 'm2';
-    selects[1].dispatchEvent(new Event('change', { bubbles: true }));
+    // The viewed agent's model is live (R2), but a selection is only a DRAFT: the
+    // PATCH happens on the explicit action, and it never touches the frozen team.
+    const select = byClass('.agent-model-select', 'select');
+    expect(select.disabled).toBe(false);
+    expect(select.value).toBe('');
+
+    select.value = 'm2';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    await flush();
+    expect(patches).toEqual([]);
+
+    applyAction().click();
     await flush();
 
     expect(patches).toEqual([{ agentModels: { summarizer: 'm2' } }]);
-    // The PATCH rebuild keeps the viewed card in front and shows the new model.
-    expect(agentFronts()).toEqual([undefined, 'true']);
+
+    // The refresh keeps the viewed configuration and shows the saved model.
+    expect(configuredAgent()).toBe('summarizer');
     expect(agentRoles()).toEqual(['primary', 'secondary']);
-    expect(
-        [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')].map((select) => select.value)
-    ).toEqual(['', 'm2']);
+    expect(byClass('.agent-model-select', 'select').value).toBe('m2');
 });
 
 it('filters the sessions rail to the selected harness and opens within it', async () => {
@@ -1527,7 +1627,10 @@ it('stops every task in the originating session while a run is in flight', async
     expect(byClass('.harness-item[data-harness="workspace"]', 'button').disabled).toBe(false);
     expect(byClass('.new-session', 'button').disabled).toBe(true);
     openAgents();
-    expect(byClass('.agent-add', 'button').disabled).toBe(true);
+    // T3: mid-run the team/instruction editors are locked (the reason is the dialog's
+    // own note), and the membership toggle is part of that lock.
+    expect(memberToggle().disabled).toBe(true);
+    expect(instructionBox().disabled).toBe(true);
     // R2: the TEAM is locked mid-run, the MODEL is not — it edits the session's live
     // map for the next request and never cancels this stream.
     const streamingSelect = byClass('.agent-model-select', 'select');
@@ -1963,6 +2066,11 @@ it('keeps a live model edit when the delayed 202 answer lands afterwards', async
     expect(select.disabled).toBe(false);
     select.value = 'm2';
     select.dispatchEvent(new Event('change', { bubbles: true }));
+    await flush();
+
+    // T3: the selection alone is a draft; the explicit action writes it.
+    expect(patches).toEqual([]);
+    applyAction().click();
     await flush();
 
     expect(patches).toEqual([{ agentModels: { instruct: 'm2' } }]);
@@ -2550,7 +2658,8 @@ it('deletes an inactive session on the first click, with no confirmation panel',
         'Viewing a saved session · agent team frozen'
     );
     openAgents();
-    expect(byClass('.agent-main', 'button').disabled).toBe(true);
+    expect(instructionBox().disabled).toBe(true);
+    expect(applyAction().disabled).toBe(true);
     // No session was created: a delete is not a submit.
     expect(calls.filter((call) => call.url === '/api/sessions' && call.method === 'POST')).toEqual([]);
     expect(statusText()).toBe('idle');
@@ -2656,8 +2765,16 @@ it('deletes the running current session, stops watching and creates no replaceme
     expect(localStorage.getItem(SESSION_KEY)).toBeNull();
     expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
     openAgents();
-    expect(byClass('.agent-main', 'button').disabled).toBe(false);
-    expect(byClass('.agent-add', 'button').disabled).toBe(false);
+    // The deleted conversation took its lock with it: the harness is editable again.
+    expect(instructionBox().disabled).toBe(false);
+    // The configured agent is the primary, so its own box is locked with the reason
+    // (a harness always has one). An outside agent's box is the editable affordance.
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.agent-dialog-field-note')].map((node) => node.textContent)
+    ).toEqual(['The primary agent is always part of the team.']);
+    selectConfigured('summarizer');
+    expect(memberToggle().disabled).toBe(false);
+    expect(memberToggle().checked).toBe(false);
     // The deleted conversation took its pending work with it: empty field + idle
     // means no action, and there is no Reset control to fall back on (R10).
     expect(byClass('.composer-action', 'button').hidden).toBe(true);
@@ -2897,6 +3014,6 @@ it('never resurrects a deleted session from a stale session-list answer', async 
     expect(document.querySelectorAll('.tile')).toHaveLength(0);
     expect(document.querySelector('.harness-note')?.textContent).toBe('Edits apply to new sessions');
     openAgents();
-    expect(byClass('.agent-main', 'button').disabled).toBe(false);
+    expect(instructionBox().disabled).toBe(false);
     expect(refresh.disabled).toBe(false);
 });

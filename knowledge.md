@@ -2165,9 +2165,9 @@ paths below `/v1/harness` **plus** the bare root:
 | Route | Purpose |
 |---|---|
 | `GET /api/health` | Liveness and session count |
-| `GET /api/harnesses` | Harness descriptors (`primary`/`subagents`/`coreTools`/`agentModels?`/`builtin`/`editable`), provider defaults, and `agents`; every entry is editable and `editable` is always `true` |
-| `POST /api/harnesses` | `{ name, title?, description?, primary, subagents?, agentModels? }` → `201 { harness }` |
-| `PATCH /api/harnesses/:name` | `{ title?, description?, primary?, subagents?, agentModels? }` → `{ harness }`; every template is patchable |
+| `GET /api/harnesses` | Harness descriptors (`primary`/`subagents`/`coreTools`/`agentModels?`/`agentInstructions?`/`builtin`/`editable`), provider defaults, and `agents`; every entry is editable and `editable` is always `true` |
+| `POST /api/harnesses` | `{ name, title?, description?, primary, subagents?, agentModels?, agentInstructions? }` → `201 { harness }` |
+| `PATCH /api/harnesses/:name` | `{ title?, description?, primary?, subagents?, agentModels?, agentInstructions? }` → `{ harness }`; every template is patchable |
 | `GET /api/agents` | Trusted agent registry (`AgentDescriptor[]`) |
 | `GET /api/tools` | Full catalogue: session-bound core entries first (`group: 'Core tools'`, `sessionBound: true`), then every direct-call tool (including the core file tools); `search` always present with `availability` |
 | `GET /api/tools/bootstrap` | Alias of `GET /api/tools` — the list the root bootstrap document carries |
@@ -2522,11 +2522,13 @@ the dispatcher:
   unique, not an alias), a known `primary`, and a distinct, bounded, known
   `subagents` allowlist, then builds a live harness with the shared toolbox and
   `builtin: false, editable: true`;
-- `update()` changes `title`/`description`/`primary`/`subagents`/`agentModels` for
+- `update()` changes `title`/`description`/`primary`/`subagents`/`agentModels`/
+  `agentInstructions` for
   **every** entry (there is no 403/read-only branch; `editable` is a compatibility
   wire field, always true). It **replaces** the preset object instead of mutating
   it. A metadata-only patch keeps the captured factory (demo's script, flaky's
-  `testFlaky`); an executable patch (primary/subagents/agentModels) rebuilds from
+  `testFlaky`); an executable patch (primary/subagents/agentModels/agentInstructions)
+  rebuilds from
   the `template`: `scripted` upgrades to a live profiled harness and corrects
   `requiresEndpoint`/`tools`/`environmentTools`, `flaky` rebuilds the live toolbox
   with the extra retained, and `live` uses `createProfiledHarness`. Changing
@@ -2543,13 +2545,31 @@ the dispatcher:
   `PATCH /sessions/:id`. Only ids are overridable: provider, base URL, and key
   always come from `RunnerSettings`. `describeHarness()` emits the override map
   only when it is non-empty, so an omitted agent reads as "session default";
+- `agentInstructions` (T3 editable configuration) is the parallel map of selected
+  agent id → instruction OVERRIDE on create/patch. Same validation shape
+  (`normalizeAgentInstructions`: keys must be FINAL members, values trimmed,
+  non-empty, ≤8000 characters, and free of control characters except tab/newline/CR,
+  so multi-line prose is legal) and the same REPLACE semantics (`{}` clears every
+  override). It is EXECUTABLE state: `update()` rebuilds the factory (an instruction
+  patch on the scripted demo therefore upgrades it to a live harness, exactly like a
+  model patch), it is persisted in the registry record, and `agentInstruction(profile,
+  override)` applies it to the identity sentence ONLY — the profile's `guidelines`
+  still compose, and the trusted profile in `src/agents` is never rewritten. A member
+  the map omits runs the trusted `GET /agents` instruction, which is why the
+  descriptor carries the OVERRIDE map and the UI pairs the two to show what an agent
+  actually runs. Sessions are deliberately NOT part of this contract: a running
+  conversation's system messages are already seeded, so `PATCH /sessions/:id` still
+  accepts `agentModels` only and the frozen `harnessDefinition` records the overrides
+  the conversation was built with;
 - unknown names are 404; duplicate names are 409; everything else is 400. No
   registry failure is a 403.
 
 Semantic validation lives in the registry; the dispatcher rejects unknown body
-fields, so `instruction`, `tools`, or `provider` cannot be smuggled into a
+fields, so a bare `instruction`, `tools`, or `provider` cannot be smuggled into a
 create/patch request. `agentModels` is the single model-shaped field: it selects an
-id, never credentials. The registry is **in memory only unless a database root is
+id, never credentials. `agentInstructions` (T3) is the single text-shaped field: a
+per-member OVERRIDE stored on the harness, validated and bounded by the registry,
+that never rewrites the trusted profile. The registry is **in memory only unless a database root is
 supplied**: with one, registry metadata is saved in `<root>/harness/state.json` and
 replayed on restart (see the Persistence section in README.md); without one, a
 restart returns to the shipped catalogue.

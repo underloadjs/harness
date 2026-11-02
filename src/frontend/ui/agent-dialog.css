@@ -1,0 +1,240 @@
+/* Agent configuration dialog (T3) — content of ui/agent-dialog.ts.
+   ---------------------------------------------------------------------------
+   Imported by ../styles.css, so it shares that file's tokens (--text/--muted/
+   --accent/--bg-input/--border/--mono) and the shared `.field-input` /
+   `.field-select` / `.button` primitives. ui/dialog.css owns the modal frame
+   (`.dialog`, `.dialog-body` padding/scroll, the close button); this file styles
+   ONLY the body content, which is why nothing here sets a width or a position:
+   the modal already does, and the body scrolls.
+
+   The layout is one column: the agent dropdown, that agent's configuration, the
+   team list (the only part a live activity frame repaints), and the footer whose
+   action sits bottom-right — the single control that writes to the server. */
+
+.agent-dialog {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.agent-dialog-section {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+/* Section labels are quiet mono captions: they name the field without competing
+   with the control's own accessible name. */
+.agent-dialog-label {
+    margin: 0;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+/* Honest restriction reason (frozen saved session / run in flight / session
+   creation). Painted only when editing really is locked. */
+.agent-dialog-note {
+    margin: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-input);
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.4;
+}
+
+/* The one-line team fact above the editors ("Researcher is a team member."), so a
+   disabled membership control reads as a stated state rather than a broken button. */
+.agent-dialog-state {
+    margin: 0;
+    color: var(--muted);
+    font-size: 11.5px;
+}
+
+/* The dropdown that chooses which agent is being configured. It is a full-width
+   select, not a card wall: every agent the server advertises fits here at any
+   team size. */
+.agent-dialog-agent-select {
+    width: 100%;
+}
+
+.agent-dialog-config {
+    padding: 12px;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    background: var(--bg-elevated);
+}
+
+/* The model select reuses `.agent-model-select` (ui/agents.ts), which is styled for
+   the deck's compact card. Inside the configuration panel it is a normal full-width
+   field instead. */
+.agent-dialog-config .agent-model-select {
+    width: 100%;
+    max-width: 420px;
+}
+
+/* Instruction editor. `field-input` paints the frame; this only sets the reading
+   shape, because the text is a multi-paragraph system prompt. */
+.agent-dialog-instruction {
+    min-height: 128px;
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.5;
+    resize: vertical;
+}
+
+/* Secondary affordances: reverting an override, and the per-field scope notes that
+   tell the reader WHERE a save lands (harness vs this conversation). */
+.agent-dialog-revert {
+    align-self: flex-start;
+    padding: 4px 9px;
+    border: 1px solid var(--border-strong);
+    border-radius: 7px;
+    background: transparent;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    cursor: pointer;
+}
+
+.agent-dialog-revert:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.agent-dialog-field-note {
+    margin: 0;
+    color: var(--muted);
+    font-size: 11px;
+    line-height: 1.4;
+}
+
+/* Membership: one explicit checkbox. Nothing else can add or remove an agent, so a
+   team never changes shape without a visible tick. */
+.agent-dialog-membership {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.agent-dialog-member {
+    width: 14px;
+    height: 14px;
+    accent-color: var(--accent);
+}
+
+.agent-dialog-member-label {
+    color: var(--text);
+    font-size: 12px;
+}
+
+.agent-dialog-member:disabled + .agent-dialog-member-label {
+    color: var(--muted);
+}
+
+/* The team list. Rows are plain (no deck overlap): the dialog is a form, and the
+   deck's fan geometry would make a two-column read impossible. */
+.agent-dialog-team-list {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.agent-dialog-agent {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-input);
+    font-size: 12px;
+}
+
+/* Activity (ui/activity.ts paints `data-activity`/`aria-busy` here). A colour and
+   border change is the signal; the deck's animated ring belongs to the cards. */
+.agent-dialog-agent[data-activity='active'] {
+    border-color: var(--accent);
+}
+
+.agent-dialog-agent-name {
+    color: var(--text);
+}
+
+.agent-dialog-agent-role {
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+}
+
+/* The model id is the row's right-hand fact (the resolved model the team list shows
+   is the same map the editor's dropdown is built from), so it is pushed to the far
+   edge and the name/role pair stays readable on the left. */
+.agent-dialog-agent-model {
+    margin-left: auto;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+/* The footer. The action is the ONLY writer in this dialog, so it is the last thing
+   on the bottom-right: what the reader reaches for after reading the note and the
+   refusal above it. */
+.agent-dialog-footer {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    margin-top: 4px;
+    padding-top: 12px;
+    border-top: 1px solid var(--border);
+}
+
+.agent-dialog-footer-note {
+    /* The note takes the row's remaining width so the button stays right-aligned at
+       every width instead of floating next to a short sentence. */
+    flex: 1 1 240px;
+    margin: 0;
+    color: var(--muted);
+    font-size: 11.5px;
+    line-height: 1.4;
+}
+
+/* A refused save (role=status). Distinct from the note: it is the outcome of the
+   action the reader just pressed, and the drafts are still on screen. */
+.agent-dialog-error {
+    flex: 1 1 100%;
+    margin: 0;
+    color: var(--danger);
+    font-size: 11.5px;
+    line-height: 1.4;
+}
+
+.agent-dialog-apply {
+    /* Bottom-right, and never squashed by a long note.
+
+       `margin-left: auto` is REQUIRED, not decoration. The refusal line below always
+       exists in the DOM (its text is simply empty while nothing failed) and its
+       `flex-basis: 100%` forces a wrap, so the button becomes the ONLY item on its own
+       flex line — and `justify-content: space-between` positions a lone item at the
+       START of the line. Verified in real Chrome at the 808px dialog and the 360px
+       phone dialog, idle and refused: without this margin the action sits bottom-LEFT
+       in both states; with it the button's right edge lands on the body's content edge
+       (rightGap 0) in all four cases. */
+    flex: 0 0 auto;
+    margin-left: auto;
+    white-space: nowrap;
+}
+
+.agent-dialog-apply:disabled {
+    cursor: default;
+}

@@ -331,7 +331,7 @@ export const resolveToolParameters = (
     const properties = isPlainObject(schema.properties) ? schema.properties : undefined;
 
     // Multi-property (or schema-less-shaped) tool: the arguments ARE the value,
-    // so validate the object itself. This is the syntaxCheck/toolRequest path.
+    // so validate the object itself. This is the syntax/toolRequest path.
     if (key === undefined || properties === undefined) {
         const check = validateSchemaValue(schema, raw, '$');
 

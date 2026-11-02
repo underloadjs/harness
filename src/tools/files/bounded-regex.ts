@@ -2,8 +2,8 @@
 //
 // WHY THIS EXISTS (T16)
 // ---------------------
-// fileGlob's content mode takes a JavaScript regular-expression SOURCE from the
-// caller and runs it against every line of every matching file. JavaScript regexes
+// grep takes a JavaScript regular-expression SOURCE from the caller and runs it
+// against every line of every matching file. JavaScript regexes
 // backtrack, so a pattern like `(a+)+$` against a 31-byte line blocks the whole
 // process for ~8 seconds — and worse patterns are effectively unbounded. A tool
 // call must never be able to freeze the harness, so the matching itself is run
@@ -46,7 +46,7 @@
 // deliberately NOT part of the budget: a slow walk is not an expensive pattern.
 //
 // Cross-references:
-//   - ./fileGlob — content mode, the only caller
+//   - ./grep.tool.ts — the only caller
 //   - ../catalogue — the model-facing description of the same limit
 
 import { createContext, Script } from 'node:vm';
@@ -82,7 +82,7 @@ export type BoundedLineMatcher = {
 // can assert the exact message without duplicating it.
 export const budgetError = (budgetMs: number): HarnessError =>
     new HarnessError(
-        `fileGlob content pattern did not finish within its ${budgetMs}ms matching budget and was stopped. Simplify the pattern: nested quantifiers such as "(a+)+" can backtrack exponentially.`
+        `grep pattern did not finish within its ${budgetMs}ms matching budget and was stopped. Simplify the pattern: nested quantifiers such as "(a+)+" can backtrack exponentially.`
     );
 
 // V8 reports the timeout through a stable code; the message is also checked because

@@ -8,10 +8,17 @@
 //   empty + idle                    -> nothing at all
 //
 // Reset is gone; this file proves no `.run` / `.stop` / `.reset` control survives
-// outside the in-field action, and that Enter (native newline) / Ctrl+Cmd+Enter
-// (send) / Shift+Alt+Enter (newline) / IME Enter (ignored) / clicking keep the
-// exact submission semantics the old buttons had.
+// outside the in-field action, and that the keyboard matrix keeps the exact submission
+// semantics the old buttons had. T1 splits the bare Enter by INPUT DEVICE, and T3
+// claims the send half only on a POSITIVELY detected fine pointer:
 //
+//   (pointer: fine)                     -> Enter SENDS; Shift+Enter / Alt+Enter newline
+//   (pointer: coarse)                   -> Enter is a native NEWLINE, send = button
+//   (pointer: none) / no matchMedia      -> NEWLINE: an undetected device never sends
+//   Ctrl/Cmd+Enter                      -> sends on every device (unchanged, R3)
+//   IME Enter (isComposing / keyCode 229) -> ignored everywhere (unchanged)
+//   Enter on a focused chip x           -> left to native button activation (T3/D1): the
+//                                          field claims nothing, so no whole-draft send
 // T15/R6: the composer has NO attachment accessory. Clipboard paste, drag/drop and
 // @ file lookup are the whole attachment surface, and the inline chips are pinned in
 // attachments-main.test.ts / ui/attachments.test.ts. This file only proves the
@@ -160,6 +167,112 @@ const stubServer = (taskError?: string, restored?: SessionSnapshot): Server => {
     return server;
 };
 
+// --- T1/T3: device stub -----------------------------------------------------------
+//
+// `main.ts` creates its MediaQueryLists ONCE at module scope, so the stub must be
+// installed before `mount()` (and `vi.resetModules()` in beforeEach re-imports the
+// module, so each test gets a fresh pair). Keying by query string keeps the two axes
+// independent exactly like a browser evaluates them:
+//   `(max-width: 860px)`  -> layout only (rails, line cap);
+//   `(pointer: fine)`     -> the POSITIVE fine-pointer claim that gates Enter-to-send.
+// T3 hardened the policy from "not coarse" to "positively fine", so ONE boolean covers
+// every newline device: a phone (`coarse`), a keyboard-only / assistive setup (`none`)
+// and an engine without `matchMedia` all report `fine: false`. Only `fine: true` may
+// send. An unknown query throws, so a new media axis in main.ts must be pinned here
+// instead of silently reading as a desktop default. `setFine` fires the change
+// listeners, which is what a real device switch looks like to the page.
+type MediaListener = (event: { matches: boolean }) => void;
+
+type MediaStub = {
+    matches: boolean;
+    media: string;
+    addEventListener: (type: string, listener: MediaListener) => void;
+    removeEventListener: (type: string, listener: MediaListener) => void;
+};
+
+const stubMedia = (
+    options: { fine?: boolean; phone?: boolean } = {}
+): { setFine(next: boolean): void } => {
+    const entries = new Map<string, { stub: MediaStub; listeners: Set<MediaListener> }>();
+
+    const create = (media: string, matches: boolean): void => {
+        const listeners = new Set<MediaListener>();
+        const stub: MediaStub = {
+            matches,
+            media,
+            addEventListener: (_type: string, listener: MediaListener): void => {
+                listeners.add(listener);
+            },
+            removeEventListener: (_type: string, listener: MediaListener): void => {
+                listeners.delete(listener);
+            }
+        };
+
+        entries.set(media, { stub, listeners });
+    };
+
+    create('(pointer: fine)', options.fine ?? false);
+    create('(max-width: 860px)', options.phone ?? false);
+
+    vi.stubGlobal(
+        'matchMedia',
+        vi.fn((query: string) => {
+            const entry = entries.get(query);
+            if (entry === undefined) throw new Error(`unexpected media query: ${query}`);
+
+            return entry.stub;
+        })
+    );
+
+    return {
+        setFine(next: boolean): void {
+            const entry = entries.get('(pointer: fine)');
+            if (entry === undefined) return;
+
+            entry.stub.matches = next;
+            for (const listener of [...entry.listeners]) listener({ matches: next });
+        }
+    };
+};
+
+// --- T3/D1: attachment-chip fixture ----------------------------------------------
+//
+// The only interactive control inside the contentEditable field is a chip's x remove
+// button (ui/editor.ts:380-386), so these tests need a real chip rather than a synthetic
+// one. A clipboard paste is the field's own entry point for that (the paste handler reads
+// the `clipboardData` shape defined here, because jsdom has no ClipboardEvent payload).
+// `ui/attachments.ts` skips the thumbnail when `URL.createObjectURL` is missing, which
+// jsdom is, so no object-URL stub is needed for the chip to exist.
+const PNG_BYTES = new Uint8Array([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+
+const pasteFiles = (field: HTMLElement, files: File[]): void => {
+    const event = new Event('paste', { bubbles: true, cancelable: true });
+
+    Object.defineProperty(event, 'clipboardData', {
+        value: {
+            items: files.map((file) => ({ kind: 'file', getAsFile: () => file })),
+            files
+        }
+    });
+
+    field.dispatchEvent(event);
+};
+
+const composerChips = (): HTMLElement[] => [
+    ...document.querySelectorAll<HTMLElement>('.composer-input [data-chip="attachment"]')
+];
+
+// One text node + one READY attachment chip: "keep me [Image 1]". Two flush rounds let
+// the real FileReader finish, so a later "nothing was sent" assertion cannot pass merely
+// because an in-flight read blocked `run()`.
+const pasteDraft = async (field: HTMLTextAreaElement): Promise<void> => {
+    field.value = 'keep me ';
+    field.dispatchEvent(new Event('input', { bubbles: true }));
+    pasteFiles(field, [new File([PNG_BYTES], 'shot.png', { type: 'image/png' })]);
+    await flush();
+    await flush();
+};
+
 const mount = async (): Promise<void> => {
     await import('./main');
     await flush();
@@ -178,6 +291,8 @@ afterEach(() => {
 
 it('paints the single in-field action for every state and never renders old controls', async () => {
     const server = stubServer();
+    // A hardware keyboard: the send hint must name the real shortcut (T1/R2).
+    stubMedia({ fine: true });
     await mount();
 
     const composer = byClass('.composer', 'form');
@@ -243,8 +358,9 @@ it('paints the single in-field action for every state and never renders old cont
     expect(action.disabled).toBe(false);
     expect(action.textContent).toBe('▶');
     expect(action.getAttribute('aria-label')).toBe('Send task');
-    // R1: the title advertises the real shortcut — plain Enter is a newline now.
-    expect(action.title).toBe('Send (Ctrl/Cmd+Enter)');
+    // T1/R2: on a hardware-keyboard device the title advertises the real shortcut —
+    // a bare Enter sends.
+    expect(action.title).toBe('Send (Enter)');
 
     // Submit -> the field clears and the SAME control becomes STOP while pending.
     composer.dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
@@ -291,32 +407,51 @@ it('paints the single in-field action for every state and never renders old cont
     expect(action.dataset.action).toBe('none');
 });
 
-it('sends only on Ctrl/Cmd+Enter and the button, keeping Enter, Shift+Alt+Enter and IME Enter native', async () => {
+// --- T1: the Enter policy follows the INPUT DEVICE, not the viewport -----------
+//
+// Each test pins ONE device. `defaultPrevented` is what separates the two halves of
+// the matrix: the harness prevents the default ONLY when it sends, so
+//   `defaultPrevented === false` -> the browser owns the keystroke, i.e. a native
+//                                    newline. jsdom has no editing engine, so the line
+//                                    break itself cannot be observed here — the
+//                                    un-prevented event is the whole proof;
+//   `defaultPrevented === true`  -> the harness took the keystroke and sent.
+// `server.tasks` counts POST /sessions/:id/tasks, i.e. "did it really send".
+//
+// The device axis is the positive `(pointer: fine)` claim; the `(max-width: 860px)`
+// layout query is stubbed independently to prove the two never leak into each other.
+
+it('sends on a bare Enter with a hardware keyboard, keeping Shift+Enter and Alt+Enter as newlines', async () => {
     const server = stubServer();
+    // A positively fine primary pointer: the desktop case, whatever the width is.
+    stubMedia({ fine: true });
     await mount();
 
-    const composer = byClass('.composer', 'form');
     const input = byClass('.composer-input', 'textarea');
     const action = byClass('.composer-action', 'button');
 
-    // R1: a bare Enter is a NEWLINE. Nothing is prevented (the browser inserts the
-    // line break) and nothing is POSTed; the typed text stays in the field.
+    // R2: the hint names the shortcut this device actually has.
+    expect(action.title).toBe('Send (Enter)');
+
     input.value = 'first line';
     input.dispatchEvent(new Event('input', { bubbles: true }));
-    const enter = new KeyboardEvent('keydown', {
-        key: 'Enter',
-        bubbles: true,
-        cancelable: true
-    });
+
+    // R2: a bare Enter SENDS — the default is taken from the browser (no stray line
+    // break), exactly one task is POSTed, and the field clears.
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
     input.dispatchEvent(enter);
     await flush();
+    await flush();
 
-    expect(enter.defaultPrevented).toBe(false);
-    expect(server.tasks).toBe(0);
-    expect(input.value).toBe('first line');
-    expect(action.dataset.action).toBe('submit');
+    expect(enter.defaultPrevented).toBe(true);
+    expect(server.tasks).toBe(1);
+    expect(input.value).toBe('');
+    expect(action.dataset.action).toBe('stop');
 
-    // Shift+Enter stays a newline: not prevented, not submitted.
+    // R2: Shift+Enter is the explicit "give me a line break". Not prevented (the
+    // browser inserts it), nothing POSTed, and the draft is untouched.
+    input.value = 'second line';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
     const shiftEnter = new KeyboardEvent('keydown', {
         key: 'Enter',
         shiftKey: true,
@@ -327,8 +462,8 @@ it('sends only on Ctrl/Cmd+Enter and the button, keeping Enter, Shift+Alt+Enter 
     await flush();
 
     expect(shiftEnter.defaultPrevented).toBe(false);
-    expect(server.tasks).toBe(0);
-    expect(input.value).toBe('first line');
+    expect(server.tasks).toBe(1);
+    expect(input.value).toBe('second line');
 
     // Alt+Enter is a newline too: Alt is a content modifier, not a send modifier.
     const altEnter = new KeyboardEvent('keydown', {
@@ -341,11 +476,113 @@ it('sends only on Ctrl/Cmd+Enter and the button, keeping Enter, Shift+Alt+Enter 
     await flush();
 
     expect(altEnter.defaultPrevented).toBe(false);
-    expect(server.tasks).toBe(0);
-    expect(input.value).toBe('first line');
+    expect(server.tasks).toBe(1);
+    expect(input.value).toBe('second line');
 
-    // Ctrl+Enter is the explicit send shortcut: exactly one POST, field cleared, and
-    // the same control turns into stop while the first task runs.
+    // R3: Ctrl+Shift+Enter keeps its old meaning (content modifier wins over the send
+    // modifier), so it is still a newline.
+    const ctrlShiftEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        ctrlKey: true,
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true
+    });
+    input.dispatchEvent(ctrlShiftEnter);
+    await flush();
+
+    expect(ctrlShiftEnter.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(1);
+    expect(input.value).toBe('second line');
+
+    // R3: the explicit Ctrl+Enter shortcut is unchanged on this device.
+    const ctrlEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true
+    });
+    input.dispatchEvent(ctrlEnter);
+    await flush();
+    await flush();
+
+    expect(ctrlEnter.defaultPrevented).toBe(true);
+    expect(server.tasks).toBe(2);
+    expect(input.value).toBe('');
+
+    // Cmd+Enter (macOS) is the same shortcut; while the first task still runs it
+    // queues rather than replacing (R4).
+    input.value = 'third';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    const metaEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        metaKey: true,
+        bubbles: true,
+        cancelable: true
+    });
+    input.dispatchEvent(metaEnter);
+    await flush();
+    await flush();
+
+    expect(metaEnter.defaultPrevented).toBe(true);
+    expect(server.tasks).toBe(3);
+    expect(input.value).toBe('');
+});
+
+it('keeps every existing send guard on the Enter path, so an unsendable draft is refused', async () => {
+    const server = stubServer();
+    stubMedia({ fine: true });
+    await mount();
+
+    const input = byClass('.composer-input', 'textarea');
+    const action = byClass('.composer-action', 'button');
+
+    // Whitespace-only draft: `run()` trims it and refuses, so the Enter that the
+    // hardware-keyboard policy claims must NOT create a task. The default is still
+    // prevented — the keystroke belongs to the send, so no blank line is inserted.
+    input.value = '   ';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(action.dataset.action).toBe('none');
+
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    input.dispatchEvent(enter);
+    await flush();
+    await flush();
+
+    expect(enter.defaultPrevented).toBe(true);
+    expect(server.tasks).toBe(0);
+    expect(input.value).toBe('   ');
+});
+
+it('never sends while the suggestion list owns Enter, even with a hardware keyboard', async () => {
+    const server = stubServer();
+    stubMedia({ fine: true });
+    await mount();
+
+    const input = byClass('.composer-input', 'textarea');
+    const popup = byClass('.composer-popup', 'div');
+
+    // A `#` trigger with nothing referenceable: the popup is open (and says why) but
+    // there is no row to pick. R3 leaves that keystroke with the popup, so the T1 send
+    // cannot fire in the middle of a mention.
+    input.value = 'ask #';
+    input.setSelectionRange(5, 5);
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+
+    expect(popup.hidden).toBe(false);
+    expect(input.getAttribute('aria-expanded')).toBe('true');
+    expect(input.getAttribute('aria-activedescendant')).toBeNull();
+
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    input.dispatchEvent(enter);
+    await flush();
+
+    expect(enter.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(0);
+    expect(input.value).toBe('ask #');
+
+    // R3: Ctrl/Cmd+Enter still overrides the open popup — the explicit shortcut is the
+    // reader saying "send anyway", on every device.
     const ctrlEnter = new KeyboardEvent('keydown', {
         key: 'Enter',
         ctrlKey: true,
@@ -359,73 +596,361 @@ it('sends only on Ctrl/Cmd+Enter and the button, keeping Enter, Shift+Alt+Enter 
     expect(ctrlEnter.defaultPrevented).toBe(true);
     expect(server.tasks).toBe(1);
     expect(input.value).toBe('');
-    expect(action.dataset.action).toBe('stop');
-    expect(action.hidden).toBe(false);
+});
 
-    // An IME confirmation Enter must do nothing: not prevented (the input method
-    // owns the event) and not submitted, with the half-typed text preserved.
+it('ignores an IME Enter on a hardware keyboard, ahead of the Enter-to-send policy', async () => {
+    const server = stubServer();
+    stubMedia({ fine: true });
+    await mount();
+
+    const input = byClass('.composer-input', 'textarea');
+
     input.value = 'ime text';
     input.dispatchEvent(new Event('input', { bubbles: true }));
-    const imeEnter = new KeyboardEvent('keydown', {
+
+    // R3: the composition guard runs first, so the candidate-confirming Enter neither
+    // submits nor is prevented — the input method still owns the event. This is the
+    // regression that matters most now that a bare Enter can send.
+    const composing = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        isComposing: true,
+        bubbles: true,
+        cancelable: true
+    });
+    input.dispatchEvent(composing);
+    await flush();
+
+    expect(composing.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(0);
+    expect(input.value).toBe('ime text');
+
+    // Older engines only report the legacy marker (keyCode 229): same outcome.
+    const legacy = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    Object.defineProperty(legacy, 'keyCode', { value: 229 });
+    input.dispatchEvent(legacy);
+    await flush();
+
+    expect(legacy.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(0);
+    expect(input.value).toBe('ime text');
+
+    // A composing Ctrl/Cmd+Enter is still composition, not the shortcut.
+    const composingShortcut = new KeyboardEvent('keydown', {
         key: 'Enter',
         ctrlKey: true,
         isComposing: true,
         bubbles: true,
         cancelable: true
     });
-    input.dispatchEvent(imeEnter);
+    input.dispatchEvent(composingShortcut);
     await flush();
 
-    expect(imeEnter.defaultPrevented).toBe(false);
-    expect(server.tasks).toBe(1);
+    expect(composingShortcut.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(0);
     expect(input.value).toBe('ime text');
+});
 
-    // Older engines only report the legacy composition marker (keyCode 229): the same
-    // guard applies, so this Enter is ignored as well.
-    const legacyImeEnter = new KeyboardEvent('keydown', {
-        key: 'Enter',
-        bubbles: true,
-        cancelable: true
-    });
-    Object.defineProperty(legacyImeEnter, 'keyCode', { value: 229 });
-    input.dispatchEvent(legacyImeEnter);
-    await flush();
+it('keeps Enter a newline on a touch keyboard and sends through the button or Ctrl+Enter', async () => {
+    const server = stubServer();
+    // No fine pointer (a coarse one): the phone/tablet case (R1).
+    stubMedia({ fine: false });
+    await mount();
 
-    expect(legacyImeEnter.defaultPrevented).toBe(false);
-    expect(server.tasks).toBe(1);
-    expect(input.value).toBe('ime text');
+    const input = byClass('.composer-input', 'textarea');
+    const action = byClass('.composer-action', 'button');
 
-    // Cmd+Enter (macOS) is the same shortcut: one more POST while the first runs, so
-    // the task queues instead of replacing (R4).
-    const metaEnter = new KeyboardEvent('keydown', {
-        key: 'Enter',
-        metaKey: true,
-        bubbles: true,
-        cancelable: true
-    });
-    input.dispatchEvent(metaEnter);
-    await flush();
-    await flush();
+    // R1: there is no Enter shortcut to advertise here, so the hint names the button
+    // only; the accessible name is unchanged.
+    expect(action.title).toBe('Send');
 
-    expect(metaEnter.defaultPrevented).toBe(true);
-    expect(server.tasks).toBe(2);
-    expect(input.value).toBe('');
-
-    // The submit icon is live while tasks run (R4): clicking it queues another task
-    // through the form's own submit path.
-    input.value = 'third';
+    input.value = 'first line';
     input.dispatchEvent(new Event('input', { bubbles: true }));
+
+    // R1: a bare Enter is a NEWLINE — not prevented, nothing POSTed, text still there,
+    // and the send control is still offered.
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    input.dispatchEvent(enter);
+    await flush();
+
+    expect(enter.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(0);
+    expect(input.value).toBe('first line');
     expect(action.dataset.action).toBe('submit');
+
+    // Shift+Enter is a newline here as well.
+    const shiftEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        shiftKey: true,
+        bubbles: true,
+        cancelable: true
+    });
+    input.dispatchEvent(shiftEnter);
+    await flush();
+
+    expect(shiftEnter.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(0);
+    expect(input.value).toBe('first line');
+
+    // R1: the explicit Send button is the touch send path — one POST, field cleared.
+    expect(action.getAttribute('aria-label')).toBe('Send task');
     expect(action.disabled).toBe(false);
     action.click();
     await flush();
     await flush();
 
-    expect(server.tasks).toBe(3);
+    expect(server.tasks).toBe(1);
     expect(input.value).toBe('');
-    // Empty + still pending: the action is the stop X again.
     expect(action.dataset.action).toBe('stop');
-    expect(action.hidden).toBe(false);
+
+    // R3: Ctrl+Enter remains the keyboard send on a touch device too (it queues).
+    input.value = 'queued';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    const ctrlEnter = new KeyboardEvent('keydown', {
+        key: 'Enter',
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true
+    });
+    input.dispatchEvent(ctrlEnter);
+    await flush();
+    await flush();
+
+    expect(ctrlEnter.defaultPrevented).toBe(true);
+    expect(server.tasks).toBe(2);
+    expect(input.value).toBe('');
+});
+
+it('sends on Enter in a phone-width desktop window, because width is not the input device', async () => {
+    const server = stubServer();
+    // The 860px LAYOUT query matches (a shrunk desktop window) while the primary
+    // pointer is still fine, so the composer must keep Enter-to-send.
+    stubMedia({ fine: true, phone: true });
+    await mount();
+
+    const input = byClass('.composer-input', 'textarea');
+    const action = byClass('.composer-action', 'button');
+
+    expect(input.value).toBe('');
+    expect(action.title).toBe('Send (Enter)');
+
+    input.value = 'narrow desktop';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    input.dispatchEvent(enter);
+    await flush();
+    await flush();
+
+    expect(enter.defaultPrevented).toBe(true);
+    expect(server.tasks).toBe(1);
+    expect(input.value).toBe('');
+});
+
+it('keeps Enter a newline on a wide touch device, because width is not the input device', async () => {
+    const server = stubServer();
+    // The 860px LAYOUT query does not match (a tablet in landscape) while no fine
+    // pointer is reported, so Enter must stay a newline.
+    stubMedia({ fine: false, phone: false });
+    await mount();
+
+    const input = byClass('.composer-input', 'textarea');
+    const action = byClass('.composer-action', 'button');
+
+    expect(action.title).toBe('Send');
+
+    input.value = 'wide tablet';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    input.dispatchEvent(enter);
+    await flush();
+
+    expect(enter.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(0);
+    expect(input.value).toBe('wide tablet');
+});
+
+it('falls back to the newline policy when the environment cannot report a pointer type', async () => {
+    const server = stubServer();
+    // No `stubMedia` call: jsdom has no `matchMedia`, so the pointer type is UNKNOWN
+    // (same for engines old enough to lack it). Sending is the irreversible half of the
+    // matrix, so an unknown device keeps the pre-T1 newline contract and advertises no
+    // Enter shortcut.
+    await mount();
+
+    const input = byClass('.composer-input', 'textarea');
+    const action = byClass('.composer-action', 'button');
+
+    expect(action.title).toBe('Send');
+
+    input.value = 'unknown device';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    input.dispatchEvent(enter);
+    await flush();
+
+    expect(enter.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(0);
+    expect(input.value).toBe('unknown device');
+});
+
+it('follows a mid-session input-device change in both the hint and the Enter policy', async () => {
+    const server = stubServer();
+    const media = stubMedia({ fine: false });
+    await mount();
+
+    const input = byClass('.composer-input', 'textarea');
+    const action = byClass('.composer-action', 'button');
+
+    // Touch device, draft ready: Enter is a newline and the hint says nothing about it.
+    input.value = 'draft';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(action.title).toBe('Send');
+
+    const touchEnter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    input.dispatchEvent(touchEnter);
+    await flush();
+
+    expect(touchEnter.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(0);
+
+    // A hardware keyboard is attached: the repaint fires from the same change event a
+    // browser dispatches, so the hint and the keystroke policy move together.
+    media.setFine(true);
+    expect(action.title).toBe('Send (Enter)');
+
+    const desktopEnter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    input.dispatchEvent(desktopEnter);
+    await flush();
+    await flush();
+
+    expect(desktopEnter.defaultPrevented).toBe(true);
+    expect(server.tasks).toBe(1);
+    expect(input.value).toBe('');
+});
+
+// --- T3/D1: a focused chip x owns its own Enter -----------------------------------
+//
+// The x button lives INSIDE the field, so its keydown bubbles through the field's
+// listener. Before T3 the T1 desktop policy claimed that bubbled Enter: it prevented the
+// default (killing the browser's button activation) and sent the WHOLE draft, so a
+// keyboard reader trying to drop one chip instead posted a task and lost nothing.
+
+it('leaves a bare Enter on a focused chip remove button to the button instead of sending', async () => {
+    const server = stubServer();
+    stubMedia({ fine: true });
+    await mount();
+
+    const input = byClass('.composer-input', 'textarea');
+    const action = byClass('.composer-action', 'button');
+
+    await pasteDraft(input);
+
+    // Precondition, so the zero-request assertion below is meaningful: the draft is text
+    // PLUS one READY chip, the send control is enabled (the attachment read finished, so
+    // `run()` is not merely blocked), and a plain Enter in the FIELD does send here.
+    expect(input.value).toBe('keep me [Image 1]');
+    expect(action.dataset.action).toBe('submit');
+    expect(action.disabled).toBe(false);
+
+    const chips = composerChips();
+    expect(chips).toHaveLength(1);
+
+    const remove = chips[0]?.querySelector<HTMLButtonElement>('.composer-chip-remove');
+    if (remove === undefined) throw new Error('missing .composer-chip-remove');
+
+    remove.focus();
+    expect(document.activeElement).toBe(remove);
+
+    // D1: the keystroke belongs to the focused <button>, so it is neither prevented (the
+    // browser activates it and removes exactly that chip) nor turned into a send.
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    remove.dispatchEvent(enter);
+    await flush();
+    await flush();
+
+    expect(enter.defaultPrevented).toBe(false);
+    expect(server.tasks).toBe(0);
+    expect(input.value).toBe('keep me [Image 1]');
+    expect(composerChips()).toHaveLength(1);
+});
+
+it('leaves every modified Enter on a focused chip remove button alone as well', async () => {
+    const server = stubServer();
+    stubMedia({ fine: true });
+    await mount();
+
+    const input = byClass('.composer-input', 'textarea');
+    await pasteDraft(input);
+    expect(composerChips()).toHaveLength(1);
+
+    const remove = composerChips()[0]?.querySelector<HTMLButtonElement>('.composer-chip-remove');
+    if (remove === undefined) throw new Error('missing .composer-chip-remove');
+
+    remove.focus();
+
+    // Conservative ownership: Ctrl/Cmd still send from the FIELD, but while the chip's x
+    // has focus every Enter variant is the button's, so no modifier combination can post
+    // an unintended task on the reader's way to removing a chip.
+    for (const modifiers of [
+        { ctrlKey: true },
+        { metaKey: true },
+        { shiftKey: true },
+        { altKey: true }
+    ]) {
+        const event = new KeyboardEvent('keydown', {
+            key: 'Enter',
+            ...modifiers,
+            bubbles: true,
+            cancelable: true
+        });
+
+        remove.dispatchEvent(event);
+        await flush();
+
+        expect(event.defaultPrevented).toBe(false);
+        expect(server.tasks).toBe(0);
+    }
+
+    expect(input.value).toBe('keep me [Image 1]');
+    expect(composerChips()).toHaveLength(1);
+});
+
+it('keeps the chip remove click path and the field Enter send independent of that guard', async () => {
+    const server = stubServer();
+    stubMedia({ fine: true });
+    await mount();
+
+    const input = byClass('.composer-input', 'textarea');
+    await pasteDraft(input);
+
+    const remove = composerChips()[0]?.querySelector<HTMLButtonElement>('.composer-chip-remove');
+    if (remove === undefined) throw new Error('missing .composer-chip-remove');
+
+    // The affordance the Enter guard defers to: activating the button removes exactly that
+    // chip, drops its marker text, and makes no request of its own.
+    remove.click();
+    await flush();
+
+    // The marker AND the spacing the paste inserted around it go together
+    // (ui/attachments.ts removes the padding it added), so the draft text is back to the
+    // typed words without the trailing space.
+    expect(composerChips()).toHaveLength(0);
+    expect(input.value).toBe('keep me');
+    expect(server.tasks).toBe(0);
+
+    // With the chip gone, the SAME Enter in the field does send: proof that the guard
+    // above declined a keystroke which would otherwise have produced a task.
+    input.focus();
+    const enter = new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true });
+    input.dispatchEvent(enter);
+    await flush();
+    await flush();
+
+    expect(enter.defaultPrevented).toBe(true);
+    expect(server.tasks).toBe(1);
+    expect(input.value).toBe('');
 });
 
 it('caps growth at 3 text lines on a phone and 5 on desktop, scrolling past the cap', async () => {

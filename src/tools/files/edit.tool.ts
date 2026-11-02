@@ -465,7 +465,7 @@ const prepareEdits = async (
 
         if (state === undefined) {
             // A missing, unreadable, or non-file target fails here, before anything
-            // is written. Editing is for existing files; fileWrite creates.
+            // is written. Editing is for existing files; write creates.
             state = { target: edit.target, content: await readFile(edit.target, 'utf8') };
             texts.set(edit.identity, state);
         }
@@ -539,7 +539,7 @@ const prepareEdits = async (
 export const FILE_EDIT_METADATA: PresetToolMetadata = {
     name: 'edit',
     description:
-        'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used ("typographic" or "trailing-whitespace"), so a fuzzy match is never silent. Creates nothing: use fileWrite for new files.',
+        'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used ("typographic" or "trailing-whitespace"), so a fuzzy match is never silent. Creates nothing: use write for new files.',
     tags: ['files', 'edit', 'write', 'replace', 'filesystem'],
     // R18: editing files is core, so a model never spends a discovery round on it.
     visibility: 'core',

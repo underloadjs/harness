@@ -1000,14 +1000,16 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     alwaysDeclared: false
 },
 {
-    name: "syntaxCheck",
+    name: "syntax",
     metadata: {
-        name: "syntaxCheck",
-        description: "Check whether a code snippet parses, without executing it. Pass language \"javascript\" (JavaScript as a classic script: no import/export and no top-level await) or \"python\" (Python; needs a Python 3 interpreter on PATH). Returns true when the syntax is valid, false otherwise.",
+        name: "syntax",
+        description: "Check whether a code snippet PARSES, without executing it. `language` names one of the parsers this tool actually has, and any other name is an error that lists them - never a syntax verdict. Supported: \"javascript\" (alias \"js\"; a V8 classic-script parse, so import/export and top-level await parse false), \"typescript\" (\"ts\"), \"tsx\", \"jsx\" (parsed by the TypeScript compiler reporting syntax diagnostics only - no type checking, so a type error is still true), \"json\" (strict RFC 8259: comments, trailing commas and single quotes are false, one leading byte-order mark is ignored), and \"python\" (\"py\" or \"python3\"; parsed by a real CPython 3 interpreter through compile(), which must be on PATH). Returns true when the snippet parses and false when it does not. Names are matched case-insensitively, trimmed, and a leading dot (\".ts\") means the same as \"ts\". A missing Python interpreter, a cancelled or timed-out Python check, a non-string `code`, and an unsupported language are all ERRORS, so `false` always means this snippet did not parse. Nothing here does semantic analysis, and there is no parser for any other language.",
         tags: [
             "code",
             "syntax",
             "javascript",
+            "typescript",
+            "json",
             "python",
             "validation"
         ],
@@ -1020,11 +1022,8 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                 },
                 language: {
                     type: "string",
-                    enum: [
-                        "javascript",
-                        "python"
-                    ],
-                    description: "Language to parse the snippet as."
+                    minLength: 1,
+                    description: "Language to parse the snippet as. Parsers exist for javascript (js), typescript (ts), tsx, jsx, json, python (py, python3); an alias is matched case-insensitively and a leading dot is allowed. Any other name is an error."
                 }
             },
             required: [
@@ -1034,8 +1033,8 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
             additionalProperties: false
         }
     },
-    sourcePath: "tools/syntax/syntaxCheck.tool.ts",
-    label: "tools/syntax/syntaxCheck.tool.ts",
+    sourcePath: "tools/syntax/syntax.tool.ts",
+    label: "tools/syntax/syntax.tool.ts",
     origin: "package",
     group: "preset",
     activation: "always",
@@ -1048,7 +1047,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "read",
     metadata: {
         name: "read",
-        description: "Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }. Defaults: startLine 1, startColumn 0, maxLines 200 (hard maximum 5000). `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. When an entry is truncated, request { path, startLine: nextLine, startColumn: nextColumn } to continue; nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. The whole batch shares a fixed 64 KiB UTF-8 CONTENT budget (not counting JSON escaping), split fairly between the requested files, and reading stops at that budget instead of loading huge files or lines wholesale. A call accepts at most 100 paths. A path that does not exist is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code: \"ENOENT\", message }`; it consumes no content budget and the other files are still read. Every other failure - an invalid request, a directory (use fileList or fileGlob for those), binary bytes (NUL or invalid UTF-8) encountered while streaming the file, or any other filesystem error - rejects the whole call, so a short answer never looks complete. Binary detection covers decoded chunks, not the whole file beyond the last chunk read. A window at a deep line rescans from the start to count lines. Paths are absolute or relative to the working directory.",
+        description: "Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }. Defaults: startLine 1, startColumn 0, maxLines 200 (hard maximum 5000). `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. When an entry is truncated, request { path, startLine: nextLine, startColumn: nextColumn } to continue; nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. The whole batch shares a fixed 64 KiB UTF-8 CONTENT budget (not counting JSON escaping), split fairly between the requested files, and reading stops at that budget instead of loading huge files or lines wholesale. A call accepts at most 100 paths. A path that does not exist is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code: \"ENOENT\", message }`; it consumes no content budget and the other files are still read. Every other failure - an invalid request, a directory (use fileList or glob for those), binary bytes (NUL or invalid UTF-8) encountered while streaming the file, or any other filesystem error - rejects the whole call, so a short answer never looks complete. Binary detection covers decoded chunks, not the whole file beyond the last chunk read. A window at a deep line rescans from the start to count lines. Paths are absolute or relative to the working directory.",
         tags: [
             "files",
             "read",
@@ -1118,9 +1117,9 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     alwaysDeclared: false
 },
 {
-    name: "fileWrite",
+    name: "write",
     metadata: {
-        name: "fileWrite",
+        name: "write",
         description: "Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. Every entry is validated before anything is written, and the same target path twice is rejected. A write error part-way through is reported with the paths already completed: there is no rollback.",
         tags: [
             "files",
@@ -1160,8 +1159,8 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
         },
         visibility: "core"
     },
-    sourcePath: "tools/files/fileWrite.tool.ts",
-    label: "tools/files/fileWrite.tool.ts",
+    sourcePath: "tools/files/write.tool.ts",
+    label: "tools/files/write.tool.ts",
     origin: "package",
     group: "preset",
     activation: "always",
@@ -1174,7 +1173,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "edit",
     metadata: {
         name: "edit",
-        description: "Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used (\"typographic\" or \"trailing-whitespace\"), so a fuzzy match is never silent. Creates nothing: use fileWrite for new files.",
+        description: "Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used (\"typographic\" or \"trailing-whitespace\"), so a fuzzy match is never silent. Creates nothing: use write for new files.",
         tags: [
             "files",
             "edit",
@@ -1284,17 +1283,15 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     alwaysDeclared: false
 },
 {
-    name: "fileGlob",
+    name: "glob",
     metadata: {
-        name: "fileGlob",
-        description: "Find files by glob pattern, and optionally search their contents in the same call. `patterns` (default [\"**/*\"]) supports *, ?, **, and [abc] classes; a pattern with no slash also matches file names at any depth. Patterns are matched against each file's path RELATIVE TO THE ROOT that found it, never against an absolute path, and every result is prefixed with that root: { \"paths\": [\"src\"], \"patterns\": [\"**/*.ts\"] } returns \"src/a.ts\" and \"src/nested/b.ts\". `paths` (default [\".\"]) lists the roots to walk, in order; overlapping roots and patterns are deduplicated by real file identity (a symlink alias or a case-alias root is walked once), so a file is reported once, under the first root that reached it. WITHOUT `content` the result is { files, truncated }. WITH `content` (a JavaScript regular expression) every file matching the patterns is read and each matching line is returned as { matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }; a pattern that backtracks past the 30-second matching budget is stopped with an error rather than allowed to hang. A matched line is reported as a 1024-byte UTF-8 snippet (that match carries `textTruncated` when the line was cut, and its `bytes` is the returned snippet size), and the whole content result shares a 64 KiB aggregate budget (top-level `bytes` / `contentBudget`). Content mode skips .git, node_modules, symlinks, binary files, and files larger than 1 MiB. Results are capped (100 by default) across all roots. Does not read .gitignore files.",
+        name: "glob",
+        description: "Find FILES by glob pattern: names only, never file contents (use grep for that). `patterns` (default [\"**/*\"]) supports *, ?, **, and [abc] classes; a pattern with no slash also matches file names at any depth. Patterns are matched against each file's path RELATIVE TO THE ROOT that found it, never against an absolute path, and every result is prefixed with that root: { \"paths\": [\"src\"], \"patterns\": [\"**/*.ts\"] } returns \"src/a.ts\" and \"src/nested/b.ts\" - so the same root with \"src/*.ts\" matches nothing. `paths` (default [\".\"]) lists the roots to walk, in order; overlapping roots and patterns are deduplicated by real file identity (a symlink alias or a case-alias root is walked once), so a file is reported once, under the first root that reached it. The result is { files, truncated }, with `truncated` true only when the cap was reached and more matches exist. Skips .git, node_modules and symlinks. Results are capped (100 by default) across all roots. Does not read .gitignore files, and does not search text.",
         tags: [
             "files",
             "glob",
-            "search",
-            "grep",
             "find",
-            "content",
+            "paths",
             "filesystem"
         ],
         parameters: {
@@ -1314,25 +1311,78 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
                     },
                     description: "Root directories to walk, absolute or relative to the working directory, in the order they are visited. Results are prefixed with the root that found them. Defaults to [\".\"]."
                 },
-                content: {
-                    type: "string",
-                    description: "JavaScript regular expression to match inside each file, e.g. \"TODO|FIXME\". Providing it switches the result from file paths to matching lines. Matching is time-bounded."
-                },
                 maxResults: {
                     type: "number",
-                    description: "Maximum files or matches to return across all roots. Defaults to 100 and is clamped to 1-100."
+                    description: "Maximum files to return across all roots. Defaults to 100 and is clamped to 1-100."
                 }
             },
             additionalProperties: false
         },
         visibility: "core"
     },
-    sourcePath: "tools/files/fileGlob.tool.ts",
-    label: "tools/files/fileGlob.tool.ts",
+    sourcePath: "tools/files/glob.tool.ts",
+    label: "tools/files/glob.tool.ts",
     origin: "package",
     group: "preset",
     activation: "always",
     order: 210,
+    sessionBound: false,
+    listed: false,
+    alwaysDeclared: false
+},
+{
+    name: "grep",
+    metadata: {
+        name: "grep",
+        description: "Search file CONTENTS with a regular expression and return the matching lines. `pattern` (required) is JavaScript regular-expression SOURCE without delimiters or flags, e.g. \"TODO|FIXME\"; invalid source is an error naming the parser message, never \"no matches\". `patterns` (default [\"**/*\"]) is the glob filter for which files to read - same matcher as glob: *, ?, **, and [abc] classes, a pattern with no slash also matches file names at any depth, and patterns are matched against each path RELATIVE TO THE ROOT that found it. `paths` (default [\".\"]) lists the roots to walk in order; overlapping roots and patterns are deduplicated by real file identity, so a file is searched once, under the first root that reached it. Each hit is { path, line, text, textTruncated, bytes }: `line` is the 1-based line number in the file, `text` is at most a 1024-byte UTF-8 snippet (`textTruncated` says when the line was cut), and the whole result shares a 64 KiB aggregate budget reported as `bytes` / `contentBudget`. { \"matches\": [...], \"truncated\": boolean, \"bytes\": number, \"contentBudget\": number } - `truncated` is true only when the 100-match cap or the byte budget stopped the search, so a narrow rerun is the way to see the rest. Matching is time-bounded: a pattern that backtracks past the 30-second budget is stopped with an error rather than allowed to hang. Skips .git, node_modules, symlinks, binary files, and files larger than 1 MiB. Does not read .gitignore files, and does not list file names (use glob for that).",
+        tags: [
+            "files",
+            "grep",
+            "search",
+            "content",
+            "regex",
+            "filesystem"
+        ],
+        parameters: {
+            type: "object",
+            properties: {
+                pattern: {
+                    type: "string",
+                    minLength: 1,
+                    description: "JavaScript regular-expression source to match inside each file, e.g. \"TODO|FIXME\". No delimiters and no flags."
+                },
+                patterns: {
+                    type: "array",
+                    items: {
+                        type: "string"
+                    },
+                    description: "Glob patterns selecting which files to read, OR-ed together and matched against each file path relative to its root, e.g. [\"**/*.test.ts\"]. Defaults to [\"**/*\"]."
+                },
+                paths: {
+                    type: "array",
+                    items: {
+                        type: "string"
+                    },
+                    description: "Root directories to walk, absolute or relative to the working directory, in the order they are visited. Results are prefixed with the root that found them. Defaults to [\".\"]."
+                },
+                maxResults: {
+                    type: "number",
+                    description: "Maximum matching lines to return across all roots. Defaults to 100 and is clamped to 1-100."
+                }
+            },
+            required: [
+                "pattern"
+            ],
+            additionalProperties: false
+        },
+        visibility: "core"
+    },
+    sourcePath: "tools/files/grep.tool.ts",
+    label: "tools/files/grep.tool.ts",
+    origin: "package",
+    group: "preset",
+    activation: "always",
+    order: 215,
     sessionBound: false,
     listed: false,
     alwaysDeclared: false
@@ -1631,18 +1681,20 @@ export const loadDiscoveredTool = (label: string): Promise<unknown> => {
             return import("../tools/runtime/actionRequest.tool.ts");
         case "tools/runtime/toolCancel.tool.ts":
             return import("../tools/runtime/toolCancel.tool.ts");
-        case "tools/syntax/syntaxCheck.tool.ts":
-            return import("../tools/syntax/syntaxCheck.tool.ts");
+        case "tools/syntax/syntax.tool.ts":
+            return import("../tools/syntax/syntax.tool.ts");
         case "tools/files/read.tool.ts":
             return import("../tools/files/read.tool.ts");
-        case "tools/files/fileWrite.tool.ts":
-            return import("../tools/files/fileWrite.tool.ts");
+        case "tools/files/write.tool.ts":
+            return import("../tools/files/write.tool.ts");
         case "tools/files/edit.tool.ts":
             return import("../tools/files/edit.tool.ts");
         case "tools/files/fileList.tool.ts":
             return import("../tools/files/fileList.tool.ts");
-        case "tools/files/fileGlob.tool.ts":
-            return import("../tools/files/fileGlob.tool.ts");
+        case "tools/files/glob.tool.ts":
+            return import("../tools/files/glob.tool.ts");
+        case "tools/files/grep.tool.ts":
+            return import("../tools/files/grep.tool.ts");
         case "tools/command/shell.tool.ts":
             return import("../tools/command/shell.tool.ts");
         case "tools/command/gitDiff.tool.ts":

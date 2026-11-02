@@ -168,7 +168,7 @@ const research: HarnessPreset = {
     name: 'research',
     title: 'Researcher',
     description:
-        'Researcher with the same full toolbox as every live harness and the other roles as direct subagents. read and fileGlob are always available; search joins the toolbox when the host configured a key. Investigates, cross-checks sources, and cites what it used.',
+        'Researcher with the same full toolbox as every live harness and the other roles as direct subagents. read and glob are always available; search joins the toolbox when the host configured a key. Investigates, cross-checks sources, and cites what it used.',
     requiresEndpoint: true,
     primary: 'research',
     subagents: researchTeam,
@@ -422,7 +422,7 @@ export const LEGACY_PRESET_DEFINITIONS: Readonly<Record<string, LegacyPresetDefi
     research: {
         title: 'Research',
         description:
-            'A research agent with the same full toolbox as every live harness, plus a summarizer subagent. read and fileGlob are always available; `primary` and `subagents` are explicit: the research agent is the entry point and the only agent that may delegate, and delegation is one level deep. Web search is core and joins the toolbox when the host configured a search key.',
+            'A research agent with the same full toolbox as every live harness, plus a summarizer subagent. read and glob are always available; `primary` and `subagents` are explicit: the research agent is the entry point and the only agent that may delegate, and delegation is one level deep. Web search is core and joins the toolbox when the host configured a search key.',
         requiresEndpoint: true,
         primary: 'research',
         subagents: ['summarizer'],

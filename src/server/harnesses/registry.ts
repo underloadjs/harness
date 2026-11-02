@@ -123,8 +123,20 @@ const MAX_MODEL_ID_LENGTH = 200;
 // because a provider id with a newline is a header-injection smell, not a model.
 const MODEL_ID_PATTERN = /^[^\u0000-\u001f\u007f]+$/;
 
-// What a client may supply when creating a harness. No instructions, provider
-// settings, tools, or model: those are trusted/configured server-side.
+// Bounds on a client-supplied INSTRUCTION override (T3 editable configuration).
+// A system prompt is legitimately longer than a description, but it must stay a
+// prompt: 8000 characters is generous for a role definition while keeping one
+// saved harness from smuggling megabytes into every request of every session.
+const MAX_INSTRUCTION_LENGTH = 8_000;
+
+// Instruction text keeps its prose shape: tab, newline and CR are allowed (a role
+// definition is often multi-line), every other control character is rejected.
+const INSTRUCTION_TEXT_PATTERN = /^[^\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]+$/;
+
+// What a client may supply when creating a harness. No provider settings, tools,
+// or model: those are trusted/configured server-side. `agentInstructions` (T3) is
+// the one text-shaped field, and it is an OVERRIDE stored on this harness — the
+// trusted profile in src/agents is never rewritten by it.
 export type HarnessRegistration = {
     name: string;
     title?: string;
@@ -135,6 +147,9 @@ export type HarnessRegistration = {
     // member uses the session's model. Only ids are client-supplied — never a
     // provider, base URL, or credential.
     agentModels?: Readonly<Record<string, string>>;
+    // Per-agent instruction overrides (T3): agent id → instruction text. Optional;
+    // an omitted member runs its trusted catalogue instruction.
+    agentInstructions?: Readonly<Record<string, string>>;
 };
 
 // What a client may change on an existing harness. `name` is immutable: a rename
@@ -150,6 +165,9 @@ export type HarnessPatch = {
     // member; an existing key for a member the same patch removed is dropped
     // silently (it can no longer apply) rather than rejected.
     agentModels?: Readonly<Record<string, string>>;
+    // Same REPLACE semantics as `agentModels` (T3): `{}` clears every instruction
+    // override so every member runs its trusted instruction again.
+    agentInstructions?: Readonly<Record<string, string>>;
 };
 
 export type HarnessRegistry = {
@@ -343,6 +361,81 @@ export const normalizeAgentModels = (
     return resolved;
 };
 
+// Validate one instruction override. Trimmed, non-empty, bounded, and free of
+// control characters other than tab/newline/CR. A blank value is rejected rather
+// than treated as "no override" for exactly the reason an empty model id is: a
+// client that means "revert to the trusted instruction" must OMIT the key (or send
+// `{}`), so an accidental paste of whitespace cannot silently discard a saved
+// override while the UI still shows the old text.
+const requireInstruction = (value: unknown, agent: string): string => {
+    if (typeof value !== 'string') {
+        throw new HarnessRegistryError(
+            400,
+            `\`agentInstructions.${agent}\` must be an instruction string.`
+        );
+    }
+
+    const instruction = value.trim();
+
+    if (instruction.length === 0) {
+        throw new HarnessRegistryError(
+            400,
+            `\`agentInstructions.${agent}\` cannot be empty. Omit the key to run the trusted instruction.`
+        );
+    }
+
+    if (instruction.length > MAX_INSTRUCTION_LENGTH) {
+        throw new HarnessRegistryError(
+            400,
+            `\`agentInstructions.${agent}\` cannot exceed ${MAX_INSTRUCTION_LENGTH} characters.`
+        );
+    }
+
+    if (!INSTRUCTION_TEXT_PATTERN.test(instruction)) {
+        throw new HarnessRegistryError(
+            400,
+            `\`agentInstructions.${agent}\` contains control characters.`
+        );
+    }
+
+    return instruction;
+};
+
+// Validate a per-agent instruction map against the FINAL member set (T3).
+//
+// Mirrors `normalizeAgentModels` deliberately: the same key-membership rule (an
+// override for an agent this harness does not select can never apply, so it is a
+// visible 400 rather than a stored no-op) and the same all-or-nothing shape. The
+// value rule differs only in bounds, because instruction text is prose rather than
+// an identifier. Exported for the same reason as the model validator: one place
+// decides what a legal instruction override is, so the wire message cannot drift.
+export const normalizeAgentInstructions = (
+    value: unknown,
+    members: readonly string[]
+): Record<string, string> => {
+    if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+        throw new HarnessRegistryError(
+            400,
+            '`agentInstructions` must be an object mapping agent ids to instruction text.'
+        );
+    }
+
+    const resolved: Record<string, string> = {};
+
+    for (const [agent, instruction] of Object.entries(value as Record<string, unknown>)) {
+        if (!members.includes(agent)) {
+            throw new HarnessRegistryError(
+                400,
+                `\`agentInstructions\` names "${agent}", which is not a member of this harness. Members: ${members.join(', ')}.`
+            );
+        }
+
+        resolved[agent] = requireInstruction(instruction, agent);
+    }
+
+    return resolved;
+};
+
 // Copy one template into an independent registry entry. Arrays and the model map
 // are copied so nothing a registry (or a caller holding list()[i]) does can reach
 // the shipped module constants. The factory is shared: it is immutable (a closure
@@ -360,27 +453,37 @@ const copyTemplate = (preset: HarnessPreset): HarnessPreset => ({
         ? {}
         : { environmentTools: [...preset.environmentTools] }),
     ...(preset.agentModels === undefined ? {} : { agentModels: { ...preset.agentModels } }),
+    ...(preset.agentInstructions === undefined
+        ? {}
+        : { agentInstructions: { ...preset.agentInstructions } }),
     editable: true
 });
 
 // Build the factory for a template's LIVE form. 'flaky' keeps its example-only
-// extra tool; everything else is the shared profiled harness. The model map is
-// captured by the closure (via createProfiledHarness / agentsFromProfiles), which
-// is what makes a later PATCH invisible to an existing session.
+// extra tool; everything else is the shared profiled harness. The model and
+// instruction maps are captured by the closure (via createProfiledHarness /
+// agentsFromProfiles), which is what makes a later PATCH invisible to an existing
+// session.
 const liveFactory = (
     template: 'live' | 'flaky',
     primary: string,
     subagents: readonly string[],
-    agentModels: Readonly<Record<string, string>>
+    agentModels: Readonly<Record<string, string>>,
+    agentInstructions: Readonly<Record<string, string>> = {}
 ): HarnessPreset['create'] => {
     if (template === 'live') {
-        return createProfiledHarness(primary, subagents, agentModels);
+        return createProfiledHarness(primary, subagents, agentModels, agentInstructions);
     }
 
     return (settings, progress, report) =>
         createToolboxHarness(
             {
-                agents: agentsFromProfiles([primary, ...subagents], settings, agentModels),
+                agents: agentsFromProfiles(
+                    [primary, ...subagents],
+                    settings,
+                    agentModels,
+                    agentInstructions
+                ),
                 primary,
                 subagents: [...subagents],
                 // T19/F1: a rebuilt flaky example keeps its extra TOOL SET, but
@@ -423,6 +526,10 @@ export const presetToRecord = (preset: HarnessPreset): HarnessPresetRecord => ({
     ...(preset.agentModels === undefined || Object.keys(preset.agentModels).length === 0
         ? {}
         : { agentModels: { ...preset.agentModels } }),
+    ...(preset.agentInstructions === undefined ||
+      Object.keys(preset.agentInstructions).length === 0
+        ? {}
+        : { agentInstructions: { ...preset.agentInstructions } }),
     builtin: preset.builtin,
     editable: preset.editable,
     ...(preset.template === undefined ? {} : { template: preset.template }),
@@ -452,6 +559,10 @@ const presetToRecordShape = (record: HarnessPresetRecord): HarnessPresetRecord =
     ...(record.agentModels === undefined || Object.keys(record.agentModels).length === 0
         ? {}
         : { agentModels: { ...record.agentModels } }),
+    ...(record.agentInstructions === undefined ||
+      Object.keys(record.agentInstructions).length === 0
+        ? {}
+        : { agentInstructions: { ...record.agentInstructions } }),
     builtin: record.builtin,
     editable: record.editable,
     ...(record.template === undefined ? {} : { template: record.template }),
@@ -487,9 +598,21 @@ export const presetFromRecord = (
 
         create = shipped.create;
     } else if (record.template === 'flaky') {
-        create = liveFactory('flaky', record.primary, record.subagents, record.agentModels ?? {});
+        create = liveFactory(
+            'flaky',
+            record.primary,
+            record.subagents,
+            record.agentModels ?? {},
+            record.agentInstructions ?? {}
+        );
     } else if (record.template === 'live') {
-        create = liveFactory('live', record.primary, record.subagents, record.agentModels ?? {});
+        create = liveFactory(
+            'live',
+            record.primary,
+            record.subagents,
+            record.agentModels ?? {},
+            record.agentInstructions ?? {}
+        );
     } else {
         if (fallback === undefined) {
             throw new Error(
@@ -503,7 +626,12 @@ export const presetFromRecord = (
             current.primary !== record.primary ||
             JSON.stringify(current.subagents) !== JSON.stringify(record.subagents) ||
             JSON.stringify(current.agents) !== JSON.stringify(record.agents) ||
-            JSON.stringify(current.agentModels ?? {}) !== JSON.stringify(record.agentModels ?? {})
+            JSON.stringify(current.agentModels ?? {}) !== JSON.stringify(record.agentModels ?? {}) ||
+            // T3: a saved instruction override is part of the executable
+            // definition. An injected preset that no longer carries it would
+            // silently restore a different prompt, so the mismatch is an error.
+            JSON.stringify(current.agentInstructions ?? {}) !==
+            JSON.stringify(record.agentInstructions ?? {})
         ) {
             throw new Error(
                 `Harness "${record.name}" changed incompatibly while its session was saved; the frozen definition cannot be rebuilt.`
@@ -530,6 +658,9 @@ export const presetFromRecord = (
         ...(record.agentModels === undefined
             ? {}
             : { agentModels: { ...record.agentModels } }),
+        ...(record.agentInstructions === undefined
+            ? {}
+            : { agentInstructions: { ...record.agentInstructions } }),
         builtin: record.builtin,
         editable: true,
         ...(record.template === undefined ? {} : { template: record.template }),
@@ -576,7 +707,9 @@ export const isLegacyShippedDefinition = (
         sameList(record.environmentTools, definition.environmentTools) &&
         (record.template ?? 'live') === (definition.template ?? 'live') &&
         // A per-agent model map is a customisation, even when the team matches.
-        Object.keys(record.agentModels ?? {}).length === 0
+        Object.keys(record.agentModels ?? {}).length === 0 &&
+        // T3: so is a saved instruction override — it is executable text, not prose.
+        Object.keys(record.agentInstructions ?? {}).length === 0
     );
 };
 
@@ -608,7 +741,10 @@ export const restoreHarnessRegistry = (
                 description: record.description,
                 primary: record.primary,
                 subagents: [...record.subagents],
-                ...(record.agentModels === undefined ? {} : { agentModels: { ...record.agentModels } })
+                ...(record.agentModels === undefined ? {} : { agentModels: { ...record.agentModels } }),
+                ...(record.agentInstructions === undefined
+                    ? {}
+                    : { agentInstructions: { ...record.agentInstructions } })
             });
             known.set(record.name, record);
             continue;
@@ -653,7 +789,12 @@ export const restoreHarnessRegistry = (
                 ? {
                       primary: record.primary,
                       subagents: [...record.subagents],
-                      agentModels: { ...record.agentModels }
+                      agentModels: { ...record.agentModels },
+                      // T3: instruction overrides are executable state, so a saved
+                      // row replays them through the same patch that rebuilds the
+                      // factory. `{}` is correct when the row has none: it clears
+                      // overrides a newer template might ship.
+                      agentInstructions: { ...record.agentInstructions }
                   }
                 : {})
         });
@@ -727,6 +868,13 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
                 ? {}
                 : normalizeAgentModels(registration.agentModels, agents);
 
+        // Instruction overrides (T3) are validated against the same final member
+        // set: an override for an unselected agent could never apply.
+        const agentInstructions =
+            registration.agentInstructions === undefined
+                ? {}
+                : normalizeAgentInstructions(registration.agentInstructions, agents);
+
         const preset: HarnessPreset = {
             name,
             title:
@@ -752,6 +900,10 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
             // Absent vs `{}` are the same thing: no overrides. Stored as a plain
             // object so update() has one shape to reason about.
             agentModels,
+            // T3: same absent-vs-empty equivalence as `agentModels`. The factory
+            // closure captures it, so an existing session keeps the instruction its
+            // agents were built with.
+            agentInstructions,
             builtin: false,
             editable: true,
             // A created harness is a live profiled harness; later PATCHes treat
@@ -759,7 +911,7 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
             template: 'live',
             // The factory closure captures the map, so a later PATCH builds a NEW
             // closure: an existing session keeps the models it was created with.
-            create: createProfiledHarness(primary, subagents, agentModels)
+            create: createProfiledHarness(primary, subagents, agentModels, agentInstructions)
         };
 
         entries.set(name, preset);
@@ -810,6 +962,20 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
                 ? retainedModels
                 : normalizeAgentModels(patch.agentModels, agents);
 
+        // Instruction overrides (T3) follow the identical rule, for the identical
+        // reason: an override for an agent this patch removed can never apply, so it
+        // is dropped, and a stated map REPLACES the stored one (`{}` clears it).
+        const retainedInstructions = Object.fromEntries(
+            Object.entries(current.agentInstructions ?? {}).filter(([agent]) =>
+                agents.includes(agent)
+            )
+        );
+
+        const agentInstructions =
+            patch.agentInstructions === undefined
+                ? retainedInstructions
+                : normalizeAgentInstructions(patch.agentInstructions, agents);
+
         // R20.1 template handling. A metadata-only patch keeps the exact factory
         // the entry already captured (demo's script, flaky's testFlaky, a live
         // closure). An executable patch rebuilds from the template:
@@ -820,10 +986,16 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
         //   - 'flaky' rebuilds the live toolbox with testFlaky retained;
         //   - everything else uses the standard profiled factory.
         const template = current.template ?? 'live';
+
+        // An instruction edit is EXECUTABLE, not prose: it changes the system
+        // messages the next session's agents are seeded with, so it must rebuild the
+        // factory exactly like a model or team change (and, on the scripted demo,
+        // upgrade it to a live harness rather than storing text the script ignores).
         const executable =
             patch.primary !== undefined ||
             patch.subagents !== undefined ||
-            patch.agentModels !== undefined;
+            patch.agentModels !== undefined ||
+            patch.agentInstructions !== undefined;
 
         const upgradedScripted = executable && template === 'scripted';
 
@@ -846,7 +1018,8 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
                   template === 'scripted' || template === 'live' ? 'live' : 'flaky',
                   primary,
                   subagents,
-                  agentModels
+                  agentModels,
+                  agentInstructions
               )
             : current.create;
 
@@ -865,6 +1038,9 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
             subagents,
             agents,
             agentModels,
+            // T3: stated explicitly (not inherited from `...current`) so a patch that
+            // replaces or clears the map is what the new entry carries.
+            agentInstructions,
             ...(upgradedScripted
                 ? {
                       requiresEndpoint: true,

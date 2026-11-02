@@ -124,12 +124,18 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(selector: string, tag: K
     return found;
 };
 
-// T5 R11/R12: the agent deck now lives in the shared dialog, so deck/activity reads
-// open it from the composer's single agent button (idempotent once open).
+// T5 R11/R12: the agent configuration lives in the shared dialog, so a dialog read
+// opens it from the composer's single agent button (idempotent once open).
 const openDeck = (): void => {
     if (document.querySelector('.dialog') !== null) return;
     byClass('.agent-control-button', 'button').click();
 };
+
+// T3: the deck is gone, so the ring a test observes is the composer control's own
+// `data-activity` (ui/activity.ts paints it on every `start`/`done` frame). The
+// dialog's team rows carry the same state and need no separate read.
+const ringActivity = (): string | undefined =>
+    document.querySelector<HTMLElement>('.agent-control[data-agent]')?.dataset.activity;
 
 const host = (slot: 'scratch' | 'center' | 'left'): HTMLElement =>
     byClass(`.panel-host[data-slot="${slot}"]`, 'div');
@@ -206,16 +212,28 @@ it('keeps a legacy editable:false preset fully editable and never says read-only
     expect(document.querySelector('.agent-lock')).toBeNull();
     expect(document.querySelector('.harness-meta')?.textContent).not.toContain('editable');
 
-    // The team row is genuinely editable: promotion, add, remove and model selects.
+    // T3: the team is genuinely editable — the instruction editor, the model select and
+    // the membership toggle are all live (nothing here is a read-only "not editable"
+    // surface, and the entry still never says read-only).
     openDeck();
-    expect(byClass('.agent-main', 'button').disabled).toBe(false);
-    expect(byClass('.agent-add', 'button').disabled).toBe(false);
+    expect(byClass('.agent-dialog-instruction', 'textarea').disabled).toBe(false);
     expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
+    expect(byClass('.agent-dialog-member', 'input').disabled).toBe(true); // the primary
 
-    byClass('.agent-add', 'button').click();
-    document
-        .querySelector<HTMLButtonElement>('.agent-option[data-agent="summarizer"] .agent-option-add')
-        ?.click();
+    // Adding a trusted agent: select it, tick membership, save from the primary so the
+    // add does not also promote.
+    const select = byClass('.agent-dialog-agent-select', 'select');
+    select.value = 'summarizer';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+
+    const member = byClass('.agent-dialog-member', 'input');
+    member.checked = true;
+    member.dispatchEvent(new Event('change', { bubbles: true }));
+
+    select.value = 'instruct';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+
+    byClass('.agent-dialog-apply', 'button').click();
     await flush();
     await flush();
 
@@ -341,8 +359,7 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
     expect(document.querySelector('.scratch-note')?.textContent).toBe('1 tool panel for instruct.');
     // A settled turn's panel is valid scratch state, but it must not light the
     // agent ring: activity is derived only from a RUNNING turn.
-    openDeck();
-    expect(document.querySelector('.agent-tile')?.dataset.activity).toBeUndefined();
+    expect(ringActivity()).toBeUndefined();
 
     // Opening s2 replaces the board with that conversation's panels (no leakage
     // of s1's panel), and the two secondary hosts light up.
@@ -458,8 +475,7 @@ it('renders live tool_result.ui panels and keeps them across the terminal snapsh
     // lit because that is a separate, honest signal.
     expect(panelIds('scratch')).toEqual(['live']);
     expect(panelText('scratch')).toEqual(['running now']);
-    openDeck();
-    expect(document.querySelector('.agent-tile')?.dataset.activity).toBe('active');
+    expect(ringActivity()).toBe('active');
 
     push([{ type: 'snapshot', session: snapshot({ turns: [recorded] }) }]);
     controller?.close();
@@ -470,7 +486,7 @@ it('renders live tool_result.ui panels and keeps them across the terminal snapsh
     // completed history does not leave an agent looking busy.
     expect(panelIds('scratch')).toEqual(['live']);
     expect(panelText('scratch')).toEqual(['running now']);
-    expect(document.querySelector('.agent-tile')?.dataset.activity).toBeUndefined();
+    expect(ringActivity()).toBeUndefined();
     expect(byClass('.tile', 'article').dataset.state).toBe('done');
 });
 
@@ -532,8 +548,7 @@ it('derives panels from a polled snapshot without replaying old activity', async
     expect(panelText('scratch')).toEqual(['from poll']);
     // The turn is still running, so the agent ring is legitimately active — panels
     // are not what lights it (activity comes from the turn's own events).
-    openDeck();
-    expect(document.querySelector('.agent-tile')?.dataset.activity).toBe('active');
+    expect(ringActivity()).toBe('active');
 
     // Hiding the page stops polling; the panel (a completed tool's output) is still
     // valid scratch state and is not discarded by the teardown.

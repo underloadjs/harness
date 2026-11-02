@@ -80,6 +80,9 @@ export type HarnessPresetRecord = {
     tools: string[];
     environmentTools?: string[];
     agentModels?: Record<string, string>;
+    // Per-agent instruction overrides (T3 editable configuration). Optional and
+    // additive: a document without the field restores exactly as before.
+    agentInstructions?: Record<string, string>;
     builtin: boolean;
     editable: boolean;
     template?: 'live' | 'scripted' | 'flaky';
@@ -235,23 +238,21 @@ const requireStringArray = (value: unknown, label: string): string[] => {
     return [...(value as string[])];
 };
 
+// A string → string map (`agentModels`, and T3's `agentInstructions`). Both are
+// agent id → text maps restored the same way, so a malformed stored document
+// reports the same shape of error whichever field is broken. The reader itself is
+// `readStringMap` below, next to the other map readers.
+
 // Frozen descriptor (`SessionSnapshot.harnessDefinition`). Validate the fields a
 // restored session and the UI rely on; agentModels/coreTools are optional.
 const readDescriptor = (value: unknown, label: string): HarnessDescriptor => {
     const record = requireRecord(value, label);
     const agentModels =
-        record.agentModels === undefined
+        record.agentModels === undefined ? undefined : readStringMap(record.agentModels, `${label}.agentModels`);
+    const agentInstructions =
+        record.agentInstructions === undefined
             ? undefined
-            : (() => {
-                  const entry = requireRecord(record.agentModels, `${label}.agentModels`);
-                  const mapped: Record<string, string> = {};
-
-                  for (const [agent, model] of Object.entries(entry)) {
-                      mapped[agent] = requireString(model, `${label}.agentModels.${agent}`);
-                  }
-
-                  return mapped;
-              })();
+            : readStringMap(record.agentInstructions, `${label}.agentInstructions`);
 
     return {
         name: requireString(record.name, `${label}.name`),
@@ -266,6 +267,7 @@ const readDescriptor = (value: unknown, label: string): HarnessDescriptor => {
             ? {}
             : { coreTools: requireStringArray(record.coreTools, `${label}.coreTools`) }),
         ...(agentModels === undefined ? {} : { agentModels }),
+        ...(agentInstructions === undefined ? {} : { agentInstructions }),
         builtin: requireBoolean(record.builtin, `${label}.builtin`),
         editable: requireBoolean(record.editable, `${label}.editable`)
     };
@@ -291,18 +293,15 @@ const readPresetRecord = (value: unknown, label: string): HarnessPresetRecord =>
               })();
 
     const agentModels =
-        record.agentModels === undefined
+        record.agentModels === undefined ? undefined : readStringMap(record.agentModels, `${label}.agentModels`);
+
+    // T3: a saved instruction override is part of the harness's executable state, so
+    // it is restored exactly like the model map (and an older document without the
+    // field restores unchanged).
+    const agentInstructions =
+        record.agentInstructions === undefined
             ? undefined
-            : (() => {
-                  const entry = requireRecord(record.agentModels, `${label}.agentModels`);
-                  const mapped: Record<string, string> = {};
-
-                  for (const [agent, model] of Object.entries(entry)) {
-                      mapped[agent] = requireString(model, `${label}.agentModels.${agent}`);
-                  }
-
-                  return mapped;
-              })();
+            : readStringMap(record.agentInstructions, `${label}.agentInstructions`);
 
     return {
         name: requireString(record.name, `${label}.name`),
@@ -317,6 +316,7 @@ const readPresetRecord = (value: unknown, label: string): HarnessPresetRecord =>
             ? {}
             : { environmentTools: requireStringArray(record.environmentTools, `${label}.environmentTools`) }),
         ...(agentModels === undefined ? {} : { agentModels }),
+        ...(agentInstructions === undefined ? {} : { agentInstructions }),
         builtin: requireBoolean(record.builtin, `${label}.builtin`),
         editable: requireBoolean(record.editable, `${label}.editable`),
         ...(template === undefined ? {} : { template }),
@@ -481,7 +481,8 @@ const readCounterMap = (value: unknown, label: string): Record<string, number> =
     return mapped;
 };
 
-// Optional `{ key: string }` map (turn id -> invocation id / per-turn counters).
+// Optional `{ key: string }` map (turn id -> invocation id / per-turn counters, and
+// the `agentModels` / `agentInstructions` override maps of a saved preset).
 const readStringMap = (value: unknown, label: string): Record<string, string> => {
     const record = requireRecord(value, label);
     const mapped: Record<string, string> = {};

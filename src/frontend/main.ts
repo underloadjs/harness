@@ -111,6 +111,7 @@ import {
 } from './api';
 import type { HarnessBootstrap } from './api';
 import {
+    agentInstructionsOf,
     agentModelsOf,
     agentsFromDescriptors,
     builtinOf,
@@ -118,6 +119,7 @@ import {
     frameAtOf,
     frameUsageOf,
     frozenDefinitionOf,
+    instructionsForMembers,
     membersOf,
     modelsForMembers,
     primaryOf,
@@ -128,7 +130,7 @@ import { createCreateHarnessPanel } from './ui/create-harness';
 import { createAgentControl } from './ui/agent-control';
 import type { AgentControl } from './ui/agent-control';
 import { openAgentDialog } from './ui/agent-dialog';
-import type { AgentDialog } from './ui/agent-dialog';
+import type { AgentApplyResult, AgentConfigurationApply, AgentDialog } from './ui/agent-dialog';
 import { openDialog } from './ui/dialog';
 import type { DialogHandle } from './ui/dialog';
 import {
@@ -1706,10 +1708,11 @@ stage.id = 'harness-stage';
 //         empty + idle           -> no control at all
 //   - Reset is gone (R10). Starting over is the Sessions rail's New session; the
 //     server still owns POST /sessions/:id/reset for other clients (untouched).
-//   - Keyboard (R1): Enter inserts a newline like any multiline editor; Ctrl/Cmd+
-//     Enter is the shortcut that sends, and the in-field button stays the primary
-//     send path. See the `keydown` listener below the submit wiring for the full
-//     matrix (including @/# popup navigation).
+//   - Keyboard (R1 + T1): a fine pointer sends on Enter and inserts a newline on
+//     Shift+Enter; a coarse or undetectable pointer keeps Enter as a newline and sends
+//     through the button or Ctrl/Cmd+Enter. See the `keydown` listener below
+//     the submit wiring for the full matrix (including @/# popup navigation and the
+//     chip × button's own Enter).
 //
 // Attachments (T5 clip/attach) are INLINE chips in that field, not a second input:
 //   - `.composer-body` is the column holding the error line and the field wrapper, so
@@ -1793,7 +1796,8 @@ installEditorAccessors(input);
 
 // @ / # popup anchored at the caret inside the field. role=listbox + option rows
 // mirror UniversalTextBox's mention popup, but the harness keeps its own keyboard
-// submit (Ctrl/Cmd+Enter) and its plain Enter newline.
+// submit (Enter on a hardware keyboard, Ctrl/Cmd+Enter everywhere) and its Enter
+// newline on a touch keyboard.
 const composerPopup = el('div', 'composer-popup');
 composerPopup.id = 'composer-popup';
 composerPopup.setAttribute('role', 'listbox');
@@ -2598,9 +2602,11 @@ const selectComposerPopup = (index = composerPopupState?.index): boolean => {
 //
 // Labels/titles are the accessible names (the glyph is decorative): the button is a
 // real <button>, so both pointer and keyboard activate it. In submit mode it is the
-// form's submit button, so clicking it and pressing Ctrl/Cmd+Enter share one path
-// (R10: queuing behavior untouched); a bare Enter stays a native newline (see the
-// keydown contract below). In stop mode it is a plain button wired to `stopRun`.
+// form's submit button: a click arrives through the form's `submit` listener, while the
+// keyboard sends (bare Enter on a fine pointer, Ctrl/Cmd+Enter everywhere) call `run()`
+// directly. Both converge on that one body (R10: queuing behavior untouched); on a
+// touch/unknown pointer a bare Enter stays a native newline (see the keydown contract
+// below). In stop mode it is a plain button wired to `stopRun`.
 // Count draft references whose target turn has not settled yet (queued/running).
 // The server only steers WITH reference context when every target is already `done`
 // (sessions.ts `composeSteerReferences` returns undefined otherwise) — a live target
@@ -2704,9 +2710,12 @@ const paintComposer = (): void => {
     }
 
     actionButton.setAttribute('aria-label', 'Send task');
-    // The title must state the real shortcut (R1): Enter is a newline now, so the
-    // only keyboard send is Ctrl+Enter (Cmd+Enter on macOS).
-    actionButton.title = 'Send (Ctrl/Cmd+Enter)';
+    // T1: the title states the shortcut the reader actually has on THIS device, so the
+    // hint must follow the same `(pointer: fine)` query the keydown handler uses — a
+    // hardware pointer sends on a bare Enter, a touch/unknown pointer's Enter inserts a
+    // newline and Ctrl/Cmd+Enter is the only keyboard send. The button itself is the
+    // primary path either way, which is why the non-desktop hint names no shortcut.
+    actionButton.title = hasFinePointer() ? 'Send (Enter)' : 'Send';
 };
 
 // Typing / deletion is the only thing that changes the action outside a
@@ -2874,6 +2883,35 @@ let railReturnFocus: HTMLElement | undefined;
 // reachable and testable. It is defined everywhere a real desktop browser runs.
 const phoneMedia = window.matchMedia?.('(max-width: 860px)');
 const isPhoneLayout = (): boolean => phoneMedia?.matches ?? true;
+
+// T1: a SECOND, independent media axis for the composer's Enter policy — the primary
+// INPUT DEVICE, deliberately not the 860px layout breakpoint above.
+//
+// Why not width: a desktop window dragged to 700px would lose Enter-to-send, and a
+// phone in landscape past 860px would gain it. Neither is what the reader meant.
+//
+// T3 hardening: the query is POSITIVE — `(pointer: fine)` matches only when the PRIMARY
+// pointing device is a mouse/trackpad, so Enter-to-send is claimed only on a device the
+// page can actually vouch for. Testing `(pointer: coarse)` instead would classify every
+// non-coarse device as a desktop, including `(pointer: none)` (keyboard-only or
+// assistive-tech input), and would hand Enter-to-send to a machine that was never
+// detected. The matrix now reads:
+//   - `(pointer: fine)`  -> Enter sends (R2): a desktop, and a touchscreen laptop whose
+//     primary pointer is its mouse/trackpad;
+//   - `(pointer: coarse)` -> Enter is a newline (R1): a phone/tablet, whose on-screen
+//     keyboard has no dependable Shift and whose send button is on screen;
+//   - `(pointer: none)` or an absent `matchMedia` (jsdom, very old engines) -> UNKNOWN,
+//     so the newline fallback holds. Sending is the irreversible half of the matrix: an
+//     environment that cannot prove a hardware keyboard keeps the historical contract
+//     instead of inventing a submit.
+const finePointerMedia = window.matchMedia?.('(pointer: fine)');
+const hasFinePointer = (): boolean => finePointerMedia?.matches ?? false;
+
+// The Enter policy is read live on every keystroke, but the send button's shortcut
+// HINT is painted once per composer repaint. Repainting on a pointer change keeps them
+// in one state (a touchscreen laptop switching to finger input, or a phone gaining a
+// bluetooth keyboard, must not keep advertising a shortcut that no longer applies).
+finePointerMedia?.addEventListener?.('change', () => paintComposer());
 
 // Apply the platform-appropriate brand semantics:
 //   - phone: a real disclosure trigger, enabled, with `aria-controls` and the live
@@ -3072,19 +3110,12 @@ let toolEntries: readonly ToolDescriptor[] = [];
 // view (catalogue + manual runner). There is no tab strip (R3); the topbar's
 // icon-only Tools toggle drives this through `setToolsView`.
 let showingTools = false;
-// Which agent tile is FRONT (fully visible) in the overlapping card deck (R2). The
-// dialog content is rebuilt on every paint (activity frames, model PATCHes, busy
-// changes), so the viewed card has to be remembered here or an activity frame would
-// flip the deck back. This is VIEW state only — it is deliberately not
-// `selectedName`/`primaryOf`, never sent to
-// the server, and fronting a card never PATCHes the team. `undefined` means "front
-// the primary"; a name that is no longer a member is dropped on the next render so
-// removing the viewed agent falls back to the primary instead of blanking the deck.
-let agentFront: string | undefined;
-// R11/R12 (T5): the agent dialog is APP-scoped, not per view. It is opened from the
+// R11/R12/T3: the agent dialog is APP-scoped, not per view. It is opened from the
 // composer button, kept in sync across routine chrome rebuilds (see
 // `refreshAgentDialog`) and closed by the lifecycle changes that used to reset the
-// old popover (harness switch, new/deleted session, Tools view).
+// old popover (harness switch, new/deleted session, Tools view). The dialog owns its
+// OWN draft state (which agent is selected, what has been edited), so main.ts
+// remembers no view state for it: a dismissal simply drops the handle.
 let agentDialog: AgentDialog | undefined;
 // The state the open dialog was last painted from. A chrome rebuild happens for
 // every snapshot/activity frame; rebuilding identical content would collapse open
@@ -3106,7 +3137,8 @@ let watch: { instance: Instance; sessionId: string; controller: AbortController 
 // Guards a double PATCH while an agent edit is in flight.
 let savingAgents = false;
 // How many POST /sessions requests are awaiting an answer. A model edit while a
-// session is being created must not race the freeze (see setAgentModel); a counter
+// session is being created must not race the freeze (see applyAgentConfiguration); a
+// counter
 // rather than a boolean because the manual tool runner may also create one.
 let creatingSessions = 0;
 
@@ -3268,9 +3300,19 @@ const paintToolsToggle = (): void => {
 // Remove every activity ring. Called on terminal frames, cancel, delete, new
 // session, harness switch and pagehide: after those there is no in-flight agent
 // in view, and a leftover ring would claim work that is not happening.
+// Paints the live agent ring on BOTH hosts of `data-agent`: the composer control
+// (`agentSlot`) and the team rows of an OPEN configuration dialog. The dialog's rows
+// are not inside `agentSlot`, and its body is deliberately NOT rebuilt for an activity
+// frame (a rebuild would throw the reader's caret away mid-instruction, T3), so the
+// ring has to be pushed here for the two hosts to stay in step.
+const paintAgentRings = (active: ReadonlySet<string>): void => {
+    paintActivity(agentSlot, active);
+    agentDialog?.paintActivity(active);
+};
+
 const clearActivity = (): void => {
     for (const instance of instances.values()) instance.activity.clear();
-    paintActivity(agentSlot, new Set<string>());
+    paintAgentRings(new Set<string>());
 };
 
 // Paint every named panel host from the SELECTED instance's panel state.
@@ -3329,10 +3371,6 @@ const selectHarness = (name: string): void => {
     // collapsed for the new team (R1 default).
     showingTools = false;
     paintToolsToggle();
-    // The deck's front card belonged to the team being left; the new team starts
-    // with its own primary in front (the deck's own fallback does the same, this
-    // just keeps the remembered state honest).
-    agentFront = undefined;
     // Lifecycle: the agent dialog belongs to the conversation being left. The new
     // harness/session starts with it closed.
     closeAgentDialog();
@@ -3485,6 +3523,10 @@ type AgentView = {
     editable: boolean;
     // Per-member EFFECTIVE model (override or session/global fallback).
     models: Record<string, string>;
+    // The stored per-agent INSTRUCTION overrides (T3). Effective text = this map
+    // first, else the trusted catalogue instruction (main.ts pairs it with
+    // `agentLibrary`, exactly the way the dialog's textarea is seeded).
+    instructions: Record<string, string>;
     // The model a no-override choice resolves to (rendered as an id, never
     // "inherit"); '' means "not known", which the select states honestly.
     fallback: string;
@@ -3523,6 +3565,15 @@ const agentViewOf = (instance: Instance): AgentView => {
         if (model !== undefined && model.length > 0) models[name] = model;
     }
 
+    // Per-agent INSTRUCTION overrides (T3). The harness's stored map is the only
+    // source: a member absent from it runs the trusted preset instruction, which is
+    // what the dialog's textarea is seeded with. A saved conversation reads its
+    // FROZEN definition here, so the text on screen is the text that conversation
+    // actually runs — and editing it is refused, because a system message already
+    // seeded into a running transcript cannot be rewritten without rebuilding the
+    // conversation (see the `hint` below and the dialog's locked instruction note).
+    const instructions = agentInstructionsOf(display);
+
     // The actual model the no-override choice resolves to. For a new session it
     // is the typed model, else the server default (what mergeSettings applies to a
     // blank request).
@@ -3551,15 +3602,12 @@ const agentViewOf = (instance: Instance): AgentView => {
           '')
         : defaultSessionModel();
 
-    // R2 deck: prune the remembered front card against the CURRENT team before it
-    // is handed down. Removing (or promoting away) the viewed agent therefore falls
-    // back to the primary on this render, and a name that later reappears is not a
-    // ghost selection. `members` order is the server's, primary first.
-    if (agentFront !== undefined && !members.includes(agentFront)) agentFront = undefined;
-
     // The hint names the ACTUAL cause instead of claiming "locked" for a busy run.
+    // T3: it also has to cover the instruction editor, which is locked for the same
+    // three reasons, so a saved conversation's message says what is frozen rather
+    // than guessing at a team-only restriction.
     const hint = locked
-        ? 'The agent team is locked for this conversation.'
+        ? 'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.'
         : running
           ? 'Wait for the current run to finish before switching agents.'
           : submitting
@@ -3573,13 +3621,16 @@ const agentViewOf = (instance: Instance): AgentView => {
         locked,
         editable,
         models,
+        instructions,
         fallback,
         ...(hint === undefined ? {} : { hint })
     };
 };
 
-// The model dropdown payload shared by the deck inside the dialog. Every rule below
-// is the pre-existing one from the old centre row/popover; only its host changed.
+// The model dropdown payload shared by the configuration panel inside the dialog.
+// Every rule below is the pre-existing one from the old centre row/popover; only its
+// host changed. `onChange` is deliberately absent: the dialog owns the model choice
+// as a DRAFT and writes it through `onApply`, so a select change must never PATCH.
 const agentModelSelectOf = (view: AgentView) => ({
     models: view.models,
     catalogue: modelIds,
@@ -3587,13 +3638,12 @@ const agentModelSelectOf = (view: AgentView) => ({
     // R2: models are NOT part of the frozen team. A saved session edits its live map
     // through PATCH /sessions/:id, and an in-flight run keeps streaming while the
     // next request picks the new id up. The single-flight guard lives in
-    // setAgentModel/patchSessionModels, not in this flag (rendering while that PATCH
-    // is in flight must not look disabled).
+    // applyAgentConfiguration/patchSessionModels, not in this flag (rendering while
+    // that PATCH is in flight must not look disabled).
     editable: view.locked || !running,
-    // Tells the tile which promise the control makes: a session edit applies to the
+    // Tells the control which promise the choice makes: a session edit applies to the
     // next request in THIS chat, a harness edit to future sessions.
-    ...(view.locked ? { session: true } : {}),
-    onChange: (name: string, model: string) => void setAgentModel(name, model)
+    ...(view.locked ? { session: true } : {})
 });
 
 // The composer button (R11). One control, no cycling, no chevron: pressing it opens
@@ -3615,30 +3665,28 @@ const agentDialogOptionsOf = (view: AgentView, instance: Instance) => ({
     agents: agentLibrary,
     editable: view.editable,
     models: agentModelSelectOf(view),
+    instructions: view.instructions,
     activity: [...instance.activity],
     ...(view.hint === undefined ? {} : { hint: view.hint }),
-    ...(agentFront === undefined ? {} : { front: agentFront }),
-    // R2: the front card is remembered across rebuilds for the same reason as
-    // before. Fronting never PATCHes.
-    onFront: (name: string) => {
-        agentFront = name;
-    },
-    onSelectPrimary: (name: string) => void selectPrimary(name),
-    onAdd: (name: string) => void addAgent(name),
-    onRemove: (name: string) => void removeAgent(name)
+    // T3: the one write path. The dialog never PATCHes on select or on edit.
+    onApply: (changes: AgentConfigurationApply) => applyAgentConfiguration(changes)
 });
 
 // A cheap equality key for "does the open dialog need repainting?". It covers every
 // field the dialog renders that can change while it is open.
-const agentDialogSignatureOf = (view: AgentView, instance: Instance): string =>
+//
+// `activity` is deliberately NOT part of it (T3): live `start`/`done` frames arrive
+// many times a run and only move the ring on the team rows, which `paintActivity`
+// repaints in place. Including it here would rebuild the body while the reader is
+// typing an instruction, and a rebuild throws the caret away.
+const agentDialogSignatureOf = (view: AgentView): string =>
     JSON.stringify({
         members: view.members,
         primary: view.primary,
         editable: view.editable,
         models: view.models,
+        instructions: view.instructions,
         fallback: view.fallback,
-        front: agentFront ?? null,
-        activity: [...instance.activity].sort(),
         agents: agentLibrary.map((agent) => agent.name)
     });
 
@@ -3652,7 +3700,7 @@ const openAgentDialogForCurrent = (): void => {
     // One dialog at a time. A second programmatic open replaces the previous layer
     // instead of stacking two views of the same team.
     agentDialog?.close();
-    agentDialogSignature = agentDialogSignatureOf(view, instance);
+    agentDialogSignature = agentDialogSignatureOf(view);
 
     agentDialog = openAgentDialog({
         ...agentDialogOptionsOf(view, instance),
@@ -3660,12 +3708,18 @@ const openAgentDialogForCurrent = (): void => {
             agentDialog = undefined;
             agentDialogSignature = undefined;
 
-            // Focus return (R11/R13). ui/dialog.ts restores the opener when it is
+            // Focus return (R11/R13/T3). ui/dialog.ts restores the opener when it is
             // still connected; a chrome rebuild may have replaced the composer button
             // while the modal was open, so fall back to the LIVE button rather than
-            // leaving focus on <body>.
+            // leaving focus on <body>. The dialog-contents test matters too: `onClose`
+            // can run while the body is still mounted (focus sits on a control that is
+            // about to disappear), and then `activeElement` is neither null nor body.
             const active = document.activeElement;
-            if (active === null || active === document.body) {
+            if (
+                active === null ||
+                active === document.body ||
+                active.closest('.agent-dialog') !== null
+            ) {
                 agentSlot.querySelector<HTMLButtonElement>('.agent-control-button')?.focus();
             }
         }
@@ -3684,12 +3738,15 @@ const closeAgentDialog = (): void => {
 // activity frames cannot collapse instruction details or churn focus.
 //
 // `force` exists for a REJECTED/IGNORED write: the stored state did not move, so the
-// signature matches, yet the control the reader pressed is showing the choice that
-// was refused. Rebuilding is the only way to snap it back to the last confirmed value.
+// signature matches, yet the control the reader operated is showing a choice that
+// was refused. Rebuilding is the only way to snap it back to the last confirmed
+// value. T3: the dialog's editors now hold DRAFTS, so a refused write does not need
+// snapping (the draft is the truth about what the reader typed); `force` still
+// matters for the paths that write outside the dialog, and it is cheap to keep.
 const refreshAgentDialog = (view: AgentView, instance: Instance, force = false): void => {
     if (agentDialog === undefined || !agentDialog.isOpen) return;
 
-    const signature = agentDialogSignatureOf(view, instance);
+    const signature = agentDialogSignatureOf(view);
     if (!force && signature === agentDialogSignature) return;
 
     agentDialogSignature = signature;
@@ -3704,41 +3761,212 @@ const forceRefreshAgentDialog = (): void => {
     refreshAgentDialog(agentViewOf(instance), instance, true);
 };
 
+// ---------------------------------------------------------------------------
+// The one agent write path (T3 transactional configuration)
+// ---------------------------------------------------------------------------
+//
+// The dialog hands over DELTAS and the promotion it represents. This function is the
+// only place that turns them into a request, which is what keeps the two server
+// surfaces honest:
+//
+//   - NO SESSION YET — one atomic PATCH /harnesses/:name carrying the complete
+//     `primary` + `subagents` + `agentModels` + `agentInstructions`. One request, so
+//     a promotion and a model/instruction edit can never land as two partially
+//     applied writes, and the demoted old primary survives as a secondary exactly
+//     once (no stale duplicate).
+//   - A SAVED SESSION — the team and the instructions are frozen (a conversation
+//     runs the definition it was created with), so only the live model map is
+//     writable, through PATCH /sessions/:id. Anything else in the draft is refused
+//     with the reason, and the dialog keeps the drafts so the reader can start a new
+//     session and save them there.
+//
+// The return value is what the dialog renders: `applied: false` never closes it and
+// never clears a draft.
+const applyAgentConfiguration = async (
+    changes: AgentConfigurationApply
+): Promise<AgentApplyResult> => {
+    const instance = current;
+    if (instance === undefined) {
+        return { applied: false, message: 'No conversation is selected.' };
+    }
+
+    const view = agentViewOf(instance);
+    const display = view.display;
+    const members = view.members;
+    const busy = changes.primary !== undefined || changes.add.length > 0 || changes.remove.length > 0;
+
+    // A second save while one PATCH is in flight is refused, not queued: the first
+    // request already carries every draft the dialog holds right now.
+    if (savingAgents) {
+        return { applied: false, message: 'An agent save is still in flight · try again in a moment.' };
+    }
+
+    // --- saved session: live models only ----------------------------------
+    const sessionId = instance.sessionId;
+
+    if (sessionId !== undefined) {
+        if (busy) {
+            return {
+                applied: false,
+                message:
+                    'This conversation keeps the team it was created with · save on the harness to use it in a new session.'
+            };
+        }
+
+        // T5 safeguard: instruction deltas are forbidden here for the same reason the
+        // team is — a saved conversation runs the system prompt it was created with,
+        // and PATCH /sessions/:id has no instruction field to write. Today the dialog
+        // cannot produce such a draft (its editor is rendered disabled while locked),
+        // so this branch is a guard against a future/stale caller: refusing beats
+        // dropping the delta and reporting the save as applied.
+        if (Object.keys(changes.instructions).length > 0) {
+            return {
+                applied: false,
+                message:
+                    'This conversation keeps the instructions it was created with · save on the harness to use them in a new session.'
+            };
+        }
+
+        const drafted = Object.entries(changes.models);
+
+        if (drafted.length === 0) {
+            return { applied: false, message: 'Nothing changed.' };
+        }
+
+        // The session PATCH MERGES, so the body is the complete live map (the
+        // server's answer wins over the frozen overrides for members the patch does
+        // not name). A "use the default" choice becomes that resolved id rather than
+        // a deleted key: deleting here would leave the agent on the model it already
+        // runs, which is the opposite of what the reader picked.
+        const next = modelsForMembers(
+            { ...agentModelsOf(display), ...(instance.sessionModels ?? {}) },
+            members
+        );
+
+        for (const [name, model] of drafted) {
+            if (!members.includes(name)) continue;
+
+            const value = model.trim();
+            const resolved = view.fallback.trim();
+
+            if (value.length === 0) {
+                if (resolved.length > 0) next[name] = resolved;
+                else delete next[name];
+            } else {
+                next[name] = value;
+            }
+        }
+
+        if (Object.keys(next).length === 0) {
+            return { applied: false, message: 'No model is available to select here yet.' };
+        }
+
+        return await patchSessionModels(instance, sessionId, next);
+    }
+
+    // --- editing the harness itself --------------------------------------
+    if (running) {
+        return { applied: false, message: 'Wait for the current run to finish before saving agents.' };
+    }
+
+    // A session being created captures the model map at creation, so a harness PATCH
+    // from here could race the freeze and be ignored. Refuse loudly instead of
+    // silently changing a descriptor the new session already passed.
+    if (creatingSessions > 0) {
+        return {
+            applied: false,
+            message: 'A session is being created · save again once it exists.'
+        };
+    }
+
+    const primary = changes.primary ?? primaryOf(display);
+
+    // Membership: removing is opt-IN, adding is what a promotion of an outside agent
+    // implies. Nothing else moves, so the current team can never shrink by accident
+    // and the new primary is never listed as its own subagent.
+    const kept = members.filter((name) => !changes.remove.includes(name));
+    const added = changes.add.filter((name) => !kept.includes(name));
+    const nextMembers = uniqueNames([primary, ...kept.filter((name) => name !== primary), ...added]);
+
+    if (!nextMembers.includes(primary)) return { applied: false, message: 'A harness needs a primary agent.' };
+
+    // Merge the deltas onto the stored maps. An explicit '' clears a key, which is
+    // how the dialog reverts one agent to the default model or to the trusted preset
+    // instruction without a second protocol verb.
+    const models = { ...agentModelsOf(display) };
+
+    for (const [name, model] of Object.entries(changes.models)) {
+        const value = model.trim();
+        if (value.length === 0) delete models[name];
+        else models[name] = value;
+    }
+
+    const instructions = { ...agentInstructionsOf(display) };
+
+    for (const [name, instruction] of Object.entries(changes.instructions)) {
+        const value = instruction.trim();
+        if (value.length === 0) delete instructions[name];
+        else instructions[name] = value;
+    }
+
+    const nextModels = modelsForMembers(models, nextMembers);
+    const nextInstructions = instructionsForMembers(instructions, nextMembers);
+
+    // Same server state means the same request would be a pointless round trip. The
+    // dialog cannot normally get here (its action stays disabled while nothing is
+    // pending), so this is a guard against a stale tab rather than a UX path.
+    if (
+        primary === primaryOf(display) &&
+        JSON.stringify(nextMembers) === JSON.stringify(members) &&
+        JSON.stringify(nextModels) === JSON.stringify(modelsForMembers(agentModelsOf(display), members)) &&
+        JSON.stringify(nextInstructions) ===
+            JSON.stringify(agentInstructionsOf(display)) &&
+        !busy
+    ) {
+        return { applied: false, message: 'Nothing changed.' };
+    }
+
+    return await patchAgents(primary, nextMembers, nextModels, nextInstructions);
+};
+
 // Send the complete team on every change: `primary` plus every other member as
 // `subagents`. That is what makes a demotion atomic — the old primary is listed
 // as a secondary exactly once and no stale duplicate can survive.
 //
-// `models` is the COMPLETE override map the caller wants stored. The server
-// replaces its map with what it receives, so every mutation sends the whole map:
-// promotion keeps each member's entry, add leaves the new member inheriting, and
-// remove drops the removed member's key via `modelsForMembers` (the server offers
-// the same guarantee, but a complete map never depends on it).
-//
-// When `models` is omitted, agent moves preserve the descriptor's current
-// overrides and omit the field entirely if there is nothing to preserve — the
-// exact pre-R9 request body for a harness that has no per-agent models.
+// `models` and `instructions` are the COMPLETE maps the caller wants stored. The
+// server replaces each map with what it receives, so every mutation sends the whole
+// map (promotion keeps each member's entry, add leaves the new member inheriting,
+// and remove drops the removed member's key via `modelsForMembers` /
+// `instructionsForMembers` — the server offers the same guarantee, but a complete
+// map never depends on it).
 const patchAgents = async (
     primary: string,
     members: readonly string[],
-    models?: Readonly<Record<string, string>>,
-    label = 'agent team'
-): Promise<void> => {
+    models: Readonly<Record<string, string>>,
+    instructions: Readonly<Record<string, string>>,
+    label = 'agent configuration'
+): Promise<AgentApplyResult> => {
     const instance = current;
-    if (instance === undefined || savingAgents) return;
+
+    if (instance === undefined) {
+        return { applied: false, message: 'No conversation is selected.' };
+    }
+
+    if (savingAgents) {
+        return { applied: false, message: 'An agent save is still in flight · try again in a moment.' };
+    }
 
     const display = instance.frozen ?? instance.descriptor;
-    // R21.1: no harness-level permission gate. A saved session and an in-flight run
-    // are the only reasons to refuse an edit.
-    if (instance.sessionId !== undefined || running) return;
-
     const unique = uniqueNames(members);
     const nextPrimary = unique.includes(primary) ? primary : unique[0];
-    if (nextPrimary === undefined) return;
+
+    if (nextPrimary === undefined) {
+        return { applied: false, message: 'A harness needs at least one agent.' };
+    }
 
     const subagents = unique.filter((name) => name !== nextPrimary);
-
-    const nextModels = modelsForMembers(models ?? agentModelsOf(display), unique);
-    const includeModels = models !== undefined || Object.keys(nextModels).length > 0;
+    const includeModels = Object.keys(models).length > 0;
+    const includeInstructions = Object.keys(instructions).length > 0;
 
     savingAgents = true;
     // R3: `saving` is the visible word; the label says WHAT is being saved in the
@@ -3749,92 +3977,41 @@ const patchAgents = async (
         const updated = await updateHarness(display.name, {
             primary: nextPrimary,
             subagents,
-            ...(includeModels ? { agentModels: nextModels } : {})
+            ...(includeModels ? { agentModels: models } : {}),
+            // T3: `{}` is meaningful and must still be sent — it clears every stored
+            // override so every member runs its trusted preset instruction again.
+            ...(includeInstructions || Object.keys(agentInstructionsOf(display)).length > 0
+                ? { agentInstructions: instructions }
+                : {})
         });
         replaceDescriptor(updated);
         buildHarnesses();
         renderHarnessChrome();
+
+        // The pill leaves `saving` only here: the write is confirmed and the descriptor
+        // on screen is the server's answer. `label` says WHAT was saved.
         setStatus('idle', `${label} saved · applies to new sessions`);
+
+        return { applied: true, message: `${label} saved · applies to new sessions` };
     } catch (error) {
-        // The descriptor on screen is still the last server answer, so a failed
-        // PATCH leaves a truthful row. The dialog is forced because its derived state
-        // is unchanged while the rejected select still shows the user's choice (T5 R13).
-        setStatus('error', `${label}: ${messageOf(error)}`);
+        // The descriptor on screen is still the last server answer, so a failed PATCH
+        // leaves a truthful row. The dialog is forced because its derived state is
+        // unchanged while the rejected control still shows the user's choice (T5 R13).
+        const message = messageOf(error);
+        setStatus('error', `${label}: ${message}`);
         renderHarnessChrome();
         forceRefreshAgentDialog();
+
+        return { applied: false, message };
     } finally {
         savingAgents = false;
     }
 };
 
-// Change one member's model (R2). Where the edit goes depends on whether the
-// conversation exists yet:
-//
-//   - SAVED SESSION (locked id present, idle or running): PATCH /sessions/:id with
-//     the complete live `agentModels` map. The server reads that map when it builds
-//     the NEXT model request, so the change takes effect without cancelling an
-//     in-flight run. The frozen `harnessDefinition` stays historical — the team and
-//     its promotion order are still not editable here.
-//   - NO SESSION YET: the harness-level override path, unchanged from R9: the edit
-//     applies to the next session.
-//
-// An empty value is the revert-to-default choice: delete the key so the member
-// resolves to the session's settings model (or the server fallback), and send the
-// resulting map explicitly (even `{}`) so clearing the last override really clears
-// it. The dropdown labels that default with its real model id; "inherit" never
-// appears in the UI.
-const setAgentModel = async (name: string, model: string): Promise<void> => {
-    const instance = current;
-    if (instance === undefined) return;
-
-    const display = instance.frozen ?? instance.descriptor;
-    const members = membersOf(display);
-    if (!members.includes(name)) return;
-
-    const sessionId = instance.sessionId;
-    if (sessionId !== undefined) {
-        // Complete map = the live effective map (a session's own answer wins) with
-        // any frozen/harness override as the base for members the server omitted.
-        // Filtering to `members` keeps a legacy frozen-less session from sending a
-        // key the server would reject against the real team.
-        const next = modelsForMembers(
-            { ...agentModelsOf(display), ...(instance.sessionModels ?? {}) },
-            members
-        );
-
-        if (model.length === 0) delete next[name];
-        else next[name] = model;
-
-        await patchSessionModels(instance, sessionId, next);
-        return;
-    }
-
-    // No session yet and one is being created right now. The server captures the
-    // model map at creation, so a harness PATCH sent from here would race it: the
-    // session could freeze the OLD map while the rail claims the new one. Refuse
-    // loudly instead of silently changing a descriptor that the session already
-    // ignored; the tile stays on its last confirmed value.
-    if (creatingSessions > 0) {
-        setStatus('error', 'agent models: a session is being created · retry once it exists');
-        return;
-    }
-
-    // R21.1: the harness's legacy `editable` flag is not a gate. A run without a
-    // session cannot happen (the run creates it first), but keep the guard for the
-    // stale-handler case.
-    if (running) return;
-
-    const overrides = { ...agentModelsOf(display) };
-    if (model.length === 0) delete overrides[name];
-    else overrides[name] = model;
-
-    await patchAgents(primaryOf(display), members, overrides, 'agent models');
-};
-
 // PATCH a saved session's live model map and apply the answer (R2).
 //
-// `savingAgents` is the existing single-flight guard for agent edits: a second
-// select change while one PATCH is in flight is dropped rather than queued.
+// `savingAgents` is the existing single-flight guard for agent edits: a second change
+// while one PATCH is in flight is refused rather than queued.
 //
 // The answer uses the GET /sessions/:id envelope (`{ session }`), so it is applied
 // the same way — but ONLY the model fields and the directory row. The transcript is
@@ -3844,17 +4021,12 @@ const patchSessionModels = async (
     instance: Instance,
     id: string,
     models: Readonly<Record<string, string>>
-): Promise<void> => {
+): Promise<AgentApplyResult> => {
     if (savingAgents) {
-        // A second change while one PATCH is in flight is dropped, not queued. Redraw
-        // so the control snaps back to the last CONFIRMED model instead of showing a
-        // choice that will never be sent. The dialog needs the forced rebuild for the
-        // same reason as the failure path below (derived state did not change).
-        if (current === instance) {
-            renderHarnessChrome();
-            forceRefreshAgentDialog();
-        }
-        return;
+        // A second change while one PATCH is in flight is dropped, not queued. The
+        // dialog keeps its draft and shows the reason; nothing on screen claims a
+        // write that never happened.
+        return { applied: false, message: 'An agent save is still in flight · try again in a moment.' };
     }
 
     savingAgents = true;
@@ -3870,7 +4042,9 @@ const patchSessionModels = async (
         // The reader may have started a New session or opened another row while the
         // PATCH was in flight. Applying then would re-point THIS card at a session
         // it no longer shows, so drop the answer.
-        if (instance.sessionId !== id) return;
+        if (instance.sessionId !== id) {
+            return { applied: false, message: 'This conversation changed before the save landed.' };
+        }
 
         instance.sessionModels = agentModelsOf(session);
         if (typeof session.model === 'string') instance.sessionModel = session.model;
@@ -3887,59 +4061,24 @@ const patchSessionModels = async (
         // "next request" for a running session too: the run's own progress belongs
         // to the tiles, never to the header (R1).
         setStatus('idle', 'agent models saved · next request');
+
+        return { applied: true, message: 'Models saved · the next request uses them.' };
     } catch (error) {
         // Errors are shown even mid-run: a rejected model is something the reader
         // must see, and the streaming turn keeps its tiles either way. The row/dialog
         // is redrawn from the last confirmed map so it cannot pretend the change stuck.
-        setStatus('error', `agent models: ${messageOf(error)}`);
+        const message = messageOf(error);
+        setStatus('error', `agent models: ${message}`);
+
         if (current === instance) {
             renderHarnessChrome();
             forceRefreshAgentDialog();
         }
+
+        return { applied: false, message };
     } finally {
         savingAgents = false;
     }
-};
-
-const selectPrimary = async (name: string): Promise<void> => {
-    const instance = current;
-    if (instance === undefined) return;
-
-    const display = instance.frozen ?? instance.descriptor;
-    // Selecting a member promotes it and demotes the old primary to a secondary,
-    // in place (order is preserved so the row does not shuffle unexpectedly).
-    const members = membersOf(display);
-    // After a promotion the NEW primary must be the front card, so the refreshed
-    // dialog shows its model select immediately. `undefined` is the deck's documented
-    // "front the primary" value.
-    agentFront = undefined;
-    await patchAgents(name, members);
-};
-
-const addAgent = async (name: string): Promise<void> => {
-    const instance = current;
-    if (instance === undefined) return;
-
-    const display = instance.frozen ?? instance.descriptor;
-    const members = membersOf(display);
-    if (members.includes(name)) return;
-
-    await patchAgents(primaryOf(display), [...members, name]);
-};
-
-const removeAgent = async (name: string): Promise<void> => {
-    const instance = current;
-    if (instance === undefined) return;
-
-    const display = instance.frozen ?? instance.descriptor;
-    const members = membersOf(display);
-    if (members.length <= 1 || !members.includes(name)) return;
-
-    const remaining = members.filter((member) => member !== name);
-    // Removing the primary promotes the next member; the team never ends up with
-    // zero or two primaries.
-    const nextPrimary = name === primaryOf(display) ? remaining[0] : primaryOf(display);
-    await patchAgents(nextPrimary, remaining);
 };
 
 // R21.2: the tool catalogue is the global tools view and nothing else. This line is
@@ -4925,7 +5064,7 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
 
     if (current !== instance) return;
 
-    paintActivity(agentSlot, instance.activity);
+    paintAgentRings(instance.activity);
     renderHarnessChrome();
     paintPanels();
     runner.sync();
@@ -5084,7 +5223,7 @@ const refreshActivity = (instance: Instance): void => {
     const active = [...instance.records.values()].filter((turn) => turn.status === 'running');
     for (const name of activityOfTurns(active)) instance.activity.add(name);
 
-    if (current === instance) paintActivity(agentSlot, instance.activity);
+    if (current === instance) paintAgentRings(instance.activity);
 };
 
 const stopPolling = (): void => {
@@ -5161,11 +5300,11 @@ const onStreamItem = (
         // agent removes only that agent (a delegated sibling keeps spinning).
         applyActivity(instance.activity, item.event);
         if (current === instance) {
-            paintActivity(agentSlot, instance.activity);
-            // R12 (T5): keep the OPEN dialog's team cards truthful without a rebuild —
-            // event frames can arrive many times per second, so repainting the ring is
-            // both cheaper and non-disruptive (focus/details stay put).
-            agentDialog?.paintActivity(instance.activity);
+            // R12 (T5): keep the composer control AND the open dialog's team rows
+            // truthful without a rebuild — event frames can arrive many times per
+            // second, so repainting the ring is both cheaper and non-disruptive
+            // (focus, the caret and open details all stay put).
+            paintAgentRings(instance.activity);
         }
 
         // R21.3 LIVE panels: a tool result may carry `ui`. Upsert it into THIS
@@ -5916,29 +6055,69 @@ composer.addEventListener('submit', (event) => {
     void run();
 });
 
-// Keyboard contract (R1). The send button is the primary path; the keyboard only
-// mirrors it, EXCEPT while an @/# popup is open (UniversalTextBox parity):
+// Keyboard contract (R1 + T1). The send button is the primary path; the keyboard only
+// mirrors it, EXCEPT while an @/# popup is open (UniversalTextBox parity) or while a
+// chip's own control has focus:
+//   chip × focused   -> EVERY Enter (any modifier) is left to the browser: it activates
+//                         the button, which removes that one chip (T3/D1). Nothing here
+//                         prevents it and nothing sends.
 //   popup open + ArrowDown/ArrowUp -> move the active row
 //   popup open + Enter or Tab      -> pick the active row (never submit/newline)
 //   popup open + Escape            -> close the popup
-//   Enter              -> native newline. NEVER prevented and NEVER submits, so the
-//                         field behaves like any other multiline editor.
-//   Shift+Enter        -> native newline (unchanged).
+//   Enter (fine pointer)         -> SEND (T1/R2). The default is prevented so the
+//                         keystroke never also inserts a line break; `run()` keeps
+//                         every existing guard, so an empty/unfinished draft is simply
+//                         refused rather than POSTed.
+//   Enter (coarse/unknown)       -> native newline, NEVER prevented and NEVER submits
+//                         (T1/R1 + T3). An on-screen keyboard has no dependable Shift, so
+//                         the field stays a multiline editor and the button is the send
+//                         path; `(pointer: none)` and a missing `matchMedia` are unknown
+//                         input, so they keep this non-destructive half of the matrix.
+//   Shift+Enter        -> native newline on EVERY device (T1/R2). Shift is the explicit
+//                         "I want a line break" modifier and always wins.
 //   Alt+Enter          -> native newline (also unchanged: Alt is a content modifier).
-//   Ctrl+Enter, Cmd+Enter -> explicit send shortcut. The ONLY keyboard submit path
-//                         (it wins over the popup, so a reader can queue the task
-//                         without picking a suggestion).
+//   Ctrl+Enter, Cmd+Enter -> explicit send shortcut, kept on EVERY device (R3). It still
+//                         wins over the popup, so a reader can queue the task without
+//                         picking a suggestion, and on a touch keyboard it is the only
+//                         keyboard send.
 //   IME composition    -> ignored entirely: the Enter that confirms a candidate
 //                         belongs to the input method, so it must not submit and must
 //                         not be prevented (`isComposing`, plus keyCode 229 for older
-//                         engines that only report the legacy marker).
-// Both the shortcut and the button run through the form's own `submit` path, so
+//                         engines that only report the legacy marker). This guard stays
+//                         FIRST, ahead of the T1 send path, which is exactly why a
+//                         desktop Enter cannot fire mid-composition.
+// The button is the form's own submit button, so a click arrives through the `submit`
+// listener above; every keyboard send here calls `run()` directly (it prevents the
+// default, so no submit event fires). Both converge on the same `run()` body, so
 // queueing while a run is in flight (R4) stays identical.
 input.addEventListener('keydown', (event) => {
     // IME guard first: no composition key may reach the popup or send logic.
     if (event.isComposing || event.keyCode === 229) return;
 
+    // T3/D1: keyboard ownership for a chip's × remove button. That button is a real
+    // <button> INSIDE the contentEditable field (ui/editor.ts:380-386), so its keydown
+    // events bubble through this field listener and this handler must decline them:
+    //   - Enter (with ANY modifier, conservatively) belongs to the focused button, which
+    //     the browser activates natively and removes exactly that one chip. Claiming it
+    //     here would `preventDefault` the activation away and send the WHOLE draft
+    //     instead, so one keystroke would post an unintended task and lose nothing;
+    //   - the guard therefore runs BEFORE the popup and send branches below, so neither
+    //     an open suggestion list nor the T1 desktop policy can steal the keystroke;
+    //   - Backspace/Delete at the button stays the field's atomic chip delete (the
+    //     `fromRemoveButton` guard in that branch keeps its old meaning).
+    const fromRemoveButton =
+        event.target instanceof HTMLElement &&
+        event.target.closest('[data-chip-remove]') !== null;
+
+    if (event.key === 'Enter' && fromRemoveButton) return;
+
     const sending = (event.ctrlKey || event.metaKey) && !event.shiftKey && !event.altKey;
+
+    // T1/R2: a bare Enter sends only on a device whose primary pointer is fine (a real
+    // keyboard is attached, Shift is reachable). Shift and Alt are content modifiers, so
+    // they suppress the send and leave the native newline; `sending` already covers
+    // Ctrl/Cmd, and the popup handling below still outranks a bare Enter (R3).
+    const enterSends = !sending && !event.shiftKey && !event.altKey && hasFinePointer();
 
     // R4/R5: the editor owns Backspace/Delete AT an inline chip.
     //
@@ -5964,9 +6143,6 @@ input.addEventListener('keydown', (event) => {
         (event.key === 'Backspace' || event.key === 'Delete');
 
     if (plainDeleteKey && !submitting) {
-        const fromRemoveButton =
-            event.target instanceof HTMLElement && event.target.closest('[data-chip-remove]') !== null;
-
         if (!fromRemoveButton) {
             const deletion = editorDeleteChips(
                 input,
@@ -6014,14 +6190,29 @@ input.addEventListener('keydown', (event) => {
                 event.preventDefault();
                 return;
             }
+
+            // R3: the open suggestion list owns Enter. When there is nothing to pick yet
+            // (no match, or the @ lookup is still in flight) a bare Enter stays a native
+            // newline on EVERY device, so the T1 desktop send can never fire in the
+            // middle of a mention. Tab deliberately falls through to the browser.
+            if (event.key === 'Enter') return;
         }
     }
 
+    // Only Enter is a send candidate here; every other key (including Tab out of a popup
+    // that had nothing to pick) is left to the browser.
     if (event.key !== 'Enter') return;
 
-    // Send only on Ctrl/Cmd. Shift or Alt alongside it is still a newline request
-    // (content modifiers win), and a bare Enter is left to the browser.
-    if (!sending) return;
+    // T1 send matrix, evaluated once the popup no longer owns the keystroke:
+    //   `sending`     -> the explicit Ctrl/Cmd+Enter shortcut, every device (R3), with
+    //                    Shift/Alt excluded because they are content modifiers;
+    //   `enterSends`  -> a bare Enter on a hardware keyboard (R2).
+    // Everything else (touch Enter, Shift+Enter, Alt+Enter) returns here and inserts a
+    // native line break. Preventing the default BEFORE `run()` is what stops the
+    // newline that would otherwise be left behind in the field; `run()` still applies
+    // its own guards (empty draft, enqueue window, in-flight attachment read, no
+    // session/endpoint), so a send that cannot happen is a no-op, never a bad POST.
+    if (!(sending || enterSends)) return;
 
     event.preventDefault();
     void run();
@@ -6045,7 +6236,7 @@ const stopRun = (): void => {
     // Stopping is the user's terminal signal: no ring may keep spinning while the
     // cancellation round-trip finishes.
     instance.activity.clear();
-    if (current === instance) paintActivity(agentSlot, instance.activity);
+    if (current === instance) paintAgentRings(instance.activity);
 
     void cancelSession(sessionId, true)
         .catch(() => false)
@@ -6061,7 +6252,7 @@ const stopRun = (): void => {
 };
 
 // R10: one action, two roles. Submit mode is the form's own submit button (pointer and
-// the Ctrl/Cmd+Enter shortcut take the existing run() path, queueing included); only
+// every keyboard send take the existing run() path, queueing included); only
 // stop mode needs a direct listener. The state check makes a late click after the
 // queue drained a no-op instead of a stale cancel.
 actionButton.addEventListener('click', (event) => {

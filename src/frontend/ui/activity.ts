@@ -153,9 +153,11 @@ export const activityOfTurns = (turns: readonly SessionTurn[]): Set<string> => {
 export const paintActivity = (root: ParentNode, active: ReadonlySet<string>): void => {
     // Both the full deck tiles (inside the composer popover) and the compact
     // composer control carry `data-agent`; painting the same state on both keeps the
-    // ring visible whether the agent panel is open or closed.
+    // ring visible whether the agent panel is open or closed. The agent dialog's
+    // team rows (ui/agent-dialog.ts) are the third host: they are plain rows, not
+    // deck tiles, so they need their own selector rather than the deck's geometry.
     for (const tile of root.querySelectorAll<HTMLElement>(
-        '.agent-tile[data-agent], .agent-control[data-agent]'
+        '.agent-tile[data-agent], .agent-control[data-agent], .agent-dialog-agent[data-agent]'
     )) {
         const name = tile.dataset.agent ?? '';
 

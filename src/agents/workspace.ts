@@ -13,8 +13,8 @@ export const workspace: AgentProfile = {
         'Coding agent. Reads, edits, and verifies in the workspace and keeps changes targeted; the other roles are available to it as subagents.',
     instruction: 'You are a workspace coding agent.',
     guidelines: [
-        'Batch the file tools — read takes paths, fileWrite takes { path, content }, edit takes { path, oldString, newString }: one call with several targets beats several calls.',
-        'Paths resolve against the server process working directory; start with fileGlob({ patterns: ["**/*"] }) when the layout is unclear.',
+        'Batch the file tools - read takes paths, write takes { path, content }, edit takes { path, oldString, newString }: one call with several targets beats several calls.',
+        'Paths resolve against the server process working directory; start with glob({ patterns: ["**/*"] }) when the layout is unclear.',
         'Read before writing, prefer edit over rewriting a whole file, and review uncommitted changes with gitDiff.',
         'Use shell only for commands that inspect or build.',
         DISCOVERY_GUIDELINE,

@@ -994,22 +994,22 @@ describe('invocation thread entries', () => {
         const select = row.querySelector<HTMLElement>('.thread-select');
         const top = select?.querySelector<HTMLElement>('.thread-top');
 
-        // The button holds the code, the state word, the flexible preview and the
-        // measurement cluster — the same parts the compact tile uses (prompt +
-        // `.tile-top`). T1/R2: the state reads with the code (identity), and the
-        // cluster keeps measurements only.
+        // The button holds the code, the flexible preview and the measurement line — the
+        // same parts the compact tile uses (prompt + `.tile-top`). R3: the state word
+        // closes that line (it is a measurement of the block), so the identity half is the
+        // conversation code alone.
         expect([...(select?.children ?? [])].map((child) => child.className)).toEqual([
             'thread-name',
-            'thread-status',
             'thread-preview',
             'thread-top'
         ]);
         expect([...(top?.children ?? [])].map((child) => child.className)).toEqual([
             'thread-elapsed',
-            'thread-tokens'
+            'thread-tokens',
+            'thread-status'
         ]);
         expect(top?.querySelector('.thread-preview')).toBeNull();
-        expect(top?.querySelector('.thread-status')).toBeNull();
+        expect(top?.querySelector('.thread-status')?.className).toBe('thread-status');
         expect(select?.querySelector('.thread-preview')?.textContent).toBe(
             'a very long delegated task description'
         );
@@ -1296,8 +1296,8 @@ describe('invocation thread entries', () => {
         // R1: the persistent-thread badge LEADS the header, in the same slot as the
         // nested block's `.thread-name`; the measurements stay in `.tile-top`. This
         // turn is built without a runtime thread, so the badge is present but hidden.
-        // T1/R2: the badge and the state word are ONE identity line (`.tile-identity`),
-        // so the header's right edge is free for the Delete control.
+        // R3: the identity line is the badge alone and the state word closes the
+        // measurement line, so the header's right edge is free for the Delete control.
         expect([...(rootSelect?.children ?? [])].map((child) => child.className)).toEqual([
             'tile-identity',
             'tile-agent',
@@ -1308,23 +1308,23 @@ describe('invocation thread entries', () => {
         expect(rootSelect?.querySelector('.tile-agent')?.textContent).toBe('WR1');
         expect([...(rootSelect?.querySelector('.tile-top')?.children ?? [])].map((child) => child.className)).toEqual([
             'tile-elapsed',
-            'tile-tokens'
+            'tile-tokens',
+            'tile-status'
         ]);
         expect(
             [...(rootSelect?.querySelector('.tile-identity')?.children ?? [])].map((child) => child.className)
-        ).toEqual(['tile-thread', 'tile-status']);
+        ).toEqual(['tile-thread']);
 
         const childSelect = threadRows(turn)[0].querySelector<HTMLElement>('.thread-select');
         expect([...(childSelect?.children ?? [])].map((child) => child.className)).toEqual([
             'thread-name',
-            'thread-status',
             'thread-preview',
             'thread-top'
         ]);
         expect(childSelect?.querySelector('.thread-name')?.textContent).toBe('HR1');
         expect(
             [...(childSelect?.querySelector('.thread-top')?.children ?? [])].map((child) => child.className)
-        ).toEqual(['thread-elapsed', 'thread-tokens']);
+        ).toEqual(['thread-elapsed', 'thread-tokens', 'thread-status']);
 
         // F3: the code stays first and correct after the projection is rebuilt.
         turn.merge({
@@ -1340,14 +1340,17 @@ describe('invocation thread entries', () => {
         });
 
         // R1: the header order survives the rebuild — the identity line leads (the
-        // (hidden) thread badge and the state word, T1/R2), then the agent code;
-        // identity stays left of the measurements.
+        // (hidden) thread badge, R3), then the agent code; identity stays left of the
+        // measurements, and the state word stays at the end of the measurement line.
         expect(
             [...(turn.element.querySelector('.tile-select')?.children ?? [])].map((child) => child.className)
         ).toEqual(['tile-identity', 'tile-agent', 'tile-top', 'tile-prompt', 'tile-meta']);
         expect(
             [...(turn.element.querySelectorAll('.tile-identity > *') ?? [])].map((child) => child.className)
-        ).toEqual(['tile-thread', 'tile-status']);
+        ).toEqual(['tile-thread']);
+        expect(
+            [...(turn.element.querySelectorAll('.tile-top > *') ?? [])].map((child) => child.className)
+        ).toEqual(['tile-elapsed', 'tile-tokens', 'tile-status']);
         expect(turn.element.querySelector('.tile-agent')?.textContent).toBe('WR1');
     });
 

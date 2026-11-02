@@ -55,10 +55,10 @@
 //   - every `visibility: 'core'` tool, and
 //   - every searchable tool that toolRequest has enabled so far.
 //
-// Core vs searchable (R18): the everyday file tools (read, fileWrite,
-// edit, fileGlob) carry `visibility: 'core'` in the preset catalogue, and a
+// Core vs searchable (R18): the everyday file tools (read, write,
+// edit, glob, grep) carry `visibility: 'core'` in the preset catalogue, and a
 // configured search is core too, so they are declared up front. The rest of the
-// preset catalogue — fileList, syntaxCheck, shell, gitDiff, the app tools —
+// preset catalogue — fileList, syntax, shell, gitDiff, the app tools —
 // stays searchable. "core" is only a declaration classification: it does NOT make
 // the tool session-bound. The harness-owned tools below are the session-bound set,
 // and the server gates only those on a sessionId.
@@ -230,7 +230,7 @@
 // trusted ctx.run (textSummarize) still works at depth 2.
 //
 // The bundled preset catalogue (./tools) is preloaded into the registry by
-// default, so a new harness gets read/fileWrite/edit/fileGlob as declared
+// default, so a new harness gets read/write/edit/glob/grep as declared
 // core tools and can discover shell/… without the caller importing anything.
 // The searchable presets cost no context until discovered. `presets: false` opts
 // out.
@@ -7485,12 +7485,13 @@ export type { ToolUiExtraction } from './core';
 export { openAICompatible, listModels, ModelListError } from './transport';
 export type { ModelListConfiguration, ModelListErrorKind } from './transport';
 export {
-    syntaxCheck,
+    syntax,
     read,
-    fileWrite,
+    write,
     edit,
     fileList,
-    fileGlob,
+    glob,
+    grep,
     shell,
     gitDiff,
     createWebSearchTool,
@@ -7516,11 +7517,11 @@ export type {
     FileEditResult,
     FileEditResultEntry,
     FileListParameters,
-    FileGlobFilesResult,
-    FileGlobMatch,
-    FileGlobMatchesResult,
     FileGlobParameters,
     FileGlobResult,
+    FileGrepMatch,
+    FileGrepParameters,
+    FileGrepResult,
     GitDiffParameters,
     GitDiffResult,
     CommandRunResult

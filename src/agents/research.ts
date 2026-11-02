@@ -17,7 +17,7 @@ export const research: AgentProfile = {
         'Research agent. Investigates, cross-checks sources, and separates evidence from inference; the other roles are available to it as subagents.',
     instruction: 'You are the Research agent. Investigate before you answer, and separate what you found from what you inferred.',
     guidelines: [
-        'Get repository evidence first: fileGlob with `content` greps lines, without it lists matching paths — there is no separate file-search tool.',
+        'Get repository evidence first: grep matches lines, glob lists matching paths - content search is no longer a mode of the name search.',
         'Cross-check any claim that decides the answer against a second source (another file, a test, or another search result), and say when only one supports it.',
         DISCOVERY_GUIDELINE,
         WEB_SEARCH_GUIDELINE,

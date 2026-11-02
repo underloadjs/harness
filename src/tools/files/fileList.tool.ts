@@ -64,10 +64,10 @@
 // This implementation accepts that shape and also keeps accepting the legacy
 // string/array form so direct callers and existing tests do not need a flag day.
 //
-// WHAT IS DELIBERATELY UNCHANGED (and distinct from fileGlob)
-// -----------------------------------------------------------
+// WHAT IS DELIBERATELY UNCHANGED (and distinct from glob)
+// -------------------------------------------------------
 //   - nonrecursive: only the immediate entries of each directory. Recursion is
-//     fileGlob's job (`fileGlob({ patterns: ['**'] })`); this tool never walks.
+//     glob's job (`glob({ patterns: ['**'] })`); this tool never walks.
 //   - directories end with "/" so they are distinguishable from files.
 //   - "." contributes no prefix, so the default `paths: ['.']` returns bare entry
 //     names.
@@ -154,7 +154,7 @@ type FileListRequest = {
 };
 
 // Posix separators in every result, on every platform: the model should not have
-// to care which OS the harness runs on. Same convention as fileGlob.
+// to care which OS the harness runs on. Same convention as glob.
 const toPosixPath = (value: string): string => value.split(sep).join('/');
 
 // Code-point comparison (see the ORDERING note above). Kept local rather than

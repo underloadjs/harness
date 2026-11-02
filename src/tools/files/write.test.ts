@@ -1,4 +1,4 @@
-// fileWrite — the batched write contract (T14).
+// write — the batched write contract (T14).
 //
 // What this pins:
 //   - ONE call writes several files and returns an ordered [{ path, bytes }]
@@ -28,7 +28,7 @@ import {
 import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { toolParameterKey } from '../../core';
-import { fileWrite } from './fileWrite.tool';
+import { write } from './write.tool';
 
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../../Temp', import.meta.url));
 
@@ -43,12 +43,12 @@ afterAll(async () => {
     await rm(workdir, { recursive: true, force: true });
 });
 
-describe('fileWrite', () => {
+describe('write', () => {
     it('writes several files in one call, creating parents, and reports exact bytes', async () => {
         const first = join(workdir, 'batch', 'one.txt');
         const second = join(workdir, 'batch', 'deep', 'two.md');
 
-        const result = await fileWrite([
+        const result = await write([
             { path: first, content: 'one\n' },
             { path: second, content: 'héllo' }
         ]);
@@ -67,12 +67,12 @@ describe('fileWrite', () => {
         const target = join(workdir, 'overwrite.txt');
         await writeTextFile(target, 'first', 'utf8');
 
-        await expect(fileWrite([{ path: target, content: 'second' }])).resolves.toEqual([
+        await expect(write([{ path: target, content: 'second' }])).resolves.toEqual([
             { path: target, bytes: 6 }
         ]);
         await expect(readTextFile(target, 'utf8')).resolves.toBe('second');
 
-        await expect(fileWrite([{ path: target, content: '' }])).resolves.toEqual([
+        await expect(write([{ path: target, content: '' }])).resolves.toEqual([
             { path: target, bytes: 0 }
         ]);
         await expect(readTextFile(target, 'utf8')).resolves.toBe('');
@@ -83,7 +83,7 @@ describe('fileWrite', () => {
         process.chdir(workdir);
 
         try {
-            await expect(fileWrite([{ path: 'relative.txt', content: 'x' }])).resolves.toEqual([
+            await expect(write([{ path: 'relative.txt', content: 'x' }])).resolves.toEqual([
                 { path: resolve('relative.txt'), bytes: 1 }
             ]);
             await expect(readTextFile(resolve('relative.txt'), 'utf8')).resolves.toBe('x');
@@ -96,11 +96,11 @@ describe('fileWrite', () => {
         const first = join(workdir, 'preflight', 'first.txt');
 
         await expect(
-            fileWrite([
+            write([
                 { path: first, content: 'should not exist' },
                 { path: '', content: 'x' }
             ])
-        ).rejects.toThrow('fileWrite files require a non-empty "path" string.');
+        ).rejects.toThrow('write files require a non-empty "path" string.');
 
         // Preflight means the valid first entry was never written.
         await expect(readTextFile(first, 'utf8')).rejects.toThrow();
@@ -110,12 +110,12 @@ describe('fileWrite', () => {
         const target = join(workdir, 'duplicate.txt');
 
         await expect(
-            fileWrite([
+            write([
                 { path: target, content: 'one' },
                 { path: join(workdir, '.', 'duplicate.txt'), content: 'two' }
             ])
         ).rejects.toThrow(
-            `fileWrite received the same target path twice (${target}); write each file once per call.`
+            `write received the same target path twice (${target}); write each file once per call.`
         );
 
         // Nothing was written by the rejected batch.
@@ -134,12 +134,12 @@ describe('fileWrite', () => {
 
         if (process.platform === 'win32') {
             await expect(
-                fileWrite([
+                write([
                     { path: lower, content: 'one' },
                     { path: upper, content: 'two' }
                 ])
             ).rejects.toThrow(
-                `fileWrite received the same target path twice (${upper}); write each file once per call.`
+                `write received the same target path twice (${upper}); write each file once per call.`
             );
 
             // Preflight means the first entry never ran: the file keeps its text.
@@ -149,7 +149,7 @@ describe('fileWrite', () => {
 
         // Linux: two distinct files, so both are written and both are reported.
         await expect(
-            fileWrite([
+            write([
                 { path: lower, content: 'one' },
                 { path: upper, content: 'two' }
             ])
@@ -169,12 +169,12 @@ describe('fileWrite', () => {
         const dotted = join(workdir, 'fresh', '.', 'new.txt');
 
         await expect(
-            fileWrite([
+            write([
                 { path: plain, content: 'one' },
                 { path: dotted, content: 'two' }
             ])
         ).rejects.toThrow(
-            `fileWrite received the same target path twice (${dotted}); write each file once per call.`
+            `write received the same target path twice (${dotted}); write each file once per call.`
         );
 
         await expect(readTextFile(plain, 'utf8')).rejects.toThrow();
@@ -201,32 +201,32 @@ describe('fileWrite', () => {
         const throughLink = join(alias, 'target.txt');
 
         await expect(
-            fileWrite([
+            write([
                 { path: real, content: 'one' },
                 { path: throughLink, content: 'two' }
             ])
         ).rejects.toThrow(
-            `fileWrite received the same target path twice (${throughLink}); write each file once per call.`
+            `write received the same target path twice (${throughLink}); write each file once per call.`
         );
 
         await expect(readTextFile(real, 'utf8')).resolves.toBe('original');
     });
 
     it('rejects an empty array, a non-array, and malformed entries', async () => {
-        await expect(fileWrite([])).rejects.toThrow(
-            'fileWrite received an empty files array; pass at least one entry.'
+        await expect(write([])).rejects.toThrow(
+            'write received an empty files array; pass at least one entry.'
         );
-        await expect(fileWrite('a.txt' as never)).rejects.toThrow(
-            'fileWrite expects an array of { path, content } entries, e.g. [{"path":"a.txt","content":"hi"}].'
+        await expect(write('a.txt' as never)).rejects.toThrow(
+            'write expects an array of { path, content } entries, e.g. [{"path":"a.txt","content":"hi"}].'
         );
-        await expect(fileWrite([null] as never)).rejects.toThrow(
-            'fileWrite files must be objects with "path" and "content" strings.'
+        await expect(write([null] as never)).rejects.toThrow(
+            'write files must be objects with "path" and "content" strings.'
         );
-        await expect(fileWrite([{ path: 'a.txt' }] as never)).rejects.toThrow(
-            'fileWrite files require a "content" string.'
+        await expect(write([{ path: 'a.txt' }] as never)).rejects.toThrow(
+            'write files require a "content" string.'
         );
-        await expect(fileWrite([{ path: 'a\u0000b', content: 'x' }])).rejects.toThrow(
-            'fileWrite paths must not contain NUL characters.'
+        await expect(write([{ path: 'a\u0000b', content: 'x' }])).rejects.toThrow(
+            'write paths must not contain NUL characters.'
         );
     });
 
@@ -238,12 +238,12 @@ describe('fileWrite', () => {
         const rejected = join(workdir, 'nul', 'second.txt');
 
         await expect(
-            fileWrite([
+            write([
                 { path: untouched, content: 'fine' },
                 { path: rejected, content: 'a\u0000b' }
             ])
         ).rejects.toThrow(
-            `fileWrite content must not contain NUL characters (${rejected}): the file would be unreadable by read, which rejects binary content.`
+            `write content must not contain NUL characters (${rejected}): the file would be unreadable by read, which rejects binary content.`
         );
 
         // Proof that the rejection happened in preflight, not mid-batch: the valid
@@ -263,13 +263,13 @@ describe('fileWrite', () => {
         const failing = join(blocker, 'child.txt');
 
         await expect(
-            fileWrite([
+            write([
                 { path: completed, content: 'written' },
                 { path: failing, content: 'never' }
             ])
         ).rejects.toThrow(
             new RegExp(
-                `^fileWrite failed on ${escapeRegExp(failing)}: .* Writes already completed: ${escapeRegExp(
+                `^write failed on ${escapeRegExp(failing)}: .* Writes already completed: ${escapeRegExp(
                     completed
                 )}\\. No rollback was performed\\.$`
             )
@@ -280,7 +280,7 @@ describe('fileWrite', () => {
     });
 
     it('declares a single "files" array property of { path, content } objects', () => {
-        expect(fileWrite.parameters).toEqual({
+        expect(write.parameters).toEqual({
             type: 'object',
             properties: {
                 files: {
@@ -306,13 +306,13 @@ describe('fileWrite', () => {
             required: ['files'],
             additionalProperties: false
         });
-        expect(toolParameterKey(fileWrite.parameters)).toBe('files');
+        expect(toolParameterKey(write.parameters)).toBe('files');
     });
 
     it('runs through the execute path with the array a harness would pass', async () => {
         const target = join(workdir, 'execute-path.txt');
 
-        await expect(fileWrite.execute({ parameters: [{ path: target, content: 'ok' }] })).resolves.toEqual([
+        await expect(write.execute({ parameters: [{ path: target, content: 'ok' }] })).resolves.toEqual([
             { path: target, bytes: 2 }
         ]);
     });

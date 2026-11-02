@@ -284,24 +284,28 @@ export type HarnessApi = (request: HarnessApiRequest) => Promise<HarnessApiResul
 // see runtime.ts), so answering /harnesses never constructs a harness or a live
 // agent just to learn which tools a preset would register.
 
-// Body fields a client may send. Anything else is a 400: instruction text,
-// provider settings, a model, or a tool list must never be client-supplied.
-// `agentModels` (R9) is the one model-shaped field: a map of selected agent id →
-// model id, validated against the final member set by the registry.
+// Body fields a client may send. Anything else is a 400: a provider setting, a
+// model, or a tool list must never be client-supplied. `agentModels` (R9) is the
+// one model-shaped field — a map of selected agent id → model id — and
+// `agentInstructions` (T3) is the one text-shaped field: a map of selected agent id
+// → instruction OVERRIDE. Both are validated against the final member set by the
+// registry, and neither rewrites the trusted catalogue (src/agents) it overrides.
 const CREATE_HARNESS_FIELDS = [
     'name',
     'title',
     'description',
     'primary',
     'subagents',
-    'agentModels'
+    'agentModels',
+    'agentInstructions'
 ] as const;
 const UPDATE_HARNESS_FIELDS = [
     'title',
     'description',
     'primary',
     'subagents',
-    'agentModels'
+    'agentModels',
+    'agentInstructions'
 ] as const;
 
 // The one live-session mutation a client may send (PATCH /sessions/:id). The
@@ -988,8 +992,9 @@ export const createHarnessApi = ({
                         await readBody<CreateHarnessRequest>()
                     );
 
-                    // Reject instruction/provider/tool fields outright: only a
-                    // trusted agent id is a valid selection.
+                    // Reject provider/tool fields outright: only a trusted agent id
+                    // is a valid selection, and only a model id or an instruction
+                    // override is valid text.
                     requireKnownFields(body, CREATE_HARNESS_FIELDS);
 
                     // Semantic validation (known agents, duplicate ids, reserved
@@ -1006,7 +1011,13 @@ export const createHarnessApi = ({
                         // it knows the final member set and the id bounds.
                         ...(body.agentModels === undefined
                             ? {}
-                            : { agentModels: body.agentModels })
+                            : { agentModels: body.agentModels }),
+                        // Per-agent instruction overrides (T3). Same ownership: the
+                        // registry validates keys against the final members and
+                        // bounds the text, then applies it when it builds the agent.
+                        ...(body.agentInstructions === undefined
+                            ? {}
+                            : { agentInstructions: body.agentInstructions })
                     });
 
                     // R3b: a created harness is durable before the 201. This is a
@@ -1064,7 +1075,13 @@ export const createHarnessApi = ({
                     // members the patch just removed, which the registry drops).
                     ...(body.agentModels === undefined
                         ? {}
-                        : { agentModels: body.agentModels })
+                        : { agentModels: body.agentModels }),
+                    // T3: same replace semantics for the instruction overrides, so
+                    // `{}` is the explicit "run the trusted preset instructions
+                    // again" action the UI offers.
+                    ...(body.agentInstructions === undefined
+                        ? {}
+                        : { agentInstructions: body.agentInstructions })
                 });
 
                 // R3b: persist the patched registry before answering. An existing

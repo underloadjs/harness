@@ -16,8 +16,8 @@
 //
 // WHAT IS IN THE SHARED TOOLBOX (T14 names)
 // -----------------------------------------
-//   - package presets  — src/tools: syntaxCheck, read, fileWrite, edit,
-//                        fileList, fileGlob, shell, gitDiff
+//   - package presets  — src/tools: syntax, read, write, edit,
+//                        fileList, glob, grep, shell, gitDiff
 //                        (lazy proxies, see src/tools/lazy.ts)
 //   - harness tools    — src/server/tools/shared: timeNow, textCount, diceRoll,
 //                        noteSearch, textSummarize (T25: discovered from the files,
@@ -27,8 +27,8 @@
 //                        harness factory registers it only when a key resolves,
 //                        so a keyless host is offline-safe. The global catalogue
 //                        still lists it as `unconfigured`, never fake-callable.
-//   - core tools       - the four everyday file tools (read, fileWrite,
-//                        edit, fileGlob), search when the host configured a
+//   - core tools       - the core file tools (read, write,
+//                        edit, glob, grep), search when the host configured a
 //                        key, and the harness-owned set (toolRegistry, toolRequest,
 //                        toolCreate, todoManage, profileManage, chapterManage,
 //                        locationManage, plus delegate for a preset that
@@ -186,7 +186,7 @@ export const CORE_TOOL_NAMES: readonly string[] = Object.freeze(
 // descriptor metadata: `visibility: 'core'` is what makes a preset declared up
 // front. fileList is deliberately absent from the result because it stays
 // discoverable. There is no fileSearch entry — the approved consolidation is the
-// one fileGlob tool, now core.
+// one glob tool (plus grep for content), now core.
 export const CORE_PRESET_TOOL_NAMES: readonly string[] = Object.freeze(
     PRESET_DESCRIPTORS.filter((descriptor) => descriptor.metadata.visibility === 'core').map(
         (descriptor) => descriptor.metadata.name
@@ -242,14 +242,25 @@ export const providerOf = (settings: RunnerSettings) => ({
 // overridable: the provider, base URL, and credential always come from the
 // session's trusted RunnerSettings. An absent or blank override falls back to the
 // session model, so a map that omits an agent behaves exactly like today.
-export const agentFromProfile = (name: string, settings: RunnerSettings, model?: string): Agent => {
+//
+// `instruction` is the optional per-agent instruction override (T3 editable
+// configuration). It is already-validated harness text (never raw request text
+// here), and `agentInstruction` applies it to the identity sentence only, so the
+// profile's guidelines stay in force. Absent/blank means "the trusted profile",
+// which is why an untouched harness produces byte-identical system messages.
+export const agentFromProfile = (
+    name: string,
+    settings: RunnerSettings,
+    model?: string,
+    instruction?: string
+): Agent => {
     const profile = agentProfile(name);
     const override = model === undefined ? '' : model.trim();
 
     return agent({
         name,
         model: override.length > 0 ? override : settings.model,
-        instruction: agentInstruction(profile),
+        instruction: agentInstruction(profile, instruction),
         provider: providerOf(settings)
     });
 };
@@ -257,15 +268,24 @@ export const agentFromProfile = (name: string, settings: RunnerSettings, model?:
 // Build the agent registry for a selected set. Order is the caller's: primary
 // first, then the allowlist, matching the descriptor's `agents` list. `agentModels`
 // is the validated override map from the harness registry; it is applied per agent
-// so one member can run a different model from its siblings.
+// so one member can run a different model from its siblings. `agentInstructions`
+// (T3) is the parallel instruction override map, applied the same per-agent way.
 export const agentsFromProfiles = (
     names: readonly string[],
     settings: RunnerSettings,
-    agentModels: Readonly<Record<string, string>> = {}
+    agentModels: Readonly<Record<string, string>> = {},
+    agentInstructions: Readonly<Record<string, string>> = {}
 ): Record<string, Agent> => {
     const agents: Record<string, Agent> = {};
 
-    for (const name of names) agents[name] = agentFromProfile(name, settings, agentModels[name]);
+    for (const name of names) {
+        agents[name] = agentFromProfile(
+            name,
+            settings,
+            agentModels[name],
+            agentInstructions[name]
+        );
+    }
 
     return agents;
 };
@@ -275,11 +295,17 @@ export const agentsFromProfiles = (
 // change the agents — the toolbox and the loop budget are identical by
 // construction.
 //
-// The model map is captured by the closure, not read at run time: `update()`
-// builds a NEW factory for the new map, and a session created before that keeps
-// the closure (and therefore the models) it was built with.
+// The model and instruction maps are captured by the closure, not read at run
+// time: `update()` builds a NEW factory for the new maps, and a session created
+// before that keeps the closure (and therefore the models and instructions) it was
+// built with.
 export const createProfiledHarness =
-    (primary: string, subagents: readonly string[], agentModels: Readonly<Record<string, string>> = {}) =>
+    (
+        primary: string,
+        subagents: readonly string[],
+        agentModels: Readonly<Record<string, string>> = {},
+        agentInstructions: Readonly<Record<string, string>> = {}
+    ) =>
     (
         settings: RunnerSettings,
         progress: HarnessProgress,
@@ -287,7 +313,12 @@ export const createProfiledHarness =
     ): Harness =>
         createToolboxHarness(
             {
-                agents: agentsFromProfiles([primary, ...subagents], settings, agentModels),
+                agents: agentsFromProfiles(
+                    [primary, ...subagents],
+                    settings,
+                    agentModels,
+                    agentInstructions
+                ),
                 primary,
                 subagents: [...subagents]
             },

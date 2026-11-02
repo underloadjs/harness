@@ -37,9 +37,9 @@
 // deterministic tone from ui/agent-color.ts (name colour + block outline), so the
 // same agent keeps one colour across the whole transcript.
 //
-// Block anatomy (R1): the main tile and every nested entry share ONE header and body
-// design — a compact one-line header (`agent code · preview · elapsed | tokens
-// status`) that expands into the same body scale, the same native button
+// Block anatomy (R1/R3): the main tile and every nested entry share ONE header and
+// body design — a compact one-line header (`agent code · preview · elapsed | tokens
+// - status`) that expands into the same body scale, the same native button
 // (click/Enter/Space, `aria-expanded`/`aria-controls`) and the same `createBlockMeta`
 // clock/tally implementation. They differ only by depth indentation and by the
 // root's server-supplied timing.
@@ -986,7 +986,7 @@ type ThreadEntry = {
     body: HTMLElement | undefined;
     select: HTMLButtonElement | undefined;
     // Compressed header metadata: the nested counterpart of `.tile-top`
-    // (`elapsed | tokens | status`, R1). The root entry has no header of its own —
+    // (`elapsed | tokens - status`, R1/R3). The root entry has no header of its own —
     // the tile's own `BlockMeta` covers it — so this is undefined there.
     meta: BlockMeta | undefined;
     // The state word inside `.thread-status`. Kept separate so the compact CSS can
@@ -2210,21 +2210,27 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         select.setAttribute('aria-controls', `${id}-body`);
 
         const top = el('span', 'tile-top');
-        // Compact block metadata (R1): the elapsed clock and the token tally. ONE
+        // Compact block metadata (R1/R3): the elapsed clock, the token tally and, LAST,
+        // the state word — ONE measurement line that reads `2.8s | 8,946 - done`. ONE
         // shared implementation (`createBlockMeta`) paints the main tile and every
         // nested entry, so both headers tick, hide and format identically. The
         // elapsed label stays hidden until a real span exists (never "NaN" or a
         // fabricated "0ms"); the tally stays hidden until a request reports usage.
-        // The `|` between them is CSS decoration (styles.css), not part of either
-        // value.
+        // The `|` and the ` - ` are CSS decoration (styles.css), not part of any value,
+        // so every span stays a clean, copy-pastable figure; each separator is dropped
+        // together with the label it follows.
         const blockMeta = createBlockMeta({ elapsed: 'tile-elapsed', tokens: 'tile-tokens' });
-        const badge = el('span', 'tile-status');
-        badge.dataset.state = 'queued';
+        // R3: the state word measures the BLOCK (what it did and how it ended), it is
+        // not part of the conversation's identity, so it closes the measurement line
+        // instead of sitting beside the thread badge. The badge line is then the badge
+        // alone, which is the row the header Delete control is centred on (R4).
         // No decorative dot: the status is TEXT (`tile-status-text`), visible on
         // an expanded tile and clipped — not removed — on a compact row, and the
         // colour lives on the row's border/status word. The compact row is plain.
+        const statusHost = el('span', 'tile-status');
+        statusHost.dataset.state = 'queued';
         const statusText = el('span', 'tile-status-text', STATE_TEXT.queued);
-        badge.append(statusText);
+        statusHost.append(statusText);
 
         const promptPreview = el('span', 'tile-prompt', plainPreview(prompt, 220));
         const meta = el('span', 'tile-meta', 'waiting for the first event');
@@ -2242,22 +2248,23 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // the server assigns the id. The full id stays in `data-thread-id`/`title`.
         const threadBadge = el('span', 'tile-thread');
         threadBadge.hidden = true;
-        // R3: no `#ordinal` span. The metadata cluster is now MEASUREMENTS ONLY
-        // (`elapsed | tokens`); the turn's protocol `index` is bound for
-        // ordering/identity but never displayed.
-        top.append(blockMeta.elapsed, blockMeta.tokens);
-        // T1/R2: the IDENTITY LINE. The persistent-thread badge (`IT3`) leads and the
-        // state word (`done`) sits immediately to its right, because "which
-        // conversation, in what state" is one fact a reader takes in one glance. The
-        // state used to be the right-most item of the measurement cluster; that slot
-        // now belongs to the header's Delete control (`headerAction` below).
-        // ONE wrapper span is what keeps badge + state on a single line in BOTH header
+        // R3: no `#ordinal` span — the turn's protocol `index` is bound for
+        // ordering/identity but never displayed. The line reads, in order, the elapsed
+        // clock, the token tally and the state word (`2.8s | 8,946 - done`); a label
+        // that has nothing honest to report stays hidden and its separator goes with it.
+        top.append(blockMeta.elapsed, blockMeta.tokens, statusHost);
+        // T1/R3: the IDENTITY LINE is the persistent-thread badge (`IT1`) ALONE. The
+        // state word left this line (R3): "which conversation" is identity, "in what
+        // state" is a measurement of this block, and the two now read on separate lines
+        // (`IT1` on top, `2.8s | 8,946 - done` underneath).
+        // ONE wrapper span is still what keeps the badge on a single line in BOTH header
         // layouts: the compact row is a flex ROW (the wrapper is one order-0 item at
         // the head) and the expanded header is a flex COLUMN (the wrapper is its first
-        // line). `styles.css` owns the placement; the DOM order alone already reads
+        // line, which is the line the header Delete control is centred on — R4).
+        // `styles.css` owns the placement; the DOM order alone already reads
         // identity → measurements.
         const identity = el('span', 'tile-identity');
-        identity.append(threadBadge, badge);
+        identity.append(threadBadge);
         // R1: the thread IDENTITY leads the header, exactly like a nested entry's
         // `.thread-name` leads `.thread-select`. It is hidden whenever the turn has no
         // persistent thread, and `.tile-agent` disappears when it would repeat the same
@@ -2323,10 +2330,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const flow = el('div', 'tile-flow');
         body.append(promptBlock, flow);
 
-        // T1/R2: Delete's new home is the HEADER's right edge. `.tile` is
-        // `position: relative` (styles.css), so this wrapper is painted over the
-        // header's first line (the identity line) at the card's right edge. It is a
-        // SIBLING of `.tile-select` because a <button> can never contain another
+        // T1/R4: Delete's home is the HEADER's right edge, centred on the badge line.
+        // `.tile` is `position: relative` (styles.css), so this wrapper is painted over
+        // the header's FIRST line (the `.tile-identity` badge) at the card's right edge.
+        // It is a SIBLING of `.tile-select` because a <button> can never contain another
         // <button> (same reason the session rail wraps its row, main.ts `renderSessions`).
         const headerAction = el('div', 'tile-header-action');
         // T3/R2: the host is created HIDDEN, exactly like the toolbar it pairs with.
@@ -2730,7 +2737,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // The row mirrors the state so the row and the tile never disagree
             // (styles.css keys the row's compact/active treatment off it).
             row.dataset.state = next;
-            badge.dataset.state = next;
+            statusHost.dataset.state = next;
             statusText.textContent = STATE_TEXT[next];
             updateMeta();
         };
@@ -3254,12 +3261,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             select.setAttribute('aria-controls', bodyId);
 
             // R4/R1: the whole collapsed entry is ONE row, with the SAME anatomy as a
-            // compact turn tile — `name · preview · [elapsed | tokens] status`. The
-            // agent code leads (the tile's prompt is its own leading item), the preview
-            // is the single flexible, ellipsised item, and the metadata cluster
-            // (`.thread-top`) is the nested counterpart of `.tile-top`. Both clusters
-            // carry the same two labels from the shared `createBlockMeta`, so a child
-            // block shows its own duration and usage when its events report them.
+            // compact turn tile — `code [kind] · preview · [elapsed | tokens - state]`.
+            // The agent code leads (the tile's prompt is its own leading item), the
+            // preview is the single flexible, ellipsised item, and the measurement line
+            // (`.thread-top`) is the nested counterpart of `.tile-top`. Both lines carry
+            // the same two labels from the shared `createBlockMeta` plus the state word,
+            // so a child block shows its own duration, usage and state the way the root
+            // block does.
             // R8: a nested invocation shows its child CONVERSATION label when the
             // roster already joins this invocation id; only a legacy/threadless
             // block falls back to the allocator (and therefore consumes a number).
@@ -3284,16 +3292,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const blockMeta = createBlockMeta({ elapsed: 'thread-elapsed', tokens: 'thread-tokens' });
             // Status stays TEXT: the word is clipped (not removed) on a compact row,
             // exactly like `.tile-status-text`, and colour only reinforces it.
-            // T1/R2: the word now sits IMMEDIATELY right of the conversation label
-            // (`.thread-name`), mirroring the turn tile's `.tile-identity` line, and
-            // styles.css gives the freed right-edge slot to the header Delete control.
+            // R3: the word closes the MEASUREMENT line (`2.8s | 8,946 - done`), the same
+            // placement the main tile uses; it no longer rides beside `.thread-name`, so
+            // the identity half of the row stays code + kind tag only.
             const status = el('span', 'thread-status');
             status.dataset.state = options.state;
             const statusText = el('span', 'thread-status-text', STATE_TEXT[options.state]);
             status.append(statusText);
 
             const top = el('span', 'thread-top');
-            top.append(blockMeta.elapsed, blockMeta.tokens);
+            top.append(blockMeta.elapsed, blockMeta.tokens, status);
             const preview = el(
                 'span',
                 'thread-preview',
@@ -3301,9 +3309,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     ? 'delegated task'
                     : plainPreview(options.input, 160)
             );
-            // Identity first (label, then state, then the fork/auto marker), the
-            // flexible preview in the middle, the measurement cluster flush right.
-            select.append(name, status, ...(kindTag === undefined ? [] : [kindTag]), preview, top);
+            // Identity first (the conversation code, then the fork/auto marker), the
+            // flexible preview in the middle, and the measurement line — clock, tally,
+            // state word — flush right (R3/R1: one anatomy with the compact tile).
+            select.append(name, ...(kindTag === undefined ? [] : [kindTag]), preview, top);
 
             const body = el('div', 'thread-body');
             body.id = bodyId;

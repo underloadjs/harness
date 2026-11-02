@@ -407,40 +407,48 @@ it('moves focus to the tools toggle when the details dialog is closed by that sw
     expect(document.activeElement).toBe(toggle);
 });
 
-it('keeps the agent cards reachable from the composer button at every width', async () => {
+it('keeps the agent configuration reachable from the composer button at every width', async () => {
     await boot();
 
-    // T5 R11/R12: nothing from the deck sits permanently in the chat chrome any more.
+    // Nothing from the old deck sits permanently in the chat chrome any more.
     expect(document.querySelector('.agent-row')).toBeNull();
     expect(document.querySelector('.agent-summary')).toBeNull();
+    expect(document.querySelector('.agent-control-popover')).toBeNull();
 
-    // The single composer button opens the shared dialog, whose content is the
-    // existing deck. The DIALOG is the disclosure, so the cards start visible
-    // (`data-open` is written by the deck; styles.css pins the always-visible rule).
+    // The single composer button opens the configuration dialog. It is a form, not a
+    // card deck: no `.agent-row-wrap`, no phone summary, no add picker.
     byClass('.agent-control-button', 'button').click();
 
-    const row = byClass('.agent-row', 'div');
-    const wrap = byClass('.agent-row-wrap', 'div');
-    expect(wrap.dataset.open).toBe('true');
+    expect(document.querySelector('.agent-row-wrap')).toBeNull();
+    expect(document.querySelector('.agent-add')).toBeNull();
+    expect(document.querySelector('.agent-main')).toBeNull();
 
-    const summary = byClass('.agent-summary', 'button');
-    expect(summary.getAttribute('aria-controls')).toBe(row.id);
-    expect(summary.querySelector('.agent-summary-label')?.textContent).toBe('Instruct');
-    expect(summary.querySelector('.agent-summary-meta')?.textContent).toBe('1 agent');
-    expect(summary.getAttribute('aria-expanded')).toBe('true');
+    expect(byClass('.agent-dialog-agent-select', 'select').getAttribute('aria-label')).toBe(
+        'Agent to configure'
+    );
+    expect([...byClass('.agent-dialog-agent-select', 'select').options].map((option) => option.value)).toEqual([
+        'instruct'
+    ]);
+    expect(byClass('.agent-dialog-instruction', 'textarea').getAttribute('aria-label')).toBe(
+        'Instruction for Instruct'
+    );
+    expect(byClass('.agent-model-select', 'select').getAttribute('aria-label')).toBe(
+        'Model for Instruct'
+    );
 
-    const primary = byClass('.agent-main', 'button');
-    const model = byClass('.agent-model-select', 'select');
-    const add = byClass('.agent-add', 'button');
-    expect(primary.getAttribute('aria-pressed')).toBe('true');
-    expect(model.getAttribute('aria-label')).toBe('Model for Instruct');
-    expect(add.disabled).toBe(false);
-    // The only agent cannot be removed (the same rule as desktop).
-    expect(byClass('.agent-remove', 'button').disabled).toBe(true);
+    // The only agent is the primary, so it cannot leave the team (the same rule the
+    // desktop deck enforced with a disabled remove button), stated in words.
+    expect(byClass('.agent-dialog-member', 'input').disabled).toBe(true);
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.agent-dialog-field-note')].map((node) => node.textContent)
+    ).toEqual(['The primary agent is always part of the team.']);
 
-    // Closing removes the deck with the modal layer; nothing dead is left behind.
+    // One writer, and it is the action in the footer.
+    expect(document.querySelectorAll('.agent-dialog-apply')).toHaveLength(1);
+
+    // Closing removes the form with the modal layer; nothing dead is left behind.
     byClass('.dialog-close', 'button').click();
-    expect(document.querySelector('.agent-row')).toBeNull();
+    expect(document.querySelector('.agent-dialog')).toBeNull();
 });
 
 it('keeps the create-harness close button plain icon-button (F2)', async () => {

@@ -224,21 +224,39 @@ it('opens the shared agent dialog from the single composer button', async () => 
     expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · Instruct');
     expect(document.querySelector('.agent-control-popover')).toBeNull();
 
-    // R12: the dialog offers a primary chooser, the existing deck and the instructions.
+    // T3: ONE dropdown lists every agent, the selected agent's configuration is
+    // editable, and the bottom-right action is the only writer.
     expect(
-        [...document.querySelectorAll<HTMLElement>('.agent-dialog-primary')].map((entry) => [
-            entry.dataset.agent,
-            entry.textContent,
-            entry.getAttribute('aria-pressed'),
-            entry.disabled
+        [...byClass('.agent-dialog-agent-select', 'select').options].map((option) => [
+            option.value,
+            option.textContent
         ])
     ).toEqual([
-        ['instruct', 'Instruct', 'true', true],
-        ['research', 'Researcher', 'false', false],
-        ['workspace', 'Coder', 'false', false]
+        ['instruct', 'Instruct · primary'],
+        ['research', 'Researcher · team member'],
+        ['workspace', 'Coder · team member']
     ]);
-    expect(document.querySelector('.agent-dialog .agent-row-wrap')).not.toBeNull();
-    expect(document.querySelector('.agent-dialog-instructions')).not.toBeNull();
+
+    // The old primary-button wall and the adopted card deck are gone: no pressed
+    // chooser list, no `.agent-row-wrap`, no read-only instruction section.
+    expect(document.querySelector('.agent-dialog-primary')).toBeNull();
+    expect(document.querySelector('.agent-row-wrap')).toBeNull();
+    expect(document.querySelector('.agent-dialog-instructions')).toBeNull();
+
+    // The configuration shown is the selected agent's, and the instruction is a real
+    // editor seeded with the trusted text (R1: not a read-only block).
+    expect(byClass('.agent-dialog-config', 'div').dataset.agent).toBe('instruct');
+    const instruction = byClass('.agent-dialog-instruction', 'textarea');
+    expect(instruction.getAttribute('aria-label')).toBe('Instruction for Instruct');
+    expect(instruction.value).toBe('Answer directly.');
+    expect(instruction.disabled).toBe(false);
+    expect(byClass('.agent-model-select', 'select').getAttribute('aria-label')).toBe('Model for Instruct');
+
+    // Nothing has been changed, so the action is disabled: it cannot claim a save or a
+    // promotion that the reader never asked for.
+    const apply = byClass('.agent-dialog-apply', 'button');
+    expect(apply.textContent).toBe('Save configuration');
+    expect(apply.disabled).toBe(true);
 
     // R13: Escape dismisses the modal and focus returns to the composer button.
     document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
@@ -283,26 +301,38 @@ it('selects a different primary agent from the dialog and PATCHes the complete t
     await flush();
 
     byClass('.agent-control-button', 'button').click();
-    byClass('.agent-dialog-primary[data-agent="research"]', 'button').click();
+
+    // T3: choosing the agent in the dropdown is a LOCAL view change — nothing is sent,
+    // and the team is untouched. The bottom-right action then performs the promotion
+    // the reader asked for, in the same complete-team PATCH the deck used.
+    const select = byClass('.agent-dialog-agent-select', 'select');
+    select.value = 'research';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(patches).toEqual([]);
+
+    const apply = byClass('.agent-dialog-apply', 'button');
+    expect(apply.textContent).toBe('Save & set primary');
+    expect(apply.disabled).toBe(false);
+    apply.click();
     await flush();
     await flush();
 
     // The existing complete-team PATCH path, not a new endpoint.
     expect(patches[0]).toEqual({ primary: 'research', subagents: ['instruct', 'workspace'] });
 
-    // The open dialog is refreshed in place: title, pressed state and the composer
-    // button all report the promoted agent.
+    // The open dialog is refreshed in place: the header follows the agent being
+    // configured, and every dropdown entry now states the new team truth.
     expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · Researcher');
     expect(document.querySelector('.dialog')).not.toBeNull();
     expect(
-        [...document.querySelectorAll<HTMLElement>('.agent-dialog-primary')].map((entry) => [
-            entry.dataset.agent,
-            entry.getAttribute('aria-pressed')
+        [...byClass('.agent-dialog-agent-select', 'select').options].map((option) => [
+            option.value,
+            option.textContent
         ])
     ).toEqual([
-        ['research', 'true'],
-        ['instruct', 'false'],
-        ['workspace', 'false']
+        ['research', 'Researcher · primary'],
+        ['instruct', 'Instruct · team member'],
+        ['workspace', 'Coder · team member']
     ]);
     expect(byClass('.agent-control-name', 'span').textContent).toBe('Researcher');
     expect(byClass('.agent-control-code', 'span').textContent).toBe('RR');
@@ -355,14 +385,11 @@ it('changes a model from the dialog and keeps the open dialog in sync without dr
 
     byClass('.agent-control-button', 'button').click();
 
-    // The dialog adopts the EXISTING per-agent selects (same options/state as the old
-    // deck), ordered by team membership.
+    // T3: the dialog reuses the EXISTING per-agent option rules (same labels/state),
+    // but shows one agent at a time through the dropdown instead of a select per card.
     const selects = [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
-    expect(selects.map((select) => select.getAttribute('aria-label'))).toEqual([
-        'Model for Instruct',
-        'Model for Researcher',
-        'Model for Coder'
-    ]);
+    expect(selects.map((select) => select.getAttribute('aria-label'))).toEqual(['Model for Instruct']);
+
     const instruct = byClass<HTMLSelectElement>(
         '.agent-model-select[aria-label="Model for Instruct"]',
         'select'
@@ -372,25 +399,36 @@ it('changes a model from the dialog and keeps the open dialog in sync without dr
     instruct.focus();
     instruct.value = 'm3';
     instruct.dispatchEvent(new Event('change', { bubbles: true }));
+
+    // The change is a DRAFT: no request yet, and the action is armed. The reader keeps
+    // their place in the select while they type/choose (no rebuild, no caret loss).
+    expect(patches).toEqual([]);
+    expect(document.activeElement).toBe(instruct);
+    expect(byClass('.agent-dialog-apply', 'button').disabled).toBe(false);
+
+    byClass('.agent-dialog-apply', 'button').click();
     await flush();
     await flush();
 
-    // The complete override map is sent (the server replaces, never merges).
+    // The complete override map is sent (the server replaces, never merges), and only
+    // the model changed: the team is restated unchanged.
     expect(patches[0]).toEqual({
         primary: 'instruct',
         subagents: ['research', 'workspace'],
         agentModels: { instruct: 'm3' }
     });
 
-    // The dialog is still the same modal, shows the new value and has moved focus to
-    // the REPLACEMENT select the reader was operating.
+    // The dialog is still the same modal and shows the saved value. Focus never lands
+    // on <body> after the rebuild: the action is legitimately disabled again (nothing
+    // is pending), so the dialog hands focus to the dropdown that re-orients the form.
     expect(document.querySelectorAll('.dialog')).toHaveLength(1);
     const replaced = byClass<HTMLSelectElement>(
         '.agent-model-select[aria-label="Model for Instruct"]',
         'select'
     );
     expect(replaced.value).toBe('m3');
-    expect(document.activeElement).toBe(replaced);
+    expect(document.activeElement).toBe(byClass('.agent-dialog-agent-select', 'select'));
+    expect(document.activeElement?.tagName).not.toBe('BODY');
 });
 
 it('shows every agent instruction and guideline inside the dialog', async () => {
@@ -420,26 +458,43 @@ it('shows every agent instruction and guideline inside the dialog', async () => 
 
     byClass('.agent-control-button', 'button').click();
 
-    // R12: team members first, then any other catalogue preset; the existing
-    // read-only preset-detail markup is reused (`.agent-detail` / `.agent-instruction`).
+    // T3 R1: the configured agent's instruction is an EDITOR seeded with the trusted
+    // text, and the preset's own words stay available for comparison through the
+    // existing read-only markup (`.agent-detail` / `.agent-instruction`).
+    const box = byClass('.agent-dialog-instruction', 'textarea');
+    expect(box.value).toBe('Answer directly.');
     expect(
-        [...document.querySelectorAll<HTMLElement>('.agent-dialog-instructions .agent-detail-summary')].map(
-            (summary) => summary.textContent
-        )
-    ).toEqual(['Instruct', 'Researcher', 'Coder']);
-    expect(
-        [...document.querySelectorAll<HTMLElement>('.agent-dialog-instructions .agent-instruction')].map(
+        [...document.querySelectorAll<HTMLElement>('.agent-detail .agent-instruction')].map(
             (node) => node.textContent
         )
-    ).toEqual(['Answer directly.', 'Investigate.', 'Write code.']);
+    ).toEqual(['Answer directly.']);
+    // No stored override yet, so there is nothing to revert.
+    expect(document.querySelector('.agent-dialog-revert')).toBeNull();
+
+    // Typing is local. This stub answers ONLY the boot and model requests (it throws
+    // on anything else), so a write here would fail the test by itself.
+    box.value = 'Answer in one sentence.';
+    box.dispatchEvent(new Event('input', { bubbles: true }));
+    expect(byClass('.agent-dialog-apply', 'button').disabled).toBe(false);
+
+    // The dropdown reaches every trusted agent — including one the team does not
+    // select, whose guidelines the preset reference still lists.
+    const select = byClass('.agent-dialog-agent-select', 'select');
+    select.value = 'workspace';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+
+    expect(byClass('.agent-dialog-instruction', 'textarea').value).toBe('Write code.');
     expect(
-        [...document.querySelectorAll<HTMLElement>('.agent-dialog-instructions .agent-guideline')].map(
-            (node) => node.textContent
-        )
+        [...document.querySelectorAll<HTMLElement>('.agent-detail .agent-guideline')].map((node) => node.textContent)
     ).toEqual(['Keep diffs small.']);
+
+    // And the draft the reader typed for Instruct is still there when they go back.
+    select.value = 'instruct';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(byClass('.agent-dialog-instruction', 'textarea').value).toBe('Answer in one sentence.');
 });
 
-it('keeps a saved session’s team locked while models and instructions stay reachable', async () => {
+it('keeps a saved session’s team and instructions locked while models stay reachable', async () => {
     const session = snapshot({ harnessDefinition: descriptor() } as Partial<SessionSnapshot>);
     localStorage.setItem(SESSION_KEY, 's1');
 
@@ -470,40 +525,125 @@ it('keeps a saved session’s team locked while models and instructions stay rea
 
     const button = byClass('.agent-control-button', 'button');
     // The compact button is NEVER disabled: the dialog is still the way to inspect
-    // models and instructions for this conversation.
+    // the configuration and edit this conversation's live models.
     expect(button.disabled).toBe(false);
-    expect(button.title).toBe('The agent team is locked for this conversation.');
+    expect(button.title).toBe(
+        'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.'
+    );
 
     button.click();
 
-    // R12 restriction preserved: team controls are disabled and the REAL reason is
-    // stated in the dialog (not invented, not a dead control).
+    // The restriction is stated in words inside the dialog (never invented, never a
+    // dead control), and it now covers the instruction editor too: a saved
+    // conversation runs the words its agents were built with.
     expect(byClass('.agent-dialog-note', 'p').textContent).toBe(
-        'The agent team is locked for this conversation.'
+        'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.'
     );
-    expect(
-        [...document.querySelectorAll<HTMLButtonElement>('.agent-dialog-primary')].map(
-            (entry) => entry.disabled
-        )
-    ).toEqual([true, true, true]);
-    for (const main of document.querySelectorAll<HTMLButtonElement>('.agent-main')) {
-        expect(main.disabled).toBe(true);
-    }
-    expect(byClass('.agent-add', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-instruction', 'textarea').disabled).toBe(true);
+    expect(byClass('.agent-dialog-instruction', 'textarea').value).toBe('Answer directly.');
+    expect(byClass('.agent-dialog-member', 'input').disabled).toBe(true);
 
-    // R2: the model map is live even in a saved session.
-    const selects = [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
-    expect(selects.map((select) => select.disabled)).toEqual([false, false, false]);
-    expect(selects[0].title).toBe(
+    // The action cannot promote here, and it is disabled until a live model is
+    // drafted — so a disabled button can never claim a promotion this server refuses.
+    const apply = byClass('.agent-dialog-apply', 'button');
+    expect(apply.textContent).toBe('Save configuration');
+    expect(apply.disabled).toBe(true);
+
+    // R2: the model map is live even in a saved session, and the dropdown reaches
+    // every member's configuration.
+    expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
+    expect(byClass('.agent-model-select', 'select').title).toBe(
         'Model for Instruct. Applies to the next request in this session.'
     );
 
-    // Instructions are read-only data, so they never depend on the team lock.
-    expect(
-        [...document.querySelectorAll<HTMLElement>('.agent-dialog-instructions .agent-instruction')].map(
-            (node) => node.textContent
-        )
-    ).toEqual(['Answer directly.', 'Investigate.', 'Write code.']);
+    const select = byClass('.agent-dialog-agent-select', 'select');
+    select.value = 'research';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(byClass('.agent-model-select', 'select').title).toBe(
+        'Model for Researcher. Applies to the next request in this session.'
+    );
+});
+
+// R2 (T3): the whole point of the draft layer. Every dismissal path must discard the
+// edits, and nothing may reach the server until the reader presses the action.
+it('discards every draft on close, overlay and Escape without a single request', async () => {
+    let current = descriptor();
+    const patches: unknown[] = [];
+
+    vi.stubGlobal(
+        'fetch',
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            const url = String(input);
+
+            if (url === '/api') {
+                return json({
+                    rootPath: '/api',
+                    presets: [current],
+                    tools: [],
+                    defaults,
+                    sessions: [],
+                    agents
+                });
+            }
+            if (url === '/api/models') return json({ models: ['m1', 'm2'] });
+
+            if (url === '/api/harnesses/instruct' && init?.method === 'PATCH') {
+                const patched = patchHarness(current, JSON.parse(String(init.body)));
+                patches.push(patched.body);
+                current = patched.harness;
+                return json({ harness: current });
+            }
+
+            throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
+        })
+    );
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    for (const dismiss of ['close', 'overlay', 'escape'] as const) {
+        byClass('.agent-control-button', 'button').click();
+
+        // A draft on a NON-primary agent: an instruction, a model and a membership
+        // change, i.e. one edit of every kind the dialog owns.
+        const select = byClass('.agent-dialog-agent-select', 'select');
+        select.value = 'research';
+        select.dispatchEvent(new Event('change', { bubbles: true }));
+
+        const box = byClass('.agent-dialog-instruction', 'textarea');
+        box.value = 'Never sent.';
+        box.dispatchEvent(new Event('input', { bubbles: true }));
+
+        const model = byClass('.agent-model-select', 'select');
+        model.value = 'm2';
+        model.dispatchEvent(new Event('change', { bubbles: true }));
+
+        const member = byClass('.agent-dialog-member', 'input');
+        member.checked = true;
+        member.dispatchEvent(new Event('change', { bubbles: true }));
+
+        expect(patches).toEqual([]);
+        expect(byClass('.agent-dialog-apply', 'button').disabled).toBe(false);
+
+        if (dismiss === 'close') byClass('.dialog-close', 'button').click();
+        else if (dismiss === 'overlay') byClass('.dialog-overlay', 'div').click();
+        else document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }));
+
+        expect(document.querySelector('.dialog')).toBeNull();
+        // The dismissal itself wrote nothing.
+        expect(patches).toEqual([]);
+
+        // Re-opening shows the SERVER's configuration, not the dropped draft.
+        byClass('.agent-control-button', 'button').click();
+        expect(byClass('.agent-dialog-config', 'div').dataset.agent).toBe('instruct');
+        expect(byClass('.agent-dialog-instruction', 'textarea').value).toBe('Answer directly.');
+        expect(byClass('.agent-model-select', 'select').value).toBe('');
+        expect(byClass('.agent-dialog-apply', 'button').disabled).toBe(true);
+
+        byClass('.dialog-close', 'button').click();
+        expect(patches).toEqual([]);
+    }
 });
 
 it('keeps the open dialog and the focused control across a live snapshot rebuild', async () => {

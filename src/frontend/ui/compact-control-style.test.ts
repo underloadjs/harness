@@ -1,9 +1,11 @@
-// Composer agent control + shared dialog — CSS contract (T5 R9/R10/R11/R12).
+// Composer agent control + agent configuration dialog — CSS contract (T5 R9/R10/R11/
+// R12, T3 editable configuration).
 //
 // jsdom does not evaluate media queries, so the small-width behaviour is pinned here
 // against the stylesheet source: the single agent button collapses from the full
-// title to the two-letter thread code, and the deck inside the dialog is always
-// visible (the modal itself is the disclosure).
+// title to the two-letter thread code. The dialog's own rules live in
+// ui/agent-dialog.css (imported by styles.css), and the contract below pins the
+// dropdown form and the bottom-right single-writer action there.
 //
 // The dialog sizing fix lives in ui/dialog.css and is deliberately NOT asserted here;
 // dialog.test.ts owns it.
@@ -19,23 +21,29 @@ if (stylesheet === undefined) throw new Error('styles.css not found');
 
 const css = readFileSync(stylesheet, 'utf8');
 
-// Comments NAME old selectors, so contract reads use the stripped stylesheet.
+// T3: the agent dialog's own body rules live in the stylesheet its module imports
+// (src/frontend/ui/agent-dialog.css), so the dialog contract below reads that file.
+// Everything else in this suite still reads styles.css.
+const agentDialogCss = readFileSync(resolve(process.cwd(), 'src/frontend/ui/agent-dialog.css'), 'utf8');
+
+// Comments NAME old selectors, so every contract read below uses a stripped copy.
 const rules = css.replace(/\/\*[\s\S]*?\*\//g, '');
+const agentDialogRules = agentDialogCss.replace(/\/\*[\s\S]*?\*\//g, '');
 
 // Brace-matched slice so a nested @media body is never cut at its first `}`.
-const blockOf = (selector: string): string => {
-    const start = rules.indexOf(selector);
+const blockOf = (selector: string, source: string = rules): string => {
+    const start = source.indexOf(selector);
     if (start < 0) throw new Error(`missing selector ${selector}`);
 
-    const open = rules.indexOf('{', start);
+    const open = source.indexOf('{', start);
     if (open < 0) throw new Error(`missing body for ${selector}`);
 
     let depth = 0;
-    for (let index = open; index < rules.length; index += 1) {
-        if (rules[index] === '{') depth += 1;
-        if (rules[index] === '}') {
+    for (let index = open; index < source.length; index += 1) {
+        if (source[index] === '{') depth += 1;
+        if (source[index] === '}') {
             depth -= 1;
-            if (depth === 0) return rules.slice(open + 1, index);
+            if (depth === 0) return source.slice(open + 1, index);
         }
     }
 
@@ -93,20 +101,52 @@ it('collapses the agent button to its thread code at small widths and drops the 
     expect(blockOf('.agent-control-code {')).toContain('display: none');
 });
 
-it('keeps the dialog deck visible and hides its redundant phone summary', () => {
-    // The dialog IS the disclosure, so the deck's own summary has nothing to collapse
-    // and the cards stay visible at every width (the modal body scrolls instead).
-    expect(blockOf('.agent-dialog .agent-summary {')).toContain('display: none');
-    expect(blockOf(".agent-dialog .agent-row-wrap:not([data-open='true']) .agent-row {")).toContain(
-        'display: flex'
-    );
+it('imports the agent dialog stylesheet and keeps the single-writer action bottom-right', () => {
+    // T3: the dialog body moved to its own stylesheet, imported from the app sheet
+    // (Vite inlines it). Without the integration line the modal would be unstyled.
+    expect(rules).toContain("@import './ui/agent-dialog.css';");
 
-    // The primary chooser is a horizontal, wrapping row of pressed buttons.
-    const list = blockOf('.agent-dialog-primary-list {');
-    expect(list).toContain('display: flex');
-    expect(list).toContain('flex-wrap: wrap');
-    expect(blockOf(".agent-dialog-primary[aria-pressed='true'] {")).toContain(
+    // The old deck-inside-dialog rules are gone from the app sheet: the dialog is a
+    // form now, not a primary button wall plus an overlapping card deck.
+    expect(rules).not.toContain('.agent-dialog-primary-list {');
+    expect(rules).not.toContain('.agent-dialog .agent-summary {');
+    expect(rules).not.toContain('.agent-dialog-instructions');
+
+    // The dropdown is a full-width field: every advertised agent fits in one control.
+    expect(blockOf('.agent-dialog-agent-select {', agentDialogRules)).toContain('width: 100%');
+
+    // The instruction is a real editor (multi-line, resizable), not a read-only block.
+    const editor = blockOf('.agent-dialog-instruction {', agentDialogRules);
+    expect(editor).toContain('min-height: 128px');
+    expect(editor).toContain('resize: vertical');
+
+    // Footer: the note takes the remaining width and the action is pinned to the far
+    // right, which is what makes "bottom right" the reading order rather than a guess.
+    const footer = blockOf('.agent-dialog-footer {', agentDialogRules);
+    expect(footer).toContain('display: flex');
+    expect(footer).toContain('justify-content: space-between');
+    expect(footer).toContain('border-top: 1px solid var(--border)');
+
+    // T5 REGRESSION (measured in real Chrome, both idle and refused states): the
+    // refusal line always exists in the DOM and its `flex-basis: 100%` forces a wrap,
+    // so the action becomes the ONLY item on its own flex line. `space-between` then
+    // parks a lone item at the START of the line, which put the save button
+    // bottom-LEFT. `margin-left: auto` is the correction; deleting it must fail here.
+    const action = blockOf('.agent-dialog-apply {', agentDialogRules);
+    expect(action).toContain('flex: 0 0 auto');
+    expect(action).toContain('margin-left: auto');
+    expect(action).toContain('white-space: nowrap');
+    expect(blockOf('.agent-dialog-footer-note {', agentDialogRules)).toContain('flex: 1 1 240px');
+
+    // A refused save is painted in the palette's error colour, beside the action.
+    // `flex: 1 1 100%` is the other half of the contract above: it is what makes the
+    // refusal own a full line, so the note and the action cannot collide with it.
+    const error = blockOf('.agent-dialog-error {', agentDialogRules);
+    expect(error).toContain('flex: 1 1 100%');
+    expect(error).toContain('color: var(--danger)');
+
+    // The team rows carry the live activity state (ui/activity.ts paints them).
+    expect(blockOf(".agent-dialog-agent[data-activity='active'] {", agentDialogRules)).toContain(
         'border-color: var(--accent)'
     );
-    expect(blockOf('.agent-dialog-primary:disabled {')).toContain('cursor: default');
 });

@@ -11,7 +11,7 @@
 // team/result registry (or need that session's owner/fork configuration). Adding
 // them there would make the CLI promise a callable tool it cannot run.
 //
-// R18: the four core FILE tools (read/fileWrite/edit/fileGlob) and a
+// R18: the core FILE tools (read/write/edit/glob/grep) and a
 // configured search are also `visibility: 'core'`, but they are NOT listed
 // here and NOT sessionBound: they have real standalone implementations, so they
 // stay in createToolCatalogue()'s direct-call path and run without a sessionId.

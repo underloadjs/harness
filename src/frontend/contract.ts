@@ -196,6 +196,51 @@ export const modelsForMembers = (
     return result;
 };
 
+// Per-agent INSTRUCTION overrides (`agentInstructions`), read defensively.
+//
+// T3 editable configuration. Exactly parallel to `agentModelsOf`: the map is
+// optional and present only when a harness actually overrides something
+// (protocol.ts HarnessDescriptor.agentInstructions), a member absent from it runs
+// the trusted preset instruction from `GET /agents`, and a blank value means "no
+// override". The UI therefore renders an agent's REAL instruction as
+// `agentInstructionsOf(descriptor)[name] ?? descriptor.instruction` — never an
+// empty box — and the diff between the two is what the configuration dialog offers
+// to revert.
+export const agentInstructionsOf = (source: {
+    agentInstructions?: Record<string, string>;
+}): Record<string, string> => {
+    const map = source.agentInstructions;
+    if (map === null || typeof map !== 'object' || Array.isArray(map)) return {};
+
+    const result: Record<string, string> = {};
+    for (const [name, instruction] of Object.entries(map)) {
+        // A blank value is not an override; the server never stores one either.
+        if (typeof instruction === 'string' && instruction.trim().length > 0) {
+            result[name] = instruction;
+        }
+    }
+
+    return result;
+};
+
+// Filter an instruction map down to a member list, preserving member order — the
+// instruction sibling of `modelsForMembers`, for the same reason: a PATCH sends the
+// COMPLETE map because the server replaces it.
+export const instructionsForMembers = (
+    instructions: Readonly<Record<string, string>>,
+    members: readonly string[]
+): Record<string, string> => {
+    const result: Record<string, string> = {};
+    for (const member of members) {
+        const instruction = instructions[member];
+        if (typeof instruction === 'string' && instruction.trim().length > 0) {
+            result[member] = instruction;
+        }
+    }
+
+    return result;
+};
+
 // A session may freeze the definition it started with (`harnessDefinition`). The
 // frontend renders that descriptor, never the live one, so an edited harness
 // cannot rewrite a conversation that is already on screen.

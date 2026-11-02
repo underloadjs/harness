@@ -254,15 +254,21 @@ it('keeps an idle submission INSIDE the open RR2 conversation', async () => {
             row.classList.contains('is-continuation')
         )
     ).toEqual([false, true]);
-    // R1: the thread identity leads the header of the card. T1/R2: the identity LINE
-    // (`.tile-identity` = badge + state word) is the header's first child, so the
-    // state reads immediately to the right of the badge instead of at the row's edge.
+    // R1: the thread identity leads the header of the card. R3/R4: the identity LINE
+    // (`.tile-identity`) is the header's first child and holds the badge ALONE — the
+    // state word now closes the measurement line, which is also what frees the header's
+    // right edge for the Delete control the slot is centred on.
     expect(roots[0].querySelector('.tile-select')?.firstElementChild?.className).toBe('tile-identity');
-    const firstIdentity = roots[0].querySelector('.tile-select')?.firstElementChild as HTMLElement | null;
-    expect([...(firstIdentity?.children ?? [])].map((node) => node.className)).toEqual([
-        'tile-thread',
-        'tile-status'
-    ]);
+    const firstSelect = roots[0].querySelector('.tile-select') as HTMLElement | null;
+    const firstIdentity = firstSelect?.firstElementChild as HTMLElement | null;
+    expect([...(firstIdentity?.children ?? [])].map((node) => node.className)).toEqual(['tile-thread']);
+    // Scoped to the CARD HEADER's own measurement line (the card holds one exchange per
+    // run, and every run has its own line).
+    expect(
+        [...(firstSelect?.querySelectorAll<HTMLElement>(':scope > .tile-top > *') ?? [])].map(
+            (node) => node.className
+        )
+    ).toEqual(['tile-elapsed', 'tile-tokens', 'tile-status']);
     expect([...roots[0].querySelectorAll<HTMLElement>('.agent-text')].map((node) => node.textContent)).toEqual([
         'first answer\n',
         'second answer\n'

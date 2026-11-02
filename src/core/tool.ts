@@ -47,7 +47,7 @@
 // That is what makes `read(['package.json'])` natural for a human and
 // `read_file({ "path": "package.json" })` natural for a model — both reach the
 // implementation as the string. The harness unwraps using `toolParameterKey()`.
-// A multi-property tool such as syntaxCheck receives the whole argument object.
+// A multi-property tool such as syntax receives the whole argument object.
 //
 // Cross-references:
 //   - ../types        — Tool, ToolConfiguration, ToolContext, ToolVisibility

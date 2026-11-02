@@ -90,8 +90,17 @@ export const isAgentProfileName = (name: string): name is AgentProfileName =>
 // documentation that can drift from it.
 //
 // Empty guidelines produce only the instruction, so a minimal profile is valid.
-export const agentInstruction = (profile: AgentProfile): string[] => {
-    const instruction = profile.instruction.trim();
+//
+// T3 EDITABLE CONFIGURATION — `instructionOverride` is the harness-level
+// per-agent instruction the operator saved (`HarnessPreset.agentInstructions`,
+// see ../server/harnesses/types.ts). It replaces ONLY the identity sentence:
+// `guidelines` stay trusted catalogue policy lines, so a saved configuration can
+// retune an agent's role without letting a stored document silently drop the
+// shared behavioural rules. An absent or blank override is "no override", which
+// keeps the trusted text byte-identical — the shipped profiles remain the default.
+export const agentInstruction = (profile: AgentProfile, instructionOverride?: string): string[] => {
+    const custom = instructionOverride === undefined ? '' : instructionOverride.trim();
+    const instruction = custom.length > 0 ? custom : profile.instruction.trim();
     const guidelines = profile.guidelines.map((guideline) => guideline.trim()).filter((line) => line.length > 0);
 
     if (guidelines.length === 0) return [instruction];

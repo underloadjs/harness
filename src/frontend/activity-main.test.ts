@@ -69,22 +69,27 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(selector: string, tag: K
     return found;
 };
 
-// R11 (T5): the agent deck now lives inside the shared agent dialog, so deck reads
-// open it from the composer's single agent button (a no-op once open; chrome
-// rebuilds refresh the content in place and keep it painted from the live set).
+// T3: the agent dialog lists the team as plain rows (`.agent-dialog-agent`), which is
+// where the live ring paints now that the overlapping card deck is not part of the
+// modal. Opening the dialog is still required: it is the only host of these rows, and
+// a chrome rebuild keeps them painted from the live set.
 const openDeck = (): void => {
     if (document.querySelector('.dialog') !== null) return;
     byClass('.agent-control-button', 'button').click();
 };
 
-// `data-activity` and `aria-busy` per tile, in member order.
+// `data-activity` and `aria-busy` per team row, in member order.
 const tileActivity = (): (string | undefined)[] => {
     openDeck();
-    return [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.dataset.activity);
+    return [...document.querySelectorAll<HTMLElement>('.agent-dialog-agent')].map(
+        (row) => row.dataset.activity
+    );
 };
 const tileBusy = (): (string | null)[] => {
     openDeck();
-    return [...document.querySelectorAll<HTMLElement>('.agent-tile')].map((tile) => tile.getAttribute('aria-busy'));
+    return [...document.querySelectorAll<HTMLElement>('.agent-dialog-agent')].map((row) =>
+        row.getAttribute('aria-busy')
+    );
 };
 
 type Controlled = {

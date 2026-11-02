@@ -1945,9 +1945,9 @@ resource paths below `/v1/harness` and adds a bootstrap document at its root; se
 | Endpoint | Purpose |
 |---|---|
 | `GET /api/health` | Liveness and session count |
-| `GET /api/harnesses` | Harness descriptors (`primary`, `subagents`, `coreTools`, `agentModels?`, `builtin`, `editable`), provider defaults, and the trusted `agents` list. Every entry is an editable application copy; `editable` is always `true` (compatibility only) |
-| `POST /api/harnesses` | Create a harness from trusted agent ids — body `{ name, title?, description?, primary, subagents?, agentModels? }` → `201 { harness }` |
-| `PATCH /api/harnesses/:name` | Change any harness — body `{ title?, description?, primary?, subagents?, agentModels? }` → `{ harness }` |
+| `GET /api/harnesses` | Harness descriptors (`primary`, `subagents`, `coreTools`, `agentModels?`, `agentInstructions?`, `builtin`, `editable`), provider defaults, and the trusted `agents` list. Every entry is an editable application copy; `editable` is always `true` (compatibility only) |
+| `POST /api/harnesses` | Create a harness from trusted agent ids — body `{ name, title?, description?, primary, subagents?, agentModels?, agentInstructions? }` → `201 { harness }` |
+| `PATCH /api/harnesses/:name` | Change any harness — body `{ title?, description?, primary?, subagents?, agentModels?, agentInstructions? }` → `{ harness }` |
 | `GET /api/agents` | The trusted agent registry (`name`, `title`, `description`, `instruction`, `guidelines`) |
 | `GET /api/tools` | The whole tool catalogue, session-bound core tools first (`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`, `delegate`, `actionRequest`, `threadFork`) then every direct-call tool (including the core file tools); `search` always appears with `availability` |
 | `GET /api/tools/bootstrap` | Alias of `GET /api/tools` (the list the root bootstrap document carries) |
@@ -2003,7 +2003,8 @@ including the shipped templates (`instruct`, `research`, `workspace`, `reviewer`
 metadata-only `PATCH` (`title`/`description`) preserves the template's captured
 factory — the scripted `demo` keeps its offline script and `timeNow`-only registry,
 and `flaky` keeps its `testFlaky` extra. An executable `PATCH`
-(`primary`/`subagents`/`agentModels`) rebuilds the harness: `demo` becomes an
+(`primary`/`subagents`/`agentModels`/`agentInstructions`) rebuilds the harness: `demo`
+becomes an
 honest live profiled harness (shared toolbox, requires an endpoint), and `flaky`
 rebuilds the live toolbox while retaining `testFlaky`.
 `builtin: true` still marks provenance. There is no delete; with a database root
@@ -2013,14 +2014,14 @@ because a session freezes its captured preset and descriptor at creation. Both
 routes validate the request — exactly one primary, known agent ids only, no
 duplicate ids, reserved aliases
 (`writer`/`assistant`/`researcher`) and existing names rejected, bounded
-title/description — and reject unknown fields, so a client cannot supply
-instruction text, a provider, or a tool list.
+title/description — and reject unknown fields, so a client cannot supply a bare
+`instruction`, a provider, or a tool list.
 
 **Saved registry rows and improved defaults.** A restart replays the registry rows
 saved in `state.json`, but a shipped default may improve between builds (T3 widened
 the real presets' teams and retitled `research`/`workspace`). The conservative rule:
 a built-in row whose executable fields (primary, subagents, agents, tools,
-environmentTools, template, and an empty `agentModels`) still match the previously
+environmentTools, template, and an empty `agentModels`/`agentInstructions`) still match the previously
 shipped definition recorded in `LEGACY_PRESET_DEFINITIONS`
 (`src/server/harnesses/presets.ts`) is treated as an unmodified default and is
 refreshed to the current template. A row that differs in ANY executable field — or
@@ -2040,6 +2041,21 @@ without restating the map drops the overrides of agents that are no longer selec
 The factory closure captures the map, so a harness edit never rewrites an existing
 session: those models change only through `PATCH /api/sessions/:id` (which merges
 and never touches the frozen definition).
+
+`agentInstructions` is the one text-shaped field: a map of **selected agent id →
+instruction OVERRIDE**, e.g. `{ "summarizer": "Condense to one line." }`. It is
+validated like `agentModels` (keys must be final members; values trimmed, non-empty,
+at most 8000 characters, and free of control characters other than tab/newline/CR, so
+multi-line prose is legal) and REPLACED wholesale on `PATCH`, so `{}` clears every
+override and an agent the map omits runs its trusted `GET /api/agents` instruction.
+The override replaces only the profile's identity sentence: its `guidelines` still
+compose into the system message, and the shipped profile in `src/agents` is never
+rewritten. An instruction edit is EXECUTABLE, so it rebuilds the harness factory and
+is persisted with the registry row; a saved session keeps the instructions its agents
+were built with (its system messages are already in the transcript), which is why
+`PATCH /api/sessions/:id` still accepts `agentModels` only. The browser's agent dialog
+edits all of this as a local draft: nothing is written until its bottom-right action,
+and dismissing the dialog sends nothing at all.
 
 `POST /api/models` takes `{ settings?: { baseURL?, apiKey?, model? } }`. It exists
 because the browser must not hold the server key and providers rarely send CORS

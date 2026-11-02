@@ -128,11 +128,12 @@ const PRESET_SOURCE_ENTRIES = [
     'tools/command/shell.tool.ts',
     'tools/command/gitDiff.tool.ts',
     'tools/files/edit.tool.ts',
-    'tools/files/fileGlob.tool.ts',
+    'tools/files/glob.tool.ts',
+    'tools/files/grep.tool.ts',
     'tools/files/fileList.tool.ts',
     'tools/files/read.tool.ts',
-    'tools/files/fileWrite.tool.ts',
-    'tools/syntax/syntaxCheck.tool.ts'
+    'tools/files/write.tool.ts',
+    'tools/syntax/syntax.tool.ts'
 ];
 // Runtime entries that this no-subagent/no-interaction harness registers at
 // startup. Each must have a source record captured by the SAME operation runtime

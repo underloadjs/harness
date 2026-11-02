@@ -95,9 +95,10 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(selector: string, tag: K
     return found;
 };
 
-// T5 R11/R12: the per-agent selects live in the shared agent dialog now, so reading
-// them opens it from the composer's single agent button (idempotent once open; the
-// dialog refreshes itself after each confirmed PATCH).
+// T3: the per-agent select lives in the shared agent dialog and belongs to the agent
+// the dropdown currently configures, so reading one opens the dialog (idempotent once
+// open) and switching agents is `selectConfigured`. The dialog refreshes itself after
+// each confirmed PATCH.
 const openDeck = (): void => {
     if (document.querySelector('.dialog') !== null) return;
     byClass('.agent-control-button', 'button').click();
@@ -106,6 +107,28 @@ const openDeck = (): void => {
 const modelSelects = (): HTMLSelectElement[] => {
     openDeck();
     return [...document.querySelectorAll<HTMLSelectElement>('.agent-model-select')];
+};
+
+// Views another agent's configuration. Local only: it never sends a request.
+const selectConfigured = (name: string): void => {
+    openDeck();
+
+    const select = byClass('.agent-dialog-agent-select', 'select');
+    select.value = name;
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+};
+
+// The dialog's single writer.
+const applyAction = (): HTMLButtonElement => {
+    openDeck();
+
+    return byClass('.agent-dialog-apply', 'button');
+};
+
+const memberToggle = (): HTMLInputElement => {
+    openDeck();
+
+    return byClass('.agent-dialog-member', 'input');
 };
 
 const optionTexts = (select: HTMLSelectElement): (string | null)[] =>
@@ -160,23 +183,33 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
     await flush();
     await flush();
 
-    // One dropdown per member, each labelled for its agent and showing the
-    // effective model. Option 0 is the default labelled m1, so m1 is not repeated.
-    expect(modelSelects().map((select) => select.getAttribute('aria-label'))).toEqual([
-        'Model for Instruct',
-        'Model for Summarizer'
-    ]);
-    const [instruct, summarizer] = modelSelects();
+    // T3: the dialog configures ONE agent at a time, so there is exactly one select
+    // and the dropdown is how you reach the other member. Option 0 is the default
+    // labelled m1, so m1 is not repeated.
+    expect(modelSelects()).toHaveLength(1);
+    const instruct = modelSelects()[0];
+    expect(instruct.getAttribute('aria-label')).toBe('Model for Instruct');
     expect(optionTexts(instruct)).toEqual(['m1', 'm2', 'm3']);
     expect(instruct.value).toBe('m2');
-    // The summarizer's explicit override equals the fallback, so the default
-    // option represents it and already displays m1.
+
+    // The summarizer's explicit override equals the fallback, so the default option
+    // represents it and already displays m1.
+    selectConfigured('summarizer');
+    const summarizer = modelSelects()[0];
+    expect(summarizer.getAttribute('aria-label')).toBe('Model for Summarizer');
     expect(summarizer.value).toBe('');
     expect(summarizer.selectedOptions[0].textContent).toBe('m1');
+    // Viewing an agent is not an edit: nothing has been written.
+    expect(patches).toEqual([]);
 
-    // --- change one model: the complete map goes with it ------------------
-    instruct.value = 'm3';
-    instruct.dispatchEvent(new Event('change', { bubbles: true }));
+    // --- change one model: DRAFT first, then the complete map on the action --
+    selectConfigured('instruct');
+    const instructSelect = modelSelects()[0];
+    instructSelect.value = 'm3';
+    instructSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(patches).toEqual([]);
+
+    applyAction().click();
     await flush();
 
     expect(patches[0]).toEqual({
@@ -184,14 +217,21 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
         subagents: ['summarizer'],
         agentModels: { instruct: 'm3', summarizer: 'm1' }
     });
-    expect(modelSelects().map((select) => select.value)).toEqual(['m3', '']);
-    expect(modelSelects()[1].selectedOptions[0].textContent).toBe('m1');
+    expect(modelSelects()[0].value).toBe('m3');
+    selectConfigured('summarizer');
+    expect(modelSelects()[0].value).toBe('');
+    expect(modelSelects()[0].selectedOptions[0].textContent).toBe('m1');
 
     // --- adding a member preserves existing entries -----------------------
-    byClass('.agent-add', 'button').click();
-    document
-        .querySelector<HTMLButtonElement>('.agent-option[data-agent="critic"] .agent-option-add')
-        ?.click();
+    selectConfigured('critic');
+    const add = memberToggle();
+    add.checked = true;
+    add.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(patches).toHaveLength(1);
+
+    // Saved from the PRIMARY's configuration so adding does not also promote.
+    selectConfigured('instruct');
+    applyAction().click();
     await flush();
 
     expect(patches[1]).toEqual({
@@ -201,10 +241,14 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
     });
 
     // --- a new member can get its own model -------------------------------
-    const critic = modelSelects()[2];
+    selectConfigured('critic');
+    const critic = modelSelects()[0];
     expect(critic.value).toBe('');
     critic.value = 'm2';
     critic.dispatchEvent(new Event('change', { bubbles: true }));
+
+    selectConfigured('instruct');
+    applyAction().click();
     await flush();
 
     expect(patches[2]).toEqual({
@@ -214,7 +258,11 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
     });
 
     // --- promotion preserves every mapping --------------------------------
-    document.querySelectorAll<HTMLButtonElement>('.agent-main')[2].click();
+    // Selecting the outside member arms the promotion its label states; saving from
+    // there restates the complete team with the new primary first.
+    selectConfigured('critic');
+    expect(applyAction().textContent).toBe('Save & set primary');
+    applyAction().click();
     await flush();
 
     expect(patches[3]).toEqual({
@@ -222,11 +270,18 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
         subagents: ['instruct', 'summarizer'],
         agentModels: { instruct: 'm3', summarizer: 'm1', critic: 'm2' }
     });
-    expect(document.querySelector('.agent-tile')?.dataset.agent).toBe('critic');
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.agent-dialog-agent')].map((row) => row.dataset.agent)
+    ).toEqual(['critic', 'instruct', 'summarizer']);
 
     // --- removal drops only the removed member's key ----------------------
-    // Tiles are now [critic, instruct, summarizer]; index 2 is summarizer.
-    document.querySelectorAll<HTMLButtonElement>('.agent-remove')[2].click();
+    selectConfigured('summarizer');
+    const remove = memberToggle();
+    remove.checked = false;
+    remove.dispatchEvent(new Event('change', { bubbles: true }));
+
+    selectConfigured('critic');
+    applyAction().click();
     await flush();
 
     expect(patches[4]).toEqual({
@@ -234,11 +289,20 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
         subagents: ['instruct'],
         agentModels: { instruct: 'm3', critic: 'm2' }
     });
-    expect(modelSelects().map((select) => select.value)).toEqual(['m2', 'm3']);
+    selectConfigured('critic');
+    expect(modelSelects()[0].value).toBe('m2');
+    selectConfigured('instruct');
+    expect(modelSelects()[0].value).toBe('m3');
 
     // --- choosing the default deletes the key (not an empty entry) ---------
-    modelSelects()[1].value = '';
-    modelSelects()[1].dispatchEvent(new Event('change', { bubbles: true }));
+    // Drafted on Instruct, saved from the PRIMARY's configuration so the action saves
+    // the model without also promoting the agent being edited.
+    const cleared = modelSelects()[0];
+    cleared.value = '';
+    cleared.dispatchEvent(new Event('change', { bubbles: true }));
+
+    selectConfigured('critic');
+    applyAction().click();
     await flush();
 
     expect(patches[5]).toEqual({
@@ -246,8 +310,9 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
         subagents: ['instruct'],
         agentModels: { critic: 'm2' }
     });
-    expect(modelSelects()[1].value).toBe('');
-    expect(optionTexts(modelSelects()[1])[0]).toBe('m1');
+    selectConfigured('instruct');
+    expect(modelSelects()[0].value).toBe('');
+    expect(optionTexts(modelSelects()[0])[0]).toBe('m1');
 });
 
 it('names the server fallback when the stored settings model is blank', async () => {
@@ -306,19 +371,32 @@ it('shows a model-change error and keeps the last server-confirmed selection', a
     await flush();
     await flush();
 
-    modelSelects()[0].value = 'm2';
-    modelSelects()[0].dispatchEvent(new Event('change', { bubbles: true }));
+    const select = modelSelects()[0];
+    select.value = 'm2';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    // T3: the change is a draft; the rejection can only happen once the action writes.
+    applyAction().click();
     await flush();
 
     expect(byClass('.status', 'span').dataset.state).toBe('error');
     // R3: concise visible state; the rejected model message is the tooltip.
     expect(document.querySelector('.status-text')?.textContent).toBe('error');
     expect(document.querySelector('.status')?.getAttribute('title')).toBe(
-        'agent models: That model is not available to this provider.'
+        'agent configuration: That model is not available to this provider.'
     );
-    // The row is redrawn from the descriptor the server last confirmed, so it does
-    // not pretend the rejected change stuck.
-    expect(modelSelects()[0].value).toBe('');
+    // T3 R2: the dialog did NOT close and did NOT lose the edit. The refused draft is
+    // still on screen so the reader can fix it, the action is re-armed, and the reason
+    // is stated beside it (the app pill carries the same message).
+    expect(byClass('.agent-model-select', 'select').value).toBe('m2');
+    expect(applyAction().disabled).toBe(false);
+    expect(document.querySelector('.agent-dialog-error')?.textContent).toBe(
+        'That model is not available to this provider.'
+    );
+    // The stored configuration is untouched: the server's last answer still has no
+    // override, which is what the team list reports.
+    expect(
+        document.querySelector('.agent-dialog-agent[data-agent="instruct"] .agent-dialog-agent-model')?.textContent
+    ).toBe('m1');
 });
 
 // R3 (T4): the SAVING window must be observable while the PATCH is in flight. The
@@ -362,8 +440,11 @@ it('shows the saving state and diagnostic while a model PATCH is in flight', asy
     expect(pill.getAttribute('title')).toBeNull();
     expect(document.querySelector('.status-detail')?.textContent).toBe('');
 
-    modelSelects()[0].value = 'm2';
-    modelSelects()[0].dispatchEvent(new Event('change', { bubbles: true }));
+    const select = modelSelects()[0];
+    select.value = 'm2';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    // T3: the PATCH starts at the action, not at the dropdown.
+    applyAction().click();
     await patchStarted;
     await flush();
 
@@ -371,8 +452,8 @@ it('shows the saving state and diagnostic while a model PATCH is in flight', asy
     // in the hidden live-region child.
     expect(pill.dataset.state).toBe('saving');
     expect(document.querySelector('.status-text')?.textContent).toBe('saving');
-    expect(pill.getAttribute('title')).toBe('saving agent models');
-    expect(document.querySelector('.status-detail')?.textContent).toBe('saving agent models');
+    expect(pill.getAttribute('title')).toBe('saving agent configuration');
+    expect(document.querySelector('.status-detail')?.textContent).toBe('saving agent configuration');
 
     if (releasePatch === undefined) throw new Error('the PATCH never started');
     releasePatch();
@@ -384,10 +465,19 @@ it('shows the saving state and diagnostic while a model PATCH is in flight', asy
     // "applies to new sessions" wording (the session PATCH says "next request").
     expect(pill.dataset.state).toBe('idle');
     expect(document.querySelector('.status-text')?.textContent).toBe('idle');
-    expect(pill.getAttribute('title')).toBe('agent models saved · applies to new sessions');
-    expect(document.querySelector('.status-detail')?.textContent).toBe(
-        'agent models saved · applies to new sessions'
+    expect(pill.getAttribute('title')).toBe(
+        'agent configuration saved · applies to new sessions'
     );
+    expect(document.querySelector('.status-detail')?.textContent).toBe(
+        'agent configuration saved · applies to new sessions'
+    );
+    // T3: the dialog reports the same outcome in its own footer, and the drafts are
+    // cleared because the write was confirmed.
+    expect(document.querySelector('.agent-dialog-error')?.textContent).toBe('');
+    expect(byClass('.agent-dialog-footer-note', 'p').textContent).toBe(
+        'agent configuration saved · applies to new sessions'
+    );
+    expect(applyAction().disabled).toBe(true);
 });
 
 it('clears the accessible status diagnostic when the state resets', async () => {
@@ -414,14 +504,16 @@ it('clears the accessible status diagnostic when the state resets', async () => 
     await flush();
     await flush();
 
-    modelSelects()[0].value = 'm2';
-    modelSelects()[0].dispatchEvent(new Event('change', { bubbles: true }));
+    const select = modelSelects()[0];
+    select.value = 'm2';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    applyAction().click();
     await flush();
 
     const pill = byClass('.status', 'span');
     expect(pill.dataset.state).toBe('error');
     expect(document.querySelector('.status-detail')?.textContent).toBe(
-        'agent models: That model is not available to this provider.'
+        'agent configuration: That model is not available to this provider.'
     );
 
     // Picking the harness resets the app pill to the bare `idle` state.
@@ -489,37 +581,53 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     await flush();
     await flush();
 
-    // The TEAM is still frozen: promotion, add and remove are disabled. R7: there
-    // is no lock notice and no in-row "New session" link; the Sessions rail keeps
-    // its own independent New session action, which stays usable.
+    // The TEAM and the INSTRUCTIONS are still frozen: the membership toggle and the
+    // instruction editor are disabled, and the action cannot promote. R7: there is no
+    // lock notice and no in-row "New session" link; the Sessions rail keeps its own
+    // independent New session action, which stays usable.
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         'Viewing a saved session · agent team frozen'
     );
     openDeck();
-    expect(byClass('.agent-main', 'button').disabled).toBe(true);
-    expect(byClass('.agent-add', 'button').disabled).toBe(true);
-    expect(byClass('.agent-remove', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-instruction', 'textarea').disabled).toBe(true);
+    expect(byClass('.agent-dialog-member', 'input').disabled).toBe(true);
+    expect(applyAction().textContent).toBe('Save configuration');
+    expect(applyAction().disabled).toBe(true);
     expect(document.querySelector('.agent-lock')).toBeNull();
     expect(document.querySelector('.agent-row-wrap .link-button')).toBeNull();
     const railNewSession = byClass('.new-session', 'button');
     expect(railNewSession.textContent).toBe('New session');
     expect(railNewSession.disabled).toBe(false);
 
-    const selects = modelSelects();
-    // Effective live values (not the live descriptor's map, which only has
-    // instruct) with the MODEL controls enabled (R2).
-    expect(selects.map((select) => select.value)).toEqual(['m2', '']);
-    expect(selects.map((select) => select.selectedOptions[0].textContent)).toEqual(['m2', 'm1']);
-    expect(selects.map((select) => select.disabled)).toEqual([false, false]);
-    expect(selects.map((select) => select.title)).toEqual([
-        'Model for Instruct. Applies to the next request in this session.',
-        'Model for Summarizer. Applies to the next request in this session.'
-    ]);
-    expect(optionTexts(selects[0])).toEqual(['m1', 'm2', 'm3']);
+    // Effective live values (not the live descriptor's map, which only has instruct)
+    // with the MODEL control enabled (R2). One select per configuration, reached
+    // through the dropdown.
+    const instructSelect = modelSelects()[0];
+    expect(instructSelect.value).toBe('m2');
+    expect(instructSelect.selectedOptions[0].textContent).toBe('m2');
+    expect(instructSelect.disabled).toBe(false);
+    expect(instructSelect.title).toBe(
+        'Model for Instruct. Applies to the next request in this session.'
+    );
+    expect(optionTexts(instructSelect)).toEqual(['m1', 'm2', 'm3']);
 
-    // --- change one model: PATCH the SESSION, not the harness ---------------
-    selects[0].value = 'm3';
-    selects[0].dispatchEvent(new Event('change', { bubbles: true }));
+    selectConfigured('summarizer');
+    const summarizerSelect = modelSelects()[0];
+    expect(summarizerSelect.value).toBe('');
+    expect(summarizerSelect.selectedOptions[0].textContent).toBe('m1');
+    expect(summarizerSelect.disabled).toBe(false);
+    expect(summarizerSelect.title).toBe(
+        'Model for Summarizer. Applies to the next request in this session.'
+    );
+
+    // --- change one model: DRAFT, then the action PATCHes the SESSION -------
+    selectConfigured('instruct');
+    const edited = modelSelects()[0];
+    edited.value = 'm3';
+    edited.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
+
+    applyAction().click();
     await flush();
 
     // The complete live map travels: the summarizer's m1 is preserved, the edited
@@ -536,8 +644,10 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
 
     // The answer is applied like any GET snapshot, so the control shows the new id
     // and m2 (no longer effective) disappears from the options.
-    expect(modelSelects().map((select) => select.value)).toEqual(['m3', '']);
+    expect(modelSelects()[0].value).toBe('m3');
     expect(optionTexts(modelSelects()[0])).toEqual(['m1', 'm3']);
+    selectConfigured('summarizer');
+    expect(modelSelects()[0].value).toBe('');
     // R3: concise visible state; the save confirmation is the pill's tooltip.
     expect(document.querySelector('.status-text')?.textContent).toBe('idle');
     expect(document.querySelector('.status')?.getAttribute('title')).toBe(
@@ -607,12 +717,19 @@ it('changes a RUNNING session’s model without cancelling the stream', async ()
     expect(document.querySelector('.status-text')?.textContent).toBe('idle');
     // Team still frozen while running; MODELS editable (R2).
     openDeck();
-    expect(byClass('.agent-main', 'button').disabled).toBe(true);
-    expect(modelSelects().map((select) => select.disabled)).toEqual([false, false]);
+    expect(byClass('.agent-dialog-instruction', 'textarea').disabled).toBe(true);
+    expect(modelSelects()[0].disabled).toBe(false);
     expect(document.querySelectorAll('.tile')).toHaveLength(1);
 
-    modelSelects()[0].value = 'm3';
-    modelSelects()[0].dispatchEvent(new Event('change', { bubbles: true }));
+    const runningSelect = modelSelects()[0];
+    runningSelect.value = 'm3';
+    runningSelect.dispatchEvent(new Event('change', { bubbles: true }));
+    // T3: the stream keeps running while the reader decides; nothing is sent until the
+    // action, and the action here can only save a model.
+    expect(calls.filter((call) => call.method === 'PATCH')).toEqual([]);
+    expect(applyAction().disabled).toBe(false);
+
+    applyAction().click();
     await flush();
 
     expect(calls.filter((call) => call.method === 'PATCH')).toEqual([
@@ -630,7 +747,10 @@ it('changes a RUNNING session’s model without cancelling the stream', async ()
     expect(byClass('.composer-action', 'button').dataset.action).toBe('stop');
     expect(byClass('.composer-action', 'button').disabled).toBe(false);
 
-    expect(modelSelects().map((select) => select.value)).toEqual(['m3', '']);
+    expect(modelSelects()[0].value).toBe('m3');
+    selectConfigured('summarizer');
+    expect(modelSelects()[0].value).toBe('');
+    selectConfigured('instruct');
     // The save is config feedback; the session's run state stays on its tile, so the
     // header does not claim "session running".
     expect(document.querySelector('.status-text')?.textContent).toBe('idle');
@@ -679,8 +799,14 @@ it('shows a session model-change error and keeps the last confirmed value', asyn
     await flush();
     await flush();
 
-    modelSelects()[0].value = 'm3';
-    modelSelects()[0].dispatchEvent(new Event('change', { bubbles: true }));
+    // T3: the draft is written by the action, and a saved session's model save still
+    // goes to PATCH /sessions/:id (never to the harness).
+    const select = modelSelects()[0];
+    select.value = 'm3';
+    select.dispatchEvent(new Event('change', { bubbles: true }));
+    expect(calls.filter((call) => call.startsWith('PATCH'))).toEqual([]);
+
+    applyAction().click();
     await flush();
 
     expect(byClass('.status', 'span').dataset.state).toBe('error');
@@ -688,8 +814,16 @@ it('shows a session model-change error and keeps the last confirmed value', asyn
     expect(document.querySelector('.status')?.getAttribute('title')).toBe(
         'agent models: That model is not available to this session.'
     );
-    // The rejected value did not stick; the last server-confirmed map is redrawn.
-    expect(modelSelects().map((select) => select.value)).toEqual(['m2', '']);
+    // R2 (T3): the refused draft is KEPT so the reader can retry, and the dialog says
+    // why instead of closing. The SERVER's confirmed map is what the team list shows.
+    expect(modelSelects()[0].value).toBe('m3');
+    expect(applyAction().disabled).toBe(false);
+    expect(document.querySelector('.agent-dialog-error')?.textContent).toBe(
+        'That model is not available to this session.'
+    );
+    expect(
+        document.querySelector('.agent-dialog-agent[data-agent="instruct"] .agent-dialog-agent-model')?.textContent
+    ).toBe('m2');
     expect(calls).toContain('PATCH /api/sessions/s9');
     expect(calls.some((call) => call.includes('/api/harnesses/'))).toBe(false);
 });

@@ -270,6 +270,42 @@ describe('R3b durable harness database', () => {
         expect(mine?.agents).toEqual(['instruct']);
     });
 
+    // T3 editable configuration. An instruction override is EXECUTABLE state: a
+    // restart must bring back both the map and the prompts the next session runs, or
+    // the saved configuration the reader edited would silently revert on reboot.
+    it('restores a saved instruction override and applies it to the rebuilt factory', async () => {
+        const root = tempRoot('instructions');
+        const preset = liveScriptedPreset('one', 'persisted answer');
+
+        const first = runtimeOf(root, [preset]);
+        first.registry.create({
+            name: 'voiced',
+            primary: 'research',
+            subagents: ['summarizer'],
+            agentInstructions: { summarizer: 'Condense to one line.' }
+        });
+        first.store.persistRegistry();
+
+        // It is in the durable document (not only in memory).
+        const stored = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as {
+            registry: { name: string; agentInstructions?: Record<string, string> }[];
+        };
+        expect(stored.registry.find((entry) => entry.name === 'voiced')?.agentInstructions).toEqual({
+            summarizer: 'Condense to one line.'
+        });
+
+        first.store.dispose();
+
+        const second = runtimeOf(root, [preset]);
+        const restored = second.registry.find('voiced');
+
+        expect(restored?.agentInstructions).toEqual({ summarizer: 'Condense to one line.' });
+        expect(restored?.create(SETTINGS, () => undefined).agents.summarizer.instructions).toEqual([
+            'Condense to one line.',
+            'Guidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
+        ]);
+    });
+
     it('preserves a queued backlog and marks a running turn interrupted without replaying it', async () => {
         const root = tempRoot('interrupted');
         const fixture = gatedPreset();

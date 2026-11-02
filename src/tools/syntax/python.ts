@@ -1,8 +1,8 @@
-// Python half of syntaxCheck — parse a snippet without running it.
+// Python half of syntax — parse a snippet without running it.
 //
 // Pipes the source to `compile()` through the interpreter, which also only parses.
 // Requires a Python 3 interpreter on PATH; the lookup is cached after the first
-// call. Loaded through `import()` by ./syntaxCheck only when the caller asks for
+// call. Loaded through `import()` by ./syntax only when the caller asks for
 // language "python", so a JavaScript check never pays for node:child_process.
 //
 // Execution contract (R2): every child process is ASYNC and BOUNDED.
@@ -22,7 +22,7 @@
 //     never "the checker could not run".
 //
 // Cross-references:
-//   - ./syntaxCheck   — the public tool and its language dispatch
+//   - ./syntax   — the public tool and its language dispatch
 //   - ../catalogue    — metadata (name, description, tags, schema)
 //   - ../command/boundedText — shared capped UTF-8 capture
 
@@ -142,26 +142,26 @@ const withDiagnostics = (message: string, diagnostics: string): string =>
 // tool result the model can recover from.
 export const checkPython = async (code: string, signal?: AbortSignal): Promise<boolean> => {
     if (typeof code !== 'string') {
-        throw new HarnessError('syntaxCheck code must be a string.');
+        throw new HarnessError('syntax code must be a string.');
     }
 
     // Cancelled before anything ran: do not even probe the interpreter.
     if (signal?.aborted) {
-        throw new HarnessError('syntaxCheck Python check was cancelled before it started.');
+        throw new HarnessError('syntax Python check was cancelled before it started.');
     }
 
     const interpreter = await findPython();
 
     if (!interpreter) {
         throw new HarnessError(
-            'syntaxCheck requires a Python 3 interpreter on PATH (tried: python3, python).'
+            'syntax requires a Python 3 interpreter on PATH (tried: python3, python).'
         );
     }
 
     // Cancelled while the probe was running: do not start work that is already
     // unwanted.
     if (signal?.aborted) {
-        throw new HarnessError('syntaxCheck Python check was cancelled before it started.');
+        throw new HarnessError('syntax Python check was cancelled before it started.');
     }
 
     return new Promise<boolean>((resolve, reject) => {
@@ -183,7 +183,7 @@ export const checkPython = async (code: string, signal?: AbortSignal): Promise<b
             });
         } catch (error) {
             reject(
-                new HarnessError('syntaxCheck could not start the Python interpreter.', { cause: error })
+                new HarnessError('syntax could not start the Python interpreter.', { cause: error })
             );
             return;
         }
@@ -223,13 +223,13 @@ export const checkPython = async (code: string, signal?: AbortSignal): Promise<b
         };
 
         const onAbort = (): void => {
-            terminate(new HarnessError('syntaxCheck Python check was cancelled.'));
+            terminate(new HarnessError('syntax Python check was cancelled.'));
         };
 
         timer = setTimeout(() => {
             terminate(
                 new HarnessError(
-                    `syntaxCheck timed out after ${PYTHON_CHECK_TIMEOUT_MS} ms checking Python syntax.`
+                    `syntax timed out after ${PYTHON_CHECK_TIMEOUT_MS} ms checking Python syntax.`
                 )
             );
         }, PYTHON_CHECK_TIMEOUT_MS);
@@ -245,7 +245,7 @@ export const checkPython = async (code: string, signal?: AbortSignal): Promise<b
         child.on('error', (error) =>
             settle(() =>
                 reject(
-                    new HarnessError('syntaxCheck could not start the Python interpreter.', {
+                    new HarnessError('syntax could not start the Python interpreter.', {
                         cause: error
                     })
                 )
@@ -271,7 +271,7 @@ export const checkPython = async (code: string, signal?: AbortSignal): Promise<b
                     reject(
                         new HarnessError(
                             withDiagnostics(
-                                `syntaxCheck Python interpreter ended on signal ${exitSignal}.`,
+                                `syntax Python interpreter ended on signal ${exitSignal}.`,
                                 diagnostics
                             )
                         )
@@ -291,7 +291,7 @@ export const checkPython = async (code: string, signal?: AbortSignal): Promise<b
                     reject(
                         new HarnessError(
                             withDiagnostics(
-                                `syntaxCheck Python interpreter exited with code ${String(exitCode)}.`,
+                                `syntax Python interpreter exited with code ${String(exitCode)}.`,
                                 diagnostics
                             )
                         )

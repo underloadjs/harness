@@ -3,8 +3,9 @@
 // One file per tool, one folder per capability, so the folder reads as the list of
 // what ships out of the box:
 //
-//   syntax/   syntaxCheck (javascript or python, named by the caller)
-//   files/    read, fileWrite, edit, fileList, fileGlob
+//   syntax/   syntax (javascript, typescript, tsx, jsx, json or python, named by
+//             the caller)
+//   files/    read, write, edit, fileList, glob, grep
 //   command/  shell, gitDiff
 //   runtime/  the harness-owned core entries (toolRequest, toolCreate, …) — moved
 //             here from the old top-level `runtime-tools/` folder (T21)
@@ -13,9 +14,11 @@
 //   webfetch/  fetch — opt-in, per-harness (native GET by default, the `exa`
 //             provider only when a key exists; see createWebFetchTool)
 //
-// NAMING (T14): every wire name is `<namespace><action>`. The four file tools and
-// shell/search were renamed; there are no aliases, because two names for
-// one tool makes discovery ambiguous.
+// NAMING: every wire name is an action a model would type. The file tools are
+// read/write/edit plus the two search surfaces (glob for names, grep for contents) and
+// fileList; shell/search keep their names. Renames (fileWrite -> write, fileGlob ->
+// glob + grep, syntaxCheck -> syntax) have NO aliases, because two names for one tool
+// makes discovery ambiguous.
 //
 // Lazy, not eager (R1b)
 // --------------------
@@ -28,10 +31,11 @@
 // catalogue cheap to enumerate, while preserving the exact Tool contract the
 // registry relies on:
 //
-//     await syntaxCheck({ code: 'print(1)', language: 'python' }); // true
+//     await syntax({ code: 'print(1)', language: 'python' });    // true
 //     await read(['package.json']);                            // { files: […], truncated, bytes, contentBudget }
-//     await fileWrite([{ path: 'a.txt', content: 'hi' }]);         // [{ path, bytes }]
-//     harness({ tools: { syntaxCheck, read } });                // the model calls them
+//     await write([{ path: 'a.txt', content: 'hi' }]);          // [{ path, bytes }]
+//     await grep({ pattern: 'TODO', patterns: ['*.ts'] });      // { matches, truncated, bytes, contentBudget }
+//     harness({ tools: { syntax, read } });                    // the model calls them
 //
 // DERIVED TABLE, HAND-WRITTEN API (T21 → T24)
 // -------------------------------------------
@@ -48,8 +52,8 @@
 // only needs a named export if the tool is meant to be part of the public import
 // surface.
 //
-// R18: read/fileWrite/edit/fileGlob are **core** and declared up front;
-// fileList, syntaxCheck, shell, and gitDiff stay **searchable**, so the model
+// R18: read/write/edit/glob/grep are **core** and declared up front;
+// fileList, syntax, shell, and gitDiff stay **searchable**, so the model
 // asks toolRequest for `files`/`list`, `shell`, `git`, … and discovery enables the
 // matches. A harness preloads `presetTools` unless it is created with
 // `presets: false`.
@@ -69,6 +73,8 @@ import type {
     FileEditResult,
     FileGlobParameters,
     FileGlobResult,
+    FileGrepParameters,
+    FileGrepResult,
     FileListParameters,
     FileListResult,
     FileReadParameters,
@@ -100,17 +106,19 @@ const presetProxy = <TParameters, TResult>(name: string): Tool<TParameters, TRes
 
 // The named exports. Type parameters are spelled out so a direct call keeps its
 // precise signature even though the implementation is loaded lazily.
-export const syntaxCheck = presetProxy<SyntaxCheckParameters, boolean>('syntaxCheck');
+export const syntax = presetProxy<SyntaxCheckParameters, boolean>('syntax');
 
-// The four file tools are BATCHED: each takes the array its single schema property
+// The four batched file tools: each takes the array its single schema property
 // declares, so a direct call and a model call reach `execute` identically.
 export const read = presetProxy<FileReadParameters, FileReadResult>('read');
-export const fileWrite = presetProxy<{ path: string; content: string }[], FileWriteResult>('fileWrite');
+export const write = presetProxy<{ path: string; content: string }[], FileWriteResult>('write');
 export const edit = presetProxy<FileEditParameters, FileEditResult>('edit');
 export const fileList = presetProxy<FileListParameters, FileListResult>('fileList');
-// fileGlob declares four properties, so it receives the whole object and its
-// result shape depends on whether `content` was supplied.
-export const fileGlob = presetProxy<FileGlobParameters, FileGlobResult>('fileGlob');
+// The two search presets, split from the old `fileGlob` mode switch. Each declares
+// several properties, so both receive the whole object; glob answers with file names
+// and grep answers with matching lines.
+export const glob = presetProxy<FileGlobParameters, FileGlobResult>('glob');
+export const grep = presetProxy<FileGrepParameters, FileGrepResult>('grep');
 
 export const shell = presetProxy<CommandRunParameters, CommandRunResult>('shell');
 export const gitDiff = presetProxy<GitDiffParameters, GitDiffResult>('gitDiff');
@@ -125,11 +133,11 @@ export type {
     FileEditParameters,
     FileEditResult,
     FileEditResultEntry,
-    FileGlobFilesResult,
-    FileGlobMatch,
-    FileGlobMatchesResult,
     FileGlobParameters,
     FileGlobResult,
+    FileGrepMatch,
+    FileGrepParameters,
+    FileGrepResult,
     FileListParameters,
     FileListQuery,
     FileListResult,

@@ -12,6 +12,7 @@ import type {
     SessionTurn
 } from '../server/protocol';
 import {
+    agentInstructionsOf,
     agentModelsOf,
     agentsFromDescriptors,
     attemptCommitOf,
@@ -24,6 +25,7 @@ import {
     frameAtOf,
     frameUsageOf,
     frozenDefinitionOf,
+    instructionsForMembers,
     membersOf,
     modelsForMembers,
     pendingOf,
@@ -214,6 +216,43 @@ describe('per-agent models', () => {
         expect(modelsForMembers(current, ['instruct', 'critic'])).toEqual({ instruct: 'm2', critic: 'm3' });
         // No members left means an empty map (the server would clear on PATCH).
         expect(modelsForMembers(current, [])).toEqual({});
+    });
+});
+
+// T3 editable configuration: the UI's sibling accessors. An override map is optional,
+// and the effective instruction is `override ?? trusted preset text` — a missing key
+// is never an empty prompt.
+describe('per-agent instructions', () => {
+    it('reads only non-blank string overrides from a descriptor map', () => {
+        expect(
+            agentInstructionsOf(
+                descriptor({
+                    agentInstructions: { instruct: 'Lead with the answer.', helper: '   ', bad: 7 }
+                })
+            )
+        ).toEqual({ instruct: 'Lead with the answer.' });
+        // A map-less descriptor is the normal "every agent runs its preset text" shape.
+        expect(agentInstructionsOf(descriptor())).toEqual({});
+        // A malformed map must not throw at render time.
+        expect(agentInstructionsOf({ agentInstructions: [] } as never)).toEqual({});
+        expect(agentInstructionsOf({ agentInstructions: null } as never)).toEqual({});
+    });
+
+    it('filters a map to the resulting members and preserves member order', () => {
+        const current = { instruct: 'A.', helper: 'B.', critic: 'C.' };
+
+        // Removal drops the removed member's override; a PATCH sends the complete map.
+        expect(instructionsForMembers(current, ['instruct', 'critic'])).toEqual({
+            instruct: 'A.',
+            critic: 'C.'
+        });
+        expect(instructionsForMembers(current, ['critic', 'instruct'])).toEqual({
+            critic: 'C.',
+            instruct: 'A.'
+        });
+        // A blank value is not an override, so it never reaches the request body.
+        expect(instructionsForMembers({ instruct: '  ' }, ['instruct'])).toEqual({});
+        expect(instructionsForMembers(current, [])).toEqual({});
     });
 });
 

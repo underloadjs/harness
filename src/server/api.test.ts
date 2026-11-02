@@ -19,6 +19,9 @@ import { randomUUID } from 'node:crypto';
 import { basename, dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createToolCatalogue, createWebSearchCatalogueEntry, WEBSEARCH_UNCONFIGURED_HINT } from './harnesses';
+// The trusted catalogue text, so an instruction-override assertion can name the
+// words an agent runs when a harness does NOT override it.
+import { AGENT_PROFILES } from '../agents';
 import { TOOL_REGISTRY_METADATA, TOOL_REQUEST_METADATA } from '../core';
 import { MAX_API_BODY_BYTES } from './api';
 import { createHarnessRuntime } from './runtime';
@@ -2486,6 +2489,143 @@ describe('harness registry over HTTP', () => {
         ).toBeUndefined();
     });
 
+    // T3 editable configuration over HTTP: the sibling of the model contract above.
+    // The evidence that matters is that the words reach the AGENT, not just the card.
+    it('applies per-agent instructions and freezes them per session', async () => {
+        const runtime = createRuntime();
+
+        const created = await callHandler(runtime, 'POST', '/v1/harness/harnesses', {
+            body: {
+                name: 'voiced',
+                primary: 'research',
+                subagents: ['summarizer'],
+                agentInstructions: { summarizer: 'Condense to one line.' }
+            }
+        });
+        const { status, body } = await jsonBody<{ harness: HarnessDescriptor }>(created);
+
+        expect(status).toBe(201);
+        // The descriptor carries the OVERRIDE map only: `research` is absent because
+        // it runs the trusted preset instruction, which is what the UI shows as the
+        // un-overridden state (and offers to revert to).
+        expect(body.harness.agentInstructions).toEqual({ summarizer: 'Condense to one line.' });
+
+        // The factory the registry stored builds the real agents with it.
+        const built = runtime.registry.find('voiced')!.create(SETTINGS, () => undefined);
+        expect(built.agents.summarizer.instructions[0]).toBe('Condense to one line.');
+        expect(built.agents.research.instructions[0]).toBe(AGENT_PROFILES.research.instruction);
+        // Guidelines survive an override: only the identity sentence is replaced.
+        expect(built.agents.summarizer.instructions[1]).toBe(
+            'Guidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
+        );
+
+        // A session records the override in its frozen definition...
+        const session = await createSessionFor(runtime, 'voiced');
+        expect(session.harnessDefinition?.agentInstructions).toEqual({
+            summarizer: 'Condense to one line.'
+        });
+
+        // ...and a later PATCH cannot rewrite what that session was built with.
+        const patched = await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/voiced', {
+            body: { agentInstructions: { research: 'Ask before acting.' } }
+        });
+        expect(
+            (await jsonBody<{ harness: HarnessDescriptor }>(patched)).body.harness.agentInstructions
+        ).toEqual({ research: 'Ask before acting.' });
+
+        expect(runtime.store.get(session.id).harnessDefinition?.agentInstructions).toEqual({
+            summarizer: 'Condense to one line.'
+        });
+
+        // A NEW session runs the new words, and the agent the replacement map dropped
+        // is back on its trusted instruction (replace, not merge).
+        const next = await createSessionFor(runtime, 'voiced');
+        expect(next.harnessDefinition?.agentInstructions).toEqual({ research: 'Ask before acting.' });
+        expect(runtime.registry.find('voiced')!.create(SETTINGS, () => undefined).agents.research.instructions[0]).toBe(
+            'Ask before acting.'
+        );
+        expect(runtime.registry.find('voiced')!.create(SETTINGS, () => undefined).agents.summarizer.instructions[0]).toBe(
+            'You compress technical notes into at most two sentences.'
+        );
+
+        // `{}` clears every override, and the descriptor drops the field again.
+        const cleared = await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/voiced', {
+            body: { agentInstructions: {} }
+        });
+        expect(
+            (await jsonBody<{ harness: HarnessDescriptor }>(cleared)).body.harness.agentInstructions
+        ).toBeUndefined();
+    });
+
+    it('validates per-agent instructions: members only, bounded non-empty text', async () => {
+        const runtime = createRuntime();
+
+        const post = async (body: unknown) =>
+            jsonBody<{ error: { message: string } }>(
+                await callHandler(runtime, 'POST', '/v1/harness/harnesses', { body })
+            );
+
+        const patch = async (name: string, body: unknown) =>
+            jsonBody<{ error: { message: string } }>(
+                await callHandler(runtime, 'PATCH', `/v1/harness/harnesses/${name}`, { body })
+            );
+
+        // A key outside the team could never apply. A created harness starts with NO
+        // subagents, so its member set is the primary alone.
+        expect(
+            await post({ name: 'wide', primary: 'instruct', agentInstructions: { summarizer: 'Be brief.' } })
+        ).toEqual({
+            status: 400,
+            body: {
+                error: {
+                    message:
+                        '`agentInstructions` names "summarizer", which is not a member of this harness. Members: instruct.'
+                }
+            }
+        });
+
+        // Not an object of strings.
+        expect(await patch('instruct', { agentInstructions: ['Be brief.'] })).toEqual({
+            status: 400,
+            body: {
+                error: {
+                    message: '`agentInstructions` must be an object mapping agent ids to instruction text.'
+                }
+            }
+        });
+
+        // Blank text is a visible mistake: clearing an override is omitting the key
+        // (or sending `{}`), never storing an empty prompt.
+        expect(await patch('instruct', { agentInstructions: { instruct: '   ' } })).toEqual({
+            status: 400,
+            body: {
+                error: {
+                    message:
+                        '`agentInstructions.instruct` cannot be empty. Omit the key to run the trusted instruction.'
+                }
+            }
+        });
+
+        expect(await patch('instruct', { agentInstructions: { instruct: 'a'.repeat(8_001) } })).toEqual({
+            status: 400,
+            body: { error: { message: '`agentInstructions.instruct` cannot exceed 8000 characters.' } }
+        });
+
+        expect(await patch('instruct', { agentInstructions: { instruct: 'bad\u0000model' } })).toEqual({
+            status: 400,
+            body: { error: { message: '`agentInstructions.instruct` contains control characters.' } }
+        });
+
+        // Multi-line prose is legitimate prompt text and is accepted (a model id, by
+        // contrast, rejects a newline).
+        const accepted = await patch('instruct', {
+            agentInstructions: { instruct: 'Lead with the answer.\nThen cite the file.' }
+        });
+        expect((accepted.body as { harness: HarnessDescriptor }).harness.agentInstructions).toEqual({
+            instruct: 'Lead with the answer.\nThen cite the file.'
+        });
+    });
+
     it('validates per-agent models: members only, bounded non-empty ids', async () => {
         const runtime = createRuntime();
 
@@ -2593,8 +2733,11 @@ describe('harness registry over HTTP', () => {
             }
         });
 
-        // Prompt/provider/tool fields are not part of the contract: rejecting them
-        // is what stops a client from supplying a system message.
+        // A bare `instruction`/provider/tool field is not part of the contract. T3
+        // added the harness-scoped `agentInstructions` OVERRIDE map, but a client
+        // still cannot hand the server an unqualified system message or a tool list:
+        // an override must name a member agent, is bounded, and never rewrites the
+        // trusted profile in src/agents.
         expect(
             await post({
                 name: 'prompted',
@@ -2603,14 +2746,14 @@ describe('harness registry over HTTP', () => {
             })
         ).toEqual({
             status: 400,
-            body: { error: { message: 'Unknown field "instruction". Allowed fields: name, title, description, primary, subagents, agentModels.' } }
+            body: { error: { message: 'Unknown field "instruction". Allowed fields: name, title, description, primary, subagents, agentModels, agentInstructions.' } }
         });
 
         expect(
             await post({ name: 'tools', primary: 'instruct', tools: ['shell'] })
         ).toEqual({
             status: 400,
-            body: { error: { message: 'Unknown field "tools". Allowed fields: name, title, description, primary, subagents, agentModels.' } }
+            body: { error: { message: 'Unknown field "tools". Allowed fields: name, title, description, primary, subagents, agentModels, agentInstructions.' } }
         });
 
         // Unknown subagent ids are rejected against the trusted registry.
@@ -2710,19 +2853,20 @@ describe('harness registry over HTTP', () => {
             body: {
                 error: {
                     message:
-                        'A patch must change at least one of: title, description, primary, subagents, agentModels.'
+                        'A patch must change at least one of: title, description, primary, subagents, agentModels, agentInstructions.'
                 }
             }
         });
 
-        // `name` is immutable, and a client still cannot smuggle an instruction.
+        // `name` is immutable, and a client still cannot smuggle a BARE instruction:
+        // the only writable text field is the per-member `agentInstructions` map.
         expect(await patch('instruct', { name: 'renamed' })).toEqual({
             status: 400,
-            body: { error: { message: 'Unknown field "name". Allowed fields: title, description, primary, subagents, agentModels.' } }
+            body: { error: { message: 'Unknown field "name". Allowed fields: title, description, primary, subagents, agentModels, agentInstructions.' } }
         });
         expect(await patch('instruct', { instruction: 'x' })).toEqual({
             status: 400,
-            body: { error: { message: 'Unknown field "instruction". Allowed fields: title, description, primary, subagents, agentModels.' } }
+            body: { error: { message: 'Unknown field "instruction". Allowed fields: title, description, primary, subagents, agentModels, agentInstructions.' } }
         });
 
         // Writes are only on the canonical mount: /presets stays a read-only alias.

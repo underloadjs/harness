@@ -1,10 +1,18 @@
-// fileWrite — write one or more UTF-8 text files in a single call.
+// write — write one or more UTF-8 text files in a single call.
+//
+// WHY THIS NAME (T-rename): the wire name is `write`, not `fileWrite`. The file
+// namespace is already implied by the tool's own `files` tag and by the `paths` /
+// `files` / `edits` arguments, and the catalogue now pairs `read`/`write`/`edit`
+// with `glob`/`grep`/`fileList`. There is NO `fileWrite` alias on the wire: two names
+// for one tool makes discovery ambiguous (see ../catalogue). The exported TypeScript
+// type names (`FileWriteEntry`, `FileWriteParameters`, `FileWriteResult`) keep their
+// historical spelling so a consumer's imports do not break over a wire rename.
 //
 // WHY AN ARRAY (T14 batching rule)
 // --------------------------------
 // A single edit usually spans several files (a module, its barrel, its test). The
 // schema declares ONE property, `files`, so the single-property rule (see
-// ../core/tool.ts) hands `execute` the array itself — `fileWrite([{ path, content }])`
+// ../core/tool.ts) hands `execute` the array itself — `write([{ path, content }])`
 // — while a model call carries `{ "files": [...] }` and reaches the same code.
 //
 // RESULT SHAPE
@@ -49,7 +57,7 @@
 //
 // Executable on its own and registerable on a harness:
 //
-//     await fileWrite([{ path: 'notes.md', content: '# Notes' }]);
+//     await write([{ path: 'notes.md', content: '# Notes' }]);
 //
 // Metadata (name, description, tags, schema) is declared below and is authoritative
 // for T13. ../catalogue projects the same data synchronously for lazy enumeration
@@ -101,12 +109,12 @@ type PreparedWrite = {
 const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[]> => {
     if (!Array.isArray(files)) {
         throw new HarnessError(
-            'fileWrite expects an array of { path, content } entries, e.g. [{"path":"a.txt","content":"hi"}].'
+            'write expects an array of { path, content } entries, e.g. [{"path":"a.txt","content":"hi"}].'
         );
     }
 
     if (files.length === 0) {
-        throw new HarnessError('fileWrite received an empty files array; pass at least one entry.');
+        throw new HarnessError('write received an empty files array; pass at least one entry.');
     }
 
     const prepared: PreparedWrite[] = [];
@@ -116,24 +124,24 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
         // A model can pass anything: a string, a null, an array. Name the shape
         // rather than failing on a property read.
         if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
-            throw new HarnessError('fileWrite files must be objects with "path" and "content" strings.');
+            throw new HarnessError('write files must be objects with "path" and "content" strings.');
         }
 
         const { path, content } = entry as Partial<FileWriteEntry>;
 
         if (typeof path !== 'string' || path.length === 0) {
-            throw new HarnessError('fileWrite files require a non-empty "path" string.');
+            throw new HarnessError('write files require a non-empty "path" string.');
         }
 
         // NUL cannot exist in a real path and would only confuse the filesystem.
         if (path.includes('\u0000')) {
-            throw new HarnessError('fileWrite paths must not contain NUL characters.');
+            throw new HarnessError('write paths must not contain NUL characters.');
         }
 
         // Content is required, and an empty string is a legitimate "truncate the
         // file" request, so only the type and the binary marker are checked.
         if (typeof content !== 'string') {
-            throw new HarnessError('fileWrite files require a "content" string.');
+            throw new HarnessError('write files require a "content" string.');
         }
 
         // A NUL byte is the harness's own binary marker (read rejects it), so
@@ -143,7 +151,7 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
 
         if (content.includes('\u0000')) {
             throw new HarnessError(
-                `fileWrite content must not contain NUL characters (${target}): the file would be unreadable by read, which rejects binary content.`
+                `write content must not contain NUL characters (${target}): the file would be unreadable by read, which rejects binary content.`
             );
         }
 
@@ -155,7 +163,7 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
 
         if (seen.has(identity)) {
             throw new HarnessError(
-                `fileWrite received the same target path twice (${target}); write each file once per call.`
+                `write received the same target path twice (${target}); write each file once per call.`
             );
         }
 
@@ -169,8 +177,8 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
 // Authoritative registration/details for this preset (T13): the catalogue keeps
 // a synchronous data projection for lazy enumeration and a consistency test
 // asserts the two stay equal. Edit the metadata HERE.
-export const FILE_WRITE_METADATA: PresetToolMetadata = {
-    name: 'fileWrite',
+export const WRITE_METADATA: PresetToolMetadata = {
+    name: 'write',
     description:
         'Write one or more UTF-8 text files, creating parent directories as needed and overwriting existing files. Pass an array of { path, content } entries and get an ordered array of { path, bytes } in the same order. Every entry is validated before anything is written, and the same target path twice is rejected. A write error part-way through is reported with the paths already completed: there is no rollback.',
     tags: ['files', 'write', 'filesystem'],
@@ -207,7 +215,7 @@ export const FILE_WRITE_METADATA: PresetToolMetadata = {
 // Canonical discovery export (T19 / R9). A same-file alias of the literal above:
 // `../../core/tool-discovery.ts` follows the alias through the TypeScript AST, so
 // the constant above stays the single place this metadata is authored.
-export const metadata = FILE_WRITE_METADATA;
+export const metadata = WRITE_METADATA;
 
 // Harness registration policy (T19 / R9). A SEPARATE literal from `metadata`:
 // these fields are harness bookkeeping, not part of the Tool wire contract.
@@ -220,8 +228,8 @@ export const registration = {
     listed: false
 } as const;
 
-export const fileWrite = tool<FileWriteParameters, FileWriteResult>({
-    ...FILE_WRITE_METADATA,
+export const write = tool<FileWriteParameters, FileWriteResult>({
+    ...WRITE_METADATA,
     execute: async ({ parameters: files }) => {
         const prepared = await prepareWrites(files);
         const written: FileWriteResultEntry[] = [];
@@ -240,7 +248,7 @@ export const fileWrite = tool<FileWriteParameters, FileWriteResult>({
                 const reason = error instanceof Error ? error.message : String(error);
 
                 throw new HarnessError(
-                    `fileWrite failed on ${target}: ${reason} Writes already completed: ${completed}. No rollback was performed.`
+                    `write failed on ${target}: ${reason} Writes already completed: ${completed}. No rollback was performed.`
                 );
             }
 
