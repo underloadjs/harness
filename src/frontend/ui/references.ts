@@ -25,7 +25,7 @@
 // Cross-references:
 //   - ui/turns.ts      — `blocks()` supplies the real root+nested descriptors
 //   - ui/editor.ts     — chips serialize to these labels
-//   - main.ts          — popup, debounced fileGlob lookup, submit references
+//   - main.ts          — popup, debounced `glob` lookup, submit references
 
 import type { InlineChip } from './editor';
 import type { AgentResultBlock } from '../../shared/agent-results';
@@ -188,6 +188,10 @@ const escapeGlob = (value: string): string => value.replace(/([*?[\]{}])/g, '[$1
 //     basename pattern, listing files NAMED *src* instead of files INSIDE src.
 //
 // Glob magic in the query is escaped so a search cannot widen the walk.
+//
+// The WIRE tool this feeds is `glob` (the file-name half of the old two-mode
+// `fileGlob`); the helper keeps its historical name because the pattern shape it
+// builds is unchanged by the split — main.ts pairs it with `callTool('glob', …)`.
 export const fileGlobPattern = (query: string): string[] => {
     const trimmed = normalizeFileQuery(query);
     // Read the trailing slash BEFORE normalizeFileQuery strips it (see above).
@@ -204,7 +208,7 @@ export const fileGlobPattern = (query: string): string[] => {
 
 // --- @ folder rows -----------------------------------------------------------
 //
-// `fileGlob` only ever yields FILES (tools/files/glob.ts `walkFiles` recurses past
+// `glob` only ever yields FILES (src/tools/files/glob.tool.ts recurses past
 // directories), so the one source of folder rows is `fileList`: it reads ONE
 // directory non-recursively and marks directories with a trailing slash.
 //
@@ -291,9 +295,11 @@ export const filterFilePathList = (files: readonly string[], query: string): str
     return unique;
 };
 
-// `fileGlob` may answer either a bare filename list or a content result; the
-// mention picker only consumes filenames. Bounded to the first `limit` entries
-// (the server already applies its own maxResults cap).
+// `glob` answers exactly one shape, `{ files, truncated }` — the content mode that
+// used to make `fileGlob` answer a second shape is the separate `grep` tool now. The
+// defensive shape check stays: an error body or an older server may answer anything
+// else, and the picker must then show no rows rather than throw. Bounded to the
+// first `limit` entries (the server already applies its own maxResults cap).
 export const filePathsOf = (result: unknown, limit = 100): string[] => {
     if (typeof result !== 'object' || result === null) return [];
 

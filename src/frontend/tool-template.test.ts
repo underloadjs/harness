@@ -8,16 +8,23 @@
 // no tool would accept:
 //
 //   toolRequest -> { "tags": [], "limit": 0 }      (empty tags, 0 below the minimum)
-//   fileGlob    -> { "patterns": [], "paths": [], "content": "", "maxResults": 0 }
+//   glob        -> { "patterns": [], "paths": [], "maxResults": 0 }
 //
 // A pre-filled INVALID input is worse than an empty box: it looks like guidance.
 // The rule now is:
-//   - a curated example wins when one exists (toolRequest, syntaxCheck, fileGlob,
+//   - a curated example wins when one exists (toolRequest, syntax, glob, grep,
 //     the batched file tools);
 //   - otherwise only `required` properties are materialized, each taking the
 //     schema's `default`, then the first `enum` member, then a type-shaped value —
-//     so an optional `limit`/`content` is simply ABSENT and the tool applies its
+//     so an optional `limit`/`maxResults` is simply ABSENT and the tool applies its
 //     documented default.
+//
+// The fixtures below carry the CURRENT wire names and schemas: the rename made the
+// file tools `read` / `write` / `edit` / `fileList` / `glob` / `grep`, split the old
+// two-mode `fileGlob` (its `content` property is gone — a request that still sends
+// it is rejected), and turned `syntaxCheck` into `syntax` with a free-text
+// `language` (no enum: the tool normalizes aliases and errors on a language it has
+// no parser for).
 //
 // Nothing runs on selection: the box stays editable and the only request this file
 // makes is the boot document (asserted).
@@ -72,14 +79,16 @@ const TOOL_REQUEST = coreTool('toolRequest', {
     additionalProperties: false
 });
 
-// The real syntaxCheck schema: two required properties, with a language enum.
-const SYNTAX_CHECK = catalogueTool('syntaxCheck', {
+// The real syntax schema (src/tools/syntax/syntax.tool.ts): two required properties
+// and NO `enum` on `language` — it is a free-text name, so the schema alone can only
+// produce an empty string and the curated example is what makes the call valid.
+const SYNTAX = catalogueTool('syntax', {
     type: 'object',
     properties: {
         code: { type: 'string', description: 'Source code to check.' },
         language: {
             type: 'string',
-            enum: ['javascript', 'python'],
+            minLength: 1,
             description: 'Language to parse the snippet as.'
         }
     },
@@ -87,16 +96,33 @@ const SYNTAX_CHECK = catalogueTool('syntaxCheck', {
     additionalProperties: false
 });
 
-// The real fileGlob schema: four properties, every one optional. The bug produced
-// empty `patterns`/`paths`, `content: ""` and `maxResults: 0`.
-const FILE_GLOB = catalogueTool('fileGlob', {
+// The real glob schema (src/tools/files/glob.tool.ts): three properties, every one
+// optional, and NO `content` — the old `fileGlob` content mode is the `grep` tool
+// now, and a request that still sends `content` is rejected. The bug produced empty
+// `patterns`/`paths` and `maxResults: 0`.
+const GLOB = catalogueTool('glob', {
     type: 'object',
     properties: {
         patterns: { type: 'array', items: { type: 'string' }, description: 'Glob patterns.' },
         paths: { type: 'array', items: { type: 'string' }, description: 'Root directories to walk.' },
-        content: { type: 'string', description: 'Regular expression to match inside each file.' },
-        maxResults: { type: 'number', description: 'Maximum results. Defaults to 100.' }
+        maxResults: { type: 'number', description: 'Maximum files to return. Defaults to 100.' }
     },
+    additionalProperties: false
+});
+
+// The real grep schema (src/tools/files/grep.tool.ts): `pattern` is the one required
+// property, so WITHOUT the curated example the box would be `{"pattern": ""}` — an
+// empty regex source the tool rejects. This pins that a curated example beats the
+// required-only template even when the schema is technically satisfiable.
+const GREP = catalogueTool('grep', {
+    type: 'object',
+    properties: {
+        pattern: { type: 'string', minLength: 1, description: 'Regular-expression source.' },
+        patterns: { type: 'array', items: { type: 'string' }, description: 'Glob filter for files to read.' },
+        paths: { type: 'array', items: { type: 'string' }, description: 'Root directories to walk.' },
+        maxResults: { type: 'number', description: 'Maximum matching lines. Defaults to 100.' }
+    },
+    required: ['pattern'],
     additionalProperties: false
 });
 
@@ -156,7 +182,7 @@ const descriptor = {
     description: 'A general instruction-following agent.',
     requiresEndpoint: false,
     agents: ['instruct'],
-    tools: ['fileGlob'],
+    tools: ['glob'],
     coreTools: ['toolRequest', 'todoManage'],
     primary: 'instruct',
     subagents: [],
@@ -168,8 +194,9 @@ const TOOLS: readonly ToolDescriptor[] = [
     TOOL_REQUEST,
     TODO_MANAGE,
     WIDGET_MANAGE,
-    SYNTAX_CHECK,
-    FILE_GLOB,
+    SYNTAX,
+    GLOB,
+    GREP,
     CUSTOM_DEFAULTS
 ];
 
@@ -244,20 +271,26 @@ it('pre-fills every tool with an argument set that satisfies its schema', async 
     expect(JSON.parse(request)).toEqual({ tags: ['files', 'read'] });
     expect(request).not.toContain('limit');
 
-    // syntaxCheck: a real snippet and a valid language member.
-    const syntax = await argsFor('syntaxCheck');
+    // syntax: a real snippet and a language the tool actually parses. The schema
+    // alone could only offer `language: ""`, so this is the curated example winning.
+    const syntax = await argsFor('syntax');
     expect(JSON.parse(syntax)).toEqual({
         code: 'const answer = 42;\nconsole.log(answer);',
         language: 'javascript'
     });
 
-    // fileGlob: the documented pattern/root defaults, and neither the optional
-    // `content` (which would switch to content mode) nor `maxResults` (which would
-    // have been clamped from 0).
-    const glob = await argsFor('fileGlob');
+    // glob: the documented pattern/root defaults, and no `maxResults` (an absent one
+    // means the documented cap, while 0 would have been clamped). There is no
+    // `content` property in this schema any more, so the box cannot invent one.
+    const glob = await argsFor('glob');
     expect(JSON.parse(glob)).toEqual({ patterns: ['**/*'], paths: ['.'] });
     expect(glob).not.toContain('content');
     expect(glob).not.toContain('maxResults');
+
+    // grep: the required `pattern` gets a regex source that parses, not the empty
+    // string the required-only template would produce.
+    const grep = await argsFor('grep');
+    expect(JSON.parse(grep)).toEqual({ pattern: 'TODO|FIXME', patterns: ['*.ts'], paths: ['.'] });
 
     // The curated todoManage example is used verbatim: it carries the `text` that
     // the "add" action requires, which the schema alone cannot know.
@@ -277,7 +310,7 @@ it('pre-fills every tool with an argument set that satisfies its schema', async 
 it('leaves the arguments editable and executes nothing on selection', async () => {
     await toolMounted();
 
-    await argsFor('fileGlob');
+    await argsFor('glob');
 
     const box = document.querySelector<HTMLTextAreaElement>('.tool-card .tool-args');
     expect(box?.readOnly).toBe(false);

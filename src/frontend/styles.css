@@ -2951,14 +2951,84 @@ button {
     gap: 8px;
 }
 
-.agent-meta {
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 11px;
+/* R5: the block footer is NOT a metadata line any more — the model / stop reason /
+   token figures it used to print are measurements, and the block HEADERS already
+   carry theirs (`.tile-top`, `.thread-top`: `elapsed | tokens - state`). What the
+   end of an answer offers is one action: copy this block's final Markdown.
+   Right-aligned, so the control reads as an affordance of the answer above it and
+   the transcript's left column stays clean at every depth. */
+.agent-answer-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 6px;
+    margin-top: 4px;
 }
 
-.agent-meta:empty {
+/* Nothing completed to copy yet — the answer is still streaming, the block only
+   issued calls, or its text was cut short by an error/cancel. The row collapses
+   entirely instead of leaving a dead strip under the block. */
+.agent-answer-actions:empty {
     display: none;
+}
+
+/* The button is built by ui/dialog.ts (`createTextCopyButton`): a real <button>
+   with an aria-hidden inline SVG glyph, an aria-live feedback child and
+   `data-state` for success/error. These rules adapt it to the transcript —
+   quieter and smaller than the same control in a dialog header — and every one is
+   scoped through `.agent-answer-actions` on purpose: the shared specificity makes
+   them win over ui/dialog.css regardless of which stylesheet the bundle emits
+   last, so the footer look (and the copy feedback) never depends on load order. */
+.agent-answer-actions .answer-copy {
+    position: relative;
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+}
+
+/* The glyph is sized from the button so a stray SVG can never stretch the row. */
+.agent-answer-actions .answer-copy svg {
+    display: block;
+    width: 14px;
+    height: 14px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.agent-answer-actions .answer-copy:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
+}
+
+.agent-answer-actions .answer-copy:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* Written after `:hover` (same specificity) so the tick/cross tint survives while
+   the pointer is still on the button — colour only reinforces the glyph and the
+   announced word, it never replaces them. */
+.agent-answer-actions .answer-copy[data-state='success'] {
+    border-color: rgba(52, 211, 153, 0.65);
+    color: var(--ok);
+}
+
+.agent-answer-actions .answer-copy[data-state='error'] {
+    border-color: rgba(248, 113, 113, 0.65);
+    color: var(--danger);
 }
 
 .agent-error {
@@ -3073,7 +3143,12 @@ button {
     gap: 4px;
 }
 
+/* A chip is the positioning context for its OWN duration badge (R2). The badge is an
+   overlay in the top-right corner, so it must anchor to THIS box — not to the
+   `.tool-group` row, which is why the group is not the anchor. No `overflow: hidden`
+   anywhere on this box: an overlay that had to overhang would be clipped. */
 .tool {
+    position: relative;
     flex: 0 1 auto;
     max-width: 100%;
     border: 1px solid var(--border);
@@ -3109,6 +3184,35 @@ button {
     list-style: none;
 }
 
+/* R2: the duration badge overlays this corner, so the chip reserves the corner's full
+   width and the tool name can never slide underneath the pill. The reservation is
+   FIXED (not measured per value), which is what keeps the row still: the live label
+   repaints every 250ms and a final server span replaces it, and a reservation that
+   tracked the text would reflow the name on every step.
+
+   The width is sized from real Chrome geometry on the production chip (the pill is
+   `12px` of border+padding + `5.95px` per tabular character at its 9.5px mono with
+   `0.04em` letter-spacing), for the longest LEGITIMATE span:
+     `formatDuration` (ui/time.ts) has no hours unit, so minutes keep growing:
+       5 chars `4m12s`     -> pill 41.8px, needs 52px   (the old 46px was short here)
+       6 chars `59m59s`    -> pill 47.7px, needs 58px
+       7 chars `600m00s`   -> 10h   pill 53.6px, needs 64px
+       8 chars `5999m00s`  -> 99.98h pill 59.6px, needs 70px   <-- reserved for this
+   `8ch` is the SUMMARY's own `ch` (measured 6.75px vs the pill's 5.95px), so the
+   character budget already carries ~13% of slack for a substituted mono font, and
+   `+22px` is the pill's 12px chrome + its 4px inset from the chip's outer edge + a
+   6px gap between the last name glyph and the pill. Total 76px >= the 70px need.
+   Anything past 99 hours (9 chars, a hung call) is outside the budget and may reach
+   the name's ellipsis — the pill paints on its own background, and it is never
+   clipped, never truncated, never hidden, and no duration is ever invented.
+
+   The reservation stays conditional on a badge actually being painted, so a call with
+   an unknown span keeps its tighter width and the row stays compact. `:has()` is the
+   if-exists check; the badge is `[hidden]` in exactly that case anyway. */
+.tool:has(.tool-duration:not([hidden])) > .tool-summary {
+    padding-right: calc(8ch + 22px);
+}
+
 /* An opened card has room for the verbose summary line again. */
 .tool[open] > .tool-summary {
     gap: 8px;
@@ -3134,11 +3238,14 @@ button {
     outline-offset: -2px;
 }
 
-/* Collapsed chip = disclosure arrow + tool name only. Duration, the state word
-   and the argument preview are verbose metadata; they stay in the DOM (and in
-   the accessible `aria-label` on the summary) but are hidden until expanded. */
+/* Collapsed chip = disclosure arrow + tool name + duration badge. The state word
+   and the argument preview are verbose metadata; they stay in the DOM (and in the
+   accessible `aria-label` on the summary) but are hidden until expanded.
+   The duration badge is deliberately NOT in this list: a completed call already
+   knows its server-measured span, and "how long did that take?" has to be
+   answerable while scanning the collapsed row (R5). Unknown spans stay hidden by
+   their own `[hidden]` rule below, so this never paints an empty pill. */
 .tool:not([open]) .tool-state,
-.tool:not([open]) .tool-duration,
 .tool:not([open]) .tool-peek {
     display: none;
 }
@@ -3207,16 +3314,68 @@ button {
     color: var(--muted);
 }
 
-/* Elapsed/final call duration, e.g. `running 1.2s`, `ok 812ms`. */
+/* R2: the measured span as a BADGE OVERLAY in the chip's top-right corner
+   (`✓ read` with `0.8s` floating over the corner). Absolutely positioned against
+   `.tool`, which is the whole point of the overlay:
+   - one badge per chip, because each card owns its own `.tool-duration`;
+   - out of flow, so the live label (which changes every 250ms) and the final server
+     span that replaces it can change the pill's width without moving the name, the
+     arrow, or a single neighbouring chip — the row cannot jitter;
+   - `top`/`right` INSIDE the border box, so the pill is never clipped: `.tool`,
+     `.tool-summary` and `.tool-group` set no `overflow`, and the chip keeps its
+     rounded corner (the pill has its own radius);
+   - `pointer-events: none`, so hovering or clicking the badge is still hovering and
+     clicking the chip's disclosure.
+   Same pill vocabulary as `.thread-kind` / `.tile-thread` (1px `--border-strong`,
+   999px radius, mono, tabular figures), so no component library and no new
+   dependency. The text is already seconds with one decimal (`0.8s`), from
+   ui/tools.ts `formatToolDuration`; the old `·` separator is gone because the border
+   is the separator. The chip reserves this corner's width (see the `:has()` rule
+   above), so the badge never covers the tool name. */
 .tool-duration {
+    position: absolute;
+    z-index: 1;
+    top: 2px;
+    right: 3px;
+    display: inline-flex;
+    align-items: center;
+    max-width: calc(100% - 6px);
+    padding: 0 5px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    background: var(--bg-input);
     color: var(--muted);
+    font-family: var(--mono);
+    font-size: 9.5px;
+    line-height: 1.5;
+    letter-spacing: 0.04em;
+    pointer-events: none;
+    /* The live label changes every 250ms; tabular figures keep the pill's width
+       steady between `0.9s` and `1.0s`, so even the overlay does not twitch. */
     font-variant-numeric: tabular-nums;
+    white-space: nowrap;
 }
 
-.tool-duration:not(:empty)::before {
-    content: '·';
-    margin-right: 6px;
-    color: var(--border-strong);
+/* `[hidden]` is the ONLY suppression path, and it must beat the badge's own
+   `display` above — otherwise an unknown span (a legacy record with no
+   `eventTimes`, or a call that never returned) would paint an empty pill.
+   ui/tools.ts sets `duration.hidden` for exactly those cases; 0ms is a REAL span
+   and renders `0.0s`. */
+.tool-duration[hidden] {
+    display: none;
+}
+
+/* The badge takes the call's state colour, like the name and the glyph already do,
+   so the collapsed row stays scannable. Running keeps the neutral border/muted
+   text above; a cancelled call stays muted (it is history, not a failure). */
+.tool[data-state='ok'] .tool-duration {
+    border-color: rgba(74, 222, 128, 0.4);
+    color: var(--ok);
+}
+
+.tool[data-state='error'] .tool-duration {
+    border-color: rgba(248, 113, 113, 0.4);
+    color: var(--danger);
 }
 
 .tool-peek {
@@ -3247,6 +3406,73 @@ button {
     font-size: 10px;
     letter-spacing: 0.09em;
     text-transform: uppercase;
+}
+
+/* R3: one heading per pane — the section label with ITS OWN copy icon immediately
+   beside it. The button is a SIBLING of `.tool-label` (never a child), because the
+   label's text is a contract: transcript consumers and every status assertion read
+   `arguments` / `result · error` out of it, and a live "Copied" child inside the
+   label would corrupt that text. */
+.tool-heading {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+/* A pane-level copy sits on a 10px caption line, so it is a borderless 18px icon
+   rather than the boxed 28px action in a dialog header. It is still a real button
+   with a focus ring and the shared glyph repaint: ui/dialog.ts paints `data-state`
+   (tick / exclamation) plus the hidden live word, and the colours below only
+   reinforce what the glyph already says. */
+.tool-copy {
+    position: relative;
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+}
+
+/* The shared <svg> glyph, sized for this caption row (dialog.css sizes it 15px for
+   the header; the class is shared on purpose, only the metric differs). */
+.tool-copy .dialog-copy-icon {
+    width: 12px;
+    height: 12px;
+}
+
+.tool-copy:hover {
+    border-color: var(--border-strong);
+    background: var(--accent-soft);
+    color: var(--text);
+}
+
+.tool-copy:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.tool-copy[data-state='success'] {
+    color: var(--ok);
+}
+
+.tool-copy[data-state='error'] {
+    color: var(--danger);
+}
+
+/* The pane's live payload is the point of the dialog, so the copy control stays
+   legible on the small screen too — it never wraps away from its label. */
+.tool-heading > .tool-label {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
 }
 
 .tool-pending {
@@ -3691,6 +3917,104 @@ button {
     font-size: inherit;
     white-space: pre;
     tab-size: 4;
+}
+
+/* Tool-pane code viewer (R4) ------------------------------------------------
+   `.tool-code` is the <pre> built by ui/tools.ts for a tool call's arguments and
+   result, and it is the ONLY place `.code-line` rows exist. The shared `.code-block`
+   above keeps `overflow: auto` + `white-space: pre` for Markdown fences
+   (layout-containment.test.ts pins that base rule), so nothing here widens into the
+   general Markdown renderer.
+
+   What used to force a horizontal scrollbar: `.code-block code` preserves whitespace
+   and never wraps, so one long URL or one deep JSON string became a single run
+   wider than the pane, and `overflow: auto` answered with a sideways scrollbar —
+   inside the tool dialog and on a phone, where it also steals vertical room.
+
+   The fix is a per-line block with the wrap ON:
+     - the block stops preserving whitespace itself (`white-space: normal`), and each
+       ROW preserves its own (`pre-wrap`), so indentation and runs of spaces survive;
+     - `overflow-wrap: anywhere` is what breaks a 200-character URL that contains no
+       break opportunity at all;
+     - `overflow-x: hidden` is the belt: even a pathological token cannot open a
+       sideways scrollbar. Vertical scroll stays (`overflow-y: auto`, and the pane
+       heights come from the `.dialog-body > .tool-body` chain above);
+     - the two-class selectors are not decoration: ui/dialog.css sets
+       `.dialog-body pre { white-space: pre; overflow: auto }` and `pre` + class
+       beats a single class.
+
+   The rows themselves come from `splitIntoLines` (ui/tools.ts): one element per
+   LOGICAL line, joined by `.code-break` separators that carry the payload's own
+   '\n' for text fidelity and are removed from layout. */
+.tool-code.code-block {
+    padding: 6px 0 8px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    white-space: normal;
+    /* Framed surface: a 1px rule, a deeper well than the dialog body, and room for
+       the gutter rule to read as the edge of the text column. */
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--bg-deep);
+    /* One explicit metric for numbers and text: `--code-gutter` is measured in `ch`
+       of THIS font, so the number column and the text indent always agree. */
+    font: 12.5px/1.6 var(--mono);
+    tab-size: 4;
+}
+
+.tool-code code {
+    display: block;
+    padding: 0;
+    white-space: normal;
+    /* The counter the row numbers print from. One increment per ELEMENT, i.e. per
+       logical line — a row that soft-wraps into three visual lines is still numbered
+       once, and the next row continues the sequence. */
+    counter-reset: code-line;
+}
+
+.code-line {
+    position: relative;
+    display: block;
+    /* Text column starts clear of the number column; `--code-gutter` is set per pane
+       by ui/tools.ts from the row count, with 2ch as the floor. */
+    padding: 0 12px 0 calc(var(--code-gutter, 2ch) + 12px);
+    border-left: 1px solid var(--border);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    counter-increment: code-line;
+}
+
+/* The line number. GENERATED CONTENT ONLY, which is what keeps it out of every text
+   path: `code.textContent` stays byte-identical to the payload, a mouse selection
+   cannot pick a number up, and the Copy button never sees one ("line numbers are not
+   copied"). Absolutely positioned against its own row it pins to that row's FIRST
+   visual line, and the wrapped continuation lines keep flowing in the text column
+   because the gutter lives in the row's padding, which `pre-wrap` never wraps into.
+   `user-select: none` is the belt for browsers that do copy generated content. */
+.code-line::before {
+    content: counter(code-line);
+    position: absolute;
+    top: 0;
+    left: 1px;
+    width: var(--code-gutter, 2ch);
+    padding-right: 8px;
+    box-sizing: content-box;
+    color: var(--muted);
+    text-align: right;
+    user-select: none;
+}
+
+/* A blank source line still needs a line box, or its number would collapse to zero
+   height and the column would read as a gap in the numbering. */
+.code-line:empty::after {
+    content: '\00a0';
+}
+
+/* Carries the payload's '\n' for text fidelity and nothing else — see the note in
+   ui/tools.ts `createLineBreak`. Removing it from layout is what lets the rows be
+   blocks without doubling every line. */
+.code-break {
+    display: none;
 }
 
 /* highlight.js token palette, tuned to the app's dark surfaces. Layout colours
@@ -5089,6 +5413,8 @@ button {
         padding: 10px 11px 12px;
     }
 
+    /* Only the verbose preview goes away on a phone; the duration badge stays (R5
+       asks for the measured span on the collapsed chip at every width). */
     .tool-peek {
         display: none;
     }

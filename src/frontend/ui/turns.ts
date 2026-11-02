@@ -196,6 +196,11 @@ import { createAgentLabels } from './agent-label';
 // re-minting `RR1`. The board must consume the SAME parser and reservation rule.
 import { agentLabelParts } from '../../shared/agent-results';
 import type { AgentBlockDescriptor } from './references';
+// R5: the shared accessible Copy affordance (icon + success/error feedback + the
+// insecure-origin clipboard fallback that keeps an open dialog's focus trap alive).
+// It lives in ui/dialog.ts because the transcript, a tool dialog and a file preview
+// all copy text the same way; the tile only supplies the payload provider.
+import { createTextCopyButton } from './dialog';
 import { markdownFragment, plainPreview } from './markdown';
 import { elapsedBetween, formatDuration } from './time';
 import { formatTokens } from './tokens';
@@ -876,17 +881,46 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
 type AgentSection = {
     root: HTMLElement;
     flow: HTMLElement;
-    meta: HTMLElement;
+    // R5: the block FOOTER is the answer-action row (`.agent-answer-actions`), not a
+    // metadata line. The model / stop reason / token figures this row used to print
+    // are measurement facts, and the block HEADERS already carry them (`.tile-top`
+    // for the root, `.thread-top` for a nested invocation), so the bottom line was
+    // a duplicate. It now holds the single Copy action for this block's final
+    // answer and is empty (hence `display: none`, styles.css) until an answer has
+    // actually completed.
+    actions: HTMLElement;
     text: TextBlock | undefined;
     // The LAST closed prose block's cumulative buffer. `closeText` clears `text`
     // when a `done` ends the agent's message; retaining the buffer here is what
     // keeps the final answer available to the # reference descriptor (T8).
     lastText: string | undefined;
+    // R5: the block's FINAL answer — the raw Markdown of the last COMPLETED prose
+    // block of THIS invocation, which is exactly what the footer Copy action writes.
+    // Deliberately separate from `lastText`:
+    //   - `lastText` is written by every `closeText`, including the mid-response
+    //     close a `tool_call` causes, so it also tracks intermediate prose;
+    //   - `finalAnswer` is promoted only at a real completion boundary
+    //     (`attempt_commit` / `done`), so a partial answer that is still streaming,
+    //     or one cut short by an `error`/cancel, is never offered as final.
+    // A tool-only round leaves it untouched (it must not be replaced by ''), and a
+    // later message only REPLACES it when that message itself completes.
+    finalAnswer: string | undefined;
+    // The footer Copy button, created on the first promoted answer and kept for the
+    // life of the block (its payload is read at click time, so it never goes stale
+    // and never needs re-creating when the answer advances).
+    answerAction: HTMLButtonElement | undefined;
     reasoning: { details: HTMLDetailsElement; summary: HTMLElement; body: HTMLElement; buffer: string } | undefined;
     tools: ToolCallCard[];
     // Active wrapping row for consecutive tool calls, or undefined when the last
     // flow child was not a tool. Keeping the group alive across calls is what lets
     // `[websearch][read]` share a line; prose/reasoning/error resets it.
+    //
+    // R1: the row survives a MODEL BATCH boundary. `attempt_commit`, `done` and
+    // `wakeup` are scheduler lifecycle frames — nothing new is READABLE between the
+    // calls they separate — so four calls issued as two batches of two must still
+    // render as one wrapping flow, not two rows of two. Only something the reader
+    // actually sees (prose, reasoning, an error, a retry notice, a steer) breaks the
+    // run.
     toolGroup: HTMLElement | undefined;
     // `pending · name 1.2s` line for calls the SERVER still has in flight (R6).
     // Undefined means nothing is pending (or the server never reported it). It
@@ -921,6 +955,12 @@ type AgentSection = {
               // parent delegation) listed after a retry (F2).
               pendingEntries: PendingTool[];
               lastText: string | undefined;
+              // R5: the copy target as it was when this attempt opened, restored on
+              // discard. Promotion only ever happens at a completion boundary (which
+              // closes the window), so this is defensive bookkeeping: it keeps
+              // `finalAnswer` owned by the same rule as `lastText` instead of leaving
+              // one pointer that a retry can stale.
+              finalAnswer: string | undefined;
               // Thread keys THIS attempt minted (a `tool_call` for a delegation
               // queues a placeholder entry). Tracked by creation rather than by a
               // snapshot diff: a concurrently streaming sibling agent may mint its
@@ -2725,6 +2765,27 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     if (cardState === 'answered' || cardState === 'expired') continue;
                     card.setExpired(expiry);
                 }
+
+                // R5: a turn that ended NORMALLY completes whatever answer each block
+                // streamed, even a recording that never sent a `done`/`attempt_commit`
+                // frame for the last response — otherwise the footer Copy action would
+                // never appear for an answer the reader can see in full.
+                //
+                // `error` and `cancelled` deliberately skip this: an interrupted run's
+                // trailing prose is PARTIAL, and offering it as "the final answer" is
+                // exactly the mislabel R5 forbids. Those blocks keep whatever answer
+                // an earlier completed response promoted (or none at all).
+                if (next === 'done') {
+                    for (const entry of threads.values()) {
+                        // Only a prose block that is STILL LIVE needs this fallback: a
+                        // block the stream already closed was promoted by its own
+                        // `done`/`attempt_commit`. Reading `lastText` here instead
+                        // would re-promote a `done` message's content over the prose
+                        // the reader actually saw, and would happily promote prose an
+                        // `error` interrupted.
+                        promoteAnswer(entry.section, entry.section.text?.buffer);
+                    }
+                }
             } else {
                 // A non-terminal transition: clear a local end and tick while the task
                 // actually runs (R4 — `queued` deliberately does not start a clock).
@@ -2778,17 +2839,22 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             head.append(el('span', 'agent-name', label));
 
             const sectionFlow = el('div', 'agent-flow');
-            const agentMeta = el('div', 'agent-meta');
+            // R5: the footer row. It stays EMPTY until this block completes an
+            // answer, so a tool-only or still-streaming block paints no orphan
+            // control (`display: none` on `:empty`, styles.css).
+            const sectionActions = el('div', 'agent-answer-actions');
 
-            root.append(head, sectionFlow, agentMeta);
+            root.append(head, sectionFlow, sectionActions);
             container.append(root);
 
             return {
                 root,
                 flow: sectionFlow,
-                meta: agentMeta,
+                actions: sectionActions,
                 text: undefined,
                 lastText: undefined,
+                finalAnswer: undefined,
+                answerAction: undefined,
                 reasoning: undefined,
                 tools: [],
                 toolGroup: undefined,
@@ -3763,6 +3829,52 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             section.text = undefined;
         };
 
+        // R5: paint (or remove) this block's footer Copy action.
+        //
+        // The button exists ONLY while the block has a completed answer to copy:
+        // a still-streaming response, a tool-only block and an answer that was cut
+        // short by an error/cancel deliberately show nothing, so the affordance can
+        // never promise "the final answer" and deliver a partial one. Once created
+        // it stays for the life of the block, because the payload provider below is
+        // evaluated at click time — a later completed answer advances the clipboard
+        // text without re-creating the control (and without ever blanking it while a
+        // new response is still streaming).
+        const paintAnswerAction = (section: AgentSection): void => {
+            const copyable = section.finalAnswer !== undefined && section.finalAnswer.length > 0;
+            if (copyable === (section.answerAction !== undefined)) return;
+
+            if (section.answerAction === undefined) {
+                const button = createTextCopyButton({
+                    // Static accessible name: the label must not go stale when a
+                    // roster join repaints the block's agent code (`paintEntryLabel`).
+                    label: 'Copy the final answer',
+                    text: () => section.finalAnswer ?? '',
+                    className: 'answer-copy'
+                });
+                section.actions.append(button);
+                section.answerAction = button;
+                return;
+            }
+
+            section.answerAction.remove();
+            section.answerAction = undefined;
+        };
+
+        // R5: promote the prose of one COMPLETED model response to this block's
+        // final answer. Callers pass the buffer that closed at the boundary, or the
+        // terminal `done` message content (authoritative when the provider put the
+        // answer there instead of in streamed deltas).
+        //
+        // An empty/absent answer is a NO-OP rather than a reset: a round that only
+        // issued tool calls has no prose of its own, and the last real answer the
+        // reader can still see must stay copyable.
+        const promoteAnswer = (section: AgentSection, text: string | undefined): void => {
+            if (text === undefined || text.length === 0) return;
+
+            section.finalAnswer = text;
+            paintAnswerAction(section);
+        };
+
         // R9/T12d: render one steer into THIS tile's target surface. `sourceTurnId`
         // prevents an untargeted/self steer from being painted on another tile that
         // happens to scan the same audit. Child targets are resolved through the
@@ -3790,6 +3902,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             if (flowHasSteer(section.flow, key)) return true;
 
             closeText(section);
+            // R1: a steer is VISIBLE prose (the user's own guidance inserted into the
+            // conversation), so it breaks the chip run exactly like agent prose does —
+            // otherwise a later call would float back up into the row above the steer.
+            closeToolGroup(section);
             section.flow.append(createSteerNode(steer, key));
             return true;
         };
@@ -3813,20 +3929,29 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // End the current run of tool calls. The group node stays in the flow (its
         // cards belong to it); only the pointer is cleared so the next call is
         // appended to a fresh row after whatever broke the run.
+        //
+        // R1: this is for a VISIBLE break only — prose, reasoning, an error, a retry
+        // notice or a steer. Scheduler frames (`attempt_commit`, `done`, `wakeup`) do
+        // NOT call it: they add nothing readable between two calls, and clearing the
+        // pointer there is what split four consecutive calls into two rows of two.
         const closeToolGroup = (section: AgentSection): void => {
             section.toolGroup = undefined;
         };
 
         // Return the row consecutive calls should join, creating it lazily so no
-        // empty `.tool-group` ever sits in the flow between two prose blocks. A row
-        // created by the CURRENT attempt is tracked as attempt output, so a retry
-        // removes the (then empty) row with the cards it held.
+        // empty `.tool-group` ever sits in the flow between two prose blocks.
+        //
+        // R1: the row is deliberately NOT registered as attempt output. Because the
+        // pointer now survives `attempt_commit`/`done`/`wakeup`, one row can hold
+        // calls from several attempts, and discarding the row wholesale would delete
+        // calls an EARLIER attempt already committed. Ownership is therefore per
+        // CHIP (`appendTool` tracks `card.element`), and `discardAttempt` drops a row
+        // only once nothing is left in it.
         const toolGroupOf = (section: AgentSection): HTMLElement => {
             if (section.toolGroup === undefined) {
                 const group = el('div', 'tool-group');
                 section.flow.append(group);
                 section.toolGroup = group;
-                trackNode(section, group);
             }
 
             return section.toolGroup;
@@ -3878,12 +4003,18 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
         // Visible marker for a wakeup (R6). The agent resumed because pending work
         // progressed; this is NOT a completion, so nothing here resolves a card or
-        // changes the tile state. Closing the text block and the chip row means the
-        // post-wake prose and any new calls start below this line instead of being
-        // glued onto the pre-wake ones.
+        // changes the tile state.
+        //
+        // R1: the text block closes (the pre-wake prose is finished), but the chip
+        // ROW does not. A wake is a scheduler resume, not something the reader
+        // reads between two calls, so calls issued before and after it stay one
+        // wrapping flow. The marker is appended into the flow AFTER the row, and a
+        // later chip is appended INTO the row, so the visible order is
+        // `[all chips] → wakeup → pending`: the status line follows the merged row
+        // instead of splitting it, and nothing is re-created (one marker per frame,
+        // one chip per call — a replay rebuilds the projection from scratch).
         const appendWakeup = (section: AgentSection, pending: readonly HarnessPendingTool[]): void => {
             closeText(section);
-            closeToolGroup(section);
 
             const node = el('div', 'agent-wakeup');
             node.append(el('span', 'agent-wakeup-label', 'wakeup'));
@@ -4041,13 +4172,22 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 cards: [],
                 pendingEntries: [],
                 lastText: section.lastText,
+                // R5: the copy target is attempt-owned state exactly like `lastText`,
+                // so a discard rewinds both together (see `discardAttempt`).
+                finalAnswer: section.finalAnswer,
                 createdThreads: []
             };
         };
 
-        // Register one flow child as attempt output. Called by every appender that
-        // the MODEL's current attempt produces; UI chrome that another source owns
-        // (steer/action/wakeup/error markers) deliberately does not call it.
+        // Register one piece of this attempt's rendered output as discardable.
+        // Called by every appender the MODEL's current attempt produces; UI chrome
+        // that another source owns (steer/action/wakeup/error markers) deliberately
+        // does not call it.
+        //
+        // The node need not be a direct child of `.agent-flow`: a tool chip lives in
+        // the shared `.tool-group` row (R1), and that row may have been created by an
+        // EARLIER attempt, so ownership is tracked per node and removal detaches from
+        // whichever parent holds it (see `discardAttempt`).
         const trackNode = (section: AgentSection, node: HTMLElement): void => {
             section.attempt?.nodes.push(node);
         };
@@ -4097,11 +4237,27 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 entry.row?.remove();
             }
 
-            // Remove exactly the flow children this attempt appended. A steer, action
+            // Remove exactly the children this attempt appended. A steer, action
             // card, wakeup marker or error notice that landed meanwhile stays (F4),
             // and so does every committed turn of this agent.
+            //
+            // R1: removal is per NODE, from its own parent. A chip's parent may be a
+            // `.tool-group` row this attempt did NOT create (the row now survives
+            // `attempt_commit`/`done`/`wakeup`), and removing that ROW would delete
+            // calls an earlier attempt already committed. So only this attempt's own
+            // nodes are detached, and an emptied row is dropped separately below.
             for (const node of boundary.nodes) {
-                if (node.parentNode === section.flow) section.flow.removeChild(node);
+                const parent = node.parentNode;
+                if (parent === section.flow || (parent instanceof HTMLElement && parent.classList.contains('tool-group'))) {
+                    parent.removeChild(node);
+                }
+            }
+
+            // A row that held nothing but this attempt's calls is empty now: drop it,
+            // which is what "remove the row with the cards it held" used to mean.
+            // Rows that still contain committed chips are left alone.
+            for (const child of [...section.flow.children]) {
+                if (child.classList.contains('tool-group') && child.childElementCount === 0) child.remove();
             }
 
             // The status line is not attempt output, so it survived the removal above;
@@ -4110,8 +4266,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             if (section.pending !== undefined) section.flow.append(section.pending);
 
             section.reasoning = undefined;
+            // The pointer is dropped because this attempt's chips are gone; the row
+            // they lived in may still hold committed calls, and the NEXT call starts a
+            // fresh row after them.
             section.toolGroup = undefined;
             section.lastText = boundary.lastText;
+            // R5: the failed attempt never committed an answer, so the copy target
+            // rewinds with it (a promotion only ever happens at a commit boundary, so
+            // this is the safety net, not the normal path).
+            section.finalAnswer = boundary.finalAnswer;
+            paintAnswerAction(section);
             // Nothing from this attempt is live any more; the next attempt takes its
             // own boundary at its first output.
             section.attempt = undefined;
@@ -4133,17 +4297,26 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const commitAttempt = (section: AgentSection): void => {
             if (section.attempt === undefined) return;
 
+            // R5: the prose that closes HERE is a completed model response (this is
+            // the commit boundary), so it becomes the block's copyable final answer.
+            // Read the buffer BEFORE `closeText` drops the writer. A round that
+            // streamed no prose leaves the previous answer in place.
+            const completed = section.text?.buffer;
             // `closeText` flushes and retains `lastText` for the # descriptor, then
             // clears the pointer; the committed node itself is untouched.
             closeText(section);
             // Reasoning has no `lastText` contract: the committed `<details>` keeps
             // its text, only the writer is dropped so the next request mints its own.
             section.reasoning = undefined;
-            section.toolGroup = undefined;
-
+            // R1: the chip row is NOT closed. A commit is an invisible lifecycle
+            // boundary — the next request's calls have no readable output between
+            // them and these, so they join the same wrapping row.
+            //
             // The committed nodes/cards/placeholders stay live and stay owned by the
             // section; only the discard bookkeeping is dropped.
             section.attempt = undefined;
+
+            promoteAnswer(section, completed);
         };
 
         // One retry notice. Concise by design: the count, the backoff and the failed
@@ -4273,6 +4446,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
             section.tools.push(card);
             toolGroupOf(section).append(card.element);
+            // R1: the CHIP is the attempt-owned unit, not the row it sits in. The row
+            // may predate this attempt (it now survives `attempt_commit`/`done`/
+            // `wakeup`), so a discard removes this call and keeps the committed ones.
+            trackNode(section, card.element);
             // A new call must appear ABOVE the pending summary line, never below it.
             if (section.pending !== undefined) section.flow.append(section.pending);
             const pendingEntry: PendingTool = { card, section, entry, name, callId, startedAt };
@@ -4387,6 +4564,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // F5: this card is attempt output when the attempt window is open, so a
             // retry removes it AND decrements the count it just incremented.
             section.attempt?.cards.push(card);
+            // R1: same per-chip ownership as `appendTool` — the shared row it joins
+            // may belong to an earlier, already-committed attempt.
+            trackNode(section, card.element);
             updateMeta();
             return { entry: owner, section, callId: undefined };
         };
@@ -4685,6 +4865,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     const entry = route();
                     const section = entry.section;
                     const message = event.message;
+                    // R5: capture the prose that is about to close BEFORE the stream
+                    // writers are detached — this is the completed response's text.
+                    const streamed = section.text?.buffer;
                     closeText(section);
                     // R1/R3: a completed response closes the attempt window. Anything a
                     // LATER attempt appends is its own, so a retry must never discard
@@ -4695,37 +4878,35 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     // A provider can omit streamed deltas and put the answer only on
                     // the terminal message. Keep that answer as the block content too.
                     if (message.content.length > 0) section.lastText = message.content;
-                    // The agent turn is over: a later call in a new turn gets its
-                    // own row rather than joining calls from the finished turn.
-                    closeToolGroup(section);
-
-                    // `done` closes one *agent* turn, which may be a subagent
-                    // nested inside a tool call. The user turn only settles when
-                    // the stream itself ends, so the tile state is left alone.
+                    // R5: the block's copyable final answer is the prose that just
+                    // COMPLETED, i.e. exactly what the reader sees rendered in this
+                    // block. Only when nothing streamed (a provider that puts the
+                    // answer solely on the terminal message) does the `done` message
+                    // content become the target. A tool-only round supplies neither,
+                    // and the previous answer stays (an empty promotion is a no-op).
+                    promoteAnswer(
+                        section,
+                        streamed !== undefined && streamed.length > 0 ? streamed : message.content
+                    );
+                    // `done` closes one *agent* turn, which may be a subagent nested
+                    // inside a tool call. The user turn only settles when the stream
+                    // itself ends, so the tile state is left alone.
+                    //
+                    // R1: the chip row is deliberately NOT closed here. A `done` frame
+                    // is a lifecycle boundary with no readable output of its own (R5
+                    // removed the model/stop/tokens line that used to be painted into
+                    // the footer), so calls issued by the NEXT response keep wrapping in
+                    // the same row. Genuine prose — which is what used to make this line
+                    // worth breaking on — closes the row in `appendText`.
                     //
                     // Concurrency (R6): this response can be complete while its own
                     // calls are STILL RUNNING (`pending` non-empty). That is not a
                     // finish: the cards stay live, the agent is woken when outcomes
                     // land, and only the server's terminal turn status settles the
-                    // tile. `pending` is only rendered when present, so a legacy
-                    // response prints exactly the old line.
-                    const parts = [message.model, message.stopReason];
-                    if (message.toolCalls.length > 0) {
-                        parts.push(`${message.toolCalls.length} tool call${message.toolCalls.length === 1 ? '' : 's'}`);
-                    }
-                    if (message.usage !== undefined) parts.push(`${message.usage.total} tokens`);
-
+                    // tile. `pending` renders as its own status line, which the flow
+                    // keeps last.
                     const pending = pendingOf(event);
-                    if (pending !== undefined) {
-                        paintPending(section, pending);
-                        if (pending.length > 0) {
-                            parts.push(
-                                `${pending.length} tool${pending.length === 1 ? '' : 's'} still running`
-                            );
-                        }
-                    }
-
-                    section.meta.textContent = parts.join(' · ');
+                    if (pending !== undefined) paintPending(section, pending);
 
                     // Invocation status (R3). An interim response (pending work
                     // still running) stays `streaming`; a final one settles this

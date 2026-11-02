@@ -115,12 +115,13 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'threadFork',
             'actionRequest',
             'toolCancel',
-            'syntaxCheck',
+            'syntax',
             'read',
-            'fileWrite',
+            'write',
             'edit',
             'fileList',
-            'fileGlob',
+            'glob',
+            'grep',
             'shell',
             'gitDiff',
             'search',
@@ -446,7 +447,7 @@ describe('generated manifest parity (R9)', () => {
     });
 
     it('describes every package entry, and no folder entry', () => {
-        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(27);
+        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(28);
 
         for (const descriptor of BUILTIN_TOOL_DESCRIPTORS) {
             expect(descriptor.origin).toBe('package');

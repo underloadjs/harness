@@ -69,7 +69,13 @@ describe('createTurnBoard', () => {
         expect(turn.element.querySelector('.agent-text')?.innerHTML).toBe(
             '<h1>Hi</h1>\n<p>a <strong>b</strong></p>\n'
         );
-        expect(turn.element.querySelector('.agent-meta')?.textContent).toBe('');
+        // R5: the block footer is no longer a metadata line — the model / stop reason
+        // / token figures belong to the block HEADER. And this answer never COMPLETED
+        // (no `done`, no `attempt_commit`), so the footer has no Copy action yet: a
+        // streaming partial is never presented as the final answer.
+        expect(turn.element.querySelectorAll('.agent-meta')).toHaveLength(0);
+        expect([...(turn.element.querySelector('.agent-answer-actions')?.children ?? [])]).toEqual([]);
+        expect(turn.element.querySelector('.answer-copy')).toBeNull();
         expect(turn.element.querySelector('.tile-meta')?.textContent).toBe('1 agent');
     });
 
@@ -131,7 +137,15 @@ describe('createTurnBoard', () => {
         // to return from its tool call.
         turn.apply({ type: 'done', agent: 'helper', message: doneMessage('helper') });
         expect(turn.state()).toBe('streaming');
-        expect(agents[1]?.querySelector('.agent-meta')?.textContent).toBe('helper-model · stop');
+        // R5: the child block's footer no longer repeats `helper-model · stop`. It
+        // carries the Copy action for that block's own completed answer instead, and
+        // the button is an icon control (no visible word at idle).
+        expect(agents[1]?.querySelectorAll('.agent-meta')).toHaveLength(0);
+        const helperCopy = agents[1]?.querySelector<HTMLButtonElement>('.agent-answer-actions .answer-copy');
+        expect(helperCopy?.getAttribute('aria-label')).toBe('Copy the final answer');
+        expect(helperCopy?.textContent).toBe('');
+        // The root block streamed nothing, so its footer stays empty (no action).
+        expect(agents[0]?.querySelector('.answer-copy')).toBeNull();
 
         turn.setState('done', 'm1 · idle');
         expect(turn.state()).toBe('done');
@@ -1023,7 +1037,7 @@ describe('elapsed timing', () => {
 
         expect(
             [...turn.element.querySelectorAll<HTMLElement>('.tool-duration')].map((node) => node.textContent)
-        ).toEqual(['1.4s', '400ms']);
+        ).toEqual(['1.4s', '0.4s']);
     });
 
     it('leaves legacy records without a fabricated tool duration', () => {
@@ -1060,7 +1074,7 @@ describe('elapsed timing', () => {
             T + 750
         );
 
-        expect(turn.element.querySelector('.tool-duration')?.textContent).toBe('750ms');
+        expect(turn.element.querySelector('.tool-duration')?.textContent).toBe('0.8s');
     });
 
     // Consecutive calls must read as one compact row. jsdom cannot compute the
@@ -1498,9 +1512,15 @@ describe('background tools (R6)', () => {
         expect(turn.state()).toBe('streaming');
         expect(card(turn)?.getAttribute('data-state')).toBe('running');
         expect(turn.element.querySelector('.agent-pending')?.textContent).toBe('pending · read 1.2s');
-        expect(turn.element.querySelector('.agent-meta')?.textContent).toBe(
-            'writer-model · stop · 1 tool still running'
-        );
+        // R5: the completed response no longer prints `writer-model · stop · 1 tool
+        // still running` under the block. The footer is the answer action row, and the
+        // still-running fact stays where it belongs: the section's `pending ·` line
+        // above and the tile header's meta count below.
+        expect(turn.element.querySelectorAll('.agent-meta')).toHaveLength(0);
+        expect(turn.element.querySelector('.agent-answer-actions')?.textContent).toBe('');
+        expect(
+            turn.element.querySelector<HTMLButtonElement>('.agent-answer-actions .answer-copy')?.title
+        ).toBe('Copy the final answer');
         expect(turn.element.querySelector('.tile-meta')?.textContent).toBe(
             '1 agent · 1 tool call · 1 tool still running'
         );
@@ -1622,7 +1642,7 @@ describe('background tools (R6)', () => {
         const cards = [...turn.element.querySelectorAll('details.tool')];
         expect(cards).toHaveLength(1);
         expect(cards[0].getAttribute('data-state')).toBe('ok');
-        expect(cards[0].querySelector('.tool-duration')?.textContent).toBe('900ms');
+        expect(cards[0].querySelector('.tool-duration')?.textContent).toBe('0.9s');
         expect(cards[0].querySelector('.tool-result code')?.textContent).toBe('ok');
     });
 
@@ -1761,5 +1781,453 @@ describe('background tools (R6)', () => {
         expect(turn.element.querySelector('.agent-wakeup')).toBeNull();
         expect(card(turn)?.getAttribute('data-state')).toBe('running');
         expect(turn.state()).toBe('streaming');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Tool grouping across model batches (R1)
+// ---------------------------------------------------------------------------
+//
+// A run of tool calls is ONE wrapping flow unless something the reader can
+// actually SEE separates it (prose, reasoning, an error, a retry notice, a
+// steer). `attempt_commit`, `done` and `wakeup` are scheduler frames: they add
+// no readable output between two calls, so they must not split four consecutive
+// calls into two rows of two. jsdom cannot compute the flex layout, so the DOM
+// boundary IS the contract: one `.tool-group` child of `.agent-flow` holding
+// every chip in call order (styles.css flows and wraps its children).
+describe('tool grouping across model batches (R1)', () => {
+    const start = (): HarnessEvent => ({ type: 'start', agent: 'writer', model: 'm1' });
+
+    const call = (id: string, name = 'read'): HarnessEvent => ({
+        type: 'tool_call',
+        agent: 'writer',
+        call: { id, name, arguments: '{}' }
+    });
+
+    const result = (id: string, content = 'tool output'): HarnessEvent => ({
+        type: 'tool_result',
+        agent: 'writer',
+        name: 'read',
+        callId: id,
+        content,
+        isError: false
+    });
+
+    // The success boundary of one model request (R3/F1). It carries no visible
+    // output of its own, which is the whole point of the grouping rule.
+    const commit = (): HarnessEvent => ({
+        type: 'attempt_commit',
+        agent: 'writer',
+        attempt: 1,
+        maxAttempts: 11
+    });
+
+    const responseDone = (fields: Record<string, unknown> = {}): HarnessEvent =>
+        ({ type: 'done', agent: 'writer', message: doneMessage('writer'), ...fields }) as unknown as HarnessEvent;
+
+    const wake = (pending: Record<string, unknown>[]): HarnessEvent =>
+        ({ type: 'wakeup', agent: 'writer', reason: 'pending-tools', pending }) as unknown as HarnessEvent;
+
+    const record = (events: HarnessEvent[]): SessionTurn => ({
+        id: 'turn-1',
+        index: 0,
+        prompt: 'batched',
+        status: 'done',
+        startedAt: 5,
+        updatedAt: 10,
+        events
+    });
+
+    // Every wrapping row in the block, as the chip names it contains.
+    const rows = (turn: { element: HTMLElement }): string[][] =>
+        [...turn.element.querySelectorAll('.agent-flow > .tool-group')].map((row) =>
+            [...row.querySelectorAll('.tool-name')].map((name) => name.textContent ?? '')
+        );
+
+    const flowClasses = (turn: { element: HTMLElement }): string[] =>
+        [...(turn.element.querySelector('.agent-flow')?.children ?? [])].map((child) => child.className);
+
+    it('keeps four consecutive calls from two model batches in one row', () => {
+        const { board } = mount();
+        const turn = board.begin('four calls');
+
+        turn.apply(start());
+        turn.apply(call('c1', 'websearch'));
+        turn.apply(call('c2', 'read'));
+        // Invisible batch boundary: the tool-calling request commits, and the
+        // follow-up request answers with two more calls and no prose.
+        turn.apply(commit());
+        turn.apply(call('c3', 'shell'));
+        turn.apply(call('c4', 'write'));
+
+        expect(rows(turn)).toEqual([['websearch', 'read', 'shell', 'write']]);
+        // One row, nothing else in the column, and no chip that escaped the row.
+        expect(flowClasses(turn)).toEqual(['tool-group']);
+        expect(turn.element.querySelectorAll('.agent-flow > details.tool')).toHaveLength(0);
+    });
+
+    it('keeps the row across a done that separates two batches', () => {
+        const { board } = mount();
+        const turn = board.begin('done between calls');
+
+        turn.apply(start());
+        turn.apply(call('c1', 'read'));
+        turn.apply(result('c1'));
+        turn.apply(responseDone());
+        turn.apply(call('c2', 'search'));
+
+        expect(rows(turn)).toEqual([['read', 'search']]);
+        expect(flowClasses(turn)).toEqual(['tool-group']);
+    });
+
+    it('merges calls across a wakeup and keeps the status markers after the merged row', () => {
+        const { board } = mount();
+        const turn = board.begin('woken batch');
+
+        turn.apply(start());
+        turn.apply(call('c1', 'read'));
+        // The response finished while its own call was still running (R6)…
+        turn.apply(responseDone({ pending: [{ callId: 'c1', name: 'read', elapsedMs: 1200 }] }));
+        // …and the wake resumes it with a further call, no prose in between.
+        turn.apply(wake([{ callId: 'c1', name: 'read', elapsedMs: 1200 }]));
+        turn.apply(call('c2', 'search'));
+
+        // The chips share one row; the wake marker and the pending snapshot FOLLOW
+        // the row (they never split it, and neither is duplicated by the merge).
+        expect(rows(turn)).toEqual([['read', 'search']]);
+        expect(flowClasses(turn)).toEqual(['tool-group', 'agent-wakeup', 'agent-pending']);
+        expect(turn.element.querySelectorAll('.agent-wakeup')).toHaveLength(1);
+        expect(turn.element.querySelector('.agent-pending')?.textContent).toBe('pending · read 1.2s');
+        expect(turn.element.querySelectorAll('.agent-flow > details.tool')).toHaveLength(0);
+    });
+
+    it('splits the row when real prose separates the batches', () => {
+        const { board } = mount();
+        const turn = board.begin('prose between batches');
+
+        turn.apply(start());
+        turn.apply(call('c1', 'read'));
+        turn.apply(commit());
+        turn.apply({ type: 'text', agent: 'writer', delta: 'now I know' });
+        turn.apply(call('c2', 'search'));
+
+        expect(rows(turn)).toEqual([['read'], ['search']]);
+        expect(flowClasses(turn)).toEqual(['tool-group', 'markdown agent-text', 'tool-group']);
+    });
+
+    it('splits the row when reasoning separates the batches', () => {
+        const { board } = mount();
+        const turn = board.begin('reasoning between batches');
+
+        turn.apply(start());
+        turn.apply(call('c1', 'read'));
+        turn.apply(commit());
+        turn.apply({ type: 'reasoning', agent: 'writer', delta: 'checking' });
+        turn.apply(call('c2', 'search'));
+
+        expect(rows(turn)).toEqual([['read'], ['search']]);
+        expect(flowClasses(turn)).toEqual(['tool-group', 'thinking', 'tool-group']);
+    });
+
+    it('replays a batched recording into one row without duplicate chips', () => {
+        const { board } = mount();
+        const events = [start(), call('c1', 'websearch'), call('c2', 'read'), commit(), call('c3', 'shell')];
+        const [turn] = board.hydrate([record(events)]);
+
+        expect(rows(turn)).toEqual([['websearch', 'read', 'shell']]);
+        expect(turn.element.querySelectorAll('details.tool')).toHaveLength(3);
+
+        // The same record again (a poll/reconnect): the applied prefix matches, so
+        // nothing is re-rendered — one row, three chips, no duplicates.
+        turn.merge(record(events));
+        expect(rows(turn)).toEqual([['websearch', 'read', 'shell']]);
+        expect(turn.element.querySelectorAll('details.tool')).toHaveLength(3);
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Final answer copy action (R5)
+// ---------------------------------------------------------------------------
+//
+// The block footer is no longer a `model · stop · N tokens` line (the block
+// HEADERS keep those measurements). It carries one right-aligned, accessible
+// Copy action for THIS block's final answer: the raw Markdown of the last
+// COMPLETED prose of that invocation. A streaming partial, a tool-only round,
+// and an answer cut short by an error or a cancel are each pinned below.
+describe('final answer copy action (R5)', () => {
+    const start = (): HarnessEvent => ({ type: 'start', agent: 'writer', model: 'm1' });
+
+    const text = (delta: string, agent = 'writer'): HarnessEvent => ({ type: 'text', agent, delta });
+
+    const commit = (): HarnessEvent => ({
+        type: 'attempt_commit',
+        agent: 'writer',
+        attempt: 1,
+        maxAttempts: 11
+    });
+
+    const call = (id: string, name = 'read'): HarnessEvent => ({
+        type: 'tool_call',
+        agent: 'writer',
+        call: { id, name, arguments: '{}' }
+    });
+
+    const result = (id: string, content = 'tool output'): HarnessEvent => ({
+        type: 'tool_result',
+        agent: 'writer',
+        name: 'read',
+        callId: id,
+        content,
+        isError: false
+    });
+
+    // One completed agent response. `content` is the terminal message content, so a
+    // test can state whether the provider streamed deltas or answered on the frame.
+    const answerDone = (content: string, agent = 'writer'): HarnessEvent => ({
+        type: 'done',
+        agent,
+        message: {
+            role: 'assistant',
+            content,
+            reasoning: '',
+            toolCalls: [],
+            model: `${agent}-model`,
+            stopReason: 'stop'
+        }
+    });
+
+    const record = (
+        status: 'done' | 'error' | 'cancelled',
+        events: HarnessEvent[]
+    ): SessionTurn => ({
+        id: 'turn-1',
+        index: 0,
+        prompt: 'the task',
+        status,
+        startedAt: 5,
+        updatedAt: 10,
+        events
+    });
+
+    const copyButton = (scope: ParentNode): HTMLButtonElement | null =>
+        scope.querySelector<HTMLButtonElement>('.agent-answer-actions .answer-copy');
+
+    // jsdom's navigator has no clipboard, so every copy test states the async API
+    // and asserts the EXACT strings it received. ui/dialog.ts owns the write path
+    // and its insecure-origin fallback (dialog-copy.test.ts); what is pinned here
+    // is which text the transcript hands it.
+    const setClipboard = (writeText: ((text: string) => Promise<void>) | undefined): void => {
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: writeText === undefined ? undefined : { writeText }
+        });
+    };
+
+    afterEach(() => setClipboard(undefined));
+
+    const settled = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+    // Click the action and return the clipboard payloads, in call order.
+    const copyPayloads = async (button: HTMLButtonElement | null): Promise<string[]> => {
+        if (button === null) throw new Error('missing copy action');
+
+        const written: string[] = [];
+        setClipboard(async (value: string) => {
+            written.push(value);
+        });
+
+        button.click();
+        await settled();
+        return written;
+    };
+
+    it('offers nothing while the answer streams and one the moment it completes', async () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(text('# Partial'));
+        turn.flush();
+
+        // The streamed half-answer is on screen, but it is not FINAL: no action.
+        expect(turn.element.querySelector('.agent-text')?.textContent).toBe('Partial\n');
+        expect(copyButton(turn.element)).toBeNull();
+        expect(turn.element.querySelector('.agent-answer-actions')?.childElementCount).toBe(0);
+
+        turn.apply(answerDone('# Partial'));
+        const button = copyButton(turn.element);
+        expect(button).not.toBeNull();
+        expect(await copyPayloads(button)).toEqual(['# Partial']);
+        // Success feedback lives in the button (glyph + `data-state`), and the
+        // accessible name never changes.
+        expect(button?.dataset.state).toBe('success');
+        expect(button?.getAttribute('aria-label')).toBe('Copy the final answer');
+    });
+
+    it('copies the raw Markdown of the last completed answer after several tool rounds', async () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        // Round 1: intermediate prose + a call, committed by `attempt_commit`.
+        turn.apply(text('first **draft**'));
+        turn.apply(call('c1'));
+        turn.apply(result('c1', 'tool output'));
+        turn.apply(commit());
+        // Round 2: the real answer, streamed as Markdown and closed by `done`.
+        turn.apply(text('# Title\n\n'));
+        turn.apply(text('- one\n'));
+        turn.apply(text('- two'));
+        turn.apply(answerDone('# Title\n\n- one\n- two'));
+
+        // Raw Markdown exactly as streamed: not the rendered HTML, not the prompt,
+        // not the tool output, and not the intermediate prose joined on the front.
+        expect(await copyPayloads(copyButton(turn.element))).toEqual(['# Title\n\n- one\n- two']);
+    });
+
+    it('keeps the older answer while a new one streams and advances it on completion', async () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(answerDone('A'));
+        const button = copyButton(turn.element);
+        expect(await copyPayloads(button)).toEqual(['A']);
+
+        // A later message arrives: the reader can still copy the completed answer
+        // (the action is not removed and the partial is never substituted for it).
+        turn.apply(text('B still streaming'));
+        expect(copyButton(turn.element)).toBe(button);
+        expect(await copyPayloads(copyButton(turn.element))).toEqual(['A']);
+
+        // Only its completion advances the target — and the same button carries it.
+        // (The terminal content agrees with the streamed prose, as it does in a real
+        // recording; the no-delta provider case is pinned separately below.)
+        turn.apply(text(' and done'));
+        turn.apply(answerDone('B still streaming and done'));
+        expect(copyButton(turn.element)).toBe(button);
+        expect(await copyPayloads(copyButton(turn.element))).toEqual(['B still streaming and done']);
+    });
+
+    it('falls back to the terminal message content when no deltas streamed', async () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        // The documented provider case: the answer arrives only on the terminal
+        // message, so that content IS what the block completed.
+        turn.apply(start());
+        turn.apply(answerDone('message only answer'));
+
+        expect(await copyPayloads(copyButton(turn.element))).toEqual(['message only answer']);
+    });
+
+    it('keeps the answer copyable through a tool-only round', async () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(answerDone('A'));
+        // A round with no prose of its own must not blank the target with ''.
+        turn.apply(call('c1'));
+        turn.apply(result('c1'));
+        turn.apply(commit());
+
+        expect(await copyPayloads(copyButton(turn.element))).toEqual(['A']);
+    });
+
+    it('promotes the answer a committed request ended without a done frame', async () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(text('committed **answer**'));
+        turn.apply(commit());
+
+        expect(await copyPayloads(copyButton(turn.element))).toEqual(['committed **answer**']);
+    });
+
+    it('offers nothing when the only answer is cut short by an error', () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(text('half an answer'));
+        turn.apply({ type: 'error', agent: 'writer', error: { message: 'provider failed' } });
+        turn.flush();
+
+        // The partial stays readable, but it is never labelled as the final answer.
+        expect(turn.element.querySelector('.agent-text')?.textContent).toBe('half an answer\n');
+        expect(copyButton(turn.element)).toBeNull();
+    });
+
+    it('keeps the last completed answer when a later response errors', async () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(answerDone('A'));
+        turn.apply(text('interrupted draft'));
+        turn.apply({ type: 'error', agent: 'writer', error: { message: 'provider failed' } });
+
+        expect(await copyPayloads(copyButton(turn.element))).toEqual(['A']);
+    });
+
+    it('offers nothing for a turn that ends cancelled or failed mid-answer', () => {
+        const { board } = mount();
+        const cancelled = board.hydrate([record('cancelled', [start(), text('half')])])[0];
+
+        expect(cancelled.element.querySelector('.agent-text')?.textContent).toBe('half\n');
+        expect(copyButton(cancelled.element)).toBeNull();
+
+        const [failed] = board.hydrate([record('error', [start(), text('half')])]);
+        expect(copyButton(failed.element)).toBeNull();
+    });
+
+    it('completes an answer recorded without a done frame when the turn ends normally', async () => {
+        const { board } = mount();
+        // An older recording whose last response was streamed but never closed by a
+        // `done`/`attempt_commit`: the normal end of the turn completes it.
+        const [turn] = board.hydrate([record('done', [start(), text('recorded answer')])]);
+
+        expect(turn.state()).toBe('done');
+        expect(await copyPayloads(copyButton(turn.element))).toEqual(['recorded answer']);
+    });
+
+    it('gives every agent block its own final answer', async () => {
+        const { board } = mount();
+        const turn = board.begin('delegate');
+
+        turn.apply(start());
+        turn.apply(answerDone('root answer'));
+        // A second agent in the same turn is its own block with its own answer.
+        turn.apply({ type: 'start', agent: 'helper', model: 'm2' });
+        turn.apply(text('child answer', 'helper'));
+        turn.apply(answerDone('child answer', 'helper'));
+
+        const buttons = [...turn.element.querySelectorAll('.agent-answer-actions .answer-copy')];
+        expect(buttons).toHaveLength(2);
+        // DOM order is block order: the primary section first, then the flat
+        // subagent section — each copies ONLY its own answer.
+        expect(await copyPayloads(buttons[0] as HTMLButtonElement)).toEqual(['root answer']);
+        expect(await copyPayloads(buttons[1] as HTMLButtonElement)).toEqual(['child answer']);
+    });
+
+    it('keeps the header measurements the footer used to duplicate', () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply({ type: 'usage', agent: 'writer', usage: { input: 150, output: 9, total: 159, cached: 140 } });
+        turn.setUsage({ input: 150, output: 9, total: 159, cached: 140 });
+        turn.apply(answerDone('A'));
+
+        // R5 removed the footer line ONLY: the header still reports the model
+        // (section `data-model`), the token tally and the state word.
+        expect(turn.element.querySelectorAll('.agent-meta')).toHaveLength(0);
+        expect(turn.element.querySelector('.agent-answer-actions')?.textContent).toBe('');
+        expect(turn.tokens()).toBe('150 (140)');
+        expect(turn.element.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(false);
+        expect(turn.element.querySelector('.tile-status-text')?.textContent).toBe('streaming');
+        expect(turn.element.querySelector('.agent')?.getAttribute('data-model')).toBe('m1');
     });
 });

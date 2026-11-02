@@ -181,12 +181,13 @@ describe('live toolbox harness', () => {
             'delegate',
             'threadFork',
             'toolCancel',
-            'syntaxCheck',
+            'syntax',
             'read',
-            'fileWrite',
+            'write',
             'edit',
             'fileList',
-            'fileGlob',
+            'glob',
+            'grep',
             'shell',
             'gitDiff',
             'timeNow',
@@ -218,9 +219,10 @@ describe('live toolbox harness', () => {
             'delegate',
             'threadFork',
             'read',
-            'fileWrite',
+            'write',
             'edit',
-            'fileGlob'
+            'glob',
+            'grep'
         ]);
 
         // toolRequest enabled it, so the very next request declares it exactly
@@ -240,9 +242,10 @@ describe('live toolbox harness', () => {
             'delegate',
             'threadFork',
             'read',
-            'fileWrite',
+            'write',
             'edit',
-            'fileGlob',
+            'glob',
+            'grep',
             'fetch'
         ]);
 

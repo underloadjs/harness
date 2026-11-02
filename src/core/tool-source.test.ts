@@ -453,7 +453,7 @@ import { tool } from ${JSON.stringify(CORE_ENTRY)};
 import { PRESET_TOOLS } from ${JSON.stringify(CATALOGUE_ENTRY)};
 
 export const catalogueProbe = tool({
-    ...PRESET_TOOLS.syntaxCheck,
+    ...PRESET_TOOLS.syntax,
     name: 'catalogueProbe',
     execute: () => true
 });

@@ -19,7 +19,7 @@
 //   - transport failure or a runaway loop truncates history and throws.
 
 import { describe, expect, it } from 'vitest';
-import { agent, harness, read, shell, syntaxCheck, tool, toolUi } from '@underload/harness';
+import { agent, harness, read, shell, syntax, tool, toolUi } from '@underload/harness';
 import type {
     HarnessEvent,
     HarnessStream,
@@ -163,12 +163,14 @@ describe('harness', () => {
         expect(writer.tools.read.name).toBe('read');
         expect(typeof writer.tools.read.execute).toBe('function');
         expect(writer.tools.shell.name).toBe('shell');
-        expect(writer.tools.syntaxCheck.name).toBe('syntaxCheck');
+        expect(writer.tools.syntax.name).toBe('syntax');
         // R18: everyday file access is core; the rest still waits for discovery.
         expect(writer.tools.read.visibility).toBe('core');
-        expect(writer.tools.fileWrite.visibility).toBe('core');
+        expect(writer.tools.write.visibility).toBe('core');
         expect(writer.tools.edit.visibility).toBe('core');
-        expect(writer.tools.fileGlob.visibility).toBe('core');
+        // Both halves of the split search are core: `glob` names files, `grep` reads them.
+        expect(writer.tools.glob.visibility).toBe('core');
+        expect(writer.tools.grep.visibility).toBe('core');
         expect(writer.tools.fileList.visibility).toBe('searchable');
         expect(writer.tools.shell.visibility).toBe('searchable');
         // ...so the first request declares exactly the core file tools plus the
@@ -187,9 +189,10 @@ describe('harness', () => {
             'agentResult',
             'threadFork',
             'read',
-            'fileWrite',
+            'write',
             'edit',
-            'fileGlob'
+            'glob',
+            'grep'
         ]);
     });
 
@@ -205,9 +208,9 @@ describe('harness', () => {
 
         await writer('look around');
 
-        // read/fileWrite/edit/fileGlob are core, so a "files" query only
-        // finds the searchable remainder. There is no fileSearch: fileGlob is the
-        // one search surface and it is already declared.
+        // read/write/edit/glob/grep are core, so a "files" query only
+        // finds the searchable remainder. There is no fileSearch: glob and grep are
+        // the two search surfaces and both are already declared.
         const fileSearch = JSON.parse((entry.messages[2] as { content: string }).content);
         expect(fileSearch.enabled).toEqual(['fileList']);
         expect(fileSearch.tools).toEqual([
@@ -220,22 +223,22 @@ describe('harness', () => {
         expect(fileSearch.matched).toBe(1);
         expect(fileSearch.omitted).toBe(0);
 
-        // "javascript" finds the searchable syntaxCheck; core fileGlob is excluded
-        // even though its description mentions JavaScript.
+        // "javascript" finds the searchable syntax; the core search tools are excluded
+        // even though grep's description mentions file contents.
         const syntaxSearch = JSON.parse((entry.messages[4] as { content: string }).content);
-        expect(syntaxSearch.enabled).toEqual(['syntaxCheck']);
+        expect(syntaxSearch.enabled).toEqual(['syntax']);
         expect(syntaxSearch.tools).toEqual([
             {
-                name: 'syntaxCheck',
-                description: expect.stringContaining('Check whether a code snippet parses'),
-                tags: ['code', 'syntax', 'javascript', 'python', 'validation']
+                name: 'syntax',
+                description: expect.stringContaining('Check whether a code snippet PARSES'),
+                tags: ['code', 'syntax', 'javascript', 'typescript', 'json', 'python', 'validation']
             }
         ]);
         expect(syntaxSearch.matched).toBe(1);
         expect(syntaxSearch.omitted).toBe(0);
 
         expect(writer.tools.read.visibility).toBe('core');
-        expect(writer.tools.syntaxCheck.visibility).toBe('searchable');
+        expect(writer.tools.syntax.visibility).toBe('searchable');
     });
 
     it('returns the whole tag union and ranks a second-tag hit first', async () => {
@@ -337,11 +340,7 @@ describe('harness', () => {
             scripted(
                 [
                     callTool('c1', 'toolRequest', '{"tags":["javascript"]}'),
-                    callTool(
-                        'c2',
-                        'syntaxCheck',
-                        '{"code":"const a = 1;","language":"javascript"}'
-                    ),
+                    callTool('c2', 'syntax', '{"code":"const a = 1;","language":"javascript"}'),
                     answer('valid')
                 ],
                 seen
@@ -352,8 +351,8 @@ describe('harness', () => {
         const writer = harness({ agents: { writer: entry } });
         const message = await writer('check this snippet');
 
-        // "javascript" enables syntaxCheck; the core file tools are already
-        // declared, and fileGlob is one of them, so discovery adds only syntaxCheck.
+        // "javascript" enables syntax; the core file tools are already
+        // declared, and glob/grep are two of them, so discovery adds only syntax.
         expect(declaredNames(seen[1])).toEqual([
             'toolRegistry',
             'toolRequest',
@@ -368,10 +367,11 @@ describe('harness', () => {
             'agentResult',
             'threadFork',
             'read',
-            'fileWrite',
+            'write',
             'edit',
-            'fileGlob',
-            'syntaxCheck'
+            'glob',
+            'grep',
+            'syntax'
         ]);
         expect((entry.messages[4] as { content: string }).content).toBe('true');
         expect(message.content).toBe('valid');
@@ -684,7 +684,7 @@ describe('harness', () => {
             // so the recovery hint lists exactly those and points at toolRequest
             // for the searchable remainder.
             content:
-                'Tool "nope" is not registered. Available tools: toolRegistry, toolRequest, toolList, toolManage, toolCreate, todoManage, profileManage, chapterManage, locationManage, agentManage, agentResult, threadFork, read, fileWrite, edit, fileGlob. Call toolRequest with capability tags to search the catalogue.'
+                'Tool "nope" is not registered. Available tools: toolRegistry, toolRequest, toolList, toolManage, toolCreate, todoManage, profileManage, chapterManage, locationManage, agentManage, agentResult, threadFork, read, write, edit, glob, grep. Call toolRequest with capability tags to search the catalogue.'
         });
     });
 

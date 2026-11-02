@@ -642,7 +642,7 @@ describe('read', () => {
         const directory = join(workdir, 'nested');
 
         await expect(read([directory])).rejects.toThrow(
-            `read cannot read "${directory}": it is a directory, not a file. Use fileList to list its entries, or fileGlob to find files inside it.`
+            `read cannot read "${directory}": it is a directory, not a file. Use fileList to list its entries, or glob to find files inside it.`
         );
     });
 

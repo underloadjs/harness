@@ -8,6 +8,8 @@
 //   - independent cards restore their own chip, never the composer;
 //   - `destroy` closes an orphaned dialog (no leaked focus trap/overlay);
 //   - model-written markup in arguments/results stays escaped text;
+//   - the dialog has NO whole-dialog Copy; each pane heading carries its own icon
+//     (the payloads themselves are pinned in ui/tool-copy.test.ts);
 //   - local paths in argument/result code become file links that request ONE
 //     bounded `read` window on click (never automatically), through either an
 //     injected reader or the default `callTool` adapter.
@@ -252,8 +254,11 @@ describe('tool detail dialog', () => {
 
         const code = dialog()?.querySelector('.tool-result code');
         expect(code?.textContent).toBe(payload);
-        // Above the cap the block is plain (no highlight spans) but complete.
-        expect(code?.innerHTML).toBe(payload);
+        // Above the cap the block is plain (no highlight spans) but complete, and the
+        // only elements in it are the viewer's own row scaffolding — one logical line.
+        expect(code?.innerHTML).toBe(`<span class="code-line">${payload}</span>`);
+        expect(code?.querySelectorAll('.code-line')).toHaveLength(1);
+        expect(code?.querySelectorAll('.code-break')).toHaveLength(0);
     });
 
     it('links local paths in argument/result code and previews only on click', async () => {
@@ -375,5 +380,84 @@ describe('tool detail dialog', () => {
         expect(dialog()?.querySelector('script')).toBeNull();
         expect(dialog()?.querySelector('img')).toBeNull();
         expect((window as unknown as { pwned?: unknown }).pwned).toBeUndefined();
+    });
+
+    it('gives each pane heading its own copy icon and no dialog-level copy', () => {
+        const card = mount(createToolCallCard('read', '{"paths":["a.ts"]}'));
+        clickSummary(card);
+
+        // R3: the tool dialog opts out of the whole-dialog Copy action entirely —
+        // the header keeps only the title and the dismiss control.
+        expect(dialog()?.querySelectorAll('.dialog-copy')).toHaveLength(0);
+        expect(dialog()?.querySelectorAll('.dialog-head > *')).toHaveLength(2);
+
+        const headings = dialog()?.querySelectorAll<HTMLElement>('.tool-heading');
+        expect(headings).toHaveLength(2);
+        expect(headings[0]?.querySelector('.tool-label')?.textContent).toBe('arguments');
+        expect(headings[0]?.querySelector('.tool-copy')?.getAttribute('aria-label')).toBe(
+            'Copy arguments'
+        );
+        expect(headings[1]?.querySelector('.tool-label')?.textContent).toBe('result · pending');
+        expect(headings[1]?.querySelector('.tool-copy')?.getAttribute('aria-label')).toBe('Copy result');
+
+        // The heading is the section's first child and the code view stays a DIRECT
+        // child of `.tool-section`, which is what the dialog's height chain and
+        // tool-chip-style.test.ts address.
+        const sections = dialog()?.querySelectorAll<HTMLElement>('.tool-section');
+        expect(sections?.[0]?.firstElementChild).toBe(headings?.[0] ?? null);
+        expect(sections?.[0]?.lastElementChild?.className).toBe('code-block tool-code');
+        expect(sections?.[1]?.lastElementChild?.className).toContain('tool-result');
+
+        // Both icons are real tab stops of the modal, so the focus trap reaches them
+        // (these are the exact criteria dialog.ts `focusablesWithin` applies).
+        const buttons = [...(dialog()?.querySelectorAll<HTMLButtonElement>('button') ?? [])];
+        expect(buttons.map((button) => button.getAttribute('aria-label'))).toEqual([
+            'Close',
+            'Copy arguments',
+            // The file link lives in the arguments code view, i.e. between the two
+            // headings — proof the pane controls stay inside their own section.
+            'Open a.ts',
+            'Copy result'
+        ]);
+        for (const label of ['Copy arguments', 'Copy result']) {
+            const control = buttons.find((button) => button.getAttribute('aria-label') === label);
+            expect(control?.disabled).toBe(false);
+            expect((control?.tabIndex ?? -1)).toBeGreaterThanOrEqual(0);
+            expect(control?.closest('[hidden]')).toBeNull();
+            expect(control?.closest('[inert]')).toBeNull();
+        }
+    });
+
+    it('keeps the pane copy controls alive across close and reopen (one write per click)', () => {
+        const calls: string[] = [];
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText: async (text: string): Promise<void> => void calls.push(text) }
+        });
+
+        try {
+            const card = mount(createToolCallCard('read', '{"paths":["a.ts"]}'));
+            card.resolve('RESULT', 'completed');
+            clickSummary(card);
+
+            const argumentsButton = dialog()?.querySelector<HTMLElement>(
+                '.tool-section:first-child .tool-copy'
+            );
+            argumentsButton?.click();
+
+            // The SAME node is adopted on reopen: the body moves in and back out, so
+            // the listener is never re-attached and a click can never write twice.
+            closeDialog();
+            expect(card.element.contains(argumentsButton ?? null)).toBe(true);
+            clickSummary(card);
+            expect(dialog()?.querySelector('.tool-section:first-child .tool-copy')).toBe(
+                argumentsButton ?? null
+            );
+            argumentsButton?.click();
+
+            expect(calls).toEqual(['{"paths":["a.ts"]}', '{"paths":["a.ts"]}']);
+        } finally {
+            Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+        }
     });
 });

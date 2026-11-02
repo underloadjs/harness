@@ -5,7 +5,7 @@
 //     inserts an atomic chip carrying the exact turn/thread binding;
 //   - labels are conversation-scoped: one label names one block (R5/R6), so the
 //     popup and the server's plain-text resolution cannot disagree;
-//   - `@` lookup uses the query-aware fileGlob call and inserts a path token (no
+//   - `@` lookup uses the query-aware `glob` call and inserts a path token (no
 //     bytes);
 //   - submitting sends `references` alongside the unchanged prompt text, including
 //     while the previous task is still running (the queued state);
@@ -128,7 +128,7 @@ type Call = { url: string; method: string | undefined; body: unknown };
 
 // Extra knobs for the FOLDER half of the @ lookup. `fileList` reads exactly ONE
 // directory (src/frontend/main.ts:2245 `scheduleFileLookup`) and is the only source
-// of folder rows — `fileGlob` recurses past directories — so a test must be able to
+// of folder rows - `glob` recurses past directories - so a test must be able to
 // both feed it entries and make it fail independently of the glob (which alone owns
 // the popup's error note).
 type StubFilesOptions = {
@@ -160,7 +160,7 @@ const stubServer = (
             if (url === '/api/models') return json({ models: ['m1'] });
             if (url === '/api/sessions' && method === 'POST') return json({ session }, 201);
 
-            if (url === '/api/tools/fileGlob' && method === 'POST') {
+            if (url === '/api/tools/glob' && method === 'POST') {
                 if (lookupError !== undefined) {
                     return json({ ok: false, error: { message: lookupError }, durationMs: 1 });
                 }
@@ -348,7 +348,7 @@ it('looks up files with a query-aware glob and inserts a pointer token', async (
     // The lookup is debounced; wait past the 160ms window.
     await new Promise((resolve) => setTimeout(resolve, 220));
 
-    const lookup = calls.find((call) => call.url === '/api/tools/fileGlob');
+    const lookup = calls.find((call) => call.url === '/api/tools/glob');
     expect(lookup?.body).toEqual({
         parameters: { patterns: ['**/*main*'], paths: ['.'], maxResults: 100 }
     });
@@ -498,7 +498,7 @@ it('normalizes ./ and backslash path queries for both lookup and filtering', asy
 
     await new Promise((resolve) => setTimeout(resolve, 220));
 
-    const lookup = calls.find((call) => call.url === '/api/tools/fileGlob');
+    const lookup = calls.find((call) => call.url === '/api/tools/glob');
     expect(lookup?.body).toEqual({
         parameters: { patterns: ['**/src/frontend*/**', '**/src/frontend*'], paths: ['.'], maxResults: 100 }
     });
@@ -541,7 +541,7 @@ it('does not offer cancelled legacy inline blocks in the # popup', async () => {
 });
 
 it('shows an explicit error when the file lookup fails', async () => {
-    stubServer(restored(), [], 'fileGlob exploded');
+    stubServer(restored(), [], 'glob exploded');
     await mount();
 
     const input = composer();
@@ -550,13 +550,13 @@ it('shows an explicit error when the file lookup fails', async () => {
 
     await new Promise((resolve) => setTimeout(resolve, 220));
 
-    expect(document.querySelector('.composer-popup-error')?.textContent).toBe('fileGlob exploded');
+    expect(document.querySelector('.composer-popup-error')?.textContent).toBe('glob exploded');
     expect(popupTokens()).toEqual([]);
 });
 
 // --- @ folder rows (folders first, then files) -------------------------------
 //
-// `fileGlob` recurses PAST directories (tools/files/glob.ts `walkFiles`), so the
+// `glob` recurses PAST directories (src/tools/files/glob.tool.ts walks file names only), so the
 // picker could never offer a folder. A SECOND request now runs in parallel after the
 // same 160ms debounce: `fileList` reads the typed scope's directory and its entries
 // ending in "/" become folder rows (ui/references.ts `folderPathsOf`), placed BEFORE
@@ -591,7 +591,7 @@ it('lists folders above files for an empty @ query', async () => {
     expect(calls.filter((call) => call.url === '/api/tools/fileList').map((call) => call.body)).toEqual([
         { parameters: { paths: ['.'], limit: 200 } }
     ]);
-    expect(calls.filter((call) => call.url === '/api/tools/fileGlob').map((call) => call.body)).toEqual([
+    expect(calls.filter((call) => call.url === '/api/tools/glob').map((call) => call.body)).toEqual([
         { parameters: { patterns: ['**/*'], paths: ['.'], maxResults: 100 } }
     ]);
 });
@@ -625,7 +625,7 @@ it('drills into a picked folder and re-scopes both lookups', async () => {
         { parameters: { paths: ['.'], limit: 200 } },
         { parameters: { paths: ['src'], limit: 200 } }
     ]);
-    expect(calls.filter((call) => call.url === '/api/tools/fileGlob').map((call) => call.body)).toEqual([
+    expect(calls.filter((call) => call.url === '/api/tools/glob').map((call) => call.body)).toEqual([
         { parameters: { patterns: ['**/*'], paths: ['.'], maxResults: 100 } },
         { parameters: { patterns: ['**/src/**'], paths: ['.'], maxResults: 100 } }
     ]);

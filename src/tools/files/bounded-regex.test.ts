@@ -1,7 +1,8 @@
 // tools/files/bounded-regex — a content matcher that cannot hang (T16).
 //
-// The defect this pins: fileGlob's `content` argument is a JavaScript regular
-// expression supplied by a caller, and JavaScript regexes backtrack. `(a+)+$`
+// The defect this pins: grep's `pattern` argument (the content half of the old
+// `fileGlob`) is a JavaScript regular expression supplied by a caller, and JavaScript
+// regexes backtrack. `(a+)+$`
 // against a 31-byte line of "a" plus "b" blocks the main thread for ~8 seconds, and
 // worse patterns are effectively unbounded, so one tool call could freeze the
 // harness. The fix runs the match loop inside `node:vm` with a real timeout.
@@ -10,7 +11,7 @@
 // parameter, so the bound is proven with a short deadline. Waiting out the 30-second
 // production budget would also exceed vitest's 15-second per-test timeout, so the
 // DEFAULT is pinned as a number and enforced through a mocked clock in
-// fileGlob.test.ts; the catastrophic-pattern stop itself is proven with an injected
+// grep.test.ts; the catastrophic-pattern stop itself is proven with an injected
 // short budget here.
 //
 // What is pinned:
@@ -71,7 +72,7 @@ describe('createBoundedLineMatcher', () => {
     });
 
     it('publishes a 30-second default matching budget', () => {
-        // The production budget fileGlob uses when nothing is injected. 30s is the
+        // The production budget grep uses when nothing is injected. 30s is the
         // ONLY matching bound: generous for a legitimate deep grep, still finite for
         // a catastrophic pattern.
         expect(MAX_CONTENT_MATCH_MILLIS).toBe(30_000);
@@ -112,7 +113,7 @@ describe('createBoundedLineMatcher', () => {
 
         expect(caught).toBeInstanceOf(HarnessError);
         expect((caught as HarnessError).message).toBe(
-            'fileGlob content pattern did not finish within its 150ms matching budget and was stopped. Simplify the pattern: nested quantifiers such as "(a+)+" can backtrack exponentially.'
+            'grep pattern did not finish within its 150ms matching budget and was stopped. Simplify the pattern: nested quantifiers such as "(a+)+" can backtrack exponentially.'
         );
     });
 

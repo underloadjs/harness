@@ -103,12 +103,13 @@ describe('tool catalogue', () => {
         const catalogue = createToolCatalogue({ websearch: keyless() });
 
         expect(catalogue.entries.map((entry) => entry.name)).toEqual([
-            'syntaxCheck',
+            'syntax',
             'read',
-            'fileWrite',
+            'write',
             'edit',
             'fileList',
-            'fileGlob',
+            'glob',
+            'grep',
             'shell',
             'gitDiff',
             'timeNow',

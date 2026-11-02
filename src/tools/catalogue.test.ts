@@ -2,12 +2,15 @@
 //
 // This file pins what a UI, a docs page, or toolRequest sees WITHOUT executing a
 // preset: the name order, the metadata validity rules, the batched file schemas,
-// and the unified fileGlob contract. It never calls an implementation — that is
-// the point of R1b.
+// and the two search surfaces. It never calls an implementation — that is the point
+// of R1b.
 //
 // T14: every wire name is `<namespace><action>`, and there are no legacy aliases.
 // A separate `searchFiles` tool no longer exists: fileGlob covers filename and
-// content search, so this file asserts its absence explicitly.
+// content search, so this file asserts its absence explicitly. The rename splits that
+// one tool in two — `glob` answers with NAMES and `grep` with matching LINES — and
+// `fileWrite` becomes `write` and `syntaxCheck` becomes `syntax`, again with no
+// aliases, so this file pins both halves separately.
 
 import { describe, expect, it } from 'vitest';
 import { toolParameterKey, normalizeTags } from '../core/tool';
@@ -17,12 +20,13 @@ import { presetTools } from './index';
 describe('preset catalogue', () => {
     it('lists the presets in a stable order', () => {
         expect(PRESET_TOOL_NAMES).toEqual([
-            'syntaxCheck',
+            'syntax',
             'read',
-            'fileWrite',
+            'write',
             'edit',
             'fileList',
-            'fileGlob',
+            'glob',
+            'grep',
             'shell',
             'gitDiff'
         ]);
@@ -30,8 +34,8 @@ describe('preset catalogue', () => {
     });
 
     it('publishes no legacy tool name at all', () => {
-        // The breaking part of T14: the old names are gone from the table, so a
-        // stale descriptor or a model guessing an old name cannot resolve.
+        // The breaking part of T14, and of the rename: the old names are gone from the
+        // table, so a stale descriptor or a model guessing an old name cannot resolve.
         const legacy = [
             'readFile',
             'writeFile',
@@ -39,6 +43,10 @@ describe('preset catalogue', () => {
             'listFiles',
             'globFiles',
             'searchFiles',
+            'fileWrite',
+            'fileGlob',
+            'fileSearch',
+            'syntaxCheck',
             'runCommand',
             'websearch',
             'requestTools',
@@ -80,35 +88,41 @@ describe('preset catalogue', () => {
         }
     });
 
-    it('publishes syntaxCheck as one searchable, language-named preset', () => {
-        expect(PRESET_TOOLS.syntaxCheck.tags).toEqual([
+    it('publishes syntax as one searchable, language-named preset', () => {
+        // R3: the language set grew (typescript/tsx/jsx/json joined javascript and
+        // python) and `language` is a free name, so the schema has NO enum — an
+        // unsupported name is a runtime error, which the description states.
+        expect(PRESET_TOOLS.syntax.tags).toEqual([
             'code',
             'syntax',
             'javascript',
+            'typescript',
+            'json',
             'python',
             'validation'
         ]);
-        expect(PRESET_TOOLS.syntaxCheck.parameters).toEqual({
+        expect(PRESET_TOOLS.syntax.parameters).toEqual({
             type: 'object',
             properties: {
                 code: { type: 'string', description: 'Source code to check.' },
                 language: {
                     type: 'string',
-                    enum: ['javascript', 'python'],
-                    description: 'Language to parse the snippet as.'
+                    minLength: 1,
+                    description:
+                        'Language to parse the snippet as. Parsers exist for javascript (js), typescript (ts), tsx, jsx, json, python (py, python3); an alias is matched case-insensitively and a leading dot is allowed. Any other name is an error.'
                 }
             },
             required: ['code', 'language'],
             additionalProperties: false
         });
-        expect(presetTools.syntaxCheck.visibility).toBe('searchable');
+        expect(presetTools.syntax.visibility).toBe('searchable');
     });
 
-    it('makes the four everyday file tools core and keeps fileList discoverable', () => {
-        // R18: read/write/edit/glob are declared on every request; fileList is the
+    it('makes the five everyday file tools core and keeps fileList discoverable', () => {
+        // R18: read/write/edit/glob/grep are declared on every request; fileList is the
         // occasional directory survey and still waits for toolRequest. Exactly the
         // approved set and no fileSearch alias.
-        for (const name of ['read', 'fileWrite', 'edit', 'fileGlob'] as const) {
+        for (const name of ['read', 'write', 'edit', 'glob', 'grep'] as const) {
             expect(PRESET_TOOLS[name].visibility).toBe('core');
             expect(presetTools[name].visibility).toBe('core');
         }
@@ -117,9 +131,9 @@ describe('preset catalogue', () => {
         expect(presetTools.fileList.visibility).toBe('searchable');
         expect(PRESET_TOOLS).not.toHaveProperty('fileSearch');
 
-        // syntaxCheck, shell and gitDiff share the same visibility default:
+        // syntax, shell and gitDiff share the same visibility default:
         // discovery is the only way to reach them.
-        for (const name of ['syntaxCheck', 'shell', 'gitDiff'] as const) {
+        for (const name of ['syntax', 'shell', 'gitDiff'] as const) {
             expect(presetTools[name].visibility).toBe('searchable');
         }
     });
@@ -128,7 +142,7 @@ describe('preset catalogue', () => {
         // This is the schema half of the batching contract: one property means the
         // single-property rule hands `execute` the array itself.
         expect(toolParameterKey(PRESET_TOOLS.read.parameters)).toBe('paths');
-        expect(toolParameterKey(PRESET_TOOLS.fileWrite.parameters)).toBe('files');
+        expect(toolParameterKey(PRESET_TOOLS.write.parameters)).toBe('files');
         expect(toolParameterKey(PRESET_TOOLS.edit.parameters)).toBe('edits');
 
         // R9: fileList is the exception — its paged contract needs `offset`/`limit`
@@ -142,19 +156,19 @@ describe('preset catalogue', () => {
         ]);
 
         expect(PRESET_TOOLS.read.parameters.required).toEqual(['paths']);
-        expect(PRESET_TOOLS.fileWrite.parameters.required).toEqual(['files']);
+        expect(PRESET_TOOLS.write.parameters.required).toEqual(['files']);
         expect(PRESET_TOOLS.edit.parameters.required).toEqual(['edits']);
         // fileList has no `required`: the documented default is ["."].
         expect('required' in PRESET_TOOLS.fileList.parameters).toBe(false);
 
         expect(PRESET_TOOLS.read.tags).toEqual(['files', 'read', 'filesystem']);
-        expect(PRESET_TOOLS.fileWrite.tags).toEqual(['files', 'write', 'filesystem']);
+        expect(PRESET_TOOLS.write.tags).toEqual(['files', 'write', 'filesystem']);
         expect(PRESET_TOOLS.edit.tags).toEqual(['files', 'edit', 'write', 'replace', 'filesystem']);
         expect(PRESET_TOOLS.fileList.tags).toEqual(['files', 'list', 'filesystem']);
     });
 
     it('pins the batched entry shapes', () => {
-        expect(PRESET_TOOLS.fileWrite.parameters).toEqual({
+        expect(PRESET_TOOLS.write.parameters).toEqual({
             type: 'object',
             properties: {
                 files: {
@@ -220,37 +234,53 @@ describe('preset catalogue', () => {
         });
     });
 
-    it('unifies glob and content search into one fileGlob tool', () => {
-        // One entry with FOUR properties, so the single-property rule does NOT
-        // apply and `execute` receives the whole object.
-        expect(PRESET_TOOLS.fileGlob.tags).toEqual([
-            'files',
-            'glob',
-            'search',
-            'grep',
-            'find',
-            'content',
-            'filesystem'
-        ]);
-        expect(Object.keys(PRESET_TOOLS.fileGlob.parameters.properties)).toEqual([
+    it('splits search into glob for names and grep for contents', () => {
+        // Both entries declare SEVERAL properties, so the single-property rule does
+        // NOT apply and `execute` receives the whole object.
+        expect(PRESET_TOOLS.glob.tags).toEqual(['files', 'glob', 'find', 'paths', 'filesystem']);
+        expect(Object.keys(PRESET_TOOLS.glob.parameters.properties)).toEqual([
             'patterns',
             'paths',
-            'content',
             'maxResults'
         ]);
-        // Every argument is optional: the documented defaults are ["**/*"] and ["."].
-        expect('required' in PRESET_TOOLS.fileGlob.parameters).toBe(false);
-        expect(toolParameterKey(PRESET_TOOLS.fileGlob.parameters)).toBeUndefined();
+        // Every glob argument is optional: the documented defaults are ["**/*"] and ["."].
+        expect('required' in PRESET_TOOLS.glob.parameters).toBe(false);
+        expect(toolParameterKey(PRESET_TOOLS.glob.parameters)).toBeUndefined();
 
-        // The description IS the contract the model reads, so the two result shapes
-        // and the mode rule have to be stated there.
-        expect(PRESET_TOOLS.fileGlob.description).toContain('{ files, truncated }');
-        // U11: the documented content-mode shape carries the per-match bounds, not
-        // top-level `textTruncated` (see fileGlob.ts FileGlobMatch).
-        expect(PRESET_TOOLS.fileGlob.description).toContain(
-            'matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget'
+        // The description IS the contract the model reads: one shape for glob, and no
+        // leftover `content` property that would resurrect the old mode switch.
+        expect(PRESET_TOOLS.glob.description).toContain('{ files, truncated }');
+        expect(PRESET_TOOLS.glob.description).toContain('names only, never file contents');
+        expect(PRESET_TOOLS.glob.parameters.properties).not.toHaveProperty('content');
+
+        expect(PRESET_TOOLS.grep.tags).toEqual([
+            'files',
+            'grep',
+            'search',
+            'content',
+            'regex',
+            'filesystem'
+        ]);
+        expect(Object.keys(PRESET_TOOLS.grep.parameters.properties)).toEqual([
+            'pattern',
+            'patterns',
+            'paths',
+            'maxResults'
+        ]);
+        // `pattern` is the one property with no default; omitting it is an error
+        // rather than a search that matches everything.
+        expect(PRESET_TOOLS.grep.parameters.required).toEqual(['pattern']);
+        expect(toolParameterKey(PRESET_TOOLS.grep.parameters)).toBeUndefined();
+
+        // U11: the content shape carries the per-match bounds, not a top-level
+        // `textTruncated` (see grep.tool.ts FileGrepMatch).
+        expect(PRESET_TOOLS.grep.description).toContain(
+            'Each hit is { path, line, text, textTruncated, bytes }'
         );
-        expect(PRESET_TOOLS.fileGlob.description).toContain('Does not read .gitignore files.');
+        expect(PRESET_TOOLS.grep.description).toContain(
+            '{ "matches": [...], "truncated": boolean, "bytes": number, "contentBudget": number }'
+        );
+        expect(PRESET_TOOLS.grep.description).toContain('use glob for that');
     });
 
     it('keeps gitDiff unchanged and every argument optional', () => {
@@ -262,8 +292,10 @@ describe('preset catalogue', () => {
 
     it('does not claim a sandbox or gitignore support it does not implement', () => {
         // The descriptions are the contract the model reads; wording that implies a
-        // fence must not creep in. .gitignore is explicitly documented as unread.
-        expect(PRESET_TOOLS.fileGlob.description).toContain('Does not read .gitignore files.');
+        // fence must not creep in. .gitignore is explicitly documented as unread by
+        // both search surfaces.
+        expect(PRESET_TOOLS.glob.description).toContain('Does not read .gitignore files');
+        expect(PRESET_TOOLS.grep.description).toContain('Does not read .gitignore files');
         expect(PRESET_TOOLS.gitDiff.description).toContain('Read-only');
         expect(PRESET_TOOLS.gitDiff.description).toContain('non-zero exit is data, not an error');
     });

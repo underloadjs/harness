@@ -1,7 +1,7 @@
 // Composer @ / # pure logic (T5 R1/R2).
 //
 // Pins the token grammar, the query-aware file glob, the @ folder rows (folders
-// come from `fileList`; `fileGlob` only yields files), the latest-label rule (the
+// come from `fileList`; `glob` only yields files), the latest-label rule (the
 // same rule the server applies to plain `#LABEL`) and the exact {turnId,
 // threadId?, label} metadata a reference chip carries into a submit.
 //
@@ -59,7 +59,7 @@ it('builds a narrowing glob instead of filtering a capped page', () => {
     // a folder row types (`@src/frontend/`), so only that folder's descendants are
     // candidates. The no-slash form above still means "name prefix".
     expect(fileGlobPattern('./src/frontend/')).toEqual(['**/src/frontend/**']);
-    // Windows-style separators normalize to the posix paths fileGlob returns.
+    // Windows-style separators normalize to the posix paths glob returns.
     expect(fileGlobPattern('.\\src\\frontend')).toEqual(['**/src/frontend*/**', '**/src/frontend*']);
     // Glob magic is escaped, so a query cannot widen the walk.
     expect(fileGlobPattern('a*b')).toEqual(['**/*a[*]b*']);
@@ -101,7 +101,7 @@ it('reads `fileList` entries tolerantly', () => {
     expect(fileListEntriesOf({ entries: [1, 'x', null] })).toEqual(['x']);
     // An error body / missing reply contributes no rows.
     expect(fileListEntriesOf(null)).toEqual([]);
-    // `fileGlob`-shaped replies are not `fileList` replies.
+    // `glob`-shaped replies are not `fileList` replies.
     expect(fileListEntriesOf({ files: [] })).toEqual([]);
 });
 

@@ -67,12 +67,13 @@ afterEach(() => {
 // The exact shipped source map: package presets then app tools (T25: the app half
 // is discovered from `src/server/tools/shared`, so its paths are the new ones).
 const EXPECTED_SOURCE_PATHS = {
-    syntaxCheck: 'tools/syntax/syntaxCheck.tool.ts',
+    syntax: 'tools/syntax/syntax.tool.ts',
     read: 'tools/files/read.tool.ts',
-    fileWrite: 'tools/files/fileWrite.tool.ts',
+    write: 'tools/files/write.tool.ts',
     edit: 'tools/files/edit.tool.ts',
     fileList: 'tools/files/fileList.tool.ts',
-    fileGlob: 'tools/files/fileGlob.tool.ts',
+    glob: 'tools/files/glob.tool.ts',
+    grep: 'tools/files/grep.tool.ts',
     shell: 'tools/command/shell.tool.ts',
     gitDiff: 'tools/command/gitDiff.tool.ts',
     timeNow: 'server/tools/shared/timeNow.tool.ts',

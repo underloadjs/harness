@@ -52,8 +52,8 @@ every tool the model asks for along the way.
 `search` here is a caller-supplied tool (searchable by default, so toolRequest
 enables it). The built-in opt-in `search` factory is core: when a key is
 configured it is declared on the first request. The bundled catalogue splits the
-same way (R18): `read`, `fileWrite`, `edit`, and `fileGlob` are core, while
-`fileList`, `shell`, `gitDiff`, and `syntaxCheck` are discovered through the
+same way (R18): `read`, `write`, `edit`, `glob`, and `grep` are core, while
+`fileList`, `shell`, `gitDiff`, and `syntax` are discovered through the
 core `toolRequest` tool — see [Tool discovery](#tool-discovery). The harness-owned
 `toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`,
 `locationManage`, `agentManage`, and `agentResult` (plus `delegate` when
@@ -297,8 +297,8 @@ loopback port (health, harness index, session POST, clean close).
 **Browser note.** Importing the browser root (or `./frontend`) evaluates no Node
 graph: `dist/underload-harness.browser.mjs` statically reaches only the library,
 shared and client chunks. The package tools are a documented Node-only exception —
-`read`/`fileWrite`/`edit`/`fileGlob`/`fileList`, `shell`, `gitDiff` and
-`syntaxCheck` are lazy chunks (`import()`) whose bodies use `node:fs`, `node:vm` and
+`read`/`write`/`edit`/`glob`/`grep`/`fileList`, `shell`, `gitDiff` and
+`syntax` are lazy chunks (`import()`) whose bodies use `node:fs`, `node:vm` and
 `node:child_process`. They are exported (the root is the same library surface) but a
 browser must not call them; the catalogue only loads a body when that tool is called,
 so ordinary browser imports stay Node-free.
@@ -314,10 +314,12 @@ tools/
   lazy.ts               builds a callable Tool whose body loads on first use
   runtime/              the harness-owned core entries (toolRequest, toolCreate,
                         todoManage, delegate, threadFork, …) — one *.tool.ts each
-  syntax/               syntaxCheck.tool.ts (javascript.ts + python.ts load on demand)
-  files/                read.tool.ts, fileWrite.tool.ts, edit.tool.ts,
-                        fileGlob.tool.ts (core, always declared), fileList.tool.ts
-                        (searchable by tag), glob.ts (shared walker)
+  syntax/               syntax.tool.ts (javascript.ts, typescript.ts, json.ts and
+                        python.ts load on demand)
+  files/                read.tool.ts, write.tool.ts, edit.tool.ts,
+                        glob.tool.ts + grep.tool.ts (both core, always declared),
+                        fileList.tool.ts (searchable by tag), glob.ts (shared walker),
+                        search.ts (the pattern/root rules both searches share)
   command/              shell.tool.ts, gitDiff.tool.ts
   websearch/            request.ts (bounds/errors), exa.ts, tavily.ts,
                         index.ts (createWebSearchTool — opt-in, per-harness)
@@ -474,7 +476,7 @@ harness({ tools: { read } });                // the model calls read
   That is why `read(['package.json'])` and a model call with
   `{ "paths": ["package.json"] }` reach the implementation identically — which is
   exactly what makes the batched file tools possible. Multi-property tools receive
-  the whole object, as `syntaxCheck({ code, language })` does.
+  the whole object, as `syntax({ code, language })` and `glob({ patterns })` do.
 - `execute` may throw. The harness turns the error into a tool result the model
   can read and recover from.
 - `agent`, `agents`, and `run` are **optional** in the tool context, because a
@@ -496,14 +498,14 @@ metadata. Selection is uncapped; the host bounds the persistent enabled set with
 `maxEnabledTools` (default 32), and core tools never spend that bound.
 
 Every harness also preloads the bundled preset catalogue by default (`presets:
-true`), so its tools are available with no imports at all. The four core file tools
-(`read`, `fileWrite`, `edit`, `fileGlob`) plus a configured `search` are
+true`), so its tools are available with no imports at all. The five core file tools
+(`read`, `write`, `edit`, `glob`, `grep`) plus a configured `search` are
 declared from the first request, together with the harness-owned `toolRequest`,
 `toolList`, `toolManage`, `toolCreate`, `todoManage`, `profileManage`,
 `chapterManage`, `locationManage`, `agentManage`, and `agentResult`
 (and `delegate` when subagents exist). `actionRequest` joins that set when
 `interaction` is configured, and `threadFork` when `forks.enabled` is true
-(the default). `fileList`, `shell`, `gitDiff`, `syntaxCheck`, and the app tools
+(the default). `fileList`, `shell`, `gitDiff`, `syntax`, and the app tools
 stay searchable. `toolList` is the name+description inventory of the live registry
 (enabled or not); `toolManage` is the source/path/edit surface described below.
 
@@ -544,7 +546,7 @@ claiming nothing matched. These entries are never enabled, never count against
 |---|---|
 | Query shape | `names` (exact, case-sensitive), `regex` (bare source or `/source/flags`), and `tags` are OR-ed into one union; each match appears once. An empty query enables nothing and returns the vocabulary. |
 | Tags | Trimmed, lowercased, deduplicated. Not required when `names` or `regex` is supplied. |
-| Default visibility | `'searchable'`. The core set is `read`/`fileWrite`/`edit`/`fileGlob`, a configured `search`, the harness-owned `toolRequest`/`toolList`/`toolManage`/`toolCreate`/`todoManage`/`profileManage`/`chapterManage`/`locationManage`/`agentManage`/`agentResult`, plus `delegate` on a primary with subagents, `actionRequest` when `interaction` is configured, and `threadFork` when forks are enabled. `fileList` is searchable. |
+| Default visibility | `'searchable'`. The core set is `read`/`write`/`edit`/`glob`/`grep`, a configured `search`, the harness-owned `toolRequest`/`toolList`/`toolManage`/`toolCreate`/`todoManage`/`profileManage`/`chapterManage`/`locationManage`/`agentManage`/`agentResult`, plus `delegate` on a primary with subagents, `actionRequest` when `interaction` is configured, and `threadFork` when forks are enabled. `fileList` is searchable. |
 | Core vs session-bound | `core` means always declared. Only the harness-owned set is `sessionBound` (needs a `sessionId` for a manual server call); core file tools and search run directly. |
 | Ranking | Exact requested names keep caller order. Name-regex hits follow, then tag matches ranked OR-style: a tool's rank is its **best single-tag score** — exact tag (4) > tag prefix (3) > tag substring (2) > name/description hit (1). More matching tags only breaks ties. |
 | Enabled bound | `maxEnabledTools` (default **32**) bounds the persistent SEARCHABLE enabled set at the model-turn boundary. Every selector kind (names, regex, tags) switches the set: this request's ordered matches lead, prior entries fill leftover capacity, overflow is `omitted`, and displaced prior names are `evicted`. Core tools are always declared and never count. |
@@ -755,13 +757,13 @@ groups related tools for discovery; the action is what the model calls.
 | `todoTools` | `todoManage` | core; always declared |
 | `delegate` | `delegate` | core; primary only, when subagents exist |
 | `readFile` | `read` | **batched and bounded**: `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` → `{ files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }` |
-| `writeFile` | `fileWrite` | **batched**: `({ path, content }[])` → `{ path, bytes }[]` |
+| `writeFile` / `fileWrite` | `write` | **batched**: `({ path, content }[])` → `{ path, bytes }[]` |
 | `editFile` | `edit` | **batched**: `({ path, oldString, newString, replaceAll? }[])` → `{ path, replacements, bytes }[]` |
 | `listFiles` | `fileList` | **paged**: `(paths?)` or `({ paths?, offset?, limit? })` → `{ entries, truncated, nextOffset, offset, limit, bytes, contentBudget }` |
-| `globFiles` + `searchFiles` | `fileGlob` | **unified**: filename mode, or content mode when `content` is supplied |
+| `globFiles` + `searchFiles` / `fileGlob` | `glob` (names) + `grep` (contents) | the one mode-switched tool is SPLIT: `glob` never reads file contents and has no `content` property, `grep` takes a required `pattern` and answers `{ matches, truncated, bytes, contentBudget }` |
 | `runCommand` | `shell` | unchanged shape |
 | `gitDiff` | `gitDiff` | unchanged (already `namespace`+`action` shape) |
-| `syntaxCheck` | `syntaxCheck` | unchanged (already `namespace`+`action` shape) |
+| `syntaxCheck` | `syntax` | renamed, and `language` is now a validated free name (javascript, typescript, tsx, jsx, json, python, plus aliases) instead of a two-value enum |
 | `websearch` | `search` | the **tool**; the `websearch` harness configuration field keeps its name |
 | `clock` | `timeNow` | app tool |
 | `wordCount` | `textCount` | app tool |
@@ -792,24 +794,26 @@ Shipped with the package, each usable standalone or registered on a harness:
 
 ```ts
 import {
-    syntaxCheck,
+    syntax,
     read,
-    fileWrite,
+    write,
     edit,
     fileList,
-    fileGlob,
+    glob,
+    grep,
     shell,
     gitDiff
 } from '@underload/harness';
 
-await syntaxCheck({ code: 'def f():\n    pass', language: 'python' }); // true
+await syntax({ code: 'def f():\n    pass', language: 'python' });  // true
+await syntax({ code: 'const a: number = 1;', language: 'ts' });     // true (typescript, tsx, jsx and json too)
 await read(['package.json']);                                   // { files: [{ path, content, … }], truncated, bytes, contentBudget }
-await fileWrite([{ path: 'notes.md', content: '# Notes' }]);         // [{ path, bytes }]
+await write([{ path: 'notes.md', content: '# Notes' }]);            // [{ path, bytes }]
 await fileList(['src', 'task']);                                    // { entries: ['src/a.ts', 'src/nested/', 'task/b.ts', ...], truncated, nextOffset, offset, limit, bytes, contentBudget }
 await fileList({ paths: ['src'], offset: 200, limit: 100 });        // page 2 of the same list
 await edit([{ path: 'a.ts', oldString: 'let x', newString: 'let y' }]);
-await fileGlob({ patterns: ['src/**/*.ts'] });                      // { files, truncated }
-await fileGlob({ patterns: ['*.ts'], content: 'TODO' });             // { matches, truncated }
+await glob({ patterns: ['src/**/*.ts'] });                          // { files, truncated } — names only
+await grep({ pattern: 'TODO', patterns: ['*.ts'] });                // { matches, truncated, bytes, contentBudget } — lines
 await gitDiff();                                                    // { exitCode, stdout, stderr, truncated, timedOut, stderrTruncated, aborted }
 await shell({ command: 'git status' });                        // { exitCode, stdout, stderr, truncated, timedOut, aborted }
 await shell({ command: 'npm test', timeoutMs: 600_000 });      // 1..600000 ms; tree killed on timeout
@@ -818,8 +822,8 @@ await shell({ command: 'npm test', timeoutMs: 600_000 });      // 1..600000 ms; 
 Each tool lives in its own file under a capability folder (`tools/syntax/`,
 `tools/files/`, `tools/command/`, and the harness-owned `tools/runtime/`), and the
 barrel also exports the preset set as `presetTools`. **Every new harness preloads
-that catalogue**: `read`, `fileWrite`, `edit`, and `fileGlob` are declared
-immediately (core), while `fileList`, `syntaxCheck`, `shell`, and `gitDiff`
+that catalogue**: `read`, `write`, `edit`, `glob`, and `grep` are declared
+immediately (core), while `fileList`, `syntax`, `shell`, and `gitDiff`
 cost context only after a toolRequest query enables them; `presets: false` turns
 the preload off.
 
@@ -849,7 +853,7 @@ never asks for `shell` never loads it. The published build turns each branch
 into a chunk next to `dist/underload-harness.mjs`; all of `dist/` is shipped, and
 `inlineDynamicImports` must stay off or the split is undone.
 
-**The file tools are batched.** `read`, `fileWrite`, `edit`, and `fileList`
+**The file tools are batched.** `read`, `write`, `edit`, and `fileList`
 each declare exactly ONE array property (`paths` / `files` / `edits`), so the
 single-property rule hands `execute` the array itself. A direct call and a model
 call therefore reach the same code:
@@ -857,7 +861,7 @@ call therefore reach the same code:
 ```ts
 await read(['a.ts', 'b.ts']);                                  // { files: [{ path, content, … }, …], … }
 await read([{ path: 'big.ts', startLine: 400, maxLines: 50 }]); // one bounded window
-await fileWrite([{ path: 'a.ts', content: 'a' }, { path: 'b.ts', content: 'b' }]);
+await write([{ path: 'a.ts', content: 'a' }, { path: 'b.ts', content: 'b' }]);
 await edit([{ path: 'a.ts', oldString: 'a', newString: 'b' }]);
 ```
 
@@ -890,7 +894,7 @@ malformed request, a range error, a directory, binary bytes in a chunk that was
 read, or any other filesystem error — rejects the whole call, so a partial answer
 can never look complete.
 
-`fileWrite` and `edit` validate **every** entry (shape, non-empty strings, no
+`write` and `edit` validate **every** entry (shape, non-empty strings, no
 NUL, unique target file) before the first write, and `edit` also reads and
 match-checks every file first, so one bad entry leaves every file untouched.
 Uniqueness is by **real file identity**, not spelling: on Windows `notes.txt` and
@@ -901,35 +905,44 @@ with the paths already completed: there is **no transaction and no rollback**.
 
 | Tool | Signatures | Result |
 |---|---|---|
-| `syntaxCheck` | `({ code, language: 'javascript' \| 'python' })` | `true` when the snippet parses; JavaScript is a classic script (no `import`/`export` or top-level await) |
+| `syntax` | `({ code, language: string })` — any name, validated at run time | `true` when the snippet parses and `false` when it does not. Parsers: `javascript` (a classic script, so no `import`/`export` or top-level await) and its `js` alias, `typescript`/`ts`, `tsx`, `jsx` (syntax diagnostics only — a type error still parses), `json` (strict; one leading BOM is ignored), and `python`/`py`/`python3`. Any other language is an ERROR that lists the supported set, never a verdict |
 | `read` | `(paths: (string \| { path, startLine?, startColumn?, maxLines? })[])` — non-empty | `{ files, truncated, bytes, contentBudget }`; one window per path, ordered; a missing path is an entry with `error: { code: 'ENOENT', message }` (empty content, 0 bytes), while a malformed request, directory, binary, or other I/O error rejects the whole call |
-| `fileWrite` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`, creating parent directories; duplicate target files rejected |
+| `write` | `(files: { path, content }[])` — non-empty | ordered `{ path, bytes }[]`, creating parent directories; duplicate target files rejected |
 | `edit` | `(edits: { path, oldString, newString, replaceAll? }[])` — non-empty | ordered `{ path, replacements, bytes }[]`; `oldString` must be unique unless `replaceAll`; exact-first matching with typographic-variant and trailing-whitespace fallbacks, line endings matched and preserved; all edits preflighted |
 | `fileList` | `(paths?)` — string or string[]; defaults to `["."]` | `string[]` of `dir/entry`, directories end with `/`; non-recursive |
-| `fileGlob` | `({ patterns?, paths?, maxResults? })` | filename mode: `{ files, truncated }`; caps at 100 |
-| `fileGlob` | `({ patterns?, paths?, content, maxResults? })` | content mode: `{ matches: [{ path, line, text }], truncated }`; caps at 100, matching time-bounded |
+| `glob` | `({ patterns?, paths?, maxResults? })` | `{ files, truncated }` — NAMES only, capped at 100; there is no `content` property any more |
+| `grep` | `({ pattern, patterns?, paths?, maxResults? })` | `{ matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }`; caps at 100 matches and 64 KiB of match text, matching time-bounded |
 | `shell` | `({ command, cwd? })` | `{ exitCode, stdout, stderr }` |
 | `gitDiff` | `({ ref?, staged?, paths?, cwd? })` | `{ exitCode, stdout, stderr, truncated, timedOut }`; read-only |
 
-**`fileGlob` is the one search surface.** Its mode is decided by the presence of
-`content`, which is documented in the tool description because a model reads that,
-not this table:
+**Search is two tools now, not one tool with two modes.** `fileGlob` used to
+switch between "which names match?" and "which lines match?" depending on whether the
+caller sent `content`; the rename split that responsibility so each capability is
+addressable by name, and there is no `fileSearch` alias either:
 
-- no `content` → `{ files: string[], truncated }` (glob matching only);
-- `content` → `{ matches: { path, line, text }[], truncated }` (a content grep
-  restricted to files matching `patterns`).
+- `glob({ patterns?, paths?, maxResults? })` → `{ files: string[], truncated }`
+  (glob matching only, and it never opens a file);
+- `grep({ pattern, patterns?, paths?, maxResults? })` →
+  `{ matches: { path, line, text, textTruncated, bytes }[], truncated, bytes, contentBudget }`
+  (a content search restricted to files matching `patterns`).
 
+Both share one walker, so the rules below apply to each of them.
 `patterns` (default `["**/*"]`) are OR-ed, and a pattern with no `/` also matches
 file names at any depth. A pattern is matched against each file's path **relative to
 the root that found it**, and results carry that root as their prefix, so
-`fileGlob({ paths: ['src'], patterns: ['**/*.ts'] })` returns `src/a.ts` and
+`glob({ paths: ['src'], patterns: ['**/*.ts'] })` returns `src/a.ts` and
 `src/nested/b.ts` (never an absolute path, and never a pattern matched against one).
 `paths` (default `["."]`) are walked in caller order; roots that resolve to the same
 directory (a symlink alias, or `src`/`SRC` on Windows) are walked once, and files are
 deduplicated by resolved identity while keeping the first root's prefix. The cap is
 global across every root.
-`.git`, `node_modules`, symlinks, binary files, and files over 1 MiB are skipped in
-content mode, and `.gitignore` is **not** read.
+`.git`, `node_modules`, symlinks, binary files, and files over 1 MiB are skipped by
+`grep`, and `.gitignore` is **not** read.
+
+`grep` bounds its OUTPUT as well as its time: each match `text` is cut to 1 KiB on a
+code-point boundary (`textTruncated` says when), and the whole call stops at a 64 KiB
+aggregate with `truncated: true`, so one match on a minified line cannot flood a tool
+response. `bytes` reports what the response consumed and `contentBudget` the fixed cap.
 
 Content matching is **time-bounded**: a JavaScript regex can backtrack
 exponentially (`(a+)+$` needs seconds on a 31-byte line), so the match loop runs in
@@ -941,17 +954,21 @@ search and the boundary is crossed once per file, not once per line).
 `gitDiff` runs a fixed `git diff` argv with no shell, colour, external diff
 drivers, or textconv, and never stages or commits.
 
-`syntaxCheck` never executes the code it checks. Its Python half needs a Python 3
+`syntax` never executes the code it checks. Its Python half needs a Python 3
 interpreter on `PATH` and throws if none is found — a missing interpreter is a
-setup problem, not a verdict of "invalid syntax". The JavaScript and Python
-parsers are imported on demand, so a check in one language never loads the other.
+setup problem, not a verdict of "invalid syntax", and the same rule covers an
+unsupported `language` and a non-string `code`: both throw, so `false` always means
+"this snippet did not parse". Every language module is imported on demand, so a
+JavaScript check never loads the TypeScript compiler, the compiler never loads the
+interpreter, and JSON needs neither.
 
-Every preset is tagged. The four core file tools are always declared, so a model
-reads/writes/edits/globs directly. `fileList` is found with `files`/`list`; a shell
-with `shell`, git with `git`, and syntax checks with `javascript`/`python`. Those
+Every preset is tagged. The five core file tools are always declared, so a model
+reads/writes/edits/lists names with `glob` and finds text with `grep` directly.
+`fileList` is found with `files`/`list`; a shell
+with `shell`, git with `git`, and syntax checks with `javascript`/`typescript`/`json`/`python`. Those
 searchable tools stay out of the context window until enabled.
 
-**These presets hold no sandbox.** `read`, `fileWrite`, `edit`,
+**These presets hold no sandbox.** `read`, `write`, `edit`,
 `shell`, and `gitDiff` act with the permissions of the host process. Run the
 harness inside a container, a worktree, or an account you are willing to have
 modified, or wrap `execute` to add a fence.
@@ -1825,7 +1842,8 @@ needs no extra variable when the service is running.
 
 The catalogue lives in `src/server/harnesses/`. Both entry points use it. Every **live**
 preset is built by the same factory (`src/server/harnesses/toolbox.ts`), so the registered
-toolbox is identical: all eight package tools (`syntaxCheck`, the five file tools,
+toolbox is identical: all nine package tools (`syntax`, the six file tools
+`read`/`write`/`edit`/`fileList`/`glob`/`grep`,
 `shell`, `gitDiff`), the app tools (`timeNow`, `textCount`, `diceRoll`,
 `noteSearch`, `textSummarize`), opt-in `search`, and the harness-owned core tools
 (`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`,
@@ -1833,9 +1851,9 @@ toolbox is identical: all eight package tools (`syntaxCheck`, the five file tool
 preset declares a subagent,
 `threadFork` when forks are enabled, and `actionRequest` when the host supplies an
 interaction handler).
-R18 splits declarations: the four core file tools and a
+R18 splits declarations: the five core file tools and a
 configured `search` are always declared, while `fileList`, `shell`,
-`gitDiff`, `syntaxCheck`, and the app tools are discovered. Choosing a harness
+`gitDiff`, `syntax`, and the app tools are discovered. Choosing a harness
 changes the agents, not the tools.
 
 Agent identities live in **`src/agents/`** as trusted `AgentProfile` values:
@@ -1981,12 +1999,13 @@ POST /api/tools/fileList   { "parameters": ["src", "task"] }
 { "type": "object", "properties": { "paths": { "type": "array", … } }, … }
 
 // a multi-property tool takes the whole object, because there is nothing to unwrap:
-POST /api/tools/fileGlob   { "parameters": { "patterns": ["**/*.ts"], "paths": ["src"] } }
+POST /api/tools/glob       { "parameters": { "patterns": ["**/*.ts"], "paths": ["src"] } }
+POST /api/tools/grep       { "parameters": { "pattern": "TODO", "patterns": ["*.ts"] } }
 POST /api/tools/toolRequest { "parameters": { "tags": ["files"] }, "sessionId": "…" }
 ```
 
-The single-property tools are `read`, `fileWrite`, `edit`, and `fileList`;
-`fileGlob`, `syntaxCheck`, `shell`, `gitDiff`, and every core tool carry several
+The single-property tools are `read`, `write`, `edit`, and `fileList`;
+`glob`, `grep`, `syntax`, `shell`, `gitDiff`, and every core tool carry several
 properties. `read`'s single `paths` property still accepts range objects as its
 ITEMS (`{ "paths": [{ "path": "big.ts", "startLine": 400, "maxLines": 50 }] }`), so
 per-file windows do not add a second top-level property and the unwrapping rule is
@@ -2250,7 +2269,7 @@ catalogue and appends `[unconfigured — …]` to an entry that needs a missing 
 
 **No sandbox.** The standalone server binds to `127.0.0.1` by default and has no
 CORS layer, which is what keeps a same-origin UI simple. It is still a process with
-the server's permissions: `workspace`, `shell`, `fileWrite`, and direct tool
+the server's permissions: `workspace`, `shell`, `write`, and direct tool
 calls can change the host. Do not expose it to a network you do not trust. The
 service host is stricter in transport but not in trust: `0.0.0.0` plus permissive
 CORS, with only the loopback/same-host Origin gate described above. Serving the
@@ -2465,7 +2484,7 @@ deployed UI — see “GitHub Pages” below). Requests with no `Origin` (curl,
 server-to-server) are allowed. That stops an arbitrary public web page from
 reading transcripts or driving tools **through a browser**, but it does not
 authenticate anyone who can reach the port directly. Combined with unsandboxed
-tools (`shell`, `fileWrite`, `toolCreate`), that means: bind the service to a
+tools (`shell`, `write`, `toolCreate`), that means: bind the service to a
 trusted network only, and prefer loopback (`host: '127.0.0.1'`) when the port is
 reachable from elsewhere. No global service host/CORS settings are changed by this
 package.

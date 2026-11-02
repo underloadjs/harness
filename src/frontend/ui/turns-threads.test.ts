@@ -337,7 +337,13 @@ describe('invocation thread entries', () => {
         expect(row.dataset.state).toBe('streaming');
         expect(row.querySelector('.thread-status')?.textContent).toBe('streaming');
         expect(row.querySelector('.agent-pending')?.textContent).toBe('pending · read 1.2s');
-        expect(row.querySelector('.agent-meta')?.textContent).toBe('helper-model · stop · 1 tool still running');
+        // R5: no `helper-model · stop · 1 tool still running` footer line. The child
+        // block gets its own answer action instead, so a reader can copy THIS
+        // invocation's completed answer (the interim `done` message) and not the
+        // parent's or the whole transcript's.
+        expect(row.querySelectorAll('.agent-meta')).toHaveLength(0);
+        expect(row.querySelector('.agent-answer-actions')?.textContent).toBe('');
+        expect(row.querySelector('.answer-copy')?.getAttribute('aria-label')).toBe('Copy the final answer');
 
         turn.apply({
             type: 'tool_result',
@@ -1524,5 +1530,88 @@ describe('invocation thread entries', () => {
         expect(after.querySelector('.thread-prompt')?.textContent).toBe('changed by the record\n');
         // The rebuilt header still shows the SAME code for that invocation.
         expect(after.querySelector('.thread-name')?.textContent).toBe('HR1');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// R5 — one Copy action per rendered agent block.
+//
+// "Final answer" is scoped to the block the control sits in: a delegated
+// invocation copies its OWN last completed answer (the prose that child streamed),
+// never the parent's answer, the delegation result text, the child's task prompt
+// or the whole transcript.
+// ---------------------------------------------------------------------------
+describe('per-block final answer copy (R5)', () => {
+    const setClipboard = (writeText: (text: string) => Promise<void>): void => {
+        Object.defineProperty(navigator, 'clipboard', {
+            configurable: true,
+            value: { writeText }
+        });
+    };
+
+    afterEach(() => {
+        Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
+    });
+
+    const settled = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
+
+    const copyPayloads = async (button: HTMLButtonElement | null): Promise<string[]> => {
+        if (button === null) throw new Error('missing copy action');
+
+        const written: string[] = [];
+        setClipboard(async (value: string) => {
+            written.push(value);
+        });
+
+        button.click();
+        await settled();
+        return written;
+    };
+
+    it('copies the child answer for the child block and the root answer for the tile', async () => {
+        const board = mount();
+        const turn = board.begin('delegate root');
+
+        turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
+        turn.apply(delegateCall('helper', 'long task', 'd1'));
+        turn.apply(
+            withThread(
+                { type: 'start', agent: 'helper', model: 'h1' },
+                { id: 't1', callId: 'd1', input: 'long task' }
+            )
+        );
+        // The child answers in Markdown, then its request completes.
+        turn.apply(withThread({ type: 'text', agent: 'helper', delta: '# child answer' }, { id: 't1' }));
+        turn.apply(
+            withThread(
+                { type: 'done', agent: 'helper', message: doneMessage('helper') },
+                { id: 't1' }
+            )
+        );
+        // The parent's authoritative result for the spawning call, then its own answer.
+        turn.apply({
+            type: 'tool_result',
+            agent: 'writer',
+            name: 'delegate',
+            callId: 'd1',
+            content: 'child said ok',
+            isError: false
+        });
+        turn.apply({ type: 'text', agent: 'writer', delta: 'root **answer**' });
+        turn.apply({ type: 'done', agent: 'writer', message: doneMessage('writer') });
+
+        const row = threadRows(turn)[0];
+        // Each block has its OWN action, and each writes only its own raw Markdown.
+        expect(row.querySelectorAll('.agent-answer-actions .answer-copy')).toHaveLength(1);
+        expect(await copyPayloads(row.querySelector('.answer-copy'))).toEqual(['# child answer']);
+        expect(await copyPayloads(turn.element.querySelector('.agent-answer-actions .answer-copy'))).toEqual([
+            'root **answer**'
+        ]);
+        // Neither action copies the other block's text, the delegation result or
+        // the child's task prompt.
+        const combined = await copyPayloads(row.querySelector('.answer-copy'));
+        expect(combined[0]).not.toContain('child said ok');
+        expect(combined[0]).not.toContain('long task');
+        expect(combined[0]).not.toContain('delegate root');
     });
 });

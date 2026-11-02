@@ -24,12 +24,13 @@ import { describe, expect, it } from 'vitest';
 import type { Tool } from '../types';
 import * as catalogue from '../tools/catalogue';
 import { PRESET_TOOL_NAMES, PRESET_TOOLS } from '../tools/catalogue';
-import * as syntaxEntry from '../tools/syntax/syntaxCheck.tool';
+import * as syntaxEntry from '../tools/syntax/syntax.tool';
 import * as fileReadEntry from '../tools/files/read.tool';
-import * as fileWriteEntry from '../tools/files/fileWrite.tool';
+import * as writeEntry from '../tools/files/write.tool';
 import * as fileEditEntry from '../tools/files/edit.tool';
 import * as fileListEntry from '../tools/files/fileList.tool';
-import * as fileGlobEntry from '../tools/files/fileGlob.tool';
+import * as globEntry from '../tools/files/glob.tool';
+import * as grepEntry from '../tools/files/grep.tool';
 import * as commandRunEntry from '../tools/command/shell.tool';
 import * as gitDiffEntry from '../tools/command/gitDiff.tool';
 import * as coreMetadata from './metadata';
@@ -208,11 +209,11 @@ type PresetEntry = {
 
 const presetEntries: PresetEntry[] = [
     {
-        key: 'syntaxCheck',
-        metadataName: 'SYNTAX_CHECK_METADATA',
-        sourcePath: '../tools/syntax/syntaxCheck.tool.ts',
-        metadata: syntaxEntry.SYNTAX_CHECK_METADATA,
-        tool: syntaxEntry.syntaxCheck
+        key: 'syntax',
+        metadataName: 'SYNTAX_METADATA',
+        sourcePath: '../tools/syntax/syntax.tool.ts',
+        metadata: syntaxEntry.SYNTAX_METADATA,
+        tool: syntaxEntry.syntax
     },
     {
         key: 'read',
@@ -222,11 +223,12 @@ const presetEntries: PresetEntry[] = [
         tool: fileReadEntry.read
     },
     {
-        key: 'fileWrite',
-        metadataName: 'FILE_WRITE_METADATA',
-        sourcePath: '../tools/files/fileWrite.tool.ts',
-        metadata: fileWriteEntry.FILE_WRITE_METADATA,
-        tool: fileWriteEntry.fileWrite
+        // Renamed from `fileWrite`; the metadata constant follows the new wire name.
+        key: 'write',
+        metadataName: 'WRITE_METADATA',
+        sourcePath: '../tools/files/write.tool.ts',
+        metadata: writeEntry.WRITE_METADATA,
+        tool: writeEntry.write
     },
     {
         key: 'edit',
@@ -243,11 +245,19 @@ const presetEntries: PresetEntry[] = [
         tool: fileListEntry.fileList
     },
     {
-        key: 'fileGlob',
-        metadataName: 'FILE_GLOB_METADATA',
-        sourcePath: '../tools/files/fileGlob.tool.ts',
-        metadata: fileGlobEntry.FILE_GLOB_METADATA,
-        tool: fileGlobEntry.fileGlob
+        // The two halves of the old `fileGlob`: names here, contents in grep below.
+        key: 'glob',
+        metadataName: 'GLOB_METADATA',
+        sourcePath: '../tools/files/glob.tool.ts',
+        metadata: globEntry.GLOB_METADATA,
+        tool: globEntry.glob
+    },
+    {
+        key: 'grep',
+        metadataName: 'GREP_METADATA',
+        sourcePath: '../tools/files/grep.tool.ts',
+        metadata: grepEntry.GREP_METADATA,
+        tool: grepEntry.grep
     },
     {
         key: 'shell',

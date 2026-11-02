@@ -4,9 +4,11 @@
 // directly) and registered on a harness (called by the model). File tools run
 // inside a temporary directory so they never touch the repository.
 //
-// T14: the four file tools are BATCHED (one array argument each) and fileGlob is
-// the single search surface (filename mode, or content mode when `content` is
-// supplied). Names follow `<namespace><action>`.
+// T14: the four file tools are BATCHED (one array argument each). The rename moved
+// `fileWrite` to `write`, split `fileGlob` into `glob` (names) and `grep` (lines), and
+// moved `syntax` to `syntax` — with no old names on the wire, so this file also
+// pins that the PUBLIC ENTRY exports the new names. Names follow
+// `<namespace><action>` except the two bare search verbs.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { mkdir, mkdtemp, rm } from 'node:fs/promises';
@@ -17,11 +19,12 @@ import {
     harness,
     shell,
     edit,
-    fileGlob,
+    glob,
+    grep,
     fileList,
     read,
-    fileWrite,
-    syntaxCheck
+    write,
+    syntax
 } from '@underload/harness';
 import type { HarnessStream, HarnessStreamEvent } from '@underload/harness';
 
@@ -34,6 +37,11 @@ const FILE_READ_CONTENT_BUDGET = 64 * 1024;
 // for the same lazy-loading reason as above.
 const FILE_LIST_CONTENT_BUDGET = 64 * 1024;
 const FILE_LIST_DEFAULT_LIMIT = 200;
+
+// Mirrors FILE_GREP_CONTENT_BUDGET in ./files/grep.tool for the same reason: grep is
+// the content half of the old fileGlob, and its aggregate budget is part of the
+// result shape a model reads.
+const FILE_GREP_CONTENT_BUDGET = 64 * 1024;
 
 // Repo-root Temp/, so fixtures never land in OS temp.
 const TEMP_ROOT = fileURLToPath(new URL('../../../../../Temp', import.meta.url));
@@ -74,40 +82,63 @@ const answer = (text: string): HarnessStreamEvent[] => [
     { type: 'done', stopReason: 'stop', toolCalls: [] }
 ];
 
-describe('syntaxCheck', () => {
+describe('syntax', () => {
     it('checks JavaScript when the caller names the language', async () => {
         await expect(
-            syntaxCheck({ code: 'const a = 1; function f() { return a; }', language: 'javascript' })
+            syntax({ code: 'const a = 1; function f() { return a; }', language: 'javascript' })
         ).resolves.toBe(true);
-        await expect(syntaxCheck({ code: 'const = ;', language: 'javascript' })).resolves.toBe(false);
+        await expect(syntax({ code: 'const = ;', language: 'javascript' })).resolves.toBe(false);
     });
 
     it('parses JavaScript as a classic script only', async () => {
         await expect(
-            syntaxCheck({ code: 'for (const x of [1]) { console.log(x); }', language: 'javascript' })
+            syntax({ code: 'for (const x of [1]) { console.log(x); }', language: 'javascript' })
         ).resolves.toBe(true);
         // Classic-script parser: import/export is module syntax.
-        await expect(syntaxCheck({ code: 'import x from "y";', language: 'javascript' })).resolves.toBe(
+        await expect(syntax({ code: 'import x from "y";', language: 'javascript' })).resolves.toBe(
             false
         );
     });
 
     it('checks Python when the caller names the language', async () => {
         await expect(
-            syntaxCheck({ code: 'def f(x):\n    return x + 1', language: 'python' })
+            syntax({ code: 'def f(x):\n    return x + 1', language: 'python' })
         ).resolves.toBe(true);
-        await expect(syntaxCheck({ code: 'def f(x) return x', language: 'python' })).resolves.toBe(
+        await expect(syntax({ code: 'def f(x) return x', language: 'python' })).resolves.toBe(
             false
         );
+    });
+
+    it('checks the languages the rename added, through the public entry', async () => {
+        // R3: TypeScript/TSX/JSX/JSON are reachable through `@underload/harness`, and
+        // the aliases a caller really types ("ts", ".tsx") resolve too.
+        await expect(syntax({ code: 'const a: number = 1;', language: 'ts' })).resolves.toBe(true);
+        await expect(syntax({ code: 'const a: number = 1;', language: '.ts' })).resolves.toBe(true);
+        await expect(syntax({ code: 'const el = <div />;', language: 'tsx' })).resolves.toBe(true);
+
+        // The DIALECT decides the grammar: the same JSX is a parse error in plain .ts.
+        await expect(
+            syntax({ code: 'const el = <div />;', language: 'typescript' })
+        ).resolves.toBe(false);
+        await expect(
+            syntax({ code: 'export const El = () => <div />;', language: 'jsx' })
+        ).resolves.toBe(true);
+
+        await expect(syntax({ code: '{"a":1}', language: 'json' })).resolves.toBe(true);
+        await expect(syntax({ code: '{"a":1,}', language: 'json' })).resolves.toBe(false);
+
+        // transpileModule reports SYNTAX diagnostics only, so a type error is a valid
+        // parse — the limit the description publishes.
+        await expect(syntax({ code: 'const a: number = "s";', language: 'ts' })).resolves.toBe(true);
     });
 
     it('does not execute the code it checks', async () => {
         // If either ran, it would create the file.
         await expect(
-            syntaxCheck({ code: 'open("executed.txt", "w").write("x")', language: 'python' })
+            syntax({ code: 'open("executed.txt", "w").write("x")', language: 'python' })
         ).resolves.toBe(true);
         await expect(
-            syntaxCheck({
+            syntax({
                 code: 'require("node:fs").writeFileSync("executed-js.txt", "x");',
                 language: 'javascript'
             })
@@ -155,27 +186,39 @@ describe('syntaxCheck', () => {
     });
 
     it('rejects an unsupported language instead of guessing', async () => {
-        // The schema's enum catches a model call; a direct call bypasses the
-        // schema, so the implementation refuses rather than returning a verdict.
-        await expect(syntaxCheck({ code: 'puts 1', language: 'ruby' as never })).rejects.toThrow(
-            'syntaxCheck requires language to be "javascript" or "python"; received "ruby".'
+        // R3: `language` has no schema enum any more, so BOTH a model call and a
+        // direct call are answered by the implementation — which refuses rather than
+        // returning a verdict for a language with no parser here.
+        await expect(syntax({ code: 'puts 1', language: 'ruby' as never })).rejects.toThrow(
+            'syntax supports javascript (js), typescript (ts), tsx, jsx, json, python (py, python3); received "ruby". A language outside that list has no parser here, so it is reported as an error rather than answered with a syntax verdict.'
         );
     });
 
     it('has a standard tool shape', () => {
-        expect(syntaxCheck.name).toBe('syntaxCheck');
-        expect(syntaxCheck.description).toContain('JavaScript');
-        expect(syntaxCheck.description).toContain('Python');
-        expect(syntaxCheck.parameters).toMatchObject({
+        expect(syntax.name).toBe('syntax');
+
+        // The description names every parser, in the case the schema uses, so a model
+        // selecting by description finds the language it actually has.
+        for (const language of ['javascript', 'typescript', 'tsx', 'jsx', 'json', 'python']) {
+            expect(syntax.description).toContain(`"${language}"`);
+        }
+
+        expect(syntax.parameters).toMatchObject({
             type: 'object',
             required: ['code', 'language']
         });
+
+        // R3: `language` stays a validated free string — no enum, because an
+        // unsupported name has to produce the tool's own error, not a schema rejection.
+        const syntaxParameters = syntax.parameters as { properties?: Record<string, unknown> };
+
+        expect(syntaxParameters.properties).not.toHaveProperty('language.enum');
     });
 });
 
 describe('file tools', () => {
     it('writes, reads, and lists with the batched arguments', async () => {
-        const written = await fileWrite([{ path: 'notes/hello.md', content: '# Hello' }]);
+        const written = await write([{ path: 'notes/hello.md', content: '# Hello' }]);
 
         expect(written).toEqual([{ path: join(workdir, 'notes', 'hello.md'), bytes: 7 }]);
 
@@ -214,8 +257,55 @@ describe('file tools', () => {
         });
     });
 
+    it('finds names with glob and lines with grep — the split of the old fileGlob', async () => {
+        await write([
+            { path: 'search-split/a.ts', content: 'const a = 1;\n// TODO: one\n' },
+            { path: 'search-split/nested/b.js', content: 'TODO: two\n' },
+            { path: 'search-split/notes.md', content: 'nothing here\n' }
+        ]);
+
+        // glob answers with PATHS ONLY, root-prefixed.
+        await expect(glob({ paths: ['search-split'], patterns: ['*.ts'] })).resolves.toEqual({
+            files: ['search-split/a.ts'],
+            truncated: false
+        });
+
+        // grep answers with LINES, in the same walk order, with the byte accounting.
+        await expect(grep({ pattern: 'TODO', paths: ['search-split'] })).resolves.toEqual({
+            matches: [
+                {
+                    path: 'search-split/a.ts',
+                    line: 2,
+                    text: '// TODO: one',
+                    textTruncated: false,
+                    bytes: 12
+                },
+                {
+                    path: 'search-split/nested/b.js',
+                    line: 1,
+                    text: 'TODO: two',
+                    textTruncated: false,
+                    bytes: 9
+                }
+            ],
+            truncated: false,
+            bytes: 21,
+            contentBudget: FILE_GREP_CONTENT_BUDGET
+        });
+
+        // There is no mode rule left to remember: glob has no `content` property, and
+        // grep's pattern is required, so a stale `fileGlob({ content })` request cannot
+        // be silently reinterpreted as something else. The casts keep the reads inside
+        // the `Record<string, unknown>` shape the Tool contract publishes.
+        const globParameters = glob.parameters as { properties?: Record<string, unknown> };
+        const grepParameters = grep.parameters as { required?: string[] };
+
+        expect(globParameters.properties).not.toHaveProperty('content');
+        expect(grepParameters.required).toEqual(['pattern']);
+    });
+
     it('reads several files in one call', async () => {
-        await fileWrite([
+        await write([
             { path: 'multi-read/a.txt', content: 'a' },
             { path: 'multi-read/b.txt', content: 'b' }
         ]);
@@ -250,7 +340,7 @@ describe('file tools', () => {
     });
 
     it('edits several files in one call', async () => {
-        await fileWrite([
+        await write([
             { path: 'multi-edit/a.txt', content: 'alpha\n' },
             { path: 'multi-edit/b.txt', content: 'beta\n' }
         ]);
@@ -275,7 +365,7 @@ describe('file tools', () => {
     });
 
     it('lists directories with a trailing slash so they are distinguishable', async () => {
-        await fileWrite([
+        await write([
             { path: 'tree/a.txt', content: 'a' },
             { path: 'tree/sub/b.txt', content: 'b' }
         ]);
@@ -293,7 +383,7 @@ describe('file tools', () => {
     });
 
     it('lists several directories in one call, grouped in the caller order', async () => {
-        await fileWrite([
+        await write([
             { path: 'multi/src/a.ts', content: 'a' },
             { path: 'multi/task/b.ts', content: 'b' }
         ]);
@@ -316,7 +406,7 @@ describe('file tools', () => {
         // with no prefix at all.
         const previous = process.cwd();
         await mkdir('defaults/empty/sub', { recursive: true });
-        await fileWrite([{ path: 'defaults/empty/marker.txt', content: 'm' }]);
+        await write([{ path: 'defaults/empty/marker.txt', content: 'm' }]);
         process.chdir(join(previous, 'defaults', 'empty'));
 
         try {
@@ -339,8 +429,8 @@ describe('file tools', () => {
     });
 
     it('overwrites an existing file', async () => {
-        await fileWrite([{ path: 'over.txt', content: 'first' }]);
-        await fileWrite([{ path: 'over.txt', content: 'second' }]);
+        await write([{ path: 'over.txt', content: 'first' }]);
+        await write([{ path: 'over.txt', content: 'second' }]);
 
         await expect(read(['over.txt'])).resolves.toEqual({
             files: [
@@ -405,7 +495,7 @@ describe('shell', () => {
     });
 
     it('honours cwd', async () => {
-        await fileWrite([{ path: 'cwd-test/marker.txt', content: 'x' }]);
+        await write([{ path: 'cwd-test/marker.txt', content: 'x' }]);
         const result = await shell({
             command: 'node -e "console.log(process.cwd())"',
             cwd: 'cwd-test'
@@ -416,21 +506,27 @@ describe('shell', () => {
 });
 
 describe('presets inside a harness', () => {
-    it('ships the four everyday file tools core and the rest searchable', () => {
+    it('ships the five everyday file tools core and the rest searchable', () => {
         expect(read.tags).toEqual(['files', 'read', 'filesystem']);
-        expect(syntaxCheck.tags).toEqual([
+        expect(syntax.tags).toEqual([
             'code',
             'syntax',
             'javascript',
+            'typescript',
+            'json',
             'python',
             'validation'
         ]);
         expect(read.visibility).toBe('core');
         expect(edit.visibility).toBe('core');
-        expect(fileGlob.visibility).toBe('core');
+        expect(write.visibility).toBe('core');
+        // Both search surfaces are core (R18): naming a file and finding a line are the
+        // everyday first steps of a code task.
+        expect(glob.visibility).toBe('core');
+        expect(grep.visibility).toBe('core');
         expect(fileList.visibility).toBe('searchable');
         expect(shell.visibility).toBe('searchable');
-        expect(syntaxCheck.visibility).toBe('searchable');
+        expect(syntax.visibility).toBe('searchable');
     });
 
     it('registers a core file tool under its export name and runs it without discovery', async () => {
@@ -442,9 +538,9 @@ describe('presets inside a harness', () => {
             ])
         });
 
-        const writer = harness({ agents: { writer: entry }, tools: { read, fileWrite } });
+        const writer = harness({ agents: { writer: entry }, tools: { read, write } });
 
-        await fileWrite([{ path: 'harness.txt', content: 'seeded content' }]);
+        await write([{ path: 'harness.txt', content: 'seeded content' }]);
 
         // The registry key renames the tool, so the model calls `read`.
         expect(writer.tools.read.name).toBe('read');
@@ -493,8 +589,8 @@ describe('presets inside a harness', () => {
         });
     });
 
-    it('discovers syntaxCheck and hands it the whole two-property object', async () => {
-        // syntaxCheck declares `code` and `language`, so the single-property rule
+    it('discovers syntax and hands it the whole two-property object', async () => {
+        // syntax declares `code` and `language`, so the single-property rule
         // does not apply: the implementation receives the object a direct call
         // would pass.
         const entry = agent({
@@ -503,18 +599,18 @@ describe('presets inside a harness', () => {
                 callTool('c0', 'toolRequest', '{"tags":["python"]}'),
                 callTool(
                     'c1',
-                    'syntaxCheck',
+                    'syntax',
                     '{"code":"def f():\\n    pass","language":"python"}'
                 ),
                 answer('valid')
             ])
         });
 
-        const writer = harness({ agents: { writer: entry }, tools: { syntaxCheck } });
+        const writer = harness({ agents: { writer: entry }, tools: { syntax } });
         await writer('check it');
 
         expect(JSON.parse((entry.messages[2] as { content: string }).content).enabled).toEqual([
-            'syntaxCheck'
+            'syntax'
         ]);
         expect((entry.messages[4] as { content: string }).content).toBe('true');
     });

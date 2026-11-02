@@ -70,14 +70,15 @@ const instructionOf = (presetName: string, agentName: string): string => {
     return message.content;
 };
 
-// The exact shared registry order: eight package tools, then five app tools.
+// The exact shared registry order: nine package tools, then five app tools.
 const TOOLBOX = [
-    'syntaxCheck',
+    'syntax',
     'read',
-    'fileWrite',
+    'write',
     'edit',
     'fileList',
-    'fileGlob',
+    'glob',
+    'grep',
     'shell',
     'gitDiff',
     'timeNow',
@@ -321,13 +322,13 @@ describe('one toolbox, different agents', () => {
         expect(registeredTools('flaky')).toContain('testFlaky');
     });
 
-    it('marks the four everyday file tools core and leaves fileList discoverable', () => {
+    it('marks the five everyday file tools core and leaves fileList discoverable', () => {
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
 
         const harness = presetOf('instruct').create(SETTINGS, progress);
 
-        // R18: read/write/edit/glob are declared up front. fileList and the app /
+        // R18: read/write/edit/glob/grep are declared up front. fileList and the app /
         // command tools still go through toolRequest. The harness-owned tools are
         // core as well, but they are the session-bound set.
         expect(
@@ -335,12 +336,13 @@ describe('one toolbox, different agents', () => {
                 [...TOOLBOX].map((name) => [name, harness.tools[name].visibility])
             )
         ).toEqual({
-            syntaxCheck: 'searchable',
+            syntax: 'searchable',
             read: 'core',
-            fileWrite: 'core',
+            write: 'core',
             edit: 'core',
             fileList: 'searchable',
-            fileGlob: 'core',
+            glob: 'core',
+            grep: 'core',
             shell: 'searchable',
             gitDiff: 'searchable',
             timeNow: 'searchable',
@@ -416,9 +418,10 @@ describe('one toolbox, different agents', () => {
             'delegate',
             'threadFork',
             'read',
-            'fileWrite',
+            'write',
             'edit',
-            'fileGlob',
+            'glob',
+            'grep',
             'search'
         ]);
         // W4: fetch is registered by the live factory but is SEARCHABLE, so a

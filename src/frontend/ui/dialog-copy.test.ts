@@ -13,7 +13,7 @@
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/dialog-copy.test.ts
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createDialogHost } from './dialog';
+import { createDialogHost, createTextCopyButton } from './dialog';
 import type { DialogCopySource, DialogHost } from './dialog';
 
 const flush = (): Promise<void> => new Promise((resolve) => setTimeout(resolve, 0));
@@ -238,5 +238,106 @@ describe('dialog copy action', () => {
         handle.update({ copy: null });
         expect(copyButton(host)).toBeNull();
         expect(host.top?.element.querySelectorAll('.dialog-head > *')).toHaveLength(2);
+    });
+});
+
+// R3 — the SAME control, exported for surfaces that are not a dialog header (a tool
+// pane heading, an answer footer). The behaviour above is reused, not forked, so the
+// only things pinned here are the label-driven chrome and the click-time provider.
+describe('shared text copy button', () => {
+    it('builds an icon button whose accessible name and tooltip are the caller label', () => {
+        const button = createTextCopyButton({
+            label: 'Copy arguments',
+            text: () => 'payload',
+            className: 'tool-copy'
+        });
+        document.body.append(button);
+
+        expect(button.tagName).toBe('BUTTON');
+        expect(button.type).toBe('button');
+        // The shared class first, so the shared icon/live-child selectors keep working
+        // and the caller's class only restyles.
+        expect(button.className).toBe('text-copy tool-copy');
+        expect(button.getAttribute('aria-label')).toBe('Copy arguments');
+        expect(button.title).toBe('Copy arguments');
+        expect(button.querySelector('svg.dialog-copy-icon > path')?.getAttribute('d')).toBe(
+            'M9 9.5h9.5v9.5H9z M15 5H5.5v9.5'
+        );
+        expect(button.querySelector('.dialog-copy-feedback')?.getAttribute('role')).toBe('status');
+        expect(button.querySelector('.dialog-copy-feedback')?.textContent).toBe('');
+        expect(button.dataset.state).toBeUndefined();
+    });
+
+    it('defaults its class and writes the provider value resolved at click time', async () => {
+        const writeText = vi.fn(async () => undefined);
+        setClipboard(writeText);
+
+        let payload = 'first';
+        const button = createTextCopyButton({ label: 'Copy answer', text: () => payload });
+        document.body.append(button);
+        expect(button.className).toBe('text-copy');
+
+        button.click();
+        await flush();
+        payload = 'second';
+        button.click();
+        await flush();
+
+        expect(writeText).toHaveBeenNthCalledWith(1, 'first');
+        expect(writeText).toHaveBeenNthCalledWith(2, 'second');
+        expect(button.textContent).toBe('Copied');
+        expect(button.dataset.state).toBe('success');
+        // The name never changes; the announcement is the live child.
+        expect(button.getAttribute('aria-label')).toBe('Copy answer');
+        expect(button.title).toBe('Copied to the clipboard');
+    });
+
+    it('uses the textarea fallback with no dialog open (standalone surface)', async () => {
+        // The tool dialog pins the trapped-focus variant; an answer footer has no trap
+        // at all, and the same helper still has to focus and select its own textarea.
+        setClipboard(undefined);
+        const seen: string[] = [];
+        setExecCommand((command: string) => {
+            if (command !== 'copy') return false;
+            seen.push(document.querySelector<HTMLTextAreaElement>('.dialog-copy-buffer')?.value ?? '');
+            return true;
+        });
+
+        const button = createTextCopyButton({ label: 'Copy answer', text: () => 'fallback text' });
+        document.body.append(button);
+        button.click();
+        await flush();
+
+        expect(seen).toEqual(['fallback text']);
+        expect(document.querySelector('.dialog-copy-buffer')).toBeNull();
+        expect(button.textContent).toBe('Copied');
+    });
+
+    it('reports a failure in place and keeps its own state per button', async () => {
+        setClipboard(async () => {
+            throw new Error('denied');
+        });
+        setExecCommand(() => false);
+
+        const failing = createTextCopyButton({
+            label: 'Copy arguments',
+            text: () => {
+                throw new Error('no payload yet');
+            }
+        });
+        const succeeding = createTextCopyButton({
+            label: 'Copy result',
+            text: () => 'result'
+        });
+        document.body.append(failing, succeeding);
+
+        failing.click();
+        await flush();
+
+        expect(failing.textContent).toBe('Copy failed');
+        expect(failing.dataset.state).toBe('error');
+        expect(failing.title).toBe('Copy failed — the clipboard was not available');
+        expect(succeeding.dataset.state).toBeUndefined();
+        expect(succeeding.textContent).toBe('');
     });
 });

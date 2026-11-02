@@ -43,7 +43,9 @@ describe('browser discovery fallback', () => {
         expect(descriptors.map((descriptor) => descriptor.name)).toEqual(
             BUILTIN_TOOL_DESCRIPTORS.map((descriptor) => descriptor.name)
         );
-        expect(descriptors).toHaveLength(27);
+        // 28 package rows: the 16 harness-owned runtime entries plus the 9 presets,
+        // which now include `grep` beside `glob` (the split of the old fileGlob).
+        expect(descriptors).toHaveLength(28);
     });
 
     it('returns detached copies, not the manifest rows themselves', () => {

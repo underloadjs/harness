@@ -13,8 +13,8 @@
 // `sourcePath`, so metadata and executable body are one revision for every label.
 //
 // What is mocked here, and why it is the honest simulation of a stale manifest:
-//   `../core/tool-manifest` is replaced with the REAL rows MINUS `syntaxCheck` —
-//   exactly the bytes a manifest generated before `syntaxCheck.tool.ts` existed
+//   `../core/tool-manifest` is replaced with the REAL rows MINUS `syntax` —
+//   exactly the bytes a manifest generated before `syntax.tool.ts` existed
 //   would contain — with `read`'s metadata doctored to stale values. Its
 //   generated loader is POISONED: on a source-backed (Node) catalogue reaching it at
 //   all is the regression, so it records the label and throws instead of loading a
@@ -33,7 +33,7 @@ import { afterAll, describe, expect, it, vi } from 'vitest';
 // catalogue must keep this empty: the generated loader is a BUILD ARTIFACT.
 const generatedLoads = vi.hoisted(() => [] as string[]);
 
-// The stale-manifest simulation (see the header). `syntaxCheck` is a SHIPPED preset,
+// The stale-manifest simulation (see the header). `syntax` is a SHIPPED preset,
 // so this is a real row disappearing from the generated table while its file stays on
 // disk — the precise T24 failure mode, with no invented tool. `read` keeps its
 // row but carries STALE metadata, which proves the catalogue reads the ENTRY, not the
@@ -45,7 +45,7 @@ vi.mock('../core/tool-manifest', async (importOriginal) => {
     return {
         ...actual,
         BUILTIN_TOOL_DESCRIPTORS: actual.BUILTIN_TOOL_DESCRIPTORS.filter(
-            (descriptor) => descriptor.name !== 'syntaxCheck'
+            (descriptor) => descriptor.name !== 'syntax'
         ).map((descriptor) =>
             descriptor.name === 'read'
                 ? {
@@ -103,12 +103,13 @@ const ALL_PACKAGE_NAMES = [
     'threadFork',
     'actionRequest',
     'toolCancel',
-    'syntaxCheck',
+    'syntax',
     'read',
-    'fileWrite',
+    'write',
     'edit',
     'fileList',
-    'fileGlob',
+    'glob',
+    'grep',
     'shell',
     'gitDiff',
     'search',
@@ -118,12 +119,13 @@ const ALL_PACKAGE_NAMES = [
 ];
 
 const PRESET_NAMES = [
-    'syntaxCheck',
+    'syntax',
     'read',
-    'fileWrite',
+    'write',
     'edit',
     'fileList',
-    'fileGlob',
+    'glob',
+    'grep',
     'shell',
     'gitDiff'
 ];
@@ -138,13 +140,16 @@ afterAll(() => {
 
 describe('live Node descriptor catalogue (T24)', () => {
     it('is not shortened by a stale generated manifest', () => {
-        // The mock really is stale: the generated table no longer knows syntaxCheck.
+        // The mock really is stale: the generated table no longer knows syntax.
         expect(BUILTIN_TOOL_DESCRIPTORS.map((descriptor) => descriptor.name)).not.toContain(
-            'syntaxCheck'
+            'syntax'
         );
-        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(26);
+        // The generated manifest ships 28 package rows today; the filter above removes
+        // `syntax`, so 27 is the stale table this simulation really contains.
+        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(27);
 
-        // The live scan still reports the whole package tree, in scan order.
+        // The live scan still reports the whole package tree, in scan order. The
+        // generated table is one row shorter: it lost `syntax` to the filter above.
         expect(TOOL_DESCRIPTORS.map((descriptor) => descriptor.name)).toEqual(ALL_PACKAGE_NAMES);
         expect(PRESET_TOOL_NAMES).toEqual(PRESET_NAMES);
         expect(Object.keys(presetTools)).toEqual(PRESET_NAMES);
@@ -182,11 +187,11 @@ describe('live Node descriptor catalogue (T24)', () => {
     it('derives the exact descriptor row of a manifest-unknown entry', () => {
         // Field-for-field against the entry's own literals; the whole row is
         // asserted, not a subset, so a drifted projection fails here.
-        expect(descriptorOf('syntaxCheck')).toEqual({
-            name: 'syntaxCheck',
-            metadata: PRESET_TOOLS.syntaxCheck,
-            sourcePath: 'tools/syntax/syntaxCheck.tool.ts',
-            label: 'tools/syntax/syntaxCheck.tool.ts',
+        expect(descriptorOf('syntax')).toEqual({
+            name: 'syntax',
+            metadata: PRESET_TOOLS.syntax,
+            sourcePath: 'tools/syntax/syntax.tool.ts',
+            label: 'tools/syntax/syntax.tool.ts',
             origin: 'package',
             group: 'preset',
             activation: 'always',
@@ -195,7 +200,38 @@ describe('live Node descriptor catalogue (T24)', () => {
             listed: false,
             alwaysDeclared: false
         });
-        expect(descriptorSourcePath('syntaxCheck')).toBe('tools/syntax/syntaxCheck.tool.ts');
+        expect(descriptorSourcePath('syntax')).toBe('tools/syntax/syntax.tool.ts');
+    });
+
+    it('lists the new grep row beside glob, and write in fileWrite\'s slot', () => {
+        // R1/R2 registration contract: the rename kept every historical `order` slot
+        // (read 170, write 180, edit 190, fileList 200, glob 210, syntax 160) and grep
+        // sits at 215, directly beside the name search, so discovery order does not
+        // move for anything else.
+        expect(descriptorOf('grep')).toEqual({
+            name: 'grep',
+            metadata: PRESET_TOOLS.grep,
+            sourcePath: 'tools/files/grep.tool.ts',
+            label: 'tools/files/grep.tool.ts',
+            origin: 'package',
+            group: 'preset',
+            activation: 'always',
+            order: 215,
+            sessionBound: false,
+            listed: false,
+            alwaysDeclared: false
+        });
+
+        expect(descriptorSourcePath('write')).toBe('tools/files/write.tool.ts');
+        expect(descriptorSourcePath('glob')).toBe('tools/files/glob.tool.ts');
+        expect(descriptorOf('write')!.order).toBe(180);
+        expect(descriptorOf('glob')!.order).toBe(210);
+        expect(descriptorOf('grep')!.order).toBe(215);
+
+        // Both search presets are core, so a fresh harness declares grep without any
+        // toolRequest round.
+        expect(descriptorMetadata('grep').visibility).toBe('core');
+        expect(descriptorMetadata('glob').visibility).toBe('core');
     });
 
     it('agrees with the harness, which registers the same fresh entry', async () => {
@@ -215,21 +251,23 @@ describe('live Node descriptor catalogue (T24)', () => {
             }
         });
 
-        expect(writer.tools.syntaxCheck).toBeDefined();
-        expect(writer.tools.syntaxCheck.description).toBe(PRESET_TOOLS.syntaxCheck.description);
-        expect(writer.tools.syntaxCheck.tags).toEqual([
+        expect(writer.tools.syntax).toBeDefined();
+        expect(writer.tools.syntax.description).toBe(PRESET_TOOLS.syntax.description);
+        expect(writer.tools.syntax.tags).toEqual([
             'code',
             'syntax',
             'javascript',
+            'typescript',
+            'json',
             'python',
             'validation'
         ]);
         // Registered from the same editable entry the catalogue lists.
-        expect(writer.toolSource('syntaxCheck')?.sourcePath).toBe(
-            'tools/syntax/syntaxCheck.tool.ts'
+        expect(writer.toolSource('syntax')?.sourcePath).toBe(
+            'tools/syntax/syntax.tool.ts'
         );
         await expect(
-            writer.executeTool('syntaxCheck', { code: 'let x = 1;', language: 'javascript' })
+            writer.executeTool('syntax', { code: 'let x = 1;', language: 'javascript' })
         ).resolves.toBe(true);
     });
 
@@ -279,17 +317,19 @@ describe('live Node descriptor catalogue (T24)', () => {
         // compile it from source instead of rejecting with
         // `No generated tool loader for ...`. This is the half that made the T24 bug
         // visible to a caller rather than just to a catalogue listing.
-        expect(presetTools.syntaxCheck.description).toBe(PRESET_TOOLS.syntaxCheck.description);
-        expect(presetTools.syntaxCheck.tags).toEqual([
+        expect(presetTools.syntax.description).toBe(PRESET_TOOLS.syntax.description);
+        expect(presetTools.syntax.tags).toEqual([
             'code',
             'syntax',
             'javascript',
+            'typescript',
+            'json',
             'python',
             'validation'
         ]);
 
         await expect(
-            presetTools.syntaxCheck({ code: 'const a = 1;', language: 'javascript' })
+            presetTools.syntax({ code: 'const a = 1;', language: 'javascript' })
         ).resolves.toBe(true);
 
         // The generated loader was never consulted for it: source compilation was
@@ -298,9 +338,9 @@ describe('live Node descriptor catalogue (T24)', () => {
 
         // `loadPresetTool` is the same seam the proxy uses; a direct call resolves
         // to a callable Tool carrying the entry's own metadata.
-        const loaded = await loadPresetTool('syntaxCheck');
-        expect(loaded.name).toBe('syntaxCheck');
-        expect(loaded.description).toBe(PRESET_TOOLS.syntaxCheck.description);
+        const loaded = await loadPresetTool('syntax');
+        expect(loaded.name).toBe('syntax');
+        expect(loaded.description).toBe(PRESET_TOOLS.syntax.description);
         expect(await loaded({ code: 'const b = 2;', language: 'javascript' })).toBe(true);
         expect(generatedLoads).toEqual([]);
     });
@@ -443,11 +483,13 @@ describe('descriptor mutation isolation (T24)', () => {
             'compile'
         ]);
         expect(TOOL_DESCRIPTORS.map((descriptor) => descriptor.name)).toEqual(before);
-        expect(descriptorOf('syntaxCheck')!.order).toBe(160);
-        expect(descriptorMetadata('syntaxCheck').tags).toEqual([
+        expect(descriptorOf('syntax')!.order).toBe(160);
+        expect(descriptorMetadata('syntax').tags).toEqual([
             'code',
             'syntax',
             'javascript',
+            'typescript',
+            'json',
             'python',
             'validation'
         ]);

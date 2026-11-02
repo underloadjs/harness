@@ -172,7 +172,7 @@ it('lists core tools in the global tools view, calls with the captured session a
                     ok: true,
                     result: {
                         enabled: ['read'],
-                        tools: ['read', 'fileGlob'],
+                        tools: ['read', 'glob'],
                         truncated: true,
                         remaining: 2
                     },
@@ -183,7 +183,7 @@ it('lists core tools in the global tools view, calls with the captured session a
             // The refresh a core call triggers. The discovery must reach the core
             // section without a reload.
             if (url === '/api/sessions/s1' && method === undefined) {
-                return json({ session: snapshot({ discoveredTools: ['read', 'fileGlob'] }) });
+                return json({ session: snapshot({ discoveredTools: ['read', 'glob'] }) });
             }
 
             if (url === '/api/tools/read' && method === 'POST') {
@@ -301,7 +301,7 @@ it('lists core tools in the global tools view, calls with the captured session a
     // right-rail core dropdown).
     expect(calls.filter((call) => call.url === '/api/sessions/s1')).toHaveLength(1);
     expect(byClass('.tools-session-note', 'p').textContent).toBe(
-        'Session-bound tools run inside instruct · session s1 · enabled for this session: read, fileGlob'
+        'Session-bound tools run inside instruct · session s1 · enabled for this session: read, glob'
     );
 
     // An ordinary tool is unchanged: no sessionId key, no extra session traffic.

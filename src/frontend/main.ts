@@ -621,20 +621,27 @@ const createView = (
 const EXAMPLES: Readonly<Record<string, unknown>> = {
     // Two properties, so the runner sends the whole object (no single-property
     // unwrapping): the language is part of the input, not a separate mode.
-    syntaxCheck: { code: 'const answer = 42;\nconsole.log(answer);', language: 'javascript' },
+    // `language` is a free-text NAME now (the schema enum is gone): the tool
+    // normalizes aliases (`ts`, `.tsx`, `Python3`) and errors on a language it has
+    // no parser for, so the example uses a canonical spelling.
+    syntax: { code: 'const answer = 42;\nconsole.log(answer);', language: 'javascript' },
     // The batched file tools each declare ONE array property, so the textarea holds
     // the array itself, not a wrapper object (T14).
     read: ['package.json'],
-    fileWrite: [{ path: 'notes/hello.txt', content: 'hello from the harness UI\n' }],
+    write: [{ path: 'notes/hello.txt', content: 'hello from the harness UI\n' }],
     edit: [{ path: 'notes/hello.txt', oldString: 'hello', newString: 'hi' }],
     // "." works from whatever directory the server runs in.
     fileList: ['.'],
-    // fileGlob declares four properties, so it takes the whole object. Both lists
-    // are the documented defaults, and the optional `content`/`maxResults` are
-    // OMITTED: an absent `content` is filename mode (the useful first call) and an
-    // absent `maxResults` means the documented cap, whereas `""` or `0` would
-    // switch to content mode or be clamped. Add `content` to try a content search.
-    fileGlob: { patterns: ['**/*'], paths: ['.'] },
+    // glob declares three OPTIONAL properties, so it takes the whole object. Both
+    // lists are the documented defaults, and the optional `maxResults` is OMITTED:
+    // an absent `maxResults` means the documented cap, whereas `0` would be clamped.
+    // glob is FILE NAMES only — the old `content` property is gone (it is rejected
+    // as an unknown property), so a content search is the `grep` call below.
+    glob: { patterns: ['**/*'], paths: ['.'] },
+    // grep is the content half of the old fileGlob: `pattern` is required, so the
+    // schema alone would only produce `{"pattern": ""}`. A regex source with two
+    // alternatives plus the file filter shows the whole shape in one editable call.
+    grep: { pattern: 'TODO|FIXME', patterns: ['*.ts'], paths: ['.'] },
     shell: { command: 'git status --short' },
     // Core tools: the manual runner can call these inside the selected session, so
     // their examples have to satisfy the same schema the model sees (non-empty
@@ -688,7 +695,8 @@ const placeholderFor = (schema: Record<string, unknown> | undefined): unknown =>
     const values = schema?.enum;
 
     // An enum member is valid by construction. Taking the first keeps the template
-    // deterministic (todoManage.action, syntaxCheck.language).
+    // deterministic (todoManage.action; `syntax.language` is free text now, so the
+    // curated example is what makes that call valid).
     if (Array.isArray(values) && values.length > 0) return values[0];
 
     switch (schema?.type) {
@@ -714,11 +722,12 @@ const placeholderFor = (schema: Record<string, unknown> | undefined): unknown =>
 // -----------------------------------------
 // Filling every property with a type-shaped blank produced arguments that no tool
 // would accept: `{"tags": [], "limit": 0}` for toolRequest (empty tags, and 0 is
-// below the minimum), `{"patterns": [], "paths": [], "content": "", "maxResults": 0}`
-// for fileGlob. Omitting what the schema does not require is both valid and the
-// honest reading of "optional": the tool then applies its documented default. Only
-// the `required` list is materialized; a schema with no `required` at all gets `{}`,
-// which is a valid no-argument call.
+// below the minimum), `{"patterns": [], "paths": [], "maxResults": 0}` for glob —
+// every glob property is optional now, so the old `content` mode property is not
+// even part of that schema any more. Omitting what the schema does not require is
+// both valid and the honest reading of "optional": the tool then applies its
+// documented default. Only the `required` list is materialized; a schema with no
+// `required` at all gets `{}`, which is a valid no-argument call.
 //
 // The ONE-property case is different: the single-property rule means the textarea
 // holds that property's VALUE, not a wrapper object (see `singleProperty` above), so
@@ -2198,12 +2207,12 @@ const autoGrow = (): void => {
 // --- @ / # popup -------------------------------------------------------------
 //
 // One popup, three sources:
-//   - `@query` files: a DEBOUNCED, query-aware fileGlob call (the existing /tools
+//   - `@query` files: a DEBOUNCED, query-aware `glob` call (the existing /tools
 //     endpoint; no new route). Each query changes the glob, so the server walk is
 //     narrowed instead of permanently limiting the picker to the first 100 files.
 //     A monotonically increasing sequence drops stale replies.
 //   - `@query` folders: the SAME debounced beat also reads `fileList` for the typed
-//     scope (fileGlob never yields directories), because folders are listed FIRST —
+//     scope (glob never yields directories), because folders are listed FIRST —
 //     navigation on top, matching file hits below. Both answers carry the same
 //     sequence, so they are painted together or not at all.
 //   - `#query`: the board's REAL root+nested agent blocks (view.blocks()), deduped
@@ -2211,7 +2220,8 @@ const autoGrow = (): void => {
 //     resolution rule). No network.
 //
 // A THIRD source fills the same list: `@query` also asks fileList for the folders
-// of the typed scope (fileGlob yields files only), and those rows are placed FIRST
+// of the typed scope (glob answers file names only — content search is `grep`, and
+// neither of them is what a mention picker wants), and those rows are placed FIRST
 // so folder navigation reads top-down. A folder row ends with "/" and drills in.
 //
 // Accessibility: the field owns aria-expanded/aria-activedescendant and the popup
@@ -2437,7 +2447,7 @@ const scheduleFileLookup = (trigger: MentionTrigger & { kind: 'file' }): void =>
         lookupTimer = undefined;
         void (async () => {
             const scope = fileQueryScope(trigger.query);
-            // Folders come from `fileList` (fileGlob walks past directories), read
+            // Folders come from `fileList` (glob walks past directories), read
             // in parallel with the glob: one debounce still, two answers. The folder
             // read NEVER fails the picker — an unreadable half-typed directory or an
             // unconfigured tool just contributes no folder rows, and the glob keeps
@@ -2449,7 +2459,10 @@ const scheduleFileLookup = (trigger: MentionTrigger & { kind: 'file' }): void =>
 
             try {
                 const [response, folderRows] = await Promise.all([
-                    callTool('fileGlob', {
+                    // `glob` is the filename half of the old `fileGlob`: names only,
+                    // no `content` property, so the picker never has to interpret a
+                    // second result shape.
+                    callTool('glob', {
                         patterns: fileGlobPattern(trigger.query),
                         paths: ['.'],
                         maxResults: 100

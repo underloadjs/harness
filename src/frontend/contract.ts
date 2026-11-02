@@ -60,6 +60,11 @@ export const HARNESS_CORE_TOOL_NAMES = [
 // lines summarize the canonical descriptions in src/tools/runtime/toolList.tool.ts
 // and src/tools/runtime/toolManage.tool.ts (that module is authoritative; these are
 // only the one-line form kept here for callers that render a hint).
+//
+// RENAME (wire names): `fileWrite` is `write`, and the two-mode `fileGlob` is now
+// `glob` (file NAMES only) plus `grep` (file CONTENTS); `syntaxCheck` is `syntax`
+// with a free-text `language`. Keys follow the wire names, because that is what a
+// caller can look a tool up by.
 export const HARNESS_CORE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
     toolRequest: 'Find tools by capability tag and enable them for this chat.',
     toolList: 'List every registered tool by name and description.',
@@ -68,9 +73,11 @@ export const HARNESS_CORE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = 
     todoManage: 'Keep a task list for the current work.',
     delegate: 'Hand a self-contained task to one of this harness’s agents.',
     read: 'Read one or more text files on the server host.',
-    fileWrite: 'Write one or more text files on the server host.',
+    write: 'Write one or more text files on the server host.',
     edit: 'Replace exact text in one or more files on the server host.',
-    fileGlob: 'Find files by glob, or search their contents, in one call.',
+    glob: 'Find files by glob pattern: names only, never contents.',
+    grep: 'Search file contents with a regular expression.',
+    syntax: 'Check whether a code snippet parses, without running it.',
     search: 'Search the web when the host configured a provider key.'
 };
 

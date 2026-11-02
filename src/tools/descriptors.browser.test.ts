@@ -58,17 +58,18 @@ describe('browser catalogue fallback (T24)', () => {
         // Field for field: no live row may sneak in, and no generated row may be
         // rewritten by the projection.
         expect(TOOL_DESCRIPTORS).toEqual([...BUILTIN_TOOL_DESCRIPTORS]);
-        expect(TOOL_DESCRIPTORS).toHaveLength(27);
+        expect(TOOL_DESCRIPTORS).toHaveLength(28);
     });
 
     it('derives the preset and runtime groups from the generated data', () => {
         expect(PRESET_TOOL_NAMES).toEqual([
-            'syntaxCheck',
+            'syntax',
             'read',
-            'fileWrite',
+            'write',
             'edit',
             'fileList',
-            'fileGlob',
+            'glob',
+            'grep',
             'shell',
             'gitDiff'
         ]);
@@ -112,16 +113,16 @@ describe('browser catalogue fallback (T24)', () => {
     // This is the one place the two halves of a row provably come from the same build
     // artifact, so it must stay reachable here even though Node never uses it.
     it('loads a known preset through the generated loader in a generated catalogue', async () => {
-        const loaded = await loadPresetTool('syntaxCheck');
+        const loaded = await loadPresetTool('syntax');
 
         // The row and the body are both the generated artifact: name/description come
         // from the generated descriptor, the callable from the generated import().
-        expect(loaded.name).toBe('syntaxCheck');
+        expect(loaded.name).toBe('syntax');
         expect(loaded.description).toBe(
-            BUILTIN_TOOL_DESCRIPTORS.find((descriptor) => descriptor.name === 'syntaxCheck')!
+            BUILTIN_TOOL_DESCRIPTORS.find((descriptor) => descriptor.name === 'syntax')!
                 .metadata.description
         );
         expect(typeof loaded.execute).toBe('function');
-        expect(generatedLoads).toEqual(['tools/syntax/syntaxCheck.tool.ts']);
+        expect(generatedLoads).toEqual(['tools/syntax/syntax.tool.ts']);
     });
 });

@@ -1,6 +1,7 @@
-// Real fileGlob schema check for the @ mention patterns (T8).
+// Real glob schema check for the @ mention patterns (T8).
 //
-// The composer calls the REAL `/tools/fileGlob` tool. Mocking the pattern string is
+// The composer calls the REAL `/tools/glob` tool (the file-name half of the old
+// two-mode `fileGlob`). Mocking the pattern string is
 // not enough: `**/src/frontend*` looks plausible but matches no descendant file
 // because `*` never crosses `/`. This test runs the actual tool against a
 // disposable tree under the repo-root Temp directory and asserts the exact files.
@@ -11,9 +12,10 @@ import { existsSync } from 'node:fs';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { join, relative, resolve } from 'node:path';
 import { afterEach, beforeEach, expect, it } from 'vitest';
-// T14: the file tools are the canonical `*.tool.ts` modules (fileGlob.ts was
-// renamed to fileGlob.tool.ts by the tool-inventory upgrade).
-import { fileGlob } from '../../tools/files/fileGlob.tool';
+// The file tools are the canonical `*.tool.ts` modules, and the rename split the
+// two-mode `fileGlob` into `glob` (names) + `grep` (contents). The @ picker only
+// ever asked for names, so this consumes `glob.tool.ts` — a REAL tool, no fixture.
+import { glob } from '../../tools/files/glob.tool';
 import { fileGlobPattern } from './references';
 
 // Locate the repo root regardless of whether vitest runs from the package root
@@ -35,7 +37,7 @@ const relativeFiles = (files: readonly string[]): string[] =>
 
 beforeEach(async () => {
     await mkdir(TEMP_ROOT, { recursive: true });
-    root = await mkdtemp(join(TEMP_ROOT, 't8-fileglob-'));
+    root = await mkdtemp(join(TEMP_ROOT, 't8-glob-'));
 
     const files = [
         'README.md',
@@ -56,14 +58,14 @@ afterEach(async () => {
     await rm(root, { recursive: true, force: true });
 });
 
-it('matches descendants of a path-prefix directory with the real fileGlob', async () => {
+it('matches descendants of a path-prefix directory with the real glob', async () => {
     const expected = [
         'src/frontend-extra/other.ts',
         'src/frontend/main.ts',
         'src/frontend/ui/deep.ts'
     ];
 
-    const result = await fileGlob({
+    const result = await glob({
         patterns: fileGlobPattern('src/frontend'),
         paths: [root],
         maxResults: 100
@@ -73,7 +75,7 @@ it('matches descendants of a path-prefix directory with the real fileGlob', asyn
 
     // The typed forms `@./src/frontend` and `@.\src\frontend` produce the SAME walk.
     for (const query of ['./src/frontend', '.\\src\\frontend']) {
-        const normalized = await fileGlob({
+        const normalized = await glob({
             patterns: fileGlobPattern(query),
             paths: [root],
             maxResults: 100
@@ -83,14 +85,14 @@ it('matches descendants of a path-prefix directory with the real fileGlob', asyn
 });
 
 it('still searches by basename and matches the empty overview', async () => {
-    const byName = await fileGlob({
+    const byName = await glob({
         patterns: fileGlobPattern('main'),
         paths: [root],
         maxResults: 100
     });
     expect(relativeFiles(byName.files)).toEqual(['src/frontend/main.ts']);
 
-    const overview = await fileGlob({
+    const overview = await glob({
         patterns: fileGlobPattern(''),
         paths: [root],
         maxResults: 100

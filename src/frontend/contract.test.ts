@@ -101,11 +101,11 @@ describe('descriptor extensions', () => {
         expect(
             coreToolsOf(
                 descriptor({
-                    coreTools: ['read', 'fileWrite', 'edit', 'fileGlob', 'search', 'toolRequest']
+                    coreTools: ['read', 'write', 'edit', 'glob', 'search', 'toolRequest']
                 }),
                 1
             )
-        ).toEqual(['read', 'fileWrite', 'edit', 'fileGlob', 'search', 'toolRequest']);
+        ).toEqual(['read', 'write', 'edit', 'glob', 'search', 'toolRequest']);
 
         // An older server with no `coreTools`: the legacy harness-owned fallback,
         // adding delegate when the local team has a second member.

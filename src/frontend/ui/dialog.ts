@@ -16,6 +16,12 @@
 // insecure-origin fallback) and the success/failure announcement, so tool/transcript/
 // file dialogs do not duplicate handlers.
 //
+// `createTextCopyButton({ label, text, className })` exports that SAME copy control
+// for callers that need it outside a dialog header (a section heading inside adopted
+// content, an answer footer). It is the shared implementation on purpose: the
+// clipboard fallback with its modal focus-trap exemption is the part every caller got
+// wrong before, and one vocabulary ("Copied" / "Copy failed") stays everywhere.
+//
 // `content` is a DOM Node, never an HTML string. The caller supplies nodes it has
 // already built with createElement/textContent (see ui/panels.ts for the same
 // data-only rule), so there is no HTML parse path here and therefore nothing to
@@ -390,9 +396,26 @@ const createCopyFeedback = (): HTMLSpanElement => {
     return feedback;
 };
 
+// Tooltip wording per state, externalised so the SAME icon/feedback machinery can
+// serve a control that is not the dialog header. `DIALOG_COPY_TITLES` reproduces the
+// historical header strings byte for byte (dialog-copy.test.ts pins them); a shared
+// pane button passes its own label as the idle tooltip, so the hover text says WHICH
+// pane it copies instead of claiming to copy "the dialog" (R3).
+type CopyTitles = { idle: string; success: string; failure: string };
+
+const DIALOG_COPY_TITLES: CopyTitles = {
+    idle: COPY_TITLE,
+    success: COPY_SUCCESS_TITLE,
+    failure: COPY_FAILURE_TITLE
+};
+
 // Paint the button's icon/state. The `title` follows the state so a hover explains
 // what just happened, and `data-state` drives the border/colour reinforcement.
-const paintCopyState = (button: HTMLButtonElement, state: 'idle' | 'success' | 'error'): void => {
+const paintCopyState = (
+    button: HTMLButtonElement,
+    state: 'idle' | 'success' | 'error',
+    titles: CopyTitles = DIALOG_COPY_TITLES
+): void => {
     const path = button.querySelector('svg.dialog-copy-icon > path');
     if (path !== null) path.setAttribute('d', COPY_ICONS[state]);
 
@@ -401,17 +424,17 @@ const paintCopyState = (button: HTMLButtonElement, state: 'idle' | 'success' | '
 
     if (state === 'success') {
         button.dataset.state = 'success';
-        button.title = COPY_SUCCESS_TITLE;
+        button.title = titles.success;
         return;
     }
     if (state === 'error') {
         button.dataset.state = 'error';
-        button.title = COPY_FAILURE_TITLE;
+        button.title = titles.failure;
         return;
     }
 
     delete button.dataset.state;
-    button.title = COPY_TITLE;
+    button.title = titles.idle;
 };
 
 // ---------------------------------------------------------------------------
@@ -586,25 +609,44 @@ const resolveFocusTarget = (entry: DialogEntry): HTMLElement | null => {
     return null;
 };
 
+// The click pipeline every copy affordance shares: resolve the text at CLICK time
+// (so a live surface copies what is on screen now), write it through the one
+// reliable clipboard path (async API, then the focus-trap-aware textarea fallback),
+// and report the truth through `paint`. `paint` is a callback rather than a fixed
+// `paintCopyState` call because the dialog must not repaint a button whose layer
+// closed mid-write, while a standalone button always repaints.
+const runTextCopy = async (
+    source: DialogCopySource,
+    button: HTMLButtonElement,
+    paint: (state: 'success' | 'error') => void
+): Promise<void> => {
+    let text: string;
+
+    try {
+        text = copyTextOf(source);
+    } catch {
+        paint('error');
+        return;
+    }
+
+    const copied = await writeClipboardText(text);
+    paint(copied ? 'success' : 'error');
+};
+
 // Resolve the copy source when the user asks for it, so a live tool card or
 // transcript copies what is CURRENTLY rendered. Feedback is written INSIDE the button
 // (the glyph, `data-state`, the `title`, and the hidden `aria-live` word — T1/R3); the
 // entry may close while the async clipboard write is in flight, in which case there is
 // no button left to paint.
 const runCopy = async (entry: DialogEntry, button: HTMLButtonElement): Promise<void> => {
-    let text: string;
-
-    try {
-        if (entry.copy === undefined) throw new Error('no copy source');
-        text = copyTextOf(entry.copy);
-    } catch {
+    if (entry.copy === undefined) {
         paintCopyState(button, 'error');
         return;
     }
 
-    const copied = await writeClipboardText(text);
-    if (entry.closed) return;
-    paintCopyState(button, copied ? 'success' : 'error');
+    await runTextCopy(entry.copy, button, (state) => {
+        if (!entry.closed) paintCopyState(button, state);
+    });
 };
 
 // Create the header Copy control lazily, so dialogs that do not opt in keep the
@@ -641,6 +683,68 @@ const removeCopyButton = (entry: DialogEntry): void => {
     entry.copy = undefined;
     entry.copyButton?.remove();
     entry.copyButton = undefined;
+};
+
+// ---------------------------------------------------------------------------
+// Shared standalone Copy control (R3)
+// ---------------------------------------------------------------------------
+
+export type TextCopyButtonOptions = {
+    // Accessible name AND idle tooltip, e.g. "Copy arguments". Required because a
+    // pane button must name the ONE thing it copies; the dialog header's own label
+    // ("Copy dialog contents") would be a lie inside a section heading.
+    label: string;
+    // Click-time text provider. Resolved on every activation, so a surface that is
+    // still streaming copies what is on screen at that moment, never a snapshot.
+    text: () => string;
+    // Optional style hook. The control always carries the shared `text-copy` class
+    // plus the shared icon/feedback classes, so a caller only adds layout.
+    className?: string;
+};
+
+// The default class for a standalone copy control. Exported because the icon and the
+// live child are styled under it (styles.css / dialog.css).
+export const TEXT_COPY_CLASS = 'text-copy';
+
+// A COPY BUTTON OUTSIDE THE DIALOG HEADER that reuses the shell's proven copy
+// machinery: the same inline SVG glyph set, the same visually hidden `role="status"`
+// announcement, the same `data-state` reinforcement and — most importantly — the
+// same `writeClipboardText` path, including the textarea fallback that focuses its
+// own helper with the modal focus trap held open (`clipboardWorkaround`). That last
+// part is why this lives HERE rather than in the caller: the harness UI is served
+// over plain HTTP on the LAN, where `navigator.clipboard` does not exist at all and a
+// hand-rolled copy silently "succeeds" while the clipboard stays unchanged.
+//
+// Synchronous and DOM-only: it opens nothing, needs no dialog, and never throws when
+// the clipboard is unavailable — the button reports the failure in place.
+// `createToolCallCard`'s argument/result headings and the answer footer use it.
+export const createTextCopyButton = (options: TextCopyButtonOptions): HTMLButtonElement => {
+    const { label, text, className } = options;
+    // Titles are derived from the label so the hover explains which pane is copied;
+    // the success/failure wording stays identical to the dialog's (one vocabulary).
+    const titles: CopyTitles = {
+        idle: label,
+        success: COPY_SUCCESS_TITLE,
+        failure: COPY_FAILURE_TITLE
+    };
+
+    const button = document.createElement('button');
+    button.type = 'button';
+    // `TEXT_COPY_CLASS` first so a caller's class can restyle without unsharing the
+    // icon/feedback selectors.
+    button.className = className === undefined ? TEXT_COPY_CLASS : `${TEXT_COPY_CLASS} ${className}`;
+    // The name never changes (an announced state is a status message, not a rename).
+    button.setAttribute('aria-label', label);
+    button.append(createCopyIcon(), createCopyFeedback());
+
+    const paint = (state: 'idle' | 'success' | 'error'): void => paintCopyState(button, state, titles);
+    paint('idle');
+
+    button.addEventListener('click', () => {
+        void runTextCopy(text, button, paint);
+    });
+
+    return button;
 };
 
 // ---------------------------------------------------------------------------

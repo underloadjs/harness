@@ -240,6 +240,57 @@ describe('attempt ownership (F1/F2/F4/F5)', () => {
         expect(turn.element.querySelectorAll('.agent-retry')).toHaveLength(1);
     });
 
+    // R1: `attempt_commit` no longer closes the chip ROW, so one row can hold calls
+    // from several attempts. Ownership is therefore tracked per CHIP: discarding the
+    // later attempt removes its calls and keeps the committed ones in the same row.
+    it('removes only the discarded attempt chips from a shared tool row', () => {
+        const board = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(call('c1', 'first'));
+        turn.apply(call('c2', 'second'));
+        turn.apply(commit());
+        // The next batch joins the SAME row (nothing readable came between them)…
+        turn.apply(call('c3', 'third'));
+        turn.apply(call('c4', 'fourth'));
+        // …and that request then fails.
+        turn.apply(retry());
+        turn.flush();
+
+        const rows = [...turn.element.querySelectorAll('.agent-flow > .tool-group')];
+        expect(rows).toHaveLength(1);
+        expect([...rows[0].querySelectorAll('.tool-name')].map((node) => node.textContent)).toEqual([
+            'first',
+            'second'
+        ]);
+        expect(turn.element.querySelectorAll('details.tool')).toHaveLength(2);
+        // F5: only the discarded calls leave the tally.
+        expect(turn.element.querySelector('.tile-meta')?.textContent).toBe('1 agent · 2 tool calls');
+    });
+
+    // R1: because the row is no longer itself attempt output, an emptied row has to
+    // be pruned explicitly — a failed first attempt must not leave a blank strip.
+    it('drops the tool row an emptied discard leaves behind', () => {
+        const board = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(call('c1', 'first'));
+        turn.apply(call('c2', 'second'));
+        turn.flush();
+
+        turn.apply(retry());
+        turn.flush();
+
+        expect(turn.element.querySelectorAll('.agent-flow > .tool-group')).toHaveLength(0);
+        expect(turn.element.querySelectorAll('details.tool')).toHaveLength(0);
+        // Only the retry notice is left in the block.
+        expect([...(turn.element.querySelector('.agent-flow')?.children ?? [])].map((child) => child.className)).toEqual(
+            ['agent-retry']
+        );
+    });
+
     // F1, HYDRATE/REPLAY path: a recorded turn applies with the `replay` origin and
     // must behave identically (the record is the same event list).
     it('keeps the committed round when the same sequence is replayed', () => {

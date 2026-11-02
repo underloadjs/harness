@@ -44,9 +44,9 @@ const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor 
         tools: ['read'],
         coreTools: [
             'read',
-            'fileWrite',
+            'write',
             'edit',
-            'fileGlob',
+            'glob',
             'toolRequest',
             'toolList',
             'toolManage',
@@ -470,12 +470,39 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     expect(tile.querySelector('.tile-status-text')?.textContent).toBe('done');
     expect(tile.querySelector('.turn-prompt')?.textContent).toBe('say hi\n');
     expect(tile.querySelector('.agent-text')?.innerHTML).toBe('<h1>Hi</h1>\n<p>a <strong>b</strong></p>\n');
-    expect(tile.querySelector('.agent-meta')?.textContent).toBe('m1 · stop');
+    // R5: the block footer no longer prints the model / stop reason line — those
+    // figures are header facts (`.tile-top`, asserted below). The footer is the
+    // answer action row: one right-aligned, accessible Copy control for THIS block.
+    expect(tile.querySelectorAll('.agent-meta')).toHaveLength(0);
+    const answerCopy = tile.querySelector<HTMLButtonElement>('.agent-answer-actions .answer-copy');
+    expect(answerCopy?.className).toContain('answer-copy');
+    expect(answerCopy?.getAttribute('aria-label')).toBe('Copy the final answer');
+    // An icon button: no visible word at idle (the announced state is a hidden live
+    // child, and `data-state` plus the glyph carry the feedback).
+    expect(answerCopy?.textContent).toBe('');
+    expect(answerCopy?.hasAttribute('data-state')).toBe(false);
+
+    // The payload is the RAW Markdown of the block's completed answer: exactly the
+    // text the model streamed — not the rendered HTML, not the prompt, not the tool
+    // result, and not the whole transcript.
+    const writeText = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, 'clipboard', {
+        configurable: true,
+        value: { writeText }
+    });
+    answerCopy?.click();
+    await flush();
+
+    expect(writeText).toHaveBeenCalledTimes(1);
+    expect(writeText).toHaveBeenCalledWith('# Hi\n\na **b**');
+    expect(answerCopy?.dataset.state).toBe('success');
+    expect(answerCopy?.getAttribute('aria-label')).toBe('Copy the final answer');
+    Object.defineProperty(navigator, 'clipboard', { configurable: true, value: undefined });
 
     // R4: the server's startedAt/updatedAt and eventTimes decide the labels.
     expect(tile.querySelector('.tile-elapsed')?.textContent).toBe('3.6s');
     expect(tile.querySelector('.tool-name')?.textContent).toBe('read');
-    expect(tile.querySelector('.tool-duration')?.textContent).toBe('800ms');
+    expect(tile.querySelector('.tool-duration')?.textContent).toBe('0.8s');
     expect(tile.classList.contains('is-expanded')).toBe(true);
 
     // The terminal snapshot populated the directory and the remembered pointer.
@@ -788,9 +815,9 @@ it('restores a remembered session with its frozen team and server timings', asyn
         // A subagent allowlist is what makes the server add delegate.
         coreTools: [
             'read',
-            'fileWrite',
+            'write',
             'edit',
-            'fileGlob',
+            'glob',
             'toolRequest',
             'toolList',
             'toolManage',
@@ -957,9 +984,9 @@ it('creates a harness from preset agents with an initial primary', async () => {
                         tools: [],
                         coreTools: [
                             'read',
-                            'fileWrite',
+                            'write',
                             'edit',
-                            'fileGlob',
+                            'glob',
                             'toolRequest',
                             'toolList',
                             'toolManage',
@@ -1048,9 +1075,9 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
                 // A server with a subagent allowlist adds delegate.
                 coreTools: [
                     'read',
-                    'fileWrite',
+                    'write',
                     'edit',
-                    'fileGlob',
+                    'glob',
                     'toolRequest',
                     'toolList',
                     'toolManage',
@@ -1292,9 +1319,9 @@ it('views a frozen team and saves a model draft through the session PATCH', asyn
         subagents: ['summarizer'],
         coreTools: [
             'read',
-            'fileWrite',
+            'write',
             'edit',
-            'fileGlob',
+            'glob',
             'toolRequest',
             'toolList',
             'toolManage',

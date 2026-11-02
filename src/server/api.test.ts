@@ -74,12 +74,13 @@ const CORE_TOOL_NAMES = [
 // The exact catalogue order after the core set: eight package presets, six harness
 // tools, search.
 const CATALOGUE_TOOL_NAMES = [
-    'syntaxCheck',
+    'syntax',
     'read',
-    'fileWrite',
+    'write',
     'edit',
     'fileList',
-    'fileGlob',
+    'glob',
+    'grep',
     'shell',
     'gitDiff',
     'timeNow',
@@ -387,12 +388,13 @@ describe('canonical bootstrap document', () => {
             subagents: ['research', 'workspace', 'reviewer', 'planner', 'summarizer'],
             agents: ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'summarizer'],
             tools: [
-                'syntaxCheck',
+                'syntax',
                 'read',
-                'fileWrite',
+                'write',
                 'edit',
                 'fileList',
-                'fileGlob',
+                'glob',
+                'grep',
                 'shell',
                 'gitDiff',
                 'timeNow',
@@ -414,9 +416,10 @@ describe('canonical bootstrap document', () => {
                 'delegate',
                 'threadFork',
                 'read',
-                'fileWrite',
+                'write',
                 'edit',
-                'fileGlob'
+                'glob',
+                'grep'
             ],
             builtin: true,
             editable: true
@@ -485,12 +488,13 @@ describe('preset descriptor tool metadata', () => {
     // The exact shared toolbox every real preset advertises: eight package tools,
     // then five app tools. No real card gets a subset any more.
     const TOOLBOX = [
-        'syntaxCheck',
+        'syntax',
         'read',
-        'fileWrite',
+        'write',
         'edit',
         'fileList',
-        'fileGlob',
+        'glob',
+        'grep',
         'shell',
         'gitDiff',
         'timeNow',
@@ -503,7 +507,7 @@ describe('preset descriptor tool metadata', () => {
     // The five real roles (T3). Each one declares subagents, so each one advertises
     // delegate; the two examples do not.
     const REAL = ['instruct', 'research', 'workspace', 'reviewer', 'planner'] as const;
-    const FILES = ['read', 'fileWrite', 'edit', 'fileGlob'];
+    const FILES = ['read', 'write', 'edit', 'glob', 'grep'];
     const CORE_BASE = [
         'toolRegistry',
         'toolRequest',
@@ -2344,12 +2348,13 @@ describe('harness registry over HTTP', () => {
             // The keyless runtime catalogue has no callable search, so the
             // descriptor advertises exactly the registered static toolbox.
             tools: [
-                'syntaxCheck',
+                'syntax',
                 'read',
-                'fileWrite',
+                'write',
                 'edit',
                 'fileList',
-                'fileGlob',
+                'glob',
+                'grep',
                 'shell',
                 'gitDiff',
                 'timeNow',
@@ -2371,9 +2376,10 @@ describe('harness registry over HTTP', () => {
                 'delegate',
                 'threadFork',
                 'read',
-                'fileWrite',
+                'write',
                 'edit',
-                'fileGlob'
+                'glob',
+                'grep'
             ],
             builtin: false,
             editable: true
@@ -2803,9 +2809,10 @@ describe('harness registry over HTTP', () => {
                 'delegate',
                 'threadFork',
                 'read',
-                'fileWrite',
+                'write',
                 'edit',
-                'fileGlob'
+                'glob',
+                'grep'
             ],
             builtin: true,
             editable: true
@@ -2929,12 +2936,13 @@ describe('harness registry over HTTP', () => {
             editable: true
         });
         expect(live.body.harness.tools).toEqual([
-            'syntaxCheck',
+            'syntax',
             'read',
-            'fileWrite',
+            'write',
             'edit',
             'fileList',
-            'fileGlob',
+            'glob',
+            'grep',
             'shell',
             'gitDiff',
             'timeNow',
@@ -2955,9 +2963,10 @@ describe('harness registry over HTTP', () => {
             'agentResult',
             'threadFork',
             'read',
-            'fileWrite',
+            'write',
             'edit',
-            'fileGlob'
+            'glob',
+            'grep'
         ]);
 
         // A NEW session runs the live agent configuration with the shared toolbox.
@@ -2979,12 +2988,13 @@ describe('harness registry over HTTP', () => {
         );
         expect(renamed.status).toBe(200);
         expect(renamed.body.harness.tools).toEqual([
-            'syntaxCheck',
+            'syntax',
             'read',
-            'fileWrite',
+            'write',
             'edit',
             'fileList',
-            'fileGlob',
+            'glob',
+            'grep',
             'shell',
             'gitDiff',
             'timeNow',
