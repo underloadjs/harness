@@ -242,24 +242,26 @@ describe('searchTools', () => {
         // The harness renames tools to their registry key; discovery ranks what
         // the model will actually call.
         const definition = make('tool', ['unrelated'], { description: 'Unrelated capability.' });
-        definition.name = 'fileRead';
+        definition.name = 'read';
 
-        expect(searchTools([definition], ['fileread']).enabled).toEqual(['fileRead']);
+        // The registry key is the only thing left to match, and matching is
+        // case-insensitive on the normalized name.
+        expect(searchTools([definition], ['READ']).enabled).toEqual(['read']);
     });
 });
 
 // Already-available core tools (R1). A query naming a capability the caller already
-// has declared - agentDelegate is the reported case - must say so instead of "no
+// has declared - delegate is the reported case - must say so instead of "no
 // match", without enabling it or spending the discovery cap.
 describe('searchTools with declared core tools', () => {
-    const delegate = make('agentDelegate', ['agents', 'delegate', 'delegation', 'subagent', 'team'], {
+    const delegate = make('delegate', ['agents', 'delegate', 'delegation', 'subagent', 'team'], {
         visibility: 'core'
     });
 
     it('reports an exact core wire name instead of an empty match', () => {
-        // "agentDelegate" is not one of its own tags ("delegate" is), so the wire
+        // "delegate" is not one of its own tags ("delegate" is), so the wire
         // name is what has to resolve.
-        const result = searchTools([], ['agentDelegate'], undefined, 0, { declared: [delegate] });
+        const result = searchTools([], ['delegate'], undefined, 0, { declared: [delegate] });
 
         expect(result).toEqual({
             enabled: [],
@@ -267,8 +269,8 @@ describe('searchTools with declared core tools', () => {
             remaining: 0,
             alreadyAvailable: [
                 {
-                    name: 'agentDelegate',
-                    description: 'agentDelegate capability.',
+                    name: 'delegate',
+                    description: 'delegate capability.',
                     tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
                 }
             ],
@@ -290,8 +292,8 @@ describe('searchTools with declared core tools', () => {
             remaining: 0,
             alreadyAvailable: [
                 {
-                    name: 'agentDelegate',
-                    description: 'agentDelegate capability.',
+                    name: 'delegate',
+                    description: 'delegate capability.',
                     tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
                 }
             ],
@@ -302,7 +304,7 @@ describe('searchTools with declared core tools', () => {
     it('never matches a declared tool by its description', () => {
         // Core descriptions mention everyday words; scanning them would append an
         // already-available tool to almost every query. Name and tags only.
-        const reader = make('fileRead', ['files', 'read'], {
+        const reader = make('read', ['files', 'read'], {
             visibility: 'core',
             description: 'Read a text file.'
         });
@@ -335,8 +337,8 @@ describe('searchTools with declared core tools', () => {
             remaining: 0,
             alreadyAvailable: [
                 {
-                    name: 'agentDelegate',
-                    description: 'agentDelegate capability.',
+                    name: 'delegate',
+                    description: 'delegate capability.',
                     tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
                 }
             ]
@@ -427,20 +429,21 @@ describe('selectTools', () => {
     });
 
     it('matches a name regex and accepts the /source/flags literal form', () => {
-        const read = make('fileRead', ['files']);
+        const read = make('read', ['files']);
         const write = make('fileWrite', ['files']);
         const shell = make('shellRun', ['shell']);
 
-        // Case-insensitive literal: only fileRead matches the anchored source.
-        expect(selectTools([write, read, shell], { regex: '/^fileread$/i' })).toEqual({
-            names: ['fileRead'],
-            tools: [{ name: 'fileRead', description: 'fileRead capability.', tags: ['files'] }]
+        // Case-insensitive literal: only read matches the anchored source.
+        expect(selectTools([write, read, shell], { regex: '/^read$/i' })).toEqual({
+            names: ['read'],
+            tools: [{ name: 'read', description: 'read capability.', tags: ['files'] }]
         });
 
-        // A bare source is also accepted; both file tools match, name order wins.
-        expect(selectTools([write, read, shell], { regex: '^file' }).names).toEqual([
-            'fileRead',
-            'fileWrite'
+        // A bare source is also accepted; several tools match, and the result is
+        // ordered by name.
+        expect(selectTools([write, read, shell], { regex: '/^(file|shell)/' }).names).toEqual([
+            'fileWrite',
+            'shellRun'
         ]);
     });
 
@@ -565,19 +568,19 @@ describe('selectTools', () => {
 // cannot consume the harness's per-turn enable budget.
 describe('selectTools with declared core tools', () => {
     const delegate = make(
-        'agentDelegate',
+        'delegate',
         ['agents', 'delegate', 'delegation', 'subagent', 'team'],
         { visibility: 'core' }
     );
 
     it('reports a core tool matched by exact name without selecting it', () => {
-        expect(selectTools([], { names: ['agentDelegate'] }, { declared: [delegate] })).toEqual({
+        expect(selectTools([], { names: ['delegate'] }, { declared: [delegate] })).toEqual({
             names: [],
             tools: [],
             alreadyAvailable: [
                 {
-                    name: 'agentDelegate',
-                    description: 'agentDelegate capability.',
+                    name: 'delegate',
+                    description: 'delegate capability.',
                     tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
                 }
             ]
@@ -585,13 +588,13 @@ describe('selectTools with declared core tools', () => {
     });
 
     it('reports a core tool matched by name regex without selecting it', () => {
-        expect(selectTools([], { regex: '/^agentdel/i' }, { declared: [delegate] })).toEqual({
+        expect(selectTools([], { regex: '/^deleg/i' }, { declared: [delegate] })).toEqual({
             names: [],
             tools: [],
             alreadyAvailable: [
                 {
-                    name: 'agentDelegate',
-                    description: 'agentDelegate capability.',
+                    name: 'delegate',
+                    description: 'delegate capability.',
                     tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
                 }
             ]
@@ -614,8 +617,8 @@ describe('selectTools with declared core tools', () => {
             ],
             alreadyAvailable: [
                 {
-                    name: 'agentDelegate',
-                    description: 'agentDelegate capability.',
+                    name: 'delegate',
+                    description: 'delegate capability.',
                     tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
                 }
             ]
@@ -623,7 +626,7 @@ describe('selectTools with declared core tools', () => {
     });
 
     it('never matches a declared core tool by its description', () => {
-        const reader = make('fileRead', ['files', 'read'], {
+        const reader = make('read', ['files', 'read'], {
             visibility: 'core',
             description: 'Read a text file.'
         });

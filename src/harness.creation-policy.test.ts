@@ -57,7 +57,7 @@ describe('toolCreation policy', () => {
         const seenResearcher: HarnessStreamRequest[] = [];
         const researcher = brain(scripted([answer('facts')], seenResearcher));
         const writerAgent = brain(
-            scripted([callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"go"}'), answer('final')])
+            scripted([callTool('c1', 'delegate', '{"agent":"researcher","input":"go"}'), answer('final')])
         );
         const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
 
@@ -73,7 +73,7 @@ describe('toolCreation policy', () => {
             scripted([callTool('r1', 'toolCreate', JSON.stringify(creation)), answer('blocked')], seenResearcher)
         );
         const writerAgent = brain(
-            scripted([callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"go"}'), answer('final')])
+            scripted([callTool('c1', 'delegate', '{"agent":"researcher","input":"go"}'), answer('final')])
         );
         const writer = harness({
             agents: { writer: writerAgent, researcher },
@@ -205,7 +205,7 @@ describe('run depth authority', () => {
             scripted([
                 callTool(
                     'c1',
-                    'agentDelegate',
+                    'delegate',
                     '{"agent":"researcher","input":"go"}'
                 ),
                 answer('final')

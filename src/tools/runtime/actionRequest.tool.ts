@@ -83,6 +83,13 @@ export const metadata = ACTION_REQUEST_METADATA;
 export const registration = {
     group: 'runtime',
     activation: 'interaction',
+    // T2/R2: ASYNC — the policy a host integration depends on. The answer arrives from
+    // the owner (a human or an owner fork) at an unpredictable time, so the requester
+    // stays PAUSED with the pending card rather than parked inside a sync batch, and the
+    // answer triggers its own turn the moment it lands. Changing this to 'sync' would
+    // hold the whole message's batch hostage to an out-of-band reply, so it is stated
+    // here explicitly (the control dispatch is async by construction either way).
+    mode: 'async',
     order: 140,
     sessionBound: true,
     alwaysDeclared: false,

@@ -4,7 +4,7 @@
 //
 //     const writer = harness({
 //         agents: { writer: agent({ model, provider }) },
-//         tools: { webSearch: tool({ ... }) },
+//         tools: { search: tool({ ... }) },
 //         report: { progress: async (event) => console.log(event) }
 //     });
 //
@@ -55,10 +55,10 @@
 //   - every `visibility: 'core'` tool, and
 //   - every searchable tool that toolRequest has enabled so far.
 //
-// Core vs searchable (R18): the everyday file tools (fileRead, fileWrite,
-// fileEdit, fileGlob) carry `visibility: 'core'` in the preset catalogue, and a
-// configured webSearch is core too, so they are declared up front. The rest of the
-// preset catalogue — fileList, syntaxCheck, commandRun, gitDiff, the app tools —
+// Core vs searchable (R18): the everyday file tools (read, fileWrite,
+// edit, fileGlob) carry `visibility: 'core'` in the preset catalogue, and a
+// configured search is core too, so they are declared up front. The rest of the
+// preset catalogue — fileList, syntaxCheck, shell, gitDiff, the app tools —
 // stays searchable. "core" is only a declaration classification: it does NOT make
 // the tool session-bound. The harness-owned tools below are the session-bound set,
 // and the server gates only those on a sessionId.
@@ -81,7 +81,7 @@
 // not conclude "no match" for something it can call directly, and such a tag is not
 // reported in `unmatchedTags`. Nothing is enabled for them and the searchable
 // bound is untouched. The list is the caller's own view: a subagent never sees
-// agentDelegate there, and a harness without subagents never has it to report.
+// delegate there, and a harness without subagents never has it to report.
 //
 // Harness-owned names sit outside that scheme:
 //   - toolRequest  — discovery, described above.     (every agent, core)
@@ -94,7 +94,7 @@
 //   - locationManage — session places/settings.      (every agent, core)
 //   - agentManage  — list agents and result previews.(every agent, core)
 //   - agentResult  — read one completed result.       (every agent, core)
-//   - agentDelegate — hand a task to a subagent.     (primary agent only, core)
+//   - delegate — hand a task to a subagent.     (primary agent only, core)
 //   - threadSend   — post a message into another thread. (every agent, core,
 //                    registered once this session owns an independent thread)
 //   - threadList   — list this session's live conversations and ids. (same
@@ -139,7 +139,7 @@
 // mid-conversation, and the tool is registered searchable and enabled at once. The
 // source is compiled but never executed at registration. There is NO sandbox: a
 // created tool runs with this process's permissions, the same trust model as the
-// commandRun preset. See core/creation.ts for the validated bounds.
+// shell preset. See core/creation.ts for the validated bounds.
 //
 // Tool creation is additionally bounded by policy and budget (R12):
 //   - `toolCreation` is 'all' (default), 'primary' (the tool is not declared to
@@ -149,7 +149,7 @@
 //     does not restore it, because created tools stay registered across a reset.
 //
 // Cancellation (R10, T3): `HarnessRunOptions.signal` reaches every model request,
-// every tool's `ToolContext.signal`, and every run a tool or agentDelegate starts.
+// every tool's `ToolContext.signal`, and every run a tool or delegate starts.
 // Tools now run in the BACKGROUND with a per-call AbortController linked to the
 // run signal: cancelling the run aborts all of them, while the model's `toolCancel`
 // aborts exactly one. The harness releases a cancelled call LOGICALLY at once
@@ -204,13 +204,13 @@
 // Manual execution (R8): `harness.executeTool(name, parameters)` runs one
 // REGISTERED tool directly, with this harness's context. It is the host/server path
 // behind the UI's Tools tab (server/sessions.ts → executeTool), so a manual
-// toolRequest/toolCreate/todoManage/agentDelegate call changes this session rather
+// toolRequest/toolCreate/todoManage/delegate call changes this session rather
 // than a detached copy. Core file tools (R18) also run here, exactly like a direct
 // call; only the harness-owned set needs session state. Discovery gates the model
 // only: an explicit user call may run a searchable tool that was never enabled.
 // Everything else still applies —
-// toolCreate keeps its guarded registration, agentDelegate keeps its primary-only
-// check, and a tool this harness did not register (agentDelegate without subagents)
+// toolCreate keeps its guarded registration, delegate keeps its primary-only
+// check, and a tool this harness did not register (delegate without subagents)
 // is an honest error, never a fabricated implementation.
 //
 // todoManage is session state, not catalogue state: a fresh list is created for
@@ -220,7 +220,7 @@
 // chapterManage, and locationManage follow the same pattern with their own
 // closures (core/profile.ts, chapter.ts, location.ts).
 //
-// agentDelegate is bounded delegation (R4): `primary` selects the entry agent, and
+// delegate is bounded delegation (R4): `primary` selects the entry agent, and
 // `subagents` is the allowlist the primary may delegate to. The tool is not
 // declared to subagents (and a guessed call is rejected), so delegation is one
 // level deep; re-entering an already-running agent is rejected by runAgent, which
@@ -230,8 +230,8 @@
 // trusted ctx.run (textSummarize) still works at depth 2.
 //
 // The bundled preset catalogue (./tools) is preloaded into the registry by
-// default, so a new harness gets fileRead/fileWrite/fileEdit/fileGlob as declared
-// core tools and can discover commandRun/… without the caller importing anything.
+// default, so a new harness gets read/fileWrite/edit/fileGlob as declared
+// core tools and can discover shell/… without the caller importing anything.
 // The searchable presets cost no context until discovered. `presets: false` opts
 // out.
 //
@@ -257,6 +257,10 @@ import {
     resolveToolParameters,
     boundToolResult,
     DEFAULT_CREATED_TOOLS_LIMIT,
+    // T2/R2: the documented turn-policy default ('sync'). The registry and the
+    // discovery rows both leave an undeclared tool WITHOUT a mode, so this constant is
+    // the single place the effective default is resolved.
+    DEFAULT_TOOL_MODE,
     cloneToolSourceRecord,
     supportsToolCompilation,
     createTodoTool,
@@ -291,7 +295,7 @@ import {
     resolveToolFolders,
     writeToolSourceFile,
     // Agent-inspection bounds (leaf values, no imports). The delegation allowlist
-    // override is a data-only projection of the discovered agentDelegate row.
+    // override is a data-only projection of the discovered delegate row.
     AGENT_MANAGE_LIST_PER_AGENT,
     AGENT_MANAGE_PREVIEW_CHARS,
     AGENT_RESULT_PAGE_CHARS,
@@ -381,6 +385,7 @@ import type {
     ToolCreation,
     ToolCreationPolicy,
     ToolCreationResult,
+    ToolMode,
     ToolUiPanel
 } from './types';
 import type { PreparedTool, ToolSourceRecord } from './core';
@@ -575,7 +580,7 @@ const resolveToolCreation = (value: ToolCreationPolicy | undefined): ToolCreatio
 
 // How deeply agent runs may nest (R12): the entry run, plus at most ONE
 // delegation level. Enforced centrally in runAgent so every door — the model's
-// agentDelegate tool, `ctx.run`, and a model-created tool that received the whole
+// delegate tool, `ctx.run`, and a model-created tool that received the whole
 // `context` and calls `context.run` — obeys the same rule. Without this, a
 // subagent's tool (created or not) could call `run()` on a third agent and turn
 // "one level deep" into an unstated hierarchy.
@@ -699,7 +704,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const actorKeys = new WeakMap<Agent, string>();
 
     // A branch inherits the SOURCE's role (a fork of the primary keeps
-    // agentDelegate/toolCreate; a fork of a subagent does not). Registered
+    // delegate/toolCreate; a fork of a subagent does not). Registered
     // agents fall back to the registry comparison, so a plugin-added agent is a
     // subagent without extra bookkeeping.
     const roleOf = (brain: Agent): HarnessActorRole =>
@@ -721,7 +726,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const requested = configuration.subagents;
 
         // Default: every agent except the primary. A one-agent harness therefore
-        // has no subagents and gets no agentDelegate tool at all.
+        // has no subagents and gets no delegate tool at all.
         if (requested === undefined) return agentNames.filter((name) => name !== primaryName);
 
         const resolved: string[] = [];
@@ -914,11 +919,29 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const primaryOnlyDefinitions = new WeakSet<Tool>();
     const runtimeControlDefinitions = new WeakMap<Tool, 'toolCancel' | 'threadFork' | 'actionRequest'>();
     const pendingOnlyDefinitions = new WeakSet<Tool>();
-    // T2/R1 answer extraction belongs to the BASELINE agentDelegate definition.
+    // T2/R1 answer extraction belongs to the BASELINE delegate definition.
     // A replacement under the same wire name must behave like an ordinary tool,
     // so both model and manual `context.run` paths key the descriptor on this
     // marker rather than on the call name.
     const delegateAnswerDefinitions = new WeakSet<Tool>();
+    // T2/R2 turn policy, bound to the PUBLISHED DEFINITION of a discovered row. A
+    // baseline entry declares its mode in its own `registration` literal, discovery
+    // projects it into the descriptor, and this map attaches it to the exact object the
+    // registration published (compiled source OR the descriptor+loader proxy). A
+    // replacement under the same wire name is a DIFFERENT object, so it inherits nothing
+    // and answers only for the mode it declares through tool({ mode }) — the same
+    // definition-not-name rule the other markers above follow.
+    const modeDefinitions = new WeakMap<Tool, ToolMode>();
+
+    // The EFFECTIVE turn policy of a resolved definition, in precedence order:
+    //   1. the discovered registration policy bound at registration (built-ins);
+    //   2. the mode the definition itself declares (`tool({ mode })`, including a
+    //      tool compiled from host source or created by toolCreate);
+    //   3. DEFAULT_TOOL_MODE ('sync') for everything else.
+    // Every tool therefore has one documented effective default, and no name-based
+    // policy can leak onto a replacement.
+    const effectiveToolMode = (definition: Tool): ToolMode =>
+        modeDefinitions.get(definition) ?? definition.mode ?? DEFAULT_TOOL_MODE;
 
     // Progress reporting is awaited for every step, so a UI can pace the run.
     const progress: HarnessProgress = async (event: HarnessEvent) => {
@@ -1067,7 +1090,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // actionable; they are still ordinary replaceable registry entries.
             if (pendingOnlyDefinitions.has(definition)) continue;
             // Primary-only definitions are marked by object, NOT by wire name, so
-            // replacing agentDelegate/toolCreate drops the gate unless the
+            // replacing delegate/toolCreate drops the gate unless the
             // replacement itself declares it.
             if (primaryOnlyDefinitions.has(definition) && role !== 'primary') continue;
             core.push(definition);
@@ -1951,7 +1974,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // ORDER is `descriptor.order` (the scan order), which is the historical
     // registration order: toolRegistry, toolRequest, toolList, toolManage,
     // toolCreate, todo/profile/chapter/location, agentManage/agentResult,
-    // agentDelegate, threadFork, actionRequest, toolCancel, then the presets.
+    // delegate, threadFork, actionRequest, toolCancel, then the presets.
     //
     // LIVE CLOSURES stay exactly where they were: this loop decides WHEN and FROM
     // WHICH SOURCE a row is registered, while each row's `execute` still reaches a
@@ -2041,8 +2064,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             parameters?: Record<string, unknown>;
             visibility?: 'core' | 'searchable';
         } = {}
-    ): PreparedTool =>
-        registerBaselineSource(
+    ): PreparedTool => {
+        const prepared = registerBaselineSource(
             {
                 name: descriptor.name,
                 description: overrides.description ?? descriptor.metadata.description,
@@ -2054,6 +2077,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             },
             fallback
         );
+
+        // T2/R2: bind the DISCOVERED policy to the object that was actually published,
+        // whether it came from compiled source or from the descriptor+loader proxy.
+        // Nothing re-reads the entry, and nothing keys the policy on the name, so the
+        // mode survives scanning -> descriptor -> registration -> launch.
+        if (descriptor.mode !== undefined) modeDefinitions.set(prepared.tool, descriptor.mode);
+
+        return prepared;
+    };
 
     // A row's declared control, mapped onto the runtime dispatch marker. The
     // vocabulary is the descriptor's (`cancel`/`fork`/`action`); the marker names
@@ -2072,7 +2104,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // The wire name of the delegation row, resolved once from discovery. Used to
     // project the per-harness allowlist schema at registration time without a
     // hardcoded name constant.
-    const delegateDescriptorName = descriptorOf('agentDelegate')?.name;
+    const delegateDescriptorName = descriptorOf('delegate')?.name;
 
     // Register every active descriptor in scan order and bind its flags to the
     // published DEFINITION object.
@@ -2357,7 +2389,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // Per-harness network closures. They are populated during startup from the
     // `websearch`/`webfetch` configuration and carry the credentials; the compiled
     // source entries only reference the operations, never the keys.
-    const webOperations: { webSearch?: Tool; webFetch?: Tool } = {};
+    const webOperations: { search?: Tool; fetch?: Tool } = {};
 
     // Live operations used by the standalone core source entries. These are not a
     // capability substitute: core tools also receive the full `context.harness`.
@@ -2372,22 +2404,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             delegateFor(caller, parameters, run, runDepth),
         threadSend: (caller, threadId, parameters) => threadSendFor(caller, threadId, parameters),
         threadList: (threadId) => threadRoster(threadId),
-        webSearch: (context) => {
-            const operation = webOperations.webSearch;
+        search: (context) => {
+            const operation = webOperations.search;
 
             if (operation === undefined) {
                 throw new HarnessError(
-                    'webSearch is not configured for this harness (no provider key resolved).'
+                    'search is not configured for this harness (no provider key resolved).'
                 );
             }
 
             return operation.execute(context);
         },
-        webFetch: (context) => {
-            const operation = webOperations.webFetch;
+        fetch: (context) => {
+            const operation = webOperations.fetch;
 
             if (operation === undefined) {
-                throw new HarnessError('webFetch is not configured for this harness.');
+                throw new HarnessError('fetch is not configured for this harness.');
             }
 
             return operation.execute(context);
@@ -2811,7 +2843,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     // Delegation's per-harness allowlist schema was applied to the registered
-    // agentDelegate declaration by the descriptor loop above. The primary-only and
+    // delegate declaration by the descriptor loop above. The primary-only and
     // answer-extraction flags are descriptor-driven too (`primaryOnly: true`,
     // `answerExtraction: true` on the entry), so a replacement under the same wire
     // name inherits neither.
@@ -2874,6 +2906,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             description: definition.description,
             tags: definition.tags,
             visibility: definition.visibility,
+            // T2/R2: the caller's DECLARED turn policy travels with the wrapper, so a
+            // host that registers `tool({ mode: 'async' })` under its own name keeps it.
+            // Absent stays absent (effective 'sync'), and the shared object is still
+            // never mutated.
+            ...(definition.mode === undefined ? {} : { mode: definition.mode }),
             ...(definition.parameters === undefined
                 ? {}
                 : { parameters: definition.parameters }),
@@ -2912,8 +2949,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const operation = create();
         if (operation === undefined) return;
 
-        if (activation === 'websearch') webOperations.webSearch = operation;
-        else webOperations.webFetch = operation;
+        if (activation === 'websearch') webOperations.search = operation;
+        else webOperations.fetch = operation;
 
         // The provider surface (description, tags, dynamic schema) replaces the
         // entry's generic literal. That is the documented contract: the credential
@@ -2936,10 +2973,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     );
 
     // The tools a request may declare: every core tool first (file tools, a
-    // configured webSearch, and the harness-owned set), then everything discovered
+    // configured search, and the harness-owned set), then everything discovered
     // so far. Everything else stays out of the context window on purpose.
     //
-    // agentDelegate is core for the primary only: it is skipped for every other
+    // delegate is core for the primary only: it is skipped for every other
     // agent, so a subagent cannot even see the delegation control. toolCreate is
     // the same under the 'primary' creation policy (R12). That rule lives in
     // visibleCoreTools, which toolRequest also reads — one source for both.
@@ -2956,7 +2993,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     // Declarations handed to every request. Rebuilt per run so a plugin that
     // registers tools mid-flight is picked up on the next call, and so a toolRequest
-    // round shows up in the very next request. Per-brain because agentDelegate is a
+    // round shows up in the very next request. Per-brain because delegate is a
     // primary-only declaration.
     //
     // toolCancel is appended ONLY while this agent's ACTOR has background work
@@ -3093,6 +3130,18 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // take another turn instead of waiting/returning.
         dirty: boolean;
         waiters: Array<() => void>;
+        // T2/R3 — SYNC GROUPS. Every SYNC tool call this run launches is recorded under
+        // the group (a Set of unsettled call ids) built for the assistant message that
+        // requested it, and a member is removed only once its outcome has been DELIVERED
+        // (success, failure, or cancellation all settle). A sync completion may not start
+        // a turn until its whole group drained, which is what makes one turn see the whole
+        // batch. ASYNC calls never join a group and always wake the run themselves.
+        // Per-run by construction: two runs (delegation, two threads) never share a group.
+        syncGroups: Map<string, Set<string>>;
+        // The parked batch gate (see waitForSyncBatch). One run launches one message's
+        // calls at a time, so at most one gate is ever parked; a settled group resolves
+        // every waiter here.
+        syncWakers: Array<() => void>;
         // The error a tool threw while the run was being aborted. A cancellation
         // discards late RESULTS, but a tool that observed the abort and threw
         // gives the more specific error the caller should see (the historical
@@ -3109,7 +3158,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // throws, so the error is parked here and rethrown by the loop: a failing
         // emitter still fails the run, exactly like a synchronous event would.
         deliveryError?: unknown;
-        // Delegation answer extraction (T2/R1), opted into by the two agentDelegate
+        // Delegation answer extraction (T2/R1), opted into by the two delegate
         // call sites only (see RunInternals). When true, the run also records the
         // last substantive tool-free response below and may resolve to it instead
         // of a whitespace-only terminal turn.
@@ -3815,6 +3864,88 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         run.dirty = true;
         const waiters = run.waiters.splice(0);
         for (const resolve of waiters) resolve();
+
+        // T2/R3: every wake ALSO releases a parked batch gate. This is the half of the
+        // sync/async contract that keeps async work independent: an async completion,
+        // the periodic heartbeat, a steer, or a parked delivery failure may take its own
+        // turn while a sync group from an earlier message is still in flight, and the
+        // loop re-reads real state after waking (this is a notification, not a decision).
+        const wakers = run.syncWakers.splice(0);
+        for (const wake of wakers) wake();
+    };
+
+    // T2/R3 — the batch gate. A SYNC call's completion may not start an agent turn
+    // until EVERY sync call launched from the same assistant message has settled
+    // (success, failure, and cancellation all settle). `syncGroups` maps a call id to the
+    // group set built for the message that requested it; membership is recorded at
+    // LAUNCH (only for sync calls), so the settled lookup below is the single source of
+    // "was this completion allowed to wake the run?".
+    //
+    // The group wakes exactly ONCE: N sync completions cost one turn, not N, and the
+    // removal happens while the delivery is being processed, so the group's wake can
+    // never outrun one of its own results out of the transcript.
+    const settleCompletion = (run: RunState, callId: string): void => {
+        const group = run.syncGroups.get(callId);
+
+        // An ASYNC call (or a call that never joined a group) triggers its own turn,
+        // immediately, exactly like the historical background behaviour.
+        if (group === undefined) {
+            markRunDirty(run);
+            return;
+        }
+
+        run.syncGroups.delete(callId);
+        group.delete(callId);
+
+        // Still waiting on the sibling sync calls of the same assistant message: the
+        // outcome is already canonical in the transcript, but no turn starts yet.
+        if (group.size > 0) return;
+
+        // Whole batch settled -> the ONE wake this group is allowed.
+        const wakers = run.syncWakers.splice(0);
+        for (const wake of wakers) wake();
+        markRunDirty(run);
+    };
+
+    // Record a scheduled call as a member of the current message's sync group. An async
+    // call passes no group, which is exactly "never blocks another turn".
+    const joinSyncBatch = (run: RunState, group: Set<string> | undefined, callId: string): void => {
+        if (group === undefined) return;
+        group.add(callId);
+        run.syncGroups.set(callId, group);
+    };
+
+    // Park the loop while the message it just answered still owes a SYNC outcome.
+    // Released by: the group draining (settleCompletion), ANY other wake (markRunDirty —
+    // an async completion, the periodic heartbeat, a steer, or a parked delivery failure),
+    // or the run's signal aborting, so a cancelled run reaches its rollback instead of
+    // hanging here.
+    const waitForSyncBatch = (run: RunState): Promise<void> => {
+        if (run.syncGroups.size === 0) return Promise.resolve();
+
+        return new Promise<void>((resolve) => {
+            const signal = run.signal;
+            let done = false;
+
+            const wake = (): void => {
+                if (done) return;
+                done = true;
+
+                const index = run.syncWakers.indexOf(wake);
+                if (index !== -1) run.syncWakers.splice(index, 1);
+                if (signal) signal.removeEventListener('abort', wake);
+                resolve();
+            };
+
+            run.syncWakers.push(wake);
+
+            if (signal) {
+                // Checked after registering so an abort landing between the size check
+                // and the listener cannot be missed.
+                if (signal.aborted) wake();
+                else signal.addEventListener('abort', wake, { once: true });
+            }
+        });
     };
 
     // Let every delivery already queued for this agent settle before asking the
@@ -4227,10 +4358,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 run.abortError = task.error;
                 run.abortErrorSet = true;
             }
+            // A cancelled run still drains its sync group: a member whose delivery is
+            // skipped must not stay registered, or a parked batch gate would wait on a
+            // call that will never be delivered.
+            settleCompletion(run, call.id);
             return;
         }
 
-        if (!run.active) return;
+        if (!run.active) {
+            settleCompletion(run, call.id);
+            return;
+        }
 
         const brain = run.agent;
         const durationMs = Math.max(0, Date.now() - task.startedAt);
@@ -4295,7 +4433,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // reporter runs: a slow progress callback must not be able to keep
         // `dirty` false while the loop decides the response is final, and two
         // completions must not be lost behind one blocked mailbox job.
-        markRunDirty(run);
+        //
+        // T2/R3: this wake is MODE-AWARE. `settleCompletion` marks dirty immediately for
+        // an ASYNC call, and for a SYNC call only once every sync call of the same
+        // assistant message has settled (success, failure, or cancellation) — so a sync
+        // batch costs exactly ONE turn, while no individual delivery was ever delayed by
+        // a sibling still running.
+        settleCompletion(run, call.id);
 
         // Computed AFTER the board removed this task, so the list is what is still
         // running, not the call just delivered.
@@ -4361,10 +4505,17 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //
     // EXCEPTION: an abort is not a tool failure. It propagates (no result is
     // written for it) so the run rolls back instead of inviting a retry.
+    //
+    // `batch` is the SYNC GROUP for the assistant message being answered (T2/R3). A call
+    // whose effective mode is 'sync' joins it, which is what defers its turn trigger until
+    // the whole batch settled; an 'async' call never joins and keeps triggering its own
+    // turn. Validation failures never reach the scheduler, so they never join either —
+    // their result already exists, and the gate can therefore never strand on them.
     const launchToolCall = async (
         run: RunState,
         call: HarnessToolCall,
-        offered?: ReadonlyMap<string, Tool>
+        offered?: ReadonlyMap<string, Tool>,
+        batch?: Set<string>
     ): Promise<void> => {
         // ABORT BOUNDARY (R10): no call starts into a cancelled run.
         throwIfAborted(run);
@@ -4396,8 +4547,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return;
         }
 
+        // T2/R2/R3: the EFFECTIVE mode of the RESOLVED definition decides whether this
+        // call joins the current message's SYNC GROUP. Resolved once, here, because the
+        // branch controls below dispatch through their own handlers and must honour the
+        // same policy. A call that never schedules (every validation failure and the
+        // toolCancel acknowledgement) never joins, so the batch gate can never strand on
+        // a call that has no task to wait for.
+        const syncGroup = effectiveToolMode(definition) === 'sync' ? batch : undefined;
+
         // Roles/content policies are attached to the baseline DEFINITION objects,
-        // not to names. A replacement under agentDelegate/toolCreate is an ordinary
+        // not to names. A replacement under delegate/toolCreate is an ordinary
         // tool and does not inherit the old gate.
         if (primaryOnlyDefinitions.has(definition) && roleOf(brain) !== 'primary') {
             await fail(
@@ -4496,6 +4655,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // snapshot and, for actionRequest, the owner lineage), so a baseline
         // control definition dispatches to a runtime handler. A replacement has no
         // marker and therefore executes through definition.execute like any tool.
+        //
+        // T2/R3: both controls are declared `mode: 'async'` in their own entries, and
+        // this dispatch implements exactly that: the branch/owner task is scheduled on the
+        // board, delivered through the mailbox, and its completion wakes the requester on
+        // its own. They therefore never join a sync group (`syncGroup` is unused here),
+        // which is what keeps a fork from holding its requester's batch hostage. The
+        // descriptors test pins those two rows to 'async' so the declaration and the
+        // dispatch cannot drift.
         const runtimeControl = runtimeControlDefinitions.get(definition);
 
         if (runtimeControl === 'threadFork' && forks.enabled) {
@@ -4541,6 +4708,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
         // Launch. The task's own signal is what the tool sees; it is linked to
         // the run signal by the scheduler, and toolCancel aborts only this call.
+        //
+        // T2/R3: a sync call joins the group here (not at dispatch), so only a call that
+        // really became background work can hold the batch gate.
+        joinSyncBatch(run, syncGroup, call.id);
+
         scheduler.schedule({
             scope: run.scope,
             agent: run.actorKey,
@@ -4582,7 +4754,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         // labels the child's events with the tool call that spawned
                         // it (T3 UI threads); the runtime guards above are unchanged.
                         //
-                        // T2/R1: only the built-in agentDelegate opts into answer
+                        // T2/R1: only the built-in delegate opts into answer
                         // extraction (a whitespace-only final turn resolves to the
                         // run's last substantive tool-free response). Any other tool
                         // using ctx.run keeps the literal final-turn return.
@@ -4618,7 +4790,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                         // Keep the mailbox chain healthy and fail the RUN on the
                         // loop, where the rollback path is.
                         if (run.deliveryError === undefined) run.deliveryError = error;
-                        markRunDirty(run);
+                        // T2/R3: a FAILED delivery still settles the call's slot in its
+                        // sync group, so a parked batch gate is never stranded by a
+                        // reporter that threw. For an async call this is the historical
+                        // immediate wake, unchanged.
+                        settleCompletion(run, call.id);
                     })
                 );
             }
@@ -4951,7 +5127,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
 
         // A branch is a separate actor with the SAME role as its source, so a fork
-        // of the primary keeps agentDelegate/toolCreate and a fork of a subagent
+        // of the primary keeps delegate/toolCreate and a fork of a subagent
         // does not gain them.
         actorRoles.set(branch, roleOf(run.agent));
 
@@ -5052,7 +5228,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 enqueueMailbox(run.actorKey, () =>
                     deliverTask(task, run, call).catch((error) => {
                         if (run.deliveryError === undefined) run.deliveryError = error;
-                        markRunDirty(run);
+                        // T2/R3: a FAILED delivery still settles the call's slot in its
+                        // sync group, so a parked batch gate is never stranded by a
+                        // reporter that threw. For an async call this is the historical
+                        // immediate wake, unchanged.
+                        settleCompletion(run, call.id);
                     })
                 );
             }
@@ -5432,7 +5612,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 enqueueMailbox(run.actorKey, () =>
                     deliverTask(task, run, call).catch((error) => {
                         if (run.deliveryError === undefined) run.deliveryError = error;
-                        markRunDirty(run);
+                        // T2/R3: a FAILED delivery still settles the call's slot in its
+                        // sync group, so a parked batch gate is never stranded by a
+                        // reporter that threw. For an async call this is the historical
+                        // immediate wake, unchanged.
+                        settleCompletion(run, call.id);
                     })
                 );
             }
@@ -5888,9 +6072,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
                 // Launch every requested call; they run concurrently. A launch
                 // failure is already a tool result, so the round always completes.
+                //
+                // T2/R3: ONE fresh SYNC GROUP per assistant message. Every call whose
+                // resolved definition is 'sync' joins it at schedule time; the gate below
+                // then holds the NEXT turn until the whole group delivered. Async calls
+                // never join and keep triggering their own turns.
+                const syncBatch = new Set<string>();
+
                 for (const call of message.toolCalls) {
                     throwIfAborted(run);
-                    await launchToolCall(run, call, offered);
+                    await launchToolCall(run, call, offered, syncBatch);
                 }
 
                 // R3/F1: close this request's output AFTER its tool_call frames (a
@@ -5902,6 +6093,22 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 }
 
                 await settleWindow(run);
+
+                // T2/R3 — the BATCH GATE. `settleWindow` only coalesces work that settles
+                // without real I/O, so a SYNC call that is genuinely still running would
+                // otherwise buy a turn built on placeholders. Parking here is exactly the
+                // "a lone sync tool triggers the next turn AFTER it finishes" contract,
+                // and for several sync calls it means ONE turn carrying the whole batch.
+                //
+                // The park is never a block on async work:
+                //   - an ASYNC completion (or the periodic heartbeat, a steer, or a parked
+                //     delivery failure) goes through markRunDirty, which releases every
+                //     parked gate immediately — that call gets its own turn even while
+                //     sync calls are still in flight, and its delivery was never delayed
+                //     by the group;
+                //   - an abort releases the gate too, so a cancelled run reaches its
+                //     rollback instead of waiting here.
+                if (run.syncGroups.size > 0) await waitForSyncBatch(run);
             }
         } catch (error) {
             // Mark the run dead BEFORE any await: a completion racing this catch
@@ -6017,7 +6224,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     // The one entry point every path uses: the harness call, ctx.run, and
-    // agentDelegate. Guards live here so none can be bypassed through a tool's
+    // delegate. Guards live here so none can be bypassed through a tool's
     // general context.
     //
     // Per-run state replaces the old global runStack/runSignal: concurrent tools
@@ -6028,14 +6235,14 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         signal?: AbortSignal,
         parent?: RunState,
         // The parent tool call that spawned this run (T3 UI threads). `ctx.run`
-        // and agentDelegate pass their own `call.id`; a host/root invocation passes
+        // and delegate pass their own `call.id`; a host/root invocation passes
         // nothing. It only labels the child's events — it grants no authority.
         callId?: string,
         // Internal, delegate-only answer extraction (T2/R1). Omitted for host runs
         // and arbitrary ctx.run calls, which keep their historical return value.
         internals?: RunInternals,
         // Root-prompt attachments (T3). ONLY the harness callable passes these;
-        // ctx.run/agentDelegate omit them so root bytes never reach a child
+        // ctx.run/delegate omit them so root bytes never reach a child
         // prompt. Validated here, before the run acquires the agent or mutates
         // any history.
         attachments?: HarnessAttachment[],
@@ -6097,7 +6304,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             if (threadState !== undefined) return threadState;
 
             if (parent !== undefined && parent.threadState?.record.origin === 'host') {
-                // `ctx.run`/agentDelegate resolve a registry agent by name; a brain
+                // `ctx.run`/delegate resolve a registry agent by name; a brain
                 // outside the registry cannot be re-created as a thread, so it falls
                 // back to its own default conversation (never a host's transcript).
                 if (agents[brain.name] !== brain) return defaultThreadOf(brain);
@@ -6113,7 +6320,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         })();
 
         // The BRAIN that actually runs. A registry brain arrives from the
-        // callable/ctx.run/agentDelegate; when the run is bound to a host thread,
+        // callable/ctx.run/delegate; when the run is bound to a host thread,
         // that thread's own Agent instance is the actor: its transcript, its actor
         // key, and its events. Without this the child of a host thread would still
         // write into `agent:<name>` (and queue behind it), which is exactly the
@@ -6232,6 +6439,10 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                 iteration: 0,
                 dirty: false,
                 waiters: [],
+                // T2/R3: empty at launch; the batch gate fills it as sync calls are
+                // scheduled and drains it as their outcomes are delivered.
+                syncGroups: new Map(),
+                syncWakers: [],
                 steering: [],
                 attachments: validatedAttachments,
                 // Delegate-only answer extraction (T2/R1). A host run and an
@@ -6860,7 +7071,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // with the session it belongs to, exactly like the model would, but without
     // spending a discovery round trip. The server's `POST /tools/:name` calls this
     // through its session for the session-bound harness-owned tools, which is what
-    // makes a manual toolRequest/toolCreate/todoManage/agentDelegate call mutate
+    // makes a manual toolRequest/toolCreate/todoManage/delegate call mutate
     // THIS harness instead of a detached copy. Core file tools use the ordinary
     // direct-call path and do not require a session.
     //
@@ -6868,7 +7079,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // action may run any registered tool even when toolRequest never enabled it;
     // the model still cannot. Nothing else is bypassed — toolCreate goes through
     // createToolFrom (validation, budget, collisions, guarded compilation) and
-    // agentDelegate's own execute re-checks the primary's authority.
+    // delegate's own execute re-checks the primary's authority.
     //
     // R11: the arguments are resolved and VALIDATED exactly like the model path,
     // except that the already-unwrapped direct-call form is accepted too (see
@@ -6965,7 +7176,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         const definition = tools[name];
 
         // The session owns which tools exist: a harness without subagents has no
-        // agentDelegate, so an operator asking for one gets an honest error here (the
+        // delegate, so an operator asking for one gets an honest error here (the
         // server maps it to 404) instead of a fabricated implementation. The same is
         // true of toolCreate under `toolCreation: false`.
         if (!definition) {
@@ -6987,7 +7198,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         try {
             return await definition.execute({
                 parameters: resolved,
-                // An explicit host call acts as the session's entry agent: agentDelegate
+                // An explicit host call acts as the session's entry agent: delegate
                 // therefore stays primary-only, and ctx.run cycles and the depth rule are
                 // still enforced by runAgent.
                 agent: primary,
@@ -7006,7 +7217,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
                     if (!target) {
                         throw new HarnessError(`Agent "${agentName}" is not registered.`);
                     }
-                    // T2/R1: a MANUAL agentDelegate call gets the same answer
+                    // T2/R1: a MANUAL delegate call gets the same answer
                     // extraction as the model path, so a host-triggered delegation
                     // cannot return a blank terminal turn while the child already
                     // answered substantively. Other manual ctx.run tools keep the
@@ -7275,12 +7486,12 @@ export { openAICompatible, listModels, ModelListError } from './transport';
 export type { ModelListConfiguration, ModelListErrorKind } from './transport';
 export {
     syntaxCheck,
-    fileRead,
+    read,
     fileWrite,
-    fileEdit,
+    edit,
     fileList,
     fileGlob,
-    commandRun,
+    shell,
     gitDiff,
     createWebSearchTool,
     WEB_SEARCH_METADATA,

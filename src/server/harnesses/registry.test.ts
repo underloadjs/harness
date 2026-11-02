@@ -24,11 +24,11 @@ import { presets } from './presets';
 import { SHARED_TOOL_NAMES } from './toolbox';
 import { AGENT_PROFILE_NAMES } from '../../agents';
 
-// The exact tool-order assertions below assume a KEYLESS host: webSearch is
+// The exact tool-order assertions below assume a KEYLESS host: search is
 // registered only when EXA_API_KEY/TAVILY_API_KEY resolves (harness.ts:728-738),
-// while webFetch is keyless and registers whenever the factory opts in
+// while fetch is keyless and registers whenever the factory opts in
 // (harness.ts:753-761). Pin the env so a developer shell holding real keys cannot
-// insert webSearch ahead of webFetch and turn a correct order into a failure.
+// insert search ahead of fetch and turn a correct order into a failure.
 beforeEach(() => {
     vi.stubEnv('EXA_API_KEY', '');
     vi.stubEnv('TAVILY_API_KEY', '');
@@ -145,7 +145,7 @@ describe('creating a harness', () => {
             subagents: ['summarizer'],
             agents: ['research', 'summarizer'],
             tools: SHARED_TOOL_NAMES,
-            environmentTools: ['webSearch'],
+            environmentTools: ['search'],
             builtin: false,
             editable: true
         });
@@ -155,11 +155,11 @@ describe('creating a harness', () => {
         const harness = preset.create(SETTINGS, progress);
         expect(Object.keys(harness.agents)).toEqual(['research', 'summarizer']);
         expect(Object.keys(harness.subagents)).toEqual(['summarizer']);
-        expect(harness.tools.agentDelegate.visibility).toBe('core');
+        expect(harness.tools.delegate.visibility).toBe('core');
         // W4: createToolboxHarness opts into `webfetch: true`, and the harness
         // appends environment tools after the configured table and before the
-        // harness-owned core set (harness.ts:740-761). webSearch is absent because
-        // this host is keyless; webFetch needs no credential, so it lands first of
+        // harness-owned core set (harness.ts:740-761). search is absent because
+        // this host is keyless; fetch needs no credential, so it lands first of
         // the appended tools and stays searchable (not core).
         expect(Object.keys(harness.tools)).toEqual([
             'toolRegistry',
@@ -173,11 +173,11 @@ describe('creating a harness', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'agentDelegate',
+            'delegate',
             'threadFork',
             'toolCancel',
             ...SHARED_TOOL_NAMES,
-            'webFetch'
+            'fetch'
         ]);
 
         // The registry lists it after the built-ins.
@@ -203,7 +203,7 @@ describe('creating a harness', () => {
         expect(preset.subagents).toEqual([]);
 
         // No subagents means the harness registers no delegate tool at all.
-        expect(preset.create(SETTINGS, progress).tools.agentDelegate).toBeUndefined();
+        expect(preset.create(SETTINGS, progress).tools.delegate).toBeUndefined();
     });
 
     it('rejects bad names, reserved aliases, duplicates and unknown agents', () => {
@@ -361,7 +361,7 @@ describe('updating a harness', () => {
         const harness = after.create(SETTINGS, progress);
         expect(Object.keys(harness.agents)).toEqual(['workspace', 'research', 'summarizer']);
         expect(Object.keys(harness.subagents)).toEqual(['research', 'summarizer']);
-        expect(harness.tools.agentDelegate.visibility).toBe('core');
+        expect(harness.tools.delegate.visibility).toBe('core');
     });
 
     it('drops the new primary from the old allowlist when subagents are not restated', () => {
@@ -381,7 +381,7 @@ describe('updating a harness', () => {
             'reviewer',
             'planner'
         ]);
-        expect(after.create(SETTINGS, progress).tools.agentDelegate.visibility).toBe('core');
+        expect(after.create(SETTINGS, progress).tools.delegate.visibility).toBe('core');
     });
 
     it('validates a patched allowlist against the effective primary', () => {
@@ -439,7 +439,7 @@ describe('updating a harness', () => {
         // The flaky example keeps its extra tool and shared toolbox declaration.
         expect(flakyAfter.create).toBe(flakyBefore.create);
         expect(flakyAfter.tools).toEqual([...SHARED_TOOL_NAMES, 'testFlaky']);
-        expect(flakyAfter.environmentTools).toEqual(['webSearch']);
+        expect(flakyAfter.environmentTools).toEqual(['search']);
         expect(flakyAfter.template).toBe('flaky');
 
         // The runtime really keeps them: these are the exact registered names.
@@ -482,7 +482,7 @@ describe('updating a harness', () => {
         expect(after.description).toContain('no longer uses the offline script');
         expect(after.requiresEndpoint).toBe(true);
         expect(after.tools).toEqual(SHARED_TOOL_NAMES);
-        expect(after.environmentTools).toEqual(['webSearch']);
+        expect(after.environmentTools).toEqual(['search']);
         expect(after.primary).toBe('workspace');
         expect(after.agents).toEqual(['workspace']);
 

@@ -2,7 +2,7 @@
 //
 // HISTORY
 // -------
-// This file used to mock `./files/fileRead.tool` and `./files/fileEdit.tool` and
+// This file used to mock `./files/read.tool` and `./files/edit.tool` and
 // count those mock factories, because the generated loader `import()`ed those
 // modules. T27 changed the Node body source: `loadPresetTool` now compiles every
 // source-backed descriptor's editable `sourcePath` through `prepareToolCandidate`,
@@ -69,7 +69,7 @@ const SCRATCH_ROOT = path.join(PACKAGE_ROOT, '..', '..', '..', 'Temp', 't27', 'l
 const READ_TARGET = path.join(SCRATCH_ROOT, 'read.txt');
 const EDIT_TARGET = path.join(SCRATCH_ROOT, 'edit.txt');
 
-// One fresh fixture set per test: `fileEdit` mutates its target, so the exact
+// One fresh fixture set per test: `edit` mutates its target, so the exact
 // expected bytes below depend on starting from these contents every time.
 const prepareFixtures = (): void => {
     fs.rmSync(SCRATCH_ROOT, { recursive: true, force: true });
@@ -95,15 +95,15 @@ describe('lazy preset tools', () => {
         // Full metadata is available — the description the model reads, the tags
         // discovery matches (or the visibility flag), and the schema the harness
         // declares — with no body compiled.
-        expect(presetTools.fileRead.name).toBe('fileRead');
-        expect(presetTools.fileRead.description).toBe(
+        expect(presetTools.read.name).toBe('read');
+        expect(presetTools.read.description).toBe(
             'Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }. Defaults: startLine 1, startColumn 0, maxLines 200 (hard maximum 5000). `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. When an entry is truncated, request { path, startLine: nextLine, startColumn: nextColumn } to continue; nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. The whole batch shares a fixed 64 KiB UTF-8 CONTENT budget (not counting JSON escaping), split fairly between the requested files, and reading stops at that budget instead of loading huge files or lines wholesale. A call accepts at most 100 paths. A path that does not exist is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code: "ENOENT", message }`; it consumes no content budget and the other files are still read. Every other failure - an invalid request, a directory (use fileList or fileGlob for those), binary bytes (NUL or invalid UTF-8) encountered while streaming the file, or any other filesystem error - rejects the whole call, so a short answer never looks complete. Binary detection covers decoded chunks, not the whole file beyond the last chunk read. A window at a deep line rescans from the start to count lines. Paths are absolute or relative to the working directory.'
         );
-        expect(presetTools.fileRead.tags).toEqual(['files', 'read', 'filesystem']);
+        expect(presetTools.read.tags).toEqual(['files', 'read', 'filesystem']);
         // Core by catalogue metadata (R18): declared up front, but that changes no
         // laziness property — the body still compiles only on first call.
-        expect(presetTools.fileRead.visibility).toBe('core');
-        expect(presetTools.fileRead.parameters).toEqual({
+        expect(presetTools.read.visibility).toBe('core');
+        expect(presetTools.read.parameters).toEqual({
             type: 'object',
             properties: {
                 paths: {
@@ -157,7 +157,7 @@ describe('lazy preset tools', () => {
         expect(compiles).toEqual([]);
 
         // First execution compiles the entry the descriptor was scanned from.
-        await expect(presetTools.fileRead([READ_TARGET])).resolves.toEqual({
+        await expect(presetTools.read([READ_TARGET])).resolves.toEqual({
             files: [
                 {
                     path: READ_TARGET,
@@ -175,11 +175,11 @@ describe('lazy preset tools', () => {
             contentBudget: 65536
         });
         expect(compiles).toEqual([
-            { sourcePath: 'tools/files/fileRead.tool.ts', expectedName: 'fileRead' }
+            { sourcePath: 'tools/files/read.tool.ts', expectedName: 'read' }
         ]);
 
         // The proxy caches its successful resolve: a second call compiles nothing.
-        await expect(presetTools.fileRead([READ_TARGET])).resolves.toEqual({
+        await expect(presetTools.read([READ_TARGET])).resolves.toEqual({
             files: [
                 {
                     path: READ_TARGET,
@@ -207,17 +207,17 @@ describe('lazy preset tools', () => {
 
         // Two direct resolutions, two compilations: the seam deliberately keeps no
         // compiled body, so an entry edited between calls is never served stale.
-        const first = await loadPresetTool('fileRead');
-        const second = await loadPresetTool('fileRead');
+        const first = await loadPresetTool('read');
+        const second = await loadPresetTool('read');
 
         expect(compiles).toEqual([
-            { sourcePath: 'tools/files/fileRead.tool.ts', expectedName: 'fileRead' },
-            { sourcePath: 'tools/files/fileRead.tool.ts', expectedName: 'fileRead' }
+            { sourcePath: 'tools/files/read.tool.ts', expectedName: 'read' },
+            { sourcePath: 'tools/files/read.tool.ts', expectedName: 'read' }
         ]);
 
         // Both are genuinely usable and carry the entry's own metadata.
-        expect(first.name).toBe('fileRead');
-        expect(second.name).toBe('fileRead');
+        expect(first.name).toBe('read');
+        expect(second.name).toBe('read');
         expect(first.description).toBe(second.description);
         await expect(first([READ_TARGET])).resolves.toEqual({
             files: [
@@ -249,19 +249,19 @@ describe('lazy preset tools', () => {
         // `execute` is what the harness calls; it must defer exactly like the
         // callable and reach the real body.
         await expect(
-            presetTools.fileEdit.execute({
+            presetTools.edit.execute({
                 parameters: [{ path: EDIT_TARGET, oldString: 'before', newString: 'after' }]
             })
         ).resolves.toEqual([{ path: EDIT_TARGET, replacements: 1, bytes: 11 }]);
         expect(compiles).toEqual([
-            { sourcePath: 'tools/files/fileEdit.tool.ts', expectedName: 'fileEdit' }
+            { sourcePath: 'tools/files/edit.tool.ts', expectedName: 'edit' }
         ]);
         expect(fs.readFileSync(EDIT_TARGET, 'utf8')).toBe('after value');
 
         // The callable shares the same proxy resolve: still one compile, and the
         // second edit applies to the bytes the first one wrote.
         await expect(
-            presetTools.fileEdit([
+            presetTools.edit([
                 { path: EDIT_TARGET, oldString: 'after', newString: 'final' }
             ])
         ).resolves.toEqual([{ path: EDIT_TARGET, replacements: 1, bytes: 11 }]);

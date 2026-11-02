@@ -10,7 +10,7 @@
 //           example). All built from TRUSTED agent profiles in src/agents through
 //           `createProfiledHarness` (./toolbox.ts), so they register the SAME
 //           toolbox: package coding tools, the app tools, environment-backed
-//           webSearch, and the harness core tools. Only the agents differ: names,
+//           search, and the harness core tools. Only the agents differ: names,
 //           instructions, guidelines, primary, and subagents.
 //   fixture — demo is a scripted offline run with timeNow only. It is retained so
 //           the UI (and the service tests) can exercise the whole loop without a
@@ -30,7 +30,7 @@
 // a specialist from the team and the Planner's `coder`/`researcher`/`reviewer`
 // targets exist by id. `teamOf()` derives the allowlist from one list, so the five
 // presets cannot drift. The one-level delegation rule is a harness property (a
-// subagent never receives agentDelegate), so none of these prompts may ask a
+// subagent never receives delegate), so none of these prompts may ask a
 // subagent to delegate again.
 //
 // EDITABLE TEMPLATES (R20.1)
@@ -132,7 +132,7 @@ export const teamOf = (primary: string): string[] => [
 
 // The general-purpose choice and the first card in the UI. Its profile's
 // guidelines are about *behaviour* and discovery, not about which capabilities
-// exist: the four core file tools and a configured webSearch are always declared;
+// exist: the four core file tools and a configured search are always declared;
 // fileList, commands, git, syntax and the app tools are searchable.
 // The allowlist is computed once per preset so the metadata and the factory
 // closure cannot see two different lists.
@@ -142,16 +142,16 @@ const instruct: HarnessPreset = {
     name: 'instruct',
     title: 'Instruct',
     description:
-        'General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured webSearch are always available; call toolRequest for fileList, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.',
+        'General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured search are always available; call toolRequest for fileList, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.',
     requiresEndpoint: true,
     primary: 'instruct',
     subagents: instructTeam,
     agents: ['instruct', ...instructTeam],
     tools: SHARED_TOOL_NAMES,
     // Same environment-backed declaration as every live preset: a keyless host
-    // simply does not append webSearch to the descriptor (it stays listed as
+    // simply does not append search to the descriptor (it stays listed as
     // unconfigured in the global tool catalogue).
-    environmentTools: ['webSearch'],
+    environmentTools: ['search'],
     builtin: true,
     editable: true,
     template: 'live',
@@ -168,13 +168,13 @@ const research: HarnessPreset = {
     name: 'research',
     title: 'Researcher',
     description:
-        'Researcher with the same full toolbox as every live harness and the other roles as direct subagents. fileRead and fileGlob are always available; webSearch joins the toolbox when the host configured a key. Investigates, cross-checks sources, and cites what it used.',
+        'Researcher with the same full toolbox as every live harness and the other roles as direct subagents. read and fileGlob are always available; search joins the toolbox when the host configured a key. Investigates, cross-checks sources, and cites what it used.',
     requiresEndpoint: true,
     primary: 'research',
     subagents: researchTeam,
     agents: ['research', ...researchTeam],
     tools: SHARED_TOOL_NAMES,
-    environmentTools: ['webSearch'],
+    environmentTools: ['search'],
     builtin: true,
     editable: true,
     template: 'live',
@@ -198,7 +198,7 @@ const workspace: HarnessPreset = {
     subagents: workspaceTeam,
     agents: ['workspace', ...workspaceTeam],
     tools: SHARED_TOOL_NAMES,
-    environmentTools: ['webSearch'],
+    environmentTools: ['search'],
     builtin: true,
     editable: true,
     template: 'live',
@@ -220,7 +220,7 @@ const reviewer: HarnessPreset = {
     subagents: reviewerTeam,
     agents: ['reviewer', ...reviewerTeam],
     tools: SHARED_TOOL_NAMES,
-    environmentTools: ['webSearch'],
+    environmentTools: ['search'],
     builtin: true,
     editable: true,
     template: 'live',
@@ -229,7 +229,7 @@ const reviewer: HarnessPreset = {
 
 // Planner: plan, then route each step to the specialist that owns it. It is the
 // preset that exists FOR delegation, and its team deliberately contains the other
-// four real roles by id, so `agentDelegate` targets really exist.
+// four real roles by id, so `delegate` targets really exist.
 const plannerTeam = teamOf('planner');
 
 const planner: HarnessPreset = {
@@ -242,7 +242,7 @@ const planner: HarnessPreset = {
     subagents: plannerTeam,
     agents: ['planner', ...plannerTeam],
     tools: SHARED_TOOL_NAMES,
-    environmentTools: ['webSearch'],
+    environmentTools: ['search'],
     builtin: true,
     editable: true,
     template: 'live',
@@ -343,10 +343,10 @@ const failure: HarnessPreset = {
     subagents: [],
     agents: ['flaky'],
     tools: [...SHARED_TOOL_NAMES, ...EXAMPLE_TOOL_NAMES],
-    // R18: the factory below uses createToolboxHarness, which opts into webSearch
+    // R18: the factory below uses createToolboxHarness, which opts into search
     // exactly like the live presets. Declaring it here keeps descriptor.tools and
     // descriptor.coreTools equal to what the session actually registers.
-    environmentTools: ['webSearch'],
+    environmentTools: ['search'],
     builtin: true,
     editable: true,
     template: 'flaky',
@@ -410,25 +410,25 @@ export const LEGACY_PRESET_DEFINITIONS: Readonly<Record<string, LegacyPresetDefi
     instruct: {
         title: 'Instruct',
         description:
-            'A general instruction-following agent with the full shared toolbox. File read/write/edit/glob and a configured webSearch are always available; call toolRequest with capability tags for fileList, commands, diffs, syntax checks, time, text, or notes. The live presets differ only in their agents, not their tools.',
+            'A general instruction-following agent with the full shared toolbox. File read/write/edit/glob and a configured search are always available; call toolRequest with capability tags for fileList, commands, diffs, syntax checks, time, text, or notes. The live presets differ only in their agents, not their tools.',
         requiresEndpoint: true,
         primary: 'instruct',
         subagents: [],
         agents: ['instruct'],
         tools: SHARED_TOOL_NAMES,
-        environmentTools: ['webSearch'],
+        environmentTools: ['search'],
         template: 'live'
     },
     research: {
         title: 'Research',
         description:
-            'A research agent with the same full toolbox as every live harness, plus a summarizer subagent. fileRead and fileGlob are always available; `primary` and `subagents` are explicit: the research agent is the entry point and the only agent that may delegate, and delegation is one level deep. Web search is core and joins the toolbox when the host configured a search key.',
+            'A research agent with the same full toolbox as every live harness, plus a summarizer subagent. read and fileGlob are always available; `primary` and `subagents` are explicit: the research agent is the entry point and the only agent that may delegate, and delegation is one level deep. Web search is core and joins the toolbox when the host configured a search key.',
         requiresEndpoint: true,
         primary: 'research',
         subagents: ['summarizer'],
         agents: ['research', 'summarizer'],
         tools: SHARED_TOOL_NAMES,
-        environmentTools: ['webSearch'],
+        environmentTools: ['search'],
         template: 'live'
     },
     workspace: {
@@ -440,7 +440,7 @@ export const LEGACY_PRESET_DEFINITIONS: Readonly<Record<string, LegacyPresetDefi
         subagents: [],
         agents: ['workspace'],
         tools: SHARED_TOOL_NAMES,
-        environmentTools: ['webSearch'],
+        environmentTools: ['search'],
         template: 'live'
     }
 };

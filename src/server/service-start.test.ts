@@ -109,17 +109,17 @@ const TOOL_NAMES = [
     'locationManage',
     'agentManage',
     'agentResult',
-    'agentDelegate',
+    'delegate',
     // N4: conditional harness-owned tools, appended to the global catalogue.
     'actionRequest',
     'threadFork',
     'syntaxCheck',
-    'fileRead',
+    'read',
     'fileWrite',
-    'fileEdit',
+    'edit',
     'fileList',
     'fileGlob',
-    'commandRun',
+    'shell',
     'gitDiff',
     'timeNow',
     'textCount',
@@ -127,7 +127,7 @@ const TOOL_NAMES = [
     'noteSearch',
     'textSummarize',
     'testFlaky',
-    'webSearch'
+    'search'
 ];
 
 const parseSse = (text: string): SessionStreamItem[] => {

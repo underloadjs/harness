@@ -128,8 +128,8 @@ describe('invocation identity (T3 UI threads)', () => {
         const helper = brain(scripted([answer('first facts'), answer('second facts')]));
         const lead = brain(
             scripted([
-                callTool('c1', 'agentDelegate', '{"agent":"helper","input":"first task"}'),
-                callTool('c2', 'agentDelegate', '{"agent":"helper","input":"second task"}'),
+                callTool('c1', 'delegate', '{"agent":"helper","input":"first task"}'),
+                callTool('c2', 'delegate', '{"agent":"helper","input":"second task"}'),
                 answer('lead done')
             ])
         );
@@ -250,13 +250,17 @@ describe('invocation identity (T3 UI threads)', () => {
             description: 'Hold until the test releases it.',
             tags: ['test'],
             visibility: 'core',
+            // T2/R2: async on purpose. The test pins a child that ANSWERS while its
+            // call is still in flight, which only exists for an async tool: a sync call
+            // would hold the batch gate and the pause frames would never be emitted.
+            mode: 'async',
             execute: () => gate.promise
         });
 
         const helper = brain(scripted([callTool('h1', 'hold', '{}'), answer('child finished')]));
         const lead = brain(
             scripted([
-                callTool('c1', 'agentDelegate', '{"agent":"helper","input":"wait for it"}'),
+                callTool('c1', 'delegate', '{"agent":"helper","input":"wait for it"}'),
                 answer('lead finished')
             ])
         );
@@ -337,7 +341,7 @@ describe('invocation identity (T3 UI threads)', () => {
         const helper = brain(scripted([callTool('h1', 'hold', '{}'), answer('never')]));
         const lead = brain(
             scripted([
-                callTool('c1', 'agentDelegate', '{"agent":"helper","input":"wait for it"}'),
+                callTool('c1', 'delegate', '{"agent":"helper","input":"wait for it"}'),
                 answer('never')
             ])
         );

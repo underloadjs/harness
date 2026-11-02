@@ -1,7 +1,7 @@
 // terminateTree — end a child process AND the tree it started.
 //
 // `child.kill()` is not enough for either command tool:
-//   - commandRun uses `shell: true`, so the direct child is cmd.exe/sh. Killing
+//   - shell uses `shell: true`, so the direct child is cmd.exe/sh. Killing
 //     the shell can leave the real command running and holding the pipes, and the
 //     'close' event then never fires;
 //   - gitDiff disables external drivers, but git itself may still start helpers.
@@ -22,7 +22,7 @@
 //
 // Resolution: the promise resolves only once the Windows taskkill attempt has
 // completed (or timed out) and the fallback root kill has been issued. Callers
-// (./commandRun, ./gitDiff, ../syntax/python) await it before settling a
+// (./shell, ./gitDiff, ../syntax/python) await it before settling a
 // timeout/abort result, so a tool result cannot be reported while the tree kill
 // is still in flight. LIMITATION, stated honestly: `taskkill /T` is still
 // best-effort — a descendant that changed its parent pid (or was reparented) is
@@ -30,7 +30,7 @@
 // closed.
 //
 // Cross-references:
-//   - ./commandRun — timeout and AbortSignal both await terminateTree
+//   - ./shell — timeout and AbortSignal both await terminateTree
 //   - ./gitDiff    — same, for the fixed git argv
 //   - ../syntax/python — awaits it on timeout/abort
 

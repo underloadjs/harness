@@ -43,7 +43,7 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         description: 'A general instruction-following agent.',
         requiresEndpoint: true,
         agents: ['instruct'],
-        tools: ['fileRead'],
+        tools: ['read'],
         coreTools: ['toolRequest', 'toolCreate', 'todoManage'],
         primary: 'instruct',
         subagents: [],
@@ -63,7 +63,7 @@ const coreTool = (name: string, parameters: Record<string, unknown>): ToolDescri
 });
 
 const fileReadTool: ToolDescriptor = {
-    name: 'fileRead',
+    name: 'read',
     group: 'Files',
     description: 'Read one or more files.',
     tags: ['files', 'read'],
@@ -171,8 +171,8 @@ it('lists core tools in the global tools view, calls with the captured session a
                 return json({
                     ok: true,
                     result: {
-                        enabled: ['fileRead'],
-                        tools: ['fileRead', 'fileGlob'],
+                        enabled: ['read'],
+                        tools: ['read', 'fileGlob'],
                         truncated: true,
                         remaining: 2
                     },
@@ -183,10 +183,10 @@ it('lists core tools in the global tools view, calls with the captured session a
             // The refresh a core call triggers. The discovery must reach the core
             // section without a reload.
             if (url === '/api/sessions/s1' && method === undefined) {
-                return json({ session: snapshot({ discoveredTools: ['fileRead', 'fileGlob'] }) });
+                return json({ session: snapshot({ discoveredTools: ['read', 'fileGlob'] }) });
             }
 
-            if (url === '/api/tools/fileRead' && method === 'POST') {
+            if (url === '/api/tools/read' && method === 'POST') {
                 return json({ ok: true, result: { path: 'package.json', content: '{}' }, durationMs: 2 });
             }
 
@@ -231,7 +231,7 @@ it('lists core tools in the global tools view, calls with the captured session a
     );
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-tab-button')].map((node) => node.dataset.tool)
-    ).toEqual(['toolRequest', 'fileRead']);
+    ).toEqual(['toolRequest', 'read']);
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-tab-kind')].map((node) => node.textContent)
     ).toEqual(['core · session', 'searchable']);
@@ -301,11 +301,11 @@ it('lists core tools in the global tools view, calls with the captured session a
     // right-rail core dropdown).
     expect(calls.filter((call) => call.url === '/api/sessions/s1')).toHaveLength(1);
     expect(byClass('.tools-session-note', 'p').textContent).toBe(
-        'Session-bound tools run inside instruct · session s1 · enabled for this session: fileRead, fileGlob'
+        'Session-bound tools run inside instruct · session s1 · enabled for this session: read, fileGlob'
     );
 
     // An ordinary tool is unchanged: no sessionId key, no extra session traffic.
-    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="fileRead"]')?.click();
+    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="read"]')?.click();
     expect(document.querySelector('.tool-session')?.hidden).toBe(true);
 
     byClass('.tool-args', 'textarea').value = '["package.json"]';
@@ -316,8 +316,8 @@ it('lists core tools in the global tools view, calls with the captured session a
     await flush();
     await flush();
 
-    expect(calls.find((call) => call.url === '/api/tools/fileRead')).toEqual({
-        url: '/api/tools/fileRead',
+    expect(calls.find((call) => call.url === '/api/tools/read')).toEqual({
+        url: '/api/tools/read',
         method: 'POST',
         body: { parameters: ['package.json'] }
     });
@@ -361,7 +361,7 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
     );
 
     const toolRequestButton = byClass('.tool-tab-button[data-tool="toolRequest"]', 'button');
-    const fileReadButton = byClass('.tool-tab-button[data-tool="fileRead"]', 'button');
+    const fileReadButton = byClass('.tool-tab-button[data-tool="read"]', 'button');
     // Every entry advertises the popup it opens and starts unpressed.
     expect(toolRequestButton.getAttribute('aria-haspopup')).toBe('dialog');
     expect(toolRequestButton.getAttribute('aria-pressed')).toBe('false');
@@ -387,10 +387,10 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
     fileReadButton.click();
 
     expect(document.querySelectorAll('.dialog')).toHaveLength(1);
-    expect(byClass('.dialog-title', 'h2').textContent).toBe('fileRead');
+    expect(byClass('.dialog-title', 'h2').textContent).toBe('read');
     expect(toolRequestButton.getAttribute('aria-pressed')).toBe('false');
     expect(fileReadButton.getAttribute('aria-pressed')).toBe('true');
-    expect(document.querySelector('.main-title')?.textContent).toBe('fileRead');
+    expect(document.querySelector('.main-title')?.textContent).toBe('read');
     expect(document.querySelector('.harness-id')?.textContent).toBe('Files');
     expect(document.querySelector('.harness-note')?.textContent).toBe('searchable · tags: files, read');
 
@@ -469,11 +469,11 @@ it('shows a server request failure for a core call instead of pretending it ran'
     expect(document.querySelector('.tool-output')?.className).toBe('card tool-output is-error');
 });
 
-// T3: agentDelegate is configuration-dependent. The manual runner must build its
+// T3: delegate is configuration-dependent. The manual runner must build its
 // example from the SELECTED harness's subagents (the server registers the tool only
 // when there is a target) instead of the old hard-coded `summarizer`, which most
 // harnesses do not configure.
-const agentDelegateTool = coreTool('agentDelegate', {
+const agentDelegateTool = coreTool('delegate', {
     type: 'object',
     properties: {
         agent: { type: 'string', enum: ['research', 'workspace'], description: 'Target agent id.' },
@@ -512,7 +512,7 @@ it('fills the delegation example from the selected team, not a hard-coded agent'
 
     openTools();
     await flush();
-    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="agentDelegate"]')?.click();
+    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="delegate"]')?.click();
 
     // The first configured subagent is the example target, and the brief says what a
     // self-contained brief must contain.
@@ -555,12 +555,12 @@ it('reports delegation as unavailable when the selected harness has no subagents
     // The catalogue is host-wide, but the tab says when the tool is actually
     // registered for a session, so a subagent-less harness claims nothing.
     expect(byClass('.tools-tab-hint', 'p').textContent).toContain(
-        'agentDelegate when the selected harness has subagents'
+        'delegate when the selected harness has subagents'
     );
 
     // Delegation is blocked rather than offered with a target this team lacks.
     // The runner is inside the modal now, so open the entry before reading it.
-    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="agentDelegate"]')?.click();
+    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="delegate"]')?.click();
 
     expect(byClass('.tool-args', 'textarea').value).toBe('{}');
     expect(document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.disabled).toBe(true);
@@ -573,7 +573,7 @@ it('reports delegation as unavailable when the selected harness has no subagents
         )
     ).toEqual([
         'This runs on the harness server with the server process permissions. The file and command presets are not sandboxed.',
-        'Not available for the selected harness: it declares no subagents, so agentDelegate is not registered in its sessions.'
+        'Not available for the selected harness: it declares no subagents, so delegate is not registered in its sessions.'
     ]);
     expect(byClass('.tool-output .card-head', 'div').textContent).toBe('unavailable');
 

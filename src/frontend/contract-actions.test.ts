@@ -178,7 +178,7 @@ describe('event guards', () => {
                 role: 'subagent' as const,
                 forkDepth: 1,
                 model: 'm1',
-                tools: ['fileRead']
+                tools: ['read']
             }
         };
 
@@ -190,7 +190,7 @@ describe('event guards', () => {
             branchStartEventOf({ ...start, branch: { ...start.branch, forkDepth: -1 } } as unknown as HarnessEvent)
         ).toBeUndefined();
         expect(
-            branchStartEventOf({ ...start, branch: { ...start.branch, tools: 'fileRead' } } as unknown as HarnessEvent)
+            branchStartEventOf({ ...start, branch: { ...start.branch, tools: 'read' } } as unknown as HarnessEvent)
         ).toBeUndefined();
 
         const end = {

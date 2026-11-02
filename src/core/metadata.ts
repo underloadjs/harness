@@ -16,7 +16,7 @@
 //   tools/runtime/locationManage.tool.ts   LOCATION_MANAGE_NAME / LOCATION_MANAGE_METADATA
 //   tools/runtime/agentManage.tool.ts      AGENT_MANAGE_NAME / AGENT_MANAGE_METADATA
 //   tools/runtime/agentResult.tool.ts      AGENT_RESULT_NAME / AGENT_RESULT_METADATA
-//   tools/runtime/agentDelegate.tool.ts    AGENT_DELEGATE_NAME / agentDelegateMetadata
+//   tools/runtime/delegate.tool.ts    AGENT_DELEGATE_NAME / agentDelegateMetadata
 //   tools/runtime/toolCancel.tool.ts       TOOL_CANCEL_NAME / TOOL_CANCEL_METADATA
 //   tools/runtime/actionRequest.tool.ts    ACTION_REQUEST_NAME / ACTION_REQUEST_METADATA
 //   tools/runtime/threadFork.tool.ts       THREAD_FORK_NAME / THREAD_FORK_METADATA
@@ -48,7 +48,7 @@
 // Core vs conditional. The ALWAYS-DECLARED set is coreToolMetadata(), in the
 // harness's historical registration order (taken from each descriptor's
 // `registration.order`). actionRequest/threadFork/toolCancel/threadSend/
-// threadList/agentDelegate are capability-by-configuration: they are exported
+// threadList/delegate are capability-by-configuration: they are exported
 // individually (and listed by the server catalogue) but deliberately omitted from
 // coreToolMetadata() because a session without the capability must not declare
 // them.
@@ -138,7 +138,7 @@ export const CHAPTER_MANAGE_NAME = descriptorOf('chapterManage').name;
 export const LOCATION_MANAGE_NAME = descriptorOf('locationManage').name;
 export const AGENT_MANAGE_NAME = descriptorOf('agentManage').name;
 export const AGENT_RESULT_NAME = descriptorOf('agentResult').name;
-export const AGENT_DELEGATE_NAME = descriptorOf('agentDelegate').name;
+export const AGENT_DELEGATE_NAME = descriptorOf('delegate').name;
 export const TOOL_CANCEL_NAME = descriptorOf('toolCancel').name;
 export const ACTION_REQUEST_NAME = descriptorOf('actionRequest').name;
 export const THREAD_FORK_NAME = descriptorOf('threadFork').name;
@@ -177,7 +177,7 @@ export const THREAD_LIST_METADATA = coreMetadataOf(THREAD_LIST_NAME);
 // Delegation: the ONE set-projection function in this module.
 // ---------------------------------------------------------------------------
 
-// Delegation (R4). Capability-by-configuration: the harness registers agentDelegate
+// Delegation (R4). Capability-by-configuration: the harness registers delegate
 // only when the allowlist is non-empty, so this metadata has two honest forms:
 //   - with subagents - the runtime declaration, whose `agent` enum is the exact
 //     allowlist and whose description names it;

@@ -27,7 +27,7 @@ const descriptor = (): HarnessDescriptor =>
         requiresEndpoint: true,
         agents: ['instruct'],
         tools: [],
-        coreTools: ['fileRead'],
+        coreTools: ['read'],
         primary: 'instruct',
         subagents: [],
         builtin: true,
@@ -200,6 +200,19 @@ it('opens the JSON transcript and deletes a thread through the existing endpoint
     expect(tile.dataset.threadId).toBe('thread-a');
     const bar = byClass('.tile-transcript-action', 'div');
     expect(bar.hidden).toBe(false);
+    // T1/R2 (shell wiring): Delete is a header control of the card, Transcript stays in
+    // the toolbar, and the state word leads beside the thread badge.
+    const header = tile.querySelector<HTMLElement>('.tile-header-action');
+    expect(header?.parentElement).toBe(tile);
+    expect(header?.querySelector('.thread-delete')).not.toBeNull();
+    expect(bar.querySelector('.thread-delete')).toBeNull();
+    expect(
+        [...(tile.querySelectorAll<HTMLElement>('.tile-identity > *') ?? [])].map((node) => node.className)
+    ).toEqual(['tile-thread', 'tile-status']);
+    // The fixture's thread is `IN1` and its turn is `done`, so the identity line reads
+    // exactly `IN1` + `done` in that order (screenshot R2).
+    expect(tile.querySelector('.tile-thread')?.textContent).toBe('IN1');
+    expect(tile.querySelector('.tile-identity .tile-status-text')?.textContent).toBe('done');
 
     // R7: the explicit open fetches the same session once and renders pretty JSON.
     byClass('.tile-transcript-action .transcript-open', 'button').click();
@@ -219,7 +232,7 @@ it('opens the JSON transcript and deletes a thread through the existing endpoint
     expect(pre?.textContent).toContain('"hello answer"');
 
     // R9: first click only opens the inline confirmation; the API is untouched.
-    byClass('.tile-transcript-action .thread-delete', 'button').click();
+    byClass('.tile-header-action .thread-delete', 'button').click();
     expect(byClass('.tile-transcript-action .thread-delete-confirm', 'div').hidden).toBe(false);
     expect(calls.some((call) => call.method === 'DELETE')).toBe(false);
 
@@ -264,7 +277,7 @@ it('reconciles the DELETE result even when the snapshot is stale for the waterma
     await flush();
     expect(document.querySelector('.thread-transcript-json')).not.toBeNull();
 
-    byClass('.tile-transcript-action .thread-delete', 'button').click();
+    byClass('.tile-header-action .thread-delete', 'button').click();
     byClass('.thread-delete-confirm-delete', 'button').click();
     await flush();
 
@@ -378,7 +391,7 @@ it('recomputes tool panels from surviving records on a stale DELETE answer', asy
 
     expect(document.querySelector('.panel[data-panel-id="thread-panel"]')).not.toBeNull();
 
-    byClass('.tile-transcript-action .thread-delete', 'button').click();
+    byClass('.tile-header-action .thread-delete', 'button').click();
     byClass('.thread-delete-confirm-delete', 'button').click();
     await flush();
 

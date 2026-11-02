@@ -81,7 +81,7 @@ describe('createTurnBoard', () => {
         turn.apply({
             type: 'tool_call',
             agent: 'writer',
-            call: { id: 'c1', name: 'fileRead', arguments: '{"path":"package.json"}' }
+            call: { id: 'c1', name: 'read', arguments: '{"path":"package.json"}' }
         });
 
         const tool = turn.element.querySelector('details.tool');
@@ -91,7 +91,7 @@ describe('createTurnBoard', () => {
         turn.apply({
             type: 'tool_result',
             agent: 'writer',
-            name: 'fileRead',
+            name: 'read',
             content: '{"ok":true}',
             isError: false
         });
@@ -103,10 +103,10 @@ describe('createTurnBoard', () => {
 
     it('colours a delegated agent block and keeps the tile open until the stream ends', () => {
         const { board } = mount();
-        const turn = board.begin('agentDelegate');
+        const turn = board.begin('delegate');
 
         turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
-        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'd1', name: 'agentDelegate', arguments: '{}' } });
+        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'd1', name: 'delegate', arguments: '{}' } });
         turn.apply({ type: 'start', agent: 'helper', model: 'm2' });
         turn.apply({ type: 'text', agent: 'helper', delta: 'done' });
 
@@ -172,7 +172,7 @@ describe('createTurnBoard', () => {
         // name an agent, so it renders the `unknown` placeholder section. The tile and
         // that section must agree on the SAME neutral tone (before the correction the
         // section hashed the literal 'unknown' to cyan while the tile stayed neutral).
-        turn.apply({ type: 'tool_result', agent: 'ghost', name: 'fileRead', content: 'ok', isError: false });
+        turn.apply({ type: 'tool_result', agent: 'ghost', name: 'read', content: 'ok', isError: false });
 
         const agent = turn.element.querySelector<HTMLElement>('.agent');
         expect(agent?.dataset.agent).toBeUndefined();
@@ -296,8 +296,8 @@ describe('server turns', () => {
             serverTurn({
                 events: [
                     { type: 'start', agent: 'writer', model: 'm1' },
-                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'fileRead', arguments: '{}' } },
-                    { type: 'tool_result', agent: 'writer', name: 'fileRead', content: '{"ok":true}', isError: false },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'read', arguments: '{}' } },
+                    { type: 'tool_result', agent: 'writer', name: 'read', content: '{"ok":true}', isError: false },
                     { type: 'text', agent: 'writer', delta: 'recorded **prose**' },
                     { type: 'done', agent: 'writer', message: doneMessage('writer') }
                 ]
@@ -401,11 +401,11 @@ describe('server turns', () => {
             serverTurn({
                 events: [
                     { type: 'start', agent: 'writer', model: 'm1' },
-                    { type: 'tool_call', agent: 'writer', call: { id: 'd1', name: 'agentDelegate', arguments: '{}' } },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'd1', name: 'delegate', arguments: '{}' } },
                     { type: 'start', agent: 'helper', model: 'm2' },
                     { type: 'text', agent: 'helper', delta: 'delegated' },
                     { type: 'done', agent: 'helper', message: doneMessage('helper') },
-                    { type: 'tool_result', agent: 'writer', name: 'agentDelegate', content: 'done', isError: false }
+                    { type: 'tool_result', agent: 'writer', name: 'delegate', content: 'done', isError: false }
                 ]
             })
         ]);
@@ -1010,11 +1010,11 @@ describe('elapsed timing', () => {
                 updatedAt: T + 2200,
                 events: [
                     { type: 'start', agent: 'writer', model: 'm1' },
-                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'fileRead', arguments: '{"path":"a"}' } },
-                    { type: 'tool_call', agent: 'writer', call: { id: 'c2', name: 'fileRead', arguments: '{"path":"b"}' } },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'read', arguments: '{"path":"a"}' } },
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c2', name: 'read', arguments: '{"path":"b"}' } },
                     // Results arrive out of call order; the call id is the match.
-                    { type: 'tool_result', agent: 'writer', name: 'fileRead', content: 'b', isError: false, callId: 'c2' },
-                    { type: 'tool_result', agent: 'writer', name: 'fileRead', content: 'a', isError: false, callId: 'c1' },
+                    { type: 'tool_result', agent: 'writer', name: 'read', content: 'b', isError: false, callId: 'c2' },
+                    { type: 'tool_result', agent: 'writer', name: 'read', content: 'a', isError: false, callId: 'c1' },
                     { type: 'done', agent: 'writer', message: doneMessage('writer') }
                 ],
                 eventTimes: [T, T + 100, T + 500, T + 900, T + 1500, T + 2200]
@@ -1034,8 +1034,8 @@ describe('elapsed timing', () => {
                 updatedAt: T + 1000,
                 events: [
                     { type: 'start', agent: 'writer', model: 'm1' },
-                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'fileRead', arguments: '{}' } },
-                    { type: 'tool_result', agent: 'writer', name: 'fileRead', content: 'ok', isError: false }
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'read', arguments: '{}' } },
+                    { type: 'tool_result', agent: 'writer', name: 'read', content: 'ok', isError: false }
                 ]
             })
         ]);
@@ -1052,11 +1052,11 @@ describe('elapsed timing', () => {
 
         turn.apply({ type: 'start', agent: 'writer', model: 'm1' }, T);
         turn.apply(
-            { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'fileRead', arguments: '{}' } },
+            { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'read', arguments: '{}' } },
             T
         );
         turn.apply(
-            { type: 'tool_result', agent: 'writer', name: 'fileRead', content: 'ok', isError: false },
+            { type: 'tool_result', agent: 'writer', name: 'read', content: 'ok', isError: false },
             T + 750
         );
 
@@ -1072,14 +1072,14 @@ describe('elapsed timing', () => {
         const turn = board.begin('two calls');
 
         turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
-        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'fileRead', arguments: '{"path":"a"}' } });
+        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'read', arguments: '{"path":"a"}' } });
         turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'c2', name: 'websearch', arguments: '{"query":"x"}' } });
 
         const groups = [...turn.element.querySelectorAll('.agent-flow > .tool-group')];
         expect(groups).toHaveLength(1);
         expect([...groups[0].children].map((child) => child.className)).toEqual(['tool', 'tool']);
         expect([...groups[0].querySelectorAll('.tool-name')].map((node) => node.textContent)).toEqual([
-            'fileRead',
+            'read',
             'websearch'
         ]);
         // No card escaped the group into the flow column.
@@ -1091,10 +1091,10 @@ describe('elapsed timing', () => {
         const turn = board.begin('mixed flow');
 
         turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
-        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'fileRead', arguments: '{}' } });
+        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'read', arguments: '{}' } });
         turn.apply({ type: 'text', agent: 'writer', delta: 'checking more' });
-        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'c2', name: 'commandRun', arguments: '{}' } });
-        turn.apply({ type: 'tool_result', agent: 'writer', name: 'fileRead', content: '{"ok":true}', isError: false });
+        turn.apply({ type: 'tool_call', agent: 'writer', call: { id: 'c2', name: 'shell', arguments: '{}' } });
+        turn.apply({ type: 'tool_result', agent: 'writer', name: 'read', content: '{"ok":true}', isError: false });
 
         const flowChildren = [...(turn.element.querySelector('.agent-flow')?.children ?? [])].map(
             (child) => child.className
@@ -1117,14 +1117,14 @@ describe('elapsed timing', () => {
                     { type: 'tool_call', agent: 'writer', call: { id: 'c1', name: 'websearch', arguments: '{}' } },
                     { type: 'tool_call', agent: 'writer', call: { id: 'c2', name: 'websearch', arguments: '{}' } },
                     { type: 'reasoning', agent: 'writer', delta: 'thinking' },
-                    { type: 'tool_call', agent: 'writer', call: { id: 'c3', name: 'fileRead', arguments: '{}' } }
+                    { type: 'tool_call', agent: 'writer', call: { id: 'c3', name: 'read', arguments: '{}' } }
                 ]
             })
         ]);
 
         const groups = [...turn.element.querySelectorAll('.agent-flow > .tool-group')];
         expect(groups.map((group) => group.querySelectorAll('details.tool').length)).toEqual([2, 1]);
-        expect(groups[1].querySelector('.tool-name')?.textContent).toBe('fileRead');
+        expect(groups[1].querySelector('.tool-name')?.textContent).toBe('read');
     });
 });
 
@@ -1164,9 +1164,10 @@ describe('token tally', () => {
         usage: { input, output, total: input + output, ...(cached === undefined ? {} : { cached }) }
     });
 
-    // The MEASUREMENT spans, in DOM order. `tile-tokens` sits between the elapsed
-    // label and the status badge. The persistent-thread badge is identity, not a
-    // measurement, and leads the header (asserted below and in turns-threads.test.ts).
+    // The MEASUREMENT spans, in DOM order. `tile-tokens` follows the elapsed label.
+    // T1/R2: the state word is no longer part of this cluster — it is identity, asserted
+    // with `.tile-identity` below (and in turns-threads.test.ts). The persistent-thread
+    // badge is identity, not a measurement, and leads the header.
     const topClasses = (turn: { element: HTMLElement }): (string | null)[] =>
         [...(turn.element.querySelector('.tile-top')?.children ?? [])].map((child) => child.className);
 
@@ -1209,9 +1210,15 @@ describe('token tally', () => {
         );
         // R1: the persistent-thread badge LEADS the header (identity before
         // measurements) and stays hidden (but present) for a turn with no runtime
-        // thread identity; `.tile-top` holds measurements only.
-        expect(topClasses(turn)).toEqual(['tile-elapsed', 'tile-tokens', 'tile-status']);
-        expect(turn.element.querySelector('.tile-select')?.firstElementChild?.className).toBe('tile-thread');
+        // thread identity; `.tile-top` holds measurements only. T1/R2: the state word
+        // now reads beside the badge inside `.tile-identity`.
+        expect(topClasses(turn)).toEqual(['tile-elapsed', 'tile-tokens']);
+        expect(turn.element.querySelector('.tile-select')?.firstElementChild?.className).toBe('tile-identity');
+        expect(
+            [...(turn.element.querySelectorAll<HTMLElement>('.tile-identity > *') ?? [])].map(
+                (child) => child.className
+            )
+        ).toEqual(['tile-thread', 'tile-status']);
     });
 
     it('falls back to the cumulative input only when no usage event was recorded', () => {
@@ -1396,7 +1403,7 @@ describe('token tally', () => {
 describe('background tools (R6)', () => {
     const start = (): HarnessEvent => ({ type: 'start', agent: 'writer', model: 'm1' });
 
-    const call = (id: string, name = 'fileRead'): HarnessEvent => ({
+    const call = (id: string, name = 'read'): HarnessEvent => ({
         type: 'tool_call',
         agent: 'writer',
         call: { id, name, arguments: '{}' }
@@ -1406,7 +1413,7 @@ describe('background tools (R6)', () => {
         ({
             type: 'tool_result',
             agent: 'writer',
-            name: 'fileRead',
+            name: 'read',
             callId: 'c1',
             content: 'ok',
             isError: false,
@@ -1452,17 +1459,17 @@ describe('background tools (R6)', () => {
 
         turn.apply(start());
         turn.apply(call('c1'));
-        turn.apply(call('c2', 'webSearch'));
+        turn.apply(call('c2', 'search'));
 
         // c1 finished; the server reports c2 still running.
         turn.apply(
-            result({ durationMs: 300, pending: [{ callId: 'c2', name: 'webSearch', elapsedMs: 900 }] }),
+            result({ durationMs: 300, pending: [{ callId: 'c2', name: 'search', elapsedMs: 900 }] }),
             undefined,
             'recorded'
         );
 
         expect(turn.element.querySelector('.agent-pending')?.textContent).toBe(
-            'pending · webSearch 900ms'
+            'pending · search 900ms'
         );
         expect(turn.element.querySelector('.tile-meta')?.textContent).toBe(
             '1 agent · 2 tool calls · 1 tool still running'
@@ -1482,14 +1489,14 @@ describe('background tools (R6)', () => {
         turn.apply(start());
         turn.apply(call('c1'));
         turn.apply(
-            responseDone({ pending: [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }] })
+            responseDone({ pending: [{ callId: 'c1', name: 'read', elapsedMs: 1200 }] })
         );
 
         // The response is complete, the turn is not: the card still runs and the
         // snapshot list names it with the server's span.
         expect(turn.state()).toBe('streaming');
         expect(card(turn)?.getAttribute('data-state')).toBe('running');
-        expect(turn.element.querySelector('.agent-pending')?.textContent).toBe('pending · fileRead 1.2s');
+        expect(turn.element.querySelector('.agent-pending')?.textContent).toBe('pending · read 1.2s');
         expect(turn.element.querySelector('.agent-meta')?.textContent).toBe(
             'writer-model · stop · 1 tool still running'
         );
@@ -1505,10 +1512,10 @@ describe('background tools (R6)', () => {
         turn.apply(start());
         turn.apply(call('c1'));
         turn.apply(
-            responseDone({ pending: [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }] })
+            responseDone({ pending: [{ callId: 'c1', name: 'read', elapsedMs: 1200 }] })
         );
 
-        turn.apply(wake({ pending: [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }] }));
+        turn.apply(wake({ pending: [{ callId: 'c1', name: 'read', elapsedMs: 1200 }] }));
 
         const labels = [...turn.element.querySelectorAll('.agent-wakeup-label')].map((node) => node.textContent);
         const texts = [...turn.element.querySelectorAll('.agent-wakeup-text')].map((node) => node.textContent);
@@ -1655,7 +1662,7 @@ describe('background tools (R6)', () => {
 
         // Legacy frame with no callId arriving after the turn settled: the runtime
         // detached the call, so nothing may be added to the transcript.
-        turn.apply({ type: 'tool_result', agent: 'writer', name: 'fileRead', content: 'late', isError: false });
+        turn.apply({ type: 'tool_result', agent: 'writer', name: 'read', content: 'late', isError: false });
 
         expect(turn.element.querySelectorAll('details.tool')).toHaveLength(1);
         expect(card(turn)?.getAttribute('data-state')).toBe('cancelled');
@@ -1678,29 +1685,29 @@ describe('background tools (R6)', () => {
 
         turn.apply(start());
         turn.apply(call('c1'));
-        turn.apply(call('c2', 'webSearch'));
+        turn.apply(call('c2', 'search'));
         turn.apply(
             responseDone({
                 pending: [
-                    { callId: 'c1', name: 'fileRead', elapsedMs: 1200 },
-                    { callId: 'c2', name: 'webSearch', elapsedMs: 900 }
+                    { callId: 'c1', name: 'read', elapsedMs: 1200 },
+                    { callId: 'c2', name: 'search', elapsedMs: 900 }
                 ]
             })
         );
         expect(turn.element.querySelector('.agent-pending')?.textContent).toBe(
-            'pending · fileRead 1.2s · webSearch 900ms'
+            'pending · read 1.2s · search 900ms'
         );
 
         // EXACT runtime shape for a finishing call: `durationMs` present, `pending`
         // omitted because nothing remained at that instant. The completed call must
         // still leave the line; the sibling must stay.
         turn.apply(result({ callId: 'c1', durationMs: 1200 }), undefined, 'recorded');
-        expect(turn.element.querySelector('.agent-pending')?.textContent).toBe('pending · webSearch 900ms');
+        expect(turn.element.querySelector('.agent-pending')?.textContent).toBe('pending · search 900ms');
         expect(turn.element.querySelector('.tile-meta')?.textContent).toBe(
             '1 agent · 2 tool calls · 1 tool still running'
         );
 
-        turn.apply(result({ callId: 'c2', name: 'webSearch', durationMs: 900 }), undefined, 'recorded');
+        turn.apply(result({ callId: 'c2', name: 'search', durationMs: 900 }), undefined, 'recorded');
         expect(turn.element.querySelector('.agent-pending')).toBeNull();
         expect(turn.element.querySelector('.tile-meta')?.textContent).toBe('1 agent · 2 tool calls');
     });
@@ -1711,30 +1718,30 @@ describe('background tools (R6)', () => {
 
         turn.apply(start());
         turn.apply(call('c1'));
-        turn.apply(responseDone({ pending: [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }] }));
+        turn.apply(responseDone({ pending: [{ callId: 'c1', name: 'read', elapsedMs: 1200 }] }));
 
         turn.apply({ type: 'start', agent: 'helper', model: 'm2' });
         turn.apply({
             type: 'tool_call',
             agent: 'helper',
-            call: { id: 'h1', name: 'commandRun', arguments: '{}' }
+            call: { id: 'h1', name: 'shell', arguments: '{}' }
         });
         turn.apply({
             type: 'done',
             agent: 'helper',
             message: doneMessage('helper'),
-            pending: [{ callId: 'h1', name: 'commandRun', elapsedMs: 5000 }]
+            pending: [{ callId: 'h1', name: 'shell', elapsedMs: 5000 }]
         });
 
         expect([...turn.element.querySelectorAll('.agent-pending')].map((node) => node.textContent)).toEqual([
-            'pending · fileRead 1.2s',
-            'pending · commandRun 5.0s'
+            'pending · read 1.2s',
+            'pending · shell 5.0s'
         ]);
 
         // The writer dries up; the helper's snapshot is untouched.
         turn.apply(result({ durationMs: 1200 }), undefined, 'recorded');
         expect([...turn.element.querySelectorAll('.agent-pending')].map((node) => node.textContent)).toEqual([
-            'pending · commandRun 5.0s'
+            'pending · shell 5.0s'
         ]);
     });
 
@@ -1744,12 +1751,12 @@ describe('background tools (R6)', () => {
 
         turn.apply(start());
         turn.apply(call('c1'));
-        turn.apply(responseDone({ pending: [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }] }));
+        turn.apply(responseDone({ pending: [{ callId: 'c1', name: 'read', elapsedMs: 1200 }] }));
 
         // `pending` is required on a wake frame: absence is malformed, not "settled".
         turn.apply(wake({ pending: undefined }));
 
-        expect(turn.element.querySelector('.agent-pending')?.textContent).toBe('pending · fileRead 1.2s');
+        expect(turn.element.querySelector('.agent-pending')?.textContent).toBe('pending · read 1.2s');
         expect(turn.element.querySelector('.agent-wakeup')).toBeNull();
         expect(card(turn)?.getAttribute('data-state')).toBe('running');
         expect(turn.state()).toBe('streaming');

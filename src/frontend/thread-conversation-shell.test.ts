@@ -254,8 +254,15 @@ it('keeps an idle submission INSIDE the open RR2 conversation', async () => {
             row.classList.contains('is-continuation')
         )
     ).toEqual([false, true]);
-    // R1: the thread identity leads the header of the card.
-    expect(roots[0].querySelector('.tile-select')?.firstElementChild?.className).toBe('tile-thread');
+    // R1: the thread identity leads the header of the card. T1/R2: the identity LINE
+    // (`.tile-identity` = badge + state word) is the header's first child, so the
+    // state reads immediately to the right of the badge instead of at the row's edge.
+    expect(roots[0].querySelector('.tile-select')?.firstElementChild?.className).toBe('tile-identity');
+    const firstIdentity = roots[0].querySelector('.tile-select')?.firstElementChild as HTMLElement | null;
+    expect([...(firstIdentity?.children ?? [])].map((node) => node.className)).toEqual([
+        'tile-thread',
+        'tile-status'
+    ]);
     expect([...roots[0].querySelectorAll<HTMLElement>('.agent-text')].map((node) => node.textContent)).toEqual([
         'first answer\n',
         'second answer\n'
@@ -402,7 +409,7 @@ it('keeps a focused CHILD follow-up inside that child card', async () => {
                 agent: 'researcher',
                 call: {
                     id: 'd1',
-                    name: 'agentDelegate',
+                    name: 'delegate',
                     arguments: JSON.stringify({ agent: 'helper', input: 'child task' })
                 }
             },

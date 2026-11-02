@@ -53,7 +53,7 @@
 // compare tags. They are exported for tests and for tooling that inspects a
 // schema, and are not re-exported from the package root.
 export { agent } from './agent';
-export { tool, toolParameterKey, normalizeTags } from './tool';
+export { tool, toolParameterKey, normalizeTags, DEFAULT_TOOL_MODE } from './tool';
 export { MAX_DISCOVERY_MATCHES, searchTools, selectTools } from './discovery';
 export type {
     ToolSelectionOptions,
@@ -100,6 +100,7 @@ export type {
     ToolActivation,
     ToolGroup,
     ToolMetadata,
+    ToolMode,
     ToolOrigin,
     ToolRegistration
 } from './tool-discovery';

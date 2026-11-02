@@ -30,7 +30,7 @@ const withThread = (event: Record<string, unknown>, thread: Record<string, unkno
 const delegateCall = (agent: string, id: string): HarnessEvent => ({
     type: 'tool_call',
     agent: 'Researcher',
-    call: { id, name: 'agentDelegate', arguments: JSON.stringify({ agent, input: 'child task' }) }
+    call: { id, name: 'delegate', arguments: JSON.stringify({ agent, input: 'child task' }) }
 });
 
 const record = (

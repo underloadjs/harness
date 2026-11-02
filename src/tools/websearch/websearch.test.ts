@@ -27,7 +27,7 @@ const configured = (
 ): Tool<WebSearchParameters, WebSearchResult> => {
     const definition = createWebSearchTool({ env, ...toolConfiguration });
 
-    if (!definition) throw new Error('Expected a configured webSearch tool.');
+    if (!definition) throw new Error('Expected a configured search tool.');
 
     return definition;
 };
@@ -61,7 +61,7 @@ describe('key resolution', () => {
     it('offers only the provider that has a key', () => {
         const exa = configured({ EXA_API_KEY: 'exa-secret-key' });
 
-        expect(exa.name).toBe('webSearch');
+        expect(exa.name).toBe('search');
         // R18: a configured search tool is core — declared, never discovered.
         expect(exa.visibility).toBe('core');
         expect(exa.tags).toEqual(['web', 'search', 'internet', 'news', 'research']);
@@ -121,7 +121,7 @@ describe('key resolution', () => {
 
     it('rejects an explicit value that is not a string or getter', () => {
         expect(() => createWebSearchTool({ exa: { apiKey: 42 as never } })).toThrow(
-            'webSearch provider "exa" apiKey must be a string or a function returning one.'
+            'search provider "exa" apiKey must be a string or a function returning one.'
         );
     });
 
@@ -134,7 +134,7 @@ describe('key resolution', () => {
                     }
                 }
             })
-        ).toThrow('webSearch provider "exa" apiKey getter failed.');
+        ).toThrow('search provider "exa" apiKey getter failed.');
     });
 
     it('keeps keys out of the schema, description, and tags', () => {
@@ -472,8 +472,8 @@ describe('validation', () => {
     it('rejects a blank or non-string query', async () => {
         const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
 
-        await expect(tool({ query: '   ' })).rejects.toThrow('webSearch requires a non-empty query string.');
-        await expect(tool({ query: 42 as never })).rejects.toThrow('webSearch requires a non-empty query string.');
+        await expect(tool({ query: '   ' })).rejects.toThrow('search requires a non-empty query string.');
+        await expect(tool({ query: 42 as never })).rejects.toThrow('search requires a non-empty query string.');
     });
 
     it('accepts a bare query string from a direct caller', async () => {
@@ -491,7 +491,7 @@ describe('validation', () => {
         const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
 
         await expect(tool({ query: 'q', maxResults: 'ten' as never })).rejects.toThrow(
-            'webSearch maxResults must be a number between 1 and 20.'
+            'search maxResults must be a number between 1 and 20.'
         );
     });
 
@@ -499,7 +499,7 @@ describe('validation', () => {
         const tool = configured({ EXA_API_KEY: 'exa-secret-key' });
 
         await expect(tool({ query: 'q', provider: 'tavily' })).rejects.toThrow(
-            'webSearch provider "tavily" is not configured. Configured: exa.'
+            'search provider "tavily" is not configured. Configured: exa.'
         );
     });
 });

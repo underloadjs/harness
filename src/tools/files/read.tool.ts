@@ -1,4 +1,4 @@
-// fileRead — read a BOUNDED window of one or more UTF-8 text files.
+// read — read a BOUNDED window of one or more UTF-8 text files.
 //
 // WHY BOUNDED BY DEFAULT (this revision)
 // --------------------------------------
@@ -31,8 +31,8 @@
 // declares exactly ONE property, `paths`, so the single-property rule (see
 // ../core/tool.ts) hands `execute` the array itself:
 //
-//     fileRead(['a.ts', 'b.ts'])
-//     fileRead([{ path: 'a.ts', startLine: 10, maxLines: 20 }])
+//     read(['a.ts', 'b.ts'])
+//     read([{ path: 'a.ts', startLine: 10, maxLines: 20 }])
 //
 // A model call carries `{ "paths": [...] }` and reaches this same code. Each item
 // is either a path string (defaults: startLine 1, maxLines 200) or a range object
@@ -103,8 +103,8 @@
 //
 // Executable on its own and registerable on a harness:
 //
-//     await fileRead(['package.json']);
-//     await fileRead([{ path: 'README.md', startLine: 20, maxLines: 40 }]);
+//     await read(['package.json']);
+//     await read([{ path: 'README.md', startLine: 20, maxLines: 40 }]);
 //
 // Metadata (name, description, tags, schema) is declared below and is authoritative
 // for T13. ../catalogue projects the same data synchronously for lazy enumeration
@@ -238,7 +238,7 @@ const missingEntry = (request: NormalizedTarget): FileReadEntry => ({
     bytes: 0,
     error: {
         code: 'ENOENT',
-        message: `fileRead could not find "${request.path}": no such file or directory (ENOENT).`
+        message: `read could not find "${request.path}": no such file or directory (ENOENT).`
     }
 });
 
@@ -259,7 +259,7 @@ const closeQuietly = async (handles: Iterable<FileHandle>): Promise<void> => {
 // (and therefore a test's expectation) cannot drift between them.
 const binaryError = (path: string): HarnessError =>
     new HarnessError(
-        `fileRead refused "${path}": the file contains binary data (NUL bytes or invalid UTF-8). fileRead reads UTF-8 text only.`
+        `read refused "${path}": the file contains binary data (NUL bytes or invalid UTF-8). read reads UTF-8 text only.`
     );
 
 // Validate one non-negative integer range field. `undefined` takes the default;
@@ -275,7 +275,7 @@ const readInteger = (
 
     if (!Number.isInteger(value) || (value as number) < minimum || (value as number) > maximum) {
         throw new HarnessError(
-            `fileRead ${field} must be an integer between ${minimum} and ${maximum}; received ${String(value)}.`
+            `read ${field} must be an integer between ${minimum} and ${maximum}; received ${String(value)}.`
         );
     }
 
@@ -287,17 +287,17 @@ const readInteger = (
 const normalizeTargets = (paths: FileReadParameters): NormalizedTarget[] => {
     if (!Array.isArray(paths)) {
         throw new HarnessError(
-            'fileRead expects an array of paths (strings or { path, startLine, startColumn, maxLines } objects), e.g. ["package.json"].'
+            'read expects an array of paths (strings or { path, startLine, startColumn, maxLines } objects), e.g. ["package.json"].'
         );
     }
 
     if (paths.length === 0) {
-        throw new HarnessError('fileRead received an empty paths array; pass at least one file path.');
+        throw new HarnessError('read received an empty paths array; pass at least one file path.');
     }
 
     if (paths.length > FILE_READ_MAX_TARGETS) {
         throw new HarnessError(
-            `fileRead accepts at most ${FILE_READ_MAX_TARGETS} paths per call; received ${paths.length}. Split the batch.`
+            `read accepts at most ${FILE_READ_MAX_TARGETS} paths per call; received ${paths.length}. Split the batch.`
         );
     }
 
@@ -316,7 +316,7 @@ const normalizeTargets = (paths: FileReadParameters): NormalizedTarget[] => {
         // rejected with the same shape guidance as a non-array argument.
         if (target === null || typeof target !== 'object' || Array.isArray(target)) {
             throw new HarnessError(
-                'fileRead paths must be strings or { path, startLine, startColumn, maxLines } objects.'
+                'read paths must be strings or { path, startLine, startColumn, maxLines } objects.'
             );
         }
 
@@ -334,11 +334,11 @@ const normalizeTargets = (paths: FileReadParameters): NormalizedTarget[] => {
 // unhelpful type error.
 const validatePath = (path: unknown): string => {
     if (typeof path !== 'string' || path.length === 0) {
-        throw new HarnessError('fileRead paths must be non-empty strings.');
+        throw new HarnessError('read paths must be non-empty strings.');
     }
 
     if (path.includes('\u0000')) {
-        throw new HarnessError('fileRead paths must not contain NUL characters.');
+        throw new HarnessError('read paths must not contain NUL characters.');
     }
 
     return path;
@@ -528,12 +528,12 @@ const scanFile = async (handle: FileHandle, request: NormalizedTarget, budget: n
 // genuine denial keeps permission wording, and is therefore distinguishable.
 const directoryFailure = (path: string): HarnessError =>
     new HarnessError(
-        `fileRead cannot read "${path}": it is a directory, not a file. Use fileList to list its entries, or fileGlob to find files inside it.`
+        `read cannot read "${path}": it is a directory, not a file. Use fileList to list its entries, or fileGlob to find files inside it.`
     );
 
 const permissionFailure = (path: string, message: string): HarnessError =>
     new HarnessError(
-        `fileRead was denied permission to read "${path}": ${message}. This is a filesystem permission problem, not a missing path or a directory read.`
+        `read was denied permission to read "${path}": ${message}. This is a filesystem permission problem, not a missing path or a directory read.`
     );
 
 const errorCodeOf = (error: unknown): string | undefined => {
@@ -567,14 +567,14 @@ const fileError = async (path: string, error: unknown): Promise<HarnessError> =>
     if (await isDirectoryTarget(path, error)) return directoryFailure(path);
     if (code === 'EACCES' || code === 'EPERM') return permissionFailure(path, message);
 
-    return new HarnessError(`fileRead failed to read "${path}": ${message}`);
+    return new HarnessError(`read failed to read "${path}": ${message}`);
 };
 
 // Authoritative registration/details for this preset (T13): the catalogue keeps
 // a synchronous data projection for lazy enumeration and a consistency test
 // asserts the two stay equal. Edit the metadata HERE.
 export const FILE_READ_METADATA: PresetToolMetadata = {
-    name: 'fileRead',
+    name: 'read',
     description:
         'Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }. Defaults: startLine 1, startColumn 0, maxLines 200 (hard maximum 5000). `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. When an entry is truncated, request { path, startLine: nextLine, startColumn: nextColumn } to continue; nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. The whole batch shares a fixed 64 KiB UTF-8 CONTENT budget (not counting JSON escaping), split fairly between the requested files, and reading stops at that budget instead of loading huge files or lines wholesale. A call accepts at most 100 paths. A path that does not exist is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code: "ENOENT", message }`; it consumes no content budget and the other files are still read. Every other failure - an invalid request, a directory (use fileList or fileGlob for those), binary bytes (NUL or invalid UTF-8) encountered while streaming the file, or any other filesystem error - rejects the whole call, so a short answer never looks complete. Binary detection covers decoded chunks, not the whole file beyond the last chunk read. A window at a deep line rescans from the start to count lines. Paths are absolute or relative to the working directory.',
     tags: ['files', 'read', 'filesystem'],
@@ -639,14 +639,23 @@ export const metadata = FILE_READ_METADATA;
 export const registration = {
     group: 'preset',
     activation: 'always',
+    // T2/R2: reading is cheap and the model needs the bytes before it can act on them,
+    // so a read completion does not start a turn of its own - the whole sync batch of
+    // this message settles first. Same value as the `tool({ mode })` declaration below;
+    // this literal is what discovery and the generated manifest report.
+    mode: 'sync',
     order: 170,
     sessionBound: false,
     alwaysDeclared: false,
     listed: false
 } as const;
 
-export const fileRead = tool<FileReadParameters, FileReadResult>({
+export const read = tool<FileReadParameters, FileReadResult>({
     ...FILE_READ_METADATA,
+    // T2/R2: the DECLARED turn policy, mirrored from `registration` above so the
+    // standalone callable, a host-registered `tools: { read }`, and the harness's
+    // descriptor-bound registration all resolve the same effective mode.
+    mode: 'sync',
     execute: async ({ parameters: paths }) => {
         const requested = normalizeTargets(paths);
 

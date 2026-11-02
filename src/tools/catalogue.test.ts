@@ -18,12 +18,12 @@ describe('preset catalogue', () => {
     it('lists the presets in a stable order', () => {
         expect(PRESET_TOOL_NAMES).toEqual([
             'syntaxCheck',
-            'fileRead',
+            'read',
             'fileWrite',
-            'fileEdit',
+            'edit',
             'fileList',
             'fileGlob',
-            'commandRun',
+            'shell',
             'gitDiff'
         ]);
         expect(Object.keys(presetTools)).toEqual(PRESET_TOOL_NAMES);
@@ -108,7 +108,7 @@ describe('preset catalogue', () => {
         // R18: read/write/edit/glob are declared on every request; fileList is the
         // occasional directory survey and still waits for toolRequest. Exactly the
         // approved set and no fileSearch alias.
-        for (const name of ['fileRead', 'fileWrite', 'fileEdit', 'fileGlob'] as const) {
+        for (const name of ['read', 'fileWrite', 'edit', 'fileGlob'] as const) {
             expect(PRESET_TOOLS[name].visibility).toBe('core');
             expect(presetTools[name].visibility).toBe('core');
         }
@@ -117,9 +117,9 @@ describe('preset catalogue', () => {
         expect(presetTools.fileList.visibility).toBe('searchable');
         expect(PRESET_TOOLS).not.toHaveProperty('fileSearch');
 
-        // syntaxCheck, commandRun and gitDiff share the same visibility default:
+        // syntaxCheck, shell and gitDiff share the same visibility default:
         // discovery is the only way to reach them.
-        for (const name of ['syntaxCheck', 'commandRun', 'gitDiff'] as const) {
+        for (const name of ['syntaxCheck', 'shell', 'gitDiff'] as const) {
             expect(presetTools[name].visibility).toBe('searchable');
         }
     });
@@ -127,9 +127,9 @@ describe('preset catalogue', () => {
     it('declares the three batched file tools as ONE array property each', () => {
         // This is the schema half of the batching contract: one property means the
         // single-property rule hands `execute` the array itself.
-        expect(toolParameterKey(PRESET_TOOLS.fileRead.parameters)).toBe('paths');
+        expect(toolParameterKey(PRESET_TOOLS.read.parameters)).toBe('paths');
         expect(toolParameterKey(PRESET_TOOLS.fileWrite.parameters)).toBe('files');
-        expect(toolParameterKey(PRESET_TOOLS.fileEdit.parameters)).toBe('edits');
+        expect(toolParameterKey(PRESET_TOOLS.edit.parameters)).toBe('edits');
 
         // R9: fileList is the exception — its paged contract needs `offset`/`limit`
         // beside `paths`, so it is a multi-property object with no `required`. The
@@ -141,15 +141,15 @@ describe('preset catalogue', () => {
             'limit'
         ]);
 
-        expect(PRESET_TOOLS.fileRead.parameters.required).toEqual(['paths']);
+        expect(PRESET_TOOLS.read.parameters.required).toEqual(['paths']);
         expect(PRESET_TOOLS.fileWrite.parameters.required).toEqual(['files']);
-        expect(PRESET_TOOLS.fileEdit.parameters.required).toEqual(['edits']);
+        expect(PRESET_TOOLS.edit.parameters.required).toEqual(['edits']);
         // fileList has no `required`: the documented default is ["."].
         expect('required' in PRESET_TOOLS.fileList.parameters).toBe(false);
 
-        expect(PRESET_TOOLS.fileRead.tags).toEqual(['files', 'read', 'filesystem']);
+        expect(PRESET_TOOLS.read.tags).toEqual(['files', 'read', 'filesystem']);
         expect(PRESET_TOOLS.fileWrite.tags).toEqual(['files', 'write', 'filesystem']);
-        expect(PRESET_TOOLS.fileEdit.tags).toEqual(['files', 'edit', 'write', 'replace', 'filesystem']);
+        expect(PRESET_TOOLS.edit.tags).toEqual(['files', 'edit', 'write', 'replace', 'filesystem']);
         expect(PRESET_TOOLS.fileList.tags).toEqual(['files', 'list', 'filesystem']);
     });
 
@@ -181,7 +181,7 @@ describe('preset catalogue', () => {
             additionalProperties: false
         });
 
-        expect(PRESET_TOOLS.fileEdit.parameters).toEqual({
+        expect(PRESET_TOOLS.edit.parameters).toEqual({
             type: 'object',
             properties: {
                 edits: {
@@ -256,8 +256,8 @@ describe('preset catalogue', () => {
     it('keeps gitDiff unchanged and every argument optional', () => {
         expect(PRESET_TOOLS.gitDiff.tags).toEqual(['git', 'diff', 'vcs', 'review', 'command']);
         expect('required' in PRESET_TOOLS.gitDiff.parameters).toBe(false);
-        expect(PRESET_TOOLS.commandRun.tags).toEqual(['shell', 'command', 'process']);
-        expect(PRESET_TOOLS.commandRun.parameters.required).toEqual(['command']);
+        expect(PRESET_TOOLS.shell.tags).toEqual(['shell', 'command', 'process']);
+        expect(PRESET_TOOLS.shell.parameters.required).toEqual(['command']);
     });
 
     it('does not claim a sandbox or gitignore support it does not implement', () => {

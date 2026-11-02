@@ -80,7 +80,7 @@ describe('openFilePreview', () => {
                     endLine: 0,
                     truncated: false,
                     nextLine: null,
-                    error: { message: 'fileRead could not find "missing.ts": no such file or directory (ENOENT).' }
+                    error: { message: 'read could not find "missing.ts": no such file or directory (ENOENT).' }
                 }
             ],
             truncated: false
@@ -90,7 +90,7 @@ describe('openFilePreview', () => {
         await flush();
 
         expect(dialog().querySelector('.preview-error')?.textContent).toBe(
-            'fileRead could not find "missing.ts": no such file or directory (ENOENT).'
+            'read could not find "missing.ts": no such file or directory (ENOENT).'
         );
         handle.close();
     });

@@ -64,12 +64,12 @@ describe('browser catalogue fallback (T24)', () => {
     it('derives the preset and runtime groups from the generated data', () => {
         expect(PRESET_TOOL_NAMES).toEqual([
             'syntaxCheck',
-            'fileRead',
+            'read',
             'fileWrite',
-            'fileEdit',
+            'edit',
             'fileList',
             'fileGlob',
-            'commandRun',
+            'shell',
             'gitDiff'
         ]);
         expect(PRESET_DESCRIPTORS).toEqual(
@@ -91,7 +91,7 @@ describe('browser catalogue fallback (T24)', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'agentDelegate',
+            'delegate',
             'actionRequest',
             'threadFork'
         ]);

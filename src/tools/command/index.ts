@@ -1,6 +1,6 @@
 // @underload/harness tools/command — the shell escape hatch, and the read-only git view.
 //
-// commandRun has no sandbox, no allowlist, and no confirmation: it runs with the
+// shell has no sandbox, no allowlist, and no confirmation: it runs with the
 // host's permissions. gitDiff is the narrow alternative for the common case — a
 // fixed, non-mutating `git diff` argv with no shell.
 //
@@ -12,5 +12,5 @@
 // evaluate `node:child_process` for every importer of the folder barrel, which is
 // what the lazy catalogue (../lazy, ../index) avoids. Values are reached through the
 // generated descriptor loader; only the public TYPES live on this barrel.
-export type { CommandRunParameters, CommandRunResult } from './commandRun.tool';
+export type { CommandRunParameters, CommandRunResult } from './shell.tool';
 export type { GitDiffParameters, GitDiffResult } from './gitDiff.tool';

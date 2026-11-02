@@ -678,7 +678,7 @@ export const enqueueTask = async (
 // POST /tools/:name — call one tool on the server.
 //
 // `sessionId` is only meaningful for a `sessionBound` core tool (toolRequest,
-// toolCreate, todoManage, agentDelegate): the server runs it inside that session's
+// toolCreate, todoManage, delegate): the server runs it inside that session's
 // harness, so discovery, runtime tools, todos and delegation change the
 // conversation the user is looking at. It is omitted for a catalogue tool, whose
 // request body therefore stays byte-identical to the pre-R8 contract.

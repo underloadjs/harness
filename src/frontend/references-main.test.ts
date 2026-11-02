@@ -81,14 +81,14 @@ const restored = (): SessionSnapshot => ({
                 {
                     type: 'tool_call',
                     agent: 'instruct',
-                    call: { id: 'd1', name: 'agentDelegate', arguments: '{}' }
+                    call: { id: 'd1', name: 'delegate', arguments: '{}' }
                 },
                 { type: 'start', agent: 'research', model: 'm1' },
                 { type: 'text', agent: 'research', delta: 'nested answer' },
                 {
                     type: 'tool_result',
                     agent: 'instruct',
-                    name: 'agentDelegate',
+                    name: 'delegate',
                     content: 'ok',
                     isError: false,
                     callId: 'd1'

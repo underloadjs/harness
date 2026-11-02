@@ -1,4 +1,4 @@
-// Shared HTTP plumbing for the webSearch adapters.
+// Shared HTTP plumbing for the search adapters.
 //
 // WHY THIS FILE EXISTS
 // --------------------

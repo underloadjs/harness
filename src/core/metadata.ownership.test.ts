@@ -25,12 +25,12 @@ import type { Tool } from '../types';
 import * as catalogue from '../tools/catalogue';
 import { PRESET_TOOL_NAMES, PRESET_TOOLS } from '../tools/catalogue';
 import * as syntaxEntry from '../tools/syntax/syntaxCheck.tool';
-import * as fileReadEntry from '../tools/files/fileRead.tool';
+import * as fileReadEntry from '../tools/files/read.tool';
 import * as fileWriteEntry from '../tools/files/fileWrite.tool';
-import * as fileEditEntry from '../tools/files/fileEdit.tool';
+import * as fileEditEntry from '../tools/files/edit.tool';
 import * as fileListEntry from '../tools/files/fileList.tool';
 import * as fileGlobEntry from '../tools/files/fileGlob.tool';
-import * as commandRunEntry from '../tools/command/commandRun.tool';
+import * as commandRunEntry from '../tools/command/shell.tool';
 import * as gitDiffEntry from '../tools/command/gitDiff.tool';
 import * as coreMetadata from './metadata';
 import { ACTION_REQUEST_LIMITS } from './action';
@@ -55,7 +55,7 @@ import * as chapterManageEntry from '../tools/runtime/chapterManage.tool';
 import * as locationManageEntry from '../tools/runtime/locationManage.tool';
 import * as agentManageEntry from '../tools/runtime/agentManage.tool';
 import * as agentResultEntry from '../tools/runtime/agentResult.tool';
-import * as agentDelegateEntry from '../tools/runtime/agentDelegate.tool';
+import * as agentDelegateEntry from '../tools/runtime/delegate.tool';
 import * as toolCancelEntry from '../tools/runtime/toolCancel.tool';
 import * as actionRequestEntry from '../tools/runtime/actionRequest.tool';
 import * as threadForkEntry from '../tools/runtime/threadFork.tool';
@@ -215,11 +215,11 @@ const presetEntries: PresetEntry[] = [
         tool: syntaxEntry.syntaxCheck
     },
     {
-        key: 'fileRead',
+        key: 'read',
         metadataName: 'FILE_READ_METADATA',
-        sourcePath: '../tools/files/fileRead.tool.ts',
+        sourcePath: '../tools/files/read.tool.ts',
         metadata: fileReadEntry.FILE_READ_METADATA,
-        tool: fileReadEntry.fileRead
+        tool: fileReadEntry.read
     },
     {
         key: 'fileWrite',
@@ -229,11 +229,11 @@ const presetEntries: PresetEntry[] = [
         tool: fileWriteEntry.fileWrite
     },
     {
-        key: 'fileEdit',
+        key: 'edit',
         metadataName: 'FILE_EDIT_METADATA',
-        sourcePath: '../tools/files/fileEdit.tool.ts',
+        sourcePath: '../tools/files/edit.tool.ts',
         metadata: fileEditEntry.FILE_EDIT_METADATA,
-        tool: fileEditEntry.fileEdit
+        tool: fileEditEntry.edit
     },
     {
         key: 'fileList',
@@ -250,11 +250,11 @@ const presetEntries: PresetEntry[] = [
         tool: fileGlobEntry.fileGlob
     },
     {
-        key: 'commandRun',
+        key: 'shell',
         metadataName: 'COMMAND_RUN_METADATA',
-        sourcePath: '../tools/command/commandRun.tool.ts',
+        sourcePath: '../tools/command/shell.tool.ts',
         metadata: commandRunEntry.COMMAND_RUN_METADATA,
-        tool: commandRunEntry.commandRun
+        tool: commandRunEntry.shell
     },
     {
         key: 'gitDiff',
@@ -298,17 +298,17 @@ describe('runtime entry metadata ownership', () => {
         }
     });
 
-    it('keeps agentDelegate metadata literal and pins the inlined bounds', () => {
+    it('keeps delegate metadata literal and pins the inlined bounds', () => {
         // The facade's factory and the entry's factory are different module
         // instances on purpose (the facade must not import a .tool module), so the
         // contract is behavioural equality, not object identity.
-        expect(agentDelegateEntry.AGENT_DELEGATE_NAME).toBe('agentDelegate');
-        expect(agentDelegateEntry.agentDelegateMetadata().name).toBe('agentDelegate');
-        expect(agentDelegateEntry.metadata.name).toBe('agentDelegate');
+        expect(agentDelegateEntry.AGENT_DELEGATE_NAME).toBe('delegate');
+        expect(agentDelegateEntry.agentDelegateMetadata().name).toBe('delegate');
+        expect(agentDelegateEntry.metadata.name).toBe('delegate');
         // The zero-allowlist form is the entry literal, projected through the facade.
-        expect(coreMetadata.AGENT_DELEGATE_NAME).toBe('agentDelegate');
+        expect(coreMetadata.AGENT_DELEGATE_NAME).toBe('delegate');
         expect(coreMetadata.agentDelegateMetadata()).toEqual({
-            name: 'agentDelegate',
+            name: 'delegate',
             description: agentDelegateEntry.metadata.description,
             tags: ['agents', 'delegate', 'delegation', 'subagent', 'team'],
             visibility: 'core',
@@ -319,7 +319,7 @@ describe('runtime entry metadata ownership', () => {
             agentDelegateEntry.agentDelegateMetadata(['alpha', 'beta'])
         );
         expect(agentDelegateEntry.agentDelegateMetadata(['alpha', 'beta'])).toEqual({
-            name: 'agentDelegate',
+            name: 'delegate',
             description:
                 'Delegate a self-contained task to a configured subagent and return its answer. Subagents: alpha, beta. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.',
             tags: ['agents', 'delegate', 'delegation', 'subagent', 'team'],
@@ -344,7 +344,7 @@ describe('runtime entry metadata ownership', () => {
         // The entry annotates the factory with the leaf type through a TYPE-ONLY
         // import of '../core' (erased at transpile, resolves to the LIVE core
         // module), so the captured revision keeps `dependencies: []`.
-        expect(sourceOf('../tools/runtime/agentDelegate.tool.ts')).toContain(
+        expect(sourceOf('../tools/runtime/delegate.tool.ts')).toContain(
             "import type { CoreToolMetadata } from '../../core';"
         );
 
@@ -512,7 +512,7 @@ describe('T13/T12 declarative cross-contract', () => {
 
     it('describes newest-request replacement for every selector and exact omitted counts', () => {
         expect(TOOL_REQUEST_METADATA.description).toBe(
-            'Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example ["files", "list"], ["shell"], or ["git", "diff"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example agentDelegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.'
+            'Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example ["files", "list"], ["shell"], or ["git", "diff"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example delegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.'
         );
     });
 });

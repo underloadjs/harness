@@ -15,17 +15,17 @@ import { fileURLToPath } from 'node:url';
 import {
     agent,
     harness,
-    commandRun,
-    fileEdit,
+    shell,
+    edit,
     fileGlob,
     fileList,
-    fileRead,
+    read,
     fileWrite,
     syntaxCheck
 } from '@underload/harness';
 import type { HarnessStream, HarnessStreamEvent } from '@underload/harness';
 
-// Mirrors FILE_READ_CONTENT_BUDGET in ./files/fileRead. Importing the constant
+// Mirrors FILE_READ_CONTENT_BUDGET in ./files/read. Importing the constant
 // through the package would evaluate the implementation module eagerly and break
 // the lazy-loading contract (see laziness.test.ts).
 const FILE_READ_CONTENT_BUDGET = 64 * 1024;
@@ -115,7 +115,7 @@ describe('syntaxCheck', () => {
 
         // A missing path is now a not-found ENTRY (R1), so "the code did not run" is
         // proven by the ENOENT error on that entry instead of a thrown call.
-        await expect(fileRead(['executed.txt', 'executed-js.txt'])).resolves.toEqual({
+        await expect(read(['executed.txt', 'executed-js.txt'])).resolves.toEqual({
             files: [
                 {
                     path: join(workdir, 'executed.txt'),
@@ -129,7 +129,7 @@ describe('syntaxCheck', () => {
                     error: {
                         code: 'ENOENT',
                         message:
-                            'fileRead could not find "executed.txt": no such file or directory (ENOENT).'
+                            'read could not find "executed.txt": no such file or directory (ENOENT).'
                     }
                 },
                 {
@@ -144,7 +144,7 @@ describe('syntaxCheck', () => {
                     error: {
                         code: 'ENOENT',
                         message:
-                            'fileRead could not find "executed-js.txt": no such file or directory (ENOENT).'
+                            'read could not find "executed-js.txt": no such file or directory (ENOENT).'
                     }
                 }
             ],
@@ -181,7 +181,7 @@ describe('file tools', () => {
 
         // The batched read returns one bounded window per path, in request order.
         // `# Hello` is one unterminated line, so the window ended at EOF.
-        await expect(fileRead(['notes/hello.md'])).resolves.toEqual({
+        await expect(read(['notes/hello.md'])).resolves.toEqual({
             files: [
                 {
                     path: join(workdir, 'notes', 'hello.md'),
@@ -220,7 +220,7 @@ describe('file tools', () => {
             { path: 'multi-read/b.txt', content: 'b' }
         ]);
 
-        await expect(fileRead(['multi-read/b.txt', 'multi-read/a.txt'])).resolves.toEqual({
+        await expect(read(['multi-read/b.txt', 'multi-read/a.txt'])).resolves.toEqual({
             files: [
                 {
                     path: join(workdir, 'multi-read', 'b.txt'),
@@ -256,7 +256,7 @@ describe('file tools', () => {
         ]);
 
         await expect(
-            fileEdit([
+            edit([
                 { path: 'multi-edit/a.txt', oldString: 'alpha', newString: 'ALPHA' },
                 { path: 'multi-edit/b.txt', oldString: 'beta', newString: 'BETA' }
             ])
@@ -342,7 +342,7 @@ describe('file tools', () => {
         await fileWrite([{ path: 'over.txt', content: 'first' }]);
         await fileWrite([{ path: 'over.txt', content: 'second' }]);
 
-        await expect(fileRead(['over.txt'])).resolves.toEqual({
+        await expect(read(['over.txt'])).resolves.toEqual({
             files: [
                 {
                     path: join(workdir, 'over.txt'),
@@ -364,7 +364,7 @@ describe('file tools', () => {
     it('reports a missing file as an ordered not-found entry', async () => {
         // R1: a missing path is data now, not a thrown error. The entry keeps the
         // absolute resolved path, empty content, 0 bytes, and the ENOENT error.
-        await expect(fileRead(['nope/missing.txt'])).resolves.toEqual({
+        await expect(read(['nope/missing.txt'])).resolves.toEqual({
             files: [
                 {
                     path: join(workdir, 'nope/missing.txt'),
@@ -378,7 +378,7 @@ describe('file tools', () => {
                     error: {
                         code: 'ENOENT',
                         message:
-                            'fileRead could not find "nope/missing.txt": no such file or directory (ENOENT).'
+                            'read could not find "nope/missing.txt": no such file or directory (ENOENT).'
                     }
                 }
             ],
@@ -389,9 +389,9 @@ describe('file tools', () => {
     });
 });
 
-describe('commandRun', () => {
+describe('shell', () => {
     it('returns exit code, stdout, and stderr', async () => {
-        const result = await commandRun({ command: 'node -e "console.log(42)"' });
+        const result = await shell({ command: 'node -e "console.log(42)"' });
 
         expect(result.exitCode).toBe(0);
         expect(result.stdout.trim()).toBe('42');
@@ -399,14 +399,14 @@ describe('commandRun', () => {
     });
 
     it('returns a non-zero exit as data instead of throwing', async () => {
-        const result = await commandRun({ command: 'node -e "process.exit(3)"' });
+        const result = await shell({ command: 'node -e "process.exit(3)"' });
 
         expect(result.exitCode).toBe(3);
     });
 
     it('honours cwd', async () => {
         await fileWrite([{ path: 'cwd-test/marker.txt', content: 'x' }]);
-        const result = await commandRun({
+        const result = await shell({
             command: 'node -e "console.log(process.cwd())"',
             cwd: 'cwd-test'
         });
@@ -417,7 +417,7 @@ describe('commandRun', () => {
 
 describe('presets inside a harness', () => {
     it('ships the four everyday file tools core and the rest searchable', () => {
-        expect(fileRead.tags).toEqual(['files', 'read', 'filesystem']);
+        expect(read.tags).toEqual(['files', 'read', 'filesystem']);
         expect(syntaxCheck.tags).toEqual([
             'code',
             'syntax',
@@ -425,11 +425,11 @@ describe('presets inside a harness', () => {
             'python',
             'validation'
         ]);
-        expect(fileRead.visibility).toBe('core');
-        expect(fileEdit.visibility).toBe('core');
+        expect(read.visibility).toBe('core');
+        expect(edit.visibility).toBe('core');
         expect(fileGlob.visibility).toBe('core');
         expect(fileList.visibility).toBe('searchable');
-        expect(commandRun.visibility).toBe('searchable');
+        expect(shell.visibility).toBe('searchable');
         expect(syntaxCheck.visibility).toBe('searchable');
     });
 
@@ -437,39 +437,41 @@ describe('presets inside a harness', () => {
         const entry = agent({
             model: 'm',
             stream: scripted([
-                callTool('c1', 'fileRead', '{"paths":["harness.txt"]}'),
+                callTool('c1', 'read', '{"paths":["harness.txt"]}'),
                 answer('read it')
             ])
         });
 
-        const writer = harness({ agents: { writer: entry }, tools: { fileRead, fileWrite } });
+        const writer = harness({ agents: { writer: entry }, tools: { read, fileWrite } });
 
         await fileWrite([{ path: 'harness.txt', content: 'seeded content' }]);
 
-        // The registry key renames the tool, so the model calls `fileRead`.
-        expect(writer.tools.fileRead.name).toBe('fileRead');
+        // The registry key renames the tool, so the model calls `read`.
+        expect(writer.tools.read.name).toBe('read');
         // R18: core, so the very first declaration already contains it.
-        expect(writer.tools.fileRead.visibility).toBe('core');
+        expect(writer.tools.read.visibility).toBe('core');
 
         const message = await writer('read the file');
 
         expect(message.content).toBe('read it');
-        // user -> fileRead call -> result -> pause -> answer: no toolRequest round.
-        // IMMEDIATE CONTINUATION (R1): fileRead does real fs I/O, so it is still
-        // pending when the harness takes the next turn. The scripted answer is
-        // therefore committed as a PAUSE (index 3), the real result is inserted at
-        // its original call position (index 2), and the model is re-requested once
-        // the read lands. The scripted transport has no further turn left, so it
-        // repeats its last answer for that final request (index 4).
+        // user -> read call -> real result -> answer: no toolRequest round, and NO
+        // pause turn spent on a placeholder.
+        //
+        // T2/R3: `read` declares `mode: 'sync'`, so its completion joins the message's
+        // SYNC GROUP and the batch gate holds the next request until the result was
+        // DELIVERED. `read` does real fs I/O, so this is exactly where the historical
+        // background behaviour differed: a pending sync call used to let the harness
+        // commit a pause turn and re-request once the result landed (a 5-message
+        // transcript). Under the sync policy the model is asked again only after the
+        // whole sync batch settled, so the transcript is four messages and the scripted
+        // answer is consumed once.
         expect(entry.messages.map((item) => item.role)).toEqual([
             'user',
             'assistant',
             'tool',
-            'assistant',
             'assistant'
         ]);
         expect((entry.messages[3] as { content: string }).content).toBe('read it');
-        expect((entry.messages[4] as { content: string }).content).toBe('read it');
         // The single-property rule unwrapped the model's {"paths":[...]} to the
         // array, and the result serialized as the bounded batch object.
         expect(JSON.parse((entry.messages[2] as { content: string }).content)).toEqual({

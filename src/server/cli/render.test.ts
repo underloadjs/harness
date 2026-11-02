@@ -65,7 +65,7 @@ const resultWith = (fields: Record<string, unknown> = {}): HarnessEvent =>
     ({
         type: 'tool_result',
         agent: 'writer',
-        name: 'fileRead',
+        name: 'read',
         content: 'ok',
         isError: false,
         ...fields
@@ -112,21 +112,21 @@ describe('createRenderer', () => {
     it('prints a legacy tool result exactly as before (no duration, no pending)', () => {
         const { out } = renderAll([resultWith()]);
 
-        expect(out).toEqual(['← fileRead\n  ok\n']);
+        expect(out).toEqual(['← read\n  ok\n']);
     });
 
     it('prints the authoritative duration on the result line', () => {
         const { out } = renderAll([resultWith({ durationMs: 1250 })]);
 
-        expect(out).toEqual(['← fileRead · 1.3s\n  ok\n']);
+        expect(out).toEqual(['← read · 1.3s\n  ok\n']);
     });
 
     it('prints an error result with its duration and marks it as an error', () => {
         const { out } = renderAll([
-            resultWith({ name: 'commandRun', content: 'exit 1', isError: true, durationMs: 2000 })
+            resultWith({ name: 'shell', content: 'exit 1', isError: true, durationMs: 2000 })
         ]);
 
-        expect(out).toEqual(['← commandRun · 2.0s (error)\n  exit 1\n']);
+        expect(out).toEqual(['← shell · 2.0s (error)\n  exit 1\n']);
     });
 
     it('lists calls still in flight under the result that finished', () => {
@@ -134,20 +134,20 @@ describe('createRenderer', () => {
             resultWith({
                 durationMs: 300,
                 pending: [
-                    { callId: 'c2', name: 'webSearch', elapsedMs: 900 },
-                    { callId: 'c3', name: 'commandRun', elapsedMs: 65_000 }
+                    { callId: 'c2', name: 'search', elapsedMs: 900 },
+                    { callId: 'c3', name: 'shell', elapsedMs: 65_000 }
                 ]
             })
         ]);
 
         expect(out).toEqual([
-            '← fileRead · 300ms\n  ok\n',
-            '  pending · webSearch 900ms, commandRun 1m05s\n'
+            '← read · 300ms\n  ok\n',
+            '  pending · search 900ms, shell 1m05s\n'
         ]);
     });
 
     it('does not print a pending line when the array is empty or absent', () => {
-        expect(renderAll([resultWith({ pending: [] })]).out).toEqual(['← fileRead\n  ok\n']);
+        expect(renderAll([resultWith({ pending: [] })]).out).toEqual(['← read\n  ok\n']);
     });
 
     it('reports an interim done with its still-running calls, never as the end', () => {
@@ -155,12 +155,12 @@ describe('createRenderer', () => {
             doneWith({
                 message: message({
                     stopReason: 'tool_calls',
-                    toolCalls: [{ id: 'c1', name: 'fileRead', arguments: '{}' }],
+                    toolCalls: [{ id: 'c1', name: 'read', arguments: '{}' }],
                     usage: { input: 10, output: 5, total: 15 }
                 }),
                 pending: [
-                    { callId: 'c1', name: 'fileRead', elapsedMs: 1200 },
-                    { callId: 'c2', name: 'webSearch', elapsedMs: 900 }
+                    { callId: 'c1', name: 'read', elapsedMs: 1200 },
+                    { callId: 'c2', name: 'search', elapsedMs: 900 }
                 ]
             })
         ]);
@@ -177,10 +177,10 @@ describe('createRenderer', () => {
 
     it('prints a wakeup with the calls that are still running', () => {
         const { out } = renderAll([
-            wakeupWith({ pending: [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }] })
+            wakeupWith({ pending: [{ callId: 'c1', name: 'read', elapsedMs: 1200 }] })
         ]);
 
-        expect(out).toEqual(['~ writer woke · 1 still running · fileRead 1.2s\n']);
+        expect(out).toEqual(['~ writer woke · 1 still running · read 1.2s\n']);
     });
 
     it('prints a wakeup that leaves nothing pending as a finished wake', () => {

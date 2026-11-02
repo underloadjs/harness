@@ -1,6 +1,6 @@
 // Tavily adapter.
 //
-// Loaded by `import()` from ./index on the first `webSearch` call, so constructing
+// Loaded by `import()` from ./index on the first `search` call, so constructing
 // a harness or listing tools never touches this module or the network.
 //
 // Wire contract (https://docs.tavily.com/documentation/api-reference/endpoint/search):

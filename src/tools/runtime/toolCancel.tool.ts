@@ -52,6 +52,9 @@ export const metadata = TOOL_CANCEL_METADATA;
 export const registration = {
     group: 'runtime',
     activation: 'always',
+    // T2/R2: no mode is declared. toolCancel is answered INLINE by the owning run
+    // (immediateResult), so it never becomes a background task and has no completion to
+    // group; the documented 'sync' default is both its effective value and a no-op.
     order: 150,
     sessionBound: true,
     alwaysDeclared: false,

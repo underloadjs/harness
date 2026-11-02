@@ -39,13 +39,13 @@
 // TOOL EXECUTION (R8): every tool runs on the server. GET /tools (and
 // /tools/bootstrap, and the bootstrap document) lists the whole catalogue PLUS the
 // harness-owned core tools — toolRegistry, toolRequest, toolCreate, todoManage,
-// agentDelegate — marked
+// delegate — marked
 // `visibility: 'core'` and `sessionBound: true`. R18: only the harness-owned set
-// is sessionBound; core file tools/webSearch keep a real `tool` and run directly.
+// is sessionBound; core file tools/search keep a real `tool` and run directly.
 // A sessionBound entry has no standalone implementation: POST /tools/:name
 // requires `sessionId`, rejects 400
 // without one, 404 for an unknown session or a core tool that session's harness
-// does not register (agentDelegate without subagents), and 409 while the session is
+// does not register (delegate without subagents), and 409 while the session is
 // busy (a streaming run, a reset, or another manual call) so a manual mutation
 // cannot race an active operation. When a `sessionId` IS supplied, ANY name runs
 // in that session's LIVE registry (R4 self-modifying tools): a replaced preset,
@@ -369,7 +369,7 @@ const toolIndex = (entries: readonly CatalogueEntry[]): ToolIndex => ({
 // Bound ONE manual tool value for the HTTP result (R13).
 //
 // The model-facing transcript is bounded in harness.ts; the manual (host) route is
-// a second way to obtain a tool result, and a huge fileRead/webSearch result would
+// a second way to obtain a tool result, and a huge read/search result would
 // otherwise travel as one enormous JSON body. The SAME shared cap is applied here —
 // to the serialized text, not to a reimplementation of the limit — with two rules:
 //
@@ -607,17 +607,17 @@ export const createHarnessApi = ({
     //
     //   session named — execute against that session's LIVE harness registry via
     //     store.callTool, for EVERY name (static or not). R4 of the self-modifying
-    //     tools task: a session may replace a known preset (timeNow, fileRead, …)
+    //     tools task: a session may replace a known preset (timeNow, read, …)
     //     or toolCreate/toolRegistry a new name, and the HTTP call must observe the
     //     implementation, metadata, and schema currently registered in THAT
     //     session — never a detached copy from the static catalogue. This also
     //     covers the harness-owned core tools (toolRegistry, toolRequest, toolCreate,
-    //     todoManage, agentDelegate): they have no standalone implementation and only mean
+    //     todoManage, delegate): they have no standalone implementation and only mean
     //     something inside a harness. The store rejects a session that is already
     //     busy (running, resetting, or another manual call).
     //   no session — the direct runner that predates R8: no harness, no model, no
     //     loop. This is the useful path for standalone app tools and for the core
-    //     FILE tools/webSearch (R18: `visibility: 'core'` but real implementations,
+    //     FILE tools/search (R18: `visibility: 'core'` but real implementations,
     //     so they must NOT require a session). A sessionBound entry refuses with
     //     400 because it cannot run without a harness.
     //
@@ -680,7 +680,7 @@ export const createHarnessApi = ({
                 const payload: ToolCallResult = {
                     ok: false,
                     // R13: the error text is bounded by the shared 64 KiB cap, so a
-                    // commandRun failure that dumps a build log cannot bloat the HTTP
+                    // shell failure that dumps a build log cannot bloat the HTTP
                     // body either.
                     error: { message: boundErrorMessage(error) },
                     durationMs: Date.now() - started

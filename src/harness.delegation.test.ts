@@ -3,7 +3,7 @@
 // Contract pinned here:
 //   - `primary` selects the entry agent; without it the first `agents` key wins;
 //   - `subagents` is an allowlist, defaulting to every agent except the primary;
-//   - the `agentDelegate` tool is core but declared ONLY to the primary, so a subagent
+//   - the `delegate` tool is core but declared ONLY to the primary, so a subagent
 //     never sees it (and a guessed call is rejected);
 //   - delegation is one level deep: only a top-level primary run may delegate, and
 //     re-entering a running agent is refused (ctx.run cycles included);
@@ -63,7 +63,7 @@ describe('primary and subagents', () => {
         expect(writer.name).toBe('researcher');
         expect(writer.agent).toBe(writer.agents.researcher);
         expect(Object.keys(writer.subagents)).toEqual(['writer']);
-        expect(writer.tools.agentDelegate).toBeDefined();
+        expect(writer.tools.delegate).toBeDefined();
     });
 
     it('keeps the first agents key as primary when none is named', () => {
@@ -84,7 +84,7 @@ describe('primary and subagents', () => {
         });
 
         expect(writer.subagents).toEqual({});
-        expect(writer.tools.agentDelegate).toBeUndefined();
+        expect(writer.tools.delegate).toBeUndefined();
     });
 
     it('uses an explicit allowlist and exposes it on the tool schema', () => {
@@ -100,7 +100,7 @@ describe('primary and subagents', () => {
 
         expect(Object.keys(writer.subagents)).toEqual(['researcher']);
         expect(
-            (writer.tools.agentDelegate.parameters as Record<string, any>).properties.agent.enum
+            (writer.tools.delegate.parameters as Record<string, any>).properties.agent.enum
         ).toEqual(['researcher']);
     });
 
@@ -121,7 +121,7 @@ describe('primary and subagents', () => {
     });
 });
 
-describe('agentDelegate', () => {
+describe('delegate', () => {
     it('declares delegate to the primary only', async () => {
         const seenWriter: HarnessStreamRequest[] = [];
         const seenResearcher: HarnessStreamRequest[] = [];
@@ -130,7 +130,7 @@ describe('agentDelegate', () => {
         const writerAgent = brain(
             scripted(
                 [
-                    callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"find facts"}'),
+                    callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts"}'),
                     answer('final')
                 ],
                 seenWriter
@@ -154,7 +154,7 @@ describe('agentDelegate', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'agentDelegate',
+            'delegate',
             'threadFork',
         ]);
         expect(declaredNames(seenResearcher[0])).toEqual([
@@ -180,7 +180,7 @@ describe('agentDelegate', () => {
 
         const writerAgent = brain(
             scripted([
-                callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"find facts"}'),
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts"}'),
                 answer('final')
             ])
         );
@@ -206,7 +206,7 @@ describe('agentDelegate', () => {
         const researcher = brain(scripted([answer('r')]));
         const editor = brain(scripted([answer('e')]));
         const writerAgent = brain(
-            scripted([callTool('c1', 'agentDelegate', '{"agent":"editor","input":"edit"}'), answer('recovered')])
+            scripted([callTool('c1', 'delegate', '{"agent":"editor","input":"edit"}'), answer('recovered')])
         );
 
         const writer = harness({
@@ -218,21 +218,21 @@ describe('agentDelegate', () => {
         await writer('go');
 
         expect(content(writerAgent.messages[2])).toBe(
-            'Tool "agentDelegate" received arguments that do not match its schema: $.agent must be one of: "researcher".'
+            'Tool "delegate" received arguments that do not match its schema: $.agent must be one of: "researcher".'
         );
     });
 
     it('rejects a subagent that tries to delegate (guessed name)', async () => {
         const researcher = brain(
             scripted([
-                callTool('r1', 'agentDelegate', '{"agent":"researcher","input":"again"}'),
+                callTool('r1', 'delegate', '{"agent":"researcher","input":"again"}'),
                 answer('blocked')
             ])
         );
 
         const writerAgent = brain(
             scripted([
-                callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"go"}'),
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"go"}'),
                 answer('final')
             ])
         );
@@ -243,7 +243,7 @@ describe('agentDelegate', () => {
         // The subagent's call is answered with a tool result it can read; the run
         // does not crash and delegation stays one level deep.
         expect(content(researcher.messages[2])).toBe(
-            'Tool "agentDelegate" is only available to the primary agent "writer".'
+            'Tool "delegate" is only available to the primary agent "writer".'
         );
         expect(content(writerAgent.messages[2])).toBe('{"agent":"researcher","content":"blocked"}');
     });
@@ -291,7 +291,7 @@ describe('agentDelegate', () => {
 
         const writerAgent = brain(
             scripted([
-                callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"find facts"}'),
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts"}'),
                 answer('final')
             ])
         );
@@ -316,7 +316,7 @@ describe('agentDelegate', () => {
 
         const writerAgent = brain(
             scripted([
-                callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"find facts"}'),
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts"}'),
                 answer('final')
             ])
         );
@@ -339,7 +339,7 @@ describe('agentDelegate', () => {
         });
         const writerAgent = brain(
             scripted([
-                callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"find facts"}'),
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts"}'),
                 answer('final')
             ]),
             { instruction: 'You are a writer.' }

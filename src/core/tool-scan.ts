@@ -29,6 +29,7 @@ import type {
     ToolActivation,
     ToolGroup,
     ToolMetadata,
+    ToolMode,
     ToolOrigin,
     ToolRegistration
 } from './tool-metadata';
@@ -52,6 +53,11 @@ const ACTIVATIONS: readonly ToolActivation[] = [
 ];
 
 const GROUPS: readonly ToolGroup[] = ['runtime', 'preset', 'external'];
+
+// Accepted `registration.mode` values (T2/R2). Absent means the entry inherits the
+// documented default ('sync'); the scanner never invents a value, so a consumer can
+// still tell a stated policy from a defaulted one.
+const MODES: readonly ToolMode[] = ['sync', 'async'];
 
 // ---------------------------------------------------------------------------
 // Node runtime (guarded, bundler-invisible dynamic import)
@@ -251,7 +257,7 @@ const propertyKey = (sourceFile: TsSourceFile, name: TsNode, label: string): str
 //
 // SAME-FILE IDENTIFIERS ARE ALLOWED, AND ONLY SAME-FILE ONES (T19). Every runtime
 // entry writes `name: TOOL_REQUEST_NAME` and every preset writes
-// `name: 'fileRead'`; both must read the same way. An identifier is therefore
+// `name: 'read'`; both must read the same way. An identifier is therefore
 // resolved through `findTopLevelConst` in THIS file — the same bounded alias walk
 // the `metadata`/`registration` exports use — and never through an import. A name
 // that is not a top-level literal here is an error naming the alias, so the failure
@@ -562,6 +568,17 @@ const readRegistration = (
         );
     }
 
+    // Optional turn policy: absent stays absent (the runtime applies the documented
+    // 'sync' default), and anything else is a hard discovery failure rather than a
+    // silently defaulted policy, because the mode changes when the model is re-run.
+    const mode = value.mode ?? fallback.mode;
+
+    if (mode !== undefined && !MODES.includes(mode as ToolMode)) {
+        throw new HarnessError(
+            `Tool entry ${label} registration.mode must be one of ${MODES.join(', ')}; received ${JSON.stringify(mode)}.`
+        );
+    }
+
     const order = value.order ?? fallback.order;
 
     if (typeof order !== 'number' || !Number.isFinite(order)) {
@@ -594,6 +611,10 @@ const readRegistration = (
     const registration: ToolRegistration = {
         group: group as ToolGroup,
         activation: activation as ToolActivation,
+        // Stated policy only: an entry that declares no mode keeps the key ABSENT, so
+        // the descriptor and the generated manifest report "defaulted" rather than
+        // inventing a value the author never wrote (T2/R2).
+        ...(mode === undefined ? {} : { mode: mode as ToolMode }),
         order
     };
 
@@ -754,6 +775,10 @@ const readEntry = (
         origin,
         group: registration.group,
         activation: registration.activation,
+        // Turn policy travels with the row (T2/R2): the scanner never defaults it, so
+        // `mode === undefined` means "the entry stated none" and the runtime applies
+        // the documented 'sync' default at launch.
+        ...(registration.mode === undefined ? {} : { mode: registration.mode }),
         order: registration.order,
         ...(registration.pendingOnly === undefined ? {} : { pendingOnly: registration.pendingOnly }),
         ...(registration.control === undefined ? {} : { control: registration.control }),
@@ -876,6 +901,7 @@ export type {
     ToolActivation,
     ToolGroup,
     ToolMetadata,
+    ToolMode,
     ToolOrigin,
     ToolRegistration
 } from './tool-metadata';

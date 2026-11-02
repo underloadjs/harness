@@ -1,7 +1,7 @@
 // File preview dialog (R11).
 //
 // Clicking a transcript file link opens ONE reusable modal (ui/dialog.ts) and,
-// only for that user activation, asks the existing `fileRead` tool for a BOUNDED
+// only for that user activation, asks the existing `read` tool for a BOUNDED
 // window of the file. There is no auto-fetch of mentioned paths, no new server
 // endpoint and no filesystem access in the browser.
 //
@@ -14,7 +14,7 @@
 //         -> { files: [{ content, truncated, startLine, endLine, nextLine,
 //                        error? }], truncated? }
 //
-// main.ts implements that with `callTool('fileRead', [{ path, startLine, maxLines }])`.
+// main.ts implements that with `callTool('read', [{ path, startLine, maxLines }])`.
 // The result shape is read structurally (`files[]`), so an older/extra field does
 // not break the dialog.
 //
@@ -46,7 +46,7 @@ import { highlightCode } from './markdown';
 // same order of magnitude as the tool's own default (200). The shell clamps it.
 export const FILE_PREVIEW_MAX_LINES = 200;
 
-// Structural view of one `fileRead` entry. Everything is optional/unknown at the
+// Structural view of one `read` entry. Everything is optional/unknown at the
 // boundary because this is wire data; the renderer narrows each field.
 export type FilePreviewEntry = {
     content?: unknown;
@@ -104,7 +104,7 @@ const firstEntryOf = (result: FilePreviewResult): FilePreviewEntry | undefined =
     return entry as FilePreviewEntry;
 };
 
-// Error text for a wire failure. The ENOENT message from fileRead already names
+// Error text for a wire failure. The ENOENT message from read already names
 // the requested path, so it is shown verbatim.
 const messageOfEntry = (entry: FilePreviewEntry): string | undefined => {
     if (entry.error === undefined || entry.error === null) return undefined;
@@ -143,7 +143,7 @@ const previewBody = (path: string, result: FilePreviewResult): PreviewBody => {
     const endLine = integerOf(entry.endLine);
     const truncated = entry.truncated === true || result.truncated === true;
 
-    // Range caption: line numbering is metadata from fileRead, not prefixes in
+    // Range caption: line numbering is metadata from read, not prefixes in
     // the copied text. This keeps the preview honest when the window starts late.
     const range =
         endLine === undefined || endLine < startLine

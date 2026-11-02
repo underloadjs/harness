@@ -184,7 +184,7 @@ describe('action cards in the turn board', () => {
             type: 'done',
             agent: 'writer',
             message: doneMessage(),
-            pending: [{ callId: 'call-9', name: 'fileRead', elapsedMs: 25 }]
+            pending: [{ callId: 'call-9', name: 'read', elapsedMs: 25 }]
         });
         expect(cardOf(turn).dataset.state).toBe('pending');
 
@@ -300,7 +300,7 @@ describe('fork / autoanswer branch rows', () => {
                 role: 'primary',
                 forkDepth: 1,
                 model: 'fork-model',
-                tools: ['fileRead']
+                tools: ['read']
             }
         });
 

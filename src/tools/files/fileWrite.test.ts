@@ -14,7 +14,7 @@
 //     are named and there is no claim of a transaction or rollback.
 //
 // Fixtures are real files under the repo-root `Temp/`, one unique directory per
-// run, removed afterwards (module-relative, same convention as fileRead.test.ts).
+// run, removed afterwards (module-relative, same convention as read.test.ts).
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -232,7 +232,7 @@ describe('fileWrite', () => {
 
     it('rejects NUL content in preflight, without creating the earlier valid entry', async () => {
         // A NUL byte is the harness's own binary marker, so a file containing one is
-        // rejected by fileRead. Writing it would create an artifact this package
+        // rejected by read. Writing it would create an artifact this package
         // cannot read back; the whole batch is refused before the first write.
         const untouched = join(workdir, 'nul', 'first.txt');
         const rejected = join(workdir, 'nul', 'second.txt');
@@ -243,7 +243,7 @@ describe('fileWrite', () => {
                 { path: rejected, content: 'a\u0000b' }
             ])
         ).rejects.toThrow(
-            `fileWrite content must not contain NUL characters (${rejected}): the file would be unreadable by fileRead, which rejects binary content.`
+            `fileWrite content must not contain NUL characters (${rejected}): the file would be unreadable by read, which rejects binary content.`
         );
 
         // Proof that the rejection happened in preflight, not mid-batch: the valid

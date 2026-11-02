@@ -430,7 +430,7 @@ describe('tool calls', () => {
         const module = await import('./api');
 
         // A catalogue tool keeps the pre-R8 body: no sessionId key at all.
-        expect(await module.callTool('fileRead', { path: 'a.txt' })).toEqual({
+        expect(await module.callTool('read', { path: 'a.txt' })).toEqual({
             ok: true,
             result: { enabled: [] },
             durationMs: 3
@@ -441,7 +441,7 @@ describe('tool calls', () => {
 
         expect(calls).toEqual([
             {
-                url: '/api/tools/fileRead',
+                url: '/api/tools/read',
                 method: 'POST',
                 body: { parameters: { path: 'a.txt' } }
             },

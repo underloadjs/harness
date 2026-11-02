@@ -1823,8 +1823,9 @@ button {
     line-height: 1.4;
 }
 
-/* The header group (elapsed, tally, badge) is the LAST item, so the row reads
-   prompt → metadata. It never shrinks: the badge is the state cue. */
+/* The measurement cluster (elapsed clock, token tally) is the LAST item of a compact
+   row, so the row reads identity → prompt → measurements. It never shrinks. T1/R2:
+   the state word left this cluster and now leads next to the conversation badge. */
 .tile:not(.is-expanded) .tile-top {
     order: 2;
     flex: 0 0 auto;
@@ -1999,6 +2000,22 @@ button {
     min-width: 0;
 }
 
+/* T1/R2: the header's IDENTITY LINE — the persistent-thread badge followed
+   immediately by the state word (`IT3  done`), which is the pair a reader takes in as
+   one fact. One wrapper span is the only way to keep them adjacent in BOTH header
+   layouts: the compact row is a flex ROW that orders this span as a single `order: 0`
+   item, the expanded header is a flex COLUMN that stacks it as its first line.
+   `max-width` reserves the right-edge slot the header Delete control occupies. */
+.tile-identity {
+    order: 0;
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    flex: 0 1 auto;
+    min-width: 0;
+    max-width: calc(100% - 92px);
+}
+
 /* R3: no `.tile-index` rule exists — the turn ordinal was removed from the DOM,
    so there is nothing to style. The server `index` still binds for ordering. */
 
@@ -2030,16 +2047,54 @@ button {
     content: ' | ';
 }
 
+/* T1/R2: the state word is NO LONGER right-aligned. It sits immediately right of the
+   conversation identity (`.tile-identity` / right after `.thread-name`), and the
+   right-edge slot it used to hold belongs to the header Delete control
+   (`.tile-header-action` / `.thread-header-action`). Typography is shared so the
+   nested word stays the same size/register as the main block's. */
 :is(.tile-status, .thread-status) {
     position: relative;
     display: inline-flex;
     align-items: center;
     gap: 5px;
     min-width: 0;
-    margin-left: auto;
     color: var(--muted);
     font-family: var(--mono);
     font-size: 10.5px;
+    white-space: nowrap;
+}
+
+/* T5/R2: an EXPANDED header must SHRINK the state word, never let it overpaint its
+   neighbour. `.tile-status` / `.thread-status` already carry `min-width: 0`, so a narrow
+   transcript column compresses the flex box — but the word inside is `white-space:
+   nowrap` with the default `overflow: visible`, so it PAINTS OUTSIDE the box (a rect-only
+   probe reports 0 and misses it). Real Chrome, `Temp/t5/probe-status.html`, 84 cells
+   (nested card + main tile x 7 column widths x {done, "waiting for server"} x
+   {fork tag, none} x {short, long} token tallies, desktop labels and the <=600px glyph):
+   the pre-fix control collides in 25/84 cells — the ink runs over `.thread-kind` /
+   `.thread-top` from 420px down to 300px (e.g. a 400px column: 111px of ink in a 63px
+   box). Clipping the WORD inside its own box removes every one of those cells in both
+   viewport configurations, because a clipped span's ink IS its rect:
+     - `text-overflow` never rewrites `textContent`, so the complete state stays available
+       to assistive tech, and the un-truncated identity stays in the existing badge/row
+       title (`Thread RR2 · Helper · idle`, ui/turns.ts `threadTitleOf`);
+     - `min-width: 1.5em` is a legibility floor measured to be the largest value that
+       still keeps 340/400/460px columns collision-free in both viewports (~2 glyphs plus
+       the ellipsis, e.g. `wa…`). It is NOT free: every pixel of un-shrinkable status
+       width is taken from the row, which is why 2.5em/3.5em reintroduced cluster-vs-Delete
+       contact at 340px (2/12 cells) while 1.5em stays clean (0/12). A 0 floor is clean to
+       300px but measured a 0px box there, i.e. the state cue disappears entirely;
+     - this block is `is-expanded`-only, so the sr-only clip below (compact rows) and the
+       shared colour rules are untouched. */
+:is(.tile.is-expanded, .thread-tile.is-expanded) :is(.tile-status, .thread-status) {
+    flex: 0 1 auto;
+    min-width: 1.5em;
+}
+
+:is(.tile.is-expanded, .thread-tile.is-expanded) :is(.tile-status-text, .thread-status-text) {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
     white-space: nowrap;
 }
 
@@ -2448,16 +2503,17 @@ button {
     display: none;
 }
 
-/* R7/R8: the transcript/delete toolbar of an EXPANDED block, shared by a turn
-   tile, a nested invocation card and the roster-only focus panel. Transcript is
-   the leading action, Delete the trailing one; the inline confirmation wraps onto
-   its own full-width row so neither button moves. ui/turns.ts toggles `hidden`
-   with expansion, so a collapsed row never shows a permanent second row. */
+/* R7/R8: the transcript toolbar of an EXPANDED block, shared by a turn tile, a
+   nested invocation card and the roster-only focus panel. Transcript is the leading
+   action and the inline Delete confirmation wraps onto its own full-width row so
+   nothing moves. ui/turns.ts toggles `hidden` with expansion, so a collapsed row
+   never shows a permanent second row. T1/R2: Delete itself moved to the card header
+   (see `.tile-header-action` below), which is why this bar no longer spaces two
+   buttons apart. */
 :is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions) {
     display: flex;
     flex-wrap: wrap;
     align-items: center;
-    justify-content: space-between;
     gap: 8px;
     padding: 7px 12px;
     border-top: 1px solid var(--border);
@@ -2562,6 +2618,69 @@ button {
 .thread-delete-confirm-delete {
     border-color: rgba(248, 113, 113, 0.55);
     color: var(--danger);
+}
+
+/* T1/R2: Delete's slot in the CARD HEADER — the right-edge position the state word
+   used to occupy. Both card owners are already `position: relative` (`.tile`,
+   `.thread-tile`), so the control is painted over the header without reparenting the
+   header's own <button> (a <button> can never nest). ui/turns.ts toggles `hidden`
+   with the toolbar, so a collapsed row never shows it. */
+:is(.tile-header-action, .thread-header-action, .thread-focus-head-action) {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+}
+
+:is(.tile-header-action, .thread-header-action, .thread-focus-head-action)[hidden] {
+    display: none;
+}
+
+/* Expanded turn tile: the header stacks as a column whose FIRST line is the identity
+   line (badge + state), so the control is centred on THAT line rather than sitting on
+   the header's padding edge. T3/R2: `top` is the header padding (10px) plus half the
+   identity line's height (the 17px pill) minus half the button's own height (~26px),
+   i.e. ~5px; at the previous 10px the button's centre read ~4.5px BELOW the identity
+   line, and its lower edge grazed the next header line. `right: 12px` matches the
+   header's horizontal padding. */
+.tile.is-expanded > .tile-header-action {
+    position: absolute;
+    z-index: 1;
+    top: 5px;
+    right: 12px;
+}
+
+/* A nested card's header is always ONE row, so the control is centred in it. */
+.thread-tile > .thread-header-action {
+    position: absolute;
+    z-index: 1;
+    top: 2px;
+    right: 10px;
+}
+
+/* T3/R2: the slot must be RESERVED, not merely painted. `.thread-select` is a flex row
+   and `.thread-preview` — its only shrinkable item — is `display:none` once the card is
+   expanded, so `.thread-top` (`order: 2; margin-left: auto`) slides flush to the row's
+   right edge: exactly the pixels `.thread-header-action` floats over (reviewer-measured
+   56x16px overlap at desktop width, 29x16px at a narrow one). The header gives up the
+   slot's width while the card is expanded, so the cluster ends INSIDE it: 84px covers
+   the ~66px desktop label button (and the ~34px phone glyph) plus the 10px right inset,
+   leaving clearance instead of overlap. A collapsed card needs no reserve because
+   ui/turns.ts keeps the host `hidden`. */
+.thread-tile.is-expanded > .thread-select {
+    padding-right: 84px;
+}
+
+/* The roster-only panel is a plain block (no absolute ancestor needed): the head is a
+   flex row, so Delete goes flush right with `margin-left: auto`. */
+.thread-focus-head {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.thread-focus-head-action {
+    margin-left: auto;
 }
 
 .thread-focus-transcript {
@@ -2714,14 +2833,27 @@ button {
     }
 
     /* R8/T10: sm/mobile action bars show `{}` (Transcript) and `X` (Delete)
-       glyphs. aria-label still supplies the full accessible name. */
-    :is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions)
-        .action-label {
+       glyphs. aria-label still supplies the full accessible name. T1/R2: the glyph
+       swap also covers the header slots, where Delete now lives. */
+    :is(
+        .tile-transcript-action,
+        .thread-transcript-action,
+        .thread-focus-actions,
+        .tile-header-action,
+        .thread-header-action,
+        .thread-focus-head-action
+    ) .action-label {
         display: none;
     }
 
-    :is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions)
-        .action-glyph {
+    :is(
+        .tile-transcript-action,
+        .thread-transcript-action,
+        .thread-focus-actions,
+        .tile-header-action,
+        .thread-header-action,
+        .thread-focus-head-action
+    ) .action-glyph {
         display: inline;
     }
 }
@@ -2900,7 +3032,7 @@ button {
    semantics. Collapsed, every card answers "what ran, and did it work?".
    
    Consecutive calls share one `.tool-group` row (turns.ts): collapsed they are
-   compact inline chips (`[websearch][fileRead]`) that wrap when the tile is
+   compact inline chips (`[websearch][read]`) that wrap when the tile is
    narrow; an opened chip takes the full line so its arguments/result can use the
    card's former width. */
 
@@ -4585,14 +4717,13 @@ button {
 }
 
 .session-row {
-    /* R8: one directory entry = the selection button + its delete control, with the
-       inline confirmation replacing both while it is open. The contract with the
+    /* R8/T1: one directory entry = the selection button + its delete control, and the
+       delete control is the whole action (no confirmation row). The contract with the
        behaviour layer (main.ts) is structural, not visual:
          .session-row[data-session-id][data-status][data-active]  ← wrapper
            .session                                              ← select button
-           .session-delete                                       ← remove control
-           .session-confirm                                      ← open confirmation
-             .session-confirm-delete / .session-confirm-cancel
+           .session-delete                                       ← remove control (one
+              click = one DELETE)
        The wrapper owns the surface and the active frame so the entry stays one
        block while it hosts a sibling control. */
     display: grid;
@@ -4710,86 +4841,8 @@ button {
     cursor: not-allowed;
 }
 
-/* The confirmation exists only while open (no reserved height when closed). It is a
-   wrapping flex row: the question wraps inside the rail width and the buttons drop
-   to a second line when they cannot fit beside it. Inside `.session-row` it spans
-   both columns, so it is as wide as the entry, never wider. */
-.session-confirm {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 5px;
-    /* Natural height (it must not stretch to fill a column flex parent) and the
-       full entry width in both placements: the list, or a spanning grid row. */
-    flex: 0 0 auto;
-    width: 100%;
-    min-width: 0;
-    max-width: 100%;
-    padding: 6px 8px;
-    border: 1px solid rgba(248, 113, 113, 0.45);
-    border-radius: 6px;
-    background: rgba(248, 113, 113, 0.08);
-    color: var(--text);
-    font-size: 11.5px;
-    line-height: 1.4;
-    /* A literal harness name or session id in the question wraps instead of
-       widening the rail: the sidebar never scrolls sideways. */
-    overflow-wrap: anywhere;
-}
-
-.session-row > .session-confirm {
-    grid-column: 1 / -1;
-}
-
-.session-confirm-delete,
-.session-confirm-cancel {
-    flex: 0 0 auto;
-    padding: 3px 9px;
-    border-radius: 6px;
-    font-family: var(--mono);
-    font-size: 11px;
-    cursor: pointer;
-}
-
-/* The irreversible choice is the filled danger button and the safe one is the
-   quieter outline, so "delete" is dominant and "cancel" is not mistaken for it. */
-.session-confirm-delete {
-    border: 1px solid var(--danger);
-    background: var(--danger);
-    color: #1b0b0b;
-    font-weight: 600;
-}
-
-.session-confirm-delete:hover:not(:disabled) {
-    border-color: #fca5a5;
-    background: #fca5a5;
-}
-
-.session-confirm-delete:focus-visible {
-    outline: 2px solid var(--danger);
-    outline-offset: 2px;
-}
-
-.session-confirm-cancel {
-    border: 1px solid var(--border-strong);
-    background: var(--bg-elevated);
-    color: var(--text);
-}
-
-.session-confirm-cancel:hover:not(:disabled) {
-    border-color: var(--accent);
-}
-
-.session-confirm-cancel:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-}
-
-.session-confirm-delete:disabled,
-.session-confirm-cancel:disabled {
-    opacity: 0.45;
-    cursor: not-allowed;
-}
+/* T1/R1: the `.session-confirm*` rules are GONE with the inline confirmation panel —
+   one click on `.session-delete` deletes, so the rail has no second row to style. */
 
 /* R8: each line of the entry clips with an ellipsis rather than pushing the grid
    column wider (a long harness name or id would otherwise break the rail width). */

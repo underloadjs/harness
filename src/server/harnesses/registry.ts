@@ -745,10 +745,10 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
             agents,
             // One toolbox for every live harness, user-created included. The four
             // core file tools are declared up front (R18); the searchable remainder
-            // waits for toolRequest, and webSearch is core when configured.
+            // waits for toolRequest, and search is core when configured.
             // Copied so no registry entry aliases the shared module array.
             tools: [...SHARED_TOOL_NAMES],
-            environmentTools: ['webSearch'],
+            environmentTools: ['search'],
             // Absent vs `{}` are the same thing: no overrides. Stored as a plain
             // object so update() has one shape to reason about.
             agentModels,
@@ -869,7 +869,7 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
                 ? {
                       requiresEndpoint: true,
                       tools: [...SHARED_TOOL_NAMES],
-                      environmentTools: ['webSearch'],
+                      environmentTools: ['search'],
                       template: 'live' as const
                   }
                 : {}),

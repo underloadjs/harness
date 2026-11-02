@@ -58,11 +58,11 @@ describe('materializeBranchHistory', () => {
                 content: 'call',
                 reasoning: 'why',
                 toolCalls: [
-                    { id: 'origin-a', name: 'fileRead', arguments: '{}' },
+                    { id: 'origin-a', name: 'read', arguments: '{}' },
                     { id: 'origin-b', name: 'fileList', arguments: '[]' }
                 ]
             },
-            { role: 'tool', content: 'A', toolCallId: 'origin-a', name: 'fileRead' }
+            { role: 'tool', content: 'A', toolCallId: 'origin-a', name: 'read' }
         ];
         const before = JSON.parse(JSON.stringify(source)) as HarnessMessage[];
 
@@ -80,11 +80,11 @@ describe('materializeBranchHistory', () => {
                 content: 'call',
                 reasoning: 'why',
                 toolCalls: [
-                    { id: 'call_branch-1_1', name: 'fileRead', arguments: '{}' },
+                    { id: 'call_branch-1_1', name: 'read', arguments: '{}' },
                     { id: 'call_branch-1_2', name: 'fileList', arguments: '[]' }
                 ]
             },
-            { role: 'tool', content: 'A', toolCallId: 'call_branch-1_1', name: 'fileRead' },
+            { role: 'tool', content: 'A', toolCallId: 'call_branch-1_1', name: 'read' },
             {
                 role: 'tool',
                 content: BRANCH_PENDING_PLACEHOLDER.threadFork,
@@ -109,7 +109,7 @@ describe('materializeBranchHistory', () => {
             {
                 role: 'assistant',
                 content: '',
-                toolCalls: [{ id: 'x', name: 'commandRun', arguments: '{}' }]
+                toolCalls: [{ id: 'x', name: 'shell', arguments: '{}' }]
             }
         ];
 
@@ -120,13 +120,13 @@ describe('materializeBranchHistory', () => {
             {
                 role: 'assistant',
                 content: '',
-                toolCalls: [{ id: 'call_b_1', name: 'commandRun', arguments: '{}' }]
+                toolCalls: [{ id: 'call_b_1', name: 'shell', arguments: '{}' }]
             },
             {
                 role: 'tool',
                 content: BRANCH_PENDING_PLACEHOLDER.actionRequest,
                 toolCallId: 'call_b_1',
-                name: 'commandRun'
+                name: 'shell'
             }
         ]);
 
@@ -136,7 +136,7 @@ describe('materializeBranchHistory', () => {
             role: 'tool',
             content: BRANCH_PENDING_PLACEHOLDER.other,
             toolCallId: 'call_b_1',
-            name: 'commandRun'
+            name: 'shell'
         });
     });
 
@@ -196,13 +196,13 @@ describe('materializeBranchHistory', () => {
                     {
                         role: 'assistant',
                         content: '',
-                        toolCalls: [{ id: 'x', name: 'fileRead', arguments: '{}' }]
+                        toolCalls: [{ id: 'x', name: 'read', arguments: '{}' }]
                     },
-                    { role: 'tool', content: 'ok', toolCallId: 'x', name: 'fileRead' },
+                    { role: 'tool', content: 'ok', toolCallId: 'x', name: 'read' },
                     {
                         role: 'assistant',
                         content: '',
-                        toolCalls: [{ id: 'x', name: 'fileRead', arguments: '{}' }]
+                        toolCalls: [{ id: 'x', name: 'read', arguments: '{}' }]
                     }
                 ],
                 branchId: 'b'
@@ -222,10 +222,10 @@ describe('materializeBranchHistory', () => {
                     {
                         role: 'assistant',
                         content: '',
-                        toolCalls: [{ id: 'x', name: 'fileRead', arguments: '{}' }]
+                        toolCalls: [{ id: 'x', name: 'read', arguments: '{}' }]
                     },
-                    { role: 'tool', content: 'one', toolCallId: 'x', name: 'fileRead' },
-                    { role: 'tool', content: 'two', toolCallId: 'x', name: 'fileRead' }
+                    { role: 'tool', content: 'one', toolCallId: 'x', name: 'read' },
+                    { role: 'tool', content: 'two', toolCallId: 'x', name: 'read' }
                 ],
                 branchId: 'b'
             })
@@ -241,7 +241,7 @@ describe('materializeBranchHistory', () => {
                     {
                         role: 'assistant',
                         content: '',
-                        toolCalls: [{ id: 'x', name: 'fileRead', arguments: '{}' }]
+                        toolCalls: [{ id: 'x', name: 'read', arguments: '{}' }]
                     },
                     { role: 'user', content: 'interrupt' }
                 ],
@@ -252,13 +252,13 @@ describe('materializeBranchHistory', () => {
             {
                 role: 'assistant',
                 content: '',
-                toolCalls: [{ id: 'call_b_1', name: 'fileRead', arguments: '{}' }]
+                toolCalls: [{ id: 'call_b_1', name: 'read', arguments: '{}' }]
             },
             {
                 role: 'tool',
                 content: BRANCH_PENDING_PLACEHOLDER.threadFork,
                 toolCallId: 'call_b_1',
-                name: 'fileRead'
+                name: 'read'
             },
             { role: 'user', content: 'interrupt' }
         ]);
@@ -269,14 +269,14 @@ describe('materializeBranchHistory', () => {
                     {
                         role: 'assistant',
                         content: '',
-                        toolCalls: [{ id: 'x', name: 'fileRead', arguments: '{}' }]
+                        toolCalls: [{ id: 'x', name: 'read', arguments: '{}' }]
                     },
                     { role: 'tool', content: 'ok', toolCallId: 'x', name: 'fileList' }
                 ],
                 branchId: 'b'
             })
         ).toThrow(
-            'Branch history message [1] names tool "fileList" but call "x" requested "fileRead".'
+            'Branch history message [1] names tool "fileList" but call "x" requested "read".'
         );
 
         expect(() =>
@@ -326,9 +326,9 @@ describe('incorporateBranchHistory', () => {
             {
                 role: 'assistant',
                 content: 'ans',
-                toolCalls: [{ id: 'child-call', name: 'fileRead', arguments: '{}' }]
+                toolCalls: [{ id: 'child-call', name: 'read', arguments: '{}' }]
             },
-            { role: 'tool', content: 'ok', toolCallId: 'child-call', name: 'fileRead' }
+            { role: 'tool', content: 'ok', toolCallId: 'child-call', name: 'read' }
         ];
 
         const result = incorporateBranchHistory({
@@ -362,9 +362,9 @@ describe('incorporateBranchHistory', () => {
             {
                 role: 'assistant',
                 content: 'ans',
-                toolCalls: [{ id: 'call_branch-2_1', name: 'fileRead', arguments: '{}' }]
+                toolCalls: [{ id: 'call_branch-2_1', name: 'read', arguments: '{}' }]
             },
-            { role: 'tool', content: 'ok', toolCallId: 'call_branch-2_1', name: 'fileRead' },
+            { role: 'tool', content: 'ok', toolCallId: 'call_branch-2_1', name: 'read' },
             { role: 'user', content: branchBoundaryEnd('branch-2') }
         ]);
         expect(result.toolCallIds).toEqual([
@@ -394,9 +394,9 @@ describe('incorporation namespaces', () => {
         {
             role: 'assistant',
             content: 'owner',
-            toolCalls: [{ id: 'owner-call', name: 'fileRead', arguments: '{}' }]
+            toolCalls: [{ id: 'owner-call', name: 'read', arguments: '{}' }]
         },
-        { role: 'tool', content: 'owner-result', toolCallId: 'owner-call', name: 'fileRead' }
+        { role: 'tool', content: 'owner-result', toolCallId: 'owner-call', name: 'read' }
     ];
     const childMessages: HarnessMessage[] = [
         {
@@ -454,13 +454,13 @@ describe('incorporation namespaces', () => {
                 {
                     role: 'assistant',
                     content: 'owner',
-                    toolCalls: [{ id: ownerId, name: 'fileRead', arguments: '{}' }]
+                    toolCalls: [{ id: ownerId, name: 'read', arguments: '{}' }]
                 },
                 {
                     role: 'tool',
                     content: 'owner-result',
                     toolCallId: ownerId,
-                    name: 'fileRead'
+                    name: 'read'
                 },
                 { role: 'user', content: branchBoundaryStart(child, 'fork') },
                 {

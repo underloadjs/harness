@@ -9,7 +9,7 @@
 //   - status/outcome come from the child's own events and from the parent's
 //     `tool_result` for the spawning `callId` (the authoritative completion);
 //   - saved sessions predating the metadata still render rows inferred from
-//     `agentDelegate` calls, while genuinely unattributable legacy streams keep
+//     `delegate` calls, while genuinely unattributable legacy streams keep
 //     the old flat agent sections.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/turns-threads.test.ts
@@ -40,7 +40,7 @@ const delegateCall = (agent: string, input: string, id: string, from?: string): 
     const event = {
         type: 'tool_call',
         agent: from ?? 'writer',
-        call: { id, name: 'agentDelegate', arguments: JSON.stringify({ agent, input }) }
+        call: { id, name: 'delegate', arguments: JSON.stringify({ agent, input }) }
     };
     return from === undefined ? (event as unknown as HarnessEvent) : withThread(event, { id: from });
 };
@@ -182,7 +182,7 @@ describe('invocation thread entries', () => {
         turn.apply({
             type: 'tool_result',
             agent: 'writer',
-            name: 'agentDelegate',
+            name: 'delegate',
             callId: 'd1',
             content: 'first outcome',
             isError: false
@@ -218,7 +218,7 @@ describe('invocation thread entries', () => {
         turn.apply({
             type: 'tool_result',
             agent: 'writer',
-            name: 'agentDelegate',
+            name: 'delegate',
             callId: 'd2',
             content: 'second outcome',
             isError: false
@@ -326,7 +326,7 @@ describe('invocation thread entries', () => {
                     type: 'done',
                     agent: 'helper',
                     message: doneMessage('helper'),
-                    pending: [{ callId: 'p1', name: 'fileRead', elapsedMs: 1200 }]
+                    pending: [{ callId: 'p1', name: 'read', elapsedMs: 1200 }]
                 },
                 { id: 't1' }
             )
@@ -336,13 +336,13 @@ describe('invocation thread entries', () => {
         // R6 + R3: the response is not the finish; the invocation is still running.
         expect(row.dataset.state).toBe('streaming');
         expect(row.querySelector('.thread-status')?.textContent).toBe('streaming');
-        expect(row.querySelector('.agent-pending')?.textContent).toBe('pending · fileRead 1.2s');
+        expect(row.querySelector('.agent-pending')?.textContent).toBe('pending · read 1.2s');
         expect(row.querySelector('.agent-meta')?.textContent).toBe('helper-model · stop · 1 tool still running');
 
         turn.apply({
             type: 'tool_result',
             agent: 'writer',
-            name: 'agentDelegate',
+            name: 'delegate',
             callId: 'd1',
             content: 'final answer',
             isError: false
@@ -366,7 +366,7 @@ describe('invocation thread entries', () => {
         turn.apply({
             type: 'tool_result',
             agent: 'writer',
-            name: 'agentDelegate',
+            name: 'delegate',
             callId: 'd1',
             content: 'delegate exploded',
             isError: true
@@ -381,7 +381,7 @@ describe('invocation thread entries', () => {
         turn.apply({
             type: 'tool_result',
             agent: 'writer',
-            name: 'agentDelegate',
+            name: 'delegate',
             callId: 'd2',
             content: 'second outcome',
             isError: false
@@ -396,7 +396,7 @@ describe('invocation thread entries', () => {
         turn.apply({
             type: 'tool_result',
             agent: 'writer',
-            name: 'agentDelegate',
+            name: 'delegate',
             callId: 'd3',
             content: 'delegation cancelled',
             isError: true
@@ -419,9 +419,9 @@ describe('invocation thread entries', () => {
         turn.apply({
             type: 'tool_result',
             agent: 'writer',
-            name: 'agentDelegate',
+            name: 'delegate',
             callId: 'd1',
-            content: 'Tool call "agentDelegate" (d1) was cancelled before it completed; no result is available.',
+            content: 'Tool call "delegate" (d1) was cancelled before it completed; no result is available.',
             isError: true,
             outcome: 'cancelled'
         });
@@ -430,7 +430,7 @@ describe('invocation thread entries', () => {
         expect(row.dataset.state).toBe('cancelled');
         expect(row.querySelector('.thread-status')?.textContent).toBe('cancelled');
         expect(project(row).outcome).toBe(
-            'cancelled · Tool call "agentDelegate" (d1) was cancelled before it completed; no result is available.'
+            'cancelled · Tool call "delegate" (d1) was cancelled before it completed; no result is available.'
         );
         expect(row.querySelector<HTMLElement>('.thread-outcome')?.dataset.tone).toBe('info');
     });
@@ -450,7 +450,7 @@ describe('invocation thread entries', () => {
                         {
                             type: 'tool_result',
                             agent: 'writer',
-                            name: 'agentDelegate',
+                            name: 'delegate',
                             callId: 'd1',
                             content: 'first answer',
                             isError: false
@@ -462,7 +462,7 @@ describe('invocation thread entries', () => {
                         {
                             type: 'tool_result',
                             agent: 'writer',
-                            name: 'agentDelegate',
+                            name: 'delegate',
                             callId: 'd2',
                             content: 'second answer',
                             isError: false
@@ -519,7 +519,7 @@ describe('invocation thread entries', () => {
             {
                 type: 'tool_result',
                 agent: 'writer',
-                name: 'agentDelegate',
+                name: 'delegate',
                 callId: 'd1',
                 content: 'same outcome',
                 isError: false
@@ -858,7 +858,7 @@ describe('invocation thread entries', () => {
         const turn = board.begin('legacy ctx.run');
 
         turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
-        // No agentDelegate call and no thread metadata: inventing a child entry
+        // No delegate call and no thread metadata: inventing a child entry
         // would be a lie, so the old flat subagent section stays.
         turn.apply({ type: 'start', agent: 'helper', model: 'h2' });
         turn.apply({ type: 'text', agent: 'helper', delta: 'legacy answer' });
@@ -994,23 +994,26 @@ describe('invocation thread entries', () => {
         const select = row.querySelector<HTMLElement>('.thread-select');
         const top = select?.querySelector<HTMLElement>('.thread-top');
 
-        // The button holds the code, the flexible preview and the metadata cluster —
-        // the same three-part row the compact tile uses (prompt + `.tile-top`).
+        // The button holds the code, the state word, the flexible preview and the
+        // measurement cluster — the same parts the compact tile uses (prompt +
+        // `.tile-top`). T1/R2: the state reads with the code (identity), and the
+        // cluster keeps measurements only.
         expect([...(select?.children ?? [])].map((child) => child.className)).toEqual([
             'thread-name',
+            'thread-status',
             'thread-preview',
             'thread-top'
         ]);
         expect([...(top?.children ?? [])].map((child) => child.className)).toEqual([
             'thread-elapsed',
-            'thread-tokens',
-            'thread-status'
+            'thread-tokens'
         ]);
         expect(top?.querySelector('.thread-preview')).toBeNull();
+        expect(top?.querySelector('.thread-status')).toBeNull();
         expect(select?.querySelector('.thread-preview')?.textContent).toBe(
             'a very long delegated task description'
         );
-        expect(top?.querySelector('.thread-status')?.textContent).toBe('queued');
+        expect(select?.querySelector('.thread-status')?.textContent).toBe('queued');
         // R3/R2: the visible agent identity is the compact code, never the raw id.
         expect(select?.querySelector('.thread-name')?.textContent).toBe('HR1');
         expect(row.textContent).not.toContain('helper');
@@ -1055,7 +1058,7 @@ describe('invocation thread entries', () => {
                         {
                             type: 'tool_result',
                             agent: 'writer',
-                            name: 'agentDelegate',
+                            name: 'delegate',
                             callId: 'd1',
                             content: 'ok',
                             isError: false
@@ -1187,7 +1190,7 @@ describe('invocation thread entries', () => {
             turn.apply({
                 type: 'tool_result',
                 agent: 'writer',
-                name: 'agentDelegate',
+                name: 'delegate',
                 callId: 'd1',
                 content: 'ok',
                 isError: false,
@@ -1223,7 +1226,7 @@ describe('invocation thread entries', () => {
                         {
                             type: 'tool_result',
                             agent: 'writer',
-                            name: 'agentDelegate',
+                            name: 'delegate',
                             callId: 'd1',
                             content: 'ok',
                             isError: false,
@@ -1262,7 +1265,7 @@ describe('invocation thread entries', () => {
                         {
                             type: 'tool_result',
                             agent: 'writer',
-                            name: 'agentDelegate',
+                            name: 'delegate',
                             callId: 'd1',
                             content: 'ok',
                             isError: false,
@@ -1293,28 +1296,35 @@ describe('invocation thread entries', () => {
         // R1: the persistent-thread badge LEADS the header, in the same slot as the
         // nested block's `.thread-name`; the measurements stay in `.tile-top`. This
         // turn is built without a runtime thread, so the badge is present but hidden.
+        // T1/R2: the badge and the state word are ONE identity line (`.tile-identity`),
+        // so the header's right edge is free for the Delete control.
         expect([...(rootSelect?.children ?? [])].map((child) => child.className)).toEqual([
-            'tile-thread',
+            'tile-identity',
             'tile-agent',
             'tile-top',
             'tile-prompt',
             'tile-meta'
         ]);
         expect(rootSelect?.querySelector('.tile-agent')?.textContent).toBe('WR1');
-        expect([...(rootSelect?.querySelector('.tile-top')?.children ?? [])].map((child) => child.className)).toEqual(
-            ['tile-elapsed', 'tile-tokens', 'tile-status']
-        );
+        expect([...(rootSelect?.querySelector('.tile-top')?.children ?? [])].map((child) => child.className)).toEqual([
+            'tile-elapsed',
+            'tile-tokens'
+        ]);
+        expect(
+            [...(rootSelect?.querySelector('.tile-identity')?.children ?? [])].map((child) => child.className)
+        ).toEqual(['tile-thread', 'tile-status']);
 
         const childSelect = threadRows(turn)[0].querySelector<HTMLElement>('.thread-select');
         expect([...(childSelect?.children ?? [])].map((child) => child.className)).toEqual([
             'thread-name',
+            'thread-status',
             'thread-preview',
             'thread-top'
         ]);
         expect(childSelect?.querySelector('.thread-name')?.textContent).toBe('HR1');
-        expect([...(childSelect?.querySelector('.thread-top')?.children ?? [])].map((child) => child.className)).toEqual(
-            ['thread-elapsed', 'thread-tokens', 'thread-status']
-        );
+        expect(
+            [...(childSelect?.querySelector('.thread-top')?.children ?? [])].map((child) => child.className)
+        ).toEqual(['thread-elapsed', 'thread-tokens']);
 
         // F3: the code stays first and correct after the projection is rebuilt.
         turn.merge({
@@ -1329,11 +1339,15 @@ describe('invocation thread entries', () => {
             updatedAt: 11
         });
 
-        // R1: the header order survives the rebuild — the (hidden) thread badge is
-        // first, then the agent code; identity stays left of the measurements.
+        // R1: the header order survives the rebuild — the identity line leads (the
+        // (hidden) thread badge and the state word, T1/R2), then the agent code;
+        // identity stays left of the measurements.
         expect(
             [...(turn.element.querySelector('.tile-select')?.children ?? [])].map((child) => child.className)
-        ).toEqual(['tile-thread', 'tile-agent', 'tile-top', 'tile-prompt', 'tile-meta']);
+        ).toEqual(['tile-identity', 'tile-agent', 'tile-top', 'tile-prompt', 'tile-meta']);
+        expect(
+            [...(turn.element.querySelectorAll('.tile-identity > *') ?? [])].map((child) => child.className)
+        ).toEqual(['tile-thread', 'tile-status']);
         expect(turn.element.querySelector('.tile-agent')?.textContent).toBe('WR1');
     });
 
@@ -1387,7 +1401,7 @@ describe('invocation thread entries', () => {
         const spawn = (input: string, id: string): HarnessEvent => ({
             type: 'tool_call',
             agent: 'research',
-            call: { id, name: 'agentDelegate', arguments: JSON.stringify({ agent: 'research', input }) }
+            call: { id, name: 'delegate', arguments: JSON.stringify({ agent: 'research', input }) }
         });
 
         turn.apply(spawn('first child', 'd1'));

@@ -174,7 +174,7 @@ const toolRoundPreset = (usage: readonly [HarnessUsage, HarnessUsage]): HarnessP
         })
     );
 
-// Primary + subagent. The primary asks for `agentDelegate` on its first request and,
+// Primary + subagent. The primary asks for `delegate` on its first request and,
 // after the harness appends the delegate result as a tool message, answers with
 // text. The helper answers on its own stream. This exercises the fact that the
 // session records subagent progress in the primary turn.
@@ -190,7 +190,7 @@ const teamPreset = (): HarnessPreset =>
                         stream: async function* (request): AsyncGenerator<HarnessStreamEvent> {
                             const last = request.messages[request.messages.length - 1];
 
-                            if (last !== undefined && last.role === 'tool' && last.name === 'agentDelegate') {
+                            if (last !== undefined && last.role === 'tool' && last.name === 'delegate') {
                                 yield { type: 'text', delta: 'done by helper' };
                                 yield { type: 'done', stopReason: 'stop', toolCalls: [] };
                                 return;
@@ -202,7 +202,7 @@ const teamPreset = (): HarnessPreset =>
                                 toolCalls: [
                                     {
                                         id: 'call_1',
-                                        name: 'agentDelegate',
+                                        name: 'delegate',
                                         arguments: '{"agent":"helper","input":"find it"}'
                                     }
                                 ]
@@ -706,7 +706,7 @@ describe('SessionStore turns', () => {
                 agent: 'lead',
                 call: {
                     id: 'call_1',
-                    name: 'agentDelegate',
+                    name: 'delegate',
                     arguments: '{"agent":"helper","input":"find it"}'
                 }
             },
@@ -754,7 +754,7 @@ describe('SessionStore turns', () => {
             {
                 type: 'tool_result',
                 agent: 'lead',
-                name: 'agentDelegate',
+                name: 'delegate',
                 callId: 'call_1',
                 content: '{"agent":"helper","content":"helper answer"}',
                 // Additive execution span (harness.ts deliverTask). The clock is
@@ -1667,9 +1667,9 @@ describe('SessionStore manual tool calls', () => {
         });
 
         // singlePreset has no subagents, so its harness registers no delegate.
-        await expect(store.callTool(session.id, 'agentDelegate', { agent: 'x', input: 'go' })).rejects.toMatchObject({
+        await expect(store.callTool(session.id, 'delegate', { agent: 'x', input: 'go' })).rejects.toMatchObject({
             status: 404,
-            message: 'Tool "agentDelegate" is not available in this session.'
+            message: 'Tool "delegate" is not available in this session.'
         });
 
         // A tool that throws keeps its own message: the API layer reports it as

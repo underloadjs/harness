@@ -18,6 +18,7 @@
 //
 // Cross-references:
 //   - ./types.ts      — AgentProfile
+//   - ./guidelines.ts — the policy lines the real roles share (one source, no drift)
 //   - ./instruct.ts … — one file per profile
 //   - ../../harnesses/presets.ts — built-in harnesses assembled from these ids
 //   - ../../harnesses/registry.ts — user-created harnesses validated here

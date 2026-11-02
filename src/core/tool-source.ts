@@ -41,7 +41,7 @@
 // What is NOT checked:
 //   - semantic TypeScript type correctness (transpileModule does not type-check);
 //   - behavioural correctness or safety. Candidate code runs with this process's
-//     permissions, exactly like `toolCreate` and `commandRun`.
+//     permissions, exactly like `toolCreate` and `shell`.
 //
 // MODULE RESOLUTION
 // -----------------
@@ -1413,7 +1413,7 @@ const isConfigurationLike = (value: unknown): value is ToolConfiguration =>
     typeof (value as ToolConfiguration).execute === 'function';
 
 // Select the exported implementation. Supported shapes, in order:
-//   1. the named export the harness expects (`export const fileRead = tool(...)`);
+//   1. the named export the harness expects (`export const read = tool(...)`);
 //   2. a default export that is a Tool or ToolConfiguration;
 //   3. a named `tool` export;
 //   4. `metadata` + `execute` named exports (the runtime-tools convention);

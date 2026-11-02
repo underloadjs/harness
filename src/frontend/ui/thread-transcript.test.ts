@@ -8,11 +8,15 @@
 //     provenance;
 //   - no sibling thread event leaks in, and no raw provider HTTP log is invented
 //     (the limitations array states that honestly);
-//   - dialog body and Copy action are the SAME pretty JSON string;
+//   - dialog body and Copy action are the SAME pretty JSON string, resolved at CLICK
+//     time from the rendered surface (T1/R3), including through the insecure-origin
+//     execCommand fallback the LAN deployment depends on;
 //   - refresh updates an open dialog from a newer snapshot, ignores a stale
 //     session and CLOSES when the thread vanished;
-//   - expanded tile / nested card / focus panel toolbars put Transcript left and
-//     Delete right, with desktop labels, mobile glyphs and accessible names;
+//   - T1/R2 header anatomy: the state word sits immediately right of the thread badge
+//     (identity line) and Delete occupies the header's right slot of an expanded tile,
+//     a nested card and the roster-only panel; Transcript keeps its toolbar, with
+//     desktop labels, mobile glyphs and accessible names;
 //   - delete is two-step (no request before confirm), deduped while in flight,
 //     disabled for default/running/queued/descendant work, keeps data on failure
 //     and closes focus/transcript on success.
@@ -151,7 +155,7 @@ const childToolCall = withThread(
     {
         type: 'tool_call',
         agent: 'Helper',
-        call: { id: 'call-child', name: 'fileRead', arguments: '{"path":"a.ts"}' }
+        call: { id: 'call-child', name: 'read', arguments: '{"path":"a.ts"}' }
     },
     invocation('inv-child', 'inv-parent')
 );
@@ -167,7 +171,7 @@ const grandResult = withThread(
     {
         type: 'tool_result',
         agent: 'Grand',
-        name: 'fileRead',
+        name: 'read',
         callId: 'call-grand',
         content: 'grand result',
         isError: false,
@@ -220,7 +224,7 @@ const parentTurn = turnOf({
             agent: 'Researcher',
             call: {
                 id: 'call-delegate',
-                name: 'agentDelegate',
+                name: 'delegate',
                 arguments: '{"agent":"Helper","input":"child task"}'
             }
         },
@@ -517,6 +521,73 @@ describe('lossless JSON document', () => {
         expect(writeText).toHaveBeenCalledWith(pre?.textContent);
     });
 
+    // T1/R3: the plain-HTTP LAN host (src/frontend/deployment.ts, vite.config.ts) has
+    // NO `navigator.clipboard`, so the transcript dialog's copy must work through the
+    // execCommand fallback — and must write what is DISPLAYED. `navigator.clipboard` is
+    // absent here (jsdom defines nothing unless a test installs it), which is exactly
+    // that deployment.
+    it('copies the displayed JSON through the insecure-origin fallback', async () => {
+        let copied: string | undefined;
+        let focusedHelper = false;
+        setExecCommand((command) => {
+            const area = document.querySelector<HTMLTextAreaElement>('.dialog-copy-buffer');
+            copied = area?.value;
+            focusedHelper = document.activeElement === area;
+            return command === 'copy';
+        });
+
+        const handle = openThreadTranscript(transcriptSnapshot, 'thread-child', {}, { generatedAt: 789 });
+        if (handle === undefined) throw new Error('transcript did not open');
+        const pre = handle.element.querySelector<HTMLElement>('.thread-transcript-json');
+        if (pre === null) throw new Error('missing transcript surface');
+
+        const copy = document.querySelector<HTMLButtonElement>('.dialog .dialog-copy');
+        if (copy === null) throw new Error('missing dialog copy button');
+        copy.click();
+        await flush();
+
+        // Byte-identical to the rendered document, copied from a focused helper so the
+        // selection actually belongs to the copy command.
+        expect(copied).toBe(pre.textContent);
+        expect(copied).toContain('"schema": "underload.harness.thread-transcript"');
+        expect(focusedHelper).toBe(true);
+        expect(copy.querySelector('.dialog-copy-feedback')?.textContent).toBe('Copied');
+
+        setExecCommand(undefined);
+    });
+
+    // T1/R3: Copy is a CLICK-TIME provider. A refresh replaces both the surface and the
+    // source, so a stale pre can never be reported as the current transcript.
+    it('copies the refreshed document, not the one first rendered', async () => {
+        const writeText = vi.fn(async () => undefined);
+        setClipboard(writeText);
+
+        const scope = {};
+        const handle = openThreadTranscript(transcriptSnapshot, 'thread-child', scope, { generatedAt: 1 });
+        if (handle === undefined) throw new Error('transcript did not open');
+        const first = handle.element.querySelector<HTMLElement>('.thread-transcript-json')?.textContent;
+
+        expect(
+            refreshOpenThreadTranscript(
+                snapshotOf({
+                    updatedAt: 42,
+                    status: 'error',
+                    lastError: 'provider exploded',
+                    threads: transcriptSnapshot.threads,
+                    turns: transcriptSnapshot.turns
+                }),
+                scope
+            )
+        ).toBe('updated');
+
+        await copyDialog();
+
+        const current = handle.element.querySelector<HTMLElement>('.thread-transcript-json')?.textContent;
+        expect(current).not.toBe(first);
+        expect(writeText).toHaveBeenLastCalledWith(current);
+        expect(current).toContain('"lastError": "provider exploded"');
+    });
+
     it('refreshes an open dialog from a newer snapshot and ignores stale/wrong sessions', async () => {
         const writeText = vi.fn(async () => undefined);
         setClipboard(writeText);
@@ -611,7 +682,7 @@ const openTranscriptFrom = (bar: HTMLElement): void => {
 };
 
 describe('responsive thread action bar', () => {
-    it('puts Transcript on the left and Delete on the right of an expanded tile', () => {
+    it('puts the state beside the thread badge and Delete in the header right (T1/R2)', () => {
         const board = mount();
         const snapshot = snapshotOf({
             threads: [threadOf({ id: 'thread-a', label: 'RR1', messages: [] })],
@@ -621,29 +692,57 @@ describe('responsive thread action bar', () => {
         const turn = board.adopt(snapshot.turns[0]);
         board.expand(turn);
 
+        // R2 half one: the header's FIRST line is identity — the persistent-thread
+        // badge, then the state word immediately to its right.
+        const identity = turn.element.querySelector<HTMLElement>('.tile-identity');
+        expect(identity).not.toBeNull();
+        expect([...(identity?.children ?? [])].map((node) => node.className)).toEqual([
+            'tile-thread',
+            'tile-status'
+        ]);
+        expect(identity?.firstElementChild?.textContent).toBe('RR1');
+        // The fixture's turn is terminal, so the state word is its own (`done`), read
+        // right beside the badge.
+        expect(identity?.querySelector('.tile-status-text')?.textContent).toBe('done');
+        // The measurement cluster keeps only measurements.
+        expect([...(turn.element.querySelectorAll('.tile-top > *') ?? [])].map((node) => node.className)).toEqual([
+            'tile-elapsed',
+            'tile-tokens'
+        ]);
+
+        // R2 half two: Delete occupies the header's right slot, as a sibling of the
+        // header button (a <button> can never nest inside one).
+        const header = turn.element.querySelector<HTMLElement>('.tile-header-action');
+        expect(header).not.toBeNull();
+        expect(header?.parentElement).toBe(turn.element);
+        expect(header?.hidden).toBe(false);
+        expect([...(header?.children ?? [])].map((node) => node.className)).toEqual(['thread-delete']);
+        expect(header?.querySelector('.thread-delete .action-label')?.textContent).toBe('Delete');
+        expect(header?.querySelector('.thread-delete .action-glyph')?.textContent).toBe('X');
+        expect(actionButton(header as HTMLElement, '.thread-delete').getAttribute('aria-label')).toBe(
+            'Delete thread RR1'
+        );
+        // This standalone board has no DELETE transport; the control is honest
+        // about that instead of pretending the action is wired.
+        expect(actionButton(header as HTMLElement, '.thread-delete').title).toBe(
+            'Thread deletion is not wired in this host.'
+        );
+
+        // The toolbar keeps Transcript (and the confirmation row it owns) and no longer
+        // carries a Delete button.
         const bar = tileAction(turn);
         expect(bar.hidden).toBe(false);
         expect(bar.classList.contains('tile-transcript-action')).toBe(true);
         expect([...bar.children].map((node) => node.className)).toEqual([
             'transcript-open action-transcript',
-            'thread-delete',
             'thread-delete-confirm'
         ]);
         expect(bar.querySelector('.transcript-open .action-label')?.textContent).toBe('Transcript');
         expect(bar.querySelector('.transcript-open .action-glyph')?.textContent).toBe('{}');
-        expect(bar.querySelector('.thread-delete .action-label')?.textContent).toBe('Delete');
-        expect(bar.querySelector('.thread-delete .action-glyph')?.textContent).toBe('X');
         expect(actionButton(bar, '.transcript-open').getAttribute('aria-label')).toBe(
             'Open the JSON transcript of RR1'
         );
-        expect(actionButton(bar, '.thread-delete').getAttribute('aria-label')).toBe(
-            'Delete thread RR1'
-        );
-        // This standalone board has no DELETE transport; the control is honest
-        // about that instead of pretending the action is wired.
-        expect(actionButton(bar, '.thread-delete').title).toBe(
-            'Thread deletion is not wired in this host.'
-        );
+        expect(bar.querySelector('.thread-delete')).toBeNull();
 
         openTranscriptFrom(bar);
         expect(document.querySelector('.dialog-title')?.textContent).toBe(
@@ -671,17 +770,100 @@ describe('responsive thread action bar', () => {
         );
         expect(barStart).toBeGreaterThan(-1);
         const barBlock = css.slice(barStart, css.indexOf('}', barStart));
-        expect(barBlock).toContain('justify-content: space-between');
         expect(barBlock).toContain('flex-wrap: wrap');
+        // T1/R2: the bar has ONE action, so the two-ended layout is gone (nothing is
+        // pushed to the right edge any more).
+        expect(barBlock).not.toContain('justify-content');
 
+        // T1/R2: the state word is no longer right-aligned, and the identity pair is a
+        // single order-0 line of the header.
+        const statusRule = css.match(/:is\(\.tile-status, \.thread-status\) \{[\s\S]*?\}/)?.[0];
+        expect(statusRule).toBeDefined();
+        expect(statusRule).not.toContain('margin-left: auto');
+        const identityRule = css.match(/\.tile-identity \{[\s\S]*?\}/)?.[0];
+        expect(identityRule).toContain('order: 0');
+        expect(identityRule).toContain('display: inline-flex');
+
+        // T1/R2: the header slots are positioned over the header of each card owner.
         expect(css).toMatch(
-            /@media \(max-width: 600px\)[\s\S]*?\.action-label \{\s*display: none;[\s\S]*?\.action-glyph \{\s*display: inline;/
+            /:is\(\.tile-header-action, \.thread-header-action, \.thread-focus-head-action\) \{\s*display: flex;/
         );
-        expect(css).toMatch(/\.thread-delete \{\s*margin-left: auto;/);
+        expect(css).toMatch(
+            /\.tile\.is-expanded > \.tile-header-action \{\s*position: absolute;[\s\S]*?right: 12px;/
+        );
+        expect(css).toMatch(
+            /\.thread-tile > \.thread-header-action \{\s*position: absolute;[\s\S]*?right: 10px;/
+        );
+        expect(css).toMatch(/\.thread-focus-head-action \{\s*margin-left: auto;/);
+
+        // T3/R2 (reviewer finding 1): a nested card's header is ONE flex row and its
+        // only shrinkable item (`.thread-preview`) is hidden when expanded, so the
+        // flush-right measurement cluster used to sit under the absolutely positioned
+        // slot. The expanded header must RESERVE the slot's width instead.
+        expect(css).toMatch(/\.thread-tile\.is-expanded > \.thread-select \{\s*padding-right: 84px;/);
+
+        // T3/R2 (reviewer finding 3): the turn-tile slot is centred on the identity line
+        // (top tuned inside the header's own padding band), not parked at its lower edge.
+        expect(css).toMatch(
+            /\.tile\.is-expanded > \.tile-header-action \{\s*position: absolute;[^}]*?top: 5px;[^}]*?right: 12px;/
+        );
+
+        // The glyph swap covers the header slots too, so a phone still gets `X`.
+        expect(css).toMatch(
+            /@media \(max-width: 600px\)[\s\S]*?\.thread-focus-head-action[\s\S]*?\)\s*\.action-label \{\s*display: none;[\s\S]*?\.action-glyph \{\s*display: inline;/
+        );
         expect(css).toMatch(/\.action-glyph \{\s*display: none;/);
     });
 
-    it('gives an expanded nested child conversation the same toolbar', () => {
+    // T5/R2 (reviewer finding): an expanded header may CLIP the state word, but the word
+    // must never paint over the measurement cluster / Delete slot. `.tile-status` /
+    // `.thread-status` are shrinkable (`min-width: 0`), while `.tile-status-text` /
+    // `.thread-status-text` are `nowrap` — so without an explicit clip the ink leaves the
+    // box (real Chrome: `waiting for server` = 111px of ink in a 63px box at a 400px
+    // column). The rules below are what the browser probe in Temp/t5/probe-status.html
+    // settled on: clipped ink, a small legibility floor, and the T3 slot reserve intact.
+    it('clips the expanded state word inside its own box and keeps the slot clearance', () => {
+        const stylesheetPath = ['src/frontend/styles.css', 'src/styles.css']
+            .map((candidate) => resolve(process.cwd(), candidate))
+            .find((candidate) => {
+                try {
+                    readFileSync(candidate);
+                    return true;
+                } catch {
+                    return false;
+                }
+            });
+        if (stylesheetPath === undefined) throw new Error('styles.css not found');
+        const css = readFileSync(stylesheetPath, 'utf8');
+
+        // The word clips with an ellipsis, and it may shrink to the box.
+        const text = css.match(
+            /:is\(\.tile\.is-expanded, \.thread-tile\.is-expanded\) :is\(\.tile-status-text, \.thread-status-text\) \{([^}]*)\}/
+        )?.[1];
+        expect(text).toBeDefined();
+        expect(text).toContain('min-width: 0');
+        expect(text).toContain('overflow: hidden');
+        expect(text).toContain('text-overflow: ellipsis');
+
+        // The box shrinks, with only a small floor (every un-shrinkable pixel is taken
+        // from the row: 2.5em/3.5em measured cluster-vs-Delete contact at a 340px column,
+        // 1.5em stays clean at 340/400/460 in both the label and the glyph layout).
+        const box = css.match(
+            /:is\(\.tile\.is-expanded, \.thread-tile\.is-expanded\) :is\(\.tile-status, \.thread-status\) \{([^}]*)\}/
+        )?.[1];
+        expect(box).toBeDefined();
+        expect(box).toContain('flex: 0 1 auto');
+        expect(box).toContain('min-width: 1.5em');
+
+        // Scope: `is-expanded` only, so the compact sr-only clip stays the single
+        // treatment for collapsed rows, and the T3 reserve that keeps Delete clear.
+        expect(css).toMatch(
+            /:is\(\.tile:not\(\.is-expanded\), \.thread-row:not\(\.is-expanded\)\) :is\(\.tile-status-text, \.thread-status-text\) \{\s*position: absolute;/
+        );
+        expect(css).toMatch(/\.thread-tile\.is-expanded > \.thread-select \{\s*padding-right: 84px;/);
+    });
+
+    it('gives an expanded nested child conversation the same header control', () => {
         const board = mount();
         useSnapshot(board, transcriptSnapshot);
         const parent = board.adopt(parentTurn);
@@ -690,18 +872,29 @@ describe('responsive thread action bar', () => {
             '.thread-row[data-persistent-thread="thread-child"]'
         );
         expect(childRow).not.toBeNull();
+        const childHeader = childRow?.querySelector<HTMLElement>('.thread-header-action');
         const childBar = childRow?.querySelector<HTMLElement>('.thread-transcript-action');
+        // A collapsed card hides the header slot exactly like the toolbar.
+        expect(childHeader?.hidden).toBe(true);
         expect(childBar?.hidden).toBe(true);
 
         expect(board.focusThread('thread-child')).toBe(true);
+        expect(childHeader?.hidden).toBe(false);
         expect(childBar?.hidden).toBe(false);
+        // T1/R2: the nested card's identity line is its label then its state word.
+        expect(
+            [...(childRow?.querySelectorAll<HTMLElement>(':scope > .thread-tile > .thread-select > *') ?? [])].map(
+                (node) => node.className
+            ).slice(0, 2)
+        ).toEqual(['thread-name', 'thread-status']);
         expect(childBar?.querySelector('.transcript-open .action-label')?.textContent).toBe('Transcript');
-        expect(actionButton(childBar as HTMLElement, '.thread-delete').getAttribute('aria-label')).toBe(
+        expect(childBar?.querySelector('.thread-delete')).toBeNull();
+        expect(actionButton(childHeader as HTMLElement, '.thread-delete').getAttribute('aria-label')).toBe(
             'Delete thread RR2'
         );
     });
 
-    it('gives a roster-only focused thread the same toolbar', () => {
+    it('gives a roster-only focused thread the same header control', () => {
         const board = mount();
         const snapshot = snapshotOf({
             threads: [
@@ -717,15 +910,74 @@ describe('responsive thread action bar', () => {
         expect(board.focusThread('thread-roster')).toBe(true);
         const panel = document.querySelector<HTMLElement>('.thread-focus-panel');
         expect(panel).not.toBeNull();
+        // T1/R2: the panel head is one identity line (agent, name, state) with Delete
+        // flush right, and the toolbar under it keeps Transcript.
+        expect(
+            [...(panel?.querySelector<HTMLElement>('.thread-focus-head')?.children ?? [])].map(
+                (node) => node.className
+            )
+        ).toEqual([
+            'thread-focus-agent',
+            'thread-focus-name',
+            'thread-focus-status',
+            'thread-focus-head-action'
+        ]);
+        const head = panel?.querySelector<HTMLElement>('.thread-focus-head-action');
+        expect(head?.hidden).toBe(false);
+        expect(head?.querySelector('.thread-delete .action-label')?.textContent).toBe('Delete');
         const bar = panel?.querySelector<HTMLElement>('.thread-focus-actions');
         expect(bar?.hidden).toBe(false);
         expect(bar?.querySelector('.transcript-open .action-label')?.textContent).toBe('Transcript');
-        expect(bar?.querySelector('.thread-delete .action-label')?.textContent).toBe('Delete');
+        expect(bar?.querySelector('.thread-delete')).toBeNull();
 
         openTranscriptFrom(bar as HTMLElement);
         expect(document.querySelector('.dialog-title')?.textContent).toBe(
             'Transcript · RR8 · Researcher'
         );
+    });
+
+    // T3/R2 (reviewer finding 2): a header host is appended to the card BEFORE the bar's
+    // first `sync` decides its visibility, so it must be CREATED hidden — exactly like the
+    // toolbar it pairs with — or a collapsed card paints one frame of a stray enabled
+    // Delete. `adopt` never expands, so it exposes the creation state.
+    it('creates every header slot hidden and reveals it only with the visible surface', () => {
+        const board = mount();
+        const snapshot = snapshotOf({
+            threads: [threadOf({ id: 'thread-slot', label: 'RR3', messages: [] })],
+            turns: [turnOf({ id: 'turn-slot', index: 0, threadId: 'thread-slot' })]
+        });
+        useSnapshot(board, snapshot);
+        const turn = board.adopt(snapshot.turns[0]);
+
+        expect(turn.element.classList.contains('is-expanded')).toBe(false);
+        expect(turn.element.querySelector('.tile-header-action')?.hidden).toBe(true);
+        expect(tileAction(turn).hidden).toBe(true);
+
+        // Expansion reveals BOTH halves of the surface together.
+        board.expand(turn);
+        expect(turn.element.querySelector('.tile-header-action')?.hidden).toBe(false);
+        expect(tileAction(turn).hidden).toBe(false);
+
+        // A nested child card is created collapsed too: hidden slot, revealed by focus.
+        const nested = mount();
+        useSnapshot(nested, transcriptSnapshot);
+        const parent = nested.adopt(parentTurn);
+        const childRow = parent.element.parentElement?.querySelector<HTMLElement>(
+            '.thread-row[data-persistent-thread="thread-child"]'
+        );
+        if (childRow === null) throw new Error('missing nested child row');
+        expect(childRow.querySelector('.thread-header-action')?.hidden).toBe(true);
+        expect(nested.focusThread('thread-child')).toBe(true);
+        expect(childRow.querySelector('.thread-header-action')?.hidden).toBe(false);
+
+        // The roster-only panel has no collapse state: its own sync reveals the slot.
+        const roster = mount();
+        useSnapshot(
+            roster,
+            snapshotOf({ threads: [threadOf({ id: 'thread-roster-slot', label: 'RR7', messages: [] })] })
+        );
+        expect(roster.focusThread('thread-roster-slot')).toBe(true);
+        expect(document.querySelector('.thread-focus-head-action')?.hidden).toBe(false);
     });
 
     it('keeps a JSON fallback available when a host does not provide a snapshot', () => {
@@ -764,8 +1016,21 @@ const hostTarget = (overrides: Partial<SessionThread> = {}): SessionSnapshot =>
         turns: [turnOf({ id: 'turn-a', index: 0, threadId: 'thread-a' })]
     });
 
-const deleteButton = (bar: HTMLElement): HTMLButtonElement =>
-    actionButton(bar, '.thread-delete');
+// T1/R2: Delete lives in the CARD HEADER (`.tile-header-action` on a turn tile,
+// `.thread-header-action` on a nested card, `.thread-focus-head-action` on the
+// roster-only panel); its two-step confirmation stays in the toolbar below the header.
+// These helpers therefore take the SURFACE element (`turn.element`, a `.thread-row`,
+// or the `.thread-focus-panel`) and find the half they need inside it.
+const headerActionOf = (surface: ParentNode): HTMLElement => {
+    const host = surface.querySelector<HTMLElement>(
+        '.tile-header-action, .thread-header-action, .thread-focus-head-action'
+    );
+    if (host === null) throw new Error('missing thread header action slot');
+    return host;
+};
+
+const deleteButton = (surface: HTMLElement): HTMLButtonElement =>
+    actionButton(headerActionOf(surface), '.thread-delete');
 const confirmBox = (bar: HTMLElement): HTMLElement => {
     const box = bar.querySelector<HTMLElement>('.thread-delete-confirm');
     if (box === null) throw new Error('missing delete confirmation');
@@ -789,8 +1054,16 @@ describe('confirmed thread deletion', () => {
         const turn = board.adopt(snapshot.turns[0]);
         board.expand(turn);
         const bar = tileAction(turn);
+        const card = turn.element;
 
-        deleteButton(bar).click();
+        // T1/R2: the header owns the Delete control, the toolbar owns Transcript and
+        // the confirmation.
+        expect([...(headerActionOf(card).children ?? [])].map((node) => node.className)).toEqual([
+            'thread-delete'
+        ]);
+        expect(bar.querySelector('.thread-delete')).toBeNull();
+
+        deleteButton(card).click();
         expect(confirmBox(bar).hidden).toBe(false);
         expect(calls).toEqual([]);
 
@@ -798,7 +1071,7 @@ describe('confirmed thread deletion', () => {
         expect(confirmBox(bar).hidden).toBe(true);
         expect(calls).toEqual([]);
 
-        deleteButton(bar).click();
+        deleteButton(card).click();
         const yes = actionButton(bar, '.thread-delete-confirm-delete');
         expect(yes.textContent).toBe('Delete thread');
         yes.click();
@@ -806,11 +1079,11 @@ describe('confirmed thread deletion', () => {
 
         expect(calls).toEqual([['s1', 'thread-a']]);
         expect(confirmBox(bar).hidden).toBe(true);
-        expect(deleteButton(bar).disabled).toBe(true);
+        expect(deleteButton(card).disabled).toBe(true);
 
         // A second confirm/pointer event while the DELETE is in flight is a no-op.
         yes.click();
-        deleteButton(bar).click();
+        deleteButton(card).click();
         await flush();
         expect(calls).toHaveLength(1);
 
@@ -820,7 +1093,7 @@ describe('confirmed thread deletion', () => {
         // no longer in flight; re-expanding paints a usable toolbar again.
         expect(bar.hidden).toBe(true);
         board.expand(turn);
-        expect(deleteButton(bar).disabled).toBe(false);
+        expect(deleteButton(card).disabled).toBe(false);
     });
 
     it('closes focus/transcript and removes the row on a successful shell snapshot', async () => {
@@ -847,7 +1120,7 @@ describe('confirmed thread deletion', () => {
         openTranscriptFrom(tileAction(turn));
         expect(document.querySelector('.dialog')).not.toBeNull();
 
-        deleteButton(tileAction(turn)).click();
+        deleteButton(turn.element).click();
         actionButton(tileAction(turn), '.thread-delete-confirm-delete').click();
         await flush();
 
@@ -868,14 +1141,14 @@ describe('confirmed thread deletion', () => {
         const turn = board.adopt(snapshot.turns[0]);
         board.expand(turn);
 
-        deleteButton(tileAction(turn)).click();
+        deleteButton(turn.element).click();
         actionButton(tileAction(turn), '.thread-delete-confirm-delete').click();
         await flush();
 
         expect(board.turns()).toHaveLength(1);
         expect(board.focusedThread()).toBe('thread-a');
         expect(tileAction(turn).hidden).toBe(false);
-        expect(deleteButton(tileAction(turn)).disabled).toBe(false);
+        expect(deleteButton(turn.element).disabled).toBe(false);
         const notice = document.querySelector<HTMLElement>('.notice');
         expect(notice?.dataset.tone).toBe('error');
         expect(notice?.textContent).toBe(
@@ -904,19 +1177,22 @@ describe('confirmed thread deletion', () => {
         const defaultTurn = board.adopt(snapshot.turns[0]);
         board.expand(defaultTurn);
         const defaultBar = tileAction(defaultTurn);
-        expect(deleteButton(defaultBar).hidden).toBe(true);
+        expect(deleteButton(defaultTurn.element).hidden).toBe(true);
+        // T1/R2: with no Delete control, the header slot itself is hidden (it reserves
+        // nothing on an undeletable default conversation).
+        expect(headerActionOf(defaultTurn.element).hidden).toBe(true);
         expect(actionButton(defaultBar, '.transcript-open').hidden).toBe(false);
 
         const runningTurn = board.adopt(snapshot.turns[1]);
         board.expand(runningTurn);
         const runningBar = tileAction(runningTurn);
-        expect(deleteButton(runningBar).hidden).toBe(false);
-        expect(deleteButton(runningBar).disabled).toBe(true);
-        expect(deleteButton(runningBar).title).toBe(
+        expect(deleteButton(runningTurn.element).hidden).toBe(false);
+        expect(deleteButton(runningTurn.element).disabled).toBe(true);
+        expect(deleteButton(runningTurn.element).title).toBe(
             'Stop the active or queued work in this thread before deleting it.'
         );
 
-        deleteButton(runningBar).click();
+        deleteButton(runningTurn.element).click();
         expect(confirmBox(runningBar).hidden).toBe(true);
     });
 
@@ -980,7 +1256,7 @@ describe('confirmed thread deletion', () => {
                             agent: 'Researcher',
                             call: {
                                 id: 'call-1',
-                                name: 'agentDelegate',
+                                name: 'delegate',
                                 arguments: JSON.stringify({ agent: 'Helper', input: 'child' })
                             }
                         },
@@ -1001,7 +1277,8 @@ describe('confirmed thread deletion', () => {
         );
         const childBar = childRow?.querySelector<HTMLElement>('.thread-transcript-action');
         expect(childBar?.hidden).toBe(false);
-        expect(deleteButton(childBar as HTMLElement).disabled).toBe(true);
+        // T1/R2: the protected state is stated by the HEADER control now.
+        expect(deleteButton(childRow as HTMLElement).disabled).toBe(true);
     });
 
     it('keeps a same-id delete in a new session in flight when the old request resolves', async () => {
@@ -1026,13 +1303,13 @@ describe('confirmed thread deletion', () => {
         useSnapshot(board, first);
         const firstTurn = board.adopt(first.turns[0]);
         board.expand(firstTurn);
-        deleteButton(tileAction(firstTurn)).click();
+        deleteButton(firstTurn.element).click();
         actionButton(tileAction(firstTurn), '.thread-delete-confirm-delete').click();
         await flush();
 
         expect(requests).toHaveLength(1);
         expect(requests[0]).toMatchObject({ sessionId: 's1', threadId: 'thread-a' });
-        expect(deleteButton(tileAction(firstTurn)).disabled).toBe(true);
+        expect(deleteButton(firstTurn.element).disabled).toBe(true);
 
         // Session switch: the SAME persistent thread id is legal because thread ids
         // are only unique inside one session. The new board starts its own DELETE.
@@ -1045,20 +1322,20 @@ describe('confirmed thread deletion', () => {
         const reconciled = board.reconcile(second.turns, {});
         const secondTurn = reconciled[0];
         board.expand(secondTurn);
-        deleteButton(tileAction(secondTurn)).click();
+        deleteButton(secondTurn.element).click();
         actionButton(tileAction(secondTurn), '.thread-delete-confirm-delete').click();
         await flush();
 
         expect(requests).toHaveLength(2);
         expect(requests[1]).toMatchObject({ sessionId: 's2', threadId: 'thread-a' });
-        expect(deleteButton(tileAction(secondTurn)).disabled).toBe(true);
+        expect(deleteButton(secondTurn.element).disabled).toBe(true);
 
         // The OLD request resolves: its finally must remove only its own composite
         // key/suppression token, not the new session's in-flight delete.
         requests[0].resolve({ deleted: true, session: first });
         await flush();
 
-        expect(deleteButton(tileAction(secondTurn)).disabled).toBe(true);
+        expect(deleteButton(secondTurn.element).disabled).toBe(true);
         expect(confirmBox(tileAction(secondTurn)).hidden).toBe(true);
 
         requests[1].resolve({ deleted: true, session: second });
@@ -1074,9 +1351,9 @@ describe('confirmed thread deletion', () => {
         board.expand(turn);
 
         const bar = tileAction(turn);
-        expect(deleteButton(bar).disabled).toBe(true);
-        expect(deleteButton(bar).title).toBe('Thread deletion is not wired in this host.');
-        deleteButton(bar).click();
+        expect(deleteButton(turn.element).disabled).toBe(true);
+        expect(deleteButton(turn.element).title).toBe('Thread deletion is not wired in this host.');
+        deleteButton(turn.element).click();
         expect(confirmBox(bar).hidden).toBe(true);
     });
 });

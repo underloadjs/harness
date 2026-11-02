@@ -36,7 +36,7 @@
 // highlighted DOM BEFORE it is wrapped in `<pre><code>`: `file-links.ts` correctly
 // treats code as literal text, but wrapping a path in a button inside a highlight
 // span keeps every other token highlighted and adds no HTML parse path. A click is
-// the only trigger: `openFilePreview` requests one bounded `fileRead` window.
+// the only trigger: `openFilePreview` requests one bounded `read` window.
 // Tool content is NOT Markdown and is never parsed for images/markup; a literal
 // image URL stays inert text (there is no sanitized `<img>` to enhance here).
 //
@@ -94,7 +94,7 @@ export type ToolCallCardOptions = {
 // path is read while building or replaying a card, and the browser never touches
 // the filesystem itself.
 const readFileForToolPreview: FilePreviewReader = async ({ path, startLine, maxLines }) => {
-    const response = await callTool('fileRead', [{ path, startLine, maxLines }]);
+    const response = await callTool('read', [{ path, startLine, maxLines }]);
     if (!response.ok) throw new Error(response.error.message);
 
     // ui/file-preview.ts reads the documented `files[]` shape structurally, so the
@@ -336,8 +336,8 @@ export const createToolCallCard = (
     // backdrop or the close button is indistinguishable from `handle.close()`.
     let dialog: DialogHandle | undefined;
 
-    // Dialog heading doubles as the live status: `fileRead · running` ->
-    // `fileRead · ok`. The chip remains the compact surface for scanning; the
+    // Dialog heading doubles as the live status: `read · running` ->
+    // `read · ok`. The chip remains the compact surface for scanning; the
     // modal title repeats the state in text because the modal covers the chip.
     const dialogTitle = (): string => `${name} · ${STATE_TEXT[current]}`;
 

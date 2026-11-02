@@ -238,7 +238,7 @@ describe('cancellation', () => {
         const seenResearcher: HarnessStreamRequest[] = [];
         const researcher = brain(scripted([callTool('r1', 'probe', '{}'), answer('facts')], seenResearcher));
         const writerAgent = brain(
-            scripted([callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"find"}'), answer('final')])
+            scripted([callTool('c1', 'delegate', '{"agent":"researcher","input":"find"}'), answer('final')])
         );
 
         const writer = harness({

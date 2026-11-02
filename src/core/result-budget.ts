@@ -2,7 +2,7 @@
 //
 // Every tool result and every tool ERROR the harness feeds back to the model is
 // TEXT on the wire. A single tool can return — or throw — something enormous:
-// `fileRead` of a 20 MB log, a command that dumps a build log into a failure
+// `read` of a 20 MB log, a command that dumps a build log into a failure
 // message, a web page pasted into a search snippet. That text is then replayed
 // on EVERY subsequent request of the conversation, so one unbounded result can
 // exceed the model's context window and end the session with a transport error
@@ -24,7 +24,7 @@
 //   1. It is a POST-SERIALIZATION cap. The tool's value and its JSON string are
 //      fully allocated before this runs, so the cap bounds the conversation's
 //      token cost, NOT the process's peak memory. A tool that wants to avoid
-//      allocating gigabytes must bound its own work (fileRead's content budget
+//      allocating gigabytes must bound its own work (read's content budget
 //      does exactly that).
 //   2. It only bounds the MODEL-facing text. Declarative UI panels travel on a
 //      separate `ui` field and are bounded by core/tool-ui.ts instead; the two
@@ -37,7 +37,7 @@
 
 // The default budget: 64 KiB of UTF-8 bytes per model-facing tool result or
 // tool error. 64 KiB is roughly 16k tokens of English prose — large enough for
-// any honest tool result (fileRead's own content budget is the same size) and
+// any honest tool result (read's own content budget is the same size) and
 // small enough that a handful of them still fit a context window.
 export const MODEL_TOOL_RESULT_BUDGET_BYTES = 64 * 1024;
 

@@ -14,7 +14,7 @@
 // The captured text can therefore be one character longer than the byte cap.
 //
 // Consumers:
-//   - ./commandRun   — 128 KiB stdout, 16 KiB stderr
+//   - ./shell   — 128 KiB stdout, 16 KiB stderr
 //   - ./gitDiff      — 128 KiB stdout, 16 KiB stderr
 //   - ../syntax/python — 8 KiB stderr diagnostics
 

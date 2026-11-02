@@ -206,6 +206,9 @@ describe('completions during the final request (P1-A)', () => {
                     description: 'alpha',
                     tags: ['x'],
                     visibility: 'core',
+                    // T2/R2: async — this test pins overlapping ASYNC completions racing
+                    // the final request, so the calls must not join a sync batch group.
+                    mode: 'async',
                     parameters: { type: 'object', properties: { value: { type: 'string' } } },
                     execute: () => alphaGate.promise
                 }),
@@ -213,6 +216,8 @@ describe('completions during the final request (P1-A)', () => {
                     description: 'beta',
                     tags: ['x'],
                     visibility: 'core',
+                    // T2/R2: async (see the alpha tool above).
+                    mode: 'async',
                     parameters: { type: 'object', properties: { value: { type: 'string' } } },
                     execute: () => betaGate.promise
                 })
@@ -354,6 +359,9 @@ describe('completions during the final request (P1-A)', () => {
                     description: 'alpha',
                     tags: ['x'],
                     visibility: 'core',
+                    // T2/R2: async — three overlapping async completions racing one
+                    // another is the behaviour under test here.
+                    mode: 'async',
                     parameters: { type: 'object', properties: { value: { type: 'string' } } },
                     execute: () => gateA.promise
                 }),
@@ -361,6 +369,8 @@ describe('completions during the final request (P1-A)', () => {
                     description: 'beta',
                     tags: ['x'],
                     visibility: 'core',
+                    // T2/R2: async (see the alpha tool above).
+                    mode: 'async',
                     parameters: { type: 'object', properties: { value: { type: 'string' } } },
                     execute: () => gateB.promise
                 }),
@@ -368,6 +378,8 @@ describe('completions during the final request (P1-A)', () => {
                     description: 'gamma',
                     tags: ['x'],
                     visibility: 'core',
+                    // T2/R2: async (see the alpha tool above).
+                    mode: 'async',
                     parameters: { type: 'object', properties: { value: { type: 'string' } } },
                     execute: () => gateC.promise
                 })
@@ -459,8 +471,8 @@ describe('delegated child ownership after abort (P2-A)', () => {
             if (turn === 0) {
                 delegateCalls++;
                 for (const frame of calls(
-                    call('d1', 'agentDelegate', '{"agent":"child","input":"one"}'),
-                    call('d2', 'agentDelegate', '{"agent":"child","input":"two"}')
+                    call('d1', 'delegate', '{"agent":"child","input":"one"}'),
+                    call('d2', 'delegate', '{"agent":"child","input":"two"}')
                 )) {
                     yield frame;
                 }
@@ -702,7 +714,7 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
             {
                 type: 'done',
                 stopReason: 'tool_calls',
-                toolCalls: [{ id, name: 'agentDelegate', arguments: '{"agent":"child","input":"work"}' }]
+                toolCalls: [{ id, name: 'delegate', arguments: '{"agent":"child","input":"work"}' }]
             }
         ];
 
@@ -806,7 +818,7 @@ describe('preemptive cancellation of a stuck child (T15)', () => {
                 type: 'done',
                 stopReason: 'tool_calls',
                 toolCalls: [
-                    { id, name: 'agentDelegate', arguments: `{"agent":"child","input":"${input}"}` }
+                    { id, name: 'delegate', arguments: `{"agent":"child","input":"${input}"}` }
                 ]
             }
         ];

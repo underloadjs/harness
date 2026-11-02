@@ -52,13 +52,13 @@ export type HarnessPreset = {
     primary: string;
     // The delegation allowlist. Empty for a single-agent harness; Research names
     // `summarizer`. This is exposed so a descriptor can report the actual core
-    // tool set (agentDelegate exists only when there is somewhere to delegate).
+    // tool set (delegate exists only when there is somewhere to delegate).
     subagents: readonly string[];
     // Declared for display only — the harness registry is the source of truth.
     agents: readonly string[];
     tools: readonly string[];
     // Declared tools that only exist when the host configured their credential
-    // (today: `webSearch`, backed by EXA_API_KEY / TAVILY_API_KEY).
+    // (today: `search`, backed by EXA_API_KEY / TAVILY_API_KEY).
     //
     // Deliberately declarative: a descriptor must be computable without building
     // the harness (and therefore without constructing a live agent or a session),
@@ -66,7 +66,7 @@ export type HarnessPreset = {
     // appends only the ones with an executable definition. A keyless host adds
     // nothing, which keeps "listed" == "callable" — the preset factory itself
     // already skips registration when the key is absent (see src/harness.ts).
-    // Every live preset and the recoverable-failure example declare `webSearch`
+    // Every live preset and the recoverable-failure example declare `search`
     // (all are built by createToolboxHarness, which opts in); the scripted demo
     // does not.
     environmentTools?: readonly string[];
@@ -113,9 +113,9 @@ export type HarnessPreset = {
 };
 
 // How a tool is grouped in the direct-call catalogue. 'Web search' is separate
-// from the presets because webSearch is credential-dependent and opt-in: a host
+// from the presets because search is credential-dependent and opt-in: a host
 // must see at a glance whether this deployment can run it. 'Core tools' holds the
-// harness-owned set (toolRequest, toolCreate, todoManage, agentDelegate), which are
+// harness-owned set (toolRequest, toolCreate, todoManage, delegate), which are
 // listed for review and manual execution but only ever run inside a session. R18:
 // the core FILE tools stay in 'Package presets' and are directly callable, because
 // 'core' visibility does not imply a session binding.
@@ -142,10 +142,10 @@ export type ToolAvailability = {
 // definition, which is what keeps "listed" from meaning "pretends to work".
 //
 // `sessionBound` marks the harness-owned CORE tools (R8): toolRegistry,
-// toolRequest, toolCreate, todoManage, agentDelegate. They have no `tool` and can never be called with a
+// toolRequest, toolCreate, todoManage, delegate. They have no `tool` and can never be called with a
 // dummy implementation: they run inside a session's harness, so the server requires
 // a `sessionId` and forwards the call to `harness.executeTool`. R18 keeps the flag
-// off the core file tools and webSearch: they have real implementations and run
+// off the core file tools and search: they have real implementations and run
 // statelessly. Listing the harness-owned set is what lets the UI's Tools tab show
 // it and run it against the selected session.
 export type CatalogueEntry = {

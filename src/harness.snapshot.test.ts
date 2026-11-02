@@ -457,7 +457,7 @@ describe('harness snapshot/restore', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'agentDelegate',
+            'delegate',
             'threadFork',
             'repeat',
             'bulk01',

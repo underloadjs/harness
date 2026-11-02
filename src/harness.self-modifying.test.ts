@@ -370,8 +370,8 @@ describe('self-modifying tool kernel', () => {
     it('compiles shipped preset and core entries through the same operation and exposes their source revisions', () => {
         const writer = harness({ agents: { writer: brain(scripted([answer('ok')])) } });
 
-        const preset = writer.toolSource('fileRead');
-        expect(preset?.sourcePath).toBe('tools/files/fileRead.tool.ts');
+        const preset = writer.toolSource('read');
+        expect(preset?.sourcePath).toBe('tools/files/read.tool.ts');
         expect(preset?.checks).toEqual([
             'transpile:syntax',
             'load:module',
@@ -613,7 +613,7 @@ describe('self-modifying tool kernel', () => {
         const writer = harness({ agents: { writer: brain(scripted([answer('ok')])) } });
 
         // The configured model-facing built-ins are ordinary source/definition
-        // registrations now. Replacing toolRequest and fileRead must publish.
+        // registrations now. Replacing toolRequest and read must publish.
         const replacedRequest = await writer.registerTool({
             name: 'toolRequest',
             moduleText: moduleFor({ name: 'toolRequest', body: "return { brand: 'replacement' };" })
@@ -624,14 +624,14 @@ describe('self-modifying tool kernel', () => {
         });
 
         const replacedFileRead = await writer.registerTool({
-            name: 'fileRead',
+            name: 'read',
             description: 'replacement reader',
             tags: ['files'],
-            moduleText: moduleFor({ name: 'fileRead', body: "return 'replacement-reader';" })
+            moduleText: moduleFor({ name: 'read', body: "return 'replacement-reader';" })
         });
         expect(replacedFileRead.replaced).toBe(true);
-        expect(writer.tools.fileRead.description).toBe('replacement reader');
-        await expect(writer.executeTool('fileRead', [])).resolves.toBe('replacement-reader');
+        expect(writer.tools.read.description).toBe('replacement reader');
+        await expect(writer.executeTool('read', [])).resolves.toBe('replacement-reader');
     });
 
     it('registers configuration.toolSources after the baseline and before configured tool overrides', async () => {
@@ -663,7 +663,7 @@ describe('self-modifying tool kernel', () => {
         await expect(overridden.executeTool('customList', {})).resolves.toBe('override');
     });
 
-    it('compiles webSearch/webFetch as source entries while credentials stay harness-owned', async () => {
+    it('compiles search/fetch as source entries while credentials stay harness-owned', async () => {
         const writer = harness({
             agents: { writer: brain(scripted([answer('ok')])) },
             websearch: {
@@ -672,21 +672,21 @@ describe('self-modifying tool kernel', () => {
             webfetch: { env: {} }
         });
 
-        expect(writer.toolSource('webSearch')?.sourcePath).toBe('tools/runtime/webSearch.tool.ts');
-        expect(writer.toolSource('webFetch')?.sourcePath).toBe('tools/runtime/webFetch.tool.ts');
+        expect(writer.toolSource('search')?.sourcePath).toBe('tools/runtime/search.tool.ts');
+        expect(writer.toolSource('fetch')?.sourcePath).toBe('tools/runtime/fetch.tool.ts');
 
         // Dynamic per-harness provider surface is supplied as registration
         // metadata; no key appears in the captured source.
         const searchProperties = (
-            writer.tools.webSearch.parameters as { properties: Record<string, unknown> }
+            writer.tools.search.parameters as { properties: Record<string, unknown> }
         ).properties;
         expect(Object.keys(searchProperties)).toContain('provider');
         const fetchProperties = (
-            writer.tools.webFetch.parameters as { properties: Record<string, unknown> }
+            writer.tools.fetch.parameters as { properties: Record<string, unknown> }
         ).properties;
         expect(Object.keys(fetchProperties)).toEqual(['url', 'format']);
 
-        for (const record of [writer.toolSource('webSearch'), writer.toolSource('webFetch')]) {
+        for (const record of [writer.toolSource('search'), writer.toolSource('fetch')]) {
             expect(record?.moduleText).not.toContain('test-exa-key');
             expect(record?.moduleText).not.toContain('EXA_API_KEY');
             expect(record?.moduleText).not.toContain('TAVILY_API_KEY');

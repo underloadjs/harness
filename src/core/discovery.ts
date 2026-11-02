@@ -47,7 +47,7 @@
 //
 // ALREADY-AVAILABLE CORE TOOLS (additive, never enabled). A query used to answer
 // "no match" for a capability the caller could already call — the reported case
-// was tag "agentDelegate" in a harness WITH subagents, where the tool is declared
+// was tag "delegate" in a harness WITH subagents, where the tool is declared
 // on every request yet discovery claimed nothing matched. searchTools now also
 // scores the core tools the CALLER already has (options.declared, supplied by the
 // harness from its own declaration rule) and reports the hits as
@@ -55,7 +55,7 @@
 //   - nothing is added to `enabled`/`tools`, so the 5-match budget is untouched;
 //   - no declaration changes, because those tools were declared already;
 //   - the caller supplies the visible set, so a subagent (which never sees
-//     agentDelegate) or a one-agent harness (which has no agentDelegate at all)
+//     delegate) or a one-agent harness (which has no delegate at all)
 //     gets no such entry — absence stays honest;
 //   - a core hit also counts as a MATCHED query tag, so `unmatchedTags` cannot
 //     claim a capability is absent when it is available.
@@ -145,7 +145,7 @@ const scoreTool = (tool: Tool, needle: string): number => {
 // Same ladder as scoreTag (exact 4, prefix 3, contains 2) but applied to the wire
 // NAME as well as the tags, and NEVER to the description. Name comparison is
 // case-insensitive because normalizeTags lower-cases the query, and it is what
-// makes an exact-name lookup ("agentDelegate") resolve even though tag matching
+// makes an exact-name lookup ("delegate") resolve even though tag matching
 // alone would stop at "delegate".
 const scoreDeclaredTool = (tool: Tool, needle: string): number => {
     let best = 0;

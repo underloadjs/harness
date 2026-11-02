@@ -44,7 +44,7 @@
 //     surrogate pair is never split). A cut snippet is flagged with
 //     `textTruncated: true` on that match — the omission is explicit, never silent.
 //   - AGGREGATE: at most FILE_GLOB_CONTENT_BUDGET (64 KiB) of UTF-8 match text per
-//     call, the same budget fileRead uses. When the next match would cross it the
+//     call, the same budget read uses. When the next match would cross it the
 //     search stops and `truncated: true` is reported, because a match that exists
 //     was NOT returned. The returned matches stay a genuine prefix of the walk, so
 //     re-running with a narrower pattern is the honest way to see the rest.
@@ -115,7 +115,7 @@ import {
 export const FILE_GLOB_MATCH_TEXT_BYTES = 1024;
 
 // Maximum UTF-8 bytes of match text across the whole call (the same 64 KiB budget
-// fileRead uses). Reaching it ends the search with `truncated: true`.
+// read uses). Reaching it ends the search with `truncated: true`.
 export const FILE_GLOB_CONTENT_BUDGET = 64 * 1024;
 
 export type FileGlobParameters = {

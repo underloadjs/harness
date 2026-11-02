@@ -353,10 +353,10 @@ describe('actionRequest runtime', () => {
                     return answer('owner done');
                 }
                 if (results.some((content) => content.includes('previous answer'))) {
-                    return call('d2', 'agentDelegate', '{"agent":"helper","input":"do work"}');
+                    return call('d2', 'delegate', '{"agent":"helper","input":"do work"}');
                 }
                 if (!request.messages.some((message) => message.role === 'assistant')) {
-                    return call('d1', 'agentDelegate', '{"agent":"helper","input":"previous task"}');
+                    return call('d1', 'delegate', '{"agent":"helper","input":"previous task"}');
                 }
                 return answer('waiting');
             }, writerSeen)
@@ -469,7 +469,7 @@ describe('actionRequest runtime', () => {
                     const results = realToolContents(request);
                     if (results.length > 0) return answer('owner done');
                     if (!request.messages.some((message) => message.role === 'assistant')) {
-                        return call('d1', 'agentDelegate', '{"agent":"helper","input":"go"}');
+                        return call('d1', 'delegate', '{"agent":"helper","input":"go"}');
                     }
                     return answer('waiting');
                 })
@@ -541,7 +541,7 @@ describe('actionRequest runtime', () => {
                 const results = realToolContents(request);
                 if (results.length > 0) return answer('owner done');
                 if (!request.messages.some((message) => message.role === 'assistant')) {
-                    return call('d1', 'agentDelegate', '{"agent":"helper","input":"go"}');
+                    return call('d1', 'delegate', '{"agent":"helper","input":"go"}');
                 }
                 return answer('waiting');
             })
@@ -642,7 +642,7 @@ describe('actionRequest runtime', () => {
                 const results = realToolContents(request);
                 if (results.length > 0) return answer('owner done');
                 if (!request.messages.some((message) => message.role === 'assistant')) {
-                    return call('d1', 'agentDelegate', '{"agent":"helper","input":"go"}');
+                    return call('d1', 'delegate', '{"agent":"helper","input":"go"}');
                 }
                 return answer('waiting');
             })
@@ -693,7 +693,7 @@ describe('actionRequest runtime', () => {
                     const results = realToolContents(request);
                     if (results.length > 0) return answer('owner done');
                     if (!request.messages.some((message) => message.role === 'assistant')) {
-                        return call('d1', 'agentDelegate', '{"agent":"helper","input":"go"}');
+                        return call('d1', 'delegate', '{"agent":"helper","input":"go"}');
                     }
                     return answer('waiting');
                 })

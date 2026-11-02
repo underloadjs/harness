@@ -1,4 +1,4 @@
-// webFetch `native` provider — a direct GET plus a dependency-free conversion.
+// fetch `native` provider — a direct GET plus a dependency-free conversion.
 //
 // Loaded by `import()` from ./index on the first native call, so constructing a
 // harness never touches this module. There is no SDK and no parser package: the

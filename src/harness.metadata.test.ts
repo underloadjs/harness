@@ -5,14 +5,14 @@
 // schema (names/regex/tags, uncapped selection, an optional per-query limit), the
 // toolList inventory contract, the toolManage operations, the toolCreate security
 // statement, the todoManage actions, the record tools' schemas and partial-update
-// contract, and the agentDelegate allowlist. The server describes the same tools
+// contract, and the delegate allowlist. The server describes the same tools
 // in its catalogue from `src/core/metadata.ts` - the copy these registrations use
 // - so pinning the registered text here also pins what a descriptor advertises;
 // `server/api.test.ts` asserts that projection end to end.
 //
 // T14: the wire names are toolRequest / toolList / toolManage / toolCreate /
 // todoManage / profileManage / chapterManage / locationManage / agentManage /
-// agentResult / agentDelegate.
+// agentResult / delegate.
 
 import { describe, expect, it } from 'vitest';
 import { agent, harness } from '@underload/harness';
@@ -61,7 +61,7 @@ describe('core tool metadata', () => {
         // host-configured enabled bound, and newest-request precedence have to be
         // stated there too.
         expect(writer.tools.toolRequest.description).toBe(
-            'Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example ["files", "list"], ["shell"], or ["git", "diff"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example agentDelegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.'
+            'Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example ["files", "list"], ["shell"], or ["git", "diff"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example delegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.'
         );
         expect(writer.tools.toolRequest.tags).toEqual(['discovery', 'tools', 'catalogue']);
         expect(writer.tools.toolRequest.visibility).toBe('core');
@@ -408,10 +408,10 @@ describe('core tool metadata', () => {
         );
     });
 
-    it('registers agentDelegate from the allowlist, and never without subagents', () => {
-        // No subagents: no agentDelegate tool at all, which is why the server's
-        // agentDelegate descriptor is session-dependent.
-        expect(solo().tools.agentDelegate).toBeUndefined();
+    it('registers delegate from the allowlist, and never without subagents', () => {
+        // No subagents: no delegate tool at all, which is why the server's
+        // delegate descriptor is session-dependent.
+        expect(solo().tools.delegate).toBeUndefined();
 
         const team = harness({
             agents: {
@@ -423,7 +423,7 @@ describe('core tool metadata', () => {
 
         // The runtime declaration names the exact allowlist in its enum, and the
         // description states the one-level rule.
-        expect(team.tools.agentDelegate.parameters).toEqual({
+        expect(team.tools.delegate.parameters).toEqual({
             type: 'object',
             properties: {
                 agent: {
@@ -436,10 +436,10 @@ describe('core tool metadata', () => {
             required: ['agent', 'input'],
             additionalProperties: false
         });
-        expect(team.tools.agentDelegate.description).toBe(
+        expect(team.tools.delegate.description).toBe(
             'Delegate a self-contained task to a configured subagent and return its answer. Subagents: helper. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.'
         );
-        expect(team.tools.agentDelegate.visibility).toBe('core');
-        expect(team.tools.agentDelegate.tags).toEqual(['agents', 'delegate', 'delegation', 'subagent', 'team']);
+        expect(team.tools.delegate.visibility).toBe('core');
+        expect(team.tools.delegate.tags).toEqual(['agents', 'delegate', 'delegation', 'subagent', 'team']);
     });
 });

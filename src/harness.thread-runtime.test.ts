@@ -592,7 +592,7 @@ describe('host-parent delegation (R4)', () => {
         routed(
             {
                 [`${prefix} task`]: scripted([
-                    callTool('d1', 'agentDelegate', JSON.stringify({ agent: 'helper', input: `child ${prefix}` })),
+                    callTool('d1', 'delegate', JSON.stringify({ agent: 'helper', input: `child ${prefix}` })),
                     answer('parent done')
                 ])
             },
@@ -764,7 +764,7 @@ describe('host-parent delegation (R4)', () => {
                         first: scripted([
                             callTool(
                                 'd1',
-                                'agentDelegate',
+                                'delegate',
                                 JSON.stringify({ agent: 'helper', input: 'child one' })
                             ),
                             answer('first done')
@@ -772,7 +772,7 @@ describe('host-parent delegation (R4)', () => {
                         continue: scripted([
                             callTool(
                                 'd2',
-                                'agentDelegate',
+                                'delegate',
                                 JSON.stringify({ agent: 'helper', input: 'child two' })
                             ),
                             answer('second done')
@@ -995,7 +995,7 @@ describe('host-parent delegation (R4)', () => {
             .threadMessages(beta.id)
             .find((message) => message.role === 'tool') as { content: string };
 
-        expect(alphaTool.content).toBe('Tool "agentDelegate" failed: child stopped');
+        expect(alphaTool.content).toBe('Tool "delegate" failed: child stopped');
         expect(betaTool.content).toBe('{"agent":"helper","content":"beta facts"}');
 
         // The unrelated child completed, and both parents are idle and resumable.
@@ -1248,9 +1248,9 @@ describe('cross-thread chat and delegation links (R4)', () => {
         const helper = brain(scripted([answer('the facts')]));
         const lead = brain(
             scripted([
-                callTool('c1', 'agentDelegate', '{"agent":"helper","input":"find facts"}'),
+                callTool('c1', 'delegate', '{"agent":"helper","input":"find facts"}'),
                 answer('lead done'),
-                callTool('c2', 'agentDelegate', '{"agent":"helper","input":"more facts"}'),
+                callTool('c2', 'delegate', '{"agent":"helper","input":"more facts"}'),
                 answer('lead done again')
             ])
         );
@@ -1286,7 +1286,7 @@ describe('cross-thread chat and delegation links (R4)', () => {
 
         const toolMessages = lead.messages.filter((message) => message.role === 'tool');
         expect((toolMessages.at(-1) as { content: string }).content).toBe(
-            'Tool "agentDelegate" failed: Thread "agent:helper" is stopped; a host must resume it before it can run.'
+            'Tool "delegate" failed: Thread "agent:helper" is stopped; a host must resume it before it can run.'
         );
         expect(helper.messages).toEqual([
             { role: 'user', content: 'find facts' },
@@ -1569,7 +1569,7 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
         const helper = brain(scripted([answer('facts')]));
         const lead = brain(
             scripted([
-                callTool('d1', 'agentDelegate', JSON.stringify({ agent: 'helper', input: 'find' })),
+                callTool('d1', 'delegate', JSON.stringify({ agent: 'helper', input: 'find' })),
                 answer('lead done')
             ])
         );
@@ -1595,7 +1595,7 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
             agents: {
                 lead: brain(
                     scripted([
-                        callTool('d1', 'agentDelegate', JSON.stringify({ agent: 'helper', input: 'find' })),
+                        callTool('d1', 'delegate', JSON.stringify({ agent: 'helper', input: 'find' })),
                         answer('lead done')
                     ])
                 ),
@@ -1620,6 +1620,9 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
             description: 'Hold until released.',
             tags: ['test'],
             visibility: 'core',
+            // T2/R2: async — the run must keep taking requests (pause, then a failing
+            // attempt) while this call is outstanding, which is the async contract.
+            mode: 'async',
             execute: () => hold.promise
         });
 

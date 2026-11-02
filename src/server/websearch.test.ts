@@ -1,7 +1,7 @@
 // Websearch over the real HTTP API.
 //
-// C1 fixes a specific gap: `GET /api/tools` must list webSearch even on a host
-// with no provider key, `POST /api/tools/webSearch` must explain that honestly,
+// C1 fixes a specific gap: `GET /api/tools` must list search even on a host
+// with no provider key, `POST /api/tools/search` must explain that honestly,
 // and with EXA_API_KEY in the process environment the same endpoint must execute
 // with the server-side key. Both cases run against a real server on an ephemeral
 // port; the configured case intercepts only the outbound Exa request, so no
@@ -50,8 +50,8 @@ afterEach(() => {
     vi.unstubAllEnvs();
 });
 
-describe('webSearch catalogue', () => {
-    it('lists webSearch as unconfigured and refuses a direct call without a key', async () => {
+describe('search catalogue', () => {
+    it('lists search as unconfigured and refuses a direct call without a key', async () => {
         // The runtime catalogue must read this at server start; a module-level
         // singleton built before these stubs would have seen the host env.
         vi.stubEnv('EXA_API_KEY', '');
@@ -61,10 +61,10 @@ describe('webSearch catalogue', () => {
 
         try {
             const index = await toolsIndex(server.url);
-            const descriptor = index.tools.find((tool) => tool.name === 'webSearch');
+            const descriptor = index.tools.find((tool) => tool.name === 'search');
 
             expect(descriptor).toEqual({
-                name: 'webSearch',
+                name: 'search',
                 group: 'Web search',
                 description: WEB_SEARCH_METADATA.description,
                 tags: ['web', 'search', 'internet', 'news', 'research'],
@@ -77,7 +77,7 @@ describe('webSearch catalogue', () => {
                 }
             });
 
-            const result = await callTool(server.url, 'webSearch', { query: 'anything' });
+            const result = await callTool(server.url, 'search', { query: 'anything' });
 
             expect(withoutDuration(result)).toEqual({
                 ok: false,
@@ -132,14 +132,14 @@ describe('webSearch catalogue', () => {
             expect(toolsBody).not.toContain(KEY);
 
             const index = JSON.parse(toolsBody) as ToolIndex;
-            const descriptor = index.tools.find((tool) => tool.name === 'webSearch');
+            const descriptor = index.tools.find((tool) => tool.name === 'search');
 
             expect(descriptor?.availability).toEqual({
                 state: 'available',
                 environment: [...WEBSEARCH_ENVIRONMENT]
             });
 
-            const result = await callTool(server.url, 'webSearch', {
+            const result = await callTool(server.url, 'search', {
                 query: 'harness tool discovery',
                 maxResults: 5
             });

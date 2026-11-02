@@ -47,7 +47,7 @@ const delegatedTurn = (status: AgentResultTurn['status'] = 'done'): AgentResultT
             agent: 'instruct',
             call: {
                 id: 'call_1',
-                name: 'agentDelegate',
+                name: 'delegate',
                 arguments: '{"agent":"research","input":"find it"}'
             }
         },
@@ -67,7 +67,7 @@ const delegatedTurn = (status: AgentResultTurn['status'] = 'done'): AgentResultT
         {
             type: 'tool_result',
             agent: 'instruct',
-            name: 'agentDelegate',
+            name: 'delegate',
             callId: 'call_1',
             content: '{"agent":"research","content":"research answer"}',
             isError: false
@@ -154,7 +154,7 @@ describe('listAgentResultBlocks', () => {
                 agent: 'instruct',
                 call: {
                     id: 'call_9',
-                    name: 'agentDelegate',
+                    name: 'delegate',
                     arguments: '{"agent":"research","input":"fail"}'
                 }
             },
@@ -173,7 +173,7 @@ describe('listAgentResultBlocks', () => {
             {
                 type: 'tool_result',
                 agent: 'instruct',
-                name: 'agentDelegate',
+                name: 'delegate',
                 callId: 'call_9',
                 content: 'child exploded',
                 isError: true
@@ -181,7 +181,7 @@ describe('listAgentResultBlocks', () => {
             {
                 type: 'tool_result',
                 agent: 'instruct',
-                name: 'agentDelegate',
+                name: 'delegate',
                 callId: 'call_9',
                 content: 'ignored duplicate',
                 isError: false
@@ -318,7 +318,7 @@ describe('reference lookup', () => {
                     agent: 'instruct',
                     call: {
                         id: 'call_7',
-                        name: 'agentDelegate',
+                        name: 'delegate',
                         arguments: '{"agent":"research","input":"later"}'
                     }
                 }
@@ -424,7 +424,7 @@ describe('reference lookup', () => {
                     agent: 'instruct',
                     call: {
                         id: `call-${id}`,
-                        name: 'agentDelegate',
+                        name: 'delegate',
                         arguments: '{"agent":"researcher","input":"look"}'
                     }
                 },
@@ -443,7 +443,7 @@ describe('reference lookup', () => {
                 {
                     type: 'tool_result',
                     agent: 'instruct',
-                    name: 'agentDelegate',
+                    name: 'delegate',
                     callId: `call-${id}`,
                     content: answerText,
                     isError: false
@@ -517,7 +517,7 @@ describe('conversation labels (R8)', () => {
                     thread: { id: 'inv-root' },
                     call: {
                         id: 'call_1',
-                        name: 'agentDelegate',
+                        name: 'delegate',
                         arguments: '{"agent":"Helper","input":"child"}'
                     }
                 },
@@ -533,7 +533,7 @@ describe('conversation labels (R8)', () => {
                     thread: { id: 'inv-child', parentId: 'inv-root', callId: 'call_1' },
                     message: assistant('child answer')
                 },
-                { type: 'tool_result', agent: 'Researcher', name: 'agentDelegate', callId: 'call_1', content: 'ok', isError: false },
+                { type: 'tool_result', agent: 'Researcher', name: 'delegate', callId: 'call_1', content: 'ok', isError: false },
                 { type: 'done', agent: 'Researcher', thread: { id: 'inv-root' }, message: assistant('root answer') }
             ]
         };
@@ -825,7 +825,7 @@ describe('host-thread root routing', () => {
                     agent: 'probe',
                     call: {
                         id: 'call_1',
-                        name: 'agentDelegate',
+                        name: 'delegate',
                         arguments: '{"agent":"research","input":"find it"}'
                     },
                     thread: { id: '1' }

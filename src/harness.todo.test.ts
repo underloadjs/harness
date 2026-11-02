@@ -183,7 +183,7 @@ describe('todoManage', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'agentDelegate',
+            'delegate',
             'threadFork',
             'peek'
         ]);

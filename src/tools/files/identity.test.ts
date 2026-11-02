@@ -2,7 +2,7 @@
 //
 // This helper is the fix for three defects that all came from comparing resolved
 // PATH STRINGS instead of file identity:
-//   - fileWrite/fileEdit accepted a batch that wrote one file twice under two
+//   - fileWrite/edit accepted a batch that wrote one file twice under two
 //     spellings (Windows case aliases, symlink aliases);
 //   - fileGlob walked the same tree twice for aliased roots and listed every file
 //     twice.

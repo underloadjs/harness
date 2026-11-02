@@ -14,7 +14,7 @@
 //       tool message (placeholders are projection-only; the canonical transcript
 //       keeps the actual result at the original call position, in call order, even
 //       when results arrive out of order).
-//   R4  One model stream per agent at a time; `agentDelegate` stays pending while
+//   R4  One model stream per agent at a time; `delegate` stays pending while
 //       the child runs, the parent stays free, same-agent followups are queued with
 //       the child's transcript preserved, and only the primary sees delegation.
 //       `toolCancel({callId})` releases one call, siblings continue, and a late
@@ -228,12 +228,19 @@ const streamFrom = (
 };
 
 // A tool that reports its start and then stays pending until the test settles it.
+//
+// `mode: 'async'` is part of what this helper exists to test (T2/R2/R3): an ASYNC
+// completion triggers its own agent turn, so the model is re-requested while the call is
+// still pending and `tool_result`/`wakeup` frames carry the real pending list. Under the
+// library default ('sync') a pending call would hold the batch gate instead, and these
+// background-contract tests would pin the wrong behaviour.
 const gatedTool = (name: string, gate: Deferred<string>, log: string[] = []) =>
     tool<string, string>({
         description: `Gated test tool ${name}.`,
         tags: ['test'],
         // Core, so the model sees it without a discovery round.
         visibility: 'core',
+        mode: 'async',
         parameters: {
             type: 'object',
             properties: { value: { type: 'string' } },
@@ -257,6 +264,9 @@ const abortableTool = (name: string, log: string[]) => {
         description: `Abortable test tool ${name}.`,
         tags: ['test'],
         visibility: 'core',
+        // T2/R2: async, exactly like the shipped long-running tools, so a run-level
+        // cancel and a per-call abort are observable while the run stays responsive.
+        mode: 'async',
         parameters: {
             type: 'object',
             properties: { value: { type: 'string' } },
@@ -286,6 +296,9 @@ const stubbornTool = (name: string) => {
         description: `Uncooperative test tool ${name}.`,
         tags: ['test'],
         visibility: 'core',
+        // T2/R2: async (see gatedTool) — the point is a call that keeps running while
+        // the run stays responsive, which is the async contract.
+        mode: 'async',
         parameters: {
             type: 'object',
             properties: { value: { type: 'string' } },
@@ -894,7 +907,7 @@ describe('delegation under background tools', () => {
                         (turn, request) => {
                             if (turn === 0) {
                                 return calls(
-                                    call('d1', 'agentDelegate', '{"agent":"researcher","input":"one"}')
+                                    call('d1', 'delegate', '{"agent":"researcher","input":"one"}')
                                 );
                             }
 
@@ -918,7 +931,7 @@ describe('delegation under background tools', () => {
                             if (!queued && settled === 0) {
                                 queuedWhileChildPending = !slowGate.settled;
                                 return calls(
-                                    call('d2', 'agentDelegate', '{"agent":"researcher","input":"two"}')
+                                    call('d2', 'delegate', '{"agent":"researcher","input":"two"}')
                                 );
                             }
 
@@ -954,13 +967,13 @@ describe('delegation under background tools', () => {
                 role: 'assistant',
                 content: '',
                 toolCalls: [
-                    { id: 'd1', name: 'agentDelegate', arguments: '{"agent":"researcher","input":"one"}' }
+                    { id: 'd1', name: 'delegate', arguments: '{"agent":"researcher","input":"one"}' }
                 ]
             },
-            { role: 'tool', content: expect.any(String), toolCallId: 'd1', name: 'agentDelegate' }
+            { role: 'tool', content: expect.any(String), toolCallId: 'd1', name: 'delegate' }
         ]);
         // Allowlist/depth: a subagent never sees the delegation control.
-        expect(childSeen[0].toolNames.filter((name) => name === 'agentDelegate')).toEqual([]);
+        expect(childSeen[0].toolNames.filter((name) => name === 'delegate')).toEqual([]);
         expect(state.status).toBe('pending');
 
         // The child's own tool completes; its first run answers, which settles d1.
@@ -990,12 +1003,12 @@ describe('delegation under background tools', () => {
         ).toEqual([
             {
                 toolCallId: 'd1',
-                name: 'agentDelegate',
+                name: 'delegate',
                 content: '{"agent":"researcher","content":"child-one"}'
             },
             {
                 toolCallId: 'd2',
-                name: 'agentDelegate',
+                name: 'delegate',
                 content: '{"agent":"researcher","content":"child-two"}'
             }
         ]);
@@ -1039,7 +1052,7 @@ describe('delegated answer extraction', () => {
                     ? calls(
                           call(
                               'd1',
-                              'agentDelegate',
+                              'delegate',
                               '{"agent":"researcher","input":"find facts"}'
                           )
                       )
@@ -1093,7 +1106,7 @@ describe('delegated answer extraction', () => {
         expect(toolMessages(writer.agent.messages)).toEqual([
             {
                 toolCallId: 'd1',
-                name: 'agentDelegate',
+                name: 'delegate',
                 content: '{"agent":"researcher","content":"the researched facts"}'
             }
         ]);
@@ -1137,7 +1150,7 @@ describe('delegated answer extraction', () => {
         expect(toolMessages(writer.agent.messages)).toEqual([
             {
                 toolCallId: 'd1',
-                name: 'agentDelegate',
+                name: 'delegate',
                 content: '{"agent":"researcher","content":"final facts"}'
             }
         ]);
@@ -1160,7 +1173,7 @@ describe('delegated answer extraction', () => {
         });
 
         const state = probe(
-            writer.executeTool('agentDelegate', { agent: 'researcher', input: 'find facts' })
+            writer.executeTool('delegate', { agent: 'researcher', input: 'find facts' })
         );
         await flush();
         expect(state.status).toBe('pending');
@@ -1196,7 +1209,7 @@ describe('delegated answer extraction', () => {
         });
 
         const state = probe(
-            writer.executeTool('agentDelegate', { agent: 'researcher', input: 'find facts' })
+            writer.executeTool('delegate', { agent: 'researcher', input: 'find facts' })
         );
         await flush();
         slowGate.resolve('slow-done');
@@ -1278,7 +1291,7 @@ describe('delegated answer extraction', () => {
         });
 
         const first = probe(
-            writer.executeTool('agentDelegate', { agent: 'researcher', input: 'find facts' })
+            writer.executeTool('delegate', { agent: 'researcher', input: 'find facts' })
         );
         await flush();
         slowGate.resolve('slow-done');
@@ -1287,7 +1300,7 @@ describe('delegated answer extraction', () => {
         expect(first.value).toEqual({ agent: 'researcher', content: 'first facts' });
 
         const second = probe(
-            writer.executeTool('agentDelegate', { agent: 'researcher', input: 'find more' })
+            writer.executeTool('delegate', { agent: 'researcher', input: 'find more' })
         );
         await flush();
 
@@ -1618,7 +1631,7 @@ describe('toolCancel', () => {
                         (turn) => {
                             if (turn === 0) {
                                 return calls(
-                                    call('d1', 'agentDelegate', '{"agent":"helper","input":"work"}')
+                                    call('d1', 'delegate', '{"agent":"helper","input":"work"}')
                                 );
                             }
                             if (turn === 1) {
@@ -1773,7 +1786,7 @@ describe('whole-run cancel', () => {
                         (turn) => {
                             if (turn === 0) {
                                 return calls(
-                                    call('d1', 'agentDelegate', '{"agent":"researcher","input":"dig"}')
+                                    call('d1', 'delegate', '{"agent":"researcher","input":"dig"}')
                                 );
                             }
                             if (turn === 1) {

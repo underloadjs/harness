@@ -1,4 +1,4 @@
-// BoundedText — the shared capped UTF-8 capture behind commandRun, gitDiff, and
+// BoundedText — the shared capped UTF-8 capture behind shell, gitDiff, and
 // the Python syntax checker.
 //
 // What this pins, exactly:

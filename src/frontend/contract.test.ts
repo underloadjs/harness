@@ -99,11 +99,11 @@ describe('descriptor extensions', () => {
         expect(
             coreToolsOf(
                 descriptor({
-                    coreTools: ['fileRead', 'fileWrite', 'fileEdit', 'fileGlob', 'webSearch', 'toolRequest']
+                    coreTools: ['read', 'fileWrite', 'edit', 'fileGlob', 'search', 'toolRequest']
                 }),
                 1
             )
-        ).toEqual(['fileRead', 'fileWrite', 'fileEdit', 'fileGlob', 'webSearch', 'toolRequest']);
+        ).toEqual(['read', 'fileWrite', 'edit', 'fileGlob', 'search', 'toolRequest']);
 
         // An older server with no `coreTools`: the legacy harness-owned fallback,
         // adding delegate when the local team has a second member.
@@ -113,7 +113,7 @@ describe('descriptor extensions', () => {
             'toolManage',
             'toolCreate',
             'todoManage',
-            'agentDelegate'
+            'delegate'
         ]);
         expect(coreToolsOf(descriptor(), 1)).toEqual([
             'toolRequest',
@@ -167,14 +167,14 @@ describe('session timings', () => {
             callIdOf({
                 type: 'tool_result',
                 agent: 'a',
-                name: 'fileRead',
+                name: 'read',
                 content: 'x',
                 isError: false,
                 callId: 'c1'
             } as HarnessEvent)
         ).toBe('c1');
         expect(
-            callIdOf({ type: 'tool_result', agent: 'a', name: 'fileRead', content: 'x', isError: false })
+            callIdOf({ type: 'tool_result', agent: 'a', name: 'read', content: 'x', isError: false })
         ).toBeUndefined();
         expect(callIdOf({ type: 'text', agent: 'a', delta: 'x' })).toBeUndefined();
     });
@@ -342,15 +342,15 @@ describe('token tallies', () => {
 // value types) that the runtime would not send but persisted data can contain, and
 // the accessors must degrade instead of throwing.
 const pendingTools = [
-    { callId: 'c1', name: 'fileRead', elapsedMs: 1200 },
-    { callId: 'c2', name: 'webSearch', elapsedMs: 900 }
+    { callId: 'c1', name: 'read', elapsedMs: 1200 },
+    { callId: 'c2', name: 'search', elapsedMs: 900 }
 ];
 
 const resultWith = (fields: Record<string, unknown>): HarnessEvent =>
     ({
         type: 'tool_result',
         agent: 'writer',
-        name: 'fileRead',
+        name: 'read',
         content: 'ok',
         isError: false,
         ...fields

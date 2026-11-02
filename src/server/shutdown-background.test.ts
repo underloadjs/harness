@@ -67,7 +67,7 @@ const DEFAULTS = {
     hasApiKey: true
 };
 
-// Forced unconfigured webSearch entry: the catalogue must not depend on the test
+// Forced unconfigured search entry: the catalogue must not depend on the test
 // runner's environment (mirrors persistence.test.ts).
 const CATALOGUE = createToolCatalogue({
     websearch: createWebSearchCatalogueEntry({ configuration: { env: {} } })

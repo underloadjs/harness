@@ -87,7 +87,7 @@ describe('harness root attachments', () => {
         const writer = agent({
             model: 'parent',
             stream: scripted(
-                [calls('d1', 'agentDelegate', '{"agent":"helper","input":"child prompt"}'), answer('parent done')],
+                [calls('d1', 'delegate', '{"agent":"helper","input":"child prompt"}'), answer('parent done')],
                 primarySeen
             )
         });

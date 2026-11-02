@@ -1,7 +1,7 @@
 // R11 live-shell wiring: a transcript file link uses the EXISTING tool endpoint.
 //
 // The unit tests cover the dialog and the DOM transform. This test pins the seam
-// the shell owns: clicking a file link posts one bounded `fileRead` call through
+// the shell owns: clicking a file link posts one bounded `read` call through
 // `api.callTool`, with no new route and no auto-fetch.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts transcript-preview-main.test.ts
@@ -99,7 +99,7 @@ const stubServer = (restored: SessionSnapshot): Call[] => {
                 );
             }
 
-            if (url === '/api/tools/fileRead' && method === 'POST') {
+            if (url === '/api/tools/read' && method === 'POST') {
                 return json({
                     ok: true,
                     result: {
@@ -140,7 +140,7 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-it('opens a bounded fileRead through the existing tool endpoint', async () => {
+it('opens a bounded read through the existing tool endpoint', async () => {
     const restored = snapshot({ turns: [turn()] });
     localStorage.setItem(SESSION_KEY, 's1');
     const calls = stubServer(restored);
@@ -154,7 +154,7 @@ it('opens a bounded fileRead through the existing tool endpoint', async () => {
     link?.click();
     await flush();
 
-    const toolCalls = calls.filter((call) => call.url === '/api/tools/fileRead');
+    const toolCalls = calls.filter((call) => call.url === '/api/tools/read');
     expect(toolCalls).toHaveLength(1);
     expect(toolCalls[0]?.method).toBe('POST');
     expect(toolCalls[0]?.body).toEqual({

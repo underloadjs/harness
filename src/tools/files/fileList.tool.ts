@@ -15,7 +15,7 @@
 // -----------------------------
 // The old contract returned `string[]` for the WHOLE listing. One `node_modules`
 // or build-output directory could therefore produce tens of thousands of entries in
-// a single tool response, which is exactly the failure that fileRead's budget
+// a single tool response, which is exactly the failure that read's budget
 // already prevents on the read side. Every call now returns a bounded WINDOW of the
 // flat entry list:
 //

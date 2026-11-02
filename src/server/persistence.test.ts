@@ -65,7 +65,7 @@ const DEFAULTS = {
     hasApiKey: true
 };
 
-// Force the unconfigured webSearch entry so the catalogue does not depend on the
+// Force the unconfigured search entry so the catalogue does not depend on the
 // test runner's environment (nor on a developer's .env).
 const CATALOGUE = createToolCatalogue({
     websearch: createWebSearchCatalogueEntry({ configuration: { env: {} } })
@@ -772,7 +772,7 @@ describe('R3b durable harness database', () => {
                 {
                     role: 'assistant',
                     content: '',
-                    toolCalls: [{ id: 'lead-1', name: 'agentDelegate', arguments: '{}' }]
+                    toolCalls: [{ id: 'lead-1', name: 'delegate', arguments: '{}' }]
                 }
             ],
             helper: [
@@ -789,7 +789,7 @@ describe('R3b durable harness database', () => {
             role: 'tool',
             content: INTERRUPTED_TOOL_RESULT_TEXT,
             toolCallId: 'lead-1',
-            name: 'agentDelegate'
+            name: 'delegate'
         });
         expect(multiRepaired.agents.helper.messages[1]).toEqual({
             role: 'tool',

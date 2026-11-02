@@ -69,9 +69,9 @@ const CORE_ORDER = [
     'agentResult'
 ];
 
-// N6: threadFork is core for every agent; agentDelegate stays primary-only and is
+// N6: threadFork is core for every agent; delegate stays primary-only and is
 // declared BEFORE threadFork (registration order).
-const CORE_ORDER_PRIMARY = [...CORE_ORDER, 'agentDelegate', 'threadFork'];
+const CORE_ORDER_PRIMARY = [...CORE_ORDER, 'delegate', 'threadFork'];
 const CORE_ORDER_SUBAGENT = [...CORE_ORDER, 'threadFork'];
 
 // R9 bounded shapes (src/core/{profile,chapter,location}.ts):
@@ -173,7 +173,7 @@ describe('session record tools', () => {
             page: page()
         });
 
-        // Configured tools precede the harness-owned set; agentDelegate is
+        // Configured tools precede the harness-owned set; delegate is
         // primary-only, and threadFork follows it in registration order.
         // `peek` was configured after the baseline, so it follows it.
         expect(declaredNames(writerSeen[0])).toEqual([...CORE_ORDER_PRIMARY, 'peek']);

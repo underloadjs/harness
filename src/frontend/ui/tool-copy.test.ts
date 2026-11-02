@@ -57,7 +57,7 @@ describe('tool dialog copy', () => {
     it('copies the pending call arguments and state, then the settled result', async () => {
         const writeText = vi.fn(async () => undefined);
         setClipboard(writeText);
-        const card = mount(createToolCallCard('fileRead', '{"paths":["a.ts"]}'));
+        const card = mount(createToolCallCard('read', '{"paths":["a.ts"]}'));
         openDialog(card);
 
         copyButton().click();
@@ -66,7 +66,7 @@ describe('tool dialog copy', () => {
         expect(writeText).toHaveBeenNthCalledWith(
             1,
             [
-                'Tool: fileRead',
+                'Tool: read',
                 'State: running',
                 '',
                 'Arguments:',
@@ -84,7 +84,7 @@ describe('tool dialog copy', () => {
         expect(writeText).toHaveBeenNthCalledWith(
             2,
             [
-                'Tool: fileRead',
+                'Tool: read',
                 'State: ok',
                 '',
                 'Arguments:',
@@ -102,7 +102,7 @@ describe('tool dialog copy', () => {
             throw new Error('permission denied');
         });
         setExecCommand(() => false);
-        const card = mount(createToolCallCard('fileRead', '{}'));
+        const card = mount(createToolCallCard('read', '{}'));
         openDialog(card);
 
         copyButton().click();

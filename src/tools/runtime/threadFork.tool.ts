@@ -43,6 +43,11 @@ export const metadata = THREAD_FORK_METADATA;
 export const registration = {
     group: 'runtime',
     activation: 'forks',
+    // T2/R2: ASYNC, and this is the declaration of the behaviour the branch runtime
+    // already implements (a detached clone answers through the mailbox whenever it
+    // finishes, and the requester stays free). The control dispatch path never joins a
+    // sync group, so the mode and the dispatch agree by construction.
+    mode: 'async',
     order: 130,
     sessionBound: true,
     alwaysDeclared: false,

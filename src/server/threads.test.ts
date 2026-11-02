@@ -1086,7 +1086,7 @@ describe('delegated child threads', () => {
                                         toolCalls: [
                                             {
                                                 id: 'delegate-1',
-                                                name: 'agentDelegate',
+                                                name: 'delegate',
                                                 arguments: JSON.stringify({
                                                     agent: 'helper',
                                                     input: 'child work'
@@ -1472,7 +1472,7 @@ describe('delegated child threads', () => {
                                             toolCalls: [
                                                 {
                                                     id: 'twin-a',
-                                                    name: 'agentDelegate',
+                                                    name: 'delegate',
                                                     arguments: JSON.stringify({
                                                         agent: 'helper',
                                                         input: 'twin task'
@@ -1480,7 +1480,7 @@ describe('delegated child threads', () => {
                                                 },
                                                 {
                                                     id: 'twin-b',
-                                                    name: 'agentDelegate',
+                                                    name: 'delegate',
                                                     arguments: JSON.stringify({
                                                         agent: 'helper',
                                                         input: 'twin task'
@@ -2040,7 +2040,7 @@ describe('cascaded thread stop', () => {
                                         toolCalls: [
                                             {
                                                 id: 'delegate-1',
-                                                name: 'agentDelegate',
+                                                name: 'delegate',
                                                 arguments: JSON.stringify({
                                                     agent: 'helper',
                                                     input: 'child work'

@@ -17,7 +17,7 @@
 //
 // Shape compatibility (do not regress this — T3's toolCreate registration and the
 // server's direct-call path depend on it):
-//   - the proxy is callable: `fileRead(['a.txt'])` runs the real tool's direct path;
+//   - the proxy is callable: `read(['a.txt'])` runs the real tool's direct path;
 //   - `execute(context)` exists and runs the real tool's execute path, because
 //     harness.ts calls `definition.execute(...)` directly;
 //   - `name` is a writable, enumerable own property, so `definition.name = key`
@@ -37,13 +37,13 @@
 
 import { normalizeTags } from '../core/tool';
 import type { Tool } from '../types';
-import { descriptorMetadata, loadPresetTool } from './descriptors';
+import { descriptorMetadata, descriptorOf, loadPresetTool } from './descriptors';
 import type { DescriptorMetadata } from './descriptors';
 
 // Build the callable proxy for one descriptor row.
 //
 // The explicit generics let each named export keep its parameter/result types
-// (`lazyTool<string[], FileReadResult>('fileRead')`) even though the loader is
+// (`lazyTool<string[], FileReadResult>('read')`) even though the loader is
 // untyped: the descriptor row is schema plumbing, not the public type surface.
 export const lazyTool = <TParameters = any, TResult = any>(
     name: string
@@ -87,6 +87,12 @@ export const lazyTool = <TParameters = any, TResult = any>(
     callable.description = metadata.description;
     callable.tags = normalizeTags(metadata.tags);
     callable.visibility = metadata.visibility ?? 'searchable';
+    // T2/R2: the row's DECLARED turn policy travels with the proxy, so a host that
+    // registers a preset directly (`tools: { shell }` or the whole `presetTools` map)
+    // resolves the same effective mode the harness binds for the registered baseline
+    // row. A row that declared no policy leaves the key absent = documented 'sync'.
+    const mode = descriptorOf(name)?.mode;
+    if (mode !== undefined) callable.mode = mode;
     callable.parameters = metadata.parameters;
 
     // The harness executes through this property, not through the callable, so it

@@ -45,7 +45,7 @@ export type StartServerOptions = {
     // its endpoint `variables.root` (see ./service.ts).
     databaseRoot?: string | null;
     // Direct-call catalogue. Omitted means "build it now, after `.env` loading".
-    // Tests inject one to pin a configured/unconfigured webSearch without
+    // Tests inject one to pin a configured/unconfigured search without
     // touching the test runner's environment.
     catalogue?: ToolCatalogue;
     // The in-memory harness registry shared by the store and the API. Omitted
@@ -102,7 +102,7 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
 
     const configuration = loadConfiguration();
 
-    // Built after loadEnvironmentFile() on purpose: webSearch resolves its
+    // Built after loadEnvironmentFile() on purpose: search resolves its
     // provider key here, once, and the handler keeps the snapshot for its whole
     // lifetime. A keyless host still gets the entry, marked unconfigured.
     const catalogue = options.catalogue ?? createToolCatalogue();
@@ -132,7 +132,7 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
 
     // The store owns no catalogue, so bind the describer here: every session's
     // frozen `harnessDefinition` reflects what THIS host can actually run
-    // (webSearch only when a key resolved).
+    // (search only when a key resolved).
     const store = new SessionStore(
         options.settings ?? configuration.settings,
         registry,

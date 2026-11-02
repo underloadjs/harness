@@ -99,7 +99,7 @@ describe('agentManage / agentResult registration', () => {
         const lead = brain(
             scripted(
                 [
-                    callTool('c1', 'agentDelegate', '{"agent":"helper","input":"help"}'),
+                    callTool('c1', 'delegate', '{"agent":"helper","input":"help"}'),
                     answer('lead result')
                 ],
                 seenLead
@@ -130,7 +130,7 @@ describe('agentManage / agentResult registration', () => {
 
         expect(declaredNames(seenLead[0])).toEqual([
             ...CORE_DECLARATIONS,
-            'agentDelegate',
+            'delegate',
             'threadFork'
         ]);
         expect(declaredNames(seenHelper[0])).toEqual([...CORE_DECLARATIONS, 'threadFork']);
@@ -201,7 +201,7 @@ describe('agentManage', () => {
         });
         const lead = brain(
             scripted([
-                callTool('c1', 'agentDelegate', '{"agent":"helper","input":"help"}'),
+                callTool('c1', 'delegate', '{"agent":"helper","input":"help"}'),
                 answer('lead result')
             ]),
             { instruction: 'LEAD-SYSTEM-SECRET' }
@@ -590,7 +590,7 @@ describe('subagent and fork results', () => {
         const helper = brain(scripted([answer('helper result')]));
         const lead = brain(
             scripted([
-                callTool('c1', 'agentDelegate', '{"agent":"helper","input":"help"}'),
+                callTool('c1', 'delegate', '{"agent":"helper","input":"help"}'),
                 answer('lead final')
             ])
         );
@@ -799,7 +799,7 @@ describe('snapshot durability (R3)', () => {
                 const delegateResult = request.messages.some(
                     (message) =>
                         message.role === 'tool' &&
-                        message.name === 'agentDelegate' &&
+                        message.name === 'delegate' &&
                         message.content.includes('helper answer')
                 );
                 const forkResult = request.messages.some(
@@ -819,7 +819,7 @@ describe('snapshot durability (R3)', () => {
                             toolCalls: [
                                 {
                                     id: 'c1',
-                                    name: 'agentDelegate',
+                                    name: 'delegate',
                                     arguments: '{"agent":"helper","input":"help"}'
                                 },
                                 {

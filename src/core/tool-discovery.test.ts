@@ -73,12 +73,14 @@ describe('tools folder consolidation (R7)', () => {
 
         expect(runtimeEntries).toEqual([
             'actionRequest.tool.ts',
-            'agentDelegate.tool.ts',
             'agentManage.tool.ts',
             'agentResult.tool.ts',
             'chapterManage.tool.ts',
+            'delegate.tool.ts',
+            'fetch.tool.ts',
             'locationManage.tool.ts',
             'profileManage.tool.ts',
+            'search.tool.ts',
             'threadFork.tool.ts',
             'threadList.tool.ts',
             'threadSend.tool.ts',
@@ -88,9 +90,7 @@ describe('tools folder consolidation (R7)', () => {
             'toolList.tool.ts',
             'toolManage.tool.ts',
             'toolRegistry.tool.ts',
-            'toolRequest.tool.ts',
-            'webFetch.tool.ts',
-            'webSearch.tool.ts'
+            'toolRequest.tool.ts'
         ]);
     });
 });
@@ -111,20 +111,20 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'agentDelegate',
+            'delegate',
             'threadFork',
             'actionRequest',
             'toolCancel',
             'syntaxCheck',
-            'fileRead',
+            'read',
             'fileWrite',
-            'fileEdit',
+            'edit',
             'fileList',
             'fileGlob',
-            'commandRun',
+            'shell',
             'gitDiff',
-            'webSearch',
-            'webFetch',
+            'search',
+            'fetch',
             'threadSend',
             'threadList'
         ]);
@@ -132,7 +132,7 @@ describe('discoverToolMetadata (R8/R9)', () => {
 
     it('reports the group, activation, origin and sourcePath of one entry exactly', () => {
         const descriptors = discoverToolMetadata();
-        const read = descriptors.find((descriptor) => descriptor.name === 'fileRead');
+        const read = descriptors.find((descriptor) => descriptor.name === 'read');
 
         expect(read).toBeDefined();
         expect({
@@ -146,9 +146,9 @@ describe('discoverToolMetadata (R8/R9)', () => {
             listed: read!.listed,
             alwaysDeclared: read!.alwaysDeclared
         }).toEqual({
-            name: 'fileRead',
-            label: 'tools/files/fileRead.tool.ts',
-            sourcePath: 'tools/files/fileRead.tool.ts',
+            name: 'read',
+            label: 'tools/files/read.tool.ts',
+            sourcePath: 'tools/files/read.tool.ts',
             origin: 'package',
             group: 'preset',
             activation: 'always',
@@ -177,7 +177,7 @@ describe('discoverToolMetadata (R8/R9)', () => {
             };
         };
 
-        expect(policy('agentDelegate')).toEqual({
+        expect(policy('delegate')).toEqual({
             activation: 'subagents',
             pendingOnly: undefined,
             control: undefined,
@@ -209,7 +209,7 @@ describe('discoverToolMetadata (R8/R9)', () => {
             answerExtraction: undefined,
             sessionBound: true
         });
-        expect(policy('webSearch')).toEqual({
+        expect(policy('search')).toEqual({
             activation: 'websearch',
             pendingOnly: undefined,
             control: undefined,
@@ -217,7 +217,7 @@ describe('discoverToolMetadata (R8/R9)', () => {
             answerExtraction: undefined,
             sessionBound: true
         });
-        expect(policy('webFetch')).toEqual({
+        expect(policy('fetch')).toEqual({
             activation: 'webfetch',
             pendingOnly: undefined,
             control: undefined,
@@ -233,7 +233,7 @@ describe('discoverToolMetadata (R8/R9)', () => {
             answerExtraction: undefined,
             sessionBound: true
         });
-        expect(policy('fileRead')).toEqual({
+        expect(policy('read')).toEqual({
             activation: 'always',
             pendingOnly: undefined,
             control: undefined,
@@ -256,12 +256,12 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'agentDelegate',
+            'delegate',
             'threadFork',
             'actionRequest',
             'toolCancel',
-            'webSearch',
-            'webFetch',
+            'search',
+            'fetch',
             'threadSend',
             'threadList'
         ]);

@@ -1,8 +1,8 @@
-// Shared HTTP plumbing and bounds for the webFetch tool.
+// Shared HTTP plumbing and bounds for the fetch tool.
 //
 // WHY THIS FILE EXISTS
 // --------------------
-// webFetch has two providers — `native` (a direct GET) and `exa` (Exa's
+// fetch has two providers — `native` (a direct GET) and `exa` (Exa's
 // /contents POST) — but only the GET policy lives here: how long a fetch may
 // take, how much of a response is accepted, which content types are readable,
 // what an error may say, and how a URL is validated. The Exa adapter reuses
@@ -86,17 +86,17 @@ export const acceptHeader = (format: 'markdown' | 'text' | 'html'): string => {
 // One fixed sentence per failure class. Page bodies are deliberately absent:
 // an error page is HTML noise the model does not need.
 const statusFailure = (status: number): HarnessError => {
-    if (status === 404) return new HarnessError('webFetch could not find the page (HTTP 404).');
+    if (status === 404) return new HarnessError('fetch could not find the page (HTTP 404).');
     if (status === 401 || status === 403) {
-        return new HarnessError(`webFetch was denied access to the page (HTTP ${status}).`);
+        return new HarnessError(`fetch was denied access to the page (HTTP ${status}).`);
     }
-    if (status === 429) return new HarnessError('webFetch is rate limited by the host (HTTP 429). Try again later.');
+    if (status === 429) return new HarnessError('fetch is rate limited by the host (HTTP 429). Try again later.');
 
-    return new HarnessError(`webFetch failed (HTTP ${status}).`);
+    return new HarnessError(`fetch failed (HTTP ${status}).`);
 };
 
 const oversizedResponse = (): HarnessError =>
-    new HarnessError(`webFetch received a response larger than ${MAX_RESPONSE_BYTES} bytes.`);
+    new HarnessError(`fetch received a response larger than ${MAX_RESPONSE_BYTES} bytes.`);
 
 // Read a response body without ever holding more than MAX_RESPONSE_BYTES.
 // Same streaming budget as ../websearch/request's reader: chunk-by-chunk byte
@@ -233,8 +233,8 @@ export const requestPage = async (url: string, format: 'markdown' | 'text' | 'ht
     // since fetch rejects with an AbortError for both.
     const networkFailure = (): HarnessError =>
         controller.signal.aborted
-            ? new HarnessError(`webFetch timed out after ${FETCH_TIMEOUT_MS} ms.`)
-            : new HarnessError('webFetch could not be reached (network error).');
+            ? new HarnessError(`fetch timed out after ${FETCH_TIMEOUT_MS} ms.`)
+            : new HarnessError('fetch could not be reached (network error).');
 
     const send = async (userAgent: string): Promise<Response> => {
         try {
@@ -285,7 +285,7 @@ export const requestPage = async (url: string, format: 'markdown' | 'text' | 'ht
                 // Best-effort: the rejection message is what the caller needs.
             }
 
-            throw new HarnessError(`webFetch does not support this content type (${mime || 'unknown'}).`);
+            throw new HarnessError(`fetch does not support this content type (${mime || 'unknown'}).`);
         }
 
         const body = await readBody(response, networkFailure);

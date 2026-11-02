@@ -53,12 +53,16 @@ describe('file preview copy', () => {
 
         await flush();
 
-        expect(copyButton()?.textContent).toBe('Copy');
+        // T1/R3: the shared control is an icon button — no visible word before the
+        // first activation, a stable accessible name, and a hidden live child.
+        expect(copyButton()?.textContent).toBe('');
+        expect(copyButton()?.querySelector('svg.dialog-copy-icon > path')).not.toBeNull();
+        expect(copyButton()?.getAttribute('aria-label')).toBe('Copy dialog contents');
         copyButton()?.click();
         await flush();
 
         expect(writeText).toHaveBeenCalledWith(content);
-        expect(copyButton()?.textContent).toBe('Copied');
+        expect(copyButton()?.querySelector('.dialog-copy-feedback')?.textContent).toBe('Copied');
     });
 
     it('has no Copy action for an error or an empty window', async () => {
@@ -70,7 +74,7 @@ describe('file preview copy', () => {
                               content: '',
                               startLine: 1,
                               endLine: 0,
-                              error: { message: 'fileRead could not find "missing.ts".' }
+                              error: { message: 'read could not find "missing.ts".' }
                           }
                       ]
                   }

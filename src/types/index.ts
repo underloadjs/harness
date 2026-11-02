@@ -490,7 +490,7 @@ export type ToolSearchResult = {
     //
     // Present only when at least one core tool matches, so an ordinary result keeps
     // its old exact shape. The harness supplies only the core tools VISIBLE to the
-    // calling agent (agentDelegate is excluded for subagents, toolCreate under the
+    // calling agent (delegate is excluded for subagents, toolCreate under the
     // 'primary' policy too), which is what keeps this list honest rather than a
     // registry dump.
     alreadyAvailable?: ToolMatch[];
@@ -516,7 +516,7 @@ export type ToolSearchOptions = {
 // ToolContext, including agent/agents/run inside a harness).
 //
 // SECURITY: compilation uses the host realm's Function constructor. A created tool
-// has exactly the permissions of the process — the same trust model as `commandRun`
+// has exactly the permissions of the process — the same trust model as `shell`
 // in src/tools. There is NO sandbox and NO isolation; the only guarantees are
 // bounded input validation, a bounded number of tools, and a compile error if the
 // source does not parse.
@@ -703,7 +703,7 @@ export type HarnessToolRuntime = {
     // (completed answer values only, never transcripts).
     agentManage: () => unknown;
     agentResult: (parameters: Record<string, any>) => unknown;
-    // agentDelegate: one-level bounded delegation. `run` is the invocation-bound
+    // delegate: one-level bounded delegation. `run` is the invocation-bound
     // harness runner from ToolContext (never a captured implementation).
     delegate: (
         caller: Agent | undefined,
@@ -723,8 +723,8 @@ export type HarnessToolRuntime = {
     // credentials) live in the harness; the independently compiled source entries
     // only delegate to these live operations. A source replacement that does not
     // use the configured provider can ignore them.
-    webSearch: (context: ToolContext) => Promise<unknown>;
-    webFetch: (context: ToolContext) => Promise<unknown>;
+    search: (context: ToolContext) => Promise<unknown>;
+    fetch: (context: ToolContext) => Promise<unknown>;
     // Session record stores (todo/profile/chapter/location) executed by their
     // source entries. State stays harness-owned and is cleared by reset().
     executeRecordTool: (
@@ -1206,7 +1206,7 @@ export type LocationStoreState = {
 // What a tool implementation is handed when the model calls it.
 //
 // The harness fields are optional because a tool can also be executed on its
-// own: `fileRead(['package.json'])` runs the same implementation with no agent, no
+// own: `read(['package.json'])` runs the same implementation with no agent, no
 // registry, and no run(). A tool that needs them must check, and the presets in
 // src/tools deliberately do not.
 export type ToolContext<TParameters = any> = {
@@ -1238,7 +1238,7 @@ export type ToolContext<TParameters = any> = {
     // not control.
     signal?: AbortSignal;
     // How deep the calling run is: 1 = a top-level run, 2 = a delegated/ctx.run
-    // child. Present for every harness invocation. The model-facing agentDelegate
+    // child. Present for every harness invocation. The model-facing delegate
     // tool uses it to keep delegation one level deep even when the primary agent
     // is itself being driven as somebody else's subagent.
     runDepth?: number;
@@ -1262,10 +1262,36 @@ export type ToolContext<TParameters = any> = {
     callTool?: (name: string, parameters: unknown) => Promise<unknown>;
 };
 
+// WHEN a finished call of this tool is allowed to start the next agent turn
+// (T2/R3). The mode belongs to the RESOLVED definition, never to the wire name, so
+// replacing a tool replaces its policy instead of inheriting one by name.
+//
+//   'sync'  — the completion joins its batch's SYNC GROUP: the run is re-entered only
+//             once EVERY sync call launched from the same assistant message has
+//             settled (success, failure, or cancellation). A message with one sync
+//             call therefore waits for exactly that call before the next turn. The
+//             implementation is STILL launched as background work (promise-backed,
+//             cancelable, delivered through the agent mailbox); only the turn trigger
+//             is grouped.
+//   'async' — the completion triggers its own turn immediately, even while other
+//             calls from the same message are still in flight. This is the historical
+//             background-tool behaviour.
+//
+// EFFECTIVE DEFAULT: 'sync'. A tool that declares nothing is sync, and the shipped
+// built-ins state their mode in their own `registration` literal so the policy
+// survives scanning, the generated manifest, and source loading without ever being
+// re-derived from a name.
+export type ToolMode = 'sync' | 'async';
+
 // A tool definition. `name` is optional: inside a harness the registry key names
-// the tool, so `webSearch: tool({...})` is enough.
+// the tool, so `search: tool({...})` is enough.
 export type ToolConfiguration<TParameters = any, TResult = any> = {
     name?: string;
+    // WHEN a completion of this tool may start the next agent turn. Omitted means
+    // 'sync' (see ToolMode): the call joins its message's sync group, and the run is
+    // re-entered only once every sync call of that batch has settled. Declare 'async'
+    // for a long-running tool whose outcome should re-prompt the model on its own.
+    mode?: ToolMode;
     // Shown to the model. Required — an undescribed tool is an unusable tool.
     description: string;
     // Capability tags, used by tool discovery to find close matches. Required:
@@ -1286,9 +1312,9 @@ export type ToolConfiguration<TParameters = any, TResult = any> = {
 // A tool is an executable object: it can be called directly, or registered on a
 // harness and called by the model. Both paths run the same implementation.
 //
-//     const fileRead = tool<string[], FileReadResult>({...});
-//     await fileRead(['package.json']);        // direct, no harness
-//     harness({ tools: { fileRead } });        // the model calls it
+//     const read = tool<string[], FileReadResult>({...});
+//     await read(['package.json']);        // direct, no harness
+//     harness({ tools: { read } });        // the model calls it
 export type Tool<TParameters = any, TResult = any> = {
     // Execute directly. The argument is the parameter value, exactly as
     // `execute` receives it.
@@ -1301,6 +1327,11 @@ export type Tool<TParameters = any, TResult = any> = {
     tags: readonly string[];
     // Resolved visibility. A harness declares core tools plus enabled ones.
     visibility: ToolVisibility;
+    // The DECLARED turn mode, copied from the configuration when one was given.
+    // Absent means the harness applies the documented 'sync' default. The harness
+    // never derives this from the wire name: a definition it did not register (a
+    // replacement, a host tool, a model-created tool) carries only its own policy.
+    mode?: ToolMode;
     parameters?: Record<string, unknown>;
     execute: (context: ToolContext<TParameters>) => Promise<TResult>;
 };
@@ -1309,7 +1340,7 @@ export type Tool<TParameters = any, TResult = any> = {
 // Web search (opt-in)
 // ---------------------------------------------------------------------------
 //
-// One model-facing tool, `webSearch`, backed by a hosted search API. The keys are
+// One model-facing tool, `search`, backed by a hosted search API. The keys are
 // provider credentials, so they are resolved once at harness construction and
 // never appear in a tool schema, argument, result, or progress event (W3).
 //
@@ -1373,12 +1404,12 @@ export type WebSearchResult = {
 };
 
 // ---------------------------------------------------------------------------
-// webFetch — one model-facing page-fetch tool (W4).
+// fetch — one model-facing page-fetch tool (W4).
 //
 // `native` needs no credential: it is a bounded GET with global `fetch` and a
 // dependency-free HTML-to-markdown/text conversion. `exa` is an optional
 // provider, available only when an Exa key exists (the same EXA_API_KEY
-// webSearch resolves), and reads pages through Exa's /contents endpoint.
+// search resolves), and reads pages through Exa's /contents endpoint.
 //
 // Cross-references:
 //   - tools/webfetch/index.ts  — createWebFetchTool, the per-harness factory
@@ -1453,7 +1484,7 @@ export type HarnessThread = {
     callId?: string;
     input?: string;
     // N3: what spawned this NON-ROOT invocation.
-    //   - 'delegation' — an ordinary agentDelegate / ctx.run child;
+    //   - 'delegation' — an ordinary delegate / ctx.run child;
     //   - 'fork'       — a threadFork branch that reads the owner history;
     //   - 'autoanswer' — a tool-free owner fork answering an actionRequest.
     // Omitted for historical recorded turns (they predate this field) and may be
@@ -1787,7 +1818,7 @@ export type HarnessStateChangeEvent = {
 export type HarnessRunOptions = {
     // Cancellation for this run. Forwarded to every model request, into each
     // tool's `ToolContext.signal` (a per-call controller linked to this one), and
-    // to every run it causes (ctx.run and agentDelegate) so a cancel reaches
+    // to every run it causes (ctx.run and delegate) so a cancel reaches
     // subagents too (R10).
     //
     // The harness checks it BEFORE each model turn and before each tool call, so
@@ -1951,14 +1982,14 @@ export type HarnessConfiguration = {
     // Every brain the harness can run, keyed by name. The FIRST entry is the
     // entry point unless `primary` names another one: `writer(...)` runs that
     // agent, and the rest are reachable from tools through `ctx.run(name, input)`
-    // or the `agentDelegate` tool the primary agent gets.
+    // or the `delegate` tool the primary agent gets.
     agents: Record<string, Agent>;
     // Which agent the callable runs. Defaults to the first entry of `agents`, so
     // a single-agent config needs nothing. Must name a registered agent.
     primary?: string;
     // Agents the primary agent may delegate to. Defaults to every agent except
     // the primary. When the list is empty there is no delegation at all and the
-    // `agentDelegate` tool is not registered. Subagents never receive it, so
+    // `delegate` tool is not registered. Subagents never receive it, so
     // delegation is one level deep by construction.
     subagents?: readonly string[];
 
@@ -2051,19 +2082,19 @@ export type HarnessConfiguration = {
     // a name collision.
     presets?: boolean;
     // Opt-in web search. `true` reads EXA_API_KEY / TAVILY_API_KEY from this
-    // process's environment and registers one searchable `webSearch` tool; an
+    // process's environment and registers one searchable `search` tool; an
     // object does the same with an injected env or explicit key overrides. Off
     // when absent or false, and absent when neither key is present — so a
     // default harness never carries a network tool it cannot use. Secrets stay in
     // the constructed tool closure: no schema value, argument, result, or event
-    // carries them. A configured tool named `webSearch` wins over this field.
+    // carries them. A configured tool named `search` wins over this field.
     websearch?: boolean | WebsearchConfiguration;
     // Opt-in page fetch (W4). `true` (or a configuration object) registers the
-    // `webFetch` tool: a bounded native GET that needs no credential, plus the
+    // `fetch` tool: a bounded native GET that needs no credential, plus the
     // `exa` provider when EXA_API_KEY (or an explicit key) is available. Unlike
     // `websearch`, this tool is registered even with no key at all, because its
     // default provider is keyless. Off when absent or false. A configured tool
-    // named `webFetch` wins over this field.
+    // named `fetch` wins over this field.
     webfetch?: boolean | WebFetchConfiguration;
     // N3 fork/branch bounds and the threadFork capability. Omitted = threadFork
     // is not registered and no branch may be created. Values are validated at
@@ -2100,7 +2131,7 @@ export type Harness = {
     readonly subagents: Readonly<Record<string, Agent>>;
     // The registered tools, keyed by the names the model calls. Includes the
     // built-in toolRequest, toolCreate, todoManage, profileManage,
-    // chapterManage, and locationManage entries, plus agentDelegate when there
+    // chapterManage, and locationManage entries, plus delegate when there
     // is at least one subagent.
     readonly tools: Readonly<Record<string, Tool>>;
     // Register a tool from source at runtime. This is the host-side path the
@@ -2151,9 +2182,9 @@ export type Harness = {
     //
     // `parameters` may be EITHER form (R11):
     //   - the value `execute` receives, i.e. already unwrapped by the
-    //     single-property rule: `executeTool('fileRead', ['package.json'])`;
+    //     single-property rule: `executeTool('read', ['package.json'])`;
     //   - the schema wrapper object, like the model sends:
-    //     `executeTool('fileRead', { paths: ['package.json'] })`.
+    //     `executeTool('read', { paths: ['package.json'] })`.
     // Both are validated against the tool's JSON Schema and resolved to the same
     // value, so the legacy direct-call convention keeps working and a manual call
     // cannot smuggle arguments past the runtime check. A schema mismatch throws
@@ -2163,8 +2194,8 @@ export type Harness = {
     // toolRequest has not enabled is still runnable here; the model remains
     // unable to call it. Reserved policy is NOT bypassed: `toolCreate` here goes
     // through the same validated registration path (budget, name rules,
-    // collisions, compilation), and `agentDelegate` still requires a harness that
-    // actually registered it (no subagents means no agentDelegate tool).
+    // collisions, compilation), and `delegate` still requires a harness that
+    // actually registered it (no subagents means no delegate tool).
     //
     // Throws HarnessError when the name is not registered in this harness, or
     // whatever the implementation throws; unlike the model path there is no

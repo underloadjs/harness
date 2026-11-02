@@ -6,7 +6,7 @@
 //
 // RUNTIME, NOT MODULE STATE
 // -------------------------
-// The direct-call catalogue now includes `webSearch`, which depends on a provider
+// The direct-call catalogue now includes `search`, which depends on a provider
 // key. Keys arrive from `.env`, and the src/server/CLI load that file *after* their
 // imports are evaluated. A module-level catalogue would therefore capture whatever
 // the environment happened to contain at import time (usually nothing). So the

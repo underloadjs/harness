@@ -430,12 +430,18 @@ describe('harness model-request retries', () => {
             description: 'Hold A.',
             tags: ['test'],
             visibility: 'core',
+            // T2/R2: async (see holdB) — a completion that lands WHILE a request is in
+            // flight is what supersedes the text-only response.
+            mode: 'async',
             execute: () => first.promise
         });
         const holdB = tool({
             description: 'Hold B.',
             tags: ['test'],
             visibility: 'core',
+            // T2/R2: async — the superseding completion has to be able to re-prompt the
+            // model while this call is still running.
+            mode: 'async',
             execute: () => second.promise
         });
 

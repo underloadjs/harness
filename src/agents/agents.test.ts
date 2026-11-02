@@ -8,6 +8,9 @@
 // T3 roster: the five real roles (instruct, research, workspace, reviewer,
 // planner) come first in picker order, then the delegated summarizer, then the two
 // fixtures. Order is pinned so a new profile is an explicit addition.
+//
+// The later blocks pin what the model-visible text may contain: the policy a tool
+// declaration cannot express, never a copy of the declaration list itself.
 
 import { describe, expect, it } from 'vitest';
 import {
@@ -24,6 +27,14 @@ import { reviewer } from './reviewer';
 import { planner } from './planner';
 import { research } from './research';
 import { workspace } from './workspace';
+import {
+    DELEGATION_GUIDELINE,
+    DISCOVERY_GUIDELINE,
+    PERMISSIONS_GUIDELINE,
+    TOOL_CREATE_GUIDELINE,
+    WEB_SEARCH_GUIDELINE
+} from './guidelines';
+import { BUILTIN_TOOL_DESCRIPTORS } from '../core/tool-manifest';
 
 // The exact error text a client sees for a bad id: the message lists the known set
 // in picker order, so this is also a roster pin.
@@ -112,31 +123,61 @@ describe('agent profiles', () => {
     });
 });
 
-// The workspace prompt is model-visible production text, so a stale discovery
-// claim reaches every coding session. The old wording said the first toolRequest
-// returned "at most 5 best matches"; that contradicts the uncapped selectTools
-// union plus the harness's maxEnabledTools bound (harness.ts:58-67, 399-404) and
-// would teach the model to expect a page it will never receive. This pins the
-// replacement line exactly and proves the stale sentence is gone from the whole
-// composed prompt, not just from the profile object.
-describe('workspace discovery prompt', () => {
-    it('describes the uncapped selector and the newest-request enabled bound', () => {
-        // Index 1 is the discovery guideline, directly after the always-available
-        // file tools line; asserted in full so any reword is a deliberate edit.
-        expect(workspace.guidelines[1]).toBe(
-            'toolRequest returns EVERY match for the union of exact names, a name regex, and tags (best match first) - there is no five-result page. The host bounds how many searchable tools stay enabled per turn (maxEnabledTools, default 32; core tools never count), and the newest request takes precedence, displacing older enabled tools when that bound is full; `matched`/`omitted` report the full count, so ask for the capability you actually need.'
-        );
+// Availability is the declaration list, not prompt prose: every model request receives
+// its callable tools with name, description, and schema (src/harness.ts
+// `offerDeclarations` → src/transport/openai.ts `tools`), so the old profiles spent
+// hundreds of characters restating which tools exist and how the discovery selector
+// works. That contract now lives ONCE, in toolRequest's own metadata, and the profiles
+// carry only the policy a schema cannot say. These tests pin the boundary — and keep the
+// stale claim the rewrite removed from ever coming back.
+describe('profile guidance stays policy, not a tool inventory', () => {
+    const REAL_ROLES = [instruct, research, workspace, reviewer, planner];
 
-        const prompt = agentInstruction(workspace).join('\n');
+    it('composes the shared policy lines instead of copying them per profile', () => {
+        for (const profile of REAL_ROLES) {
+            expect(profile.guidelines).toContain(DELEGATION_GUIDELINE);
+            expect(profile.guidelines).toContain(DISCOVERY_GUIDELINE);
+        }
 
-        // The exact stale claim, in the forms the old text used.
-        expect(prompt).not.toMatch(/at most 5 best matches/);
-        expect(prompt).not.toMatch(/unless you pass a smaller limit/);
-        expect(prompt).not.toMatch(/first discovery call returns/);
+        expect(instruct.guidelines).toContain(WEB_SEARCH_GUIDELINE);
+        expect(instruct.guidelines).toContain(TOOL_CREATE_GUIDELINE);
+        expect(research.guidelines).toContain(WEB_SEARCH_GUIDELINE);
+        expect(workspace.guidelines).toContain(PERMISSIONS_GUIDELINE);
+        expect(planner.guidelines).toContain(PERMISSIONS_GUIDELINE);
+    });
 
-        // The accurate contract the model must see instead.
-        expect(prompt).toContain('maxEnabledTools, default 32');
-        expect(prompt).toContain('newest request takes precedence');
+    it('never re-lists declared tools or re-states the discovery selector', () => {
+        for (const profile of REAL_ROLES) {
+            const prompt = agentInstruction(profile).join('\n');
+
+            // No "X is always available" inventory line: the declaration says it.
+            expect(prompt).not.toMatch(/always available/i);
+
+            // The selector mechanics (uncapped union, enabled bound, page wording) are
+            // toolRequest's description. The stale claims this guards against are the
+            // exact forms the old prompt used.
+            expect(prompt).not.toMatch(/at most 5 best matches/);
+            expect(prompt).not.toMatch(/unless you pass a smaller limit/);
+            expect(prompt).not.toMatch(/first discovery call returns/);
+            expect(prompt).not.toMatch(/five-result/);
+            expect(prompt).not.toContain('maxEnabledTools');
+        }
+
+        // The accurate contract is still advertised — where the model reads it as part of
+        // the declaration, so no profile has to repeat it.
+        const toolRequest = BUILTIN_TOOL_DESCRIPTORS.find((descriptor) => descriptor.name === 'toolRequest');
+        const description = toolRequest?.metadata.description ?? '';
+
+        expect(description).toContain('maxEnabledTools');
+        expect(description).toContain('newest request takes precedence');
+    });
+
+    it('keeps each real profile inside a bounded system prompt', () => {
+        // The whole point of the shared lines: growth has to be deliberate. 1500
+        // characters is room for a policy bullet, not for a tool manual.
+        for (const profile of REAL_ROLES) {
+            expect(agentInstruction(profile).join('\n').length).toBeLessThan(1500);
+        }
     });
 });
 

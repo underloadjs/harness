@@ -187,7 +187,7 @@ describe('persistent conversation labels (R8/R10)', () => {
             agent: 'Researcher',
             call: {
                 id: 'call-1',
-                name: 'agentDelegate',
+                name: 'delegate',
                 arguments: JSON.stringify({ agent: 'Helper', input: 'child task' })
             }
         });
@@ -374,7 +374,7 @@ describe('persistent conversation labels (R8/R10)', () => {
                         agent: 'Researcher',
                         call: {
                             id: 'call-1',
-                            name: 'agentDelegate',
+                            name: 'delegate',
                             arguments: JSON.stringify({ agent: 'Helper', input: 'child' })
                         }
                     },
@@ -440,7 +440,7 @@ describe('persistent conversation labels (R8/R10)', () => {
                 agent: 'Researcher',
                 call: {
                     id: 'call-1',
-                    name: 'agentDelegate',
+                    name: 'delegate',
                     arguments: JSON.stringify({ agent: 'Helper', input: 'child' })
                 }
             },
@@ -549,7 +549,7 @@ describe('one thread-owned card (R2/R3)', () => {
         {
             type: 'tool_call',
             agent: 'Researcher',
-            call: { id: callId, name: 'agentDelegate', arguments: JSON.stringify({ agent, input }) }
+            call: { id: callId, name: 'delegate', arguments: JSON.stringify({ agent, input }) }
         } as HarnessEvent,
         withThread({ type: 'start', agent, model: 'h1' }, { id: invocation, parentId: 'inv-4', callId, input })
     ];
@@ -615,11 +615,13 @@ describe('one thread-owned card (R2/R3)', () => {
         expect(cards[0].querySelectorAll(':scope > .turn-row > .tile')).toHaveLength(2);
 
         // R1: identity once per card, leading the header — never beside the clock.
+        // T1/R2: the header's first child is the identity LINE (badge + state), so the
+        // right edge stays free for the card's Delete control.
         expect(
             [...cards[0].querySelectorAll<HTMLElement>(':scope > .turn-row .tile-select')].map(
                 (select) => select.firstElementChild?.className
             )
-        ).toEqual(['tile-thread', 'tile-thread']);
+        ).toEqual(['tile-identity', 'tile-identity']);
         expect(
             [...cards[0].querySelectorAll<HTMLElement>(':scope > .turn-row .tile-thread')].map(
                 (node) => node.textContent

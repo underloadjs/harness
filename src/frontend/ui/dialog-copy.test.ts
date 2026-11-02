@@ -1,8 +1,14 @@
 // R5 — shared Copy action for data-inspection dialogs.
 //
-// Pins the exact feedback contract (Copy -> Copied / Copy failed), the live source
-// evaluation, the async Clipboard API path, the textarea/execCommand fallback, and
-// the optional add/remove behaviour used by asynchronously loaded previews.
+// Pins the exact feedback contract, the live source evaluation, the async Clipboard
+// API path, the textarea/execCommand fallback (T1/R3: it must FOCUS the helper, because
+// the plain-HTTP LAN deployment has no `navigator.clipboard` at all), and the optional
+// add/remove behaviour used by asynchronously loaded previews.
+//
+// T1/R3: the control is an ICON button. Its accessible name/title are stable action
+// text, the announced word is the hidden `role="status"` child, and success/failure
+// also swaps the glyph (`data-state` drives the colour reinforcement) so feedback is
+// never colour-only.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/dialog-copy.test.ts
 
@@ -70,18 +76,96 @@ describe('dialog copy action', () => {
         host.open({ title: 'Tool', content: paragraph('body'), copy: 'exact payload' });
         const button = copyButton(host);
         expect(button).not.toBeNull();
-        expect(button?.textContent).toBe('Copy');
-        expect(button?.getAttribute('aria-live')).toBe('polite');
+
+        // T1/R3: an ICON button. No visible word at idle (the glyph and its colour
+        // carry the state), and the accessible name/title are stable action text so a
+        // state change never renames the control.
+        expect(button?.textContent).toBe('');
+        expect(button?.querySelector('svg.dialog-copy-icon > path')).not.toBeNull();
+        expect(button?.getAttribute('aria-label')).toBe('Copy dialog contents');
+        expect(button?.title).toBe('Copy the dialog contents to the clipboard');
+        expect(button?.hasAttribute('aria-live')).toBe(false);
+        const feedback = button?.querySelector<HTMLElement>('.dialog-copy-feedback');
+        expect(feedback?.getAttribute('aria-live')).toBe('polite');
+        expect(feedback?.getAttribute('role')).toBe('status');
+        expect(feedback?.textContent).toBe('');
+        const idlePath = button?.querySelector('svg.dialog-copy-icon > path')?.getAttribute('d');
 
         button?.click();
         await flush();
 
         expect(writeText).toHaveBeenCalledTimes(1);
         expect(writeText).toHaveBeenCalledWith('exact payload');
-        expect(button?.textContent).toBe('Copied');
+        // Success feedback: the glyph changes, the live word announces the result, and
+        // `data-state` drives the border/colour reinforcement.
+        const successPath = button?.querySelector('svg.dialog-copy-icon > path')?.getAttribute('d');
+        expect(successPath).toBeDefined();
+        expect(successPath).not.toBe(idlePath);
+        expect(feedback?.textContent).toBe('Copied');
         expect(button?.dataset.state).toBe('success');
+        expect(button?.title).toBe('Copied to the clipboard');
         // The dialog stays open: copying is not a dismiss action.
         expect(host.count).toBe(1);
+    });
+
+    it('keeps the accessible name and swaps the glyph on a failed copy', async () => {
+        setClipboard(async () => {
+            throw new Error('permission denied');
+        });
+        setExecCommand(() => false);
+
+        host.open({ title: 'Tool', content: paragraph('body'), copy: 'nope' });
+        const button = copyButton(host);
+        const idlePath = button?.querySelector('svg.dialog-copy-icon > path')?.getAttribute('d');
+        button?.click();
+        await flush();
+
+        const failurePath = button?.querySelector('svg.dialog-copy-icon > path')?.getAttribute('d');
+        expect(failurePath).toBeDefined();
+        expect(failurePath).not.toBe(idlePath);
+        expect(button?.querySelector('.dialog-copy-feedback')?.textContent).toBe('Copy failed');
+        expect(button?.dataset.state).toBe('error');
+        // The name never changed, so a reader is never told the button became "Copy failed".
+        expect(button?.getAttribute('aria-label')).toBe('Copy dialog contents');
+    });
+
+    // T1/R3 REGRESSION: the deployed UI is also served over plain HTTP on the LAN
+    // static host (src/frontend/deployment.ts), where `navigator.clipboard` does not
+    // exist AT ALL, so every copy went through this fallback. `execCommand('copy')`
+    // copies the selection of the FOCUSED control; the old code only called
+    // `area.select()` while the dialog panel held focus, so it copied nothing and still
+    // reported success. The modal focus trap is the other half: it drags focus out of
+    // the helper back into the panel, which is why the workaround needs the trap held
+    // open for the duration of the command.
+    it('falls back to the focused textarea + execCommand when the async API is unavailable', async () => {
+        let captured: { value: string | undefined; focused: boolean; start: number; end: number } | undefined;
+        const execCommand = vi.fn((command: string) => {
+            const area = document.querySelector<HTMLTextAreaElement>('.dialog-copy-buffer');
+            captured = {
+                value: area?.value,
+                // The proof the trap did not steal focus back before the command ran.
+                focused: document.activeElement === area,
+                start: area?.selectionStart ?? -1,
+                end: area?.selectionEnd ?? -1
+            };
+            return command === 'copy';
+        });
+        setExecCommand(execCommand);
+
+        host.open({ title: 'Tool', content: paragraph('body'), copy: 'fallback payload' });
+        const panel = host.top?.element;
+        const button = copyButton(host);
+        button?.click();
+        await flush();
+
+        // The whole payload, in a focused helper, selected start-to-end.
+        expect(captured).toEqual({ value: 'fallback payload', focused: true, start: 0, end: 16 });
+        expect(execCommand).toHaveBeenCalledWith('copy');
+        // Cleanup: no leftover buffer, and focus is back on the dialog panel.
+        expect(document.querySelector('.dialog-copy-buffer')).toBeNull();
+        expect(document.activeElement).toBe(panel ?? document.body);
+        expect(button?.querySelector('.dialog-copy-feedback')?.textContent).toBe('Copied');
+        expect(button?.dataset.state).toBe('success');
     });
 
     it('evaluates a function source on every activation (live dialog contents)', async () => {
@@ -115,24 +199,6 @@ describe('dialog copy action', () => {
 
         expect(copyButton(host)?.textContent).toBe('Copy failed');
         expect(copyButton(host)?.dataset.state).toBe('error');
-    });
-
-    it('falls back to the focused textarea + execCommand when the async API is unavailable', async () => {
-        let captured: string | undefined;
-        const execCommand = vi.fn((command: string) => {
-            captured = document.querySelector<HTMLTextAreaElement>('.dialog-copy-buffer')?.value;
-            return command === 'copy';
-        });
-        setExecCommand(execCommand);
-
-        host.open({ title: 'Tool', content: paragraph('body'), copy: 'fallback payload' });
-        copyButton(host)?.click();
-        await flush();
-
-        expect(execCommand).toHaveBeenCalledWith('copy');
-        expect(captured).toBe('fallback payload');
-        expect(document.querySelector('.dialog-copy-buffer')).toBeNull();
-        expect(copyButton(host)?.textContent).toBe('Copied');
     });
 
     it('treats a throwing source as a failed copy without closing the dialog', async () => {

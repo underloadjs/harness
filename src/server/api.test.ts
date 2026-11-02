@@ -9,7 +9,7 @@
 // suite; this file pins the HTTP contract — routing, bootstrap, statuses, origin
 // gate, body policy/bounds, and frame passthrough.
 //
-// No network is touched: `settings`/`defaults` are injected, webSearch keys are
+// No network is touched: `settings`/`defaults` are injected, search keys are
 // stubbed empty, and only the scripted demo preset runs.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -60,8 +60,8 @@ const CORE_TOOL_NAMES = [
     ...RECORD_TOOL_NAMES,
     'agentManage',
     'agentResult',
-    'agentDelegate',
-    // N4: conditional harness-owned tools, appended after agentDelegate in the
+    'delegate',
+    // N4: conditional harness-owned tools, appended after delegate in the
     // global catalogue. They are sessionBound and answer 404 in a session whose
     // harness lacks an owner answerer / fork configuration.
     'actionRequest',
@@ -69,15 +69,15 @@ const CORE_TOOL_NAMES = [
 ];
 
 // The exact catalogue order after the core set: eight package presets, six harness
-// tools, webSearch.
+// tools, search.
 const CATALOGUE_TOOL_NAMES = [
     'syntaxCheck',
-    'fileRead',
+    'read',
     'fileWrite',
-    'fileEdit',
+    'edit',
     'fileList',
     'fileGlob',
-    'commandRun',
+    'shell',
     'gitDiff',
     'timeNow',
     'textCount',
@@ -85,7 +85,7 @@ const CATALOGUE_TOOL_NAMES = [
     'noteSearch',
     'textSummarize',
     'testFlaky',
-    'webSearch'
+    'search'
 ];
 
 const TOOL_NAMES = [...CORE_TOOL_NAMES, ...CATALOGUE_TOOL_NAMES];
@@ -194,7 +194,7 @@ const createFixture = async (prefix: string, root: string = TEMP_LIST_ROOT): Pro
 // fixture path has to be compared in that same form.
 const posix = (value: string): string => value.split(sep).join('/');
 
-// Stub search keys so `webSearch` is deterministically listed as unconfigured
+// Stub search keys so `search` is deterministically listed as unconfigured
 // regardless of the machine/.env running the suite.
 const stubEmptySearchKeys = (): void => {
     vi.stubEnv('EXA_API_KEY', '');
@@ -371,26 +371,26 @@ describe('canonical bootstrap document', () => {
         expect(body.sessions).toEqual([]);
 
         // Descriptors, not factories: the first card is the Instruct harness. Its
-        // core set is the four file tools, the harness-owned set, and agentDelegate
-        // (T3 gives every real preset a team); a keyless host has no core webSearch.
+        // core set is the four file tools, the harness-owned set, and delegate
+        // (T3 gives every real preset a team); a keyless host has no core search.
         // fileList and the command/app tools stay searchable.
         expect((body.presets as unknown[])[0]).toEqual({
             name: 'instruct',
             title: 'Instruct',
             description:
-                'General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured webSearch are always available; call toolRequest for fileList, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.',
+                'General instruction-following agent with the full shared toolbox and every other role as a direct subagent. File read/write/edit/glob and a configured search are always available; call toolRequest for fileList, commands, diffs, syntax checks, time, text, or notes. Only the agents differ between live presets, never the tools.',
             requiresEndpoint: true,
             primary: 'instruct',
             subagents: ['research', 'workspace', 'reviewer', 'planner', 'summarizer'],
             agents: ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'summarizer'],
             tools: [
                 'syntaxCheck',
-                'fileRead',
+                'read',
                 'fileWrite',
-                'fileEdit',
+                'edit',
                 'fileList',
                 'fileGlob',
-                'commandRun',
+                'shell',
                 'gitDiff',
                 'timeNow',
                 'textCount',
@@ -408,11 +408,11 @@ describe('canonical bootstrap document', () => {
                 ...RECORD_TOOL_NAMES,
                 'agentManage',
                 'agentResult',
-                'agentDelegate',
+                'delegate',
                 'threadFork',
-                'fileRead',
+                'read',
                 'fileWrite',
-                'fileEdit',
+                'edit',
                 'fileGlob'
             ],
             builtin: true,
@@ -469,13 +469,13 @@ describe('canonical bootstrap document', () => {
     });
 });
 
-// Preset descriptors and the environment-backed `webSearch` tool.
+// Preset descriptors and the environment-backed `search` tool.
 //
 // The declarative half (`environmentTools` in src/harnesses/presets.ts) says WHICH
-// preset can run webSearch; the runtime catalogue says WHETHER this host has it.
+// preset can run search; the runtime catalogue says WHETHER this host has it.
 // These tests pin the resolver in api.ts: configured hosts advertise the tool on
 // every live preset (instruct/research/workspace), keyless hosts advertise the
-// same shared toolbox minus webSearch. The configured catalogue is injected with
+// same shared toolbox minus search. The configured catalogue is injected with
 // an explicit `env`, so the test never reads or mutates the real process
 // environment.
 describe('preset descriptor tool metadata', () => {
@@ -483,12 +483,12 @@ describe('preset descriptor tool metadata', () => {
     // then five app tools. No real card gets a subset any more.
     const TOOLBOX = [
         'syntaxCheck',
-        'fileRead',
+        'read',
         'fileWrite',
-        'fileEdit',
+        'edit',
         'fileList',
         'fileGlob',
-        'commandRun',
+        'shell',
         'gitDiff',
         'timeNow',
         'textCount',
@@ -498,9 +498,9 @@ describe('preset descriptor tool metadata', () => {
     ];
 
     // The five real roles (T3). Each one declares subagents, so each one advertises
-    // agentDelegate; the two examples do not.
+    // delegate; the two examples do not.
     const REAL = ['instruct', 'research', 'workspace', 'reviewer', 'planner'] as const;
-    const FILES = ['fileRead', 'fileWrite', 'fileEdit', 'fileGlob'];
+    const FILES = ['read', 'fileWrite', 'edit', 'fileGlob'];
     const CORE_BASE = [
         'toolRegistry',
         'toolRequest',
@@ -514,40 +514,40 @@ describe('preset descriptor tool metadata', () => {
     ];
 
     const CONFIGURED_PRESET_TOOLS = {
-        instruct: [...TOOLBOX, 'webSearch'],
-        research: [...TOOLBOX, 'webSearch'],
-        workspace: [...TOOLBOX, 'webSearch'],
-        reviewer: [...TOOLBOX, 'webSearch'],
-        planner: [...TOOLBOX, 'webSearch'],
+        instruct: [...TOOLBOX, 'search'],
+        research: [...TOOLBOX, 'search'],
+        workspace: [...TOOLBOX, 'search'],
+        reviewer: [...TOOLBOX, 'search'],
+        planner: [...TOOLBOX, 'search'],
         demo: ['timeNow'],
         // The example adds its own failure tool and shares the same opt-in search
         // wiring as the real presets (createToolboxHarness).
-        flaky: [...TOOLBOX, 'testFlaky', 'webSearch']
+        flaky: [...TOOLBOX, 'testFlaky', 'search']
     };
 
     // R18 core sets. Every real preset/flaky registers the four file tools; the demo
     // fixture registers timeNow only, so it must NOT advertise them. Every real
-    // preset declares subagents, so every one advertises agentDelegate; flaky and
-    // the demo do not. A configured host adds webSearch after the file tools (the
+    // preset declares subagents, so every one advertises delegate; flaky and
+    // the demo do not. A configured host adds search after the file tools (the
     // order coreToolNames emits).
     const CORE_TOOLS = {
-        instruct: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES],
-        research: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES],
-        workspace: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES],
-        reviewer: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES],
-        planner: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES],
+        instruct: [...CORE_BASE, 'delegate', 'threadFork', ...FILES],
+        research: [...CORE_BASE, 'delegate', 'threadFork', ...FILES],
+        workspace: [...CORE_BASE, 'delegate', 'threadFork', ...FILES],
+        reviewer: [...CORE_BASE, 'delegate', 'threadFork', ...FILES],
+        planner: [...CORE_BASE, 'delegate', 'threadFork', ...FILES],
         demo: [...CORE_BASE, 'threadFork'],
         flaky: [...CORE_BASE, 'threadFork', ...FILES]
     };
 
     const CONFIGURED_CORE_TOOLS = {
-        instruct: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES, 'webSearch'],
-        research: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES, 'webSearch'],
-        workspace: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES, 'webSearch'],
-        reviewer: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES, 'webSearch'],
-        planner: [...CORE_BASE, 'agentDelegate', 'threadFork', ...FILES, 'webSearch'],
+        instruct: [...CORE_BASE, 'delegate', 'threadFork', ...FILES, 'search'],
+        research: [...CORE_BASE, 'delegate', 'threadFork', ...FILES, 'search'],
+        workspace: [...CORE_BASE, 'delegate', 'threadFork', ...FILES, 'search'],
+        reviewer: [...CORE_BASE, 'delegate', 'threadFork', ...FILES, 'search'],
+        planner: [...CORE_BASE, 'delegate', 'threadFork', ...FILES, 'search'],
         demo: [...CORE_BASE, 'threadFork'],
-        flaky: [...CORE_BASE, 'threadFork', ...FILES, 'webSearch']
+        flaky: [...CORE_BASE, 'threadFork', ...FILES, 'search']
     };
 
     const configuredRuntime = (): HarnessRuntime => {
@@ -572,7 +572,7 @@ describe('preset descriptor tool metadata', () => {
     const coreLists = (presets: HarnessDescriptor[]): Record<string, string[] | undefined> =>
         Object.fromEntries(presets.map((preset) => [preset.name, preset.coreTools]));
 
-    it('appends webSearch to every live preset when configured', async () => {
+    it('appends search to every live preset when configured', async () => {
         const runtime = configuredRuntime();
         const bootstrap = await jsonBody<{ presets: HarnessDescriptor[] }>(
             await callHandler(runtime, 'GET', '/v1/harness')
@@ -588,7 +588,7 @@ describe('preset descriptor tool metadata', () => {
 
         // The direct-call catalogue agrees: the same key makes the tool callable.
         const tools = await jsonBody<ToolIndex>(await callHandler(runtime, 'GET', '/v1/harness/tools'));
-        expect(tools.body.tools.find((tool) => tool.name === 'webSearch')?.availability).toEqual({
+        expect(tools.body.tools.find((tool) => tool.name === 'search')?.availability).toEqual({
             state: 'available',
             environment: ['EXA_API_KEY', 'TAVILY_API_KEY']
         });
@@ -617,14 +617,14 @@ describe('preset descriptor tool metadata', () => {
             flaky: [...TOOLBOX, 'testFlaky']
         });
 
-        // Keyless honesty: no card advertises a core webSearch it cannot run, and
+        // Keyless honesty: no card advertises a core search it cannot run, and
         // the demo's timeNow-only registry does not inherit the package core set.
         expect(coreLists(bootstrap.body.presets)).toEqual(CORE_TOOLS);
 
-        // Keyless stays honest: the global catalogue still lists webSearch, but as
+        // Keyless stays honest: the global catalogue still lists search, but as
         // unconfigured, and no preset card advertises a tool it cannot call.
         const tools = await jsonBody<ToolIndex>(await callHandler(runtime, 'GET', '/v1/harness/tools'));
-        expect(tools.body.tools.find((tool) => tool.name === 'webSearch')?.availability).toEqual({
+        expect(tools.body.tools.find((tool) => tool.name === 'search')?.availability).toEqual({
             state: 'unconfigured',
             environment: ['EXA_API_KEY', 'TAVILY_API_KEY'],
             hint: WEBSEARCH_UNCONFIGURED_HINT
@@ -1295,7 +1295,7 @@ describe('all-tools manual execution', () => {
                 ...RECORD_TOOL_NAMES,
                 'agentManage',
                 'agentResult',
-                'agentDelegate',
+                'delegate',
                 'actionRequest',
                 'threadFork'
             ].map((name) => ({
@@ -1381,19 +1381,19 @@ describe('all-tools manual execution', () => {
 
         // R18: core visibility, but NOT session-bound — they have real
         // implementations in the direct-call catalogue.
-        const fileRead = body.tools.find((tool) => tool.name === 'fileRead');
-        expect(fileRead).toMatchObject({
-            name: 'fileRead',
+        const read = body.tools.find((tool) => tool.name === 'read');
+        expect(read).toMatchObject({
+            name: 'read',
             group: 'Package presets',
             visibility: 'core'
         });
-        expect(fileRead?.sessionBound).toBeUndefined();
+        expect(read?.sessionBound).toBeUndefined();
 
-        // A keyless webSearch is visible and core-marked, but has no executable
+        // A keyless search is visible and core-marked, but has no executable
         // tool and is not falsely session-bound or runnable.
-        const webSearch = body.tools.find((tool) => tool.name === 'webSearch');
-        expect(webSearch).toMatchObject({
-            name: 'webSearch',
+        const search = body.tools.find((tool) => tool.name === 'search');
+        expect(search).toMatchObject({
+            name: 'search',
             group: 'Web search',
             visibility: 'core',
             availability: {
@@ -1402,7 +1402,7 @@ describe('all-tools manual execution', () => {
                 hint: WEBSEARCH_UNCONFIGURED_HINT
             }
         });
-        expect(webSearch?.sessionBound).toBeUndefined();
+        expect(search?.sessionBound).toBeUndefined();
 
         // The manual call needs no `sessionId`: it is an ordinary direct call.
         const fixture = await createFixture('api-core-file-');
@@ -1412,8 +1412,8 @@ describe('all-tools manual execution', () => {
             await writeTextFile(path, 'core file', 'utf8');
 
             const result = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/fileRead', {
-                    // fileRead declares ONE property, so `parameters` IS the array
+                await callHandler(runtime, 'POST', '/v1/harness/tools/read', {
+                    // read declares ONE property, so `parameters` IS the array
                     // (the direct-call contract, not a { paths } wrapper).
                     body: { parameters: [path] }
                 })
@@ -1422,7 +1422,7 @@ describe('all-tools manual execution', () => {
             expect(result.status).toBe(200);
             expect(result.body).toEqual({
                 ok: true,
-                // fileRead now returns a bounded batch object, not a bare array.
+                // read now returns a bounded batch object, not a bare array.
                 // 'core file' is one unterminated line of 9 UTF-8 bytes.
                 result: {
                     files: [
@@ -1717,13 +1717,13 @@ describe('all-tools manual execution', () => {
         const session = await createDemo(runtime);
         expect(
             await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/agentDelegate', {
+                await callHandler(runtime, 'POST', '/v1/harness/tools/delegate', {
                     body: { sessionId: session.id, parameters: { agent: 'helper', input: 'go' } }
                 })
             )
         ).toEqual({
             status: 404,
-            body: { error: { message: 'Tool "agentDelegate" is not available in this session.' } }
+            body: { error: { message: 'Tool "delegate" is not available in this session.' } }
         });
     });
 
@@ -1897,7 +1897,7 @@ describe('body policy and bounds', () => {
         const runtime = createRuntime();
 
         // A file long enough that even a bounded read serializes past the 64 KiB
-        // manual cap: fileRead's own 64 KiB content budget fills the page, and the
+        // manual cap: read's own 64 KiB content budget fills the page, and the
         // JSON envelope around it crosses the cap. That is exactly the "huge value"
         // case the manual route must not return verbatim.
         const fixture = await createFixture('harness-bounds-api-');
@@ -1906,7 +1906,7 @@ describe('body policy and bounds', () => {
             await writeTextFile(path, 'x'.repeat(70_000), 'utf8');
 
             const read = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/fileRead', {
+                await callHandler(runtime, 'POST', '/v1/harness/tools/read', {
                     body: { parameters: [path] }
                 })
             );
@@ -1933,7 +1933,7 @@ describe('body policy and bounds', () => {
             expect(bounded.budgetBytes).toBe(64 * 1024);
             // EXACT and PORTABLE: `originalBytes` is the UTF-8 length of the tool's
             // own serialized result, so the expectation is derived from the fixture
-            // instead of hard-coded. fileRead returns the 64 KiB content budget as
+            // instead of hard-coded. read returns the 64 KiB content budget as
             // ONE unterminated line for this fixture, and its metadata is fixed
             // (1-based line 1, `nextColumn` at the cut, the same byte count at both
             // levels). `JSON.stringify(path)` makes the separator/prefix handling the
@@ -1981,12 +1981,12 @@ describe('body policy and bounds', () => {
             // 'direct' mode, so both documented shapes reach `execute` with the same
             // value. A wrong type is a tool error, not an implementation crash.
             const legacy = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/fileRead', {
+                await callHandler(runtime, 'POST', '/v1/harness/tools/read', {
                     body: { parameters: [path] }
                 })
             );
             const wrapped = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/fileRead', {
+                await callHandler(runtime, 'POST', '/v1/harness/tools/read', {
                     body: { parameters: { paths: [path] } }
                 })
             );
@@ -2005,7 +2005,7 @@ describe('body policy and bounds', () => {
 
             // A number where an array of paths belongs is rejected by the schema.
             const wrong = await jsonBody<ToolCallResult>(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/fileRead', {
+                await callHandler(runtime, 'POST', '/v1/harness/tools/read', {
                     body: { parameters: 7 }
                 })
             );
@@ -2255,14 +2255,16 @@ describe('standalone /api compatibility', () => {
 // live harness's metadata/routing. Both are in-memory; both affect future
 // sessions only, which the frozen-definition assertions below pin directly.
 describe('harness registry over HTTP', () => {
+    // Exact because it is catalogue data: these are the shared lines of
+    // src/agents/guidelines.ts plus instruct's own rules, and the picker renders them
+    // verbatim. Availability is NOT here — the tool declarations carry it.
     const INSTRUCT_GUIDELINES = [
-        'fileRead, fileWrite, fileEdit and fileGlob are always available: use them directly. fileGlob is the single search surface (filename mode, or content mode when you pass `content`); there is no separate file-search tool.',
-        'Search the rest of the catalogue with toolRequest before concluding that a capability is missing: "files"/"list" for fileList, "shell" for commandRun, "git"/"diff" for gitDiff, "javascript" or "python" for syntaxCheck, and "time", "text", "random" or "notes" for the app tools. Discovery enables the matches for your next turn.',
-        'webSearch is always available when the host configured a search key; call it directly. If it is not declared, the host has no key, so say so instead of inventing sources.',
-        'If you are the primary agent and this harness configures subagents, agentDelegate is declared to you: give one subagent a self-contained brief (it never sees this conversation), and verify its answer yourself. A subagent never receives agentDelegate, so it cannot delegate further; if you are a subagent or there are no configured targets, do the work yourself.',
-        'Prefer a tool over memory when it can answer more accurately, and say which tool you used.',
-        'File and command tools execute on the server host with the server process permissions and are not sandboxed, so inspect before you change anything.',
-        'If a small capability is missing, toolCreate can add one for this session.',
+        'Your tool list is not the whole catalogue: use toolRequest (tag, name, or regex) to enable a searchable tool for your next turn before concluding a capability is missing.',
+        'search exists only when the host configured a key; if it is not declared, say so instead of inventing sources. fetch is searchable under "web" and "fetch".',
+        'If you are the primary agent and this harness configures subagents, delegate is declared to you: give ONE target a self-contained brief (a subagent never sees this conversation) and verify its answer. A subagent never receives delegate and cannot delegate further; otherwise do the work yourself.',
+        'Prefer a tool over memory when a tool can answer more accurately, and name the tool you used.',
+        'File and command tools run unsandboxed with the server process permissions, so inspect before you change anything.',
+        'If a small capability is still missing, toolCreate can add one for this session.',
         'Be concise.'
     ];
 
@@ -2288,7 +2290,7 @@ describe('harness registry over HTTP', () => {
             name: 'instruct',
             title: 'Instruct',
             description:
-                'General instruction-following agent with the shared toolbox. Answers directly; file read/write/edit/glob and configured web search are always available, and other capabilities are discovered by tag.',
+                'General instruction-following agent. Answers directly and concisely with the tools it is given; every other role is available to it as a subagent.',
             instruction:
                 'You are the Instruct agent. Answer the request directly and keep the answer focused.',
             guidelines: INSTRUCT_GUIDELINES
@@ -2336,16 +2338,16 @@ describe('harness registry over HTTP', () => {
             primary: 'research',
             subagents: ['summarizer'],
             agents: ['research', 'summarizer'],
-            // The keyless runtime catalogue has no callable webSearch, so the
+            // The keyless runtime catalogue has no callable search, so the
             // descriptor advertises exactly the registered static toolbox.
             tools: [
                 'syntaxCheck',
-                'fileRead',
+                'read',
                 'fileWrite',
-                'fileEdit',
+                'edit',
                 'fileList',
                 'fileGlob',
-                'commandRun',
+                'shell',
                 'gitDiff',
                 'timeNow',
                 'textCount',
@@ -2363,11 +2365,11 @@ describe('harness registry over HTTP', () => {
                 ...RECORD_TOOL_NAMES,
                 'agentManage',
                 'agentResult',
-                'agentDelegate',
+                'delegate',
                 'threadFork',
-                'fileRead',
+                'read',
                 'fileWrite',
-                'fileEdit',
+                'edit',
                 'fileGlob'
             ],
             builtin: false,
@@ -2605,7 +2607,7 @@ describe('harness registry over HTTP', () => {
         });
 
         expect(
-            await post({ name: 'tools', primary: 'instruct', tools: ['commandRun'] })
+            await post({ name: 'tools', primary: 'instruct', tools: ['shell'] })
         ).toEqual({
             status: 400,
             body: { error: { message: 'Unknown field "tools". Allowed fields: name, title, description, primary, subagents, agentModels.' } }
@@ -2655,11 +2657,11 @@ describe('harness registry over HTTP', () => {
                 ...RECORD_TOOL_NAMES,
                 'agentManage',
                 'agentResult',
-                'agentDelegate',
+                'delegate',
                 'threadFork',
-                'fileRead',
+                'read',
                 'fileWrite',
-                'fileEdit',
+                'edit',
                 'fileGlob'
             ],
             builtin: true,
@@ -2784,12 +2786,12 @@ describe('harness registry over HTTP', () => {
         });
         expect(live.body.harness.tools).toEqual([
             'syntaxCheck',
-            'fileRead',
+            'read',
             'fileWrite',
-            'fileEdit',
+            'edit',
             'fileList',
             'fileGlob',
-            'commandRun',
+            'shell',
             'gitDiff',
             'timeNow',
             'textCount',
@@ -2808,9 +2810,9 @@ describe('harness registry over HTTP', () => {
             'agentManage',
             'agentResult',
             'threadFork',
-            'fileRead',
+            'read',
             'fileWrite',
-            'fileEdit',
+            'edit',
             'fileGlob'
         ]);
 
@@ -2834,12 +2836,12 @@ describe('harness registry over HTTP', () => {
         expect(renamed.status).toBe(200);
         expect(renamed.body.harness.tools).toEqual([
             'syntaxCheck',
-            'fileRead',
+            'read',
             'fileWrite',
-            'fileEdit',
+            'edit',
             'fileList',
             'fileGlob',
-            'commandRun',
+            'shell',
             'gitDiff',
             'timeNow',
             'textCount',

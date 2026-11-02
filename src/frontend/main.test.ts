@@ -41,11 +41,11 @@ const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor 
         description: 'A general instruction-following agent.',
         requiresEndpoint: true,
         agents: ['instruct'],
-        tools: ['fileRead'],
+        tools: ['read'],
         coreTools: [
-            'fileRead',
+            'read',
             'fileWrite',
-            'fileEdit',
+            'edit',
             'fileGlob',
             'toolRequest',
             'toolList',
@@ -267,12 +267,12 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     const call = {
         type: 'tool_call' as const,
         agent: 'instruct',
-        call: { id: 'c1', name: 'fileRead', arguments: '{"path":"package.json"}' }
+        call: { id: 'c1', name: 'read', arguments: '{"path":"package.json"}' }
     };
     const result = {
         type: 'tool_result' as const,
         agent: 'instruct',
-        name: 'fileRead',
+        name: 'read',
         content: '{"ok":true}',
         isError: false,
         callId: 'c1'
@@ -425,7 +425,7 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
 
     // R4: the server's startedAt/updatedAt and eventTimes decide the labels.
     expect(tile.querySelector('.tile-elapsed')?.textContent).toBe('3.6s');
-    expect(tile.querySelector('.tool-name')?.textContent).toBe('fileRead');
+    expect(tile.querySelector('.tool-name')?.textContent).toBe('read');
     expect(tile.querySelector('.tool-duration')?.textContent).toBe('800ms');
     expect(tile.classList.contains('is-expanded')).toBe(true);
 
@@ -467,7 +467,7 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
 // This walks the whole round trip: chat → catalogue → tool → catalogue → chat.
 it('shows the tools badge only in the tools view and keeps it hidden in the chat head', async () => {
     const tool = {
-        name: 'fileRead',
+        name: 'read',
         group: 'Files',
         description: 'Read one or more files.',
         tags: ['files', 'read'],
@@ -506,7 +506,7 @@ it('shows the tools badge only in the tools view and keeps it hidden in the chat
     // Selected tool: the head names the tool and its GROUP in the badge.
     byClass('.tool-tab-button', 'button').click();
     await flush();
-    expect(document.querySelector('.main-title')?.textContent).toBe('fileRead');
+    expect(document.querySelector('.main-title')?.textContent).toBe('read');
     expect(badge.textContent).toBe('Files');
     expect(badge.hidden).toBe(false);
 
@@ -731,18 +731,18 @@ it('restores a remembered session with its frozen team and server timings', asyn
         agents: ['instruct', 'summarizer'],
         primary: 'instruct',
         subagents: ['summarizer'],
-        // A subagent allowlist is what makes the server add agentDelegate.
+        // A subagent allowlist is what makes the server add delegate.
         coreTools: [
-            'fileRead',
+            'read',
             'fileWrite',
-            'fileEdit',
+            'edit',
             'fileGlob',
             'toolRequest',
             'toolList',
             'toolManage',
             'toolCreate',
             'todoManage',
-            'agentDelegate'
+            'delegate'
         ]
     });
 
@@ -758,12 +758,12 @@ it('restores a remembered session with its frozen team and server timings', asyn
             {
                 type: 'tool_call',
                 agent: 'instruct',
-                call: { id: 'c1', name: 'fileRead', arguments: '{"path":"package.json"}' }
+                call: { id: 'c1', name: 'read', arguments: '{"path":"package.json"}' }
             },
             {
                 type: 'tool_result',
                 agent: 'instruct',
-                name: 'fileRead',
+                name: 'read',
                 content: '{"ok":true}',
                 isError: false,
                 callId: 'c1'
@@ -890,16 +890,16 @@ it('creates a harness from preset agents with an initial primary', async () => {
                         editable: true,
                         tools: [],
                         coreTools: [
-                            'fileRead',
+                            'read',
                             'fileWrite',
-                            'fileEdit',
+                            'edit',
                             'fileGlob',
                             'toolRequest',
                             'toolList',
                             'toolManage',
                             'toolCreate',
                             'todoManage',
-                            ...(request.subagents.length > 0 ? ['agentDelegate'] : [])
+                            ...(request.subagents.length > 0 ? ['delegate'] : [])
                         ]
                     })
                 },
@@ -979,18 +979,18 @@ it('adds a picker agent, promotes it to primary and never duplicates a member', 
                 agents: [request.primary, ...request.subagents],
                 primary: request.primary,
                 subagents: request.subagents,
-                // A server with a subagent allowlist adds agentDelegate.
+                // A server with a subagent allowlist adds delegate.
                 coreTools: [
-                    'fileRead',
+                    'read',
                     'fileWrite',
-                    'fileEdit',
+                    'edit',
                     'fileGlob',
                     'toolRequest',
                     'toolList',
                     'toolManage',
                     'toolCreate',
                     'todoManage',
-                    ...(request.subagents.length > 0 ? ['agentDelegate'] : [])
+                    ...(request.subagents.length > 0 ? ['delegate'] : [])
                 ]
             });
             return json({ harness: current });
@@ -1196,16 +1196,16 @@ it('fronts a card of a frozen team and keeps that card across the live model PAT
         primary: 'instruct',
         subagents: ['summarizer'],
         coreTools: [
-            'fileRead',
+            'read',
             'fileWrite',
-            'fileEdit',
+            'edit',
             'fileGlob',
             'toolRequest',
             'toolList',
             'toolManage',
             'toolCreate',
             'todoManage',
-            'agentDelegate'
+            'delegate'
         ]
     });
     const restored = snapshot({ harnessDefinition: frozen } as Partial<SessionSnapshot>);
@@ -2464,17 +2464,18 @@ it('shows the offline pane when a proxy answers 200 with HTML instead of JSON', 
 });
 
 // ---------------------------------------------------------------------------
-// R8: permanent session deletion
+// R8: permanent session deletion (T1/R1: one click, no confirmation step)
 // ---------------------------------------------------------------------------
 //
 // The row is a `.session-row` wrapper with the select button and a SIBLING
-// `.session-delete` control. Deleting is two-step and inline: the first click
-// only opens `.session-confirm`, cancel sends nothing, and confirm sends exactly
-// one DELETE /sessions/:id and then removes the row. No replacement session is
-// created for the current conversation, and a late observer frame must not
-// resurrect a deleted one.
+// `.session-delete` control. T1/R1 removed the inline `.session-confirm` step: one
+// click sends exactly one DELETE /sessions/:id and then removes the row. No
+// replacement session is created for the current conversation, and a late observer
+// frame must not resurrect a deleted one. The permanence warning lives on the control
+// (`title`/`aria-label`), and the guards (`deletionBlocked`, `removingSessions`) are
+// what keep the click safe — not the extra click.
 
-it('confirms an inactive session delete once, and cancel sends no request', async () => {
+it('deletes an inactive session on the first click, with no confirmation panel', async () => {
     const doneTurn: SessionTurn = {
         id: 't1',
         index: 0,
@@ -2514,42 +2515,26 @@ it('confirms an inactive session delete once, and cancel sends no request', asyn
     const del = byClass('.session-row[data-session-id="s2"] .session-delete', 'button');
     expect(del.textContent).toBe('×');
     expect(del.getAttribute('aria-label')).toBe('Delete session s2');
-    expect(del.title).toBe('Delete this session permanently');
+    // T1/R1: the sentence the confirmation panel used to print is the control's own
+    // tooltip, so the warning survives the removed step.
+    expect(del.title).toBe('Delete this session permanently. Running or queued work in it stops.');
     expect(del.disabled).toBe(false);
 
-    // First step: the confirmation opens and NOTHING is sent.
+    // T1/R1: ONE click is the whole action. The rail never renders a `.session-confirm`
+    // group, so the row keeps exactly two children: select + delete.
     del.click();
     await flush();
 
-    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([]);
-    expect(document.querySelectorAll('.session-confirm')).toHaveLength(1);
-    const confirm = byClass('.session-confirm', 'div');
-    expect(confirm.dataset.sessionId).toBe('s2');
-    expect(confirm.getAttribute('role')).toBe('group');
-    expect(confirm.getAttribute('aria-label')).toBe('Confirm deleting session s2');
-    expect(confirm.querySelector('.session-confirm-text')?.textContent).toBe(
-        'Delete this session permanently. Running or queued work in it stops.'
-    );
-    expect(confirm.querySelector('.session-confirm-delete')?.textContent).toBe('Delete session');
-    expect(confirm.querySelector<HTMLButtonElement>('.session-confirm-delete')?.disabled).toBe(false);
-    expect(confirm.querySelector('.session-confirm-cancel')?.textContent).toBe('Cancel');
-
-    // Cancel is a pure view change: the row and the pointer survive, no request.
-    byClass('.session-confirm-cancel', 'button').click();
-    await flush();
-
     expect(document.querySelector('.session-confirm')).toBeNull();
-    expect(calls.filter((call) => call.method === 'DELETE')).toEqual([]);
-    expect(rowIds()).toEqual(['s1', 's2']);
-    expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
 
-    // Two-step, then exactly one DELETE and the row disappears.
-    byClass('.session-row[data-session-id="s2"] .session-delete', 'button').click();
-    await flush();
-    byClass('.session-confirm-delete', 'button').click();
-    await flush();
     await flush();
 
+    const rows = [...document.querySelectorAll<HTMLElement>('.session-row')];
+    expect(rows.map((node) => [...node.children].map((child) => child.className))).toEqual([
+        ['session', 'session-delete']
+    ]);
+
+    // ...and exactly one DELETE goes out for that one click.
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
         { url: '/api/sessions/s2', method: 'DELETE', body: undefined }
     ]);
@@ -2647,12 +2632,9 @@ it('deletes the running current session, stops watching and creates no replaceme
         'running'
     );
 
-    // Deleting the CURRENT session is allowed while it runs: the confirmation
-    // says the running/queued work stops.
+    // T1/R1: deleting the CURRENT session is allowed while it runs — the control's own
+    // title says the running/queued work stops, and one click sends the DELETE.
     byClass('.session-row[data-session-id="s1"] .session-delete', 'button').click();
-    await flush();
-    expect(byClass('.session-confirm-delete', 'button').disabled).toBe(false);
-    byClass('.session-confirm-delete', 'button').click();
     await flush();
     await flush();
 
@@ -2717,13 +2699,12 @@ it('keeps the row and reports the error when a delete is rejected', async () => 
     await flush();
     await flush();
 
+    // T1/R1: one click is one attempt.
     byClass('.session-delete', 'button').click();
-    await flush();
-    byClass('.session-confirm-delete', 'button').click();
     await flush();
     await flush();
 
-    // One attempt, row still there, confirmation closed, error reported through
+    // One attempt, row still there, no confirmation surface, error reported through
     // the app-scoped pill (the same place a failed session-list read reports).
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
         { url: '/api/sessions/s1', method: 'DELETE', body: undefined }
@@ -2760,9 +2741,8 @@ it('drops the row when the server answers 404 for an already-deleted session', a
     await flush();
     await flush();
 
+    // T1/R1: one click, one request.
     byClass('.session-delete', 'button').click();
-    await flush();
-    byClass('.session-confirm-delete', 'button').click();
     await flush();
     await flush();
 
@@ -2778,7 +2758,7 @@ it('drops the row when the server answers 404 for an already-deleted session', a
     expect(document.querySelector('.status-detail')?.textContent).toBe('session s1 was already gone');
 });
 
-it('dedupes a double-confirmed delete and disables the row while it is in flight', async () => {
+it('sends one DELETE per click and disables the row while the delete is in flight', async () => {
     const current = snapshot({ harnessDefinition: descriptor() });
     localStorage.setItem(SESSION_KEY, 's1');
 
@@ -2803,20 +2783,22 @@ it('dedupes a double-confirmed delete and disables the row while it is in flight
     await flush();
     await flush();
 
-    byClass('.session-delete', 'button').click();
+    // T1/R1: the first click starts the DELETE. The repaint replaces the rail, so
+    // clicking the HELD (detached) node again proves the `removingSessions` guard —
+    // not merely the `disabled` attribute — is what blocks a duplicate request.
+    const control = byClass('.session-delete', 'button');
+    control.click();
     await flush();
 
-    // Hold the node: the in-flight repaint replaces the DOM, so this click proves
-    // the guard (not the disabled attribute) is what blocks a duplicate.
-    const confirm = byClass('.session-confirm-delete', 'button');
-    confirm.click();
+    expect(document.querySelector('.session-confirm')).toBeNull();
+    expect(byClass('.session-delete', 'button').disabled).toBe(true);
+
+    control.click();
+    byClass('.session-delete', 'button').click();
     await flush();
-    confirm.click();
     await flush();
 
     expect(deletes).toBe(1);
-    expect(byClass('.session-delete', 'button').disabled).toBe(true);
-    expect(document.querySelector('.session-confirm')).toBeNull();
 
     settleDelete?.(json({ deleted: true }));
     await flush();
@@ -2886,10 +2868,9 @@ it('never resurrects a deleted session from a stale session-list answer', async 
     expect(listRequests).toBe(1);
     expect(refresh.disabled).toBe(true);
 
-    // Delete the CURRENT session while that older read is still in flight.
+    // Delete the CURRENT session while that older read is still in flight. T1/R1: the
+    // click IS the confirmation.
     byClass('.session-row[data-session-id="s1"] .session-delete', 'button').click();
-    await flush();
-    byClass('.session-confirm-delete', 'button').click();
     await flush();
     await flush();
 

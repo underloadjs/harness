@@ -90,7 +90,7 @@ const formatMs = (milliseconds: number): string => {
     return `${Math.floor(seconds / 60)}m${String(seconds % 60).padStart(2, '0')}s`;
 };
 
-// `name 1.2s, webSearch 900ms` — deterministic order: the server's array order.
+// `name 1.2s, search 900ms` — deterministic order: the server's array order.
 const describePending = (pending: readonly HarnessPendingTool[]): string =>
     pending.map((tool) => `${tool.name} ${formatMs(tool.elapsedMs)}`).join(', ');
 

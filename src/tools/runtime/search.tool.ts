@@ -1,4 +1,4 @@
-// webSearch — independently compiled source entry for the opt-in search tool.
+// search — independently compiled source entry for the opt-in search tool.
 //
 // A search credential belongs to ONE harness, so the harness creates the provider
 // closure and exposes it as a live runtime operation. This entry is the registered
@@ -6,10 +6,10 @@
 // supplies the configured provider/schema as metadata overrides. No credential or
 // provider-specific value appears in this source.
 //
-// A replacement registered under `webSearch` is an ordinary source revision and
+// A replacement registered under `search` is an ordinary source revision and
 // does not inherit the configured provider closure.
 export const metadata = {
-    name: 'webSearch',
+    name: 'search',
     description:
         'Search the web through the provider configured for this harness. The configured provider/schema is supplied at registration; this generic revision is replaceable source.',
     tags: ['web', 'search', 'internet', 'news', 'research'],
@@ -31,6 +31,11 @@ export const metadata = {
 export const registration = {
     group: 'runtime',
     activation: 'websearch',
+    // T2/R2: SYNC. A search result is an input to the next thought, so the run waits
+    // for it (grouped with the rest of its message) rather than re-prompting on a
+    // placeholder. The HTTP request is still background work: cancelable, mailbox-
+    // delivered, and never blocking another message's async outcome.
+    mode: 'sync',
     order: 240,
     sessionBound: true,
     alwaysDeclared: false,
@@ -41,8 +46,8 @@ export const execute = (context: any) => {
     const harness = context?.harness;
 
     if (harness === undefined) {
-        throw new Error('webSearch requires the live harness reference.');
+        throw new Error('search requires the live harness reference.');
     }
 
-    return harness.runtime.webSearch(context);
+    return harness.runtime.search(context);
 };

@@ -1,4 +1,4 @@
-// webSearch inside a harness: conditional registration, discovery, credentials.
+// search inside a harness: conditional registration, discovery, credentials.
 //
 // The factory's wire behaviour is covered in tools/websearch/websearch.test.ts.
 // These tests pin the harness-level contract instead: whether the tool exists,
@@ -34,10 +34,10 @@ const answer = (text: string): HarnessStreamEvent[] => [
 // One scripted answer is enough, and it keeps these tests offline.
 const idle = () => agent({ model: 'm', stream: scripted([answer('idle')]) });
 
-// R18: a configured webSearch is core, so there is no discovery round: the model
+// R18: a configured search is core, so there is no discovery round: the model
 // calls it directly on the first turn.
 const searchOnly = (): HarnessStreamEvent[][] => [
-    callTool('c1', 'webSearch', '{"query":"harness","maxResults":2}'),
+    callTool('c1', 'search', '{"query":"harness","maxResults":2}'),
     answer('found it')
 ];
 
@@ -74,7 +74,7 @@ describe('registration', () => {
     it('is off when the configuration does not opt in', () => {
         const writer = harness({ agents: { writer: idle() } });
 
-        expect(writer.tools.webSearch).toBeUndefined();
+        expect(writer.tools.search).toBeUndefined();
     });
 
     it('is off when explicitly false', () => {
@@ -83,7 +83,7 @@ describe('registration', () => {
             websearch: false
         });
 
-        expect(writer.tools.webSearch).toBeUndefined();
+        expect(writer.tools.search).toBeUndefined();
     });
 
     it('is not registered when opted in but no key is available', () => {
@@ -95,7 +95,7 @@ describe('registration', () => {
             websearch: true
         });
 
-        expect(writer.tools.webSearch).toBeUndefined();
+        expect(writer.tools.search).toBeUndefined();
     });
 
     it('registers a core tool from process.env when opted in with true', () => {
@@ -109,9 +109,9 @@ describe('registration', () => {
 
         // R18: configured search is core, so it is declared without a discovery
         // round. Registration itself is still key-gated (tested above).
-        expect(writer.tools.webSearch).toBeDefined();
-        expect(writer.tools.webSearch.visibility).toBe('core');
-        expect(writer.tools.webSearch.tags).toEqual(['web', 'search', 'internet', 'news', 'research']);
+        expect(writer.tools.search).toBeDefined();
+        expect(writer.tools.search.visibility).toBe('core');
+        expect(writer.tools.search.tags).toEqual(['web', 'search', 'internet', 'news', 'research']);
     });
 
     it('does not touch the network at construction', () => {
@@ -131,10 +131,10 @@ describe('registration', () => {
                 agents: { writer: idle() },
                 websearch: { exa: { apiKey: 42 as never } }
             })
-        ).toThrow('webSearch provider "exa" apiKey must be a string or a function returning one.');
+        ).toThrow('search provider "exa" apiKey must be a string or a function returning one.');
     });
 
-    it('lets a configured tool named webSearch win', async () => {
+    it('lets a configured tool named search win', async () => {
         const custom = tool<{ query: string }, string>({
             description: 'A caller-provided search tool.',
             tags: ['web', 'search'],
@@ -149,13 +149,13 @@ describe('registration', () => {
 
         const writer = harness({
             agents: { writer: idle() },
-            tools: { webSearch: custom },
+            tools: { search: custom },
             websearch: { env: { EXA_API_KEY: 'exa-secret-key' } }
         });
 
-        expect(writer.tools.webSearch).not.toBe(custom);
-        expect(writer.tools.webSearch.description).toBe(custom.description);
-        await expect(writer.executeTool('webSearch', { query: 'custom' })).resolves.toBe(
+        expect(writer.tools.search).not.toBe(custom);
+        expect(writer.tools.search.description).toBe(custom.description);
+        await expect(writer.executeTool('search', { query: 'custom' })).resolves.toBe(
             'custom result'
         );
     });
@@ -199,7 +199,7 @@ describe('execution', () => {
             contents: { highlights: true }
         });
 
-        // user -> webSearch call -> result -> answer
+        // user -> search call -> result -> answer
         const resultMessage = entry.messages[2] as { role: string; content: string };
         expect(resultMessage.role).toBe('tool');
 
@@ -255,8 +255,8 @@ describe('execution', () => {
         });
 
         // Neither harness advertises the other's provider.
-        expect(JSON.stringify(first.tools.webSearch.parameters)).not.toContain('tavily');
-        expect(JSON.stringify(second.tools.webSearch.parameters)).not.toContain('exa');
+        expect(JSON.stringify(first.tools.search.parameters)).not.toContain('tavily');
+        expect(JSON.stringify(second.tools.search.parameters)).not.toContain('exa');
     });
 
     it('routes a model call to the custom override, not the network', async () => {
@@ -278,14 +278,14 @@ describe('execution', () => {
             model: 'm',
             stream: scripted([
                 callTool('c0', 'toolRequest', '{"tags":["web","search"]}'),
-                callTool('c1', 'webSearch', '{"query":"harness"}'),
+                callTool('c1', 'search', '{"query":"harness"}'),
                 answer('done')
             ])
         });
 
         const writer = harness({
             agents: { writer: entry },
-            tools: { webSearch: custom },
+            tools: { search: custom },
             presets: false,
             websearch: { env: { EXA_API_KEY: 'exa-secret-key' } }
         });

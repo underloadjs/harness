@@ -88,6 +88,11 @@ const cloneDescriptor = (descriptor: DiscoveredTool): DiscoveredTool => ({
     origin: descriptor.origin,
     group: descriptor.group,
     activation: descriptor.activation,
+    // T2/R2: the turn policy MUST survive this detach. The whitelist below is the
+    // descriptor's public shape; omitting `mode` here would silently drop every
+    // declared policy from `discoverToolMetadata()` (and therefore from the harness
+    // registration), which is exactly the scan/descriptor/manifest drift T24 removed.
+    ...(descriptor.mode === undefined ? {} : { mode: descriptor.mode }),
     order: descriptor.order,
     ...(descriptor.pendingOnly === undefined ? {} : { pendingOnly: descriptor.pendingOnly }),
     ...(descriptor.control === undefined ? {} : { control: descriptor.control }),
@@ -144,6 +149,7 @@ export type {
     ToolActivation,
     ToolGroup,
     ToolMetadata,
+    ToolMode,
     ToolOrigin,
     ToolRegistration
 } from './tool-metadata';

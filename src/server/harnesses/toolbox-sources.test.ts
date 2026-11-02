@@ -7,7 +7,7 @@
 //
 //   - the shared toolbox is supplied as concrete `SHARED_TOOL_SOURCES` paths;
 //   - a preset built through `createToolboxHarness` exposes real module revisions
-//     for both a package tool (fileRead) and an app tool (timeNow);
+//     for both a package tool (read) and an app tool (timeNow);
 //   - the runtime replacement path compiles and publishes a new revision for the
 //     same name;
 //   - host `extraTools` definitions still override sources LAST.
@@ -68,12 +68,12 @@ afterEach(() => {
 // is discovered from `src/server/tools/shared`, so its paths are the new ones).
 const EXPECTED_SOURCE_PATHS = {
     syntaxCheck: 'tools/syntax/syntaxCheck.tool.ts',
-    fileRead: 'tools/files/fileRead.tool.ts',
+    read: 'tools/files/read.tool.ts',
     fileWrite: 'tools/files/fileWrite.tool.ts',
-    fileEdit: 'tools/files/fileEdit.tool.ts',
+    edit: 'tools/files/edit.tool.ts',
     fileList: 'tools/files/fileList.tool.ts',
     fileGlob: 'tools/files/fileGlob.tool.ts',
-    commandRun: 'tools/command/commandRun.tool.ts',
+    shell: 'tools/command/shell.tool.ts',
     gitDiff: 'tools/command/gitDiff.tool.ts',
     timeNow: 'server/tools/shared/timeNow.tool.ts',
     textCount: 'server/tools/shared/textCount.tool.ts',
@@ -98,16 +98,16 @@ describe('production toolbox source compilation', () => {
         // -> toolSources compilation. No provider turn is run.
         const harness = preset.create(SETTINGS, progress);
 
-        const fileRead = harness.toolSource('fileRead');
-        expect(fileRead).toMatchObject({
-            name: 'fileRead',
-            sourcePath: 'tools/files/fileRead.tool.ts',
+        const read = harness.toolSource('read');
+        expect(read).toMatchObject({
+            name: 'read',
+            sourcePath: 'tools/files/read.tool.ts',
             format: 'module',
             dependencies: [],
             checks: ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
         });
-        expect(fileRead?.revision).toMatch(/^[0-9a-f]{16}$/);
-        expect(fileRead?.revision).not.toBe('definition');
+        expect(read?.revision).toMatch(/^[0-9a-f]{16}$/);
+        expect(read?.revision).not.toBe('definition');
 
         const timeNow = harness.toolSource('timeNow');
         expect(timeNow).toMatchObject({
@@ -230,7 +230,7 @@ export const execute = async () => ({ replaced: true });
             format: 'module',
             checks: ['transpile:syntax', 'load:module', 'contract:tool', 'schema:json']
         });
-        expect(harness.toolSource('fileRead')).toBeUndefined();
+        expect(harness.toolSource('read')).toBeUndefined();
     });
 
     it('lets host extraTools definitions override a source-backed name last', async () => {
@@ -257,7 +257,7 @@ export const execute = async () => ({ replaced: true });
         // implementation wins and the source revision for that name is dropped.
         expect(await harness.executeTool('timeNow', {})).toEqual({ host: true });
         expect(harness.toolSource('timeNow')).toBeUndefined();
-        expect(harness.toolSource('fileRead')).toBeDefined();
+        expect(harness.toolSource('read')).toBeDefined();
     });
 });
 
@@ -318,7 +318,7 @@ describe('server tools folder derivation (T25)', () => {
         expect(library.tools.timeNow).toBeUndefined();
         expect(library.tools.testFlaky).toBeUndefined();
         expect(library.toolSource('timeNow')).toBeUndefined();
-        expect(library.tools.fileRead).toBeDefined();
+        expect(library.tools.read).toBeDefined();
     });
 
     it('derives a catalogue for a folder that gained a brand-new entry, with no map edit', async () => {

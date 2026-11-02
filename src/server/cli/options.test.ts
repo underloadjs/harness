@@ -72,7 +72,7 @@ describe('CLI preset selection', () => {
             'toolCancel',
             'timeNow'
         ]);
-        expect(offline.tools.agentDelegate).toBeUndefined();
+        expect(offline.tools.delegate).toBeUndefined();
     });
 
     it('still accepts the short -p form and leaves other options at their defaults', () => {

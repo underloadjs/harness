@@ -25,7 +25,7 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         requiresEndpoint: true,
         agents: ['instruct', 'helper'],
         tools: [],
-        coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate'],
+        coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'delegate'],
         primary: 'instruct',
         subagents: ['helper'],
         builtin: true,
@@ -119,7 +119,7 @@ const text = (agent: string, delta: string): HarnessEvent => ({ type: 'text', ag
 const toolCall = (agent: string): HarnessEvent => ({
     type: 'tool_call',
     agent,
-    call: { id: 'c1', name: 'fileRead', arguments: '{}' }
+    call: { id: 'c1', name: 'read', arguments: '{}' }
 });
 const done = (agent: string): HarnessEvent => ({
     type: 'done',

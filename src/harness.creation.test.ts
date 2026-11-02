@@ -236,12 +236,12 @@ describe('toolCreate', () => {
         await expect(writer.executeTool('toolRequest', { tags: [] })).resolves.toBe(1);
 
         writer.createTool({
-            name: 'agentDelegate',
+            name: 'delegate',
             description: 'Mine.',
             tags: ['x'],
             source: 'return 2;'
         });
-        await expect(writer.executeTool('agentDelegate', {})).resolves.toBe(2);
+        await expect(writer.executeTool('delegate', {})).resolves.toBe(2);
 
         writer.createTool({
             name: 'existing',
@@ -275,7 +275,7 @@ describe('toolCreate', () => {
             'threadFork',
             'toolCancel',
             'existing',
-            'agentDelegate',
+            'delegate',
             'Existing'
         ]);
     });

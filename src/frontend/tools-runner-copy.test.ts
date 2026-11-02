@@ -24,7 +24,7 @@ const descriptor = (): HarnessDescriptor =>
         description: 'A general instruction-following agent.',
         requiresEndpoint: true,
         agents: ['instruct'],
-        tools: ['fileRead'],
+        tools: ['read'],
         coreTools: [],
         primary: 'instruct',
         subagents: [],
@@ -33,7 +33,7 @@ const descriptor = (): HarnessDescriptor =>
     }) as HarnessDescriptor;
 
 const fileReadTool: ToolDescriptor = {
-    name: 'fileRead',
+    name: 'read',
     group: 'Files',
     description: 'Read one or more files.',
     tags: ['files'],
@@ -92,7 +92,7 @@ it('copies the current runner result from an open tool dialog', async () => {
                 });
             }
             if (url === '/api/models') return json({ models: ['m1'] });
-            if (url === '/api/tools/fileRead') {
+            if (url === '/api/tools/read') {
                 return json({
                     ok: true,
                     result: { path: 'package.json', content: '{}' },
@@ -113,8 +113,8 @@ it('copies the current runner result from an open tool dialog', async () => {
 
     document.querySelector<HTMLButtonElement>('.tools-toggle')?.click();
     await flush();
-    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="fileRead"]')?.click();
-    expect(document.querySelector('.dialog-title')?.textContent).toBe('fileRead');
+    document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="read"]')?.click();
+    expect(document.querySelector('.dialog-title')?.textContent).toBe('read');
 
     const args = document.querySelector<HTMLTextAreaElement>('.tool-args');
     if (args === null) throw new Error('missing runner arguments');
@@ -130,7 +130,7 @@ it('copies the current runner result from an open tool dialog', async () => {
 
     expect(writeText).toHaveBeenCalledWith(
         [
-            'Tool: fileRead',
+            'Tool: read',
             'Result: result · 9ms',
             '',
             '{\n  "path": "package.json",\n  "content": "{}"\n}'

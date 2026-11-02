@@ -128,7 +128,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     name: "toolRequest",
     metadata: {
         name: "toolRequest",
-        description: "Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example [\"files\", \"list\"], [\"shell\"], or [\"git\", \"diff\"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example agentDelegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.",
+        description: "Find tools and enable them for your next turn, and check which tools you already have. Query by exact `names` (case-sensitive), by a name `regex`, and/or by capability `tags` (for example [\"files\", \"list\"], [\"shell\"], or [\"git\", \"diff\"]); the selector returns the UNION of all three, best match first, with no arbitrary five-result cap. The host may bound the total searchable tools enabled for a turn (`maxEnabledTools`); when that bound is full, the newest request takes precedence - whichever selector it used (`names`, `regex`, or `tags`), not only exact names - and replaces older enabled searchable tools as needed to make room, while core tools neither count against the bound nor get evicted. `matched` reports the full match count and `omitted` the exact number that did not get a slot, so a full answer is reported rather than silently truncated. The `alreadyAvailable` list names tools you can call directly right now without enabling anything - for example delegate when this harness has subagents; a capability that appears in neither list is genuinely unavailable. An optional `limit` narrows only this query. Call this before concluding that something cannot be done.",
         tags: [
             "discovery",
             "tools",
@@ -782,9 +782,9 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     alwaysDeclared: true
 },
 {
-    name: "agentDelegate",
+    name: "delegate",
     metadata: {
-        name: "agentDelegate",
+        name: "delegate",
         description: "Delegate a self-contained task to a configured subagent and return its answer. Only the primary agent can delegate, subagents cannot delegate further, and a harness registers this tool only when it has subagents - a session whose harness has none answers 404.",
         tags: [
             "agents",
@@ -813,11 +813,12 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
         },
         visibility: "core"
     },
-    sourcePath: "tools/runtime/agentDelegate.tool.ts",
-    label: "tools/runtime/agentDelegate.tool.ts",
+    sourcePath: "tools/runtime/delegate.tool.ts",
+    label: "tools/runtime/delegate.tool.ts",
     origin: "package",
     group: "runtime",
     activation: "subagents",
+    mode: "async",
     order: 120,
     primaryOnly: true,
     answerExtraction: true,
@@ -865,6 +866,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     origin: "package",
     group: "runtime",
     activation: "forks",
+    mode: "async",
     order: 130,
     control: "fork",
     sessionBound: true,
@@ -950,6 +952,7 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     origin: "package",
     group: "runtime",
     activation: "interaction",
+    mode: "async",
     order: 140,
     control: "action",
     sessionBound: true,
@@ -1042,9 +1045,9 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     alwaysDeclared: false
 },
 {
-    name: "fileRead",
+    name: "read",
     metadata: {
-        name: "fileRead",
+        name: "read",
         description: "Read a BOUNDED window of one or more UTF-8 text files. Each `paths` item is either a path string (defaults below) or { path, startLine, startColumn, maxLines }. Returns { files: [{ path, content, startLine, endLine, truncated, nextLine, nextColumn, bytes, error? }], truncated, bytes, contentBudget }. Defaults: startLine 1, startColumn 0, maxLines 200 (hard maximum 5000). `content` is raw text whose first line is file line `startLine`, so line numbering is metadata rather than prefixes. When an entry is truncated, request { path, startLine: nextLine, startColumn: nextColumn } to continue; nextColumn is 0 at a line boundary and non-zero only when a single huge line was cut mid-line. The whole batch shares a fixed 64 KiB UTF-8 CONTENT budget (not counting JSON escaping), split fairly between the requested files, and reading stops at that budget instead of loading huge files or lines wholesale. A call accepts at most 100 paths. A path that does not exist is reported IN PLACE as its own ordered entry with empty `content`, `bytes` 0, and `error: { code: \"ENOENT\", message }`; it consumes no content budget and the other files are still read. Every other failure - an invalid request, a directory (use fileList or fileGlob for those), binary bytes (NUL or invalid UTF-8) encountered while streaming the file, or any other filesystem error - rejects the whole call, so a short answer never looks complete. Binary detection covers decoded chunks, not the whole file beyond the last chunk read. A window at a deep line rescans from the start to count lines. Paths are absolute or relative to the working directory.",
         tags: [
             "files",
@@ -1103,11 +1106,12 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
         },
         visibility: "core"
     },
-    sourcePath: "tools/files/fileRead.tool.ts",
-    label: "tools/files/fileRead.tool.ts",
+    sourcePath: "tools/files/read.tool.ts",
+    label: "tools/files/read.tool.ts",
     origin: "package",
     group: "preset",
     activation: "always",
+    mode: "sync",
     order: 170,
     sessionBound: false,
     listed: false,
@@ -1167,9 +1171,9 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     alwaysDeclared: false
 },
 {
-    name: "fileEdit",
+    name: "edit",
     metadata: {
-        name: "fileEdit",
+        name: "edit",
         description: "Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used (\"typographic\" or \"trailing-whitespace\"), so a fuzzy match is never silent. Creates nothing: use fileWrite for new files.",
         tags: [
             "files",
@@ -1220,11 +1224,12 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
         },
         visibility: "core"
     },
-    sourcePath: "tools/files/fileEdit.tool.ts",
-    label: "tools/files/fileEdit.tool.ts",
+    sourcePath: "tools/files/edit.tool.ts",
+    label: "tools/files/edit.tool.ts",
     origin: "package",
     group: "preset",
     activation: "always",
+    mode: "sync",
     order: 190,
     sessionBound: false,
     listed: false,
@@ -1333,9 +1338,9 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     alwaysDeclared: false
 },
 {
-    name: "commandRun",
+    name: "shell",
     metadata: {
-        name: "commandRun",
+        name: "shell",
         description: "Run a shell command and return its exit code, stdout, and stderr. The command string is passed to the platform shell, so pipes, redirects, and quoting work. A non-zero exit code is returned as data, not thrown. `timeoutMs` bounds the run (integer milliseconds, 1-600000, default 120000); a command that exceeds it is killed together with its process tree on a best-effort basis and the result reports `timedOut: true`. Output is capped at 128 KiB of stdout and 16 KiB of stderr, with `truncated: true` when either cap was applied, and an aborted run reports `aborted: true`.",
         tags: [
             "shell",
@@ -1367,11 +1372,12 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
             additionalProperties: false
         }
     },
-    sourcePath: "tools/command/commandRun.tool.ts",
-    label: "tools/command/commandRun.tool.ts",
+    sourcePath: "tools/command/shell.tool.ts",
+    label: "tools/command/shell.tool.ts",
     origin: "package",
     group: "preset",
     activation: "always",
+    mode: "async",
     order: 220,
     sessionBound: false,
     listed: false,
@@ -1435,9 +1441,9 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     alwaysDeclared: false
 },
 {
-    name: "webSearch",
+    name: "search",
     metadata: {
-        name: "webSearch",
+        name: "search",
         description: "Search the web through the provider configured for this harness. The configured provider/schema is supplied at registration; this generic revision is replaceable source.",
         tags: [
             "web",
@@ -1460,20 +1466,21 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
         },
         visibility: "searchable"
     },
-    sourcePath: "tools/runtime/webSearch.tool.ts",
-    label: "tools/runtime/webSearch.tool.ts",
+    sourcePath: "tools/runtime/search.tool.ts",
+    label: "tools/runtime/search.tool.ts",
     origin: "package",
     group: "runtime",
     activation: "websearch",
+    mode: "sync",
     order: 240,
     sessionBound: true,
     listed: false,
     alwaysDeclared: false
 },
 {
-    name: "webFetch",
+    name: "fetch",
     metadata: {
-        name: "webFetch",
+        name: "fetch",
         description: "Fetch a page through the provider configured for this harness. The configured provider/schema is supplied at registration; this generic revision is replaceable source.",
         tags: [
             "web",
@@ -1497,11 +1504,12 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
         },
         visibility: "searchable"
     },
-    sourcePath: "tools/runtime/webFetch.tool.ts",
-    label: "tools/runtime/webFetch.tool.ts",
+    sourcePath: "tools/runtime/fetch.tool.ts",
+    label: "tools/runtime/fetch.tool.ts",
     origin: "package",
     group: "runtime",
     activation: "webfetch",
+    mode: "sync",
     order: 250,
     sessionBound: true,
     listed: false,
@@ -1615,8 +1623,8 @@ export const loadDiscoveredTool = (label: string): Promise<unknown> => {
             return import("../tools/runtime/agentManage.tool.ts");
         case "tools/runtime/agentResult.tool.ts":
             return import("../tools/runtime/agentResult.tool.ts");
-        case "tools/runtime/agentDelegate.tool.ts":
-            return import("../tools/runtime/agentDelegate.tool.ts");
+        case "tools/runtime/delegate.tool.ts":
+            return import("../tools/runtime/delegate.tool.ts");
         case "tools/runtime/threadFork.tool.ts":
             return import("../tools/runtime/threadFork.tool.ts");
         case "tools/runtime/actionRequest.tool.ts":
@@ -1625,24 +1633,24 @@ export const loadDiscoveredTool = (label: string): Promise<unknown> => {
             return import("../tools/runtime/toolCancel.tool.ts");
         case "tools/syntax/syntaxCheck.tool.ts":
             return import("../tools/syntax/syntaxCheck.tool.ts");
-        case "tools/files/fileRead.tool.ts":
-            return import("../tools/files/fileRead.tool.ts");
+        case "tools/files/read.tool.ts":
+            return import("../tools/files/read.tool.ts");
         case "tools/files/fileWrite.tool.ts":
             return import("../tools/files/fileWrite.tool.ts");
-        case "tools/files/fileEdit.tool.ts":
-            return import("../tools/files/fileEdit.tool.ts");
+        case "tools/files/edit.tool.ts":
+            return import("../tools/files/edit.tool.ts");
         case "tools/files/fileList.tool.ts":
             return import("../tools/files/fileList.tool.ts");
         case "tools/files/fileGlob.tool.ts":
             return import("../tools/files/fileGlob.tool.ts");
-        case "tools/command/commandRun.tool.ts":
-            return import("../tools/command/commandRun.tool.ts");
+        case "tools/command/shell.tool.ts":
+            return import("../tools/command/shell.tool.ts");
         case "tools/command/gitDiff.tool.ts":
             return import("../tools/command/gitDiff.tool.ts");
-        case "tools/runtime/webSearch.tool.ts":
-            return import("../tools/runtime/webSearch.tool.ts");
-        case "tools/runtime/webFetch.tool.ts":
-            return import("../tools/runtime/webFetch.tool.ts");
+        case "tools/runtime/search.tool.ts":
+            return import("../tools/runtime/search.tool.ts");
+        case "tools/runtime/fetch.tool.ts":
+            return import("../tools/runtime/fetch.tool.ts");
         case "tools/runtime/threadSend.tool.ts":
             return import("../tools/runtime/threadSend.tool.ts");
         case "tools/runtime/threadList.tool.ts":

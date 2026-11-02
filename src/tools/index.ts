@@ -4,17 +4,17 @@
 // what ships out of the box:
 //
 //   syntax/   syntaxCheck (javascript or python, named by the caller)
-//   files/    fileRead, fileWrite, fileEdit, fileList, fileGlob
-//   command/  commandRun, gitDiff
+//   files/    read, fileWrite, edit, fileList, fileGlob
+//   command/  shell, gitDiff
 //   runtime/  the harness-owned core entries (toolRequest, toolCreate, …) — moved
 //             here from the old top-level `runtime-tools/` folder (T21)
-//   websearch/ webSearch — opt-in, per-harness (NOT in `presetTools`: it needs a
+//   websearch/ search — opt-in, per-harness (NOT in `presetTools`: it needs a
 //             provider key, which belongs to one harness; see createWebSearchTool)
-//   webfetch/  webFetch — opt-in, per-harness (native GET by default, the `exa`
+//   webfetch/  fetch — opt-in, per-harness (native GET by default, the `exa`
 //             provider only when a key exists; see createWebFetchTool)
 //
 // NAMING (T14): every wire name is `<namespace><action>`. The four file tools and
-// commandRun/webSearch were renamed; there are no aliases, because two names for
+// shell/search were renamed; there are no aliases, because two names for
 // one tool makes discovery ambiguous.
 //
 // Lazy, not eager (R1b)
@@ -29,9 +29,9 @@
 // registry relies on:
 //
 //     await syntaxCheck({ code: 'print(1)', language: 'python' }); // true
-//     await fileRead(['package.json']);                            // { files: […], truncated, bytes, contentBudget }
+//     await read(['package.json']);                            // { files: […], truncated, bytes, contentBudget }
 //     await fileWrite([{ path: 'a.txt', content: 'hi' }]);         // [{ path, bytes }]
-//     harness({ tools: { syntaxCheck, fileRead } });                // the model calls them
+//     harness({ tools: { syntaxCheck, read } });                // the model calls them
 //
 // DERIVED TABLE, HAND-WRITTEN API (T21 → T24)
 // -------------------------------------------
@@ -39,7 +39,7 @@
 // metadata constant or an implementation module. The named exports below are the
 // package's API surface (`@underload/harness` re-exports them by name), so they stay
 // spelled out — they are a contract, not an inventory. Each one reads the SAME proxy
-// instance the table holds, so `presetTools.fileRead === fileRead`.
+// instance the table holds, so `presetTools.read === read`.
 //
 // Adding a tool therefore means adding one `.tool.ts` file. T24: `./descriptors`
 // derives its catalogue from a LIVE scan on Node, so a cold process already lists
@@ -48,8 +48,8 @@
 // only needs a named export if the tool is meant to be part of the public import
 // surface.
 //
-// R18: fileRead/fileWrite/fileEdit/fileGlob are **core** and declared up front;
-// fileList, syntaxCheck, commandRun, and gitDiff stay **searchable**, so the model
+// R18: read/fileWrite/edit/fileGlob are **core** and declared up front;
+// fileList, syntaxCheck, shell, and gitDiff stay **searchable**, so the model
 // asks toolRequest for `files`/`list`, `shell`, `git`, … and discovery enables the
 // matches. A harness preloads `presetTools` unless it is created with
 // `presets: false`.
@@ -104,18 +104,18 @@ export const syntaxCheck = presetProxy<SyntaxCheckParameters, boolean>('syntaxCh
 
 // The four file tools are BATCHED: each takes the array its single schema property
 // declares, so a direct call and a model call reach `execute` identically.
-export const fileRead = presetProxy<FileReadParameters, FileReadResult>('fileRead');
+export const read = presetProxy<FileReadParameters, FileReadResult>('read');
 export const fileWrite = presetProxy<{ path: string; content: string }[], FileWriteResult>('fileWrite');
-export const fileEdit = presetProxy<FileEditParameters, FileEditResult>('fileEdit');
+export const edit = presetProxy<FileEditParameters, FileEditResult>('edit');
 export const fileList = presetProxy<FileListParameters, FileListResult>('fileList');
 // fileGlob declares four properties, so it receives the whole object and its
 // result shape depends on whether `content` was supplied.
 export const fileGlob = presetProxy<FileGlobParameters, FileGlobResult>('fileGlob');
 
-export const commandRun = presetProxy<CommandRunParameters, CommandRunResult>('commandRun');
+export const shell = presetProxy<CommandRunParameters, CommandRunResult>('shell');
 export const gitDiff = presetProxy<GitDiffParameters, GitDiffResult>('gitDiff');
 
-// NOTE: the bounded-read constants live in ./files/fileRead and are deliberately
+// NOTE: the bounded-read constants live in ./files/read and are deliberately
 // NOT re-exported here. A VALUE re-export from './files' would statically evaluate
 // the implementation module and destroy the lazy-loading contract this file tests
 // (the folder barrels are therefore type-only — see ./files/index.ts).
@@ -152,7 +152,7 @@ export type {
 // Web search is intentionally outside `presetTools`: a preset is shared by every
 // harness, while a search tool closes over that harness's key. harness.ts calls
 // this factory only when `websearch` is configured (the configuration property
-// keeps its name; only the TOOL is called webSearch), and the factory returns
+// keeps its name; only the TOOL is called search), and the factory returns
 // undefined when no provider key is available.
 export { createWebSearchTool, WEB_SEARCH_METADATA, WEB_SEARCH_TOOL_NAME } from './websearch';
 export type { WebSearchMetadata } from './websearch';

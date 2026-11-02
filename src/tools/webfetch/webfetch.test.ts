@@ -1,4 +1,4 @@
-// webFetch — the tool factory, key resolution, the native conversion, and the
+// fetch — the tool factory, key resolution, the native conversion, and the
 // Exa contents adapter.
 //
 // Everything here is offline and deterministic: the environment is injected
@@ -79,7 +79,7 @@ describe('factory and schema', () => {
         const definition = keyless();
 
         expect(definition).toBeDefined();
-        expect(definition.name).toBe('webFetch');
+        expect(definition.name).toBe('fetch');
         // Discovery-eligible: fetching is the step after searching.
         expect(definition.visibility).toBe('searchable');
         expect(definition.tags).toEqual(['web', 'fetch', 'internet', 'read', 'url', 'research']);
@@ -255,7 +255,7 @@ if (a &lt; 2) log(a);</pre>
     it('reports a failing status without echoing the page body', async () => {
         stubFetch(() => response('<html>Big secret page text</html>', { status: 500, headers: { 'content-type': 'text/html' } }));
 
-        await expect(call(keyless(), { url: 'https://example.com' })).rejects.toThrow('webFetch failed (HTTP 500).');
+        await expect(call(keyless(), { url: 'https://example.com' })).rejects.toThrow('fetch failed (HTTP 500).');
     });
 
     it('rejects binary content types', async () => {
@@ -269,7 +269,7 @@ if (a &lt; 2) log(a);</pre>
         stubFetch(() => response(streamOf(Array.from({ length: 6 }, () => chunk)), { headers: { 'content-type': 'text/plain' } }));
 
         await expect(call(keyless(), { url: 'https://example.com/big' })).rejects.toThrow(
-            `webFetch received a response larger than ${MAX_RESPONSE_BYTES} bytes.`
+            `fetch received a response larger than ${MAX_RESPONSE_BYTES} bytes.`
         );
     });
 
@@ -300,7 +300,7 @@ if (a &lt; 2) log(a);</pre>
         pending.catch(() => undefined);
         await vi.advanceTimersByTimeAsync(FETCH_TIMEOUT_MS);
 
-        await expect(pending).rejects.toThrow(`webFetch timed out after ${FETCH_TIMEOUT_MS} ms.`);
+        await expect(pending).rejects.toThrow(`fetch timed out after ${FETCH_TIMEOUT_MS} ms.`);
 
         vi.useRealTimers();
     });

@@ -33,7 +33,7 @@ const NOTES: readonly { title: string; body: string }[] = [
     },
     {
         title: 'Single-property rule',
-        body: 'When a tool schema declares exactly one property, execute receives that property value instead of the wrapper object. That is why fileRead(["package.json"]) and a model call carrying { "paths": ["package.json"] } run the same code path.'
+        body: 'When a tool schema declares exactly one property, execute receives that property value instead of the wrapper object. That is why read(["package.json"]) and a model call carrying { "paths": ["package.json"] } run the same code path.'
     },
     {
         title: 'Progress events',

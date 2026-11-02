@@ -25,7 +25,7 @@
 //     (`{ "paths": ["a.txt"] }`) and `execute` must still receive the unwrapped
 //     value (`["a.txt"]`);
 //   - a DIRECT caller (host code, a test, the server's manual tool path) has
-//     always passed the unwrapped value (`fileRead(['a.txt'])`).
+//     always passed the unwrapped value (`read(['a.txt'])`).
 //
 // `resolveToolParameters` applies BOTH without breaking the legacy form: it
 // validates the unwrapped value first and, when that fails, re-wraps the object
@@ -49,7 +49,7 @@ import { toolParameterKey } from './tool';
 // Bounds on a MODEL-CREATED schema. A created tool's schema becomes part of the
 // request payload on every turn, and a deeply nested or enormous schema is a
 // context bomb as well as a validation cost. These limits are generous enough
-// for the project's own schemas (fileRead's `oneOf` item schema nests ~7 levels)
+// for the project's own schemas (read's `oneOf` item schema nests ~7 levels)
 // and small enough that a pathological one is rejected at creation.
 //
 // DEPTH counts container nesting (objects AND arrays); NODES counts every nested
@@ -378,8 +378,8 @@ export const resolveToolParameters = (
     // DIRECT path. The legacy form is the unwrapped value, so it is tried first
     // and validated as the property. Only when that fails do we treat the value as
     // the schema wrapper (plus validation of the wrapper), which is what makes
-    // `executeTool('fileRead', { paths: ['a'] })` and
-    // `executeTool('fileRead', ['a'])` behave identically.
+    // `executeTool('read', { paths: ['a'] })` and
+    // `executeTool('read', ['a'])` behave identically.
 
     // An EMPTY object is the "nothing filled in" argument box, not a value: both a
     // model and the HTTP UI send `{}` for a call with no arguments, and the

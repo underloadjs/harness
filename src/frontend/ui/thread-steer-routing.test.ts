@@ -97,7 +97,7 @@ describe('steer routing across turns (F1)', () => {
                     agent: 'Researcher',
                     call: {
                         id: 'call-1',
-                        name: 'agentDelegate',
+                        name: 'delegate',
                         arguments: JSON.stringify({ agent: 'Helper', input: 'child task' })
                     }
                 },

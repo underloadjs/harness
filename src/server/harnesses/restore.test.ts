@@ -84,7 +84,7 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         expect(refreshed?.title).toBe('Instruct');
         expect(
             Object.keys(refreshed!.create(SETTINGS, progress).tools)
-        ).toContain('agentDelegate');
+        ).toContain('delegate');
     });
 
     it('refreshes every real preset whose saved row is an unmodified shipped default', () => {
@@ -214,7 +214,7 @@ describe('restoreHarnessRegistry — shipped defaults vs customisations', () => 
         // unreachable and no new agent is silently introduced.
         expect(Object.keys(harness.agents)).toEqual(['instruct']);
         expect(Object.keys(harness.subagents)).toEqual([]);
-        expect(harness.tools.agentDelegate).toBeUndefined();
+        expect(harness.tools.delegate).toBeUndefined();
 
         // The registry, meanwhile, has moved on (the refresh above).
         const registry = createHarnessRegistry();

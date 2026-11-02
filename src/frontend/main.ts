@@ -56,7 +56,7 @@
 //
 // Execution is server-only. A catalogue tool is a direct call; a session-bound
 // core tool (`sessionBound`) is sent with the selected session's id so toolRequest,
-// toolCreate, todoManage and agentDelegate change THAT conversation — and the snapshot is
+// toolCreate, todoManage and delegate change THAT conversation — and the snapshot is
 // re-read afterwards so discoveries/todos show up. The browser never evaluates a
 // tool.
 //
@@ -228,7 +228,7 @@ const messageOf = (error: unknown): string => (error instanceof Error ? error.me
 // tool endpoint — no new server route, no client filesystem access. A refused
 // request surfaces the server's own message in the dialog.
 const readFileForPreview: FilePreviewReader = async ({ path, startLine, maxLines }) => {
-    const response = await callTool('fileRead', [{ path, startLine, maxLines }]);
+    const response = await callTool('read', [{ path, startLine, maxLines }]);
 
     if (!response.ok) throw new Error(response.error.message);
 
@@ -622,9 +622,9 @@ const EXAMPLES: Readonly<Record<string, unknown>> = {
     syntaxCheck: { code: 'const answer = 42;\nconsole.log(answer);', language: 'javascript' },
     // The batched file tools each declare ONE array property, so the textarea holds
     // the array itself, not a wrapper object (T14).
-    fileRead: ['package.json'],
+    read: ['package.json'],
     fileWrite: [{ path: 'notes/hello.txt', content: 'hello from the harness UI\n' }],
-    fileEdit: [{ path: 'notes/hello.txt', oldString: 'hello', newString: 'hi' }],
+    edit: [{ path: 'notes/hello.txt', oldString: 'hello', newString: 'hi' }],
     // "." works from whatever directory the server runs in.
     fileList: ['.'],
     // fileGlob declares four properties, so it takes the whole object. Both lists
@@ -633,7 +633,7 @@ const EXAMPLES: Readonly<Record<string, unknown>> = {
     // absent `maxResults` means the documented cap, whereas `""` or `0` would
     // switch to content mode or be clamped. Add `content` to try a content search.
     fileGlob: { patterns: ['**/*'], paths: ['.'] },
-    commandRun: { command: 'git status --short' },
+    shell: { command: 'git status --short' },
     // Core tools: the manual runner can call these inside the selected session, so
     // their examples have to satisfy the same schema the model sees (non-empty
     // tags, a real action, a body that would parse).
@@ -645,7 +645,7 @@ const EXAMPLES: Readonly<Record<string, unknown>> = {
         source: 'return args.trim().toUpperCase();'
     },
     todoManage: { action: 'add', text: 'Review the harness catalogue' },
-    // agentDelegate has NO static example: its only valid target is one of the
+    // delegate has NO static example: its only valid target is one of the
     // SELECTED harness's subagents, and a hard-coded id (the old 'summarizer' one)
     // was wrong for every harness that does not configure it. The runner builds
     // that example from `delegateTargets` at show time (see `show` below).
@@ -656,7 +656,7 @@ const EXAMPLES: Readonly<Record<string, unknown>> = {
     textSummarize: 'The harness runs tools until the model answers with text.',
     // The server owns the provider key; the runner only needs a valid query. The
     // exact key is never part of this value.
-    webSearch: { query: 'harness tool discovery', maxResults: 5 }
+    search: { query: 'harness tool discovery', maxResults: 5 }
 };
 
 // The single-property rule, mirrored for the UI: a one-property schema means the
@@ -760,7 +760,7 @@ const templateFor = (parameters: Record<string, unknown> | undefined): string =>
 // or session happens to be selected when the answer lands.
 //
 // `delegateTargets` reads the SELECTED harness's subagent allowlist (live
-// descriptor, or the frozen team of the open session). agentDelegate is the one
+// descriptor, or the frozen team of the open session). delegate is the one
 // core tool whose validity depends on the session's configuration: it is only
 // registered when the harness declares subagents, so the runner must not offer an
 // example naming an agent this harness does not have.
@@ -922,7 +922,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     };
 
     // Delegation is the one core tool whose VALIDITY depends on the selected
-    // harness: the server registers agentDelegate only when the harness declares
+    // harness: the server registers delegate only when the harness declares
     // subagents, so a hard-coded example (the old 'summarizer' one) named an agent
     // most harnesses do not have.
     //
@@ -936,7 +936,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     let delegateKey: string | undefined;
 
     const paintDelegate = (entry: ToolDescriptor): boolean => {
-        if (entry.name !== 'agentDelegate') {
+        if (entry.name !== 'delegate') {
             delegateKey = undefined;
             return false;
         }
@@ -1004,7 +1004,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
         if (entry === undefined || entry.availability?.state === 'unconfigured') return;
 
         // Delegation with no configured target is not a call the server can serve
-        // (it answers 404 because agentDelegate is not registered at all). Disabled
+        // (it answers 404 because delegate is not registered at all). Disabled
         // button plus this guard keeps the pane honest.
         if (paintDelegate(entry)) return;
 
@@ -1134,7 +1134,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
                 ? JSON.stringify(EXAMPLES[entry.name], null, 2)
                 : templateFor(entry.parameters);
 
-            // agentDelegate's example depends on the SELECTED team; every other
+            // delegate's example depends on the SELECTED team; every other
             // entry (including the server-wide catalogue listing) is team-independent.
             // Reset the painted-targets key so a re-show always repaints the example
             // from the current team rather than keeping the schema template.
@@ -1154,7 +1154,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
                 entry.availability?.state === 'unconfigured'
                     ? (entry.availability.hint ?? '')
                     : noDelegateTargets
-                      ? 'Not available for the selected harness: it declares no subagents, so agentDelegate is not registered in its sessions.'
+                      ? 'Not available for the selected harness: it declares no subagents, so delegate is not registered in its sessions.'
                       : '';
             availabilityNote.hidden = !unavailable && !noDelegateTargets;
 
@@ -3128,7 +3128,7 @@ const runner = createToolRunner({
 
         return ensureSession(instance);
     },
-    // agentDelegate is only registered when the harness declares subagents, so the
+    // delegate is only registered when the harness declares subagents, so the
     // manual runner asks the SELECTED instance for its real targets: the frozen
     // team for a saved session, otherwise the live descriptor's allowlist. A
     // harness with none cannot offer a callable delegation.
@@ -3416,7 +3416,7 @@ const renderHarnessChrome = (): void => {
     // no longer renders any tool list.
     renderToolsSession(display, instance.sessionId, instance.discovered);
 
-    // The manual runner lives on the tools view and shows an agentDelegate example
+    // The manual runner lives on the tools view and shows an delegate example
     // built from the selected team (see createToolRunner.paintDelegate). A team edit
     // lands here, so re-sync it: the example becomes callable the moment a subagent
     // exists, and stops being offered when the last one is removed. The runner
@@ -3991,7 +3991,7 @@ const toolsTabHead = el('div', 'tools-tab-head');
 const toolsTabHint = el(
     'p',
     'tools-tab-hint',
-    'Every tool the server lists, core tools included. Select one to open its runner. Calls execute on the harness server — nothing runs in this browser. Session-bound tools (toolRequest, toolCreate, todoManage, and agentDelegate when the selected harness has subagents) run inside the selected harness’s session; every other tool, including the core file and search tools, runs directly.'
+    'Every tool the server lists, core tools included. Select one to open its runner. Calls execute on the harness server — nothing runs in this browser. Session-bound tools (toolRequest, toolCreate, todoManage, and delegate when the selected harness has subagents) run inside the selected harness’s session; every other tool, including the core file and search tools, runs directly.'
 );
 const toolsSessionNote = el('p', 'tools-session-note field-hint', '');
 toolsTabHead.append(el('h2', 'tools-tab-title', 'Tools'), toolsTabHint, toolsSessionNote);
@@ -4302,22 +4302,25 @@ const visibleSessions = (): SessionSnapshot[] => {
 };
 
 // ---------------------------------------------------------------------------
-// Deleting a session (R8)
+// Deleting a session (R8, T1/R1)
 // ---------------------------------------------------------------------------
 //
 // Delete is PERMANENT. The server (src/server/api.ts DELETE /sessions/:id ->
 // SessionStore.remove, src/server/sessions.ts) aborts an active run, discards the
 // retained queue, closes /events watchers, and rewrites state.json without the
-// record before answering. The UI therefore never offers it as a one-click icon:
-// `.session-delete` only OPENS the inline `.session-confirm`, cancel sends no
-// request at all, and only a confirm sends exactly one DELETE.
+// record before answering.
 //
-// Local state is deliberately module-scoped, not per row: `renderSessions` may
-// rebuild the rail at any time (a refresh, a snapshot, a new submit) and the open
-// confirmation must not vanish or be duplicated by that rebuild.
+// T1/R1: the inline two-step confirmation is GONE. One click on `.session-delete`
+// sends exactly one DELETE, because the control is a small `x` on a row the reader
+// is already looking at, and the old panel cost a second click plus a rail rebuild
+// for an action the reader can undo by creating a new session. The warning that the
+// panel used to carry now lives on the control itself (`title` + `aria-label`), and
+// the safety that mattered was never the extra click: it is the guard below plus
+// `removingSessions`, which keep a delete from racing a submit/save and from being
+// sent twice. There is no confirmation state left to keep module-scoped.
 
 // Session ids with a DELETE currently in flight. Doubles as the dedupe guard: a
-// second confirm click (or a double pointer event) is a no-op.
+// second click (or a double pointer event) is a no-op.
 const removingSessions = new Set<string>();
 
 // Tombstones for ids this page has deleted. Every asynchronous path that can
@@ -4328,10 +4331,6 @@ const removingSessions = new Set<string>();
 // UUIDs, so a tombstone can never hide a different, later session.
 const deletedSessions = new Set<string>();
 
-// The one session whose inline confirmation is open, if any. Opening a second
-// row replaces it, so two confirms can never be open at once.
-let confirmingDelete: string | undefined;
-
 // A delete must not race an operation that owns the same conversation:
 //   - `submitting` is the POST /tasks window (the run() flow),
 //   - `savingAgents` is a harness/team PATCH or a session-model PATCH,
@@ -4339,25 +4338,9 @@ let confirmingDelete: string | undefined;
 //     current" ambiguous mid-flight,
 //   - and nothing may be deleted before the catalogue has booted.
 // Runs themselves are NOT a reason to block: the server stops the run as part of
-// the delete, which is exactly what the confirmation warns about.
+// the delete, which is what the control's own title warns about.
 const deletionBlocked = (): boolean =>
     !booted || submitting || savingAgents || creatingSessions > 0;
-
-// First step: open (or close) the inline confirmation. No request is sent here.
-const requestDeleteConfirmation = (id: string): void => {
-    if (deletionBlocked() || removingSessions.has(id)) return;
-
-    confirmingDelete = confirmingDelete === id ? undefined : id;
-    renderSessions();
-};
-
-// Second step's escape hatch: close the confirmation without any request.
-const cancelDelete = (): void => {
-    if (confirmingDelete === undefined) return;
-
-    confirmingDelete = undefined;
-    renderSessions();
-};
 
 // Drop every local trace of a session the server no longer holds. Used after a
 // successful DELETE, and after a 404 (the record is already gone — the desired
@@ -4436,14 +4419,14 @@ const forgetDeletedSession = (id: string): void => {
     setBusy(false);
 };
 
-// Send the DELETE. Exactly one request per confirmed action: the row is marked
-// busy before the round trip, and every entry point re-checks the guards.
+// Send the DELETE (T1/R1: this is what ONE click on `.session-delete` does). Exactly
+// one request per action: the row is marked busy before the round trip, and every
+// entry point re-checks the guards.
 const deleteSessionRow = async (id: string): Promise<void> => {
     if (deletionBlocked() || removingSessions.has(id)) return;
 
-    confirmingDelete = undefined;
     removingSessions.add(id);
-    // Paint the in-flight state (confirmation closed, control disabled).
+    // Paint the in-flight state (the control is disabled while the request runs).
     renderSessions();
 
     let removed = false;
@@ -4470,7 +4453,8 @@ const deleteSessionRow = async (id: string): Promise<void> => {
     }
 
     if (!removed && !alreadyGone) {
-        // Failure: row visible again (enabled), confirmation closed, error shown.
+        // Failure: the row stays and the control is enabled again; the rail reports
+        // the reason in the app pill.
         renderSessions();
         return;
     }
@@ -4485,10 +4469,11 @@ const deleteSessionRow = async (id: string): Promise<void> => {
 //
 // R8: every row is a `.session-row` WRAPPER around the select button and a
 // SIBLING `.session-delete` control. Buttons can never nest, so deletion is a
-// second button beside the row, and confirming it is an inline two-step action
-// (`.session-confirm`) rather than a browser dialog or a one-click delete.
-// The select button keeps its own `data-session-id`/`data-status`/`data-active`
-// as well, so the existing `.session[...]` styles and row queries keep working.
+// second button beside the row. T1/R1: pressing it deletes IMMEDIATELY — the inline
+// `.session-confirm` step is gone, and the control's `title`/`aria-label` state what
+// happens. The select button keeps its own `data-session-id`/`data-status`/
+// `data-active` as well, so the existing `.session[...]` styles and row queries keep
+// working.
 const renderSessions = (): void => {
     sessionList.replaceChildren();
 
@@ -4556,45 +4541,18 @@ const renderSessions = (): void => {
         remove.type = 'button';
         remove.dataset.sessionId = session.id;
         // A compact glyph with an explicit accessible name: the rail has no room
-        // for a word, and the inline confirmation carries the full warning.
-        remove.textContent = '×';
+        // for a word. T1/R1: with the inline confirmation removed, the control's own
+        // name and tooltip carry the whole warning (permanent, and it stops work).
+        remove.textContent = '\u00d7';
         remove.setAttribute('aria-label', `Delete session ${shortId(session.id)}`);
-        remove.title = 'Delete this session permanently';
+        remove.title = 'Delete this session permanently. Running or queued work in it stops.';
         remove.disabled = deletionBlocked() || removingSessions.has(session.id);
-        remove.addEventListener('click', () => requestDeleteConfirmation(session.id));
+        // T1/R1: one click, one DELETE, no confirmation step. `deleteSessionRow`
+        // re-checks `deletionBlocked`/`removingSessions`, so a double click (or a
+        // rebuild that repaints the row mid-flight) still sends one request.
+        remove.addEventListener('click', () => void deleteSessionRow(session.id));
 
         rowWrap.append(row, remove);
-
-        // Inline confirmation for THIS row only. It states the two consequences
-        // the server guarantee implies: the record is gone for good, and any
-        // running/queued work in it is stopped.
-        if (confirmingDelete === session.id) {
-            const confirm = el('div', 'session-confirm');
-            confirm.dataset.sessionId = session.id;
-            confirm.setAttribute('role', 'group');
-            confirm.setAttribute('aria-label', `Confirm deleting session ${shortId(session.id)}`);
-            confirm.append(
-                el(
-                    'p',
-                    'session-confirm-text',
-                    'Delete this session permanently. Running or queued work in it stops.'
-                )
-            );
-
-            const yes = el('button', 'session-confirm-delete', 'Delete session');
-            yes.type = 'button';
-            yes.disabled = removingSessions.has(session.id);
-            yes.addEventListener('click', () => void deleteSessionRow(session.id));
-
-            const no = el('button', 'session-confirm-cancel', 'Cancel');
-            no.type = 'button';
-            // Cancel is a pure view change: it sends NO request.
-            no.addEventListener('click', () => cancelDelete());
-
-            confirm.append(yes, no);
-            rowWrap.append(confirm);
-        }
-
         sessionList.append(rowWrap);
     }
 };

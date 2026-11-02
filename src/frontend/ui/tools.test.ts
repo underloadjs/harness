@@ -16,14 +16,14 @@ afterEach(() => {
 
 describe('createToolCallCard', () => {
     it('starts collapsed and reports a running state in text', () => {
-        const card = createToolCallCard('fileRead', '{"paths":["package.json"]}');
+        const card = createToolCallCard('read', '{"paths":["package.json"]}');
 
         expect(card.element.tagName).toBe('DETAILS');
         expect(card.element.open).toBe(false);
         expect(card.element.getAttribute('data-state')).toBe('running');
         expect(card.element.querySelector('.tool-state')?.textContent).toBe('running');
-        expect(card.element.querySelector('.tool-name')?.textContent).toBe('fileRead');
-        expect(card.element.querySelector('.tool-summary')?.getAttribute('aria-label')).toBe('fileRead: running');
+        expect(card.element.querySelector('.tool-name')?.textContent).toBe('read');
+        expect(card.element.querySelector('.tool-summary')?.getAttribute('aria-label')).toBe('read: running');
         expect(card.element.querySelector('.tool-summary')?.getAttribute('aria-haspopup')).toBe('dialog');
         expect(card.element.querySelector<HTMLElement>('.tool-summary')?.tabIndex).toBe(0);
         expect(card.element.querySelector('.tool-peek')?.textContent).toBe('{"paths":["package.json"]}');
@@ -36,11 +36,11 @@ describe('createToolCallCard', () => {
     });
 
     it('keeps the argument/result body in the closed card for the dialog to adopt', () => {
-        const card = createToolCallCard('fileRead', '{"paths":["package.json"]}');
+        const card = createToolCallCard('read', '{"paths":["package.json"]}');
         card.resolve('{"ok":true}', 'completed');
 
         const summary = card.element.querySelector('.tool-summary');
-        expect(summary?.getAttribute('aria-label')).toBe('fileRead: ok');
+        expect(summary?.getAttribute('aria-label')).toBe('read: ok');
 
         const argumentsText = '{\n  "paths": [\n    "package.json"\n  ]\n}';
         const resultText = '{\n  "ok": true\n}';
@@ -58,7 +58,7 @@ describe('createToolCallCard', () => {
     });
 
     it('resolves a successful result, highlighting JSON and summarising the size', () => {
-        const card = createToolCallCard('fileRead', '{"paths":["package.json"]}');
+        const card = createToolCallCard('read', '{"paths":["package.json"]}');
         card.resolve('{"ok":true}', 'completed');
 
         expect(card.state()).toBe('ok');
@@ -74,13 +74,13 @@ describe('createToolCallCard', () => {
     });
 
     it('marks failures and never overwrites a settled card', () => {
-        const card = createToolCallCard('commandRun', '{"command":"false"}');
+        const card = createToolCallCard('shell', '{"command":"false"}');
         card.resolve('exit code 1', 'failed');
 
         expect(card.state()).toBe('error');
         expect(card.element.querySelector('.tool-state')?.textContent).toBe('error');
         expect(card.element.querySelector('.tool-summary')?.getAttribute('aria-label')).toBe(
-            'commandRun: error'
+            'shell: error'
         );
         expect(card.element.querySelector('.tool-peek')?.textContent).toBe(
             '{"command":"false"} · failed'
@@ -97,16 +97,16 @@ describe('createToolCallCard', () => {
     it('shows a cancelled call as a control outcome, not a failure', () => {
         // R1: the runtime classifies a toolCancel release as `cancelled`; the card
         // must reflect that instead of borrowing the red error state.
-        const card = createToolCallCard('fileRead', '{"paths":["a.txt"]}', {
+        const card = createToolCallCard('read', '{"paths":["a.txt"]}', {
             callId: 'k1'
         });
-        card.resolve('Tool call "fileRead" (k1) was cancelled before it completed; no result is available.', 'cancelled');
+        card.resolve('Tool call "read" (k1) was cancelled before it completed; no result is available.', 'cancelled');
 
         expect(card.state()).toBe('cancelled');
         expect(card.element.getAttribute('data-state')).toBe('cancelled');
         expect(card.element.querySelector('.tool-state')?.textContent).toBe('cancelled');
         expect(card.element.querySelector('.tool-summary')?.getAttribute('aria-label')).toBe(
-            'fileRead: cancelled'
+            'read: cancelled'
         );
         expect(card.element.querySelector('.tool-peek')?.textContent).toBe(
             '{"paths":["a.txt"]} · cancelled'
@@ -144,7 +144,7 @@ describe('createToolCallCard', () => {
         vi.useFakeTimers();
         vi.setSystemTime(new Date(T));
 
-        const card = createToolCallCard('commandRun', '{"command":"slow"}', { startedAt: T });
+        const card = createToolCallCard('shell', '{"command":"slow"}', { startedAt: T });
         const label = card.element.querySelector<HTMLElement>('.tool-duration');
 
         expect(label?.hidden).toBe(false);
@@ -165,7 +165,7 @@ describe('createToolCallCard', () => {
     });
 
     it('uses an authoritative recorded duration when one is supplied', () => {
-        const card = createToolCallCard('fileRead', '{}');
+        const card = createToolCallCard('read', '{}');
         expect(card.element.querySelector<HTMLElement>('.tool-duration')?.hidden).toBe(true);
 
         card.resolve('ok', 'completed', 1500);
@@ -196,7 +196,7 @@ describe('createToolCallCard', () => {
         vi.useFakeTimers();
         vi.setSystemTime(new Date(T));
 
-        const card = createToolCallCard('commandRun', '{"command":"slow"}', { startedAt: T });
+        const card = createToolCallCard('shell', '{"command":"slow"}', { startedAt: T });
         vi.advanceTimersByTime(1500);
 
         card.abandon('Cancelled before the call returned.');
@@ -205,7 +205,7 @@ describe('createToolCallCard', () => {
         expect(card.element.getAttribute('data-state')).toBe('cancelled');
         expect(card.element.querySelector('.tool-state')?.textContent).toBe('cancelled');
         expect(card.element.querySelector('.tool-summary')?.getAttribute('aria-label')).toBe(
-            'commandRun: cancelled'
+            'shell: cancelled'
         );
         expect(card.element.querySelectorAll('.tool-label')[1]?.textContent).toBe('result · cancelled');
         expect(card.element.querySelector('.tool-pending')?.textContent).toBe(
@@ -225,7 +225,7 @@ describe('createToolCallCard', () => {
     });
 
     it('keeps an unknown span hidden when abandoning a card with no start stamp', () => {
-        const card = createToolCallCard('fileRead', '{}');
+        const card = createToolCallCard('read', '{}');
         card.abandon();
 
         expect(card.state()).toBe('cancelled');
@@ -237,7 +237,7 @@ describe('createToolCallCard', () => {
     });
 
     it('never overwrites a resolved card and is idempotent', () => {
-        const card = createToolCallCard('fileRead', '{}');
+        const card = createToolCallCard('read', '{}');
         card.resolve('{"ok":true}', 'completed');
 
         const settled = card.element.querySelector('.tool-result')?.innerHTML;
@@ -248,7 +248,7 @@ describe('createToolCallCard', () => {
         expect(card.element.querySelector('.tool-result')?.innerHTML).toBe(settled);
 
         // A second abandon keeps the FIRST reason (settled is final either way).
-        const pending = createToolCallCard('fileRead', '{}');
+        const pending = createToolCallCard('read', '{}');
         pending.abandon('first reason');
         pending.abandon('second reason');
         expect(pending.state()).toBe('cancelled');

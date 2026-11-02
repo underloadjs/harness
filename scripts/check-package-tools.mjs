@@ -94,7 +94,7 @@ const EXPECTED_CHECKS = ['transpile:syntax', 'load:module', 'contract:tool', 'sc
 // files, so a newly landed entry is counted without this script inventing its name.
 const RUNTIME_SOURCE_ENTRIES = [
     'actionRequest.tool.ts',
-    'agentDelegate.tool.ts',
+    'delegate.tool.ts',
     'agentManage.tool.ts',
     'agentResult.tool.ts',
     'chapterManage.tool.ts',
@@ -110,10 +110,10 @@ const RUNTIME_SOURCE_ENTRIES = [
     'toolManage.tool.ts',
     'toolRegistry.tool.ts',
     'toolRequest.tool.ts',
-    'webFetch.tool.ts',
-    'webSearch.tool.ts'
+    'fetch.tool.ts',
+    'search.tool.ts'
 ];
-const WEB_SOURCE_ENTRIES = ['webFetch.tool.ts', 'webSearch.tool.ts'];
+const WEB_SOURCE_ENTRIES = ['fetch.tool.ts', 'search.tool.ts'];
 // App tool entries (T25): DERIVED from the server tools folders, never a hand list.
 // The layout is the contract: `src/server/tools/shared` is the shared toolbox and
 // `src/server/tools/examples` is opt-in per harness. A new `*.tool.ts` in either
@@ -125,12 +125,12 @@ const APP_TOOL_FOLDERS = ['shared', 'examples'];
 // revisions, so this check inventories their files without claiming a startup
 // source record for them.
 const PRESET_SOURCE_ENTRIES = [
-    'tools/command/commandRun.tool.ts',
+    'tools/command/shell.tool.ts',
     'tools/command/gitDiff.tool.ts',
-    'tools/files/fileEdit.tool.ts',
+    'tools/files/edit.tool.ts',
     'tools/files/fileGlob.tool.ts',
     'tools/files/fileList.tool.ts',
-    'tools/files/fileRead.tool.ts',
+    'tools/files/read.tool.ts',
     'tools/files/fileWrite.tool.ts',
     'tools/syntax/syntaxCheck.tool.ts'
 ];
@@ -847,7 +847,7 @@ export default brandNew;
 
     // A preset the package DOES ship keeps working in the same harness, so the new
     // row joined the catalogue rather than replacing it.
-    assert.ok(scanning.tools.fileRead, 'the shipped preset catalogue is missing fileRead');
+    assert.ok(scanning.tools.read, 'the shipped preset catalogue is missing read');
 
     return { discovered: BRAND_NEW_PATH, executed: 'brandNew' };
 });

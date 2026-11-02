@@ -189,7 +189,7 @@ const probeFixture = (): Probe => {
 };
 
 // Lead + helper, mirroring the runtime's delegation stream: root `lead` calls
-// `agentDelegate`, helper answers, lead then answers. This produces a nested block
+// `delegate`, helper answers, lead then answers. This produces a nested block
 // with thread id '2' and label HR1. `helperGate` optionally parks the helper stream
 // so a test can submit a reference while the delegated turn is still running.
 const teamPreset = (
@@ -208,7 +208,7 @@ const teamPreset = (
                             requests?.push({ agent: 'lead', messages: copyMessages(request.messages) });
                             const last = request.messages[request.messages.length - 1];
 
-                            if (last !== undefined && last.role === 'tool' && last.name === 'agentDelegate') {
+                            if (last !== undefined && last.role === 'tool' && last.name === 'delegate') {
                                 yield { type: 'text', delta: 'done by helper' };
                                 yield { type: 'done', stopReason: 'stop', toolCalls: [] };
                                 return;
@@ -220,7 +220,7 @@ const teamPreset = (
                                 toolCalls: [
                                     {
                                         id: 'call_1',
-                                        name: 'agentDelegate',
+                                        name: 'delegate',
                                         arguments: '{"agent":"helper","input":"find it"}'
                                     }
                                 ]

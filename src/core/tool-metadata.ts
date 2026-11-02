@@ -26,7 +26,12 @@
 //   - ../tools/**/*.tool.ts      — the authoritative metadata owners
 //   - ../types                   — ToolVisibility
 
-import type { ToolVisibility } from '../types';
+import type { ToolMode, ToolVisibility } from '../types';
+
+// Re-exported so the scanner, the generated manifest, the catalogue projections, and
+// host integrations can all name the turn-policy union from the SAME module that owns
+// the registration shape (T2/R2). It is a pure re-export of ./types' ToolMode.
+export type { ToolMode } from '../types';
 
 // One tool's declarative half: everything a request declaration, a discovery
 // descriptor, or a server catalogue needs, and nothing that could execute.
@@ -90,6 +95,12 @@ export type ToolControl = 'cancel' | 'fork' | 'action';
 export type ToolRegistration = {
     group: ToolGroup;
     activation: ToolActivation;
+    // WHEN a completion of this tool may re-enter the model (T2/R2). Declared in the
+    // entry's own literal so the policy is DATA the scanner can read; absent means the
+    // documented default ('sync', see ./tool.ts `DEFAULT_TOOL_MODE`). The harness binds
+    // the resolved value to the published DEFINITION, never to the wire name, so a
+    // replacement under the same name carries only its own policy.
+    mode?: ToolMode;
     // Historical registration order. Lower first; ties break on the label. The
     // numeric gaps are deliberate so a new entry can be slotted in without
     // renumbering every file.
@@ -98,7 +109,7 @@ export type ToolRegistration = {
     pendingOnly?: boolean;
     // Dispatched by the owning run rather than executed as an ordinary tool.
     control?: ToolControl;
-    // Not declared to subagents; a guessed call is rejected (agentDelegate).
+    // Not declared to subagents; a guessed call is rejected (delegate).
     primaryOnly?: boolean;
     // Answer extraction belongs to the baseline delegation definition (T2/R1).
     answerExtraction?: boolean;
@@ -128,6 +139,10 @@ export type DiscoveredTool = {
     origin: ToolOrigin;
     group: ToolGroup;
     activation: ToolActivation;
+    // Resolved turn policy for this entry (T2/R2). ABSENT when the entry declared
+    // none, which is how a consumer can tell "defaulted" from "stated"; the runtime
+    // applies `DEFAULT_TOOL_MODE` ('sync') for the absent case.
+    mode?: ToolMode;
     order: number;
     pendingOnly?: boolean;
     control?: ToolControl;

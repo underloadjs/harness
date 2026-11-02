@@ -156,6 +156,10 @@ const cloneMetadata = (metadata: ToolMetadata): ToolMetadata => ({
 
 // Detached row copy: metadata via cloneMetadata, every policy flag copied by value
 // (all of them are primitives), so the returned row shares no mutable state.
+//
+// `mode` is copied like every other policy field (T2/R2): the catalogue, the
+// generated manifest, and a harness registration all read the SAME declared policy,
+// and a detached copy means a consumer cannot mutate the snapshot row.
 const cloneDescriptor = (descriptor: ToolDescriptor): ToolDescriptor => ({
     name: descriptor.name,
     metadata: cloneMetadata(descriptor.metadata),
@@ -164,6 +168,7 @@ const cloneDescriptor = (descriptor: ToolDescriptor): ToolDescriptor => ({
     origin: descriptor.origin,
     group: descriptor.group,
     activation: descriptor.activation,
+    ...(descriptor.mode === undefined ? {} : { mode: descriptor.mode }),
     order: descriptor.order,
     ...(descriptor.pendingOnly === undefined ? {} : { pendingOnly: descriptor.pendingOnly }),
     ...(descriptor.control === undefined ? {} : { control: descriptor.control }),
@@ -285,16 +290,16 @@ export const PRESET_DESCRIPTORS: readonly ToolDescriptor[] = SNAPSHOT_DESCRIPTOR
 // The harness-owned core entries the server LISTS for review/manual execution:
 // `group === 'runtime'` and `listed !== false`. That excludes the session-only
 // capability rows the server deliberately does not advertise in its global
-// catalogue (webSearch/webFetch are listed separately by their own factories;
+// catalogue (search/fetch are listed separately by their own factories;
 // toolCancel/threadSend/threadList only exist inside a live session), while keeping
-// the conditional-but-listable set (agentDelegate, actionRequest, threadFork).
+// the conditional-but-listable set (delegate, actionRequest, threadFork).
 //
 // ORDER: baseline rows (always/creation) keep descriptor order, because that is the
 // kernel's registration order and a catalogue must not disagree with the runtime.
 // Capability rows are ordered by the ACTIVATION VOCABULARY — the union declared in
 // core/tool-metadata.ts: always, creation, subagents, interaction, forks, threads,
 // websearch, webfetch. That reproduces the historical catalogue sequence
-// (agentDelegate → actionRequest → threadFork) from DATA instead of a name list, so
+// (delegate → actionRequest → threadFork) from DATA instead of a name list, so
 // adding a capability row needs no edit here and no test rewrite: the position
 // follows its declared activation.
 const ACTIVATION_ORDER: readonly ToolActivation[] = [
@@ -417,7 +422,7 @@ export const controlOf = (descriptor: ToolDescriptor): ToolControl | undefined =
 // The generated loader resolves the whole MODULE namespace (it must stay data-only
 // and cannot know which binding is the tool), so the tool is selected here:
 //
-//   - `module[descriptor.name]` — the canonical `export const fileRead = tool({...})`
+//   - `module[descriptor.name]` — the canonical `export const read = tool({...})`
 //     shape every shipped entry uses;
 //   - `module.default` - the `export default` shape a host-authored entry may use
 //     instead (server/tools/**/*.tool.ts and toolFolders entries);

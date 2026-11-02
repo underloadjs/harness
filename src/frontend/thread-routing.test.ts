@@ -38,7 +38,7 @@ const descriptor = (): HarnessDescriptor =>
         requiresEndpoint: true,
         agents: ['instruct'],
         tools: [],
-        coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'agentDelegate'],
+        coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'delegate'],
         primary: 'instruct',
         subagents: [],
         builtin: true,
@@ -410,7 +410,7 @@ it('never resurrects a deleted thread from a late snapshot, turn or event (S3)',
 it('steers a child conversation from its nested invocation row (S2)', async () => {
     const parentEvents = [
         { type: 'start', agent: 'instruct', model: 'm1' },
-        { type: 'tool_call', agent: 'instruct', call: { id: 'd1', name: 'agentDelegate', arguments: '{}' } },
+        { type: 'tool_call', agent: 'instruct', call: { id: 'd1', name: 'delegate', arguments: '{}' } },
         { type: 'start', agent: 'helper', model: 'h1', thread: { id: 'inv-9' } }
     ];
     const stub = stubServer(

@@ -1,4 +1,4 @@
-// webFetch `exa` provider — page content through Exa's /contents endpoint.
+// fetch `exa` provider — page content through Exa's /contents endpoint.
 //
 // Loaded by `import()` from ./index on the first `provider: "exa"` call, so
 // constructing a harness or fetching a native page never touches this module.

@@ -167,9 +167,9 @@ export type HarnessDescriptor = {
     agents: string[];
     tools: string[];
     // The core tools this card's runs will declare (R18): the four core file tools
-    // (fileRead/fileWrite/fileEdit/fileGlob) when registered, the harness-owned
-    // toolRequest/toolCreate/todoManage, agentDelegate when a subagent allowlist
-    // exists, and webSearch when this host has a provider key. The UI core dropdown
+    // (read/fileWrite/edit/fileGlob) when registered, the harness-owned
+    // toolRequest/toolCreate/todoManage, delegate when a subagent allowlist
+    // exists, and search when this host has a provider key. The UI core dropdown
     // renders this exact set, so it reflects runtime visibility rather than a
     // hard-coded harness list. fileList and the other presets stay searchable.
     coreTools?: string[];
@@ -219,7 +219,7 @@ export type UpdateHarnessRequest = {
 };
 
 // Whether the server can actually run a listed tool. Omitted means "available":
-// the field was added for credential-dependent tools (webSearch), so leaving it
+// the field was added for credential-dependent tools (search), so leaving it
 // off keeps every existing entry byte-identical.
 //
 // `environment` names variables only — never values — and `hint` is a non-secret
@@ -242,7 +242,7 @@ export type ToolDescriptor = {
     parameters: Record<string, unknown>;
     availability?: ToolAvailability;
     // True for the harness-owned core tools (toolRequest, toolCreate, todoManage,
-    // agentDelegate). They have no standalone implementation: a call must carry a
+    // delegate). They have no standalone implementation: a call must carry a
     // `sessionId` and executes through that session's harness. Omitted for every
     // directly callable entry, so existing descriptors keep their shape.
     sessionBound?: boolean;
@@ -600,14 +600,14 @@ export type ToolCallRequest = {
     // Which session runs the call (R8; live routing per the self-modifying-tools
     // R4). When present and non-empty, the call resolves through THAT session's
     // live harness registry: session-bound core tools (toolRegistry, toolRequest,
-    // toolCreate, todoManage, agentDelegate, …), replaced preset/app tools, and
+    // toolCreate, todoManage, delegate, …), replaced preset/app tools, and
     // runtime-created names all execute there, so discovery, registration, todos,
     // and delegation affect the conversation the user is looking at. Omitted or
     // empty keeps the static direct runner for a directly callable catalogue tool
     // (one request shape for the UI); a `sessionBound` core tool then answers 400.
     //
     // 400 when a core call omits it; 404 when the session (or the tool inside that
-    // session, e.g. agentDelegate without subagents) does not exist; 409 when the
+    // session, e.g. delegate without subagents) does not exist; 409 when the
     // session is busy (a run, a reset, or another manual call), so a manual
     // mutation cannot race an active operation.
     sessionId?: string;

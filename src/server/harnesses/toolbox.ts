@@ -16,29 +16,29 @@
 //
 // WHAT IS IN THE SHARED TOOLBOX (T14 names)
 // -----------------------------------------
-//   - package presets  — src/tools: syntaxCheck, fileRead, fileWrite, fileEdit,
-//                        fileList, fileGlob, commandRun, gitDiff
+//   - package presets  — src/tools: syntaxCheck, read, fileWrite, edit,
+//                        fileList, fileGlob, shell, gitDiff
 //                        (lazy proxies, see src/tools/lazy.ts)
 //   - harness tools    — src/server/tools/shared: timeNow, textCount, diceRoll,
 //                        noteSearch, textSummarize (T25: discovered from the files,
 //                        registered from their discovered source paths, never
 //                        imported)
-//   - webSearch        — environment-backed (EXA_API_KEY / TAVILY_API_KEY); the
+//   - search        — environment-backed (EXA_API_KEY / TAVILY_API_KEY); the
 //                        harness factory registers it only when a key resolves,
 //                        so a keyless host is offline-safe. The global catalogue
 //                        still lists it as `unconfigured`, never fake-callable.
-//   - core tools       - the four everyday file tools (fileRead, fileWrite,
-//                        fileEdit, fileGlob), webSearch when the host configured a
+//   - core tools       - the four everyday file tools (read, fileWrite,
+//                        edit, fileGlob), search when the host configured a
 //                        key, and the harness-owned set (toolRegistry, toolRequest,
 //                        toolCreate, todoManage, profileManage, chapterManage,
-//                        locationManage, plus agentDelegate for a preset that
+//                        locationManage, plus delegate for a preset that
 //                        declares subagents).
 //                        fileList and the other package/app tools stay
 //                        searchable, so they wait for toolRequest.
 //
 // "core" is a declaration classification, not a session binding: only the
 // harness-owned set is sessionBound in the server catalogue because only it
-// mutates a session's harness. Core file tools and webSearch keep the ordinary
+// mutates a session's harness. Core file tools and search keep the ordinary
 // session-less direct-call path.
 //
 // DELIBERATE EXCEPTIONS
@@ -133,7 +133,7 @@ export const SHARED_TOOL_NAMES: readonly string[] = Object.freeze(Object.keys(SH
 // compile/load/validate operation runtime replacements use. `SHARED_TOOLS` holds
 // lazy proxy definitions for package presets and app tools; passing them via
 // `configuration.tools` takes the non-compiling `prepareDefinition` branch, so
-// `harness.toolSource('fileRead'/'timeNow')` stays undefined and an agent cannot
+// `harness.toolSource('read'/'timeNow')` stays undefined and an agent cannot
 // inspect/edit the revision that is actually running.
 //
 // Every entry here points at the concrete, shipped source file. `createToolboxHarness`
@@ -168,7 +168,7 @@ export const SHARED_TOOL_FOLDERS: readonly string[] = Object.freeze([SHARED_APP_
 // The rule is the descriptor's own registration policy: a runtime entry that is
 // registered unconditionally at startup is part of the declared core set, in
 // descriptor order (the scan emits the kernel's registration order, toolRegistry
-// first). Entries that are capability-by-configuration — agentDelegate (subagents),
+// first). Entries that are capability-by-configuration — delegate (subagents),
 // actionRequest (owner answerer), threadFork (fork configuration), toolCancel
 // (pending work), the thread pair (independent threads) — are NOT in this list and
 // are projected separately by coreToolNames() below, which is why a single-agent
@@ -203,7 +203,7 @@ export const CORE_ENVIRONMENT_TOOL_NAMES = [WEB_SEARCH_TOOL_NAME] as const;
 // `registered` is the exact tool-name set the card was built with (preset.tools
 // plus environment tools THIS host can actually run — see descriptor.ts). A core
 // name is advertised only when it is in that set, so the demo fixture (timeNow
-// only) does not claim file tools, and a keyless host does not claim webSearch.
+// only) does not claim file tools, and a keyless host does not claim search.
 export const coreToolNames = (
     subagents: readonly string[] = [],
     registered: readonly string[] = []
@@ -216,8 +216,8 @@ export const coreToolNames = (
     // before file presets here too.
     return [
         ...CORE_TOOL_NAMES,
-        ...(subagents.length > 0 ? ['agentDelegate'] : []),
-        // N6: always registered (forks default enabled), after agentDelegate in
+        ...(subagents.length > 0 ? ['delegate'] : []),
+        // N6: always registered (forks default enabled), after delegate in
         // the runtime's registration order.
         'threadFork',
         ...CORE_PRESET_TOOL_NAMES.filter((name) => available.has(name)),
@@ -301,7 +301,7 @@ export const createProfiledHarness =
 export type ToolboxHarnessConfiguration = {
     agents: Record<string, Agent>;
     primary: string;
-    // Omitted/empty means a single-agent harness (no agentDelegate tool).
+    // Omitted/empty means a single-agent harness (no delegate tool).
     subagents?: readonly string[];
     // Example-only SOURCE extras (the recoverable-failure preset adds `testFlaky`).
     // Merged after the shared source map and before host `extraTools`, so a shipped
@@ -319,7 +319,7 @@ export type ToolboxHarnessConfiguration = {
 // source PATH — `toolSources` for the package presets AND the app tools (T25) — not
 // as a constructed Tool through `tools`. The harness compiles/loads/validates each
 // entry through the SAME kernel runtime replacements use, so
-// `harness.toolSource('fileRead')` and `harness.toolSource('timeNow')` report a real
+// `harness.toolSource('read')` and `harness.toolSource('timeNow')` report a real
 // module revision instead of `undefined`. `presets: false` still keeps the registry
 // exact: the kernel's default baseline is skipped because `SHARED_TOOL_SOURCES` lists
 // precisely the shared set a descriptor advertises.
@@ -328,7 +328,7 @@ export type ToolboxHarnessConfiguration = {
 // BEFORE `configuration.extraTools`: shipped exceptions (the flaky example's
 // `testFlaky`) are compiled from their editable entries, while a host definition
 // still wins on a name collision exactly as before. Environment tools
-// (webSearch/webFetch) follow the host configuration as usual.
+// (search/fetch) follow the host configuration as usual.
 //
 // FOLDER PRECEDENCE (T25): every app entry is a `toolSources` entry discovered from
 // `src/server/tools/shared`, so the kernel commits it after the package baseline and
@@ -372,9 +372,9 @@ export const createToolboxHarness = (
         // Environment-backed search; no key means the factory returns undefined
         // and the harness is unchanged. Keys are resolved at construction, after
         // `.env` is loaded by the CLI/server. The CONFIGURATION field keeps its
-        // name (`websearch`); the core tool it registers is webSearch (R18).
+        // name (`websearch`); the core tool it registers is search (R18).
         websearch: true,
-        // Page fetch (W4) must be opted into as well, or `webFetch` never enters
+        // Page fetch (W4) must be opted into as well, or `fetch` never enters
         // this harness's tool map and `toolRequest` has nothing to surface under
         // the `web`/`fetch`/`url` tags — the agent then legitimately reports
         // "search only". `native` needs no credential, so this is safe on a

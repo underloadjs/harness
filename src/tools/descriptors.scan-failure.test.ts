@@ -35,7 +35,7 @@ vi.mock('../core/tool-scan', async (importOriginal) => {
             }
 
             throw new HarnessError(
-                'Tool entry tools/files/fileRead.tool.ts metadata.tags must be a non-empty string array.'
+                'Tool entry tools/files/read.tool.ts metadata.tags must be a non-empty string array.'
             );
         }
     };
@@ -63,19 +63,19 @@ describe('live catalogue scan failures (T24)', () => {
         expect(TOOL_DESCRIPTORS).toHaveLength(27);
         expect(PRESET_DESCRIPTORS.map((descriptor) => descriptor.name)).toEqual([
             'syntaxCheck',
-            'fileRead',
+            'read',
             'fileWrite',
-            'fileEdit',
+            'edit',
             'fileList',
             'fileGlob',
-            'commandRun',
+            'shell',
             'gitDiff'
         ]);
     });
 
     it('rethrows an invalid-entry diagnostic instead of publishing stale rows', async () => {
         await expect(freshDescriptors('invalid-entry')).rejects.toThrow(
-            'Tool entry tools/files/fileRead.tool.ts metadata.tags must be a non-empty string array.'
+            'Tool entry tools/files/read.tool.ts metadata.tags must be a non-empty string array.'
         );
     });
 });

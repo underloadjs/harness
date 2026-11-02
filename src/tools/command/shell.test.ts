@@ -1,4 +1,4 @@
-// commandRun — the bounded shell escape hatch (R1).
+// shell — the bounded shell escape hatch (R1).
 //
 // What this pins, exactly:
 //   - ordinary small commands return the real exit code and exact captured text;
@@ -23,9 +23,9 @@ import { fileURLToPath } from 'node:url';
 import {
     COMMAND_DEFAULT_TIMEOUT_MS,
     COMMAND_MAX_TIMEOUT_MS,
-    commandRun,
+    shell,
     type CommandRunParameters
-} from './commandRun.tool';
+} from './shell.tool';
 import { COMMAND_STDERR_MAX_BYTES, COMMAND_STDOUT_MAX_BYTES } from './boundedText';
 import { HarnessError } from '../../util';
 
@@ -65,11 +65,11 @@ afterAll(async () => {
 // The direct callable takes no context, so a signal is only reachable through
 // execute(). This helper narrows the cast to one place.
 const executeWithSignal = (parameters: CommandRunParameters, signal: AbortSignal) =>
-    commandRun.execute({ parameters, signal } as unknown as Parameters<typeof commandRun.execute>[0]);
+    shell.execute({ parameters, signal } as unknown as Parameters<typeof shell.execute>[0]);
 
-describe('commandRun', () => {
+describe('shell', () => {
     it('returns the exact result for a small command', async () => {
-        await expect(commandRun({ command: 'node -e "process.stdout.write(\'hello\')"' })).resolves.toEqual({
+        await expect(shell({ command: 'node -e "process.stdout.write(\'hello\')"' })).resolves.toEqual({
             exitCode: 0,
             stdout: 'hello',
             stderr: '',
@@ -81,7 +81,7 @@ describe('commandRun', () => {
 
     it('captures stderr separately from stdout', async () => {
         await expect(
-            commandRun({ command: 'node -e "process.stderr.write(\'boom\')"' })
+            shell({ command: 'node -e "process.stderr.write(\'boom\')"' })
         ).resolves.toEqual({
             exitCode: 0,
             stdout: '',
@@ -93,7 +93,7 @@ describe('commandRun', () => {
     });
 
     it('returns a non-zero exit as data instead of throwing', async () => {
-        await expect(commandRun({ command: 'node -e "process.exit(3)"' })).resolves.toEqual({
+        await expect(shell({ command: 'node -e "process.exit(3)"' })).resolves.toEqual({
             exitCode: 3,
             stdout: '',
             stderr: '',
@@ -109,7 +109,7 @@ describe('commandRun', () => {
         const command =
             'node -e "process.stdout.write(Buffer.from([0xE2,0x82])); setTimeout(() => process.stdout.write(Buffer.from([0xAC])), 100)"';
 
-        await expect(commandRun({ command })).resolves.toEqual({
+        await expect(shell({ command })).resolves.toEqual({
             exitCode: 0,
             stdout: '€',
             stderr: '',
@@ -120,7 +120,7 @@ describe('commandRun', () => {
     });
 
     it('caps stdout at 128 KiB and flags truncation', async () => {
-        const result = await commandRun({ command: 'node -e "process.stdout.write(\'a\'.repeat(200000))"' });
+        const result = await shell({ command: 'node -e "process.stdout.write(\'a\'.repeat(200000))"' });
 
         expect(result.exitCode).toBe(0);
         // ASCII only, so the byte cap and the string length agree exactly.
@@ -132,7 +132,7 @@ describe('commandRun', () => {
     });
 
     it('caps stderr at 16 KiB and flags truncation', async () => {
-        const result = await commandRun({ command: 'node -e "process.stderr.write(\'b\'.repeat(20000))"' });
+        const result = await shell({ command: 'node -e "process.stderr.write(\'b\'.repeat(20000))"' });
 
         expect(result.exitCode).toBe(0);
         expect(result.stdout).toBe('');
@@ -141,7 +141,7 @@ describe('commandRun', () => {
     });
 
     it('times out a long run, kills it, and reports the flags', async () => {
-        const result = await commandRun({
+        const result = await shell({
             command: 'node -e "setTimeout(() => {}, 5000)"',
             timeoutMs: 150
         });
@@ -163,7 +163,7 @@ describe('commandRun', () => {
         const path = markerPath('timeout.txt');
         await rm(path, { force: true });
 
-        const result = await commandRun({ command: markerCommand(path, 1500), timeoutMs: 200 });
+        const result = await shell({ command: markerCommand(path, 1500), timeoutMs: 200 });
 
         expect(result.timedOut).toBe(true);
         expect(result.exitCode).toBe(-1);
@@ -235,7 +235,7 @@ describe('commandRun', () => {
     });
 
     it('rejects a spawn failure instead of reporting it as a result', async () => {
-        const error = await commandRun({
+        const error = await shell({
             command: 'node -e "process.stdout.write(\'x\')"',
             cwd: join(TEMP_ROOT, 'underload-command-run-missing-cwd')
         }).catch((caught: unknown) => caught);
@@ -245,25 +245,25 @@ describe('commandRun', () => {
     });
 
     it('rejects a blank command', async () => {
-        await expect(commandRun({ command: '   ' })).rejects.toThrow(
-            new HarnessError('commandRun requires a non-empty command string.')
+        await expect(shell({ command: '   ' })).rejects.toThrow(
+            new HarnessError('shell requires a non-empty command string.')
         );
     });
 
     it('rejects invalid timeout values', async () => {
-        const message = 'commandRun timeoutMs must be a positive finite number of milliseconds.';
+        const message = 'shell timeoutMs must be a positive finite number of milliseconds.';
 
-        await expect(commandRun({ command: 'node --version', timeoutMs: 0 })).rejects.toThrow(
+        await expect(shell({ command: 'node --version', timeoutMs: 0 })).rejects.toThrow(
             new HarnessError(message)
         );
-        await expect(commandRun({ command: 'node --version', timeoutMs: -1 })).rejects.toThrow(
+        await expect(shell({ command: 'node --version', timeoutMs: -1 })).rejects.toThrow(
             new HarnessError(message)
         );
-        await expect(commandRun({ command: 'node --version', timeoutMs: Number.NaN })).rejects.toThrow(
+        await expect(shell({ command: 'node --version', timeoutMs: Number.NaN })).rejects.toThrow(
             new HarnessError(message)
         );
         await expect(
-            commandRun({ command: 'node --version', timeoutMs: Number.POSITIVE_INFINITY })
+            shell({ command: 'node --version', timeoutMs: Number.POSITIVE_INFINITY })
         ).rejects.toThrow(new HarnessError(message));
     });
 

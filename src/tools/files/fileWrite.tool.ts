@@ -27,8 +27,8 @@
 // WHY NUL CONTENT IS REJECTED (binary consistency)
 // ------------------------------------------------
 // This tool advertises UTF-8 TEXT: the description says text, the encoding is utf8,
-// and the only reader in the package (fileRead) treats a NUL byte as binary and
-// refuses the file outright (see fileRead's binary rejection). Writing a NUL
+// and the only reader in the package (read) treats a NUL byte as binary and
+// refuses the file outright (see read's binary rejection). Writing a NUL
 // therefore produces a file that the harness itself cannot read back — a write that
 // silently breaks the read side. There is no binary write API here to opt into, so
 // the content is rejected during preflight, before any file is touched, rather than
@@ -136,14 +136,14 @@ const prepareWrites = async (files: FileWriteParameters): Promise<PreparedWrite[
             throw new HarnessError('fileWrite files require a "content" string.');
         }
 
-        // A NUL byte is the harness's own binary marker (fileRead rejects it), so
+        // A NUL byte is the harness's own binary marker (read rejects it), so
         // writing one creates a file this package cannot read back. Rejected in
         // preflight — before any write — so nothing is created meanwhile.
         const target = resolve(path);
 
         if (content.includes('\u0000')) {
             throw new HarnessError(
-                `fileWrite content must not contain NUL characters (${target}): the file would be unreadable by fileRead, which rejects binary content.`
+                `fileWrite content must not contain NUL characters (${target}): the file would be unreadable by read, which rejects binary content.`
             );
         }
 

@@ -114,8 +114,8 @@ The package `files` allow-list includes `src` and excludes tests. The runtime
 compiler must remain able to read these editable entries after a production
 install; generated `dist/` files are not the editable source model.
 
-The opt-in web tools also ship independently as `tools/runtime/webSearch.tool.ts`
-and `tools/runtime/webFetch.tool.ts`; their editable provider implementations are shipped
+The opt-in web tools also ship independently as `tools/runtime/search.tool.ts`
+and `tools/runtime/fetch.tool.ts`; their editable provider implementations are shipped
 too. The registered entries delegate provider/credential operations to the
 harness that owns them; startup supplies the configured metadata/runtime closure.
 A replacement registered under those names is an ordinary source revision and

@@ -7,8 +7,8 @@
 // that `link.ts` and `real.ts` are one file through a symlink. Consequences that
 // were real:
 //
-//   - fileWrite/fileEdit accepted a batch that wrote the same file twice under two
-//     spellings, so the second write silently won (fileWrite.ts, fileEdit.ts);
+//   - fileWrite/edit accepted a batch that wrote the same file twice under two
+//     spellings, so the second write silently won (fileWrite.ts, edit.ts);
 //   - fileGlob walked the same tree twice for roots `src` and `SRC` (or a symlinked
 //     root) and listed every file twice (fileGlob.ts `collect`).
 //
@@ -33,7 +33,7 @@
 //
 // Cross-references:
 //   - ./fileWrite   — duplicate targets in one batch
-//   - ./fileEdit    — duplicate targets in one batch
+//   - ./edit    — duplicate targets in one batch
 //   - ./fileGlob    — root aliases that walk one tree twice
 
 import { realpath } from 'node:fs/promises';
@@ -71,7 +71,7 @@ export const canonicalPathKey = (path: string): string => canonical(resolve(path
 export const fileIdentity = async (path: string): Promise<string> => {
     const absolute = resolve(path);
 
-    // The common case: the file exists (fileEdit, fileGlob, an overwrite).
+    // The common case: the file exists (edit, fileGlob, an overwrite).
     const direct = await tryRealpath(absolute);
     if (direct !== undefined) return canonical(direct);
 

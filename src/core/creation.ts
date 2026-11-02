@@ -15,7 +15,7 @@
 // -----------
 // Compilation uses the host realm's Function constructor (`new AsyncFunction`).
 // A created tool therefore has the full permissions of the process: filesystem,
-// network, child processes. That is the same trust model as `commandRun` in
+// network, child processes. That is the same trust model as `shell` in
 // src/tools — this package has no sandbox and no isolation, and nothing here
 // should ever be described as sandboxing. What this module DOES guarantee:
 //   - a bounded name/description/tag/source shape,
@@ -104,7 +104,7 @@ export const compileToolSource = (source: string): ToolBody => {
 // anything a model can get wrong, so the harness can surface the text as a tool
 // result instead of crashing the run.
 //
-// `options.reserved` is the registry's own name list (toolRequest/toolCreate/agentDelegate
+// `options.reserved` is the registry's own name list (toolRequest/toolCreate/delegate
 // in the harness). Comparison is case-insensitive so a near-collision cannot make
 // the catalogue ambiguous.
 export const createDynamicTool = (

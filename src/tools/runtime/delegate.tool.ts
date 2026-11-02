@@ -1,4 +1,4 @@
-// agentDelegate — standalone source entry for one-level bounded delegation.
+// delegate — standalone source entry for one-level bounded delegation.
 //
 // The allowlist schema is per-harness, so the kernel registration supplies the
 // exact description/schema while this entry owns the execution contract. The
@@ -24,7 +24,7 @@
 import type { CoreToolMetadata } from '../../core';
 import type { ToolContext } from '../../types';
 
-export const AGENT_DELEGATE_NAME = 'agentDelegate';
+export const AGENT_DELEGATE_NAME = 'delegate';
 
 // The canonical, AST-extractable declaration. Deliberately literal (see header).
 // This is the ZERO-SUBAGENT catalogue form: a host that lists the capability
@@ -56,6 +56,11 @@ export const metadata = {
 export const registration = {
     group: 'runtime',
     activation: 'subagents',
+    // T2/R2: ASYNC, deliberately. A delegation is a whole child run, so the parent must
+    // stay free (its own turn is not held by the child), a completion triggers its own
+    // turn the moment the child answers, and `toolCancel` / the periodic heartbeat keep
+    // working exactly as before. Grouping it would serialize the delegation model.
+    mode: 'async',
     order: 120,
     primaryOnly: true,
     answerExtraction: true,
@@ -64,7 +69,7 @@ export const registration = {
     alwaysDeclared: false
 } as const;
 
-// Delegation (R4). Capability-by-configuration: the harness registers agentDelegate
+// Delegation (R4). Capability-by-configuration: the harness registers delegate
 // only when the allowlist is non-empty, so this metadata has two honest forms:
 //   - with subagents - the runtime declaration, whose `agent` enum is the exact
 //     allowlist and whose description names it;
@@ -109,7 +114,7 @@ export const agentDelegateMetadata = (subagents: readonly string[] = []): CoreTo
 
 export const execute = (context: ToolContext) => {
     if (context.harness === undefined) {
-        throw new Error('agentDelegate requires the live harness reference.');
+        throw new Error('delegate requires the live harness reference.');
     }
 
     return context.harness.runtime.delegate(

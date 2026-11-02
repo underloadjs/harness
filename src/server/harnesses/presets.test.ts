@@ -6,10 +6,10 @@
 //     first five cards, with the visible titles Instruct/Researcher/Coder/
 //     Reviewer/Planner; demo and flaky stay after them as examples;
 //   - every real preset registers the exact same tool keys, configured and keyless —
-//     package coding tools, the app tools, webSearch when a key resolves, then the
+//     package coding tools, the app tools, search when a key resolves, then the
 //     harness core tools;
 //   - every real preset declares EVERY other real role plus `summarizer` as a direct
-//     subagent, so `agentDelegate` exists on all five and the Planner's researcher/
+//     subagent, so `delegate` exists on all five and the Planner's researcher/
 //     coder/reviewer targets exist by id;
 //   - the profiles' delegation wording is conditional and one level deep: a subagent
 //     is never asked to delegate again;
@@ -73,12 +73,12 @@ const instructionOf = (presetName: string, agentName: string): string => {
 // The exact shared registry order: eight package tools, then five app tools.
 const TOOLBOX = [
     'syntaxCheck',
-    'fileRead',
+    'read',
     'fileWrite',
-    'fileEdit',
+    'edit',
     'fileList',
     'fileGlob',
-    'commandRun',
+    'shell',
     'gitDiff',
     'timeNow',
     'textCount',
@@ -87,7 +87,7 @@ const TOOLBOX = [
     'textSummarize'
 ];
 
-// The harness-owned core set, in descriptor order, without agentDelegate.
+// The harness-owned core set, in descriptor order, without delegate.
 // toolRegistry leads because the kernel registers it before every other core tool.
 const CORE = [
     'toolRegistry',
@@ -170,7 +170,7 @@ describe('preset catalogue', () => {
                 subagents: teamOf('instruct'),
                 agents: ['instruct', ...teamOf('instruct')],
                 tools: TOOLBOX,
-                environmentTools: ['webSearch']
+                environmentTools: ['search']
             },
             {
                 name: 'research',
@@ -178,7 +178,7 @@ describe('preset catalogue', () => {
                 subagents: teamOf('research'),
                 agents: ['research', ...teamOf('research')],
                 tools: TOOLBOX,
-                environmentTools: ['webSearch']
+                environmentTools: ['search']
             },
             {
                 name: 'workspace',
@@ -186,7 +186,7 @@ describe('preset catalogue', () => {
                 subagents: teamOf('workspace'),
                 agents: ['workspace', ...teamOf('workspace')],
                 tools: TOOLBOX,
-                environmentTools: ['webSearch']
+                environmentTools: ['search']
             },
             {
                 name: 'reviewer',
@@ -194,7 +194,7 @@ describe('preset catalogue', () => {
                 subagents: teamOf('reviewer'),
                 agents: ['reviewer', ...teamOf('reviewer')],
                 tools: TOOLBOX,
-                environmentTools: ['webSearch']
+                environmentTools: ['search']
             },
             {
                 name: 'planner',
@@ -202,7 +202,7 @@ describe('preset catalogue', () => {
                 subagents: teamOf('planner'),
                 agents: ['planner', ...teamOf('planner')],
                 tools: TOOLBOX,
-                environmentTools: ['webSearch']
+                environmentTools: ['search']
             },
             {
                 name: 'demo',
@@ -220,7 +220,7 @@ describe('preset catalogue', () => {
                 tools: [...TOOLBOX, 'testFlaky'],
                 // The factory opts into search via createToolboxHarness, so the
                 // metadata says so too (descriptor/runtime agreement).
-                environmentTools: ['webSearch']
+                environmentTools: ['search']
             }
         ]);
 
@@ -253,19 +253,19 @@ describe('one toolbox, different agents', () => {
         vi.stubEnv('TAVILY_API_KEY', '');
 
         // Identical by construction: preset.tools is the same table, every real
-        // preset declares subagents (so agentDelegate exists on all five), and the
+        // preset declares subagents (so delegate exists on all five), and the
         // only other difference is the example's testFlaky. W4: the toolbox factory
-        // also opts into webfetch, so webFetch is registered right after the
-        // configured webSearch and stays SEARCHABLE (it is not in CORE).
+        // also opts into webfetch, so fetch is registered right after the
+        // configured search and stays SEARCHABLE (it is not in CORE).
         for (const name of REAL) {
             expect(registeredTools(name)).toEqual([
                 ...CORE,
-                'agentDelegate',
+                'delegate',
                 'threadFork',
                 'toolCancel',
                 ...TOOLBOX,
-                'webSearch',
-                'webFetch'
+                'search',
+                'fetch'
             ]);
         }
 
@@ -276,8 +276,8 @@ describe('one toolbox, different agents', () => {
             'toolCancel',
             ...TOOLBOX,
             'testFlaky',
-            'webSearch',
-            'webFetch'
+            'search',
+            'fetch'
         ]);
 
         // The scripted offline fixture is a documented exception.
@@ -293,23 +293,23 @@ describe('one toolbox, different agents', () => {
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
 
-        // W4: webFetch needs no credential, so unlike webSearch it is still here on
+        // W4: fetch needs no credential, so unlike search it is still here on
         // a keyless host; it lands after the shared table and before the core set.
         for (const name of REAL) {
             expect(registeredTools(name)).toEqual([
                 ...CORE,
-                'agentDelegate',
+                'delegate',
                 'threadFork',
                 'toolCancel',
                 ...TOOLBOX,
-                'webFetch'
+                'fetch'
             ]);
         }
 
-        // No key means the factory registers no webSearch at all; the global
+        // No key means the factory registers no search at all; the global
         // catalogue is where a keyless host learns it exists but is unconfigured.
-        // webFetch is the documented exception: native fetch is keyless.
-        expect(registeredTools('instruct')).not.toContain('webSearch');
+        // fetch is the documented exception: native fetch is keyless.
+        expect(registeredTools('instruct')).not.toContain('search');
     });
 
     it('excludes testFlaky from the shared toolbox and the real presets', () => {
@@ -336,12 +336,12 @@ describe('one toolbox, different agents', () => {
             )
         ).toEqual({
             syntaxCheck: 'searchable',
-            fileRead: 'core',
+            read: 'core',
             fileWrite: 'core',
-            fileEdit: 'core',
+            edit: 'core',
             fileList: 'searchable',
             fileGlob: 'core',
-            commandRun: 'searchable',
+            shell: 'searchable',
             gitDiff: 'searchable',
             timeNow: 'searchable',
             textCount: 'searchable',
@@ -352,30 +352,30 @@ describe('one toolbox, different agents', () => {
 
         // Names and metadata are registered without eager implementation loading
         // (the package entries are lazy proxies, see src/tools/lazy.ts).
-        expect(harness.tools.fileRead.tags).toEqual(['files', 'read', 'filesystem']);
+        expect(harness.tools.read.tags).toEqual(['files', 'read', 'filesystem']);
 
         // W4: the toolbox factory also opts into webfetch, but fetching stays
         // discovery-gated (SEARCHABLE), so it is never a core declaration and
         // never appears in a descriptor's coreTools.
-        expect(harness.tools.webFetch.visibility).toBe('searchable');
-        expect(harness.tools.webFetch.tags).toEqual(['web', 'fetch', 'internet', 'read', 'url', 'research']);
+        expect(harness.tools.fetch.visibility).toBe('searchable');
+        expect(harness.tools.fetch.tags).toEqual(['web', 'fetch', 'internet', 'read', 'url', 'research']);
         expect(harness.tools.toolRequest.visibility).toBe('core');
         expect(harness.tools.toolCreate.visibility).toBe('core');
         expect(harness.tools.todoManage.visibility).toBe('core');
-        expect(harness.tools.agentDelegate.visibility).toBe('core');
-        expect(presetOf('demo').create(SETTINGS, progress).tools.agentDelegate).toBeUndefined();
+        expect(harness.tools.delegate.visibility).toBe('core');
+        expect(presetOf('demo').create(SETTINGS, progress).tools.delegate).toBeUndefined();
     });
 
-    it('marks a configured webSearch core, like the file core set', () => {
+    it('marks a configured search core, like the file core set', () => {
         vi.stubEnv('EXA_API_KEY', 'configured-exa-key');
         vi.stubEnv('TAVILY_API_KEY', '');
 
         const harness = presetOf('instruct').create(SETTINGS, progress);
 
-        expect(harness.tools.webSearch.visibility).toBe('core');
+        expect(harness.tools.search.visibility).toBe('core');
         // Still only registered when a key resolved.
         vi.stubEnv('EXA_API_KEY', '');
-        expect(presetOf('instruct').create(SETTINGS, progress).tools.webSearch).toBeUndefined();
+        expect(presetOf('instruct').create(SETTINGS, progress).tools.search).toBeUndefined();
     });
 
     it('descriptor coreTools agrees with the runtime core declarations', () => {
@@ -386,7 +386,7 @@ describe('one toolbox, different agents', () => {
 
         const names = presets.map((preset) => preset.name);
 
-        // Keyless: no webSearch anywhere, and the demo fixture claims no file
+        // Keyless: no search anywhere, and the demo fixture claims no file
         // tools because it registers timeNow only.
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
@@ -397,7 +397,7 @@ describe('one toolbox, different agents', () => {
             expect(describeHarness(presetOf(name), keyless).coreTools).toEqual(coreNamesAtRuntime(name));
         }
 
-        // Configured: webSearch is core exactly on the presets that registered it
+        // Configured: search is core exactly on the presets that registered it
         // (the five real roles and flaky; not the scripted demo).
         vi.stubEnv('EXA_API_KEY', 'configured-exa-key');
         vi.stubEnv('TAVILY_API_KEY', '');
@@ -413,17 +413,17 @@ describe('one toolbox, different agents', () => {
         // Pin the configured real order too, so a descriptor cannot drift silently.
         expect(describeHarness(presetOf('instruct'), configured).coreTools).toEqual([
             ...CORE,
-            'agentDelegate',
+            'delegate',
             'threadFork',
-            'fileRead',
+            'read',
             'fileWrite',
-            'fileEdit',
+            'edit',
             'fileGlob',
-            'webSearch'
+            'search'
         ]);
-        // W4: webFetch is registered by the live factory but is SEARCHABLE, so a
+        // W4: fetch is registered by the live factory but is SEARCHABLE, so a
         // descriptor must never advertise it as a core declaration.
-        expect(describeHarness(presetOf('instruct'), configured).coreTools).not.toContain('webFetch');
+        expect(describeHarness(presetOf('instruct'), configured).coreTools).not.toContain('fetch');
     });
 
     it('gives each real preset distinct instructions and the right subagents', () => {
@@ -449,7 +449,7 @@ describe('one toolbox, different agents', () => {
     });
 
     it('asks each real profile to delegate conditionally, one level deep', () => {
-        // Every real profile must describe `agentDelegate` as declared only to a
+        // Every real profile must describe `delegate` as declared only to a
         // PRIMARY when the harness configures targets AND state that a subagent
         // cannot delegate further. That combination is what makes the same text
         // correct for a primary and for a lone/subagent profile, which must do the
@@ -457,7 +457,7 @@ describe('one toolbox, different agents', () => {
         for (const name of REAL) {
             const block = AGENT_PROFILES[name].guidelines.join('\n');
 
-            expect(block).toContain('agentDelegate');
+            expect(block).toContain('delegate');
             expect(block).toContain('If you are the primary agent and this harness configures subagents');
             expect(block).toContain('declared to you');
             expect(block).toContain('cannot delegate further');
@@ -476,7 +476,7 @@ describe('one toolbox, different agents', () => {
         // only name agents that exist in its team; this is the id-level proof that
         // researcher/coder/reviewer are callable there.
         const enums = REAL.map((name) => {
-            const parameters = presetOf(name).create(SETTINGS, progress).tools.agentDelegate
+            const parameters = presetOf(name).create(SETTINGS, progress).tools.delegate
                 .parameters as { properties: { agent: { enum?: readonly string[] } } };
             return [name, parameters.properties.agent.enum];
         });

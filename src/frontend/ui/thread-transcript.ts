@@ -28,9 +28,10 @@
 // `session.lastError` is nested under `session` because it is a session-scoped
 // field (it may describe a failure that did not run in this thread at all).
 //
-// The dialog body is a `<pre>` containing `JSON.stringify(document, null, 2)`,
-// and the dialog's Copy source is the SAME string. There is no second
-// serialization path, so what the reader inspects is exactly what is copied.
+// The dialog body is a `<pre>` containing `JSON.stringify(document, null, 2)`. The
+// dialog's Copy source is a CLICK-TIME provider over that same rendered node (T1/R3),
+// so there is no second serialization path and what the reader inspects is exactly
+// what lands on the clipboard — before and after a refresh alike.
 //
 // Freshness: the board opens from its latest applied snapshot and (when the shell
 // wires it) issues ONE `getSession` on the explicit open. Streamed events never
@@ -380,6 +381,30 @@ export const threadTranscriptContent = (transcript: ThreadTranscriptJson): HTMLE
     return host;
 };
 
+// T1/R3: the dialog's Copy SOURCE is the rendered <pre>, read at CLICK time.
+//
+// The old wiring handed the dialog a string serialized when the dialog was built. The
+// dialog resolves a provider on every activation, so this reads the text that is on
+// screen NOW — which is the property the shared dialog contract advertises, and the
+// only way a copy taken after `refreshOpenThreadTranscript` can be honest about the
+// document the reader is actually looking at. A missing/empty surface THROWS, which the
+// dialog reports as a failed copy rather than an empty success.
+const transcriptCopySource = (content: HTMLElement): (() => string) => {
+    const surface = content.querySelector<HTMLElement>('.thread-transcript-json');
+    if (surface === null) {
+        throw new Error('thread transcript content has no .thread-transcript-json surface');
+    }
+
+    return (): string => {
+        const text = surface.textContent;
+        if (typeof text !== 'string' || text.length === 0) {
+            throw new Error('thread transcript surface holds no text');
+        }
+
+        return text;
+    };
+};
+
 // The single open transcript this UI owns. `scope` is the board identity from
 // ui/turns.ts; `sessionId` guards a stale refresh that resolves after a session
 // switch with a coincidentally equal thread id. The handle comparison is what
@@ -406,11 +431,13 @@ export const openThreadTranscript = (
     const transcript = buildThreadTranscriptJson(snapshot, threadId, options);
     if (transcript === undefined) return undefined;
 
-    const copy = serializeThreadTranscript(transcript);
+    const content = threadTranscriptContent(transcript);
     const handle: DialogHandle = openDialog({
         title: `Transcript · ${threadName(transcript.thread)} · ${transcript.thread.agent}`,
-        content: threadTranscriptContent(transcript),
-        copy,
+        content,
+        // T1/R3: click-time provider, so the clipboard receives the text the reader is
+        // looking at (one serialization path: the <pre> already holds it).
+        copy: transcriptCopySource(content),
         onClose: () => {
             if (activeTranscript?.handle === handle) activeTranscript = undefined;
         }
@@ -449,10 +476,13 @@ export const refreshOpenThreadTranscript = (
         return 'closed';
     }
 
+    // T1/R3: the refreshed document replaces BOTH the visible surface and the copy
+    // provider, so a later Copy reads the new <pre> and never the detached one.
+    const content = threadTranscriptContent(transcript);
     activeTranscript.handle.update({
         title: `Transcript · ${threadName(transcript.thread)} · ${transcript.thread.agent}`,
-        content: threadTranscriptContent(transcript),
-        copy: serializeThreadTranscript(transcript)
+        content,
+        copy: transcriptCopySource(content)
     });
     return 'updated';
 };

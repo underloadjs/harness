@@ -6,15 +6,13 @@
 //
 //   .session-row[data-session-id][data-status][data-active]   ← one entry wrapper
 //     .session                                               ← select button
-//     .session-delete                                        ← remove control
-//     .session-confirm                                       ← open confirmation
-//       .session-confirm-delete / .session-confirm-cancel
+//     .session-delete                                        ← remove control (one click)
 //
 // Requirements pinned here:
 //   - the entry is COMPACT for a 320px rail: the button and the delete control share
 //     one grid row, and every text line clips instead of widening the rail;
-//   - the confirmation text WRAPS inside the entry, and its two buttons wrap under
-//     it when needed;
+//   - T1/R1: the inline confirmation is gone, so NO `.session-confirm*` rule may
+//     survive (the panel cannot come back through the stylesheet alone);
 //   - the destructive action is visually unambiguous, with disabled and focus states
 //     for both controls;
 //   - the active-entry appearance is preserved for both placements of `data-active`
@@ -144,60 +142,16 @@ it('marks the delete control as destructive with disabled and focus states', () 
     expect(blockOf('.session-delete:disabled {')).toContain('opacity: 0.4');
 });
 
-it('shows the confirmation inline, wrapping the question inside the rail', () => {
-    const confirm = blockOf('.session-confirm {');
+it('keeps no confirmation surface now that one click deletes (T1/R1)', () => {
+    // The panel, its question and both of its buttons are removed from the behaviour
+    // layer (main.ts `renderSessions`). A surviving rule here would mean the stylesheet
+    // still styles a surface that no longer exists — or that one came back.
+    expect(rules).not.toContain('.session-confirm');
 
-    // A wrapping flex row: the question uses the entry width and the buttons drop
-    // to a second line when they do not fit beside it.
-    expect(confirm).toContain('display: flex');
-    expect(confirm).toContain('flex-wrap: wrap');
-    expect(confirm).toContain('align-items: center');
-    expect(confirm).toContain('gap: 5px');
-    // The text itself breaks anywhere rather than forcing a horizontal scroll.
-    expect(confirm).toContain('overflow-wrap: anywhere');
-    expect(confirm).toContain('min-width: 0');
-    expect(confirm).toContain('max-width: 100%');
-    // Natural height and full entry width in both placements (list, or spanning grid
-    // row): a flex-basis percentage here would stretch it in a column list.
-    expect(confirm).toContain('flex: 0 0 auto');
-    expect(confirm).toContain('width: 100%');
-    expect(confirm).toContain('font-size: 11.5px');
-    // The question panel is visibly a danger zone, not a neutral box.
-    expect(confirm).toContain('border: 1px solid rgba(248, 113, 113, 0.45)');
-    expect(confirm).toContain('background: rgba(248, 113, 113, 0.08)');
-
-    // Inside the row it spans both grid columns: as wide as the entry, never wider.
-    expect(blockOf('.session-row > .session-confirm {')).toContain('grid-column: 1 / -1');
-
-    // Destructive choice = filled danger button; safe choice = quiet outline, so the
-    // two can never be confused.
-    const destroy = blockOf('.session-confirm-delete {');
-    expect(destroy).toContain('background: var(--danger)');
-    expect(destroy).toContain('border: 1px solid var(--danger)');
-    expect(destroy).toContain('color: #1b0b0b');
-    expect(destroy).toContain('font-weight: 600');
-
-    const cancel = blockOf('.session-confirm-cancel {\n    border: 1px solid var(--border-strong);');
-    expect(cancel).toContain('background: var(--bg-elevated)');
-    expect(cancel).toContain('color: var(--text)');
-});
-
-it('gives both confirmation buttons disabled and focus states', () => {
-    const shared = blockOf('.session-confirm-delete,\n.session-confirm-cancel {');
-    expect(shared).toContain('font-family: var(--mono)');
-    expect(shared).toContain('font-size: 11px');
-    expect(shared).toContain('cursor: pointer');
-
-    expect(blockOf('.session-confirm-delete:focus-visible {')).toContain(
-        'outline: 2px solid var(--danger)'
-    );
-    expect(blockOf('.session-confirm-cancel:focus-visible {')).toContain(
-        'outline: 2px solid var(--accent)'
-    );
-
-    const disabled = blockOf('.session-confirm-delete:disabled,\n.session-confirm-cancel:disabled {');
-    expect(disabled).toContain('opacity: 0.45');
-    expect(disabled).toContain('cursor: not-allowed');
+    // The rail row is therefore exactly the two controls, in explicit columns: nothing
+    // reserves a second row inside the entry.
+    expect(blockOf('.session-row > .session {')).toContain('grid-column: 1');
+    expect(blockOf('.session-row > .session-delete {')).toContain('grid-column: 2');
 });
 
 it('leaves the list shrinkable and drops the removed lock notice rules', () => {

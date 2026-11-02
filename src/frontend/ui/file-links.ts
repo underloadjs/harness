@@ -27,7 +27,7 @@
 //   - URL schemes (`http:`, `file:`, `javascript:`, `data:`, …);
 //   - traversal segments (`..`) and ambiguous query/fragment text;
 //   - control characters and over-long values.
-// The existing server-side `fileRead` tool has NO sandbox of its own (it resolves
+// The existing server-side `read` tool has NO sandbox of its own (it resolves
 // against the process cwd). This check therefore prevents an obvious cross-root
 // request from the browser but must not be described as a hard server boundary.
 //
@@ -42,7 +42,7 @@
 const MAX_LOCAL_PATH_LENGTH = 400;
 
 // Extensions treated as text files this UI can preview. Deliberately TEXT-ish:
-// `fileRead` rejects binary content, and images are handled by attachment chips
+// `read` rejects binary content, and images are handled by attachment chips
 // instead. Keep this list in sync with the preview language map below.
 export const FILE_LINK_EXTENSIONS: ReadonlySet<string> = new Set([
     'astro',
@@ -174,7 +174,7 @@ export const isFileLikePath = (
 ): boolean => extensions.has(extensionOfPath(path));
 
 // Normalize/validate a browser-originated path. Returns the relative path that
-// may be sent to `fileRead`, or undefined when the value is not a safe local
+// may be sent to `read`, or undefined when the value is not a safe local
 // relative path. See the module header for the (non-)sandbox framing.
 export const localFilePathOf = (raw: string): string | undefined => {
     const value = raw.trim();

@@ -256,9 +256,9 @@ describe('threadFork runtime', () => {
         expect(records[1].sourceBranchId).toBe(records[0].branchId);
         expect(records.map((record) => record.status)).toEqual(['completed', 'completed']);
 
-        // Role inheritance: a fork of the primary still sees agentDelegate.
+        // Role inheritance: a fork of the primary still sees delegate.
         expect(records[0].role).toBe('primary');
-        expect(records[0].tools).toContain('agentDelegate');
+        expect(records[0].tools).toContain('delegate');
         expect(records[0].tools).toContain('threadFork');
 
         // The depth refusal is a normal error-shaped tool result on the inner
@@ -367,7 +367,7 @@ describe('threadFork runtime', () => {
         expect(writer.branch(record.branchId)?.messages.length).toBeGreaterThan(0);
     });
 
-    it('gives a subagent fork the subagent role, without agentDelegate or toolCreate', async () => {
+    it('gives a subagent fork the subagent role, without delegate or toolCreate', async () => {
         const seen: HarnessStreamRequest[] = [];
 
         const helper = brain(
@@ -389,7 +389,7 @@ describe('threadFork runtime', () => {
                     return answer('lead done');
                 }
                 if (!request.messages.some((message) => message.role === 'assistant')) {
-                    return call('d1', 'agentDelegate', '{"agent":"helper","input":"go"}');
+                    return call('d1', 'delegate', '{"agent":"helper","input":"go"}');
                 }
                 return answer('waiting');
             })
@@ -408,13 +408,13 @@ describe('threadFork runtime', () => {
 
         const record = writer.branches()[0];
         expect(record.role).toBe('subagent');
-        expect(record.tools).not.toContain('agentDelegate');
+        expect(record.tools).not.toContain('delegate');
         expect(record.tools).not.toContain('toolCreate');
         expect(record.status).toBe('completed');
 
         const branchRequest = seen.find((request) => latestUser(request) === 'probe');
         const names = toolNames(branchRequest);
-        expect(names).not.toContain('agentDelegate');
+        expect(names).not.toContain('delegate');
         expect(names).not.toContain('toolCreate');
         expect(names).toContain('threadFork');
     });

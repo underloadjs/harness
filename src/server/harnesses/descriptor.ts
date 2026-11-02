@@ -11,7 +11,7 @@
 // session and the frozen definition inside that session can never disagree.
 //
 // `catalogue` is optional. It says WHICH environment-backed tools this host can
-// actually run (webSearch today). The session store does not own a catalogue, so
+// actually run (search today). The session store does not own a catalogue, so
 // the host injects a bound describer (src/server/start.ts, src/server/runtime.ts); a
 // describer without one is honest about only the statically declared tools.
 //
@@ -56,11 +56,11 @@ export const describeAgents = (profiles: readonly AgentProfile[]): AgentDescript
 // search tool that would answer `ok: false`.
 //
 // `coreTools` is the exact set this card's runs declare up front (R18): the four
-// core package file tools, a configured webSearch, the harness-owned
-// toolRequest/toolCreate/todoManage, and agentDelegate when there is a subagent
+// core package file tools, a configured search, the harness-owned
+// toolRequest/toolCreate/todoManage, and delegate when there is a subagent
 // allowlist. It is computed from the REGISTERED names, not a static "all core"
 // list, so the demo fixture (timeNow only) does not claim file tools and a keyless
-// host does not claim webSearch. A UI core dropdown can therefore trust it instead
+// host does not claim search. A UI core dropdown can therefore trust it instead
 // of hard-coding the harness-owned names.
 //
 // `agentModels` (R9) is emitted only when at least one agent has an override, so
@@ -71,7 +71,7 @@ export const describeHarness = (
     catalogue?: DescriptorCatalogue
 ): HarnessDescriptor => {
     // The exact names this card registers: the declarative preset list plus every
-    // environment-backed name THIS host can actually run. webSearch is the only
+    // environment-backed name THIS host can actually run. search is the only
     // entry there today, and it is added only when the runtime catalogue has an
     // executable definition (a provider key resolved).
     const registered = [

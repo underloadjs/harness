@@ -6,12 +6,12 @@
 // worktree, a scoped cwd). Narrow them by wrapping `execute` if a harness needs a
 // fence.
 //
-// BATCHING (T14): fileRead, fileWrite, fileEdit, and fileList each declare ONE
+// BATCHING (T14): read, fileWrite, edit, and fileList each declare ONE
 // array property (`paths` / `files` / `edits`), so the single-property rule hands
 // `execute` the array itself and one call covers several targets. fileWrite and
-// fileEdit validate everything before the first write; fileRead keeps the ordered
+// edit validate everything before the first write; read keeps the ordered
 // entry of a MISSING path (empty content + `error: { code: 'ENOENT' }`, see
-// ./fileRead) but still rejects the whole call for a malformed request, a directory,
+// ./read) but still rejects the whole call for a malformed request, a directory,
 // binary content, or any other I/O error. fileList rejects the whole call on one bad
 // directory, so a partial answer never looks complete.
 //
@@ -26,7 +26,7 @@
 // nextOffset, offset, limit, bytes, contentBudget }`, 200 entries by default and
 // 1000 at most, 64 KiB of entry text per call, resumed by passing `nextOffset` as
 // `offset` (see ./fileList). fileWrite refuses NUL content because it would create
-// a file fileRead rejects as binary.
+// a file read rejects as binary.
 //
 // TYPE-ONLY BARREL (T21)
 // ----------------------
@@ -42,7 +42,7 @@
 //     case aliases, symlink aliases, aliased roots) cannot slip through;
 //   - ./bounded-regex — content matching inside node:vm with a timeout, so a
 //     catastrophic pattern fails instead of hanging the process.
-export type { FileReadEntry, FileReadParameters, FileReadResult, FileReadTarget } from './fileRead.tool';
+export type { FileReadEntry, FileReadParameters, FileReadResult, FileReadTarget } from './read.tool';
 export type {
     FileWriteEntry,
     FileWriteParameters,
@@ -54,7 +54,7 @@ export type {
     FileEditParameters,
     FileEditResult,
     FileEditResultEntry
-} from './fileEdit.tool';
+} from './edit.tool';
 export type { FileListParameters, FileListQuery, FileListResult } from './fileList.tool';
 export type {
     FileGlobFilesResult,

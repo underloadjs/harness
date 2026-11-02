@@ -1,12 +1,12 @@
 // toolRequest + already-available core tools (R1).
 //
 // Contract pinned here:
-//   - an exact wire name ("agentDelegate") and its capability tags
+//   - an exact wire name ("delegate") and its capability tags
 //     ("agents"/"delegate"/"delegation") report the tool in `alreadyAvailable`
 //     when the CALLER already has it declared, instead of claiming no match;
 //   - that report never enables anything, never appears in `enabled`/`tools`,
 //     never spends the maxEnabledTools bound, and never enters `discoveredTools`;
-//   - a one-agent harness (no agentDelegate at all) and a SUBAGENT (agentDelegate
+//   - a one-agent harness (no delegate at all) and a SUBAGENT (delegate
 //     is primary-only) get no such entry - their absence stays honest, and every
 //     query tag is reported as unmatched;
 //   - the core declarations are unchanged: already-available tools were declared
@@ -45,10 +45,10 @@ const content = (message: unknown): string => (message as { content: string }).c
 const declaredNames = (request: HarnessStreamRequest | undefined): string[] =>
     (request?.tools ?? []).map((declaration) => declaration.name);
 
-// The exact runtime metadata agentDelegate carries in a harness whose only
+// The exact runtime metadata delegate carries in a harness whose only
 // subagent is "researcher" (core/metadata.ts agentDelegateMetadata).
 const DELEGATE_MATCH = {
-    name: 'agentDelegate',
+    name: 'delegate',
     description:
         'Delegate a self-contained task to a configured subagent and return its answer. Subagents: researcher. The subagent does not see this conversation, so include everything it needs. Only the primary agent can delegate; subagents cannot delegate further.',
     tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
@@ -67,9 +67,9 @@ const agentMatch = (metadata: { name: string; description: string; tags: readonl
 const AGENT_MATCHES = [agentMatch(AGENT_MANAGE_METADATA), agentMatch(AGENT_RESULT_METADATA)];
 
 describe('toolRequest already-available core tools', () => {
-    it('reports agentDelegate on an exact wire-name query instead of no match', async () => {
+    it('reports delegate on an exact wire-name query instead of no match', async () => {
         const entry = brain(
-            scripted([callTool('c1', 'toolRequest', '{"tags":["agentDelegate"]}'), answer('done')])
+            scripted([callTool('c1', 'toolRequest', '{"tags":["delegate"]}'), answer('done')])
         );
         const writer = harness({
             agents: { writer: entry, researcher: brain(scripted([answer('found')])) },
@@ -78,7 +78,7 @@ describe('toolRequest already-available core tools', () => {
 
         await writer('delegate?');
 
-        // The primary HAS agentDelegate declared, so the answer names it. Nothing is
+        // The primary HAS delegate declared, so the answer names it. Nothing is
         // enabled, nothing is left over, and the tag is not called unmatched.
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
             enabled: [],
@@ -91,7 +91,7 @@ describe('toolRequest already-available core tools', () => {
         expect(writer.discoveredTools).toEqual([]);
     });
 
-    it('reports agentDelegate for the capability tags agents/delegate/delegation', async () => {
+    it('reports delegate for the capability tags agents/delegate/delegation', async () => {
         const entry = brain(
             scripted([
                 callTool('c1', 'toolRequest', '{"tags":["agents","delegate","delegation"]}'),
@@ -105,7 +105,7 @@ describe('toolRequest already-available core tools', () => {
 
         await writer('delegate?');
 
-        // All three synonyms are exact tags on agentDelegate (the metadata carries
+        // All three synonyms are exact tags on delegate (the metadata carries
         // "delegation" as the noun form), so `unmatchedTags` is absent from the
         // exact shape. The two agent-inspection core tools also carry the exact
         // "agents" tag, so they are reported (metadata only) beside it.
@@ -119,13 +119,13 @@ describe('toolRequest already-available core tools', () => {
         });
     });
 
-    it('does not advertise agentDelegate to a one-agent harness that lacks it', async () => {
+    it('does not advertise delegate to a one-agent harness that lacks it', async () => {
         const entry = brain(
             scripted([
                 callTool(
                     'c1',
                     'toolRequest',
-                    '{"tags":["agentDelegate","agents","delegate"]}'
+                    '{"tags":["delegate","agents","delegate"]}'
                 ),
                 answer('done')
             ])
@@ -134,34 +134,34 @@ describe('toolRequest already-available core tools', () => {
 
         await writer('delegate?');
 
-        // No subagents means no agentDelegate was ever registered, so the honest
+        // No subagents means no delegate was ever registered, so the honest
         // answer is "nothing available" plus every tag reported as unmatched. Tags
         // come back normalized (trimmed + lower-cased).
-        expect(writer.tools.agentDelegate).toBeUndefined();
+        expect(writer.tools.delegate).toBeUndefined();
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
             enabled: [],
             tools: [],
             matched: 0,
             omitted: 0,
-            unmatchedTags: ['agentdelegate', 'delegate'],
+            unmatchedTags: ['delegate'],
             alreadyAvailable: AGENT_MATCHES,
             availableTags: []
         });
     });
 
-    it('does not advertise agentDelegate to a subagent that never receives it', async () => {
+    it('does not advertise delegate to a subagent that never receives it', async () => {
         // The primary delegates once; INSIDE that run the subagent queries the exact
-        // name and the synonyms. agentDelegate is core but primary-only, so the
+        // name and the synonyms. delegate is core but primary-only, so the
         // subagent's own toolRequest must not list it.
         const researcher = brain(
             scripted([
-                callTool('r1', 'toolRequest', '{"tags":["agentDelegate","agents","delegate"]}'),
+                callTool('r1', 'toolRequest', '{"tags":["delegate","agents","delegate"]}'),
                 answer('found')
             ])
         );
         const entry = brain(
             scripted([
-                callTool('c1', 'agentDelegate', '{"agent":"researcher","input":"find facts"}'),
+                callTool('c1', 'delegate', '{"agent":"researcher","input":"find facts"}'),
                 answer('done')
             ])
         );
@@ -175,7 +175,7 @@ describe('toolRequest already-available core tools', () => {
             tools: [],
             matched: 0,
             omitted: 0,
-            unmatchedTags: ['agentdelegate', 'delegate'],
+            unmatchedTags: ['delegate'],
             alreadyAvailable: AGENT_MATCHES,
             availableTags: []
         });

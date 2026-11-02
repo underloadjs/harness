@@ -1,4 +1,4 @@
-// commandRun — execute a shell command and collect its output.
+// shell — execute a shell command and collect its output.
 //
 // The escape hatch every CLI harness ships, and the most powerful tool here: it
 // runs with the permissions of the host process and has NO sandbox, no allowlist,
@@ -8,7 +8,7 @@
 //
 // Executable on its own and registerable on a harness:
 //
-//     const { exitCode, stdout } = await commandRun({ command: 'git status' });
+//     const { exitCode, stdout } = await shell({ command: 'git status' });
 //
 // Metadata (name, description, tags, schema) is declared below and is authoritative
 // for T13. ../catalogue projects the same data synchronously for lazy enumeration
@@ -84,7 +84,7 @@ const resolveTimeout = (timeoutMs: unknown): number => {
     if (timeoutMs === undefined) return COMMAND_DEFAULT_TIMEOUT_MS;
 
     if (typeof timeoutMs !== 'number' || !Number.isFinite(timeoutMs) || timeoutMs <= 0) {
-        throw new HarnessError('commandRun timeoutMs must be a positive finite number of milliseconds.');
+        throw new HarnessError('shell timeoutMs must be a positive finite number of milliseconds.');
     }
 
     return Math.min(Math.floor(timeoutMs), COMMAND_MAX_TIMEOUT_MS);
@@ -96,17 +96,17 @@ const resolveTimeout = (timeoutMs: unknown): number => {
 // meant.
 const validate = (parameters: CommandRunParameters): { command: string; cwd?: string; timeoutMs: number } => {
     if (!parameters || typeof parameters !== 'object') {
-        throw new HarnessError('commandRun requires a { command } object.');
+        throw new HarnessError('shell requires a { command } object.');
     }
 
     const { command, cwd, timeoutMs } = parameters;
 
     if (typeof command !== 'string' || command.trim().length === 0) {
-        throw new HarnessError('commandRun requires a non-empty command string.');
+        throw new HarnessError('shell requires a non-empty command string.');
     }
 
     if (cwd !== undefined && (typeof cwd !== 'string' || cwd.length === 0)) {
-        throw new HarnessError('commandRun cwd must be a non-empty string when provided.');
+        throw new HarnessError('shell cwd must be a non-empty string when provided.');
     }
 
     return { command, cwd, timeoutMs: resolveTimeout(timeoutMs) };
@@ -116,7 +116,7 @@ const validate = (parameters: CommandRunParameters): { command: string; cwd?: st
 // a synchronous data projection for lazy enumeration and a consistency test
 // asserts the two stay equal. Edit the metadata HERE.
 export const COMMAND_RUN_METADATA: PresetToolMetadata = {
-    name: 'commandRun',
+    name: 'shell',
     description:
         'Run a shell command and return its exit code, stdout, and stderr. The command string is passed to the platform shell, so pipes, redirects, and quoting work. A non-zero exit code is returned as data, not thrown. `timeoutMs` bounds the run (integer milliseconds, 1-600000, default 120000); a command that exceeds it is killed together with its process tree on a best-effort basis and the result reports `timedOut: true`. Output is capped at 128 KiB of stdout and 16 KiB of stderr, with `truncated: true` when either cap was applied, and an aborted run reports `aborted: true`.',
     tags: ['shell', 'command', 'process'],
@@ -151,14 +151,21 @@ export const metadata = COMMAND_RUN_METADATA;
 export const registration = {
     group: 'preset',
     activation: 'always',
+    // T2/R2: ASYNC. A command can run for minutes, and its outcome is independent of
+    // whatever else this message started, so its completion triggers its own turn (the
+    // historical background-tool behaviour) instead of holding the batch.
+    mode: 'async',
     order: 220,
     sessionBound: false,
     alwaysDeclared: false,
     listed: false
 } as const;
 
-export const commandRun = tool<CommandRunParameters, CommandRunResult>({
+export const shell = tool<CommandRunParameters, CommandRunResult>({
     ...COMMAND_RUN_METADATA,
+    // T2/R2: mirrors `registration.mode` ('async'), so a host that registers this
+    // preset directly keeps the long-running command's independent-turn behaviour.
+    mode: 'async',
     execute: (context) => {
         const { command, cwd, timeoutMs } = validate(context.parameters);
 

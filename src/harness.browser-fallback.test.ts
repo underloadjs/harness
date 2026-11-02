@@ -46,10 +46,10 @@ describe('browser baseline fallback', () => {
         expect(writer.tools.toolManage.visibility).toBe('core');
         expect(writer.tools.toolCreate.visibility).toBe('core');
         expect(writer.tools.todoManage.visibility).toBe('core');
-        expect(writer.tools.fileRead.name).toBe('fileRead');
-        expect(writer.tools.fileRead.visibility).toBe('core');
+        expect(writer.tools.read.name).toBe('read');
+        expect(writer.tools.read.visibility).toBe('core');
         // No source record is claimed for a prepared-definition fallback.
-        expect(writer.toolSource('fileRead')).toBeUndefined();
+        expect(writer.toolSource('read')).toBeUndefined();
 
         // Existing browser harness semantics remain: model turns and discovery
         // metadata are available.

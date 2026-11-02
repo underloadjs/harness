@@ -66,12 +66,12 @@ export const HARNESS_CORE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = 
     toolManage: 'Inspect and edit registered tools: details, source, path, create, update, reload.',
     toolCreate: 'Add a small session-local tool when the catalogue cannot help.',
     todoManage: 'Keep a task list for the current work.',
-    agentDelegate: 'Hand a self-contained task to one of this harness’s agents.',
-    fileRead: 'Read one or more text files on the server host.',
+    delegate: 'Hand a self-contained task to one of this harness’s agents.',
+    read: 'Read one or more text files on the server host.',
     fileWrite: 'Write one or more text files on the server host.',
-    fileEdit: 'Replace exact text in one or more files on the server host.',
+    edit: 'Replace exact text in one or more files on the server host.',
     fileGlob: 'Find files by glob, or search their contents, in one call.',
-    webSearch: 'Search the web when the host configured a provider key.'
+    search: 'Search the web when the host configured a provider key.'
 };
 
 const descriptorsOf = (descriptor: HarnessDescriptor): readonly string[] =>
@@ -136,8 +136,8 @@ export const editableOf = (_descriptor: HarnessDescriptor): boolean => true;
 export const builtinOf = (descriptor: HarnessDescriptor): boolean => descriptor.builtin === true;
 
 // Core tools for the dropdown. R18: the SERVER's `coreTools` is authoritative —
-// it already contains the four file tools, a configured webSearch, and
-// agentDelegate when applicable — so the UI reflects catalogue/runtime visibility
+// it already contains the four file tools, a configured search, and
+// delegate when applicable — so the UI reflects catalogue/runtime visibility
 // instead of hard-coding the harness-owned names. Only an older payload without
 // the field falls back to the legacy harness-owned list (adding delegate when the
 // local team has a second member).
@@ -150,7 +150,7 @@ export const coreToolsOf = (descriptor: HarnessDescriptor, memberCount: number):
 
     return [
         ...HARNESS_CORE_TOOL_NAMES,
-        ...(memberCount > 1 ? ['agentDelegate'] : [])
+        ...(memberCount > 1 ? ['delegate'] : [])
     ];
 };
 
@@ -265,7 +265,7 @@ export const callIdOf = (event: HarnessEvent): string | undefined => {
 //   - `id`        the invocation id (stable for the whole invocation);
 //   - `parentId`  the SPAWNING invocation's id. OMITTED when the parent is the
 //                 turn's root invocation (the root has no thread id);
-//   - `callId`    the tool call that spawned it (the parent's agentDelegate call);
+//   - `callId`    the tool call that spawned it (the parent's delegate call);
 //   - `input`     the child's prompt.
 //
 // Subsequent events of the same invocation may carry only `{ id }`, so every

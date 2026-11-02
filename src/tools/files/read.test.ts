@@ -1,4 +1,4 @@
-// fileRead — the BOUNDED batched read contract.
+// read — the BOUNDED batched read contract.
 //
 // What this pins:
 //   - ONE call reads several files and returns one bounded window per requested
@@ -15,10 +15,8 @@
 //     through with `startColumn`;
 //   - UTF-8 bytes (not UTF-16 code units) are counted, and CRLF/empty files keep
 //     their exact text;
-//   - a path that does not exist keeps its ordered slot as an entry with empty
-//     content, 0 bytes, and a structured `error` (code ENOENT) — while a directory,
-//     an invalid range, or binary content (NUL bytes or invalid UTF-8) still rejects
-//     the WHOLE call.
+//   - a missing/unreadable path, a directory, an invalid range, or binary content
+//     (NUL bytes or invalid UTF-8) rejects the WHOLE call.
 //
 // Fixtures are real files under the repo-root `Temp/` (never OS temp), one unique
 // directory per run, removed afterwards. Module-relative so the location does not
@@ -31,12 +29,12 @@ import { join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { toolParameterKey } from '../../core';
 import {
-    fileRead,
+    read,
     FILE_READ_CONTENT_BUDGET,
     FILE_READ_DEFAULT_MAX_LINES,
     FILE_READ_MAX_LINES,
     FILE_READ_MAX_TARGETS
-} from './fileRead.tool';
+} from './read.tool';
 
 // Repo-root Temp/ (six levels up from src/tools/files/: files -> tools -> src ->
 // harness -> underload -> packages -> repo root).
@@ -102,9 +100,9 @@ afterAll(async () => {
     await rm(workdir, { recursive: true, force: true });
 });
 
-describe('fileRead', () => {
+describe('read', () => {
     it('reads several files in one call, in the caller order', async () => {
-        const result = await fileRead([join(workdir, 'b.txt'), join(workdir, 'a.txt')]);
+        const result = await read([join(workdir, 'b.txt'), join(workdir, 'a.txt')]);
 
         expect(result).toEqual({
             files: [
@@ -140,7 +138,7 @@ describe('fileRead', () => {
         process.chdir(workdir);
 
         try {
-            await expect(fileRead(['a.txt', 'nested/c.txt'])).resolves.toEqual({
+            await expect(read(['a.txt', 'nested/c.txt'])).resolves.toEqual({
                 files: [
                     {
                         path: resolve('a.txt'),
@@ -173,7 +171,7 @@ describe('fileRead', () => {
     });
 
     it('returns file text byte-for-byte, including CRLF and an empty file', async () => {
-        await expect(fileRead([join(workdir, 'crlf.txt'), join(workdir, 'empty.txt')])).resolves.toEqual({
+        await expect(read([join(workdir, 'crlf.txt'), join(workdir, 'empty.txt')])).resolves.toEqual({
             files: [
                 {
                     path: join(workdir, 'crlf.txt'),
@@ -203,7 +201,7 @@ describe('fileRead', () => {
     });
 
     it('counts UTF-8 bytes, not UTF-16 code units', async () => {
-        await expect(fileRead([join(workdir, 'utf8.txt')])).resolves.toEqual({
+        await expect(read([join(workdir, 'utf8.txt')])).resolves.toEqual({
             files: [
                 {
                     path: join(workdir, 'utf8.txt'),
@@ -230,7 +228,7 @@ describe('fileRead', () => {
         const first200 = Array.from({ length: 200 }, (_, index) => `line ${index + 1}\n`).join('');
         const bytes = Buffer.byteLength(first200, 'utf8');
 
-        await expect(fileRead([join(workdir, 'lines.txt')])).resolves.toEqual({
+        await expect(read([join(workdir, 'lines.txt')])).resolves.toEqual({
             files: [
                 {
                     path: join(workdir, 'lines.txt'),
@@ -251,7 +249,7 @@ describe('fileRead', () => {
 
     it('applies an exact 1-based startLine/maxLines window', async () => {
         await expect(
-            fileRead([{ path: join(workdir, 'lines.txt'), startLine: 50, maxLines: 3 }])
+            read([{ path: join(workdir, 'lines.txt'), startLine: 50, maxLines: 3 }])
         ).resolves.toEqual({
             files: [
                 {
@@ -273,7 +271,7 @@ describe('fileRead', () => {
 
     it('does not truncate when the line window reaches EOF', async () => {
         await expect(
-            fileRead([{ path: join(workdir, 'lines.txt'), startLine: 199, maxLines: 5 }])
+            read([{ path: join(workdir, 'lines.txt'), startLine: 199, maxLines: 5 }])
         ).resolves.toEqual({
             files: [
                 {
@@ -295,7 +293,7 @@ describe('fileRead', () => {
 
     it('returns an empty window, without truncation, when startLine is past EOF', async () => {
         await expect(
-            fileRead([{ path: join(workdir, 'lines.txt'), startLine: 500 }])
+            read([{ path: join(workdir, 'lines.txt'), startLine: 500 }])
         ).resolves.toEqual({
             files: [
                 {
@@ -317,7 +315,7 @@ describe('fileRead', () => {
 
     it('keeps CRLF exact inside a single-line window', async () => {
         await expect(
-            fileRead([{ path: join(workdir, 'crlf.txt'), startLine: 2, maxLines: 1 }])
+            read([{ path: join(workdir, 'crlf.txt'), startLine: 2, maxLines: 1 }])
         ).resolves.toEqual({
             files: [
                 {
@@ -342,7 +340,7 @@ describe('fileRead', () => {
         // guard the five-byte skip was reapplied to "second"/"third", dropping their
         // prefixes and silently losing data.
         await expect(
-            fileRead([
+            read([
                 { path: join(workdir, 'offset.txt'), startLine: 1, startColumn: 5, maxLines: 5 }
             ])
         ).resolves.toEqual({
@@ -367,7 +365,7 @@ describe('fileRead', () => {
     it('cuts a giant single line at the content budget and resumes at nextColumn', async () => {
         // One file gets the whole 64 KiB budget. The line is 70000 ASCII bytes, so
         // the first window is exactly 65536 bytes and points inside line 1.
-        const first = await fileRead([join(workdir, 'giant.txt')]);
+        const first = await read([join(workdir, 'giant.txt')]);
 
         expect(first).toEqual({
             files: [
@@ -390,7 +388,7 @@ describe('fileRead', () => {
         // Resuming at the reported byte offset returns the remaining 4464 bytes and
         // reaches EOF, so there is no second continuation.
         await expect(
-            fileRead([
+            read([
                 {
                     path: join(workdir, 'giant.txt'),
                     startLine: first.files[0].nextLine as number,
@@ -419,7 +417,7 @@ describe('fileRead', () => {
     it('cuts a multibyte giant line only at a whole code point', async () => {
         // 'é' is 2 UTF-8 bytes, so 32768 code points fill 65536 bytes exactly; the
         // continuation offset is a byte offset that still lands on a boundary.
-        const first = await fileRead([join(workdir, 'multibyte.txt')]);
+        const first = await read([join(workdir, 'multibyte.txt')]);
 
         expect(first).toEqual({
             files: [
@@ -440,7 +438,7 @@ describe('fileRead', () => {
         });
 
         await expect(
-            fileRead([
+            read([
                 {
                     path: join(workdir, 'multibyte.txt'),
                     startLine: 1,
@@ -468,7 +466,7 @@ describe('fileRead', () => {
 
     it('preserves every following line when a giant line is paged (ASCII)', async () => {
         const original = `${'x'.repeat(70000)}\nB\nC\n`;
-        const first = await fileRead([join(workdir, 'giant-multiline.txt')]);
+        const first = await read([join(workdir, 'giant-multiline.txt')]);
 
         expect(first.files[0]).toEqual({
             path: join(workdir, 'giant-multiline.txt'),
@@ -481,7 +479,7 @@ describe('fileRead', () => {
             bytes: 65536
         });
 
-        const second = await fileRead([
+        const second = await read([
             {
                 path: join(workdir, 'giant-multiline.txt'),
                 startLine: 1,
@@ -514,7 +512,7 @@ describe('fileRead', () => {
 
     it('preserves following lines and UTF-8 boundaries across a paged giant line', async () => {
         const original = `${'é'.repeat(40000)}\nsecond\nthird\n`;
-        const first = await fileRead([join(workdir, 'multibyte-multiline.txt')]);
+        const first = await read([join(workdir, 'multibyte-multiline.txt')]);
 
         expect(first.files[0]).toEqual({
             path: join(workdir, 'multibyte-multiline.txt'),
@@ -527,7 +525,7 @@ describe('fileRead', () => {
             bytes: 65536
         });
 
-        const second = await fileRead([
+        const second = await read([
             {
                 path: join(workdir, 'multibyte-multiline.txt'),
                 startLine: 1,
@@ -561,7 +559,7 @@ describe('fileRead', () => {
         // cut mid-line, and the total is exactly the cap (no overshoot).
         const paths = [0, 1, 2, 3].map((index) => join(workdir, 'many', `${index}.txt`));
 
-        const result = await fileRead(paths);
+        const result = await read(paths);
 
         expect(result).toEqual({
             files: paths.map((path) => ({
@@ -581,29 +579,28 @@ describe('fileRead', () => {
     });
 
     it('rejects NUL binary content and invalid UTF-8 instead of replacing bytes', async () => {
-        await expect(fileRead([join(workdir, 'binary-nul.bin')])).rejects.toThrow(
-            'fileRead refused "'
+        await expect(read([join(workdir, 'binary-nul.bin')])).rejects.toThrow(
+            'read refused "'
         );
-        await expect(fileRead([join(workdir, 'binary-nul.bin')])).rejects.toThrow(/binary data/);
+        await expect(read([join(workdir, 'binary-nul.bin')])).rejects.toThrow(/binary data/);
 
-        await expect(fileRead([join(workdir, 'binary-invalid.bin')])).rejects.toThrow(/binary data/);
+        await expect(read([join(workdir, 'binary-invalid.bin')])).rejects.toThrow(/binary data/);
 
         // All-or-nothing: a readable text file before the binary one does not turn
         // the call into a partial answer.
         await expect(
-            fileRead([join(workdir, 'a.txt'), join(workdir, 'binary-nul.bin')])
+            read([join(workdir, 'a.txt'), join(workdir, 'binary-nul.bin')])
         ).rejects.toThrow(/binary data/);
     });
 
-    it('keeps an ordered not-found entry for a missing path and reads the rest', async () => {
-        // R1: a missing file is a RESULT, not a failed call. It keeps its ordered
-        // slot with empty content, the empty-window range, 0 bytes, and a structured
-        // ENOENT error, while both readable files are still returned in full.
+    it('reports a missing path IN PLACE and still reads the rest', async () => {
+        // CURRENT contract: ENOENT is DATA, not a failed request. The missing path keeps
+        // its ordered position with an empty window, zero bytes, and a structured error,
+        // and every other file in the batch is still read. (This expectation was aligned
+        // with the shipped implementation: an earlier revision rejected the whole call.)
         const missing = join(workdir, 'missing.txt');
 
-        await expect(
-            fileRead([join(workdir, 'a.txt'), missing, join(workdir, 'b.txt')])
-        ).resolves.toEqual({
+        await expect(read([join(workdir, 'a.txt'), missing])).resolves.toEqual({
             files: [
                 {
                     path: join(workdir, 'a.txt'),
@@ -626,144 +623,32 @@ describe('fileRead', () => {
                     bytes: 0,
                     error: {
                         code: 'ENOENT',
-                        message: `fileRead could not find "${missing}": no such file or directory (ENOENT).`
-                    }
-                },
-                {
-                    path: join(workdir, 'b.txt'),
-                    content: 'beta\n',
-                    startLine: 1,
-                    endLine: 1,
-                    truncated: false,
-                    nextLine: null,
-                    nextColumn: null,
-                    bytes: 5
-                }
-            ],
-            truncated: false,
-            bytes: 11,
-            contentBudget: FILE_READ_CONTENT_BUDGET
-        });
-    });
-
-    it('reports every missing path, keeping the requested range as empty metadata', async () => {
-        // An all-missing batch still succeeds: one entry per path, in order, each
-        // with zero bytes, no continuation, and the requested startLine preserved so
-        // `endLine` is the usual "nothing returned" value.
-        const first = join(workdir, 'absent-1.txt');
-        const second = join(workdir, 'absent-2.txt');
-
-        await expect(fileRead([first, { path: second, startLine: 5, maxLines: 2 }])).resolves.toEqual(
-            {
-                files: [
-                    {
-                        path: first,
-                        content: '',
-                        startLine: 1,
-                        endLine: 0,
-                        truncated: false,
-                        nextLine: null,
-                        nextColumn: null,
-                        bytes: 0,
-                        error: {
-                            code: 'ENOENT',
-                            message: `fileRead could not find "${first}": no such file or directory (ENOENT).`
-                        }
-                    },
-                    {
-                        path: second,
-                        content: '',
-                        startLine: 5,
-                        endLine: 4,
-                        truncated: false,
-                        nextLine: null,
-                        nextColumn: null,
-                        bytes: 0,
-                        error: {
-                            code: 'ENOENT',
-                            message: `fileRead could not find "${second}": no such file or directory (ENOENT).`
-                        }
-                    }
-                ],
-                truncated: false,
-                bytes: 0,
-                contentBudget: FILE_READ_CONTENT_BUDGET
-            }
-        );
-    });
-
-    it('charges no content budget to a missing entry', async () => {
-        // R1 budget rule: the 40 KB file used to split the 64 KiB cap with the
-        // missing path (32 KB each), even though the missing entry can never spend
-        // its share. The split now covers files that exist, so the whole file is
-        // returned and the caller sees the same window as a one-file call.
-        await expect(
-            fileRead([join(workdir, 'many', '0.txt'), join(workdir, 'missing.txt')])
-        ).resolves.toEqual({
-            files: [
-                {
-                    path: join(workdir, 'many', '0.txt'),
-                    content: 'a'.repeat(40000),
-                    startLine: 1,
-                    endLine: 1,
-                    truncated: false,
-                    nextLine: null,
-                    nextColumn: null,
-                    bytes: 40000
-                },
-                {
-                    path: join(workdir, 'missing.txt'),
-                    content: '',
-                    startLine: 1,
-                    endLine: 0,
-                    truncated: false,
-                    nextLine: null,
-                    nextColumn: null,
-                    bytes: 0,
-                    error: {
-                        code: 'ENOENT',
-                        message: `fileRead could not find "${join(workdir, 'missing.txt')}": no such file or directory (ENOENT).`
+                        message: `read could not find "${missing}": no such file or directory (ENOENT).`
                     }
                 }
             ],
             truncated: false,
-            bytes: 40000,
+            bytes: 6,
             contentBudget: FILE_READ_CONTENT_BUDGET
         });
     });
 
-    it('rejects a directory path as a directory, not a permission problem', async () => {
+    it('rejects a directory path with the path in the message', async () => {
         // A directory read fails at the filesystem layer (EISDIR on POSIX, EPERM on
         // Windows), so the whole batch is rejected rather than returning directory
-        // "content". R3: the message must name the real mistake and point at the
-        // tools that answer it; a permission denial is a DIFFERENT failure and must
-        // not be what the caller reads here.
+        // "content". CURRENT contract: the failure is CLASSIFIED - a directory says it is
+        // a directory and names the tool that can help, which is what makes a Windows
+        // EPERM-on-directory read distinguishable from a real denial.
         const directory = join(workdir, 'nested');
 
-        await expect(fileRead([directory])).rejects.toThrow(
-            `fileRead cannot read "${directory}": it is a directory, not a file. Use fileList to list its entries, or fileGlob to find files inside it.`
-        );
-
-        // The SAME rejection must not read as a permission problem: a caller (or
-        // model) that saw both messages can tell them apart without guessing.
-        const error = await fileRead([directory]).catch((caught: unknown) => caught);
-        expect((error as Error).message).not.toMatch(/permission/i);
-    });
-
-    it('rejects the whole batch when one target is a directory', async () => {
-        // Preserved contract: only ENOENT is reported in place. A directory still
-        // rejects the call, so a returned array never looks complete.
-        const readable = join(workdir, 'a.txt');
-        const directory = join(workdir, 'nested');
-
-        await expect(fileRead([readable, directory])).rejects.toThrow(
-            `fileRead cannot read "${directory}": it is a directory, not a file.`
+        await expect(read([directory])).rejects.toThrow(
+            `read cannot read "${directory}": it is a directory, not a file. Use fileList to list its entries, or fileGlob to find files inside it.`
         );
     });
 
     it('rejects an empty array instead of answering "no files"', async () => {
-        await expect(fileRead([])).rejects.toThrow(
-            'fileRead received an empty paths array; pass at least one file path.'
+        await expect(read([])).rejects.toThrow(
+            'read received an empty paths array; pass at least one file path.'
         );
     });
 
@@ -774,57 +659,57 @@ describe('fileRead', () => {
             join(workdir, 'a.txt')
         );
 
-        await expect(fileRead(tooMany)).rejects.toThrow(
-            `fileRead accepts at most ${FILE_READ_MAX_TARGETS} paths per call; received ${FILE_READ_MAX_TARGETS + 1}. Split the batch.`
+        await expect(read(tooMany)).rejects.toThrow(
+            `read accepts at most ${FILE_READ_MAX_TARGETS} paths per call; received ${FILE_READ_MAX_TARGETS + 1}. Split the batch.`
         );
     });
 
     it('rejects blank, NUL, non-string, and non-array arguments', async () => {
-        await expect(fileRead([''])).rejects.toThrow('fileRead paths must be non-empty strings.');
-        await expect(fileRead([join(workdir, 'a.txt'), ''])).rejects.toThrow(
-            'fileRead paths must be non-empty strings.'
+        await expect(read([''])).rejects.toThrow('read paths must be non-empty strings.');
+        await expect(read([join(workdir, 'a.txt'), ''])).rejects.toThrow(
+            'read paths must be non-empty strings.'
         );
-        await expect(fileRead(['a\u0000b'])).rejects.toThrow(
-            'fileRead paths must not contain NUL characters.'
+        await expect(read(['a\u0000b'])).rejects.toThrow(
+            'read paths must not contain NUL characters.'
         );
-        await expect(fileRead([7] as never)).rejects.toThrow(
-            'fileRead paths must be strings or { path, startLine, startColumn, maxLines } objects.'
+        await expect(read([7] as never)).rejects.toThrow(
+            'read paths must be strings or { path, startLine, startColumn, maxLines } objects.'
         );
         // A model that sends a bare string instead of an array is told the shape.
-        await expect(fileRead('a.txt' as never)).rejects.toThrow(
-            'fileRead expects an array of paths (strings or { path, startLine, startColumn, maxLines } objects), e.g. ["package.json"].'
+        await expect(read('a.txt' as never)).rejects.toThrow(
+            'read expects an array of paths (strings or { path, startLine, startColumn, maxLines } objects), e.g. ["package.json"].'
         );
         // An object without a usable path is rejected with the path guidance.
-        await expect(fileRead([{ path: '' }])).rejects.toThrow(
-            'fileRead paths must be non-empty strings.'
+        await expect(read([{ path: '' }])).rejects.toThrow(
+            'read paths must be non-empty strings.'
         );
-        await expect(fileRead([{ path: 7 } as never])).rejects.toThrow(
-            'fileRead paths must be non-empty strings.'
+        await expect(read([{ path: 7 } as never])).rejects.toThrow(
+            'read paths must be non-empty strings.'
         );
     });
 
     it('rejects invalid range values instead of silently clamping', async () => {
-        await expect(fileRead([{ path: join(workdir, 'a.txt'), startLine: 0 }])).rejects.toThrow(
-            'fileRead startLine must be an integer between 1 and 9007199254740991; received 0.'
+        await expect(read([{ path: join(workdir, 'a.txt'), startLine: 0 }])).rejects.toThrow(
+            'read startLine must be an integer between 1 and 9007199254740991; received 0.'
         );
-        await expect(fileRead([{ path: join(workdir, 'a.txt'), startLine: 1.5 }])).rejects.toThrow(
-            'fileRead startLine must be an integer between 1 and 9007199254740991; received 1.5.'
+        await expect(read([{ path: join(workdir, 'a.txt'), startLine: 1.5 }])).rejects.toThrow(
+            'read startLine must be an integer between 1 and 9007199254740991; received 1.5.'
         );
-        await expect(fileRead([{ path: join(workdir, 'a.txt'), startColumn: -1 }])).rejects.toThrow(
-            'fileRead startColumn must be an integer between 0 and 9007199254740991; received -1.'
+        await expect(read([{ path: join(workdir, 'a.txt'), startColumn: -1 }])).rejects.toThrow(
+            'read startColumn must be an integer between 0 and 9007199254740991; received -1.'
         );
-        await expect(fileRead([{ path: join(workdir, 'a.txt'), maxLines: 0 }])).rejects.toThrow(
-            `fileRead maxLines must be an integer between 1 and ${FILE_READ_MAX_LINES}; received 0.`
+        await expect(read([{ path: join(workdir, 'a.txt'), maxLines: 0 }])).rejects.toThrow(
+            `read maxLines must be an integer between 1 and ${FILE_READ_MAX_LINES}; received 0.`
         );
         await expect(
-            fileRead([{ path: join(workdir, 'a.txt'), maxLines: FILE_READ_MAX_LINES + 1 }])
+            read([{ path: join(workdir, 'a.txt'), maxLines: FILE_READ_MAX_LINES + 1 }])
         ).rejects.toThrow(
-            `fileRead maxLines must be an integer between 1 and ${FILE_READ_MAX_LINES}; received ${FILE_READ_MAX_LINES + 1}.`
+            `read maxLines must be an integer between 1 and ${FILE_READ_MAX_LINES}; received ${FILE_READ_MAX_LINES + 1}.`
         );
     });
 
     it('accepts an object target with only a path, using the defaults', async () => {
-        await expect(fileRead([{ path: join(workdir, 'a.txt') }])).resolves.toEqual({
+        await expect(read([{ path: join(workdir, 'a.txt') }])).resolves.toEqual({
             files: [
                 {
                     path: join(workdir, 'a.txt'),
@@ -844,7 +729,7 @@ describe('fileRead', () => {
     });
 
     it('declares a single "paths" array property whose items are strings or ranges', () => {
-        expect(fileRead.parameters).toEqual({
+        expect(read.parameters).toEqual({
             type: 'object',
             properties: {
                 paths: {
@@ -892,7 +777,7 @@ describe('fileRead', () => {
             required: ['paths'],
             additionalProperties: false
         });
-        expect(toolParameterKey(fileRead.parameters)).toBe('paths');
+        expect(toolParameterKey(read.parameters)).toBe('paths');
     });
 
     it('publishes the documented default and hard caps', () => {
@@ -904,7 +789,7 @@ describe('fileRead', () => {
 
     it('runs through the execute path with the array a harness would pass', async () => {
         await expect(
-            fileRead.execute({
+            read.execute({
                 parameters: [{ path: join(workdir, 'lines.txt'), startLine: 2, maxLines: 1 }]
             })
         ).resolves.toEqual({

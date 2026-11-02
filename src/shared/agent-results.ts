@@ -288,7 +288,7 @@ type ReplayBlock = {
 // but lookups use them so an old stable binding keeps working.
 type ProjectedBlock = AgentResultBlock & { aliases: string[] };
 
-// Parse `agentDelegate` arguments for the legacy placeholder: a delegation's
+// Parse `delegate` arguments for the legacy placeholder: a delegation's
 // spawning call is the only evidence of the child block when its `thread` metadata
 // is absent. Only a complete `{agent, input}` pair is usable.
 const delegateOf = (rawArguments: string): { agent: string; input: string } | undefined => {
@@ -317,7 +317,7 @@ const delegateOf = (rawArguments: string): { agent: string; input: string } | un
 // The replay follows the event order the UI uses, because labels depend on it:
 //   - the root block is created by the first event routed to it and consumes the
 //     first occurrence of the entry agent;
-//   - an `agentDelegate` tool_call creates its child placeholder IMMEDIATELY (the
+//   - an `delegate` tool_call creates its child placeholder IMMEDIATELY (the
 //     label is allocated when the call is seen), and the child `start` ADOPTS that
 //     placeholder when it carries the same `callId`;
 //   - an explicit `thread` start without a placeholder allocates a block then;
@@ -534,7 +534,7 @@ const blocksOfTurn = (
             case 'tool_call': {
                 // Queue a delegation placeholder when the call is made, so its
                 // label is allocated in the same order the UI allocates it.
-                if (event.call.name === 'agentDelegate') {
+                if (event.call.name === 'delegate') {
                     const delegate = delegateOf(event.call.arguments);
                     if (delegate !== undefined && !byCall.has(event.call.id)) {
                         // The pending descriptor identity is `call:<callId>` (what

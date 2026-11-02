@@ -457,10 +457,17 @@ type Session = {
 // is how a background save failure becomes observable (the core observer swallows
 // our callback's exceptions, so we never throw from a notification); the default
 // logs to stderr and the last message is also exposed as `persistenceError`.
+//
+// `onRestoreError` is the same injectable-reporter convention for the OTHER
+// direction: one saved session this build cannot rebuild (a snapshot naming a
+// tool that has since been renamed, a hand-edited record, a stale model map).
+// Such a session is DROPPED, never fatal, and the message is reported here —
+// the default is stderr and every message is also kept in `restoreErrors`.
 export type SessionStoreOptions = {
     persistence?: HarnessPersistence;
     database?: HarnessDatabase;
     onPersistenceError?: (error: Error) => void;
+    onRestoreError?: (error: Error) => void;
 };
 
 // Recovery wording used when a turn was running at save time. The policy is
@@ -693,6 +700,13 @@ export class SessionStore {
     // a queue: no two saves can interleave in this process.
     private readonly persistence: HarnessPersistence | undefined;
     private readonly onPersistenceError: ((error: Error) => void) | undefined;
+    // Per-session restore reporter (see SessionStoreOptions.onRestoreError).
+    private readonly onRestoreError: ((error: Error) => void) | undefined;
+    // Every saved session this load dropped, in document order, as the full
+    // diagnostic message (file path + session id + the underlying reason). Kept
+    // because a dropped session must stay explainable after it stops being
+    // addressable: the store no longer holds it, so this is the only record.
+    private readonly restoreFailures: string[] = [];
     // Last background save failure. Exposed so a caller/test can observe a write
     // error that must not change a run's outcome (the core observer swallows it).
     private lastPersistenceError: string | undefined;
@@ -718,7 +732,7 @@ export class SessionStore {
     // `registry` defaults to a fresh in-memory registry over the shipped presets.
     // It is injectable so tests can run scripted harnesses (including subagents and
     // failures) without reaching a provider, and so the host can share ONE registry
-    // with the API. `describe` captures host-specific availability (webSearch) in
+    // with the API. `describe` captures host-specific availability (search) in
     // the frozen snapshot: the store owns no catalogue, so production injects a
     // describer bound to the runtime catalogue.
     //
@@ -732,12 +746,33 @@ export class SessionStore {
     ) {
         this.persistence = options.persistence;
         this.onPersistenceError = options.onPersistenceError;
+        this.onRestoreError = options.onRestoreError;
 
         if (options.database !== undefined) {
             this.loading = true;
 
             try {
-                for (const record of options.database.sessions) this.restoreSession(record);
+                // R6: restore is best-effort PER SESSION. One unusable record (a
+                // snapshot that names a tool this build renamed, a queue that
+                // points at a turn that is gone, a model map naming a retired
+                // agent) must not take the store, the API, or every healthy
+                // session down with it — before this loop, it did: the throw
+                // escaped the constructor, so createHarnessRuntime/
+                // startHarnessServer aborted and the UI reported "server
+                // unavailable" with no way to start a new session.
+                //
+                // Document-level problems (unreadable file, malformed JSON,
+                // unknown database version, bad record shape) are still hard
+                // failures: they happen in HarnessPersistence.load() BEFORE this
+                // loop, and an unparseable document says nothing trustworthy
+                // about any session in it.
+                for (const record of options.database.sessions) {
+                    try {
+                        this.restoreSession(record);
+                    } catch (error) {
+                        this.noteRestoreError(error);
+                    }
+                }
             } finally {
                 this.loading = false;
             }
@@ -749,6 +784,13 @@ export class SessionStore {
     // for the turn-transition path, which must not fail a completed run.
     get persistenceError(): string | undefined {
         return this.lastPersistenceError;
+    }
+
+    // Sessions this load dropped, document order, each as the exact diagnostic
+    // that was reported (see noteRestoreError). Empty for an in-memory store and
+    // for a document whose every session rebuilt successfully.
+    get restoreErrors(): readonly string[] {
+        return this.restoreFailures;
     }
 
     get size(): number {
@@ -1347,10 +1389,12 @@ export class SessionStore {
     // then can the core snapshot be applied (restore validates against the exact
     // agent/registry set before mutating).
     private restoreSession(record: HarnessSessionRecord): void {
-        const location =
-            this.persistence === undefined
-                ? `Session "${record.id}"`
-                : `Session "${record.id}" in ${this.persistence.file}`;
+        // `HarnessPersistenceError` below prefixes the database file, so the inner
+        // message names the SESSION only. Naming the file twice (as `Session "id"
+        // in <file>` used to) made the persisted diagnostic unreadable, and this
+        // message is now what an operator sees in the server log for a dropped
+        // session: `<file>: Session "<id>" could not be restored: <reason>`.
+        const location = `Session "${record.id}"`;
 
         try {
             // Fast path: the registry still has the exactly-matching entry (the
@@ -1538,13 +1582,37 @@ export class SessionStore {
             session.core = harness.snapshot();
             this.sessions.set(session.id, session);
         } catch (error) {
-            // Corrupt or incompatible state must fail the whole load; silently
-            // skipping one session would hide user data loss.
+            // R6/R7: the caller decides. `restoreSession` itself stays strict — a
+            // direct restore failure is a real error with the file path and the
+            // underlying reason in its message — but the load loop turns it into a
+            // per-session drop so one stale record cannot abort the whole server.
             throw new HarnessPersistenceError(
                 this.persistence?.file ?? '',
                 `${location} could not be restored: ${messageOf(error)}`
             );
         }
+    }
+
+    // Reporting for one session the load loop dropped (R7: the failure stays
+    // observable even though it no longer throws). Same shape as
+    // `notePersistenceError`: keep the message, hand it to the injected reporter,
+    // and fall back to stderr when the host did not inject one. A reporter that
+    // throws must never turn a dropped session into a startup crash.
+    private noteRestoreError(value: unknown): void {
+        const error = value instanceof Error ? value : new Error(messageOf(value));
+        this.restoreFailures.push(error.message);
+
+        if (this.onRestoreError !== undefined) {
+            try {
+                this.onRestoreError(error);
+            } catch {
+                // Observability only; the drop already happened.
+            }
+
+            return;
+        }
+
+        console.error(`[harness] skipped an unrestorable saved session: ${error.message}`);
     }
 
     // Called before a stream is opened so a busy session is rejected with a real
@@ -1568,7 +1636,7 @@ export class SessionStore {
     // Run one REGISTERED tool inside a session's harness (R8).
     //
     // This is the server path behind `POST /tools/:name` when the caller supplies a
-    // sessionId: the core tools (toolRequest/toolCreate/todoManage/agentDelegate) have
+    // sessionId: the core tools (toolRequest/toolCreate/todoManage/delegate) have
     // no standalone implementation, so they must execute against the harness the
     // session owns — a manual discovery or todo call then affects the very
     // conversation the user is looking at. Registered, non-core tools are also
@@ -1578,7 +1646,7 @@ export class SessionStore {
     // Failure mapping is the caller's job (src/server/api.ts):
     //   - unknown session            → SessionError 404 (require)
     //   - session busy (run/manual)  → SessionError 409 (single-flight gate)
-    //   - tool absent from the run   → SessionError 404 (agentDelegate without subagents)
+    //   - tool absent from the run   → SessionError 404 (delegate without subagents)
     //   - the tool itself throws     → whatever it throws (reported as ok:false)
     //
     // `parameters` is the value `execute` receives, i.e. already unwrapped by the
@@ -1591,7 +1659,7 @@ export class SessionStore {
         // run would make that run's transcript internally inconsistent, so it is
         // rejected like a second submitted task rather than queued.
         //
-        // The same holds for a SECOND manual call: an async `agentDelegate` holds the
+        // The same holds for a SECOND manual call: an async `delegate` holds the
         // session across awaits, so without this check two manual mutations (or a
         // reset) could interleave even though `status` was never `running`.
         //
@@ -4370,7 +4438,7 @@ export class SessionStore {
     reset(id: string): SessionSnapshot {
         const session = this.require(id);
 
-        // `busy`, not `status`: a manual agentDelegate/toolCreate call holds the
+        // `busy`, not `status`: a manual delegate/toolCreate call holds the
         // session without a turn, and resetting its harness mid-call would clear
         // state the tool is still mutating. A pending queue is also refused: those
         // tasks were accepted against this harness, so the caller must stop them

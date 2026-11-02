@@ -48,7 +48,7 @@ const bootstrap = {
     ],
     tools: [
         {
-            name: 'fileRead',
+            name: 'read',
             group: 'Files',
             description: 'Read one or more files.',
             tags: ['files', 'read'],
@@ -166,7 +166,7 @@ it('opens and closes the global tools view from the topbar icon only', async () 
     expect(stage.querySelector('.tools-pane')).not.toBeNull();
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-tab-button')].map((node) => node.dataset.tool)
-    ).toEqual(['fileRead']);
+    ).toEqual(['read']);
     // List-only head: the head describes the CATALOGUE, not a tool.
     expect(head.querySelector('.main-title')?.textContent).toBe('Tools');
     expect(head.querySelector('.harness-id')?.textContent).toBe('catalogue');
@@ -187,7 +187,7 @@ it('opens and closes the global tools view from the topbar icon only', async () 
     // Activating the entry opens its runner in the shared modal. The button names
     // the popup kind and reports the current selection.
     const toolButton = byClass('.tool-tab-button', 'button');
-    expect(toolButton.dataset.tool).toBe('fileRead');
+    expect(toolButton.dataset.tool).toBe('read');
     expect(toolButton.getAttribute('aria-haspopup')).toBe('dialog');
     expect(toolButton.getAttribute('aria-pressed')).toBe('false');
 
@@ -196,10 +196,10 @@ it('opens and closes the global tools view from the topbar icon only', async () 
 
     const dialog = byClass('.dialog', 'div');
     expect(dialog.getAttribute('role')).toBe('dialog');
-    expect(dialog.querySelector('.dialog-title')?.textContent).toBe('fileRead');
+    expect(dialog.querySelector('.dialog-title')?.textContent).toBe('read');
     // While the dialog is open the head describes the SELECTED tool (name, group,
     // visibility · tags), not the catalogue.
-    expect(head.querySelector('.main-title')?.textContent).toBe('fileRead');
+    expect(head.querySelector('.main-title')?.textContent).toBe('read');
     expect(head.querySelector('.harness-id')?.textContent).toBe('Files');
     // A tool group label, not a harness id: `selectTool` un-hides the badge too
     // (main.ts:3867-3868) even though the chat header keeps it hidden.
@@ -350,12 +350,12 @@ it('opens harness details from the clickable title and keeps tools headings iner
     // Selecting a tool keeps the head inert as well.
     byClass('.tool-tab-button', 'button').click();
     await flush();
-    expect(title.textContent).toBe('fileRead');
+    expect(title.textContent).toBe('read');
     expect(button.disabled).toBe(true);
     button.click();
     await flush();
     // Only the tool runner dialog is open (its title is the tool), never a harness one.
-    expect(document.querySelector('.dialog-title')?.textContent).toBe('fileRead');
+    expect(document.querySelector('.dialog-title')?.textContent).toBe('read');
     expect(document.querySelector('.harness-details')).toBeNull();
 
     // Leaving the tools view restores the chat head and re-enables the trigger.

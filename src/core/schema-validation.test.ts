@@ -4,7 +4,7 @@
 //   - the MODEL sends the schema wrapper (`{ "paths": [...] }`); `execute`
 //     receives the unwrapped property value;
 //   - a DIRECT/host call keeps its legacy already-unwrapped form
-//     (`fileRead(['a.txt'])`) and is validated as the property;
+//     (`read(['a.txt'])`) and is validated as the property;
 //   - a manual call may also pass the wrapper; both resolve to the same value;
 //   - wrong types, missing required properties, unknown properties (when
 //     additionalProperties is false), enums, oneOf, and numeric/string/array
@@ -22,7 +22,7 @@ import {
     validateSchemaValue
 } from '@underload/harness';
 
-// The fileRead shape: one property, whose value is an array of strings.
+// The read shape: one property, whose value is an array of strings.
 const single = {
     type: 'object',
     properties: { paths: { type: 'array', items: { type: 'string' } } },
@@ -157,7 +157,7 @@ describe('validateSchemaValue', () => {
 });
 
 describe('checkToolSchemaComplexity', () => {
-    it('accepts the bundled fileRead-shaped schema untouched', () => {
+    it('accepts the bundled read-shaped schema untouched', () => {
         const nested = {
             type: 'object',
             properties: {

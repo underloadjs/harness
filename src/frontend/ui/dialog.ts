@@ -12,8 +12,9 @@
 //       -> { element, isOpen, close(), update({ title?, content?, copy? }) }
 //
 // `copy` is the opt-in data-inspection action (R5): a string or a click-time
-// provider. The dialog owns the button, clipboard path and success/failure text so
-// tool/transcript/file dialogs do not duplicate handlers.
+// provider. The dialog owns the icon button, the clipboard path (async API plus the
+// insecure-origin fallback) and the success/failure announcement, so tool/transcript/
+// file dialogs do not duplicate handlers.
 //
 // `content` is a DOM Node, never an HTML string. The caller supplies nodes it has
 // already built with createElement/textContent (see ui/panels.ts for the same
@@ -162,13 +163,44 @@ const BODY_CLASS = 'dialog-body';
 const CLOSE_GLYPH = '\u00d7';
 const CLOSE_LABEL = 'Close';
 
-// Copy feedback is TEXT in the button itself (and `aria-live`), never colour-only.
-// It stays until the next activation: no timer can race a closed dialog or leak
-// after the overlay is removed.
-const COPY_LABEL = 'Copy';
+// Copy feedback is TEXT in an aria-live child of the button plus a state-driven ICON,
+// never colour alone: the visible word is screen-reader text now, so the picture is
+// what changes on screen. T1/R3.
+// T1/R3: the words below are ANNOUNCED (live child) and used as tooltips; the visible
+// affordance is the icon. They stay in the source so the announcement is spelled the
+// same way in every dialog.
 const COPY_SUCCESS_LABEL = 'Copied';
 const COPY_FAILURE_LABEL = 'Copy failed';
+// Stable accessible name: the control's purpose never changes, so the announcement is
+// a status message (the live child) instead of a renamed button.
 const COPY_ARIA_LABEL = 'Copy dialog contents';
+const COPY_TITLE = 'Copy the dialog contents to the clipboard';
+const COPY_SUCCESS_TITLE = 'Copied to the clipboard';
+const COPY_FAILURE_TITLE = 'Copy failed — the clipboard was not available';
+
+// T1/R3: the button carries an inline SVG (stroke) glyph per state — two sheets for
+// "copy", a tick for success, an exclamation for failure. Paths, not fonts: an icon
+// font or an emoji would render inconsistently (and the repo keeps source ASCII-only).
+// `aria-hidden` on the <svg> keeps the button's accessible name equal to COPY_ARIA_LABEL.
+const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
+
+const COPY_ICONS: Record<'idle' | 'success' | 'error', string> = {
+    // Back sheet + front sheet (the conventional copy mark).
+    idle: 'M9 9.5h9.5v9.5H9z M15 5H5.5v9.5',
+    // Tick.
+    success: 'M4.5 12.5l4.5 4.5 10.5-10.5',
+    // Exclamation: the stem plus its dot.
+    error: 'M12 4.5v10.5 M12 18.6v0.9'
+};
+
+// The announced word for each state. Idle is EMPTY on purpose: the button already
+// names itself, and a live region that repeats the label on every open would announce
+// nothing new.
+const COPY_FEEDBACK: Record<'idle' | 'success' | 'error', string> = {
+    idle: '',
+    success: COPY_SUCCESS_LABEL,
+    error: COPY_FAILURE_LABEL
+};
 
 // Elements a Tab press may land on. `[tabindex]` is filtered below: `-1` is
 // programmatic-only and must not join the cycle.
@@ -235,16 +267,27 @@ const assertContent = (content: unknown): Node => {
 // Two paths, in order:
 //   1. the async Clipboard API (`navigator.clipboard.writeText`) — the safe,
 //      permission-aware path a secure browser context exposes;
-//   2. a hidden read-only textarea + `document.execCommand('copy')` — the
-//      documented fallback for older browsers, embedded webviews and pages where
-//      the async API is absent or rejects (permissions policy, insecure origin).
+//   2. a read-only textarea + `document.execCommand('copy')` — the documented
+//      fallback for older browsers, embedded webviews and pages where the async API
+//      is absent or rejects (permissions policy, INSECURE ORIGIN).
 // Both are best-effort; the caller receives a boolean and the button reports the
 // truth instead of pretending the clipboard write succeeded.
 //
-// The fallback restores focus to whatever was focused before it ran. It is only
-// invoked from the Copy button inside the top dialog, so the focus trap would pull
-// focus back anyway, but restoring the exact control keeps the behaviour stable in
-// jsdom/embedded hosts too.
+// WHY THE FALLBACK MATTERS FOR THIS APP (T1/R3): the harness UI is served over plain
+// HTTP on the LAN static host (src/frontend/deployment.ts and
+// src/frontend/vite.config.ts print `http://<LAN-IP>:<port>/`), and `navigator
+// .clipboard` simply does not exist in a non-secure origin. Every transcript copy
+// there went through the fallback, and the fallback was the thing that was broken.
+//
+// THE BUG THIS FIXES: `execCommand('copy')` copies the selection of the FOCUSED
+// control. The old code called `area.select()` without ever focusing the textarea
+// (the dialog panel holds focus), so the copy ran against an empty selection,
+// reported success, and left the clipboard unchanged. Focusing the helper is only
+// half the fix: the modal focus trap (`onDocumentFocusIn`, capture) drags any focus
+// outside the top panel straight back in, so the workaround needs the trap held
+// open for exactly the duration of the copy (see `clipboardWorkaround`).
+let clipboardWorkaround = false;
+
 const clipboardFallback = (text: string): boolean => {
     if (typeof document === 'undefined' || document.body === null) return false;
     if (typeof document.execCommand !== 'function') return false;
@@ -254,20 +297,32 @@ const clipboardFallback = (text: string): boolean => {
     area.className = 'dialog-copy-buffer';
     area.value = text;
     area.setAttribute('readonly', '');
+    // Data only, and not a stop for assistive tech passing over the dialog.
+    area.setAttribute('aria-hidden', 'true');
     // Off-screen, not display:none: a hidden element cannot be selected/copied.
     area.style.position = 'fixed';
     area.style.top = '-1000px';
     area.style.left = '-1000px';
     area.style.opacity = '0';
+
+    clipboardWorkaround = true;
     document.body.append(area);
 
     let copied = false;
     try {
+        // Focus THEN select, in that order: the selection only belongs to the copy
+        // command while its control is the focused one. `setSelectionRange` is the
+        // iOS/Safari spelling of "all of it".
+        area.focus({ preventScroll: true });
         area.select();
+        area.setSelectionRange(0, text.length);
         copied = document.execCommand('copy') === true;
     } catch {
         copied = false;
     } finally {
+        // The trap must own focus again before anything else can move it, and the
+        // helper is removed whatever the command answered.
+        clipboardWorkaround = false;
         area.remove();
         if (previousFocus instanceof HTMLElement && previousFocus.isConnected) {
             previousFocus.focus({ preventScroll: true });
@@ -302,22 +357,61 @@ const copyTextOf = (source: DialogCopySource): string => {
     return text;
 };
 
-// Paint the button's text/state. `aria-live` is set on the button so a screen
-// reader announces the new label; the visible word is the primary feedback.
+// T1/R3: the Copy control is an ICON button. Two nodes are built once and repainted
+// on every state change: the <svg> glyph (what the reader sees) and a visually hidden
+// `role="status"` word (what a screen reader hears). SVG is created in its own
+// namespace because this module never parses HTML — the same data-only rule the
+// `content` option enforces.
+const createCopyIcon = (): SVGSVGElement => {
+    const icon = document.createElementNS(SVG_NAMESPACE, 'svg');
+    icon.setAttribute('class', 'dialog-copy-icon');
+    icon.setAttribute('viewBox', '0 0 24 24');
+    // The button carries the accessible name (`aria-label`), so the glyph must not be
+    // announced a second time, and it must never take a focus order of its own.
+    icon.setAttribute('aria-hidden', 'true');
+    icon.setAttribute('focusable', 'false');
+
+    const path = document.createElementNS(SVG_NAMESPACE, 'path');
+    path.setAttribute('fill', 'none');
+    path.setAttribute('d', COPY_ICONS.idle);
+    icon.append(path);
+
+    return icon;
+};
+
+const createCopyFeedback = (): HTMLSpanElement => {
+    const feedback = document.createElement('span');
+    feedback.className = 'dialog-copy-feedback';
+    // A live region INSIDE the button announces idle -> Copied / Copy failed without
+    // renaming the control, so the visible word is no longer the only feedback.
+    feedback.setAttribute('role', 'status');
+    feedback.setAttribute('aria-live', 'polite');
+    feedback.textContent = COPY_FEEDBACK.idle;
+    return feedback;
+};
+
+// Paint the button's icon/state. The `title` follows the state so a hover explains
+// what just happened, and `data-state` drives the border/colour reinforcement.
 const paintCopyState = (button: HTMLButtonElement, state: 'idle' | 'success' | 'error'): void => {
+    const path = button.querySelector('svg.dialog-copy-icon > path');
+    if (path !== null) path.setAttribute('d', COPY_ICONS[state]);
+
+    const feedback = button.querySelector<HTMLElement>('.dialog-copy-feedback');
+    if (feedback !== null) feedback.textContent = COPY_FEEDBACK[state];
+
     if (state === 'success') {
         button.dataset.state = 'success';
-        button.textContent = COPY_SUCCESS_LABEL;
+        button.title = COPY_SUCCESS_TITLE;
         return;
     }
     if (state === 'error') {
         button.dataset.state = 'error';
-        button.textContent = COPY_FAILURE_LABEL;
+        button.title = COPY_FAILURE_TITLE;
         return;
     }
 
     delete button.dataset.state;
-    button.textContent = COPY_LABEL;
+    button.title = COPY_TITLE;
 };
 
 // ---------------------------------------------------------------------------
@@ -442,8 +536,13 @@ const onDocumentKeyDown = (event: KeyboardEvent): void => {
 // Modal focus containment: programmatic/mouse focus that lands outside the top
 // dialog is pulled back. Detached targets (focus leaving the document) are
 // ignored, and the redirect flag prevents a focusin loop.
+//
+// T1/R3: `clipboardWorkaround` is the second exemption. The execCommand fallback has
+// to focus and select a helper textarea that lives in `document.body`, OUTSIDE the
+// panel; without this the trap would yank focus back before the copy command runs and
+// the clipboard write would land on an empty selection.
 const onDocumentFocusIn = (event: FocusEvent): void => {
-    if (redirecting) return;
+    if (redirecting || clipboardWorkaround) return;
 
     const top = topLayer();
     if (top === undefined || top.entry.closed) return;
@@ -488,9 +587,10 @@ const resolveFocusTarget = (entry: DialogEntry): HTMLElement | null => {
 };
 
 // Resolve the copy source when the user asks for it, so a live tool card or
-// transcript copies what is CURRENTLY rendered. Feedback is written to the button
-// itself (text + aria-live); the entry may close while the async clipboard write is
-// in flight, in which case there is no button left to paint.
+// transcript copies what is CURRENTLY rendered. Feedback is written INSIDE the button
+// (the glyph, `data-state`, the `title`, and the hidden `aria-live` word — T1/R3); the
+// entry may close while the async clipboard write is in flight, in which case there is
+// no button left to paint.
 const runCopy = async (entry: DialogEntry, button: HTMLButtonElement): Promise<void> => {
     let text: string;
 
@@ -514,6 +614,8 @@ const installCopyButton = (entry: DialogEntry, source: DialogCopySource): void =
     entry.copy = source;
 
     if (entry.copyButton !== undefined) {
+        // Re-installing onto a live dialog (a refresh replaced the copy source) resets
+        // the previous feedback so a stale "Copied" never describes a different payload.
         paintCopyState(entry.copyButton, 'idle');
         return;
     }
@@ -521,11 +623,12 @@ const installCopyButton = (entry: DialogEntry, source: DialogCopySource): void =
     const button = document.createElement('button');
     button.type = 'button';
     button.className = COPY_CLASS;
+    // T1/R3: an icon button. The accessible name and the tooltip describe the ACTION
+    // and never change; the hidden live child inside announces the outcome.
     button.setAttribute('aria-label', COPY_ARIA_LABEL);
-    // A live region on the control makes the idle -> Copied/Copy failed change
-    // announce itself without adding a second visible status line.
-    button.setAttribute('aria-live', 'polite');
-    button.textContent = COPY_LABEL;
+    button.append(createCopyIcon(), createCopyFeedback());
+    // Paint once so `title`/`data-state`/icon are consistent from the first frame.
+    paintCopyState(button, 'idle');
     button.addEventListener('click', () => {
         void runCopy(entry, button);
     });

@@ -15,7 +15,7 @@
 // What is mocked here, and why it is the honest simulation of a stale manifest:
 //   `../core/tool-manifest` is replaced with the REAL rows MINUS `syntaxCheck` —
 //   exactly the bytes a manifest generated before `syntaxCheck.tool.ts` existed
-//   would contain — with `fileRead`'s metadata doctored to stale values. Its
+//   would contain — with `read`'s metadata doctored to stale values. Its
 //   generated loader is POISONED: on a source-backed (Node) catalogue reaching it at
 //   all is the regression, so it records the label and throws instead of loading a
 //   possibly-obsolete build artifact. The filesystem is NOT mocked, so the live
@@ -35,7 +35,7 @@ const generatedLoads = vi.hoisted(() => [] as string[]);
 
 // The stale-manifest simulation (see the header). `syntaxCheck` is a SHIPPED preset,
 // so this is a real row disappearing from the generated table while its file stays on
-// disk — the precise T24 failure mode, with no invented tool. `fileRead` keeps its
+// disk — the precise T24 failure mode, with no invented tool. `read` keeps its
 // row but carries STALE metadata, which proves the catalogue reads the ENTRY, not the
 // manifest, when both exist. The loader is poisoned for the same reason: T27 says a
 // Node catalogue never executes a generated chunk.
@@ -47,7 +47,7 @@ vi.mock('../core/tool-manifest', async (importOriginal) => {
         BUILTIN_TOOL_DESCRIPTORS: actual.BUILTIN_TOOL_DESCRIPTORS.filter(
             (descriptor) => descriptor.name !== 'syntaxCheck'
         ).map((descriptor) =>
-            descriptor.name === 'fileRead'
+            descriptor.name === 'read'
                 ? {
                       ...descriptor,
                       metadata: {
@@ -99,32 +99,32 @@ const ALL_PACKAGE_NAMES = [
     'locationManage',
     'agentManage',
     'agentResult',
-    'agentDelegate',
+    'delegate',
     'threadFork',
     'actionRequest',
     'toolCancel',
     'syntaxCheck',
-    'fileRead',
+    'read',
     'fileWrite',
-    'fileEdit',
+    'edit',
     'fileList',
     'fileGlob',
-    'commandRun',
+    'shell',
     'gitDiff',
-    'webSearch',
-    'webFetch',
+    'search',
+    'fetch',
     'threadSend',
     'threadList'
 ];
 
 const PRESET_NAMES = [
     'syntaxCheck',
-    'fileRead',
+    'read',
     'fileWrite',
-    'fileEdit',
+    'edit',
     'fileList',
     'fileGlob',
-    'commandRun',
+    'shell',
     'gitDiff'
 ];
 
@@ -151,27 +151,27 @@ describe('live Node descriptor catalogue (T24)', () => {
     });
 
     it('reads entry literals, not stale manifest metadata, for a row both know', () => {
-        // fileRead EXISTS in the stale manifest, with a doctored description/tags.
+        // read EXISTS in the stale manifest, with a doctored description/tags.
         // The catalogue must publish the entry's own literal: the manifest is a
         // build artifact and can be arbitrarily old. Comparing against the entry's
         // exported constant is the exact statement of that contract (importing a
         // `.tool` module is safe in this Node test and is what pins the equality).
         const staleRow = BUILTIN_TOOL_DESCRIPTORS.find(
-            (descriptor) => descriptor.name === 'fileRead'
+            (descriptor) => descriptor.name === 'read'
         );
         expect(staleRow?.metadata.description).toBe('STALE MANIFEST DESCRIPTION');
         expect(staleRow?.metadata.tags).toEqual(['stale', 'manifest']);
 
-        return import('./files/fileRead.tool').then((entry) => {
-            expect(PRESET_TOOLS.fileRead).toEqual({
+        return import('./files/read.tool').then((entry) => {
+            expect(PRESET_TOOLS.read).toEqual({
                 name: entry.FILE_READ_METADATA.name,
                 description: entry.FILE_READ_METADATA.description,
                 tags: [...entry.FILE_READ_METADATA.tags],
                 parameters: entry.FILE_READ_METADATA.parameters,
                 visibility: entry.FILE_READ_METADATA.visibility
             });
-            expect(PRESET_TOOLS.fileRead.tags).toEqual(['files', 'read', 'filesystem']);
-            expect(descriptorOf('fileRead')!.metadata.tags).toEqual([
+            expect(PRESET_TOOLS.read.tags).toEqual(['files', 'read', 'filesystem']);
+            expect(descriptorOf('read')!.metadata.tags).toEqual([
                 'files',
                 'read',
                 'filesystem'
@@ -249,7 +249,7 @@ describe('live Node descriptor catalogue (T24)', () => {
             'locationManage',
             'agentManage',
             'agentResult',
-            'agentDelegate',
+            'delegate',
             'actionRequest',
             'threadFork'
         ]);
@@ -270,8 +270,8 @@ describe('live Node descriptor catalogue (T24)', () => {
         // toolCreate is declared always but policy-gated at registration time.
         expect(isAlwaysDeclared(row('toolCreate'))).toBe(true);
         // Capability rows are neither.
-        expect(isCoreRegistered(row('agentDelegate'))).toBe(false);
-        expect(isAlwaysDeclared(row('agentDelegate'))).toBe(false);
+        expect(isCoreRegistered(row('delegate'))).toBe(false);
+        expect(isAlwaysDeclared(row('delegate'))).toBe(false);
     });
 
     it('executes a manifest-unknown preset through its editable source', async () => {
@@ -307,23 +307,23 @@ describe('live Node descriptor catalogue (T24)', () => {
 
     it('keeps metadata and body on ONE source revision for a manifest-known preset (T27)', async () => {
         // The T27 correction, stated in both halves for a label the generated manifest
-        // DOES know (fileRead). The manifest copy of this row is doctored and the
+        // DOES know (read). The manifest copy of this row is doctored and the
         // generated loader is poisoned, so either half coming from the build artifact
         // fails this test loudly.
-        const entry = await import('./files/fileRead.tool');
+        const entry = await import('./files/read.tool');
 
         // Half 1 — metadata: the entry's own literal, never the doctored manifest row.
-        expect(PRESET_TOOLS.fileRead).toEqual({
+        expect(PRESET_TOOLS.read).toEqual({
             name: entry.FILE_READ_METADATA.name,
             description: entry.FILE_READ_METADATA.description,
             tags: [...entry.FILE_READ_METADATA.tags],
             parameters: entry.FILE_READ_METADATA.parameters,
             visibility: entry.FILE_READ_METADATA.visibility
         });
-        expect(presetTools.fileRead.tags).toEqual(['files', 'read', 'filesystem']);
+        expect(presetTools.read.tags).toEqual(['files', 'read', 'filesystem']);
         // The compiled path IS the row's scanned entry, which is what makes the two
         // halves one revision.
-        expect(descriptorSourcePath('fileRead')).toBe('tools/files/fileRead.tool.ts');
+        expect(descriptorSourcePath('read')).toBe('tools/files/read.tool.ts');
 
         // Half 2 — executable body: the REAL implementation, not a generated chunk.
         // A fixture under Temp/ keeps the assertion independent of the repository.
@@ -351,10 +351,10 @@ describe('live Node descriptor catalogue (T24)', () => {
         };
 
         // Proxy path (what `presetTools` exposes) and the direct seam both run the
-        // entry body compiled from `tools/files/fileRead.tool.ts`.
-        await expect(presetTools.fileRead([target])).resolves.toEqual(expected);
-        const loaded = await loadPresetTool('fileRead');
-        expect(loaded.name).toBe('fileRead');
+        // entry body compiled from `tools/files/read.tool.ts`.
+        await expect(presetTools.read([target])).resolves.toEqual(expected);
+        const loaded = await loadPresetTool('read');
+        expect(loaded.name).toBe('read');
         expect(loaded.description).toBe(entry.FILE_READ_METADATA.description);
         await expect(loaded([target])).resolves.toEqual(expected);
 
@@ -399,27 +399,27 @@ describe('live Node descriptor catalogue (T24)', () => {
 
 describe('descriptor mutation isolation (T24)', () => {
     it('hands out detached metadata from descriptorMetadata and descriptorOf', () => {
-        const first = descriptorMetadata('fileRead');
+        const first = descriptorMetadata('read');
         first.tags.push('mutated');
         (first.parameters.properties as Record<string, unknown>).injected = true;
 
         // A later read is the entry's literal again: the process snapshot was never
         // exposed.
-        expect(descriptorMetadata('fileRead').tags).toEqual(['files', 'read', 'filesystem']);
-        expect(descriptorMetadata('fileRead').parameters).not.toHaveProperty(
+        expect(descriptorMetadata('read').tags).toEqual(['files', 'read', 'filesystem']);
+        expect(descriptorMetadata('read').parameters).not.toHaveProperty(
             'properties.injected'
         );
 
-        const row = descriptorOf('fileRead')!;
+        const row = descriptorOf('read')!;
         row.metadata.tags.push('mutated-row');
         row.metadata.parameters.extra = 1;
 
-        expect(descriptorOf('fileRead')!.metadata.tags).toEqual([
+        expect(descriptorOf('read')!.metadata.tags).toEqual([
             'files',
             'read',
             'filesystem'
         ]);
-        expect(descriptorOf('fileRead')!.metadata.parameters).not.toHaveProperty('extra');
+        expect(descriptorOf('read')!.metadata.parameters).not.toHaveProperty('extra');
     });
 
     it('does not alias the exported lists to each other', () => {
@@ -456,11 +456,11 @@ describe('descriptor mutation isolation (T24)', () => {
     it('does not let a mutated catalogue row corrupt a freshly built proxy', () => {
         // `lazyTool` copies name/description/tags/schema from a detached row, so a
         // consumer editing PRESET_TOOLS cannot change what a later proxy declares.
-        PRESET_TOOLS.fileRead.tags.push('mutated-catalogue');
-        (PRESET_TOOLS.fileRead.parameters.properties as Record<string, unknown>).injected = true;
+        PRESET_TOOLS.read.tags.push('mutated-catalogue');
+        (PRESET_TOOLS.read.parameters.properties as Record<string, unknown>).injected = true;
 
-        expect(presetTools.fileRead.tags).toEqual(['files', 'read', 'filesystem']);
-        expect(presetTools.fileRead.parameters).not.toHaveProperty('properties.injected');
-        expect(descriptorMetadata('fileRead').tags).toEqual(['files', 'read', 'filesystem']);
+        expect(presetTools.read.tags).toEqual(['files', 'read', 'filesystem']);
+        expect(presetTools.read.parameters).not.toHaveProperty('properties.injected');
+        expect(descriptorMetadata('read').tags).toEqual(['files', 'read', 'filesystem']);
     });
 });

@@ -1,10 +1,10 @@
-// fileEdit — replace text in one or more existing files in a single call.
+// edit — replace text in one or more existing files in a single call.
 //
 // WHY AN ARRAY (T14 batching rule)
 // --------------------------------
 // A rename or a signature change touches several files. The schema declares ONE
 // property, `edits`, so the single-property rule (see ../core/tool.ts) hands
-// `execute` the array itself — `fileEdit([{ path, oldString, newString }])` — while
+// `execute` the array itself — `edit([{ path, oldString, newString }])` — while
 // a model call carries `{ "edits": [...] }` and reaches the same code.
 //
 // The safety property comes from the contract, not from a sandbox:
@@ -20,7 +20,7 @@
 // MATCHING (ported from opencode's v2 edit tool)
 // ----------------------------------------------
 // Matching is EXACT first, with two narrow fallbacks and line-ending awareness —
-// the same cascade opencode v2 uses, so a model that copies text out of fileRead
+// the same cascade opencode v2 uses, so a model that copies text out of read
 // (or retypes it with ASCII quotes) lands on the right bytes:
 //
 //   1. exact match against an LF view of the file: CRLF is folded to LF for
@@ -79,7 +79,7 @@
 //
 // Executable on its own and registerable on a harness:
 //
-//     await fileEdit([{ path: 'notes.md', oldString: '# Notes', newString: '# Log' }]);
+//     await edit([{ path: 'notes.md', oldString: '# Notes', newString: '# Log' }]);
 //
 // Metadata (name, description, tags, schema) is declared below and is authoritative
 // for T13. ../catalogue projects the same data synchronously for lazy enumeration
@@ -379,12 +379,12 @@ type PreparedFile = {
 const normalizeEdits = async (edits: FileEditParameters): Promise<NormalizedEdit[]> => {
     if (!Array.isArray(edits)) {
         throw new HarnessError(
-            'fileEdit expects an array of { path, oldString, newString } entries, e.g. [{"path":"a.txt","oldString":"a","newString":"b"}].'
+            'edit expects an array of { path, oldString, newString } entries, e.g. [{"path":"a.txt","oldString":"a","newString":"b"}].'
         );
     }
 
     if (edits.length === 0) {
-        throw new HarnessError('fileEdit received an empty edits array; pass at least one edit.');
+        throw new HarnessError('edit received an empty edits array; pass at least one edit.');
     }
 
     const normalized: NormalizedEdit[] = [];
@@ -392,40 +392,40 @@ const normalizeEdits = async (edits: FileEditParameters): Promise<NormalizedEdit
     for (const entry of edits) {
         if (typeof entry !== 'object' || entry === null || Array.isArray(entry)) {
             throw new HarnessError(
-                'fileEdit edits must be objects with "path", "oldString", and "newString" strings.'
+                'edit edits must be objects with "path", "oldString", and "newString" strings.'
             );
         }
 
         const { path, oldString, newString, replaceAll } = entry as Partial<FileEditEntry>;
 
         if (typeof path !== 'string' || path.length === 0) {
-            throw new HarnessError('fileEdit edits require a non-empty "path" string.');
+            throw new HarnessError('edit edits require a non-empty "path" string.');
         }
 
         if (path.includes('\u0000')) {
-            throw new HarnessError('fileEdit paths must not contain NUL characters.');
+            throw new HarnessError('edit paths must not contain NUL characters.');
         }
 
         if (typeof oldString !== 'string' || oldString.length === 0) {
             // An empty oldString matches everywhere (including between every pair of
             // characters), so it is never a meaningful edit.
-            throw new HarnessError('fileEdit requires a non-empty oldString.');
+            throw new HarnessError('edit requires a non-empty oldString.');
         }
 
         if (typeof newString !== 'string') {
-            throw new HarnessError('fileEdit requires a "newString" string.');
+            throw new HarnessError('edit requires a "newString" string.');
         }
 
         // Rejecting a no-op keeps "the edit applied" an honest claim: a model that
         // passes the same text twice has not changed anything.
         if (oldString === newString) {
             throw new HarnessError(
-                'fileEdit did not change the file: oldString and newString are identical.'
+                'edit did not change the file: oldString and newString are identical.'
             );
         }
 
         if (replaceAll !== undefined && typeof replaceAll !== 'boolean') {
-            throw new HarnessError('fileEdit replaceAll must be a boolean when provided.');
+            throw new HarnessError('edit replaceAll must be a boolean when provided.');
         }
 
         const target = resolve(path);
@@ -485,7 +485,7 @@ const prepareEdits = async (
 
         if (matches.length === 0) {
             throw new HarnessError(
-                `fileEdit found no match for oldString in ${edit.target}. Read the file first and copy the text exactly, including indentation.`
+                `edit found no match for oldString in ${edit.target}. Read the file first and copy the text exactly, including indentation.`
             );
         }
 
@@ -493,7 +493,7 @@ const prepareEdits = async (
             // Naming the lines is what makes the failure actionable: a model can
             // copy more surrounding text from a line it can actually locate.
             throw new HarnessError(
-                `fileEdit found ${matches.length} matches for oldString in ${edit.target} (lines ${lineNumbers(content, matches).join(', ')}). Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
+                `edit found ${matches.length} matches for oldString in ${edit.target} (lines ${lineNumbers(content, matches).join(', ')}). Include more surrounding text to make it unique, or pass replaceAll: true to change every match.`
             );
         }
 
@@ -513,7 +513,7 @@ const prepareEdits = async (
         // Saying "applied" then would be dishonest, so the edit is rejected.
         if (updated === content) {
             throw new HarnessError(
-                `fileEdit did not change ${edit.target}: the replacement text is identical to the text it matched. Line endings follow the file; to change them, pass oldString and newString that differ only in carriage returns.`
+                `edit did not change ${edit.target}: the replacement text is identical to the text it matched. Line endings follow the file; to change them, pass oldString and newString that differ only in carriage returns.`
             );
         }
 
@@ -537,7 +537,7 @@ const prepareEdits = async (
 // a synchronous data projection for lazy enumeration and a consistency test
 // asserts the two stay equal. Edit the metadata HERE.
 export const FILE_EDIT_METADATA: PresetToolMetadata = {
-    name: 'fileEdit',
+    name: 'edit',
     description:
         'Replace text in one or more existing files. Pass an array of { path, oldString, newString } entries; oldString must match exactly, including whitespace and indentation, and must identify a unique location unless replaceAll is true, so an ambiguous edit is rejected instead of changing the wrong place. Several entries may name the SAME file: they are applied in array order, each matched against the text the previous one produced, so one call can change several places in one file and each file is still written once. Line endings are matched and preserved: write oldString and newString with \\n even for a CRLF file. If there is no exact match, the edit retries while ignoring typographic quote, dash, and space variants, then trailing whitespace on each line; otherwise it fails. Every entry is read and checked before anything is written, so one bad entry leaves every file unchanged. Returns an ordered array of { path, replacements, bytes, match? }, where `match` is present only when a fallback tier was used ("typographic" or "trailing-whitespace"), so a fuzzy match is never silent. Creates nothing: use fileWrite for new files.',
     tags: ['files', 'edit', 'write', 'replace', 'filesystem'],
@@ -593,14 +593,20 @@ export const metadata = FILE_EDIT_METADATA;
 export const registration = {
     group: 'preset',
     activation: 'always',
+    // T2/R2: an applied edit must be visible before the model reasons about the file
+    // again, so this call is grouped with the rest of its message's sync batch.
+    mode: 'sync',
     order: 190,
     sessionBound: false,
     alwaysDeclared: false,
     listed: false
 } as const;
 
-export const fileEdit = tool<FileEditParameters, FileEditResult>({
+export const edit = tool<FileEditParameters, FileEditResult>({
     ...FILE_EDIT_METADATA,
+    // T2/R2: mirrors `registration.mode` (see the note in this file's registration
+    // export); the tool() declaration is what a standalone/host registration carries.
+    mode: 'sync',
     execute: async ({ parameters: edits }) => {
         const normalized = await normalizeEdits(edits);
         // Everything below this line has been validated and matched; nothing has been
@@ -624,7 +630,7 @@ export const fileEdit = tool<FileEditParameters, FileEditResult>({
                 const reason = error instanceof Error ? error.message : String(error);
 
                 throw new HarnessError(
-                    `fileEdit failed on ${file.target}: ${reason} Edits already applied: ${completed}. No rollback was performed.`
+                    `edit failed on ${file.target}: ${reason} Edits already applied: ${completed}. No rollback was performed.`
                 );
             }
 

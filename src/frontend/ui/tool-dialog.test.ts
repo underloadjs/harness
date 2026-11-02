@@ -9,7 +9,7 @@
 //   - `destroy` closes an orphaned dialog (no leaked focus trap/overlay);
 //   - model-written markup in arguments/results stays escaped text;
 //   - local paths in argument/result code become file links that request ONE
-//     bounded `fileRead` window on click (never automatically), through either an
+//     bounded `read` window on click (never automatically), through either an
 //     injected reader or the default `callTool` adapter.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts
@@ -85,7 +85,7 @@ afterEach(() => {
 
 describe('tool detail dialog', () => {
     it('opens from a chip click without expanding the details inline', () => {
-        const card = mount(createToolCallCard('fileRead', '{"paths":["package.json"]}'));
+        const card = mount(createToolCallCard('read', '{"paths":["package.json"]}'));
 
         const event = clickSummary(card);
 
@@ -98,7 +98,7 @@ describe('tool detail dialog', () => {
         expect(dialog()).not.toBeNull();
         expect(dialog()?.getAttribute('role')).toBe('dialog');
         expect(dialog()?.getAttribute('aria-modal')).toBe('true');
-        expect(dialog()?.querySelector('.dialog-title')?.textContent).toBe('fileRead · running');
+        expect(dialog()?.querySelector('.dialog-title')?.textContent).toBe('read · running');
         expect(dialog()?.querySelector('.tool-body')).not.toBeNull();
         expect(dialog()?.querySelectorAll('.tool-section code')[0]?.textContent).toBe(
             '{\n  "paths": [\n    "package.json"\n  ]\n}'
@@ -109,11 +109,11 @@ describe('tool detail dialog', () => {
     });
 
     it('opens from Enter and Space while keeping the chip closed', () => {
-        const card = mount(createToolCallCard('commandRun', '{"command":"true"}'));
+        const card = mount(createToolCallCard('shell', '{"command":"true"}'));
 
         const enter = pressSummary(card, 'Enter');
         expect(enter.defaultPrevented).toBe(true);
-        expect(dialog()?.querySelector('.dialog-title')?.textContent).toBe('commandRun · running');
+        expect(dialog()?.querySelector('.dialog-title')?.textContent).toBe('shell · running');
         expect(card.element.open).toBe(false);
 
         closeDialog();
@@ -121,12 +121,12 @@ describe('tool detail dialog', () => {
 
         const space = pressSummary(card, ' ');
         expect(space.defaultPrevented).toBe(true);
-        expect(dialog()?.querySelector('.dialog-title')?.textContent).toBe('commandRun · running');
+        expect(dialog()?.querySelector('.dialog-title')?.textContent).toBe('shell · running');
         expect(card.element.open).toBe(false);
     });
 
     it('cancels a native details toggle and keeps a single dialog on repeat activation', () => {
-        const card = mount(createToolCallCard('fileRead', '{}'));
+        const card = mount(createToolCallCard('read', '{}'));
 
         // Guard for anything that bypasses the click listener: a programmatic
         // `open` is reverted on the queued `toggle` event (jsdom/browsers queue it).
@@ -143,7 +143,7 @@ describe('tool detail dialog', () => {
     });
 
     it('updates an already-open dialog when the call resolves', () => {
-        const card = mount(createToolCallCard('fileRead', '{"paths":["package.json"]}'));
+        const card = mount(createToolCallCard('read', '{"paths":["package.json"]}'));
         const body = card.element.querySelector('.tool-body');
         clickSummary(card);
 
@@ -152,7 +152,7 @@ describe('tool detail dialog', () => {
 
         card.resolve('{"ok":true}', 'completed', 1500);
 
-        expect(dialog()?.querySelector('.dialog-title')?.textContent).toBe('fileRead · ok');
+        expect(dialog()?.querySelector('.dialog-title')?.textContent).toBe('read · ok');
         expect(dialog()?.querySelectorAll('.tool-section .tool-label')[1]?.textContent).toBe('result');
         expect(dialog()?.querySelector('.tool-result code')?.textContent).toBe('{\n  "ok": true\n}');
         expect(card.element.querySelector('.tool-duration')?.textContent).toBe('1.5s');
@@ -160,11 +160,11 @@ describe('tool detail dialog', () => {
     });
 
     it('shows a full error result and the cancelled reason in an open dialog', () => {
-        const failed = mount(createToolCallCard('commandRun', '{"command":"false"}'));
+        const failed = mount(createToolCallCard('shell', '{"command":"false"}'));
         clickSummary(failed);
         failed.resolve('exit code 1', 'failed');
 
-        expect(dialog()?.querySelector('.dialog-title')?.textContent).toBe('commandRun · error');
+        expect(dialog()?.querySelector('.dialog-title')?.textContent).toBe('shell · error');
         expect(dialog()?.querySelectorAll('.tool-label')[1]?.textContent).toBe('result · error');
         expect(dialog()?.querySelector('.tool-result code')?.textContent).toBe('exit code 1');
         closeDialog();
@@ -181,7 +181,7 @@ describe('tool detail dialog', () => {
     });
 
     it('returns the body to the closed card and reopens the same node', () => {
-        const card = mount(createToolCallCard('fileRead', '{"paths":["package.json"]}'));
+        const card = mount(createToolCallCard('read', '{"paths":["package.json"]}'));
         card.resolve('{"ok":true}', 'completed');
         const body = card.element.querySelector('.tool-body');
 
@@ -211,8 +211,8 @@ describe('tool detail dialog', () => {
         composer.focus();
         expect(document.activeElement).toBe(composer);
 
-        const first = mount(createToolCallCard('fileRead', '{}'));
-        const second = mount(createToolCallCard('commandRun', '{}'));
+        const first = mount(createToolCallCard('read', '{}'));
+        const second = mount(createToolCallCard('shell', '{}'));
 
         clickSummary(first);
         closeDialog();
@@ -226,7 +226,7 @@ describe('tool detail dialog', () => {
     });
 
     it('closes an open dialog when the card is destroyed', () => {
-        const card = mount(createToolCallCard('fileRead', '{}'));
+        const card = mount(createToolCallCard('read', '{}'));
         const body = card.element.querySelector('.tool-body');
         clickSummary(card);
         expect(dialog()).not.toBeNull();
@@ -246,7 +246,7 @@ describe('tool detail dialog', () => {
         // markdown.ts stops highlighting at 40k. The dialog is the only detail
         // surface now, so the tail must still be present as escaped text.
         const payload = `${'a'.repeat(40_005)}TAIL`;
-        const card = mount(createToolCallCard('fileRead', '{}'));
+        const card = mount(createToolCallCard('read', '{}'));
         card.resolve(payload, 'completed');
         clickSummary(card);
 
@@ -270,7 +270,7 @@ describe('tool detail dialog', () => {
             truncated: false
         }));
         const card = mount(
-            createToolCallCard('fileRead', '{"path":"src/frontend/main.ts"}', {}, { readFile: read })
+            createToolCallCard('read', '{"path":"src/frontend/main.ts"}', {}, { readFile: read })
         );
         card.resolve('also read src/frontend/tools.ts', 'completed');
 
@@ -308,7 +308,7 @@ describe('tool detail dialog', () => {
         );
     });
 
-    it('uses the bounded callTool fileRead adapter when no reader is injected', async () => {
+    it('uses the bounded callTool read adapter when no reader is injected', async () => {
         vi.mocked(callTool).mockResolvedValueOnce({
             ok: true,
             result: {
@@ -325,7 +325,7 @@ describe('tool detail dialog', () => {
             }
         } as ToolCallResult);
 
-        const card = mount(createToolCallCard('commandRun', '{"command":"cat README.md"}'));
+        const card = mount(createToolCallCard('shell', '{"command":"cat README.md"}'));
         card.resolve('README.md', 'completed');
         clickSummary(card);
 
@@ -335,14 +335,14 @@ describe('tool detail dialog', () => {
         await flush();
 
         expect(vi.mocked(callTool)).toHaveBeenCalledTimes(1);
-        expect(vi.mocked(callTool)).toHaveBeenCalledWith('fileRead', [
+        expect(vi.mocked(callTool)).toHaveBeenCalledWith('read', [
             { path: 'README.md', startLine: 1, maxLines: 200 }
         ]);
         expect(topDialog()?.querySelector('.preview-code code')?.textContent).toBe('# Doc\n');
     });
 
     it('never interprets tool code as Markdown images', () => {
-        const card = mount(createToolCallCard('fileRead', '{}'));
+        const card = mount(createToolCallCard('read', '{}'));
         card.resolve('![chart](https://example.com/a.png)', 'completed');
         clickSummary(card);
 
@@ -356,7 +356,7 @@ describe('tool detail dialog', () => {
     it('keeps model-written markup as escaped text in arguments and results', () => {
         const card = mount(
             createToolCallCard(
-                'fileRead',
+                'read',
                 '{"path":"<img src=x onerror=\\"window.pwned=1\\">"}'
             )
         );

@@ -101,12 +101,12 @@ describe('model-request retries (R1)', () => {
         turn.apply({
             type: 'tool_call',
             agent: 'writer',
-            call: { id: 'c1', name: 'fileRead', arguments: '{"path":"a.ts"}' }
+            call: { id: 'c1', name: 'read', arguments: '{"path":"a.ts"}' }
         });
         turn.apply({
             type: 'tool_result',
             agent: 'writer',
-            name: 'fileRead',
+            name: 'read',
             callId: 'c1',
             content: 'ok',
             isError: false,
@@ -119,7 +119,7 @@ describe('model-request retries (R1)', () => {
                 role: 'assistant',
                 content: 'working on it',
                 reasoning: '',
-                toolCalls: [{ id: 'c1', name: 'fileRead', arguments: '{"path":"a.ts"}' }],
+                toolCalls: [{ id: 'c1', name: 'read', arguments: '{"path":"a.ts"}' }],
                 model: 'm1',
                 stopReason: 'tool_calls'
             }
@@ -160,7 +160,7 @@ describe('model-request retries (R1)', () => {
         turn.apply({
             type: 'tool_call',
             agent: 'writer',
-            call: { id: 'd1', name: 'agentDelegate', arguments: '{"agent":"helper","input":"look it up"}' }
+            call: { id: 'd1', name: 'delegate', arguments: '{"agent":"helper","input":"look it up"}' }
         });
         turn.flush();
 
@@ -221,8 +221,8 @@ describe('attempt ownership (F1/F2/F4/F5)', () => {
 
         turn.apply(start());
         turn.apply(text('working'));
-        turn.apply(call('c1', 'fileRead'));
-        turn.apply(result('c1', 'fileRead'));
+        turn.apply(call('c1', 'read'));
+        turn.apply(result('c1', 'read'));
         // The tool-calling request's success boundary: its only closing frame.
         turn.apply(commit());
         // The NEXT request fails its first attempt.
@@ -254,8 +254,8 @@ describe('attempt ownership (F1/F2/F4/F5)', () => {
 
         replay(start());
         replay(text('working'));
-        replay(call('c1', 'fileRead'));
-        replay(result('c1', 'fileRead'));
+        replay(call('c1', 'read'));
+        replay(result('c1', 'read'));
         replay(commit());
         replay(text('partial'));
         replay(retry());
@@ -358,7 +358,7 @@ describe('attempt ownership (F1/F2/F4/F5)', () => {
 
         turn.apply(start());
         turn.apply(text('committed'));
-        turn.apply(call('c1', 'fileRead'));
+        turn.apply(call('c1', 'read'));
         turn.apply(commit());
         turn.apply(text('second'));
         turn.apply(retry());
@@ -413,9 +413,9 @@ describe('per-request reasoning ownership (T8)', () => {
 
         turn.apply(start());
         turn.apply(reasoning('committed plan'));
-        turn.apply(call('c1', 'fileRead'));
+        turn.apply(call('c1', 'read'));
         turn.apply(commit());
-        turn.apply(result('c1', 'fileRead'));
+        turn.apply(result('c1', 'read'));
         // The NEXT request reasons, then fails its first attempt.
         turn.apply(reasoning('failed musing'));
         turn.apply(retry());
@@ -443,9 +443,9 @@ describe('per-request reasoning ownership (T8)', () => {
 
         replay(start());
         replay(reasoning('committed plan'));
-        replay(call('c1', 'fileRead'));
+        replay(call('c1', 'read'));
         replay(commit());
-        replay(result('c1', 'fileRead'));
+        replay(result('c1', 'read'));
         replay(reasoning('failed musing'));
         replay(retry());
         replay(text('final'));

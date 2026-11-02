@@ -5,14 +5,14 @@
 // `createToolCatalogue()` (./index.ts) lists tools a host can call DIRECTLY: no
 // harness, no model, no session. The harness-owned core tools are the opposite —
 // toolRegistry, toolRequest, todoManage, profileManage, chapterManage,
-// locationManage, agentManage, agentResult, agentDelegate, actionRequest,
+// locationManage, agentManage, agentResult, delegate, actionRequest,
 // threadFork only mean something inside one session's harness, because they mutate
 // that harness's registry, enabled set, todo list, record stores, or agent
 // team/result registry (or need that session's owner/fork configuration). Adding
 // them there would make the CLI promise a callable tool it cannot run.
 //
-// R18: the four core FILE tools (fileRead/fileWrite/fileEdit/fileGlob) and a
-// configured webSearch are also `visibility: 'core'`, but they are NOT listed
+// R18: the four core FILE tools (read/fileWrite/edit/fileGlob) and a
+// configured search are also `visibility: 'core'`, but they are NOT listed
 // here and NOT sessionBound: they have real standalone implementations, so they
 // stay in createToolCatalogue()'s direct-call path and run without a sessionId.
 // "Core" means always declared; only this harness-owned set means "needs a
@@ -63,7 +63,7 @@ export const CORE_TOOL_GROUP = 'Core tools' as const;
 
 // The hint a client can print verbatim. It states the one thing that is different
 // about these entries — they need a session — without promising availability in a
-// particular session (agentDelegate, for example, exists only where the harness
+// particular session (delegate, for example, exists only where the harness
 // allows subagents).
 export const CORE_TOOL_SESSION_HINT =
     'Runs inside a session harness: send a sessionId with the call.';

@@ -97,7 +97,7 @@ const teamPreset = (): HarnessPreset => ({
                         const last = request.messages[request.messages.length - 1];
 
                         // The delegated result came back: answer and finish.
-                        if (last !== undefined && last.role === 'tool' && last.name === 'agentDelegate') {
+                        if (last !== undefined && last.role === 'tool' && last.name === 'delegate') {
                             yield { type: 'text', delta: 'done by child' };
                             yield { type: 'done', stopReason: 'stop', toolCalls: [] };
                             return;
@@ -109,7 +109,7 @@ const teamPreset = (): HarnessPreset => ({
                             toolCalls: [
                                 {
                                     id: 'call_1',
-                                    name: 'agentDelegate',
+                                    name: 'delegate',
                                     arguments: '{"agent":"loaded","input":"find it"}'
                                 }
                             ]

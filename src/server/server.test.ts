@@ -92,8 +92,8 @@ describe('harness server', () => {
         const names = index.tools.map((tool) => tool.name);
 
         expect(names).toContain('timeNow');
-        expect(names).toContain('fileRead');
-        expect(names).toContain('commandRun');
+        expect(names).toContain('read');
+        expect(names).toContain('shell');
         expect(index.tools.find((tool) => tool.name === 'timeNow')?.group).toBe('Harness tools');
     });
 
@@ -153,10 +153,10 @@ describe('harness server', () => {
     });
 
     it('reports tool failures as data, not as a broken server', async () => {
-        // A missing path is a per-entry result now (fileRead R1), so this uses a
+        // A missing path is a per-entry result now (read R1), so this uses a
         // genuinely invalid request (the documented "at least one path" rule) to
         // keep the point: an execute rejection is returned as ok:false data.
-        const response = await fetch(`${base}/api/tools/fileRead`, {
+        const response = await fetch(`${base}/api/tools/read`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-Harness-Client': 'ui' },
             body: JSON.stringify({ parameters: [] })

@@ -16,18 +16,18 @@ describe('tool', () => {
     it('carries name, description, parameters, and tags', () => {
         const parameters = { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] };
 
-        const webSearch = tool({
-            name: 'webSearch',
+        const search = tool({
+            name: 'search',
             description: 'Search the web.',
             tags: ['search', 'web'],
             parameters,
             execute: ({ parameters: args }) => `results for ${args.q}`
         });
 
-        expect(webSearch.name).toBe('webSearch');
-        expect(webSearch.description).toBe('Search the web.');
-        expect(webSearch.parameters).toBe(parameters);
-        expect(webSearch.tags).toEqual(['search', 'web']);
+        expect(search.name).toBe('search');
+        expect(search.description).toBe('Search the web.');
+        expect(search.parameters).toBe(parameters);
+        expect(search.tags).toEqual(['search', 'web']);
     });
 
     it('normalizes tags so discovery can compare them directly', () => {
@@ -54,8 +54,8 @@ describe('tool', () => {
     });
 
     it('defaults the name when none is given (a harness sets it from the key)', () => {
-        const webSearch = tool({ description: 'Search.', tags: ['search'], execute: () => 'ok' });
-        expect(webSearch.name).toBe('tool');
+        const search = tool({ description: 'Search.', tags: ['search'], execute: () => 'ok' });
+        expect(search.name).toBe('tool');
     });
 
     it('is callable directly, without a harness', async () => {
@@ -127,9 +127,9 @@ describe('tool', () => {
     it('can be renamed, so a harness can key it by registry name', () => {
         const search = tool({ description: 'Search.', tags: ['search'], execute: () => 'ok' });
 
-        search.name = 'webSearch';
+        search.name = 'search';
 
-        expect(search.name).toBe('webSearch');
+        expect(search.name).toBe('search');
     });
 
     it('requires a description', () => {

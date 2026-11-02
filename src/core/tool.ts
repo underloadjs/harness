@@ -10,13 +10,13 @@
 // `tool()` returns a callable, not a passive descriptor. The same implementation
 // therefore has two entry points:
 //
-//     const fileRead = tool<string[], FileReadResult>({ ... });
+//     const read = tool<string[], FileReadResult>({ ... });
 //
-//     await fileRead(['package.json']);        // direct: no harness, no harness loop
-//     harness({ tools: { fileRead } });        // the model calls it
+//     await read(['package.json']);        // direct: no harness, no harness loop
+//     harness({ tools: { read } });        // the model calls it
 //
 // Naming: `name` is optional. Inside a harness the registry key names the tool,
-// so `tools: { fileRead }` is enough and the model calls `fileRead`. The
+// so `tools: { read }` is enough and the model calls `read`. The
 // harness overwrites `name` with the key on registration.
 //
 // Tags and visibility
@@ -44,7 +44,7 @@
 //   - the whole arguments object when the schema declares several properties;
 //   - the single property's value when it declares exactly one.
 //
-// That is what makes `fileRead(['package.json'])` natural for a human and
+// That is what makes `read(['package.json'])` natural for a human and
 // `read_file({ "path": "package.json" })` natural for a model — both reach the
 // implementation as the string. The harness unwraps using `toolParameterKey()`.
 // A multi-property tool such as syntaxCheck receives the whole argument object.
@@ -56,7 +56,7 @@
 //   - ../tools        — the preset tools built with this factory
 
 import { HarnessError } from '../util';
-import type { Tool, ToolConfiguration, ToolContext, ToolVisibility } from '../types';
+import type { Tool, ToolConfiguration, ToolContext, ToolMode, ToolVisibility } from '../types';
 
 // The property a single-property schema declares, if that is what it is.
 //
@@ -73,6 +73,16 @@ export const toolParameterKey = (parameters: Record<string, unknown> | undefined
 };
 
 const VISIBILITIES: readonly ToolVisibility[] = ['core', 'searchable'];
+
+// Accepted turn modes (T2/R2). The order is the error message's order.
+const MODES: readonly ToolMode[] = ['sync', 'async'];
+
+// The mode a tool runs under when its definition does not state one. 'sync' means
+// the completion joins its assistant message's sync group: the run is re-entered only
+// after every sync call of that batch has settled. Long-running built-ins (shell,
+// delegate, the branch controls) state 'async' in their own registration literal, so
+// this default is never re-derived from a name.
+export const DEFAULT_TOOL_MODE: ToolMode = 'sync';
 
 // Trim, lowercase, deduplicate, and drop blanks. Called for a tool's own tags and
 // for each toolRequest query, so both sides of a comparison look the same.
@@ -125,6 +135,19 @@ export const tool = <TParameters = any, TResult = any>(
         );
     }
 
+    // T2/R2: the turn policy is DECLARED data, validated at construction exactly like
+    // visibility (a typo must not silently become a different scheduling behaviour).
+    // An UNDECLARED tool carries no `mode` key at all, which is how the harness knows
+    // to apply DEFAULT_TOOL_MODE ('sync') — and how a deep-equality view of a Tool
+    // keeps its historical shape for every tool that never opted in.
+    const mode = configuration.mode;
+
+    if (mode !== undefined && !MODES.includes(mode)) {
+        throw new HarnessError(
+            `A tool mode must be one of: ${MODES.join(', ')}. Received "${String(mode)}".`
+        );
+    }
+
     // Normalize the return type so callers always get a promise, whether the
     // implementation is sync or async.
     const run = async (context: ToolContext<TParameters>): Promise<TResult> => execute(context);
@@ -146,6 +169,10 @@ export const tool = <TParameters = any, TResult = any>(
     callable.description = description;
     callable.tags = tags;
     callable.visibility = visibility;
+    // Declared mode only (see the validation above): absent stays absent, so the
+    // harness's DEFAULT_TOOL_MODE remains the single documented fallback and nothing
+    // here claims a policy the author did not write.
+    if (mode !== undefined) callable.mode = mode;
     callable.parameters = parameters;
     callable.execute = run;
 

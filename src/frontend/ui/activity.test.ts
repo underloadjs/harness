@@ -23,12 +23,12 @@ const reasoning = (agent: string): HarnessEvent => ({ type: 'reasoning', agent, 
 const toolCall = (agent: string): HarnessEvent => ({
     type: 'tool_call',
     agent,
-    call: { id: 'c1', name: 'fileRead', arguments: '{}' }
+    call: { id: 'c1', name: 'read', arguments: '{}' }
 });
 const toolResult = (agent: string): HarnessEvent => ({
     type: 'tool_result',
     agent,
-    name: 'fileRead',
+    name: 'read',
     content: 'ok',
     isError: false
 });
@@ -133,7 +133,7 @@ describe('applyActivity', () => {
             reduce([
                 start('instruct'),
                 toolCall('instruct'),
-                doneWithPending('instruct', [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }])
+                doneWithPending('instruct', [{ callId: 'c1', name: 'read', elapsedMs: 1200 }])
             ])
         ).toEqual(['instruct']);
 
@@ -147,8 +147,8 @@ describe('applyActivity', () => {
         expect(
             reduce([
                 start('instruct'),
-                doneWithPending('instruct', [{ callId: 'c1', name: 'fileRead', elapsedMs: 1 }]),
-                wakeup('instruct', [{ callId: 'c1', name: 'fileRead', elapsedMs: 1200 }])
+                doneWithPending('instruct', [{ callId: 'c1', name: 'read', elapsedMs: 1 }]),
+                wakeup('instruct', [{ callId: 'c1', name: 'read', elapsedMs: 1200 }])
             ])
         ).toEqual(['instruct']);
     });

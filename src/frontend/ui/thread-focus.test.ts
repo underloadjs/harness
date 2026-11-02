@@ -288,7 +288,7 @@ describe('persistent child conversations (S2)', () => {
         {
             type: 'tool_call',
             agent: 'writer',
-            call: { id: 'd1', name: 'agentDelegate', arguments: '{}' }
+            call: { id: 'd1', name: 'delegate', arguments: '{}' }
         } as HarnessEvent,
         { type: 'start', agent: 'helper', model: 'h1', thread: { id: 'inv-9' } } as unknown as HarnessEvent,
         ...extra
@@ -413,13 +413,13 @@ describe('persistent child conversations (S2)', () => {
                     {
                         type: 'tool_call',
                         agent: 'writer',
-                        call: { id: 'a', name: 'agentDelegate', arguments: '{}' }
+                        call: { id: 'a', name: 'delegate', arguments: '{}' }
                     } as HarnessEvent,
                     { type: 'start', agent: 'helper', model: 'h1', thread: { id: 'inv-a' } } as unknown as HarnessEvent,
                     {
                         type: 'tool_call',
                         agent: 'writer',
-                        call: { id: 'b', name: 'agentDelegate', arguments: '{}' }
+                        call: { id: 'b', name: 'delegate', arguments: '{}' }
                     } as HarnessEvent,
                     { type: 'start', agent: 'helper', model: 'h1', thread: { id: 'inv-b' } } as unknown as HarnessEvent
                 ]

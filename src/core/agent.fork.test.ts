@@ -75,9 +75,9 @@ describe('Agent.fork', () => {
                     role: 'assistant',
                     content: 'thinking',
                     reasoning: 'plan',
-                    toolCalls: [{ id: 'origin-a', name: 'fileRead', arguments: '{}' }]
+                    toolCalls: [{ id: 'origin-a', name: 'read', arguments: '{}' }]
                 },
-                { role: 'tool', content: 'ok', toolCallId: 'origin-a', name: 'fileRead' },
+                { role: 'tool', content: 'ok', toolCallId: 'origin-a', name: 'read' },
                 { role: 'assistant', content: 'done' }
             ]
         });
@@ -107,13 +107,13 @@ describe('Agent.fork', () => {
                 role: 'assistant',
                 content: 'thinking',
                 reasoning: 'plan',
-                toolCalls: [{ id: `call_${branchId}_1`, name: 'fileRead', arguments: '{}' }]
+                toolCalls: [{ id: `call_${branchId}_1`, name: 'read', arguments: '{}' }]
             },
             {
                 role: 'tool',
                 content: 'ok',
                 toolCallId: `call_${branchId}_1`,
-                name: 'fileRead'
+                name: 'read'
             },
             { role: 'assistant', content: 'done' }
         ]);
@@ -128,11 +128,11 @@ describe('Agent.fork', () => {
                     role: 'assistant',
                     content: '',
                     toolCalls: [
-                        { id: 'a', name: 'fileRead', arguments: '{}' },
+                        { id: 'a', name: 'read', arguments: '{}' },
                         { id: 'b', name: 'fileList', arguments: '[]' }
                     ]
                 },
-                { role: 'tool', content: 'A', toolCallId: 'a', name: 'fileRead' }
+                { role: 'tool', content: 'A', toolCallId: 'a', name: 'read' }
             ]
         });
         const before = JSON.parse(JSON.stringify(source.messages)) as HarnessMessage[];
@@ -145,11 +145,11 @@ describe('Agent.fork', () => {
                 role: 'assistant',
                 content: '',
                 toolCalls: [
-                    { id: `call_${branchId}_1`, name: 'fileRead', arguments: '{}' },
+                    { id: `call_${branchId}_1`, name: 'read', arguments: '{}' },
                     { id: `call_${branchId}_2`, name: 'fileList', arguments: '[]' }
                 ]
             },
-            { role: 'tool', content: 'A', toolCallId: `call_${branchId}_1`, name: 'fileRead' },
+            { role: 'tool', content: 'A', toolCallId: `call_${branchId}_1`, name: 'read' },
             {
                 role: 'tool',
                 content: BRANCH_PENDING_PLACEHOLDER.threadFork,
@@ -292,9 +292,9 @@ describe('Agent.fork', () => {
                 {
                     role: 'assistant',
                     content: '',
-                    toolCalls: [{ id: 'origin-a', name: 'fileRead', arguments: '{}' }]
+                    toolCalls: [{ id: 'origin-a', name: 'read', arguments: '{}' }]
                 },
-                { role: 'tool', content: 'ok', toolCallId: 'origin-a', name: 'fileRead' }
+                { role: 'tool', content: 'ok', toolCallId: 'origin-a', name: 'read' }
             ]
         });
         const branch = source.fork();

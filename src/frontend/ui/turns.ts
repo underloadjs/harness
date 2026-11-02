@@ -75,7 +75,7 @@
 //   - nesting, not a flat list, means an arbitrary depth works without the UI
 //     enumerating levels (styles.css indents one step per `.thread-children`).
 //
-// Identity is per INVOCATION, never per agent name: two `agentDelegate` calls to
+// Identity is per INVOCATION, never per agent name: two `delegate` calls to
 // the same agent are two entries, each with its own content, tools, status and
 // outcome. `thread` metadata (src/frontend/contract.ts `threadOf`, frozen
 // contract) is authoritative. A saved session that predates it is replayed with
@@ -440,7 +440,7 @@ export type TurnBoardOptions = {
     // on a page with no wiring; the card then reports a recoverable local error.
     answerAction?: (input: AnswerActionInput) => Promise<void>;
     // Reads a bounded window of one LOCAL RELATIVE file for the R11 preview dialog.
-    // Injected by the app shell (main.ts -> `callTool('fileRead', ...)`) so the UI
+    // Injected by the app shell (main.ts -> `callTool('read', ...)`) so the UI
     // layer owns no network code. Omitted in standalone use: clicking a file link
     // still opens the dialog, which reports that reading is not wired.
     readFile?: FilePreviewReader;
@@ -886,7 +886,7 @@ type AgentSection = {
     tools: ToolCallCard[];
     // Active wrapping row for consecutive tool calls, or undefined when the last
     // flow child was not a tool. Keeping the group alive across calls is what lets
-    // `[websearch][fileRead]` share a line; prose/reasoning/error resets it.
+    // `[websearch][read]` share a line; prose/reasoning/error resets it.
     toolGroup: HTMLElement | undefined;
     // `pending · name 1.2s` line for calls the SERVER still has in flight (R6).
     // Undefined means nothing is pending (or the server never reported it). It
@@ -1350,8 +1350,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
     // One action bar shared by the expanded tile, every nested child card and the
     // roster-only focus panel. It owns the R7 Transcript control (left) and the R9
-    // Delete control (right). Labels are desktop text, mobile glyphs; `aria-label`
-    // always carries the full accessible name.
+    // Delete control. Labels are desktop text, mobile glyphs; `aria-label` always
+    // carries the full accessible name.
+    //
+    // T1/R2: Delete no longer sits in this toolbar. It is painted into the CARD
+    // HEADER's right edge (the slot the state word used to hold), so `deleteHost` is
+    // the caller-owned element that receives the button. A <button> can never nest
+    // inside the header's own <button> (`.tile-select` / `.thread-select`), so the
+    // host is a SIBLING positioned over the header by styles.css. The two-step
+    // confirmation stays in THIS bar: it needs the full width, and moving it into the
+    // header would reflow the identity line on every click. Without a host the
+    // historical trailing-in-the-bar layout is preserved (a host wiring it itself).
     type ThreadActionBar = {
         element: HTMLElement;
         transcriptButton: HTMLButtonElement;
@@ -1363,6 +1372,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const createThreadActionBar = (input: {
         className: string;
         transcriptClass?: string;
+        deleteHost?: HTMLElement;
         visible: () => boolean;
         target: () => string | undefined;
         open: () => void;
@@ -1410,13 +1420,26 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             if (threadId !== undefined) void confirmThreadDelete(threadId);
         });
 
-        bar.append(transcriptButton, deleteButton, confirm);
+        // T1/R2: Delete is appended to the caller's HEADER host when one is given, so
+        // it sits at the right edge of the card header (styles.css paints the host
+        // there). The bar keeps Transcript plus the full-width confirmation row, which
+        // is the layout a host without a `deleteHost` still gets (Delete trailing).
+        if (input.deleteHost === undefined) bar.append(transcriptButton, deleteButton, confirm);
+        else {
+            bar.append(transcriptButton, confirm);
+            input.deleteHost.append(deleteButton);
+        }
 
         const sync = (): void => {
             const threadId = input.target();
             const entry = threadId === undefined ? undefined : transcriptEntryOf(threadId);
             if (threadId === undefined || entry === undefined || !input.visible()) {
                 bar.hidden = true;
+                // T1/R2: the header Delete belongs to the SAME surface as the bar. A
+                // collapsed card must not keep a live delete control, so the host is
+                // hidden in the DOM as well (styles.css `display:none` alone would
+                // leave a tab stop in hosts that do not load it).
+                if (input.deleteHost !== undefined) input.deleteHost.hidden = true;
                 return;
             }
 
@@ -1440,6 +1463,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 protection !== undefined ||
                 transcriptBusy ||
                 options.deleteThread === undefined;
+            // T1/R2: the header host is only shown when it actually holds a Delete
+            // control, so an undeletable default conversation reserves no slot.
+            if (input.deleteHost !== undefined) input.deleteHost.hidden = deleteButton.hidden;
             deleteButton.setAttribute('aria-label', `Delete thread ${name}`);
             deleteButton.title =
                 protection === 'active'
@@ -1882,6 +1908,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         panel.setAttribute('aria-label', `Focused thread ${name} of ${entry.agent}`);
 
         const head = el('header', 'thread-focus-head');
+        // T1/R2: the header is not a <button> here, but it keeps the SAME anatomy as
+        // a tile: state next to the conversation name on the left, Delete pinned to
+        // the right edge by styles.css.
+        const headAction = el('div', 'thread-focus-head-action');
+        // T3/R2: same first-paint rule as the card hosts (`showFocusPanel` syncs the bar
+        // after mounting the panel, which is what reveals it).
+        headAction.hidden = true;
         head.append(
             el('span', 'thread-focus-agent', entry.agent),
             el('span', 'thread-focus-name', name),
@@ -1897,13 +1930,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 )
             );
         }
+        head.append(headAction);
 
         // R7/R8: a roster-only thread has no turn tile to expand, so this panel IS
-        // its expanded surface and gets the SAME toolbar: Transcript on the left,
-        // Delete on the right (default/running protection still applies).
+        // its expanded surface and gets the SAME controls: Transcript in the toolbar
+        // under the header, Delete in the header's right slot (default/running
+        // protection still applies).
         const actionBar = createThreadActionBar({
             className: 'thread-transcript-action thread-focus-actions',
             transcriptClass: 'thread-focus-transcript',
+            deleteHost: headAction,
             visible: () => focusPanel !== undefined,
             target: () => entry.id,
             open: () => openTranscriptOf(entry.id)
@@ -2206,18 +2242,28 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // the server assigns the id. The full id stays in `data-thread-id`/`title`.
         const threadBadge = el('span', 'tile-thread');
         threadBadge.hidden = true;
-        // R3: no `#ordinal` span. The metadata cluster is `elapsed | tokens | status`
-        // (measurements only); the turn's protocol `index` is bound for
+        // R3: no `#ordinal` span. The metadata cluster is now MEASUREMENTS ONLY
+        // (`elapsed | tokens`); the turn's protocol `index` is bound for
         // ordering/identity but never displayed.
-        top.append(blockMeta.elapsed, blockMeta.tokens, badge);
+        top.append(blockMeta.elapsed, blockMeta.tokens);
+        // T1/R2: the IDENTITY LINE. The persistent-thread badge (`IT3`) leads and the
+        // state word (`done`) sits immediately to its right, because "which
+        // conversation, in what state" is one fact a reader takes in one glance. The
+        // state used to be the right-most item of the measurement cluster; that slot
+        // now belongs to the header's Delete control (`headerAction` below).
+        // ONE wrapper span is what keeps badge + state on a single line in BOTH header
+        // layouts: the compact row is a flex ROW (the wrapper is one order-0 item at
+        // the head) and the expanded header is a flex COLUMN (the wrapper is its first
+        // line). `styles.css` owns the placement; the DOM order alone already reads
+        // identity → measurements.
+        const identity = el('span', 'tile-identity');
+        identity.append(threadBadge, badge);
         // R1: the thread IDENTITY leads the header, exactly like a nested entry's
-        // `.thread-name` leads `.thread-select`. The badge used to sit inside the
-        // right-aligned metadata cluster, which put the conversation name beside the
-        // clock/tokens instead of left of them. DOM order puts it before the agent
-        // code/prompt; styles.css pins `order: 0` so the compact row (CSS-ordered) and
-        // the expanded column agree. It is hidden whenever the turn has no persistent
-        // thread, and `.tile-agent` disappears when it would repeat the same label.
-        select.append(threadBadge, tileAgent, top, promptPreview, meta);
+        // `.thread-name` leads `.thread-select`. It is hidden whenever the turn has no
+        // persistent thread, and `.tile-agent` disappears when it would repeat the same
+        // label. `styles.css` pins `order: 0` on the badge/agent so the CSS-ordered
+        // compact row and the expanded column agree.
+        select.append(identity, tileAgent, top, promptPreview, meta);
 
         const body = el('div', 'tile-body');
         body.id = `${id}-body`;
@@ -2238,7 +2284,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
         // Open a file link in the R11 preview dialog. Only a user activation calls
         // this, so no path is fetched automatically; `options.readFile` supplies
-        // the bounded request (main.ts -> callTool('fileRead', ...)).
+        // the bounded request (main.ts -> callTool('read', ...)).
         const openTranscriptFile = (path: string): void => {
             openFilePreview(path, options.readFile === undefined ? {} : { read: options.readFile });
         };
@@ -2277,19 +2323,32 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const flow = el('div', 'tile-flow');
         body.append(promptBlock, flow);
 
-        // R7/R8: the expanded tile's toolbar. Transcript sits on the left and opens
-        // the lossless JSON document; Delete sits on the right for host threads that
-        // are not live/protected. It lives between the header and body so it is
-        // immediately visible without scrolling and disappears with expansion.
+        // T1/R2: Delete's new home is the HEADER's right edge. `.tile` is
+        // `position: relative` (styles.css), so this wrapper is painted over the
+        // header's first line (the identity line) at the card's right edge. It is a
+        // SIBLING of `.tile-select` because a <button> can never contain another
+        // <button> (same reason the session rail wraps its row, main.ts `renderSessions`).
+        const headerAction = el('div', 'tile-header-action');
+        // T3/R2: the host is created HIDDEN, exactly like the toolbar it pairs with.
+        // Its visibility is decided by `actionBar.sync`, which runs when the surface is
+        // next computed; an element appended visible would paint one frame of an enabled
+        // Delete on a card that is still collapsed.
+        headerAction.hidden = true;
+
+        // R7/R8: the expanded tile's toolbar. Transcript opens the lossless JSON
+        // document; the two-step Delete confirmation still lives here because it needs
+        // the full width. Both live between the header and body so they are visible
+        // without scrolling and disappear with expansion.
         const actionBar = createThreadActionBar({
             className: 'tile-transcript-action',
+            deleteHost: headerAction,
             visible: () => expandedTurn?.element === card && card.classList.contains('is-expanded'),
             target: () => runtimeThreadId,
             open: () => openTranscriptOf(runtimeThreadId)
         });
         const transcriptAction = actionBar.element;
 
-        card.append(select, transcriptAction, body);
+        card.append(select, headerAction, transcriptAction, body);
 
         // --- per-turn state ------------------------------------------------
         let state: TurnState = 'queued';
@@ -3123,7 +3182,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             entry.meta.finish(at, origin === 'recorded');
         };
 
-        // The placeholder created when an `agentDelegate` tool call was observed,
+        // The placeholder created when an `delegate` tool call was observed,
         // matched by its spawning call id. Explicit metadata uses it to adopt (never
         // duplicate) the entry the user is already looking at.
         const findThreadByCallId = (callId: string): ThreadEntry | undefined => {
@@ -3225,13 +3284,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const blockMeta = createBlockMeta({ elapsed: 'thread-elapsed', tokens: 'thread-tokens' });
             // Status stays TEXT: the word is clipped (not removed) on a compact row,
             // exactly like `.tile-status-text`, and colour only reinforces it.
+            // T1/R2: the word now sits IMMEDIATELY right of the conversation label
+            // (`.thread-name`), mirroring the turn tile's `.tile-identity` line, and
+            // styles.css gives the freed right-edge slot to the header Delete control.
             const status = el('span', 'thread-status');
             status.dataset.state = options.state;
             const statusText = el('span', 'thread-status-text', STATE_TEXT[options.state]);
             status.append(statusText);
 
             const top = el('span', 'thread-top');
-            top.append(blockMeta.elapsed, blockMeta.tokens, status);
+            top.append(blockMeta.elapsed, blockMeta.tokens);
             const preview = el(
                 'span',
                 'thread-preview',
@@ -3239,7 +3301,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     ? 'delegated task'
                     : plainPreview(options.input, 160)
             );
-            select.append(name, ...(kindTag === undefined ? [] : [kindTag]), preview, top);
+            // Identity first (label, then state, then the fork/auto marker), the
+            // flexible preview in the middle, the measurement cluster flush right.
+            select.append(name, status, ...(kindTag === undefined ? [] : [kindTag]), preview, top);
 
             const body = el('div', 'thread-body');
             body.id = bodyId;
@@ -3251,12 +3315,21 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             outcome.hidden = true;
             body.append(outcome);
 
+            // T1/R2: header slot for this card's Delete control (same anatomy as a
+            // turn tile's `.tile-header-action`; `.thread-tile` is `position: relative`).
+            const headerAction = el('div', 'thread-header-action');
+            // T3/R2: hidden until `sync` says otherwise (see the turn tile's host). A
+            // nested card is created COLLAPSED, so a visible host would flash a stray
+            // enabled Delete before the first `setThreadExpanded`/roster pass.
+            headerAction.hidden = true;
+
             // R7/R8: a delegated/forked child conversation has no SessionTurn of its
             // own, so its JSON transcript comes from the roster entry joined to this
             // invocation. The toolbar is hidden until the entry is expanded; a pure
             // invocation detail (no persistent thread) never shows an action.
             const actionBar = createThreadActionBar({
                 className: 'thread-transcript-action',
+                deleteHost: headerAction,
                 visible: () => entry.expanded && entry.row !== undefined,
                 target: () => persistentIdOf(entry),
                 open: () => openTranscriptOf(persistentIdOf(entry))
@@ -3264,7 +3337,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const transcriptAction = actionBar.element;
             const transcriptButton = actionBar.transcriptButton;
 
-            tile.append(select, transcriptAction, body);
+            tile.append(select, headerAction, transcriptAction, body);
 
             // Children live outside the body so collapsing THIS entry never hides
             // its descendants (R2).
@@ -3764,7 +3837,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             }
 
             const node = section.pending ?? el('div', 'agent-pending');
-            // Deterministic text (tests assert it): `pending · fileRead 1.2s · webSearch 900ms`.
+            // Deterministic text (tests assert it): `pending · read 1.2s · search 900ms`.
             node.textContent = `pending · ${[...section.pendingCalls.values()]
                 .map((tool) => `${tool.name} ${formatDuration(tool.elapsedMs)}`)
                 .join(' · ')}`;
@@ -4139,7 +4212,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             block.summary.textContent = `reasoning · ${block.buffer.length.toLocaleString()} chars`;
         };
 
-        // Parse an `agentDelegate` call's arguments for the legacy fallback: without
+        // Parse an `delegate` call's arguments for the legacy fallback: without
         // the frozen `thread` metadata, the spawning call is the ONLY evidence that
         // an invocation exists and what its prompt was. Only a complete {agent,
         // input} pair is usable; anything else leaves the old flat rendering.
@@ -4207,7 +4280,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // the delegation is cancelled before the child starts). The key is the
             // spawning call id, which is stable for the whole turn, so a repeated
             // same-agent delegate still yields two distinct entries.
-            if (name === 'agentDelegate') {
+            if (name === 'delegate') {
                 const delegate = delegateOf(rawArguments, callId);
                 if (delegate !== undefined && callId !== undefined) {
                     const key = `call:${callId}`;

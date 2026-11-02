@@ -46,7 +46,7 @@ it('keeps the call alias before adoption and the runtime id after adoption', () 
         agent: 'instruct',
         call: {
             id: 'd1',
-            name: 'agentDelegate',
+            name: 'delegate',
             arguments: '{"agent":"research","input":"go"}'
         }
     };
