@@ -116,7 +116,10 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
 
     if (database !== undefined && persistence !== undefined) {
         try {
-            restoreHarnessRegistry(registry, database.registry);
+            // T5: `database.deleted` carries the built-ins the operator removed, so
+            // this build's shipped copies of them are taken out before the saved
+            // rows are replayed. Absent for a pre-T5 document (no deletions).
+            restoreHarnessRegistry(registry, database.registry, database.deleted ?? []);
         } catch (error) {
             throw new HarnessPersistenceError(
                 persistence.file,

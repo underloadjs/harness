@@ -57,7 +57,7 @@ export const describeAgents = (profiles: readonly AgentProfile[]): AgentDescript
 //
 // `coreTools` is the exact set this card's runs declare up front (R18): the four
 // core package file tools, a configured search, the harness-owned
-// toolRequest/toolCreate/todoManage, and delegate when there is a subagent
+// toolRequest/toolCreate/task, and delegate when there is a subagent
 // allowlist. It is computed from the REGISTERED names, not a static "all core"
 // list, so the demo fixture (timeNow only) does not claim file tools and a keyless
 // host does not claim search. A UI core dropdown can therefore trust it instead
@@ -71,9 +71,11 @@ export const describeHarness = (
     catalogue?: DescriptorCatalogue
 ): HarnessDescriptor => {
     // The exact names this card registers: the declarative preset list plus every
-    // environment-backed name THIS host can actually run. search is the only
-    // entry there today, and it is added only when the runtime catalogue has an
-    // executable definition (a provider key resolved).
+    // environment-backed name THIS host can actually run. search and fetch are the
+    // two entries there today (R9-R11), and each is added only when the runtime
+    // catalogue carries an executable definition — a key for search, the `webfetch`
+    // opt-in for fetch. Without that pairing a card could advertise (or omit) a
+    // declaration its harness would not actually make.
     const registered = [
         ...preset.tools,
         ...(preset.environmentTools ?? []).filter(

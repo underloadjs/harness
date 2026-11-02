@@ -34,7 +34,7 @@ import {
     createToolboxHarness
 } from './toolbox';
 import { EXAMPLE_APP_TOOL_FOLDER, appToolSourcesFrom, scanAppToolDescriptors } from './tools';
-import { createHarnessRegistry, findPreset } from './index';
+import { ALL_PRESET_TEMPLATES, createHarnessRegistry, findPreset } from './index';
 
 const SETTINGS = {
     baseURL: 'http://provider.test/v1',
@@ -76,6 +76,8 @@ const EXPECTED_SOURCE_PATHS = {
     grep: 'tools/files/grep.tool.ts',
     shell: 'tools/command/shell.tool.ts',
     gitDiff: 'tools/command/gitDiff.tool.ts',
+    // R3/R4: the byte-retrieval preset ships as an editable entry like the rest.
+    download: 'tools/webdownload/download.tool.ts',
     timeNow: 'server/tools/shared/timeNow.tool.ts',
     textCount: 'server/tools/shared/textCount.tool.ts',
     diceRoll: 'server/tools/shared/diceRoll.tool.ts',
@@ -199,7 +201,9 @@ export const execute = async () => ({ replaced: true });
     it('keeps the flaky extra source through a registry template rebuild', () => {
         stubNoSearchKeys();
 
-        const registry = createHarnessRegistry();
+        // T5: the flaky example is an injected fixture now, so the registry that
+        // rebuilds its template asks for the templates explicitly.
+        const registry = createHarnessRegistry(ALL_PRESET_TEMPLATES);
         const rebuilt = registry.update('flaky', { primary: 'workspace' });
         const harness = rebuilt.create(SETTINGS, progress);
 

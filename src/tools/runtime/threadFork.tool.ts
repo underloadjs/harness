@@ -11,7 +11,11 @@ export const THREAD_FORK_METADATA: CoreToolMetadata = {
     description:
         'Fork a private thread that reads the ENTIRE current conversation independently and returns one final summary. Use it when a self-contained investigation benefits from isolated reasoning without polluting this transcript. The new thread cannot see later messages and never receives this agent\'s tools automatically beyond the runtime grant. Pass the task as `input`; `label` is an optional short display name. The fork shares this process and any external side effects, so it is not a sandbox.',
     tags: ['fork', 'thread', 'branch', 'history', 'summarize', 'research'],
-    visibility: 'core',
+    // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
+    // and enables it for this session instead of seeing it declared on every request.
+    // Registration itself is unchanged (the entry still joins the harness registry),
+    // so toolRequest always has something to surface.
+    visibility: 'searchable',
     parameters: {
         type: 'object',
         properties: {

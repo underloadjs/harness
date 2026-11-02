@@ -121,7 +121,9 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
 
     if (database !== undefined && persistence !== undefined) {
         try {
-            restoreHarnessRegistry(registry, database.registry);
+            // T5: the deleted-builtin tombstones are replayed FIRST, so a shipped
+            // default the operator removed stays removed across this restart.
+            restoreHarnessRegistry(registry, database.registry, database.deleted);
         } catch (error) {
             throw new HarnessPersistenceError(
                 persistence.file,

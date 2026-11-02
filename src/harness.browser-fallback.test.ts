@@ -42,21 +42,23 @@ describe('browser baseline fallback', () => {
         // Harness-owned controls and presets are seedable without compiling.
         expect(writer.tools.toolRegistry).toBeDefined();
         expect(writer.tools.toolRequest.visibility).toBe('core');
-        expect(writer.tools.toolList.visibility).toBe('core');
-        expect(writer.tools.toolManage.visibility).toBe('core');
-        expect(writer.tools.toolCreate.visibility).toBe('core');
-        expect(writer.tools.todoManage.visibility).toBe('core');
+        expect(writer.tools.toolList.visibility).toBe('searchable');
+        expect(writer.tools.toolManage.visibility).toBe('searchable');
+        expect(writer.tools.toolCreate.visibility).toBe('searchable');
+        expect(writer.tools.task.visibility).toBe('core');
         expect(writer.tools.read.name).toBe('read');
         expect(writer.tools.read.visibility).toBe('core');
         // No source record is claimed for a prepared-definition fallback.
         expect(writer.toolSource('read')).toBeUndefined();
 
         // Existing browser harness semantics remain: model turns and discovery
-        // metadata are available.
+        // metadata are available. The fallback registry carries the same searchable
+        // rows as the compiled one, so a 'files' query finds fileList, download
+        // (R9-R11), and the profile row that shares the files vocabulary.
         const result = await writer('go');
         expect(result.content).toBe('browser-ok');
         expect(await writer.executeTool('toolRequest', { tags: ['files'] })).toMatchObject({
-            enabled: ['fileList']
+            enabled: ['fileList', 'download', 'profileManage']
         });
     });
 

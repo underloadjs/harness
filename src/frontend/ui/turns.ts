@@ -204,8 +204,8 @@ import { createTextCopyButton } from './dialog';
 import { markdownFragment, plainPreview } from './markdown';
 import { elapsedBetween, formatDuration } from './time';
 import { formatTokens } from './tokens';
-import { createToolCallCard } from './tools';
-import type { ToolCallCard, ToolState } from './tools';
+import { createReasoningCard, createToolCallCard } from './tools';
+import type { ReasoningCard, ToolCallCard, ToolState } from './tools';
 // Persistent (runtime) thread identity. This is NOT the invocation identity used by
 // `#` references: `SessionTurn.threadId` names the stable conversation a turn
 // belongs to, while `AgentBlockDescriptor.threadId` names one invocation. The two
@@ -667,6 +667,12 @@ type BlockMeta = {
     noteUsage: (usage: HarnessUsage | undefined) => void;
     // Authoritative cumulative tally (the root tile's `SessionTurn.usage`).
     setTally: (usage: HarnessUsage | undefined) => void;
+    // The context size this block reports RIGHT NOW (`latestInput`, falling back to the
+    // cumulative input exactly as the visible tally does), or undefined when nothing has
+    // reported usage. This is the denominator a think chip's percentage is measured
+    // against, so the chip and the header tally can never disagree about the size of the
+    // context (ui/tools.ts `formatThinkShare`).
+    context: () => number | undefined;
     // Forget the per-event usage a discarded projection contributed; the tally is
     // kept because the caller re-applies it from the record after the rebuild.
     clearUsage: () => void;
@@ -732,11 +738,14 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
         tick = window.setInterval(paint, 250);
     };
 
+    // The context figure the visible tally is built from, in one place: the latest
+    // reported request context, falling back to the cumulative input ONLY when no usage
+    // event was recorded (never on a live/hydrated block that has one, so the two scopes
+    // cannot silently collapse). Shared by the tally and by a think chip's denominator.
+    const contextInput = (): number | undefined => latestInput ?? tally?.input;
+
     const paintTokens = (): void => {
-        // Latest reported context; fall back to the cumulative input only when no
-        // usage event was recorded (never on a live/hydrated block that has one, so
-        // the two scopes cannot silently collapse).
-        const input = latestInput ?? tally?.input;
+        const input = contextInput();
         const cached = tally?.cached ?? (eventCachedReported ? eventCached : undefined);
         const text = formatTokens(input, cached);
 
@@ -864,6 +873,7 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
         paint,
         stop,
         noteUsage,
+        context: () => contextInput(),
         setTally(usage?: HarnessUsage): void {
             tally = usage;
             paintTokens();
@@ -909,18 +919,31 @@ type AgentSection = {
     // life of the block (its payload is read at click time, so it never goes stale
     // and never needs re-creating when the answer advances).
     answerAction: HTMLButtonElement | undefined;
-    reasoning: { details: HTMLDetailsElement; summary: HTMLElement; body: HTMLElement; buffer: string } | undefined;
+    // The CURRENT reasoning round: its INLINE think chip plus the cumulative text streamed
+    // so far. One writer per model request — `commitAttempt`/`discardAttempt` drop this
+    // pointer so the next request mints its own chip (T8: two requests' thinking must never
+    // fuse into one node). `buffer` is the whole round because the chip repaints from the
+    // cumulative value (pill, dialog body, accessible name), and a retry destroys the chip
+    // along with the node it tracks.
+    reasoning: { card: ReasoningCard; buffer: string } | undefined;
+    // EVERY think chip this block rendered, committed or not, so the tile's `destroy()`
+    // and `resetProjection()` can close a dialog a superseded projection no longer owns.
+    // `reasoning` alone is not enough: committing a round drops the writer pointer while
+    // the chip stays in the flow (T8), and its dialog would otherwise outlive the tile.
+    thinking: ReasoningCard[];
     tools: ToolCallCard[];
-    // Active wrapping row for consecutive tool calls, or undefined when the last
-    // flow child was not a tool. Keeping the group alive across calls is what lets
-    // `[websearch][read]` share a line; prose/reasoning/error resets it.
+    // Active wrapping row for consecutive tool calls AND think chips, or undefined when
+    // the last flow child was neither. Keeping the group alive across calls is what lets
+    // `[websearch][read]` share a line; prose/error resets it. A reasoning round now
+    // JOINS this row (it is a chip like any other), which is what keeps a run of
+    // `[think][glob][read]` on one line instead of alternating bars and rows.
     //
     // R1: the row survives a MODEL BATCH boundary. `attempt_commit`, `done` and
     // `wakeup` are scheduler lifecycle frames — nothing new is READABLE between the
     // calls they separate — so four calls issued as two batches of two must still
     // render as one wrapping flow, not two rows of two. Only something the reader
-    // actually sees (prose, reasoning, an error, a retry notice, a steer) breaks the
-    // run.
+    // actually sees (prose, an error, a retry notice, a steer) breaks the run — a
+    // reasoning round no longer does, because it is a chip inside this same row.
     toolGroup: HTMLElement | undefined;
     // `pending · name 1.2s` line for calls the SERVER still has in flight (R6).
     // Undefined means nothing is pending (or the server never reported it). It
@@ -945,8 +968,8 @@ type AgentSection = {
     // not announce with `done` — see `commitAttempt`).
     attempt:
         | {
-              // Flow children this attempt appended (prose block, reasoning block,
-              // tool rows). Only these are removed; every other child stays.
+              // Flow children this attempt appended (prose block, think chip, tool
+              // rows). Only these are removed; every other child stays.
               nodes: HTMLElement[];
               // Tool cards this attempt minted (each counted in `toolCount`).
               cards: ToolCallCard[];
@@ -1389,18 +1412,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     };
 
     // One action bar shared by the expanded tile, every nested child card and the
-    // roster-only focus panel. It owns the R7 Transcript control (left) and the R9
-    // Delete control. Labels are desktop text, mobile glyphs; `aria-label` always
-    // carries the full accessible name.
+    // roster-only focus panel. T26: the two controls SWAPPED homes — Delete now leads the
+    // bar (left, where Transcript used to be) and Transcript closes it (right, where
+    // Delete used to be painted in the card header). The header's right edge is free for
+    // the measurement line instead, so `deleteHost` and its absolutely positioned slot are
+    // gone: both buttons are ordinary bar children again and styles.css pushes the second
+    // one right. Labels are desktop text, mobile glyphs; `aria-label` always carries the
+    // full accessible name.
     //
-    // T1/R2: Delete no longer sits in this toolbar. It is painted into the CARD
-    // HEADER's right edge (the slot the state word used to hold), so `deleteHost` is
-    // the caller-owned element that receives the button. A <button> can never nest
-    // inside the header's own <button> (`.tile-select` / `.thread-select`), so the
-    // host is a SIBLING positioned over the header by styles.css. The two-step
-    // confirmation stays in THIS bar: it needs the full width, and moving it into the
-    // header would reflow the identity line on every click. Without a host the
-    // historical trailing-in-the-bar layout is preserved (a host wiring it itself).
+    // The two-step confirmation still lives in THIS bar: it needs the full width, and
+    // moving it into the header would reflow the identity line on every click.
     type ThreadActionBar = {
         element: HTMLElement;
         transcriptButton: HTMLButtonElement;
@@ -1412,7 +1433,6 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const createThreadActionBar = (input: {
         className: string;
         transcriptClass?: string;
-        deleteHost?: HTMLElement;
         visible: () => boolean;
         target: () => string | undefined;
         open: () => void;
@@ -1460,26 +1480,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             if (threadId !== undefined) void confirmThreadDelete(threadId);
         });
 
-        // T1/R2: Delete is appended to the caller's HEADER host when one is given, so
-        // it sits at the right edge of the card header (styles.css paints the host
-        // there). The bar keeps Transcript plus the full-width confirmation row, which
-        // is the layout a host without a `deleteHost` still gets (Delete trailing).
-        if (input.deleteHost === undefined) bar.append(transcriptButton, deleteButton, confirm);
-        else {
-            bar.append(transcriptButton, confirm);
-            input.deleteHost.append(deleteButton);
-        }
+        // T26: Delete leads the bar and Transcript closes it (the two swapped places, and
+        // the measurement line took the header's right-edge slot). DOM order is the visual
+        // order; `margin-left: auto` on `.transcript-open` (styles.css) is what pins the
+        // transcript button to the right even when Delete is hidden.
+        bar.append(deleteButton, transcriptButton, confirm);
 
         const sync = (): void => {
             const threadId = input.target();
             const entry = threadId === undefined ? undefined : transcriptEntryOf(threadId);
             if (threadId === undefined || entry === undefined || !input.visible()) {
                 bar.hidden = true;
-                // T1/R2: the header Delete belongs to the SAME surface as the bar. A
-                // collapsed card must not keep a live delete control, so the host is
-                // hidden in the DOM as well (styles.css `display:none` alone would
-                // leave a tab stop in hosts that do not load it).
-                if (input.deleteHost !== undefined) input.deleteHost.hidden = true;
                 return;
             }
 
@@ -1503,9 +1514,6 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 protection !== undefined ||
                 transcriptBusy ||
                 options.deleteThread === undefined;
-            // T1/R2: the header host is only shown when it actually holds a Delete
-            // control, so an undeletable default conversation reserves no slot.
-            if (input.deleteHost !== undefined) input.deleteHost.hidden = deleteButton.hidden;
             deleteButton.setAttribute('aria-label', `Delete thread ${name}`);
             deleteButton.title =
                 protection === 'active'
@@ -1948,13 +1956,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         panel.setAttribute('aria-label', `Focused thread ${name} of ${entry.agent}`);
 
         const head = el('header', 'thread-focus-head');
-        // T1/R2: the header is not a <button> here, but it keeps the SAME anatomy as
-        // a tile: state next to the conversation name on the left, Delete pinned to
-        // the right edge by styles.css.
-        const headAction = el('div', 'thread-focus-head-action');
-        // T3/R2: same first-paint rule as the card hosts (`showFocusPanel` syncs the bar
-        // after mounting the panel, which is what reveals it).
-        headAction.hidden = true;
+        // T26: the header is not a <button> here and no longer holds a control at all —
+        // Delete and Transcript both live in the bar below, in the same order every other
+        // surface uses (state stays next to the conversation name on the left).
         head.append(
             el('span', 'thread-focus-agent', entry.agent),
             el('span', 'thread-focus-name', name),
@@ -1970,16 +1974,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 )
             );
         }
-        head.append(headAction);
 
-        // R7/R8: a roster-only thread has no turn tile to expand, so this panel IS
-        // its expanded surface and gets the SAME controls: Transcript in the toolbar
-        // under the header, Delete in the header's right slot (default/running
-        // protection still applies).
+        // R7/R8/T26: a roster-only thread has no turn tile to expand, so this panel IS its
+        // expanded surface and gets the SAME controls: Delete on the left of the toolbar,
+        // Transcript on the right (default/running protection still applies).
         const actionBar = createThreadActionBar({
             className: 'thread-transcript-action thread-focus-actions',
             transcriptClass: 'thread-focus-transcript',
-            deleteHost: headAction,
             visible: () => focusPanel !== undefined,
             target: () => entry.id,
             open: () => openTranscriptOf(entry.id)
@@ -2250,23 +2251,27 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         select.setAttribute('aria-controls', `${id}-body`);
 
         const top = el('span', 'tile-top');
-        // Compact block metadata (R1/R3): the elapsed clock, the token tally and, LAST,
-        // the state word — ONE measurement line that reads `2.8s | 8,946 - done`. ONE
-        // shared implementation (`createBlockMeta`) paints the main tile and every
+        // Compact block metadata (R1/R3): the elapsed clock, the token tally and, LAST, the
+        // state box — ONE measurement line that reads `34.2s | 18,654 (37,376)`, with the
+        // state carried by the line's COLOUR rather than by a visible `- done` suffix (T2).
+        // ONE shared implementation (`createBlockMeta`) paints the main tile and every
         // nested entry, so both headers tick, hide and format identically. The
         // elapsed label stays hidden until a real span exists (never "NaN" or a
         // fabricated "0ms"); the tally stays hidden until a request reports usage.
-        // The `|` and the ` - ` are CSS decoration (styles.css), not part of any value,
-        // so every span stays a clean, copy-pastable figure; each separator is dropped
-        // together with the label it follows.
+        // The `|` is CSS decoration (styles.css), not part of any value, so every span stays
+        // a clean, copy-pastable figure; it is dropped together with the label it follows.
         const blockMeta = createBlockMeta({ elapsed: 'tile-elapsed', tokens: 'tile-tokens' });
         // R3: the state word measures the BLOCK (what it did and how it ended), it is
         // not part of the conversation's identity, so it closes the measurement line
-        // instead of sitting beside the thread badge. The badge line is then the badge
-        // alone, which is the row the header Delete control is centred on (R4).
-        // No decorative dot: the status is TEXT (`tile-status-text`), visible on
-        // an expanded tile and clipped — not removed — on a compact row, and the
-        // colour lives on the row's border/status word. The compact row is plain.
+        // instead of sitting beside the thread badge. T26: the measurement line itself now
+        // shares the header's FIRST line with the badge — flush right, in the slot the
+        // Delete button used to own — and the meta line drops underneath it.
+        // T2: the word is a SCREEN-READER label only — styles.css clips it in both header
+        // states, so the line shows the two figures and its colour shows the state. The
+        // text node stays in the DOM (never `display: none`) so the state is still
+        // announced and still searchable, and `data-state` stays the styling hook.
+        // No decorative dot: the status is TEXT (`tile-status-text`), clipped — not
+        // removed — in every header state. The compact row is plain.
         const statusHost = el('span', 'tile-status');
         statusHost.dataset.state = 'queued';
         const statusText = el('span', 'tile-status-text', STATE_TEXT.queued);
@@ -2290,19 +2295,23 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         threadBadge.hidden = true;
         // R3: no `#ordinal` span — the turn's protocol `index` is bound for
         // ordering/identity but never displayed. The line reads, in order, the elapsed
-        // clock, the token tally and the state word (`2.8s | 8,946 - done`); a label
-        // that has nothing honest to report stays hidden and its separator goes with it.
+        // clock and the token tally (`34.2s | 18,654 (37,376)`), the state box being a
+        // clipped screen-reader label at the end of it; a label that has nothing honest to
+        // report stays hidden and its separator goes with it.
         top.append(blockMeta.elapsed, blockMeta.tokens, statusHost);
-        // T1/R3: the IDENTITY LINE is the persistent-thread badge (`IT1`) ALONE. The
-        // state word left this line (R3): "which conversation" is identity, "in what
-        // state" is a measurement of this block, and the two now read on separate lines
-        // (`IT1` on top, `2.8s | 8,946 - done` underneath).
+        // T1/R3: the IDENTITY LINE is the persistent-thread badge (`IT1`) plus the
+        // measurement cluster. The state word left this line (R3): "which conversation"
+        // is identity, "in what state" is a measurement of this block, and the colour of
+        // the figures carries that state. T26: identity reads at the LEFT and the
+        // measurement line at the RIGHT of the same header line — the figures took the
+        // slot the Delete button used to hold, which is exactly where a reader looks for
+        // "how much did this cost".
         // ONE wrapper span is still what keeps the badge on a single line in BOTH header
-        // layouts: the compact row is a flex ROW (the wrapper is one order-0 item at
-        // the head) and the expanded header is a flex COLUMN (the wrapper is its first
-        // line, which is the line the header Delete control is centred on — R4).
-        // `styles.css` owns the placement; the DOM order alone already reads
-        // identity → measurements.
+        // layouts: the compact row is a flex ROW (the wrapper is one order-0 item at the
+        // head, the cluster is the order-2 item at the tail) and the expanded header is a
+        // flex ROW-WRAP whose first line is identity + cluster and whose second line is
+        // the meta. `styles.css` owns the placement; the DOM order alone already reads
+        // identity → measurements → details.
         const identity = el('span', 'tile-identity');
         identity.append(threadBadge);
         // R1: the thread IDENTITY leads the header, exactly like a nested entry's
@@ -2370,32 +2379,20 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const flow = el('div', 'tile-flow');
         body.append(promptBlock, flow);
 
-        // T1/R4: Delete's home is the HEADER's right edge, centred on the badge line.
-        // `.tile` is `position: relative` (styles.css), so this wrapper is painted over
-        // the header's FIRST line (the `.tile-identity` badge) at the card's right edge.
-        // It is a SIBLING of `.tile-select` because a <button> can never contain another
-        // <button> (same reason the session rail wraps its row, main.ts `renderSessions`).
-        const headerAction = el('div', 'tile-header-action');
-        // T3/R2: the host is created HIDDEN, exactly like the toolbar it pairs with.
-        // Its visibility is decided by `actionBar.sync`, which runs when the surface is
-        // next computed; an element appended visible would paint one frame of an enabled
-        // Delete on a card that is still collapsed.
-        headerAction.hidden = true;
-
-        // R7/R8: the expanded tile's toolbar. Transcript opens the lossless JSON
-        // document; the two-step Delete confirmation still lives here because it needs
+        // R7/R8/T26: the expanded tile's toolbar. Delete leads (left), Transcript closes
+        // it (right); the two-step Delete confirmation still lives here because it needs
         // the full width. Both live between the header and body so they are visible
-        // without scrolling and disappear with expansion.
+        // without scrolling and disappear with expansion. The header's right edge is no
+        // longer a control slot — it now carries the measurement line (styles.css).
         const actionBar = createThreadActionBar({
             className: 'tile-transcript-action',
-            deleteHost: headerAction,
             visible: () => expandedTurn?.element === card && card.classList.contains('is-expanded'),
             target: () => runtimeThreadId,
             open: () => openTranscriptOf(runtimeThreadId)
         });
         const transcriptAction = actionBar.element;
 
-        card.append(select, headerAction, transcriptAction, body);
+        card.append(select, transcriptAction, body);
 
         // --- per-turn state ------------------------------------------------
         let state: TurnState = 'queued';
@@ -2562,8 +2559,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // (the latest request is then unknowable and the cumulative input is an
         // upper bound that never understates the context). See ui/tokens.ts.
         // The figures themselves live in `blockMeta`, which also paints a nested
-        // entry's tally from that entry's own `usage` events (R1).
-        const setUsage = (usage?: HarnessUsage): void => blockMeta.setTally(usage);
+        // entry's tally from that entry's own `usage` events (R1). The server tally is a
+        // context figure too, so the think chips of this tile re-measure against it here
+        // exactly as they do on a live `usage` event.
+        const setUsage = (usage?: HarnessUsage): void => {
+            blockMeta.setTally(usage);
+            syncThinkingShares();
+        };
 
         // Compact agent labels (`RH1`, `RH2`, …): ONE allocator per tile, consumed
         // once per invocation (root included). The raw agent id never reaches the
@@ -2856,6 +2858,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 finalAnswer: undefined,
                 answerAction: undefined,
                 reasoning: undefined,
+                thinking: [],
                 tools: [],
                 toolGroup: undefined,
                 pending: undefined,
@@ -3327,13 +3330,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             select.setAttribute('aria-controls', bodyId);
 
             // R4/R1: the whole collapsed entry is ONE row, with the SAME anatomy as a
-            // compact turn tile — `code [kind] · preview · [elapsed | tokens - state]`.
+            // compact turn tile — `code [kind] · preview · [elapsed | tokens]`.
             // The agent code leads (the tile's prompt is its own leading item), the
             // preview is the single flexible, ellipsised item, and the measurement line
             // (`.thread-top`) is the nested counterpart of `.tile-top`. Both lines carry
-            // the same two labels from the shared `createBlockMeta` plus the state word,
-            // so a child block shows its own duration, usage and state the way the root
-            // block does.
+            // the same two labels from the shared `createBlockMeta`, plus the state box
+            // whose word is a clipped screen-reader label (T2), so a child block shows its
+            // own duration, usage and state the way the root block does.
             // R8: a nested invocation shows its child CONVERSATION label when the
             // roster already joins this invocation id; only a legacy/threadless
             // block falls back to the allocator (and therefore consumes a number).
@@ -3356,11 +3359,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 kindTag.title = options.kind === 'fork' ? 'Fork of this thread' : 'Automatic owner answer';
             }
             const blockMeta = createBlockMeta({ elapsed: 'thread-elapsed', tokens: 'thread-tokens' });
-            // Status stays TEXT: the word is clipped (not removed) on a compact row,
+            // Status stays TEXT: the word is clipped (not removed) in EVERY header state,
             // exactly like `.tile-status-text`, and colour only reinforces it.
-            // R3: the word closes the MEASUREMENT line (`2.8s | 8,946 - done`), the same
-            // placement the main tile uses; it no longer rides beside `.thread-name`, so
-            // the identity half of the row stays code + kind tag only.
+            // R3/T2: the box closes the MEASUREMENT line (`34.2s | 18,654 (37,376)`, the
+            // state painted as the line's colour), the same placement the main tile uses;
+            // it never rides beside `.thread-name`, so the identity half of the row stays
+            // code + kind tag only — and both stay fully legible because the preview is the
+            // only item that truncates.
             const status = el('span', 'thread-status');
             status.dataset.state = options.state;
             const statusText = el('span', 'thread-status-text', STATE_TEXT[options.state]);
@@ -3390,21 +3395,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             outcome.hidden = true;
             body.append(outcome);
 
-            // T1/R2: header slot for this card's Delete control (same anatomy as a
-            // turn tile's `.tile-header-action`; `.thread-tile` is `position: relative`).
-            const headerAction = el('div', 'thread-header-action');
-            // T3/R2: hidden until `sync` says otherwise (see the turn tile's host). A
-            // nested card is created COLLAPSED, so a visible host would flash a stray
-            // enabled Delete before the first `setThreadExpanded`/roster pass.
-            headerAction.hidden = true;
-
-            // R7/R8: a delegated/forked child conversation has no SessionTurn of its
+            // R7/R8/T26: a delegated/forked child conversation has no SessionTurn of its
             // own, so its JSON transcript comes from the roster entry joined to this
             // invocation. The toolbar is hidden until the entry is expanded; a pure
-            // invocation detail (no persistent thread) never shows an action.
+            // invocation detail (no persistent thread) never shows an action. Delete
+            // leads the bar and Transcript closes it, exactly like the main tile.
             const actionBar = createThreadActionBar({
                 className: 'thread-transcript-action',
-                deleteHost: headerAction,
                 visible: () => entry.expanded && entry.row !== undefined,
                 target: () => persistentIdOf(entry),
                 open: () => openTranscriptOf(persistentIdOf(entry))
@@ -3412,7 +3409,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const transcriptAction = actionBar.element;
             const transcriptButton = actionBar.transcriptButton;
 
-            tile.append(select, headerAction, transcriptAction, body);
+            tile.append(select, transcriptAction, body);
 
             // Children live outside the body so collapsing THIS entry never hides
             // its descendants (R2).
@@ -3930,23 +3927,25 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // cards belong to it); only the pointer is cleared so the next call is
         // appended to a fresh row after whatever broke the run.
         //
-        // R1: this is for a VISIBLE break only — prose, reasoning, an error, a retry
-        // notice or a steer. Scheduler frames (`attempt_commit`, `done`, `wakeup`) do
+        // R1: this is for a VISIBLE break only — prose, an error, a retry notice or a
+        // steer. A reasoning round does NOT break the run any more: it is a chip that
+        // joins this same row. Scheduler frames (`attempt_commit`, `done`, `wakeup`) do
         // NOT call it: they add nothing readable between two calls, and clearing the
         // pointer there is what split four consecutive calls into two rows of two.
         const closeToolGroup = (section: AgentSection): void => {
             section.toolGroup = undefined;
         };
 
-        // Return the row consecutive calls should join, creating it lazily so no
-        // empty `.tool-group` ever sits in the flow between two prose blocks.
+        // Return the row consecutive chips should join — a tool call or a think chip —
+        // creating it lazily so no empty `.tool-group` ever sits in the flow between two
+        // prose blocks.
         //
         // R1: the row is deliberately NOT registered as attempt output. Because the
         // pointer now survives `attempt_commit`/`done`/`wakeup`, one row can hold
         // calls from several attempts, and discarding the row wholesale would delete
         // calls an EARLIER attempt already committed. Ownership is therefore per
-        // CHIP (`appendTool` tracks `card.element`), and `discardAttempt` drops a row
-        // only once nothing is left in it.
+        // CHIP (`appendTool`/`appendReasoning` track `card.element`), and
+        // `discardAttempt` drops a row only once nothing is left in it.
         const toolGroupOf = (section: AgentSection): HTMLElement => {
             if (section.toolGroup === undefined) {
                 const group = el('div', 'tool-group');
@@ -4265,6 +4264,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // `renderPending` expects.
             if (section.pending !== undefined) section.flow.append(section.pending);
 
+            // The think chip is attempt output like the prose block next to it: it was
+            // removed with the nodes above, so any dialog it owns is closed here (an
+            // orphaned modal would keep a stale focus trap and a body that is no longer
+            // in the document).
+            section.reasoning?.card.destroy();
             section.reasoning = undefined;
             // The pointer is dropped because this attempt's chips are gone; the row
             // they lived in may still hold committed calls, and the NEXT call starts a
@@ -4305,8 +4309,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // `closeText` flushes and retains `lastText` for the # descriptor, then
             // clears the pointer; the committed node itself is untouched.
             closeText(section);
-            // Reasoning has no `lastText` contract: the committed `<details>` keeps
-            // its text, only the writer is dropped so the next request mints its own.
+            // Reasoning has no `lastText` contract: the committed think chip keeps its
+            // text (and its dialog stays usable), only the writer is dropped so the next
+            // request mints its own chip.
             section.reasoning = undefined;
             // R1: the chip row is NOT closed. A commit is an invisible lifecycle
             // boundary — the next request's calls have no readable output between
@@ -4366,21 +4371,57 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             schedule(block, () => renderText(block));
         };
 
+        // The context figure a section's block reports right now — the denominator of a
+        // think chip's percentage. A nested entry answers with its OWN tally
+        // (`entry.meta`, painted as `.thread-tokens`); the root section falls back to the
+        // tile's tally (`.tile-tokens`), which is the turn-wide figure.
+        const contextOfSection = (section: AgentSection): number | undefined => {
+            for (const entry of threads.values()) {
+                if (entry.section === section) return (entry.meta ?? blockMeta).context();
+            }
+
+            return blockMeta.context();
+        };
+
+        // Repaint every think chip in this tile after its block's context moved. The
+        // percentages must be shares of the context the HEADERS print, not of whatever
+        // figure happened to be current when each round finished, so a `usage` event
+        // advances every chip of that block together.
+        const syncThinkingShares = (): void => {
+            for (const entry of threads.values()) {
+                if (entry.section.thinking.length === 0) continue;
+
+                const context = (entry.meta ?? blockMeta).context();
+                for (const thought of entry.section.thinking) thought.setContext(context);
+            }
+        };
+
+        // One streamed reasoning round -> ONE inline think chip in the agent's tool row.
+        // The chip is created once per request (the first delta mints it) and repainted
+        // with the CUMULATIVE buffer, so the pill, the dialog body and an already-open
+        // dialog all agree on the same text without re-parsing anything.
         const appendReasoning = (section: AgentSection, delta: string): void => {
             beginAttempt(section);
-            // Reasoning is its own flow block, so it breaks the chip row exactly
-            // like assistant prose does.
-            closeToolGroup(section);
 
             if (section.reasoning === undefined) {
-                const details = el('details', 'thinking');
-                const summary = el('summary', 'thinking-summary', 'reasoning');
-                const reasoningBody = el('div', 'reasoning');
-                details.append(summary, reasoningBody);
-                section.flow.append(details);
-                section.reasoning = { details, summary, body: reasoningBody, buffer: '' };
-                // Attempt output: a retry removes the whole block.
-                trackNode(section, details);
+                const card = createReasoningCard();
+                // INLINE: the chip joins the same `.tool-group` row the calls use, which
+                // is the whole point of the change — `[think][glob][read]` read as one
+                // wrapping line. The row is created lazily, so a reasoning-only round
+                // still gets exactly one row and prose is never separated by an empty one.
+                toolGroupOf(section).append(card.element);
+                // Attempt output: a retry removes the chip with the rest, and the dialog
+                // it owns is closed by `destroy` below.
+                trackNode(section, card.element);
+                // Owned for the life of the BLOCK, not the round: `destroy`/
+                // `resetProjection` close every dialog this section ever opened.
+                section.thinking.push(card);
+                // Seeded with the context this block already reports. Providers only
+                // report usage per request, so the first round of a turn may have no
+                // denominator yet — then the pill stays hidden until a `usage` event
+                // arrives, and `syncThinkingShares` fills every chip in at that point.
+                card.setContext(contextOfSection(section));
+                section.reasoning = { card, buffer: '' };
             }
 
             // Status line last, exactly like prose.
@@ -4390,8 +4431,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             block.buffer += delta;
             // Plain text, appended in place: no parse, no innerHTML, no sanitizer
             // round-trip for scratch space.
-            block.body.textContent = block.buffer;
-            block.summary.textContent = `reasoning · ${block.buffer.length.toLocaleString()} chars`;
+            block.card.setText(block.buffer);
         };
 
         // Parse an `delegate` call's arguments for the legacy fallback: without
@@ -4583,6 +4623,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 entry.disposeActionBar();
                 if (entry.section.text !== undefined) cancel(entry.section.text);
                 for (const tool of entry.section.tools) tool.destroy();
+                // A think chip is the same kind of owned surface as a tool chip: its
+                // dialog belongs to the projection being discarded, so closing every
+                // one here is what keeps a rebuild from leaving an orphaned modal.
+                for (const thought of entry.section.thinking) thought.destroy();
                 // Stop the nested clock too: the rebuilt projection creates new
                 // entries, and a surviving interval would paint detached DOM forever.
                 entry.meta?.stop();
@@ -4858,6 +4902,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     if (owner?.meta !== undefined) owner.meta.noteUsage(event.usage);
 
                     blockMeta.noteUsage(event.usage);
+                    // The denominator moved, so every think chip in the tile re-measures
+                    // against it (a stale percentage would disagree with the tally a
+                    // reader sees two lines above it).
+                    syncThinkingShares();
                     break;
                 }
 
@@ -5173,6 +5221,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             for (const entry of threads.values()) {
                 if (entry.section.text !== undefined) cancel(entry.section.text);
                 for (const tool of entry.section.tools) tool.destroy();
+                // A think chip's dialog is owned by this tile exactly like a tool
+                // chip's: a cleared board must not leave the modal (and its focus trap)
+                // behind with an already-detached card.
+                for (const thought of entry.section.thinking) thought.destroy();
                 // A nested entry ticks on its own clock; a cleared board or a hidden
                 // page must not keep it running.
                 entry.meta?.stop();

@@ -28,7 +28,10 @@ describe('preset catalogue', () => {
             'glob',
             'grep',
             'shell',
-            'gitDiff'
+            'gitDiff',
+            // R3/R4: byte retrieval with the multimodal hand-off. Order 235 —
+            // after gitDiff (230), before the web provider rows (240/250).
+            'download'
         ]);
         expect(Object.keys(presetTools)).toEqual(PRESET_TOOL_NAMES);
     });
@@ -130,6 +133,14 @@ describe('preset catalogue', () => {
         expect('visibility' in PRESET_TOOLS.fileList).toBe(false);
         expect(presetTools.fileList.visibility).toBe('searchable');
         expect(PRESET_TOOLS).not.toHaveProperty('fileSearch');
+
+        // R9-R11: `download` registers with the package presets but is SEARCHABLE,
+        // so both projections must say so: the live compiled entry and the static
+        // catalogue that reads the GENERATED manifest (`npm run tools:manifest`).
+        // The earlier T8/F1 `core` claim is superseded: download is demand-discovered
+        // through toolRequest, exactly like syntax/shell/gitDiff.
+        expect(PRESET_TOOLS.download.visibility).toBe('searchable');
+        expect(presetTools.download.visibility).toBe('searchable');
 
         // syntax, shell and gitDiff share the same visibility default:
         // discovery is the only way to reach them.
@@ -290,12 +301,65 @@ describe('preset catalogue', () => {
         expect(PRESET_TOOLS.shell.parameters.required).toEqual(['command']);
     });
 
-    it('does not claim a sandbox or gitignore support it does not implement', () => {
-        // The descriptions are the contract the model reads; wording that implies a
-        // fence must not creep in. .gitignore is explicitly documented as unread by
-        // both search surfaces.
-        expect(PRESET_TOOLS.glob.description).toContain('Does not read .gitignore files');
-        expect(PRESET_TOOLS.grep.description).toContain('Does not read .gitignore files');
+    it('does not claim a sandbox and pins the gitignore wording glob and grep now publish', () => {
+        // The descriptions are the contract the model reads. Two halves:
+        //
+        //   1. No fence wording may creep in — glob/grep resolve roots against the
+        //      process working directory (files/glob.tool.ts:65, files/grep.tool.ts:62),
+        //      so neither description names a sandbox.
+        //   2. Both search surfaces now CONSULT `.gitignore` at or below each root
+        //      (files/gitignore.ts, policy note in files/glob.tool.ts:61-63 and
+        //      files/grep.tool.ts:57-59). The pre-gitignore claim "Does not read
+        //      .gitignore files" is therefore gone, and the replacement wording is
+        //      pinned verbatim so an edit that quietly drops it fails here.
+        for (const name of ['glob', 'grep'] as const) {
+            expect(PRESET_TOOLS[name].description).not.toContain('sandbox');
+
+            // Shared ignore rule, identical in both rows (glob.tool.ts:142, grep.tool.ts:212).
+            expect(PRESET_TOOLS[name].description).toContain('Reads .gitignore files at or below each root');
+            expect(PRESET_TOOLS[name].description).not.toContain('Does not read .gitignore files');
+        }
+
+        // glob's own skip sentence plus the glob-specific half of the ignore rule:
+        // an ignored path is not LISTED, and an explicitly named root is WALKED.
+        expect(PRESET_TOOLS.glob.description).toContain(
+            'Skips .git and symlinks, and skips node_modules unless a root is placed inside it.'
+        );
+        expect(PRESET_TOOLS.glob.description).toContain(
+            'so an ignored path is not listed - while a root you name explicitly is walked even when an enclosing .gitignore ignores it.'
+        );
+
+        // The closing sentence is the names-only boundary of this tool; nothing is
+        // appended after it, so a future rewrite that moves or extends it fails.
+        expect(PRESET_TOOLS.glob.description.endsWith('Does not search text.')).toBe(true);
+
+        // grep's own skip sentence (it adds binary and size skips) and its half of the
+        // ignore rule: an ignored path is never OPENED, and an explicitly named root
+        // is SEARCHED.
+        expect(PRESET_TOOLS.grep.description).toContain(
+            'Skips .git, symlinks, binary files, and files larger than 1 MiB, and skips node_modules unless a root is placed inside it.'
+        );
+        expect(PRESET_TOOLS.grep.description).toContain(
+            'so an ignored path is never opened - while a root you name explicitly is searched even when an enclosing .gitignore ignores it.'
+        );
+        expect(PRESET_TOOLS.grep.description.endsWith('Does not list file names (use glob for that).')).toBe(true);
+
+        // The `paths` argument is where the explicit-root escape hatch is documented,
+        // per tool: glob.tool.ts:160 says "walked", grep.tool.ts:237 says "searched".
+        // `parameters` is Record<string, unknown> (core/tool-metadata.ts:45), so the
+        // property map is narrowed to the shape the tool entries actually publish.
+        const globPaths = PRESET_TOOLS.glob.parameters.properties as Record<string, { description: string }>;
+        expect(globPaths.paths.description).toContain(
+            'A root you name explicitly is walked even when a .gitignore above it ignores that directory.'
+        );
+
+        const grepPaths = PRESET_TOOLS.grep.parameters.properties as Record<string, { description: string }>;
+        expect(grepPaths.paths.description).toContain(
+            'A root you name explicitly is searched even when a .gitignore above it ignores that directory.'
+        );
+
+        // gitDiff's own claims are pinned in the same place: the read-only promise and
+        // the exit-code policy.
         expect(PRESET_TOOLS.gitDiff.description).toContain('Read-only');
         expect(PRESET_TOOLS.gitDiff.description).toContain('non-zero exit is data, not an error');
     });

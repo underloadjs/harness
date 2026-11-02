@@ -19,7 +19,11 @@ export const TOOL_LIST_METADATA: CoreToolMetadata = {
     description:
         'List every registered tool by name and description, whether or not toolRequest has enabled it. Use this for an inventory; use toolRequest to make searchable tools callable, and toolManage for tags, schema, source, or editing.',
     tags: ['tools', 'list', 'catalogue', 'inventory'],
-    visibility: 'core',
+    // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
+    // and enables it for this session instead of seeing it declared on every request.
+    // Registration itself is unchanged (the entry still joins the harness registry),
+    // so toolRequest always has something to surface.
+    visibility: 'searchable',
     parameters: {
         type: 'object',
         properties: {},
@@ -39,7 +43,7 @@ export const registration = {
     activation: 'always',
     order: 30,
     sessionBound: true,
-    alwaysDeclared: true,
+    alwaysDeclared: false,
     listed: true
 } as const;
 

@@ -18,6 +18,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HarnessProgress } from '../../harness';
 import type { HarnessPreset } from './types';
+import type { HarnessRegistry } from './registry';
 import {
     createHarnessRegistry,
     isLegacyShippedDefinition,
@@ -26,7 +27,12 @@ import {
     presetToRecord
 } from './registry';
 import { describeHarness } from './descriptor';
-import { LEGACY_PRESET_DEFINITIONS, presets } from './presets';
+import {
+    ALL_PRESET_TEMPLATES,
+    FIXTURE_PRESETS,
+    LEGACY_PRESET_DEFINITIONS,
+    presets
+} from './presets';
 import { SHARED_TOOL_NAMES } from './toolbox';
 import { AGENT_PROFILE_NAMES, AGENT_PROFILES } from '../../agents';
 
@@ -64,6 +70,13 @@ const registryError = (run: () => unknown): { status: number; message: string } 
     throw new Error('expected the registry to throw');
 };
 
+// T5: the scripted demo and the flaky example are no longer part of the shipped
+// catalogue, so every test below that pins THEIR template rules (a metadata-only
+// patch keeps the script; an executable patch upgrades it) has to ask for them by
+// name. That is exactly what a host or a test does now: an explicit fixture
+// injection, not a default that ships them.
+const fixtureRegistry = (): HarnessRegistry => createHarnessRegistry(ALL_PRESET_TEMPLATES);
+
 describe('the shipped registry', () => {
     it('lists every template as an independent, editable copy', () => {
         const registry = createHarnessRegistry();
@@ -79,9 +92,7 @@ describe('the shipped registry', () => {
             { name: 'research', builtin: true, editable: true },
             { name: 'workspace', builtin: true, editable: true },
             { name: 'reviewer', builtin: true, editable: true },
-            { name: 'planner', builtin: true, editable: true },
-            { name: 'demo', builtin: true, editable: true },
-            { name: 'flaky', builtin: true, editable: true }
+            { name: 'planner', builtin: true, editable: true }
         ]);
 
         // R20.1: independent copies. No registry entry aliases a shipped template
@@ -96,6 +107,55 @@ describe('the shipped registry', () => {
         registry.update('instruct', { title: 'Edited' });
         expect(other.find('instruct')?.title).toBe('Instruct');
         expect(presets[0].title).toBe('Instruct');
+    });
+
+    it('ships only real production configurations and keeps the fixtures explicit (T5)', () => {
+        // The default catalogue is exactly the five live roles: nothing scripted,
+        // nothing that fails on purpose. A user picking a card gets a harness that
+        // talks to the configured provider with the shared toolbox.
+        expect(createHarnessRegistry().list().map((preset) => preset.name)).toEqual([
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner'
+        ]);
+        expect(presets.map((preset) => preset.name)).toEqual([
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner'
+        ]);
+
+        // The fixtures still exist as presets — they are just not shipped. Their
+        // behaviour is unchanged (demo stays offline/scripted, flaky keeps its
+        // failing tool), and a host that wants them asks for them by name.
+        expect(FIXTURE_PRESETS.map((preset) => preset.name)).toEqual(['demo', 'flaky']);
+        expect(FIXTURE_PRESETS.map((preset) => [preset.name, preset.template, preset.requiresEndpoint])).toEqual([
+            ['demo', 'scripted', false],
+            ['flaky', 'flaky', true]
+        ]);
+
+        const injected = createHarnessRegistry(ALL_PRESET_TEMPLATES);
+
+        expect(injected.list().map((preset) => preset.name)).toEqual([
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner',
+            'demo',
+            'flaky'
+        ]);
+
+        // `ALL_PRESET_TEMPLATES` is the lookup superset restore depends on: a
+        // session frozen on the scripted demo rebuilds even though demo left the
+        // catalogue (see ./restore.test.ts and ./registry.ts presetFromRecord).
+        expect(ALL_PRESET_TEMPLATES.map((preset) => preset.name)).toEqual([
+            ...presets.map((preset) => preset.name),
+            ...FIXTURE_PRESETS.map((preset) => preset.name)
+        ]);
     });
 
     it('exposes the trusted agent profiles', () => {
@@ -151,7 +211,10 @@ describe('creating a harness', () => {
             subagents: ['summarizer'],
             agents: ['research', 'summarizer'],
             tools: SHARED_TOOL_NAMES,
-            environmentTools: ['search'],
+            // The live toolbox opts into websearch AND webfetch; search stays
+            // unadvertised on a keyless host because the catalogue has no executable
+            // entry, while fetch (native) registers everywhere (R9-R11).
+            environmentTools: ['search', 'fetch'],
             builtin: false,
             editable: true
         });
@@ -162,18 +225,18 @@ describe('creating a harness', () => {
         expect(Object.keys(harness.agents)).toEqual(['research', 'summarizer']);
         expect(Object.keys(harness.subagents)).toEqual(['summarizer']);
         expect(harness.tools.delegate.visibility).toBe('core');
-        // W4: createToolboxHarness opts into `webfetch: true`, and the harness
+        // R9-R11: createToolboxHarness opts into `webfetch: true`, and the harness
         // appends environment tools after the configured table and before the
         // harness-owned core set (harness.ts:740-761). search is absent because
         // this host is keyless; fetch needs no credential, so it lands first of
-        // the appended tools and stays searchable (not core).
+        // the appended tools and is declared core like a configured search.
         expect(Object.keys(harness.tools)).toEqual([
             'toolRegistry',
             'toolRequest',
             'toolList',
             'toolManage',
             'toolCreate',
-            'todoManage',
+            'task',
             'profileManage',
             'chapterManage',
             'locationManage',
@@ -193,8 +256,6 @@ describe('creating a harness', () => {
             'workspace',
             'reviewer',
             'planner',
-            'demo',
-            'flaky',
             'my-review'
         ]);
     });
@@ -409,10 +470,10 @@ describe('updating a harness', () => {
     });
 
     it('patches every shipped template and rejects only unknown names', () => {
-        const registry = createHarnessRegistry();
+        const registry = fixtureRegistry();
 
         // R20.1: no read-only category. A metadata-only patch is a 200 for the
-        // formerly frozen demo/flaky templates too.
+        // formerly frozen demo/flaky templates too (T5: injected, not shipped).
         expect(registry.update('demo', { title: 'Demo!' }).title).toBe('Demo!');
         expect(registry.update('flaky', { title: 'Flaky!' }).title).toBe('Flaky!');
 
@@ -423,7 +484,7 @@ describe('updating a harness', () => {
     });
 
     it('keeps the demo script and flaky extras through a metadata-only patch', () => {
-        const registry = createHarnessRegistry();
+        const registry = fixtureRegistry();
         const demoBefore = registry.find('demo')!;
         const flakyBefore = registry.find('flaky')!;
 
@@ -445,7 +506,7 @@ describe('updating a harness', () => {
         // The flaky example keeps its extra tool and shared toolbox declaration.
         expect(flakyAfter.create).toBe(flakyBefore.create);
         expect(flakyAfter.tools).toEqual([...SHARED_TOOL_NAMES, 'testFlaky']);
-        expect(flakyAfter.environmentTools).toEqual(['search']);
+        expect(flakyAfter.environmentTools).toEqual(['search', 'fetch']);
         expect(flakyAfter.template).toBe('flaky');
 
         // The runtime really keeps them: these are the exact registered names.
@@ -455,7 +516,7 @@ describe('updating a harness', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'todoManage',
+            'task',
             'profileManage',
             'chapterManage',
             'locationManage',
@@ -474,7 +535,7 @@ describe('updating a harness', () => {
     });
 
     it('upgrades the demo to an honest live profiled harness on an executable patch', () => {
-        const registry = createHarnessRegistry();
+        const registry = fixtureRegistry();
         const before = registry.find('demo')!;
         const scripted = before.create(SETTINGS, progress);
 
@@ -488,38 +549,19 @@ describe('updating a harness', () => {
         expect(after.description).toContain('no longer uses the offline script');
         expect(after.requiresEndpoint).toBe(true);
         expect(after.tools).toEqual(SHARED_TOOL_NAMES);
-        expect(after.environmentTools).toEqual(['search']);
+        expect(after.environmentTools).toEqual(['search', 'fetch']);
         expect(after.primary).toBe('workspace');
         expect(after.agents).toEqual(['workspace']);
 
         const live = after.create(SETTINGS, progress);
         expect(Object.keys(live.agents)).toEqual(['workspace']);
         expect(Object.keys(live.tools)).toEqual(
-            expect.arrayContaining([...SHARED_TOOL_NAMES, 'toolRequest', 'toolCreate', 'todoManage'])
+            expect.arrayContaining([...SHARED_TOOL_NAMES, 'toolRequest', 'toolCreate', 'task'])
         );
-
-        // The captured scripted harness is unchanged (frozen-session guarantee).
-        expect(Object.keys(scripted.agents)).toEqual(['demo']);
-        expect(Object.keys(scripted.tools)).toEqual([
-            'toolRegistry',
-            'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork',
-            'toolCancel',
-            'timeNow'
-        ]);
     });
 
     it('rebuilds flaky live and retains testFlaky on an executable patch', () => {
-        const registry = createHarnessRegistry();
+        const registry = fixtureRegistry();
 
         const after = registry.update('flaky', {
             primary: 'workspace',
@@ -535,6 +577,223 @@ describe('updating a harness', () => {
         expect(live.tools.testFlaky).toBeDefined();
         expect(Object.keys(live.agents)).toEqual(['workspace']);
         expect(live.agents.workspace.model()).toBe('big/model');
+    });
+});
+
+// Deleting a harness (T5).
+//
+// This is the contract the `DELETE /harnesses/:name` route is built on: any name is
+// removable (a shipped built-in exactly like a user harness), an unknown or
+// already-removed name is an honest 404 rather than a second success, and a built-in
+// stays removed only because the registry records a TOMBSTONE the persistence layer
+// can replay — `list()` alone cannot express "this shipped default is gone", because
+// every registry seeds itself from ./presets.ts. Sessions are deliberately outside
+// this contract: an existing session holds the preset it captured (pinned by
+// ../sessions.test.ts) and a saved one rebuilds from its own record
+// (../persistence.test.ts).
+describe('deleting a harness', () => {
+    it('removes a user harness without tombstoning it', () => {
+        const registry = createHarnessRegistry();
+        registry.create({ name: 'temp', primary: 'instruct' });
+
+        // The removed entry is returned by identity, so a caller can log or roll back
+        // exactly what disappeared.
+        const before = registry.find('temp')!;
+        expect(registry.remove('temp')).toBe(before);
+        expect(before.title).toBe('temp');
+
+        expect(registry.find('temp')).toBeUndefined();
+        expect(registry.list().map((preset) => preset.name)).toEqual([
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner'
+        ]);
+
+        // No tombstone: a user harness is absent from the saved document as soon as
+        // it is absent from list(), and nothing ships it back.
+        expect(registry.deletedBuiltins()).toEqual([]);
+
+        // The object a session captured is still a working harness after removal.
+        expect(Object.keys(before.create(SETTINGS, progress).agents)).toEqual(['instruct']);
+    });
+
+    it('tombstones a deleted built-in and takes it out of every lookup', () => {
+        const registry = createHarnessRegistry();
+        const instruct = registry.find('instruct')!;
+
+        expect(registry.remove('instruct')).toBe(instruct);
+        expect(registry.list().map((preset) => preset.name)).toEqual([
+            'research',
+            'workspace',
+            'reviewer',
+            'planner'
+        ]);
+        expect(registry.find('instruct')).toBeUndefined();
+
+        // An alias follows its target: `writer` still NAMES instruct, and instruct is
+        // gone, so the alias resolves to nothing rather than to a stale card.
+        expect(registry.find('writer')).toBeUndefined();
+
+        // The tombstone is the durable half of the deletion.
+        expect(registry.deletedBuiltins()).toEqual(['instruct']);
+
+        // Alias names stay reserved whether or not their target exists: accepting
+        // `writer` as a new harness would make an old client's `writer` request mean
+        // something different after this harness is deleted.
+        expect(registryError(() => registry.create({ name: 'writer', primary: 'instruct' }))).toEqual({
+            status: 400,
+            message: 'Harness name "writer" is reserved as an alias of "instruct".'
+        });
+    });
+
+    it('reports an unknown, already-deleted, or alias-only name as 404', () => {
+        const registry = createHarnessRegistry();
+
+        // Never seen.
+        expect(registryError(() => registry.remove('nope'))).toEqual({
+            status: 404,
+            message: 'Unknown harness "nope".'
+        });
+
+        // A repeat DELETE did not remove anything, so it must not claim success.
+        expect(registry.remove('planner').name).toBe('planner');
+        expect(registryError(() => registry.remove('planner'))).toEqual({
+            status: 404,
+            message: 'Harness "planner" has already been deleted.'
+        });
+
+        // An alias is a read redirect, not an identity that can be deleted: this must
+        // not touch `instruct` (the same rule update() follows).
+        expect(registryError(() => registry.remove('writer'))).toEqual({
+            status: 404,
+            message: 'Unknown harness "writer".'
+        });
+        expect(registry.find('instruct')?.title).toBe('Instruct');
+
+        // A deleted built-in is no longer patchable either.
+        expect(registryError(() => registry.update('planner', { title: 'Back?' }))).toEqual({
+            status: 404,
+            message: 'Unknown harness "planner".'
+        });
+    });
+
+    it('lets a deleted built-in name be taken again and clears the tombstone', () => {
+        const registry = createHarnessRegistry();
+        registry.remove('instruct');
+
+        // The name is free again: deleting the shipped card and creating your own
+        // under the same id is the documented way to replace a default.
+        const rebuilt = registry.create({ name: 'instruct', title: 'My instruct', primary: 'research' });
+        expect(rebuilt.builtin).toBe(false);
+
+        // The tombstone is gone, or the next restore would delete the harness the
+        // operator just made.
+        expect(registry.deletedBuiltins()).toEqual([]);
+        expect(registry.find('instruct')?.title).toBe('My instruct');
+
+        // ...and the legacy alias resolves again, to the replacement.
+        expect(registry.find('writer')?.title).toBe('My instruct');
+
+        // A re-created name appends: it does not return to the shipped position,
+        // because listing order is creation order for anything not shipped.
+        expect(registry.list().map((preset) => preset.name)).toEqual([
+            'research',
+            'workspace',
+            'reviewer',
+            'planner',
+            'instruct'
+        ]);
+    });
+
+    it('seeds tombstones at construction, including for a name this build does not ship', () => {
+        const registry = createHarnessRegistry(presets, { deletedBuiltins: ['instruct', 'workspace'] });
+
+        expect(registry.list().map((preset) => preset.name)).toEqual(['research', 'reviewer', 'planner']);
+        expect(registry.deletedBuiltins()).toEqual(['instruct', 'workspace']);
+        expect(registry.find('writer')).toBeUndefined();
+
+        // A tombstone naming something this build does not ship is KEPT: it records a
+        // real decision, and a default that returns in a later build must come back
+        // already deleted rather than resurrected.
+        const unmatched = createHarnessRegistry(presets, { deletedBuiltins: ['retired-default'] });
+        expect(unmatched.list().map((preset) => preset.name)).toEqual([
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner'
+        ]);
+        expect(unmatched.deletedBuiltins()).toEqual(['retired-default']);
+    });
+
+    it('replays deletions idempotently and removes an entry the build still ships', () => {
+        const registry = createHarnessRegistry(ALL_PRESET_TEMPLATES);
+
+        // Startup replay: duplicates and blank names are noise, not errors, and a
+        // name this build does not ship is still recorded.
+        registry.restoreDeletedBuiltins(['demo', 'demo', '  ', 'retired-default']);
+
+        expect(registry.find('demo')).toBeUndefined();
+        expect(registry.deletedBuiltins()).toEqual(['demo', 'retired-default']);
+
+        // Order-stable and idempotent: replaying the same list again changes nothing,
+        // which is what makes a restart safe.
+        registry.restoreDeletedBuiltins(['demo']);
+        expect(registry.deletedBuiltins()).toEqual(['demo', 'retired-default']);
+        expect(registry.list().map((preset) => preset.name)).toEqual([
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner',
+            'flaky'
+        ]);
+
+        // A replayed deletion is indistinguishable from a live one to the caller.
+        expect(registryError(() => registry.remove('demo'))).toEqual({
+            status: 404,
+            message: 'Harness "demo" has already been deleted.'
+        });
+    });
+
+    it('snapshots and restores entries, listing order, and tombstones', () => {
+        const registry = createHarnessRegistry();
+        const captured = registry.snapshot();
+
+        // Every mutation shape at once: create, patch, and delete.
+        registry.create({ name: 'extra', primary: 'instruct' });
+        registry.update('research', { title: 'Renamed' });
+        registry.remove('planner');
+
+        expect(registry.list().map((preset) => preset.name)).toEqual([
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'extra'
+        ]);
+        expect(registry.deletedBuiltins()).toEqual(['planner']);
+
+        // The rollback the durable commit uses (SessionStore.mutateRegistry).
+        registry.restore(captured);
+
+        expect(registry.list().map((preset) => preset.name)).toEqual([
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner'
+        ]);
+        expect(registry.find('research')?.title).toBe('Researcher');
+        expect(registry.find('extra')).toBeUndefined();
+        expect(registry.find('planner')).toBeDefined();
+        expect(registry.deletedBuiltins()).toEqual([]);
+
+        // A restored entry is the SAME preset object that was captured, so a session
+        // holding it is unaffected by a rollback either way.
+        expect(registry.find('instruct')).toBe(captured.entries.find(([name]) => name === 'instruct')![1]);
     });
 });
 
@@ -945,7 +1204,7 @@ describe('per-agent instruction overrides', () => {
     });
 
     it('upgrades the scripted demo on an instruction edit, exactly like a model edit', () => {
-        const registry = createHarnessRegistry();
+        const registry = fixtureRegistry();
 
         // The demo's shipped factory is the offline script, which ignores prompts. An
         // instruction edit is executable, so it must not be stored against a factory
@@ -995,7 +1254,16 @@ describe('per-agent instruction overrides', () => {
         // definition, so `agentInstructions` is the only variable under test.
         expect(presetRecordEquals(record, presetToRecord(restored))).toBe(true);
 
-        const asShippedRow = { ...record, name: 'research' };
+        // `record` comes from THIS build's registry, whose environmentTools default
+        // is now ['search', 'fetch'] (R9-R11). The legacy table records what the OLD
+        // shipped row said, and isLegacyShippedDefinition compares that field, so the
+        // fixture pins it to the legacy value: `agentInstructions` is the only
+        // variable under test. A real old row still carries ['search'] and refreshes.
+        const asShippedRow = {
+            ...record,
+            name: 'research',
+            environmentTools: [...(LEGACY_PRESET_DEFINITIONS.research.environmentTools ?? [])]
+        };
 
         expect(isLegacyShippedDefinition(LEGACY_PRESET_DEFINITIONS.research, {
             ...asShippedRow,

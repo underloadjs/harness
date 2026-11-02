@@ -533,6 +533,110 @@ describe('harness mutations', () => {
     });
 });
 
+// R6 — the harness delete transport, and the unload-only session delete.
+describe('harness delete (R6)', () => {
+    it('deletes one harness by encoded name and reports whether it was removed', async () => {
+        const calls: Array<{ url: string; method: string | undefined; body: unknown }> = [];
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+                const url = String(input);
+                calls.push({
+                    url,
+                    method: init?.method,
+                    body: init?.body === undefined ? undefined : JSON.parse(String(init.body))
+                });
+
+                // The accepted contract: 200 with `{ deleted: true }`, built-ins included.
+                if (url === '/api/harnesses/a%2Fb' && init?.method === 'DELETE') return json({ deleted: true });
+
+                throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
+            })
+        );
+
+        const module = await import('./api');
+
+        expect(await module.deleteHarness('a/b')).toBe(true);
+        expect(calls).toEqual([{ url: '/api/harnesses/a%2Fb', method: 'DELETE', body: undefined }]);
+    });
+
+    it('treats a 404 as already gone instead of an error', async () => {
+        const calls: Array<{ url: string; method: string | undefined }> = [];
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+                const url = String(input);
+                calls.push({ url, method: init?.method });
+
+                // The other half of the accepted contract: an unknown harness is a 404.
+                if (url === '/api/harnesses/ghost' && init?.method === 'DELETE') {
+                    return json({ error: { message: 'Unknown harness ghost' } }, 404);
+                }
+
+                throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
+            })
+        );
+
+        const module = await import('./api');
+
+        // "It is already gone" IS the desired end state for a delete, so the caller gets
+        // a resolved `false` (nothing removed now) rather than a thrown error.
+        expect(await module.deleteHarness('ghost')).toBe(false);
+        expect(calls).toEqual([{ url: '/api/harnesses/ghost', method: 'DELETE' }]);
+    });
+
+    it('rejects a real failure with the server message and never swallows it', async () => {
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+                const url = String(input);
+
+                // A 500 is NOT in the accepted list, so it stays an Error whose message is
+                // the server's own — which is what makes the UI's failure path actionable.
+                if (url === '/api/harnesses/alpha' && init?.method === 'DELETE') {
+                    return json({ error: { message: 'The registry could not be written' } }, 500);
+                }
+
+                throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
+            })
+        );
+
+        const module = await import('./api');
+
+        await expect(module.deleteHarness('alpha')).rejects.toThrow('The registry could not be written');
+    });
+
+    it('sends the unload cleanup with keepalive and the normal delete without it', async () => {
+        const seen: Array<{ url: string; keepalive: boolean | undefined }> = [];
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+                const url = String(input);
+                seen.push({ url, keepalive: init?.keepalive });
+
+                if (init?.method === 'DELETE') return json({ deleted: true });
+
+                throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
+            })
+        );
+
+        const module = await import('./api');
+
+        await module.deleteSession('s1');
+        await module.deleteSessionOnUnload('s2');
+
+        // R7: only the unload path asks the browser to keep the request alive, because a
+        // plain fetch started from `pagehide` may never leave.
+        expect(seen).toEqual([
+            { url: '/api/sessions/s1', keepalive: undefined },
+            { url: '/api/sessions/s2', keepalive: true }
+        ]);
+    });
+});
+
 describe('task queue (R4)', () => {
     const turn = {
         id: 't1',

@@ -18,7 +18,7 @@
 //     non-finite numbers: a snapshot must survive JSON.parse(JSON.stringify(...)).
 //
 // Cross-references:
-//   - ./todo.ts, profile.ts, chapter.ts, location.ts — per-store state readers
+//   - ./task.ts, profile.ts, chapter.ts, location.ts — per-store state readers
 //   - ./snapshot.ts                                — the harness-wide reader
 //   - ../types                                     — store state shapes
 //   - ../util                                      — HarnessError

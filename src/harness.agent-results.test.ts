@@ -76,18 +76,12 @@ const hasForkResult = (request: HarnessStreamRequest): boolean =>
             message.content.includes('fork result')
     );
 
+// R9-R11: only the discovery bootstrap and the session plan are declared. The
+// inspection pair (agentManage/agentResult) is registered and searchable, which
+// is why it still reaches both agents — through toolRequest, not a declaration.
 const CORE_DECLARATIONS = [
-    'toolRegistry',
     'toolRequest',
-    'toolList',
-    'toolManage',
-    'toolCreate',
-    'todoManage',
-    'profileManage',
-    'chapterManage',
-    'locationManage',
-    'agentManage',
-    'agentResult'
+    'task'
 ];
 
 describe('agentManage / agentResult registration', () => {
@@ -109,8 +103,8 @@ describe('agentManage / agentResult registration', () => {
         const writer = harness({ agents: { lead, helper }, presets: false });
         await writer('go');
 
-        expect(writer.tools.agentManage.visibility).toBe('core');
-        expect(writer.tools.agentResult.visibility).toBe('core');
+        expect(writer.tools.agentManage.visibility).toBe('searchable');
+        expect(writer.tools.agentResult.visibility).toBe('searchable');
         expect(writer.tools.agentManage.tags).toEqual([
             'agents',
             'results',
@@ -131,9 +125,8 @@ describe('agentManage / agentResult registration', () => {
         expect(declaredNames(seenLead[0])).toEqual([
             ...CORE_DECLARATIONS,
             'delegate',
-            'threadFork'
         ]);
-        expect(declaredNames(seenHelper[0])).toEqual([...CORE_DECLARATIONS, 'threadFork']);
+        expect(declaredNames(seenHelper[0])).toEqual(CORE_DECLARATIONS);
     });
 
     it('lets other tool sources replace agentManage and agentResult (no reserved names)', async () => {

@@ -11,7 +11,11 @@ export const CHAPTER_MANAGE_METADATA: CoreToolMetadata = {
     description:
         'Manage chapters for this harness session. Actions: "add" (requires title and summary; optional content, status and order), "list", "get" (requires id), "update" (requires id and at least one of title, summary, content, status, order; fields you omit are unchanged), and "remove" (requires id). Status is planned, draft or complete and defaults to planned. The optional integer order sorts list: ordered chapters first ascending, unordered ones after in insertion order. Ids are stable strings returned by "add". Lists and mutation results carry summaries without the body; only "get" returns content. Chapters are shared by every agent in this harness, kept across turns, and cleared by reset. "list" returns ONE PAGE: { chapters, counts { total, planned, draft, complete }, page { offset, limit, hasMore, nextOffset? } } - 20 by default, at most 100, 64 KiB serialized page budget. "get" returns { chapter, content, counts }; "add"/"update" return { chapter, counts } and "remove" returns { removed, counts }, with NO list. Caps: 200 chapters, 200-character titles, 4000-character summaries and content.',
     tags: ['chapter', 'chapters', 'story', 'writing', 'outline', 'book'],
-    visibility: 'core',
+    // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
+    // and enables it for this session instead of seeing it declared on every request.
+    // Registration itself is unchanged (the entry still joins the harness registry),
+    // so toolRequest always has something to surface.
+    visibility: 'searchable',
     parameters: {
         type: 'object',
         properties: {
@@ -82,7 +86,7 @@ export const registration = {
     activation: 'always',
     order: 80,
     sessionBound: true,
-    alwaysDeclared: true,
+    alwaysDeclared: false,
     listed: true
 } as const;
 

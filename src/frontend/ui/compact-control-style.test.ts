@@ -112,8 +112,20 @@ it('imports the agent dialog stylesheet and keeps the single-writer action botto
     expect(rules).not.toContain('.agent-dialog .agent-summary {');
     expect(rules).not.toContain('.agent-dialog-instructions');
 
-    // The dropdown is a full-width field: every advertised agent fits in one control.
-    expect(blockOf('.agent-dialog-agent-select {', agentDialogRules)).toContain('width: 100%');
+    // R3: the roster strip is a full-width wrap of badges (the dropdown and the
+    // duplicate Team section are gone, and their rules must not come back).
+    expect(blockOf('.agent-dialog-tabs {', agentDialogRules)).toContain('width: 100%');
+    expect(blockOf('.agent-dialog-tabs {', agentDialogRules)).toContain('flex-wrap: wrap');
+    expect(agentDialogRules).not.toContain('.agent-dialog-agent-select {');
+    expect(agentDialogRules).not.toContain('.agent-dialog-note {');
+    expect(agentDialogRules).not.toContain('.agent-dialog-team-list {');
+
+    // The selected badge and the `[+]` are both painted, so "which agent am I editing"
+    // and "how does another agent join" are visible without a sentence.
+    expect(blockOf(".agent-dialog-tab[aria-selected='true'] {", agentDialogRules)).toContain(
+        'border-color: var(--accent)'
+    );
+    expect(blockOf('.agent-dialog-add {', agentDialogRules)).toContain('border-radius: 999px');
 
     // The instruction is a real editor (multi-line, resizable), not a read-only block.
     const editor = blockOf('.agent-dialog-instruction {', agentDialogRules);
@@ -145,7 +157,7 @@ it('imports the agent dialog stylesheet and keeps the single-writer action botto
     expect(error).toContain('flex: 1 1 100%');
     expect(error).toContain('color: var(--danger)');
 
-    // The team rows carry the live activity state (ui/activity.ts paints them).
+    // The roster badges carry the live activity state (ui/activity.ts paints them).
     expect(blockOf(".agent-dialog-agent[data-activity='active'] {", agentDialogRules)).toContain(
         'border-color: var(--accent)'
     );

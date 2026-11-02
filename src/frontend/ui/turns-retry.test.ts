@@ -6,10 +6,19 @@
 // attempt's output must then render normally.
 //
 // Pinned contract:
-//   - the failed attempt's prose, reasoning and tool chips are removed;
+//   - the failed attempt's prose, its think chip and its tool chips are removed;
+//   - a discarded think chip's DIALOG is closed with it (`card.destroy()`), and the
+//     committed chip's text is never touched by the discard;
 //   - the notice names the attempt, the budget, the backoff and the failed error;
 //   - output from an EARLIER successful turn of the same run is never discarded;
 //   - a malformed retry frame renders nothing (no fabricated "retry 0 in 0ms").
+//
+// REASONING is an inline CHIP, not a block: one `details.tool.think` per model request,
+// appended INTO the agent's `.tool-group` row (ui/turns.ts `appendReasoning` +
+// ui/tools.ts `createReasoningCard`). Because the chip IS a `details.tool`, every
+// TOOL-CALL count in this file selects `details.tool:not(.think)` and every REASONING
+// assertion selects `.tool.think` (its full text is `.tool.think .reasoning`). The old
+// `<details class="thinking">` block and its `.thinking-summary` no longer exist.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts
 
@@ -23,6 +32,27 @@ const mount = () => {
     document.body.replaceChildren(board.element);
     return board;
 };
+
+// The full text of every reasoning round still on screen, in DOM order. A think chip's
+// `.reasoning` block is the ONLY place that text lives now (it moves into the chip's
+// dialog while one is open, which no test here does), so this is the discard probe.
+const reasoningTexts = (turn: { element: HTMLElement }): string[] =>
+    [...turn.element.querySelectorAll('.tool.think .reasoning')].map((node) => node.textContent ?? '');
+
+// The tool CALLS still on screen: `details.tool` alone would also count think chips.
+const callChips = (turn: { element: HTMLElement }): number =>
+    turn.element.querySelectorAll('details.tool:not(.think)').length;
+
+// The think chips still on screen, one per model request.
+const thinkChips = (turn: { element: HTMLElement }): number =>
+    turn.element.querySelectorAll('details.tool.think').length;
+
+// Every wrapping chip row in the block, as the chip names it holds in DOM order. A
+// reasoning round now appears in here as `think` rather than as a flow-level block.
+const rowsOf = (turn: { element: HTMLElement }): string[][] =>
+    [...turn.element.querySelectorAll('.agent-flow > .tool-group')].map((row) =>
+        [...row.querySelectorAll('.tool-name')].map((node) => node.textContent ?? '')
+    );
 
 const start = (agent = 'writer'): HarnessEvent => ({ type: 'start', agent, model: 'm1' });
 
@@ -54,15 +84,26 @@ describe('model-request retries (R1)', () => {
         });
         turn.flush();
 
-        // The failed attempt is visible until the retry frame arrives.
-        expect(turn.element.querySelectorAll('details.tool')).toHaveLength(1);
+        // The failed attempt is visible until the retry frame arrives: its one tool
+        // call AND the think chip its reasoning deltas minted (both live in the SAME
+        // `.tool-group` row, which is why the call count excludes the chip).
+        expect(callChips(turn)).toBe(1);
+        expect(thinkChips(turn)).toBe(1);
+        expect(reasoningTexts(turn)).toEqual(['thinking']);
+        // The chip is the row's only child, and the prose that followed it opened a
+        // second row for the call — reasoning itself never splits the row.
+        expect(rowsOf(turn)).toEqual([['think'], ['dangerous']]);
 
         turn.apply(retry());
         turn.flush();
 
-        // Everything the abandoned attempt produced is gone.
+        // Everything the abandoned attempt produced is gone: the call chip, the think
+        // chip (no `.thinking` block survives either, because there is no longer one)
+        // and the prose.
         expect(turn.element.querySelectorAll('details.tool')).toHaveLength(0);
-        expect(turn.element.querySelector('.thinking')).toBeNull();
+        expect(callChips(turn)).toBe(0);
+        expect(thinkChips(turn)).toBe(0);
+        expect(reasoningTexts(turn)).toEqual([]);
         expect(turn.element.textContent).not.toContain('partial draft');
         expect(turn.element.textContent).not.toContain('thinking');
 
@@ -446,17 +487,16 @@ describe('attempt ownership (F1/F2/F4/F5)', () => {
 //
 // The real sequence for a reasoning round that then fails its first attempt is
 // `start, reasoning, tool_call, attempt_commit, tool_result, reasoning, retry,
-// text, done`. Committing a request must DETACH the incremental reasoning writer,
-// otherwise the failed attempt's deltas are appended into the committed block:
-// the two requests fuse into one node, and the discard (which only removes owned
-// nodes) cannot separate them, so the failed reasoning survives.
+// text, done`. Each round renders as ONE inline think chip in the agent's
+// `.tool-group` row, and committing a request must DETACH the incremental reasoning
+// WRITER pointer (the chip itself stays in the DOM with its text), otherwise the
+// failed attempt's deltas are appended into the committed chip: the two requests
+// fuse into one chip, and the discard (which only removes owned chips) cannot
+// separate them, so the failed reasoning survives.
 // ---------------------------------------------------------------------------
 
 describe('per-request reasoning ownership (T8)', () => {
     const reasoning = (delta: string): HarnessEvent => ({ type: 'reasoning', agent: 'writer', delta });
-
-    const reasoningText = (turn: { element: HTMLElement }): string[] =>
-        [...turn.element.querySelectorAll('.reasoning')].map((node) => node.textContent ?? '');
 
     it('keeps committed reasoning and drops the failed attempt reasoning', () => {
         const board = mount();
@@ -473,13 +513,77 @@ describe('per-request reasoning ownership (T8)', () => {
         turn.apply(text('final'));
         turn.flush();
 
-        // Two SEPARATE reasoning blocks are never fused: the committed one survives
-        // verbatim and the failed one is gone entirely.
-        expect(reasoningText(turn)).toEqual(['committed plan']);
+        // Two SEPARATE think chips are never fused: the committed one survives verbatim
+        // and the failed one is gone entirely — including its chip, its text and the
+        // `.reasoning` block inside it.
+        expect(reasoningTexts(turn)).toEqual(['committed plan']);
+        expect(thinkChips(turn)).toBe(1);
+        expect(turn.element.querySelector('.tool.think .tool-name')?.textContent).toBe('think');
         expect(turn.element.textContent).not.toContain('failed musing');
         expect(turn.element.textContent).toContain('final');
-        expect(turn.element.querySelectorAll('details.tool')).toHaveLength(1);
+        // The committed call chip is untouched by the discard (reasoning is not a call).
+        expect(callChips(turn)).toBe(1);
         expect(turn.element.querySelectorAll('.agent-retry')).toHaveLength(1);
+    });
+
+    // The chip is INLINE, so a discard removes it from the row the committed calls share
+    // and leaves that row (and its chips) standing.
+    it('removes only the failed attempt think chip from a shared tool row', () => {
+        const board = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(reasoning('first plan'));
+        turn.apply(call('c1', 'read'));
+        turn.apply(commit());
+        // The next request mints its OWN chip in the same row, then fails.
+        turn.apply(reasoning('second musing'));
+        turn.apply(call('c2', 'search'));
+        turn.flush();
+
+        expect(rowsOf(turn)).toEqual([['think', 'read', 'think', 'search']]);
+        expect(reasoningTexts(turn)).toEqual(['first plan', 'second musing']);
+
+        turn.apply(retry());
+        turn.flush();
+
+        // Only the failed attempt's chips leave; the row keeps the committed pair, and
+        // the committed chip's text is still exactly the committed buffer.
+        expect(rowsOf(turn)).toEqual([['think', 'read']]);
+        expect(reasoningTexts(turn)).toEqual(['first plan']);
+        expect(turn.element.textContent).not.toContain('second musing');
+    });
+
+    // The discard also closes a dialog the discarded chip OWNS (`card.destroy()`): a
+    // modal left behind by a chip that is no longer in the transcript is an orphan with
+    // a stale focus trap and a body that no longer belongs to the document.
+    it('closes a dialog the discarded think chip owns', () => {
+        const board = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(reasoning('committed plan'));
+        turn.apply(commit());
+        turn.apply(reasoning('failed musing'));
+        turn.flush();
+
+        const failed = turn.element.querySelectorAll('details.tool.think')[1] as HTMLDetailsElement;
+        expect(failed.querySelector('.reasoning')?.textContent).toBe('failed musing');
+
+        // Activating the chip MOVES that same body into the modal (no clone, no
+        // duplicate), and with no context reported the title carries only the count.
+        failed.querySelector('summary')?.click();
+        const dialog = document.querySelector<HTMLElement>('.dialog');
+        expect(dialog).not.toBeNull();
+        expect(dialog?.querySelector('.dialog-title')?.textContent).toBe('think · 13 chars');
+        expect(dialog?.querySelector('.reasoning')?.textContent).toBe('failed musing');
+
+        turn.apply(retry());
+        turn.flush();
+
+        expect(document.querySelector('.dialog')).toBeNull();
+        expect(thinkChips(turn)).toBe(1);
+        expect(reasoningTexts(turn)).toEqual(['committed plan']);
     });
 
     it('keeps committed reasoning when the same sequence is replayed', () => {
@@ -502,7 +606,10 @@ describe('per-request reasoning ownership (T8)', () => {
         replay(text('final'));
         turn.flush();
 
-        expect(reasoningText(turn)).toEqual(['committed plan']);
+        // The replayed record is the same event list, so the live and recorded paths
+        // must agree chip for chip.
+        expect(reasoningTexts(turn)).toEqual(['committed plan']);
+        expect(rowsOf(turn)).toEqual([['think', 'read']]);
         expect(turn.element.textContent).not.toContain('failed musing');
         expect(turn.element.textContent).toContain('final');
     });

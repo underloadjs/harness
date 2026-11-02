@@ -35,7 +35,7 @@ describe('metadata: actionRequest', () => {
     it('pins the name and core visibility', () => {
         expect(ACTION_REQUEST_NAME).toBe('actionRequest');
         expect(ACTION_REQUEST_METADATA.name).toBe('actionRequest');
-        expect(ACTION_REQUEST_METADATA.visibility).toBe('core');
+        expect(ACTION_REQUEST_METADATA.visibility).toBe('searchable');
         expect(ACTION_REQUEST_METADATA.tags).toEqual([
             'question',
             'ask',
@@ -101,7 +101,7 @@ describe('metadata: threadFork', () => {
     it('pins the name, input requirement and optional label bound', () => {
         expect(THREAD_FORK_NAME).toBe('threadFork');
         expect(THREAD_FORK_METADATA.name).toBe('threadFork');
-        expect(THREAD_FORK_METADATA.visibility).toBe('core');
+        expect(THREAD_FORK_METADATA.visibility).toBe('searchable');
         expect(THREAD_FORK_METADATA.tags).toEqual([
             'fork',
             'thread',
@@ -132,15 +132,9 @@ describe('conditional core registration', () => {
     it('does not put the conditional tools in the always-registered core set', () => {
         expect(coreToolMetadata().map((metadata) => metadata.name)).toEqual([
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult'
+            'task',
+            'search',
+            'fetch',
         ]);
     });
 });

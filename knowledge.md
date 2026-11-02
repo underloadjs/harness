@@ -16,7 +16,7 @@ Plugin-first CLI agent harness. `agent` is the brain, `tool` is an action, `harn
 
 1. Read `src/harness.ts` for the public barrel and the loop
 2. Check `src/core/agent.ts`, `src/core/tool.ts`, `src/core/discovery.ts`,
-   `src/core/creation.ts`, `src/core/todo.ts`, `src/core/profile.ts`,
+   `src/core/creation.ts`, `src/core/task.ts`, `src/core/profile.ts`,
    `src/core/chapter.ts`, `src/core/location.ts`, `src/core/action.ts`,
    `src/core/branch.ts`, and `src/transport/openai.ts` + `src/transport/models.ts`
 3. Check `src/tools/catalogue.ts` / `src/tools/lazy.ts` when touching presets
@@ -39,13 +39,14 @@ src/
   harness.test.ts       its test, next to it
   harness.creation.test.ts    toolCreate behaviour, next to the loop
   harness.delegation.test.ts  primary/subagents + delegate, next to the loop
-  harness.todo.test.ts        todoManage declaration/state in a harness
+  harness.task.test.ts        task declaration/state in a harness
   harness.records.test.ts     profileManage/chapterManage/locationManage in a harness
   harness.metadata.test.ts    core tool metadata (R7 cap, schemas) as registered
   harness.websearch.test.ts   opt-in search registration/core declaration/secrets
+  harness.webfetch.test.ts    opt-in fetch registration (native default, hosted keys)
   core/
     index.ts            barrel: agent, tool, searchTools, compileToolSource, createDynamicTool,
-                        createTodoTool, createProfileTool, createChapterTool, createLocationTool,
+                        createTaskTool, createProfileTool, createChapterTool, createLocationTool,
                         action/branch internals (validateActionRequestParameters,
                         validateActionChoice, agentBranchOf, forkAgent, materialize/incorporate)
     agent.ts            the brain
@@ -119,7 +120,19 @@ src/
       request.ts        bounds, fetch/timeout, sanitized errors, normalization, redaction
       exa.ts            Exa adapter (dynamic import)
       tavily.ts         Tavily adapter (dynamic import)
-      websearch.test.ts factory + both adapters, env injected, fetch stubbed
+      linkup.ts         Linkup adapter (dynamic import)
+      websearch.test.ts factory + all three adapters, env injected, fetch stubbed
+    webfetch/
+      index.ts          createWebFetchTool: native is always the default provider
+      request.ts        page bounds (100 KiB / 24 000 chars), text-only gate, URL rules
+      native.ts         the direct GET + dependency-free HTML→markdown/text converter
+      exa.ts            Exa /contents adapter (dynamic import)
+      linkup.ts         Linkup /v1/fetch adapter (dynamic import)
+      webfetch.test.ts  native + both hosted providers, env injected, fetch stubbed
+    webdownload/
+      index.ts          type-only barrel (no value import, keeps the entry lazy)
+      download.tool.ts  the `download` preset: 20 MiB cap, toolMedia() envelope
+      download.test.ts  caps, streaming, names, kinds, cancellation
     presets.test.ts     covers every preset, standalone and in a harness
   plugin/
     index.ts            barrel: runPlugins
@@ -167,7 +180,8 @@ src/server/
   harnesses/
     index.ts            createToolCatalogue: runtime catalogue for CLI and server
     core.ts             core-tool catalogue entries (sessionBound) for the server (R8)
-    presets.ts          the seven built-ins (5 real roles + 2 fixtures), legacy defaults,
+    presets.ts          the 5 shipped presets + 2 explicit fixtures (T5: demo/flaky are
+                    presets but not catalogue entries), legacy defaults,
                         and teamOf() — assembled from src/agents profiles
     registry.ts         in-memory registry: create/patch, aliases, validation, agentModels (R9),
                         restore policy (refresh unmodified shipped defaults, T3)
@@ -297,7 +311,7 @@ reach into `src/`.
 - [agent](#agent) — The brain, usable on its own
 - [tool](#tool) — An executable action: call it directly, or let the model call it
 - [Tool discovery](#tool-discovery) — Tags, visibility, toolRequest, and the ranking
-- [Session todos](#session-todos) — Core todoManage, incremental ids, per-harness state
+- [Session tasks](#session-tasks) — Core task, incremental ids, per-harness state
 - [Session records](#session-records) — Core profileManage/chapterManage/locationManage stores
 - [Agent results](#agent-results-r3) — Core agentManage/agentResult result inspection
 - [toolCreate](#createtool) — Runtime tool creation from an async function body
@@ -306,8 +320,10 @@ reach into `src/`.
   Conditional `actionRequest`/`threadFork`, autoanswer owner forks, ephemeral branches
 
 ### Preset Tools
-- [Preset tools](#preset-tools) - the eight lazy presets, executable on their own
-- [Web search](#web-search) — opt-in per-harness `search` over Exa/Tavily
+- [Preset tools](#preset-tools) - the ten lazy presets, executable on their own
+- [Web search](#web-search) — opt-in per-harness `search` over Exa/Tavily/Linkup
+- [Web fetch](#web-fetch) — opt-in `fetch`: keyless `native` default, hosted `exa`/`linkup`
+- [Web download](#web-download) — always-registered `download`: 20 MiB bytes as model media
 
 ### Harness
 - [harness](#harness) — Callable execution loop
@@ -334,7 +350,7 @@ reach into `src/`.
 | Layer | Owns | Must not own |
 |---|---|---|
 | `agent` | model, instruction, history, one transport call per turn plus its model-request retry sequence | tool execution, compaction, planning |
-| `tool` | description, JSON Schema, one `execute` function | state (except the harness-owned `todoManage`/record factories), retries, policy |
+| `tool` | description, JSON Schema, one `execute` function | state (except the harness-owned `task`/record factories), retries, policy |
 | `harness` | agent registry, tool registry, loop, progress | model I/O, prompt policy |
 
 The harness is the only layer that knows about tools and looping. That is what
@@ -461,7 +477,7 @@ Harness tools are named for what the model calls them. Two shapes coexist on pur
 | Namespace | Tools |
 |---|---|
 | `tool*` | `toolRequest` (discovery), `toolCreate` (runtime creation), `toolManage`, `toolList`, `toolRegistry`, `toolCancel` |
-| `todo*` | `todoManage` (session todos) |
+| `task*` | `task` (session tasks; the `Todo*` type names stay as legacy aliases) |
 | `profile*` | `profileManage` (session character/people records) |
 | `chapter*` | `chapterManage` (session chapters, summaries + ordered list) |
 | `location*` | `locationManage` (session locations/places) |
@@ -505,7 +521,7 @@ What is deliberately **not** renamed:
   tool (`websearch: true | WebsearchConfiguration`), so renaming it would break
   every host's configuration for no API gain;
 - **generic helpers** — `createToolCatalogue`, `createToolFrom`, `createToolRunner`,
-  `createToolboxHarness`, `createTodoTool`, `createDynamicTool`,
+  `createToolboxHarness`, `createTaskTool`, `createDynamicTool`,
   `createWebSearchTool`, and native `node:fs` `readFile`/`writeFile` imports are
   functions, not wire names.
 
@@ -583,16 +599,21 @@ created with `presets: false`. **Five file tools are core (R18)** —
 request and need no discovery. `fileList`, `syntax`, `shell`, and
 `gitDiff` stay searchable: a model that needs a directory listing asks for
 `files`/`list`. A configured tool replaces a preloaded preset of the same name.
-The harness-owned toolRequest/toolList/toolManage/toolCreate/todoManage/
-profileManage/chapterManage/locationManage/agentManage/agentResult (plus delegate
-for a primary with subagents) are core too, and a configured `search` is core
-as well. `actionRequest` is core only when
-`interaction` is configured; `threadFork` is core when `forks.enabled` (the
+The harness-owned `toolRequest` and `task` are core too, and so is the
+environment-backed web pair: `search` when a provider key resolved, `fetch` when
+the host opted into `webfetch` (R9-R11). The remaining harness-owned rows
+(`toolList`, `toolManage`, `toolCreate`, `profileManage`, `chapterManage`,
+`locationManage`, `agentManage`, `agentResult`) stay registered but SEARCHABLE,
+exactly like the always-registered `download` preset: the model opens them with
+`toolRequest`. `delegate` is core only for a primary with a subagent allowlist;
+`actionRequest` is core only when `interaction` is configured; `threadFork` is
+core when `forks.enabled` (the
 default). Both are registered as standalone definitions whose `execute` refuses a
 direct call, because the runtime handles them with the owning run.
 
-**Core is not session-bound.** The five core file tools and `search` have real
-implementations, so the server's direct-call path runs them without a `sessionId`.
+**Core is not session-bound.** The five core file tools, `download`, `search`,
+and `fetch` have real implementations, so the server's direct-call path runs them
+without a `sessionId`.
 Only the harness-owned set mutates a session's harness and therefore carries
 `sessionBound: true`. There is no `fileSearch` tool and no mode switch either:
 `glob` lists names and `grep` searches contents, both under their own name, and both
@@ -602,7 +623,7 @@ are core.
 it closes over the live registry and the harness's active set. It is registered
 after the declarative tools and before plugins, is always core, and its name is
 reserved (`harness()` throws if the config or a preset already has `toolRequest`).
-`toolCreate`, `todoManage`, `profileManage`, `chapterManage`, `locationManage`,
+`toolCreate`, `task`, `profileManage`, `chapterManage`, `locationManage`,
 `agentManage`, `agentResult`, and
 (when subagents exist) `delegate` are reserved the same way, as are
 `actionRequest` and `threadFork` when their configuration registers them.
@@ -675,41 +696,50 @@ bytes (or delete the new file) and surface rollback failure.
 
 ---
 
-## Session todos
+## Session tasks
 
-`src/core/todo.ts` builds the core `todoManage` tool. It is a **deliberate
-exception to the stateless-tool rule**: the state lives in the factory closure,
-never in a module singleton, so the harness owns exactly one list per instance.
+`src/core/task.ts` builds the `task` tool (R9-R11 renamed it from `task`).
+It is a **deliberate exception to the stateless-tool rule**: the state lives in the
+factory closure, never in a module singleton, so the harness owns exactly one list
+per instance.
 
 ```ts
-const { tool, reset } = createTodoTool();   // fresh list + id counter
+const { tool, reset, snapshot } = createTaskTool();   // fresh list + id counter
 ```
 
-- Actions are incremental: `add` (`text`), `remove` (`id`), `check` (`id`,
-  optional `completed`), `uncheck` (`id`), and `list`. `check` defaults to
-  `completed: true`; `completed: false` and the explicit `uncheck` alias both
-  clear it. `uncheck` ignores `completed` (it is always false).
-- Ids are decimal strings (`"1"`, `"2"`, …), monotonic per instance. `reset()`
-  clears both the list and the counter.
-- Results are bounded and split by action (R9): `list` returns ONE page,
-  `{ todos, counts: { total, completed, remaining }, page: { offset, limit, hasMore,
+- The wire shape is one **merge command**, not an action enum: `tasks` holds patch
+  entries, `remove` holds ids, `offset`/`limit` page the answer. No arguments (or
+  `{}`) is a read. An entry **without** `id` adds a task (`text` required); an entry
+  **with** a known `id` patches it — `text` and/or `completed`, whichever are sent;
+  omitted fields are unchanged. An unknown id, an entry with neither `text` nor a
+  known `id`, one id patched twice, or an id in both `tasks` and `remove` are all
+  rejections.
+- The whole patch is validated **before** anything mutates, so a rejected call
+  leaves the list exactly as it was.
+- Ids are decimal strings (`"1"`, `"2"`, …), monotonic per instance; a removed id
+  is never re-used. `reset()` clears both the list and the counter.
+- Every success answers the SAME bounded envelope, with no action wrapper:
+  `{ tasks, counts: { total, completed, pending }, page: { offset, limit, hasMore,
   nextOffset? } }` (20 items by default, hard maximum 100, and a 64 KiB serialized
-  page budget that stops BEFORE an item which would cross it); every mutation returns
-  only `{ todo | removed, counts }` with NO list, so a caller that needs the list
-  calls `list` with `offset`/`limit`. `todos`, `todo`, and `removed` are defensive
-  copies, so mutating a result can never mutate the session list. Caps:
-  200 todos and 4000 characters of text each.
-- Validation is per action and type-checked consistently: not an object, unknown
-  action, non-string `text`/`id`, non-boolean `completed`, blank text/id, and an
-  unknown id all throw `HarnessError` with the action/field named. The harness
-  turns that into a recoverable tool result; a failed call never mutates the list.
-- `src/harness.ts` registers the factory's tool under the exact name `todoManage`,
-  marks it core (declared to every agent with no discovery), adds it to
-  `RESERVED_TOOL_NAMES`, and calls the returned `reset()` from `harness.reset()`.
-  Because `src/server/sessions.ts` creates one harness per session, todos are isolated
-  per session and shared by the primary and its subagents within one harness.
-- No persistence, no UI panel, no HTTP endpoint, no priorities/statuses. The
-  tool-call UI renders the JSON result like any other tool.
+  page budget that stops BEFORE an item which would cross it). `tasks` is the
+  current page — including right after an add, a patch, or a remove — and is a
+  defensive copy, so mutating a result can never mutate the session list. Caps:
+  200 tasks and 4000 characters of text each.
+- Validation names the offending field with a quoted, balanced path
+  (`task "tasks[0]" needs "text" to add a task, or an existing "id" to change one.`);
+  the harness turns the throw into a recoverable tool result.
+- `src/harness.ts` registers the factory's tool under the exact name `task`, marks
+  it core (`alwaysDeclared`, so it is declared to every agent with no discovery),
+  adds it to `RESERVED_TOOL_NAMES`, and calls the returned `reset()` from
+  `harness.reset()`. Because `src/server/sessions.ts` creates one harness per
+  session, tasks are isolated per session and shared by the primary and its
+  subagents within one harness.
+- Snapshot persistence keeps the store's wire key: `records.todos: { items, nextId }`
+  (snapshot v1) with `items` in the `TaskItem` shape (`id`, `text`, `completed`).
+  `readTaskStoreState` validates it and reports duplicate or non-positive integer ids
+  with the persisted field name (`todo state contains the duplicate id "1".`).
+- Beyond the tool result and the snapshot, `getTaskStoreState()` returns a bounded
+  defensive copy for hosts. No UI panel and no dedicated HTTP endpoint.
 
 **Not OpenCode's `todowrite`.** OpenCode's current dev branch (`fd8268e`,
 2026-10-27) has an experimental `todo` plugin tool gated by `experimental.todo`:
@@ -720,16 +750,16 @@ Sources:
 [`plugin/todo.ts`](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/plugin/todo.ts),
 [`todowrite.txt`](https://github.com/anomalyco/opencode/blob/dev/packages/core/src/tool/todowrite.txt),
 [`tool-todo.test.ts`](https://github.com/anomalyco/opencode/blob/dev/packages/core/test/tool-todo.test.ts).
-`todoManage` is intentionally a harness-specific incremental API, not parity; do
-not replace it with the full-list shape.
+`task` is a partial patch with stable ids, not parity: it never rewrites the whole
+list and it does not carry `in_progress`/`cancelled` states.
 
 ---
 
 ## Session records
 
 `src/core/profile.ts`, `src/core/chapter.ts`, and `src/core/location.ts` add three
-more core tools with the same factory-closure lifecycle as [Session
-todos](#session-todos): one store per harness (so per server session), shared by
+more harness-owned tools with the same factory-closure lifecycle as [Session
+tasks](#session-tasks): one store per harness (so per server session), shared by
 every agent there, stable decimal-string ids from `"1"`, full validation before
 any mutation, defensive copies on every result, and cleared by `harness.reset()`
 (ids restart at `"1"`). Their metadata lives in `core/metadata.ts` and their types
@@ -840,11 +870,12 @@ agentResult({ agent: 'researcher', invocationId: '3', offset: 4000 })
 
 ## Preset tools
 
-`src/tools/` ships nine presets: `syntax`, the six file tools (`read`,
-`write`, `edit`, `fileList`, `glob`, `grep`), `shell`, and `gitDiff`. Each
-is a standard `tool()` and each is executable standalone. R18: `read`,
-`write`, `edit`, `glob`, and `grep` are **core**; `fileList`, `syntax`,
-`shell`, and `gitDiff` remain **searchable**.
+`src/tools/` ships ten presets: `syntax`, the six file tools (`read`,
+`write`, `edit`, `fileList`, `glob`, `grep`), `shell`, `gitDiff`, and
+`download`. Each
+is a standard `tool()` and each is executable standalone. R18 kept `read`,
+`write`, `edit`, `glob`, and `grep` **core**; `fileList`, `syntax`, `shell`,
+`gitDiff`, and (R9-R11) `download` are **searchable**.
 
 The folder is one file per tool, one folder per capability — `tools/syntax/`,
 `tools/files/`, `tools/command/` — and the barrel exports both the named tools and
@@ -877,7 +908,7 @@ when it is newer than the manifest (T24). Consequences:
 - a failed import clears the cache so the next call retries.
 
 Every preset is tagged. The five core file tools are declared up front; the
-searchable remainder (`fileList`, `syntax`, `shell`, `gitDiff`) waits for
+searchable remainder (`fileList`, `syntax`, `shell`, `gitDiff`, `download`) waits for
 `files`/`list`, `shell`, `git`, `javascript`/`typescript`/`json`/`python`, or the
 `grep` tag.
 
@@ -892,6 +923,7 @@ searchable remainder (`fileList`, `syntax`, `shell`, `gitDiff`) waits for
 | `grep` | `({ pattern, patterns?, paths?, maxResults? })` | `{ matches: [{ path, line, text, textTruncated, bytes }], truncated, bytes, contentBudget }` (required `pattern`; 1 KiB snippet per line, 64 KiB aggregate) |
 | `shell` | `({ command, cwd?, timeoutMs? })` | `{ exitCode, stdout, stderr, truncated, timedOut, aborted }`; stdout 128 KiB / stderr 16 KiB, timeout 1..600000 ms (default 120000), process tree killed best-effort |
 | `gitDiff` | `({ ref?, staged?, paths?, cwd? })` | `{ exitCode, stdout, stderr, truncated, timedOut, stderrTruncated, aborted }`; `paths` is one path or a non-empty array |
+| `download` | `({ url, name? })` — absolute `http(s)`, no userinfo, URL ≤2 048 chars | a `toolMedia()` **envelope**, not a plain value: `{ content: { url, finalUrl, contentType, kind, name, bytes, declaredBytes?, media: 'attached', mediaId }, __toolMedia: [attachment] }` — the summary text is what the model reads, the bytes ride on the tool message (20 MiB cap, 60 s, one attempt, nothing written to disk) |
 
 Implementation notes worth keeping:
 
@@ -993,11 +1025,15 @@ Implementation notes worth keeping:
   then files by resolved identity, with the first root winning the prefix; the cap is
   global. A non-object argument (a string or an array) is rejected instead of
   silently meaning "every file", and an explicit empty `patterns`/`paths` array is
-  rejected instead of matching nothing. `grep` additionally skips `.git`,
-  `node_modules`, symlinks, binaries, and files over 1 MiB, caps its result at 100
+  rejected instead of matching nothing. Both skip `.git` and symlinks always, and skip
+  `node_modules` unless a root is placed inside it; both honor the `.gitignore` files
+  **at or below** each root (`tools/files/gitignore.ts`), so an ignored path is neither
+  listed nor read, while a root you name explicitly is still walked because no rule
+  above a root reaches into it. `grep` additionally skips binaries and files over 1 MiB,
+  caps its result at 100
   matches (clamped 1-100), cuts each match to a 1 KiB snippet on a code-point boundary
   with `textTruncated`, and stops the whole call at a 64 KiB aggregate with
-  `truncated`; `.gitignore` is deliberately not read.
+  `truncated`; `.git/info/exclude` and the global `core.excludesFile` are not read.
 - **Content matching is time-bounded.** grep's `pattern` is a JavaScript regex, and
   JavaScript regexes backtrack: `(a+)+$` blocks the process for seconds on a 31-byte
   line. `tools/files/bounded-regex.ts` therefore runs the match loop inside
@@ -1029,7 +1065,7 @@ reason is the design: it needs a provider credential, and a credential belongs t
 one harness. A module singleton would freeze the first key ever read and advertise
 a network tool the host may not be able to authenticate.
 
-**Factory, not catalogue entry.** `createWebSearchTool({ env?, exa?, tavily? })`
+**Factory, not catalogue entry.** `createWebSearchTool({ env?, exa?, tavily?, linkup? })`
 (`tools/websearch/index.ts`) resolves keys **once, at construction** (a getter is
 not re-read per search; there is no rotation), and returns
 `Tool<WebSearchParameters, WebSearchResult> | undefined`. `undefined` is not an
@@ -1039,9 +1075,9 @@ error: it means no provider has a usable key, and that is also what makes
 | Input | Result |
 |---|---|
 | absent / `false` | no tool |
-| `true` / `{}` | read `EXA_API_KEY` / `TAVILY_API_KEY` from `process.env` |
+| `true` / `{}` | read `EXA_API_KEY` / `TAVILY_API_KEY` / `LINKUP_API_KEY` from `process.env` |
 | `env: {...}` | same, from an injected snapshot (tests, deploy) |
-| `exa.apiKey` / `tavily.apiKey` | explicit string or getter (called once), wins over env |
+| `exa.apiKey` / `tavily.apiKey` / `linkup.apiKey` | explicit string or getter (called once), wins over env |
 | explicit blank key | that provider is off, **without** falling back to env |
 | no provider with a key | `undefined` |
 | configured `tools.search` | wins; the factory is not consulted |
@@ -1056,24 +1092,37 @@ tool. Keys live in the tool closure: two harnesses never share one, and nothing
 enters the schema, arguments, result, events, `RunnerSettings`, the UI, or a client
 payload.
 
-**Catalogue visibility (C1).** `src/harnesses/websearch.ts` always produces an entry
+**Catalogue visibility (C1).** `src/server/harnesses/websearch.ts` always produces an entry
 for the direct-call catalogue. `createWebSearchCatalogueEntry()` calls the factory
 at run time and returns `{ entry, tool? }`:
 
 | Host state | Catalogue result |
 |---|---|
-| `EXA_API_KEY` / `TAVILY_API_KEY` present | entry + executable tool; `availability: { state: 'available', environment: [...] }` |
+| any of `EXA_API_KEY` / `TAVILY_API_KEY` / `LINKUP_API_KEY` present | entry + executable tool; `availability: { state: 'available', environment: [...] }` |
 | no usable key | entry with `WEB_SEARCH_METADATA` and no `tool`; `availability: { state: 'unconfigured', environment: [...], hint }` |
 
 `src/server/harnesses/index.ts` exports `createToolCatalogue(options?)` instead of module-level
 `catalogue`/`allTools`. The factory is what makes startup ordering safe: the server
 and CLI load `.env` after their imports, then build the catalogue, so the key is
 captured once for the handler's lifetime (never at module evaluation). `websearch`
-is group `'Web search'`; existing groups and the CLI column layout are unchanged.
+is group `'Web search'` and `webfetch` is group `'Web fetch'` (the `ToolGroup` union in
+`src/server/harnesses/types.ts`); existing groups and the CLI column layout are
+unchanged.
 `GET /api/tools` sends the optional `availability` field; `POST /api/tools/search`
 executes the injected tool when configured and returns `{ ok: false, error }` with
 the hint when not. No path echoes a key value — the hint carries variable names
 only.
+
+**The fetch entry is the same shape with a different gate.**
+`src/server/harnesses/webfetch.ts` exports `createWebFetchCatalogueEntry({ enabled?,
+configuration? })` -> `{ entry, tool? }`. `enabled` defaults to `true`, because every
+live preset builds its toolbox with `webfetch: true` (`./toolbox.ts`) and the `native`
+provider needs no credential; a host that never opts in passes `enabled: false` and
+gets the entry with `WEB_FETCH_METADATA`, no `tool`, and
+`availability: { state: 'unconfigured', environment: ['EXA_API_KEY', 'LINKUP_API_KEY'],
+hint }`. `createToolCatalogue()` appends it right after `search`, and that pairing is
+what lets `describeHarness` name `fetch` in a card's `tools`/`coreTools`: a descriptor
+advertises an environment tool only when the catalogue can actually run it.
 
 **Wire contracts** (fixed endpoints, keys in headers only):
 
@@ -1084,10 +1133,18 @@ only.
   `{ query, max_results, search_depth: 'basic', include_answer: false,
   include_raw_content: false }`, response `results[{ title, url, content,
   score?, published_date? }]`.
+- Linkup — `POST https://api.linkup.so/v1/search`, `Authorization: Bearer`, body
+  `{ q, depth: 'fast', outputType: 'searchResults', maxResults }`, response
+  `results[{ type, name, url, content, favicon }]`. `name` is the title and
+  `content` the excerpt; `type`/`favicon` are dropped and Linkup sends no
+  publication date, so `published` is simply absent for this provider.
+  `depth: 'fast'` and `outputType: 'searchResults'` are pinned for cost and
+  shape: an LLM-composed answer would be model output presented as a search
+  result (the same reason Tavily's `include_answer` is off).
 
-`numResults` / `max_results` are always set explicitly: the provider default must
-not decide the tool's context cost. `score` is ignored; highlights are joined into
-one snippet.
+`numResults` / `max_results` / `maxResults` are always set explicitly: the
+provider default must not decide the tool's context cost. `score` is ignored;
+highlights are joined into one snippet.
 
 **R12 hardening.** A snippet is redacted BEFORE it is cut to the per-result limit, so
 a secret cannot survive in the retained prefix of a truncated highlight. A URL is
@@ -1098,13 +1155,19 @@ or a hostile provider cannot allocate an unbounded buffer. These are input/outpu
 bounds, not a claim that a search result is trustworthy.
 
 **Bounds** (`tools/websearch/request.ts`): 5 results by default, 20 maximum
-(clamped), 300-character title, 1,000-character snippet, 512,000-character response
-(content-length then post-read), 15 s timeout via `AbortController` cleared in
+(clamped), 300-character title, 1,000-character snippet, a **512 KiB**
+(`512 * 1024` bytes) response read per streamed chunk with a `content-length`
+pre-check, 15 s timeout via `AbortController` cleared in
 `finally`, `redirect: 'error'`, http(s)-only result URLs. Rows without a valid URL
-are dropped, not fatal; the first row's title falls back to its URL.
+are dropped, not fatal; the first row's title falls back to its URL. The 512 KiB
+budget is the PROVIDER budget; the `fetch` tool's page GET is held to 100 KiB
+instead (see [Web fetch](#web-fetch)).
 
-**Cost policy:** one request, no retry, no failover, one provider. Exa when both
-keys exist, Tavily when it is the only one, `provider` overrides only when more
+**Cost policy:** one request, no retry, no failover, one provider. The default is
+the first provider with a key in the fixed `PROVIDERS` order **exa → tavily →
+linkup** (so Exa wins whenever its key exists, and appending a provider later
+never reorders what an existing deployment resolves to); `provider` overrides per
+call and is only offered when more
 than one is configured. 401/403 → key rejected, 402/432/433 → credits/quota, 429
 → rate limited, other non-2xx → HTTP status; timeout, network failure, non-JSON,
 and a missing `results` list each get one fixed sentence. **The provider body is
@@ -1117,30 +1180,178 @@ providers but never a value; no environment variable name appears in metadata
 either.
 
 **Laziness:** `tools/websearch/index.ts` statically imports only `tool`, types,
-`HarnessError`, and `request.ts`; `exa.ts` / `tavily.ts` are `import()`ed inside
-`execute`. No SDK: both adapters use `fetch`. A failed import is a plain tool error
+`HarnessError`, and `request.ts`; `exa.ts` / `tavily.ts` / `linkup.ts` are
+`import()`ed inside `execute` (one explicit branch per provider, so a fourth
+provider fails loudly there instead of silently running Linkup's adapter). No
+SDK: all three adapters use `fetch`. A failed import is a plain tool error
 and is not cached, so a later call can retry.
 
 **Application wiring:** the real presets (`instruct`, `research`, `workspace`,
-`reviewer`, `planner`) pass `websearch: true`, so the CLI and server read search
-keys from their own process environment; the shared-factory `flaky` example opts in
+`reviewer`, `planner`) pass `websearch: true` AND `webfetch: true` through the
+shared toolbox (`src/server/harnesses/toolbox.ts`), so the CLI and server read
+search keys from their own process environment; the shared-factory `flaky` example
+opts in
 too, while `demo` stays offline. `flaky`'s preset metadata declares
-`environmentTools: ['search']` so its descriptor matches what the factory
-registers.
+`environmentTools: ['search', 'fetch']` so its descriptor matches what the
+factory registers.
 This is why no search key was added to `RunnerSettings` or the Endpoint panel. The
 app entry points preload the package-root `.env` into `process.env` (see “CLI,
 server, and UI”); the library still has no autoload and importing it never reads a
 file.
 
 **Preset descriptors follow the catalogue.** Those live presets also declare
-`environmentTools: ['search']` in `src/harnesses/presets.ts` — metadata only, no
-harness is built to answer a listing. `describeHarness` appends such a name to the
-preset's `tools` only when the runtime catalogue holds an executable definition for
-it, and includes it in `coreTools` under the same condition (R18). A keyless host
-therefore advertises neither a callable search nor a core search; the global
-catalogue still shows the tool as unconfigured with its hint. Core file tools in
-`coreTools` are likewise filtered by the preset's registered names, so the demo
-fixture (timeNow only) does not claim them.
+`environmentTools: ['search', 'fetch']` in `src/server/harnesses/presets.ts` — metadata
+only, no harness is built to answer a listing. `describeHarness` appends such a name
+to the preset's `tools` only when the runtime catalogue holds an executable definition
+for it, and includes it in `coreTools` under the same condition (R18). That pairing is
+why each web name has its own catalogue module
+(`src/server/harnesses/{websearch,webfetch}.ts`): without a `fetch` entry a card could
+never advertise the declaration its harness really makes. A keyless host therefore
+advertises no search at all (the global catalogue still shows the tool as unconfigured
+with its hint) but does advertise `fetch`, because the `native` provider needs no
+credential. Core file tools in `coreTools` are likewise filtered by the preset's
+registered names, so the demo fixture (timeNow only) does not claim them. Both web
+names are declared CORE when registered (R9-R11): a configured search and any enabled
+fetch are in the first request's schema, while the eleven demoted runtime rows and
+`download` wait for `toolRequest`.
+
+---
+
+## Web fetch
+
+`fetch` (`tools/webfetch/`) is the page-reading sibling of `search` and follows the
+same factory rule (`createWebFetchTool({ env?, exa?, linkup? })`), with one
+deliberate difference: **it always returns a Tool.** The default provider is
+`native`, a direct GET with no credential, so "opted in but keyless" is still a
+runnable tool. `harness({ webfetch: true })` registers it; the configuration field
+keeps the folder name while the TOOL is `fetch`.
+
+| Fact | Behaviour |
+|---|---|
+| Default provider | `native`, always — even when an Exa/Linkup key exists. Hosted crawlers cost credits, so they are never a silent upgrade; `provider` picks them per call. |
+| Keyed providers | `exa` (`EXA_API_KEY`) and `linkup` (`LINKUP_API_KEY`) only. Tavily is search-only. Same explicit-string-or-getter resolution as search: omitted → env, explicit blank → provider absent with no env fallback. |
+| Schema | `url` (required), `format` (`markdown` default / `text` / `html`), and `provider` ONLY when a hosted key resolved (`available.length > 1`). |
+| Visibility | `core` (R9-R11, same policy as a configured `search`): a harness that registered `fetch` declares it on every request, so researching a page costs no `toolRequest` round. The gate is REGISTRATION, not visibility — no `webfetch` opt-in means no tool and no declaration. Registration: `tools/runtime/fetch.tool.ts`, `activation: 'webfetch'`, `mode: sync`, `order: 250`. |
+| Redirects | Followed; the result reports the final URL (the hosted JSON calls keep search's `redirect: 'error'`). |
+
+**Text only, and the bound is a policy pair.** `tools/webfetch/request.ts` caps a
+native page at **100 KiB** (`100 * 1024` bytes) — checked against `content-length`
+before the body is touched and then per streamed chunk, cancelling the reader the
+moment the budget is crossed — and returns at most **24,000 characters**
+(`truncated: true` when cut). 100 KiB (not the 512 KiB the provider requests
+allow) is the point: a page that does not fit is a file, not an article. The
+content-type gate agrees with that sentence: no header is treated as text, and the
+readable set is `text/*`, `application/json`, `*+json`, `application/xml`,
+`*+xml`, `application/xhtml+xml`, the JS/TS MIMEs and `image/svg+xml` (SVG is
+text, and must be checked BEFORE the `image|audio|video/` family rejection).
+Everything else is refused with one sentence that names `download`, so the tool
+description and the gate are one policy stated twice. Timeout is 15 s with one
+attempt per user agent, plus a single honest-`User-Agent` retry (`underload-harness`)
+when Cloudflare answers `cf-mitigated: challenge` to the browser-impersonating one.
+
+The hosted adapters reuse `tools/websearch/request.ts`'s `requestSearch` (fixed
+endpoint, JSON body, key in a header, no redirects, 512 KiB streamed response cap,
+sanitized status errors), so a hosted fetch failure reads "Exa search …" /
+"Linkup search …" — one error vocabulary per api host. Exa's `/contents` takes
+`text.maxCharacters` server-side (the local slice is a formality there); Linkup's
+`/v1/fetch` has no such knob, so `MAX_CONTENT_CHARS` is applied locally. Both
+answer markdown, so the reported `contentType` on those paths is `text/markdown`.
+Redaction happens BEFORE the character cut (the search lesson: bounding first can
+leave a secret prefix at the cut), over every configured web key.
+
+**Application wiring:** the shared toolbox passes `webfetch: true`, so a live
+session always has `fetch` registered (native on a keyless host) and declares it as
+core. It is part of the server's direct-call catalogue too
+(`src/server/harnesses/webfetch.ts`, group `Web fetch`): `createToolCatalogue()`
+holds the package presets, the app tools, the `search` entry, and the `fetch`
+entry, so `POST /api/tools/fetch` is answered whenever the host enabled webfetch —
+which is what lets a preset card advertise the declaration its harness really makes.
+A host that passes `createWebFetchCatalogueEntry({ enabled: false })` still LISTS the
+tool, with `availability.state: 'unconfigured'`, the static `WEB_FETCH_METADATA`
+shape, and no callable implementation.
+
+---
+
+## Web download
+
+`download` (`tools/webdownload/download.tool.ts`) is the byte path. `fetch`
+answers bounded text and refuses a binary; `download` accepts **any** content
+type, caps the transfer, and hands the real bytes to the model as multimodal
+input. It is a plain **preset** — in `presetTools`, exported by name, listed and
+callable in the server catalogue — with `registration: { group: 'preset',
+activation: 'always', mode: 'sync', order: 235 }` and `visibility: 'core'`, so
+every harness registers and declares it without a key, a configuration field, or a
+discovery round. `presets: false` is the only way to keep it out.
+
+**Caps (all enforced before allocation, all module-local literals).**
+`MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024` decoded bytes, checked twice — against
+`content-length` before any byte is paid for, then per streamed chunk for a host
+that declares nothing or lies. `DOWNLOAD_TIMEOUT_MS = 60_000` for the whole
+transfer (a 20 MiB file on a slow link is normal; `fetch`'s 15 s is not), one
+attempt, redirects followed, `context.signal` LINKED to the timeout controller so
+`toolCancel`/run abort stops the socket rather than only its delivery. URL must be
+absolute `http(s)` without userinfo, ≤2,048 characters. **Nothing is written to
+disk** — there is no output path argument; a host that wants a file uses `write`.
+
+The value a caller gets is a `toolMedia()` **envelope**
+(`{ __toolMedia: [attachment], content: summary }`), and the two halves are
+deliberately different sizes:
+
+- `content` is the small JSON summary (`url`, `finalUrl`, `contentType`, `kind`,
+  `name`, `bytes`, `declaredBytes?`, `media: 'attached'`, `mediaId`) — a few
+  hundred bytes, so the 64 KiB model-facing result budget never touches it;
+- the bytes go on the committed `tool` message's `attachments`
+  (`HarnessMessage` tool branch), which is what makes them survive history,
+  snapshot restore, and forks;
+- a `tool_result` event and the server's manual execute answer carry
+  `ToolMediaDescriptor[]` (`id`, `kind`, `name`, `mime`, `size`) — metadata only,
+  never base64, because events are JSON round-tripped and persisted per turn;
+- the transport expands the attachments into a clearly labelled **USER**-role
+  payload AFTER the whole contiguous tool block, so strict provider tool-call
+  pairing is never broken. Markers/ids are regenerated when one block aggregates
+  several downloads whose `dl-1` ids would collide.
+
+Validation runs at both ends of the seam: `toolMedia()` fails the call, and
+`toolMediaOf()` re-validates at the unwrap boundary so a forged envelope cannot
+splice 500 MB into history. An invalid envelope is REJECTED, never silently
+dropped — "downloaded but the model never saw it" is the failure this rule exists
+to prevent. Known families keep their media kind and are checked against the
+shared magic signatures (a server claiming `image/png` and sending HTML fails
+loudly); anything else is `kind: 'file'` with its exact bytes and a sanitized
+filename (≤200 chars, no path separators, no drive colon).
+
+**Trust profiles are not interchangeable.** `validateAttachments` takes a profile:
+uploads keep `UPLOAD_ATTACHMENT_LIMITS` (4 MiB per file / 8 MiB per turn / 4
+files, and `kind: 'file'` is an explicit transport refusal), while tool media uses
+`DOWNLOAD_ATTACHMENT_LIMITS` (20 MiB per file, 4 files / 80 MiB per aggregated
+block). Grammar, MIME tables, magic signatures and canonical base64 are shared, so
+a download is never held to a looser standard than an upload.
+
+**Provider support is the open end, stated plainly.** The transport maps image →
+`image_url`, pdf → `file` (data URL), audio → `input_audio` (wav/mp3), video →
+`video_url` **only when the request host is `openrouter.ai`** (an OpenRouter
+extension, decided on the actual hostname so an OpenAI gateway is never sent an
+unsupported part), and a generic `file` → the OpenAI-compatible
+`{ type: 'file', file: { filename, file_data } }` part under the tool-media policy
+(under the upload policy it stays an explicit "not supported" error). A provider
+that cannot represent the part answers with its own explicit error; nothing is
+dropped quietly. So "the model can see the file" is a claim about the configured
+model, not about this package.
+
+**Cost of the bytes.** One 20 MiB download becomes ~27 MiB of base64 in the
+persisted transcript, in the snapshot, and in every later request body built from
+it. `forks.maxHistoryBytes` (default 8 MiB of serialized history including
+attachment payloads) therefore still applies and can block a fork of a
+download-heavy session until it is raised. There is no UI preview of downloaded
+files.
+
+**Packaging contract.** The entry is compiled as editable source, so its only
+value imports are the `../../core` barrel and `../../util`; the bounds and MIME
+tables are literals to keep the captured source revision at `dependencies: []`. The
+focused test (`download.test.ts`) asserts those literals equal the authoritative
+numbers in `shared/attachments.ts`, so the two cannot drift. The folder barrel is
+type-only for the same reason a value re-export anywhere else would eagerly
+evaluate the entry.
 
 ---
 
@@ -1244,9 +1455,12 @@ then `summarizer`. The five primaries are `instruct`, `research` (title
 - a subagent never re-delegates, so every profile's delegation guideline is
   conditional on BOTH running as the primary AND this harness declaring
   `delegate` to it, and tells a subagent/lone agent to do the work itself;
-- `demo` (scripted) and `flaky` (failure example) stay fixtures with no subagents
-  and are listed after the real presets; the CLI and UI both select `instruct`
-  first (the CLI default is the live role, never the demo).
+- `demo` (scripted) and `flaky` (failure example) stay fixtures with no subagents,
+  and T5 un-shipped them: the server catalogue lists only the five real roles, while
+  the fixtures remain presets a host or a test injects explicitly
+  (`FIXTURE_PRESETS` / `ALL_PRESET_TEMPLATES`). The CLI and UI both select `instruct`
+  first (the CLI default is the live role, and `--preset demo` still resolves through
+  the lookup superset).
 
 ### Persistence restore policy (T3)
 
@@ -1488,14 +1702,15 @@ await writer('tell me about new year');
 - The registry key is the identity for both agents and tools; `agent.name` /
   `tool.name` are overwritten to match.
 - **Tool declarations are filtered, not the registry.** `writer.tools` holds the
-  preset preload, the configured tools, `toolRequest`, `toolCreate`, `todoManage`,
+  preset preload, the configured tools, `toolRequest`, `toolCreate`, `task`,
   `profileManage`, `chapterManage`, `locationManage`, `agentManage`, `agentResult`,
   `threadFork` when forks are
   enabled, `actionRequest` when interaction is configured, and `delegate` when
   there is a subagent; a request declares every core tool
-  (`read`/`write`/`edit`/`glob`/`grep`, a configured `search`, and the
-  harness-owned set), then whatever toolRequest enabled. The searchable remainder
-  (`fileList`, `shell`, ...) waits for discovery. `delegate` is core for
+  (`read`/`write`/`edit`/`glob`/`grep`, the environment `search`/`fetch` pair it
+  actually registered, and the declared harness-owned set), then whatever toolRequest
+  enabled. The searchable remainder (`fileList`, `shell`, `download`, ...) waits for
+  discovery. `delegate` is core for
   the primary only.
 - **`discoveredTools`** is a read-only copy of the enabled set, in discovery order.
   It persists for the harness's lifetime (every call/turn) and is emptied by
@@ -1503,7 +1718,7 @@ await writer('tell me about new year');
 - **`executeTool(name, parameters)`** (R8) runs one REGISTERED tool directly with
   this harness's context (`agent: primary`, `agents`, `run`). It is the server's
   manual-execution path for the session-bound tools (`POST /tools/:name` with a
-  `sessionId`), so a manual toolRequest/toolCreate/todoManage/profileManage/
+  `sessionId`), so a manual toolRequest/toolCreate/task/profileManage/
   chapterManage/locationManage/agentManage/agentResult/delegate call mutates
   this session. Core file tools and search are ordinary direct-call catalogue
   entries and do not need a session. Discovery gates the MODEL only: an explicit
@@ -1536,7 +1751,7 @@ await writer('tell me about new year');
   Created tools stay registered (registry state), just no longer enabled. The
   server resets every agent in a session, not only the primary; its extra
   agent-loop reset does not replace `harness.reset()`, which is what clears the
-  shared `todoManage` and record state. Branch records and action-request state are
+  shared `task` and record state. Branch records and action-request state are
   ephemeral runtime state and are not cleared by `reset()`.
 
 **Members:** callable, `name`, `agent`, `agents`, `subagents`, `tools`, `plugins`,
@@ -2050,12 +2265,12 @@ normalizer and the exported `TOOL_UI_LIMITS`.
   still teaches the model the vocabulary.
 - **Preload the catalogue, declare only the core.** Shipping the presets into
   every harness by default stays cheap: only the five core file tools are declared
-  up front, alongside toolRequest/toolCreate/todoManage/profileManage/
+  up front, alongside toolRequest/toolCreate/task/profileManage/
   chapterManage/locationManage/agentManage/agentResult (and delegate when
   applicable), while the searchable remainder costs no context until discovered.
   `presets: false` exists for callers who want an empty catalogue, which is also
   what the harness tests use when they assert exact discovery results.
-- **Session state is factory state, not module state.** Todos, profiles, chapters,
+- **Session state is factory state, not module state.** Tasks, profiles, chapters,
   and locations each get one closure per harness with its own id counter, so two
   sessions never share records and `reset()` is a complete "start over" that no
   module singleton could express.
@@ -2201,6 +2416,7 @@ paths below `/v1/harness` **plus** the bare root:
 | `GET /api/harnesses` | Harness descriptors (`primary`/`subagents`/`coreTools`/`agentModels?`/`agentInstructions?`/`builtin`/`editable`), provider defaults, and `agents`; every entry is editable and `editable` is always `true` |
 | `POST /api/harnesses` | `{ name, title?, description?, primary, subagents?, agentModels?, agentInstructions? }` → `201 { harness }` |
 | `PATCH /api/harnesses/:name` | `{ title?, description?, primary?, subagents?, agentModels?, agentInstructions? }` → `{ harness }`; every template is patchable |
+| `DELETE /api/harnesses/:name` | `200 { deleted: true }`; `404` unknown name or repeat delete (aliases are not deletable identities). Removes a user harness or a shipped built-in; a built-in's name is persisted in the database's additive `deleted` list so a restart keeps it removed. Existing and saved sessions keep the definition they captured, so deleting a harness never loses a conversation |
 | `GET /api/agents` | Trusted agent registry (`AgentDescriptor[]`) |
 | `GET /api/tools` | Full catalogue: session-bound core entries first (`group: 'Core tools'`, `sessionBound: true`), then every direct-call tool (including the core file tools); `search` always present with `availability` |
 | `GET /api/tools/bootstrap` | Alias of `GET /api/tools` — the list the root bootstrap document carries |
@@ -2213,7 +2429,7 @@ paths below `/v1/harness` **plus** the bare root:
 | `POST /api/sessions/:id/messages` | `{ input }` → SSE. LEGACY: the response owns the run (close aborts it); `409` when busy or when queued work is pending |
 | `POST /api/sessions/:id/tasks` | `{ input }` → `202 { session, turn }`. Server-queued FIFO task: the turn is `queued`, has a stable id/index, and has no `startedAt` until the pump starts it. Cap 100 pending (`429`); queued turns are durable with a database root and paused after a restart |
 | `GET /api/sessions/:id/events` | SSE watcher: one `snapshot`, `turn` upserts (queued/running/terminal), `event` frames, one final `snapshot` on drain. Disconnect only unsubscribes |
-| `POST /api/sessions/:id/reset` | Reset every agent + discovery + todos + record stores; `409` while a run or queued work is pending |
+| `POST /api/sessions/:id/reset` | Reset every agent + discovery + tasks + record stores; `409` while a run or queued work is pending |
 | `POST /api/sessions/:id/cancel` | `{ all?: boolean }` → `{ cancelled }`. Default aborts the active run only; `all: true` also cancels every queued turn, which stays in `turns` as `cancelled` |
 | `POST /api/sessions/:id/actions/:requestId/answer` | `{ choice: HarnessActionChoice }` → `{ ok: true }`. Settles one pending `actionRequest`; 400 invalid body/unknown option/out-of-bounds text, 404 unknown session or request id, 409 answered or expired. Allowed while busy |
 | `DELETE /api/sessions/:id` | Forget the session: abort active work, drop queued work, close watchers |
@@ -2262,7 +2478,7 @@ can fix.
   `discoveredTools`; `GET /tools` remains the static catalogue.
 
 **Core tools in the catalogue (R8/N4).** `src/harnesses/core.ts` adds eight entries -
-`toolRequest`, `toolCreate`, `todoManage`, `profileManage`, `chapterManage`,
+`toolRequest`, `toolCreate`, `task`, `profileManage`, `chapterManage`,
 `locationManage`, `agentManage`, `agentResult` - plus `delegate`, `actionRequest`, and `threadFork` to every
 listing (`GET /tools`, its `/tools/bootstrap` alias, and the root bootstrap
 document). The last two are conditional in a session's harness (`interaction`
@@ -2285,11 +2501,13 @@ accept and ignore `sessionId` so one request shape serves the whole Tools tab. T
 metadata comes from `src/core/metadata.ts`, the copy the harness registers, so a
 descriptor cannot advertise a schema the runtime does not use.
 
-**R18: core file/search tools are NOT session-bound.** `read`, `write`,
-`edit`, `glob`, `grep`, and a configured `search` are `visibility: 'core'` but
+**R18: core file/search/download tools are NOT session-bound.** `read`, `write`,
+`edit`, `glob`, `grep`, `download`, and a configured `search` have
+`visibility: 'core'` but
 keep their real `tool` implementation and appear in the direct-call catalogue
 (groups `Package presets` / `Web search`), so `POST /api/tools/read` works
-without a `sessionId`. `sessionBound: true` remains exclusive to the eight
+without a `sessionId`; `POST /api/tools/download` returns the summary plus
+`media` **descriptors**, never the base64. `sessionBound: true` remains exclusive to the eight
 harness-owned entries above plus `delegate`, `actionRequest`, and `threadFork`
 (the last two are still refused by the manual call path because they need the
 owning run). The UI's core dropdown reads
@@ -2381,6 +2599,30 @@ pairs same-name calls exactly.
   core plus a registered language subset (aliases resolve; an unknown fence stays
   escaped text), a CSS language caption, and accent typography/inline code. No
   browser verification was performed for this documentation pass.
+- **Chip anatomy (transcript).** A tool call and a reasoning round are the SAME
+  surface: a `details.tool` chip that stays INLINE in `.tool-group` and opens its
+  detail in a modal (never inline). Reasoning is labelled `think`
+  (`ui/tools.ts` `createReasoningCard`), painted amber, and its pill is the share of
+  the block's accumulated CONTEXT the round occupies
+  (`formatThinkShare`: chars/4 estimate over `BlockMeta.context()` — the same figure
+  the header tally prints), not a character count: what is worth seeing is how much
+  context the thinking is using. The pill is `[hidden]` until a `usage` figure exists,
+  and every chip of a block is repainted when a `usage` event or the server tally
+  advances that denominator, so a percentage can never disagree with the header.
+  Because a think chip IS a `details.tool`, "how many calls" selects
+  `details.tool:not(.think)`. No control in the app shows a disclosure chevron any
+  more (`styles.css` base `summary { list-style: none }` + the WebKit marker reset): a
+  labelled chip that opens a dialog does not need one, and a future chip inherits it.
+- **Block header vs block toolbar.** The expanded block's toolbar owns BOTH per-thread
+  actions — `Delete` first (destructive, left), `Transcript` last (`margin-left: auto`,
+  right) — plus the full-width two-step Delete confirmation. The card header keeps no
+  control slot at all (`.tile-header-action`/`.thread-header-action`/
+  `.thread-focus-head-action` are gone from the DOM and the CSS): the header's right
+  edge belongs to the measurement line, so an expanded tile lays out as a row-wrap with
+  the thread badge left and `elapsed | tokens` flush right on the same line, and the
+  meta line wraps below. A nested card was already that shape (`.thread-top`
+  `order: 2; margin-left: auto`), which is why the two headers now agree without
+  absolute positioning or reserved padding.
 - **Background work (R6).** Concurrent tools mean a turn is `running` until the
   harness promise drains, while an agent `done` can be interim. The UI reconciles
   the same way (by turn id, never rebuilding) and, for the additive frames:
@@ -2465,7 +2707,7 @@ not send `threads`/`threadId` renders exactly the old UI (`sessionThreadsOf` →
   thread removes its record and frees the slot again. The UI does NOT auto-prune:
   reducing thread count is an explicit per-row delete. Deletion purges only that
   conversation — not what other histories were told, not what it wrote to shared
-  memory (todos/profiles/chapters/locations), and not a result a connected thread
+memory (tasks/profiles/chapters/locations), and not a result a connected thread
   already received.
 - **One conversation, many runs (T12b).** The server keeps one `SessionTurn` per run,
   but the board projects every turn of one `threadId` into ONE top-level
@@ -2567,6 +2809,20 @@ the dispatcher:
   with the extra retained, and `live` uses `createProfiledHarness`. Changing
   `primary` without restating `subagents` removes the new primary from the old
   allowlist;
+- `remove(name)` (T5) deletes any entry by its DIRECT name (an alias is a read redirect,
+  not an identity), returns the removed preset, and answers 404 for an unknown or
+  already-deleted name. A deleted **built-in** also records a tombstone
+  (`deletedBuiltins()`), persisted as the additive `deleted` array in `state.json`,
+  because a fresh registry always re-seeds the shipped templates - the missing row
+  alone cannot express a deletion. A deleted **user** harness needs no tombstone (its
+  row is simply gone). `create()` clears the tombstone for the name it takes, so
+  re-creating `instruct` survives its own restart, and `restoreHarnessRegistry` replays
+  the tombstones BEFORE the saved rows. `snapshot()`/`restore()` give the durable commit
+  path one rollback for create/patch/delete: `SessionStore.mutateRegistry` writes the
+  document and restores the snapshot (entries, listing order, tombstones) when the write
+  fails, so `DELETE` never answers `{ deleted: true }` for a harness the next restart
+  brings back. Sessions are untouched either way - each one restores from its own frozen
+  preset record;
 - `agentModels` (R9) is a map of selected agent id → model id on create/patch. Keys
   are validated against the FINAL `[primary, ...subagents]` set (unknown key = 400
   naming the members), values are trimmed, non-empty, ≤200 characters, and free of
@@ -2740,7 +2996,9 @@ In the order they are expected:
 4. **sandboxed presets and created tools** — the file and command tools, and any
    `toolCreate` body, run with host permissions; a `root`-scoped/fenced variant
    would be the natural next step.
-5. **more presets** — `fetchUrl` and a patch/multi-edit tool are the obvious gaps.
+5. **more presets** — a patch/multi-edit tool is the obvious remaining gap. The
+   former `fetchUrl` idea is built: `fetch` (text) and `download` (bytes) cover
+   the read-a-URL surface.
 
 Parallel tool execution is no longer on this list: calls are scheduled
 concurrently (see “The loop”). There is no thread/CPU isolation and no ordered

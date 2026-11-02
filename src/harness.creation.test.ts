@@ -1,7 +1,9 @@
-// toolCreate — the runtime tool-creation capability (R2b).
+// toolCreate — the runtime tool-creation capability (R2b, R9-R11 policy).
 //
 // Contract pinned here:
-//   - toolCreate is a core tool, so every agent sees it without discovery;
+//   - toolCreate stays registered but is searchable, so a model reaches it only
+//     after toolRequest opens it (R9-R11 keeps just task/toolRequest/search/fetch
+//     declared);
 //   - a model-created tool is registered searchable, enabled at once, and appears
 //     in the very next request's declarations and in later toolRequest results;
 //   - registering compiles the body but NEVER executes it;
@@ -72,27 +74,19 @@ const creation: ToolCreation = {
 };
 
 describe('toolCreate', () => {
-    it('is core, so the model can reach it without discovery', async () => {
+    it('is searchable, so the model reaches it through toolRequest', async () => {
         const seen: HarnessStreamRequest[] = [];
         const writer = quiet(brain(scripted([answer('hi')], seen)));
 
         await writer('go');
 
-        expect(writer.tools.toolCreate.visibility).toBe('core');
+        // R9-R11: toolCreate stays registered (the harness-owned kernel row) but is
+        // no longer declared, so the first request offers only the bootstrap pair.
+        expect(writer.tools.toolCreate.visibility).toBe('searchable');
         expect(writer.tools.toolCreate.description).toContain('Create a tool for yourself from JavaScript source.');
         expect(declaredNames(seen[0])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork'
+            'task',
         ]);
     });
 
@@ -101,6 +95,9 @@ describe('toolCreate', () => {
         const entry = brain(
             scripted(
                 [
+                    // R9-R11: an exact-name request is enough; toolCreate is
+                    // searchable now, so the model has to open it first.
+                    callTool('c0', 'toolRequest', '{"names":["toolCreate"]}'),
                     callTool('c1', 'toolCreate', JSON.stringify(creation)),
                     callTool('c2', 'repeat', '{"text":"ab","times":2}'),
                     answer('done')
@@ -112,35 +109,23 @@ describe('toolCreate', () => {
         const writer = quiet(entry);
         const message = await writer('go');
 
-        // Round 1: core only. Round 2: the created tool is already enabled.
+        // Round 1: core only. Round 2: toolCreate joined through discovery. Round 3:
+        // the created tool is enabled too — a session-created tool is declared ahead
+        // of the runtime row a toolRequest opened.
         expect(declaredNames(seen[0])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork'
+            'task',
         ]);
         expect(declaredNames(seen[1])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork',
-            'repeat'
+            'task',
+            'toolCreate'
+        ]);
+        expect(declaredNames(seen[2])).toEqual([
+            'toolRequest',
+            'task',
+            'repeat',
+            'toolCreate'
         ]);
 
         // The tool is a real registry entry, searchable like any other.
@@ -149,7 +134,7 @@ describe('toolCreate', () => {
         expect(writer.tools.repeat.tags).toEqual(['text', 'repeat']);
 
         // The toolCreate result is metadata only — never the source.
-        expect(JSON.parse((entry.messages[2] as { content: string }).content)).toEqual({
+        expect(JSON.parse((entry.messages[4] as { content: string }).content)).toEqual({
             name: 'repeat',
             description: 'Repeat text.',
             tags: ['text', 'repeat'],
@@ -158,7 +143,7 @@ describe('toolCreate', () => {
         });
 
         // The created tool ran on the next turn with its arguments object.
-        expect((entry.messages[4] as { content: string }).content).toBe('abab');
+        expect((entry.messages[6] as { content: string }).content).toBe('abab');
         expect(message.content).toBe('done');
     });
 
@@ -184,6 +169,7 @@ describe('toolCreate', () => {
     it('applies the single-property rule to the body arguments', async () => {
         const entry = brain(
             scripted([
+                callTool('c0', 'toolRequest', '{"names":["toolCreate"]}'),
                 callTool(
                     'c1',
                     'toolCreate',
@@ -204,8 +190,9 @@ describe('toolCreate', () => {
         await writer('go');
 
         // One-property schema: the model's `{ text: "hello" }` reaches the body as
-        // the value itself, exactly like `execute({ parameters })`.
-        expect((entry.messages[4] as { content: string }).content).toBe('HELLO');
+        // the value itself, exactly like `execute({ parameters })`. The enablement
+        // round shifts the results two messages later.
+        expect((entry.messages[6] as { content: string }).content).toBe('HELLO');
     });
 
     it('stays discoverable through toolRequest after registration', async () => {
@@ -218,7 +205,10 @@ describe('toolCreate', () => {
             source: 'return args;'
         });
 
-        expect(await writer.executeTool('toolRequest', { tags: ['summary'] })).toEqual({
+        // R9-R11: the created row is searchable, so toolRequest finds it by name;
+        // a tag query would now also return the demoted runtime rows that share the
+        // text/summary vocabulary.
+        expect(await writer.executeTool('toolRequest', { names: ['digest'] })).toEqual({
             enabled: ['digest'],
             tools: [{ name: 'digest', description: 'Summarise text.', tags: ['text', 'summary'] }],
             matched: 1,
@@ -266,7 +256,7 @@ describe('toolCreate', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'todoManage',
+            'task',
             'profileManage',
             'chapterManage',
             'locationManage',
@@ -314,6 +304,7 @@ describe('toolCreate', () => {
     it('turns a failed creation into a recoverable tool result for the model', async () => {
         const entry = brain(
             scripted([
+                callTool('c0', 'toolRequest', '{"names":["toolCreate"]}'),
                 callTool('c1', 'toolCreate', JSON.stringify({ ...creation, source: 'return (' })),
                 answer('recovered')
             ])
@@ -324,7 +315,8 @@ describe('toolCreate', () => {
 
         expect(message.content).toBe('recovered');
         expect(writer.tools.repeat).toBeUndefined();
-        expect((entry.messages[2] as { content: string }).content).toMatch(
+        // The enablement round comes first, so the compile failure is message 4.
+        expect((entry.messages[4] as { content: string }).content).toMatch(
             /^Tool "toolCreate" failed: Tool source could not be compiled: /
         );
     });

@@ -66,7 +66,7 @@ describe('toolList', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'todoManage',
+            'task',
             'profileManage',
             'chapterManage',
             'locationManage',

@@ -36,7 +36,7 @@
 //   - ../harness.ts       — runtime records/concurrency (later worker)
 
 import { HarnessError } from '../util';
-import { validateAttachments } from '../shared/attachments';
+import { DOWNLOAD_ATTACHMENT_LIMITS, validateAttachments } from '../shared/attachments';
 import { utf8ByteLength } from './result-budget';
 import type {
     Agent,
@@ -520,21 +520,52 @@ const copyMessage = (raw: unknown, index: number): HarnessMessage => {
     }
 
     if (role === 'tool') {
+        // `attachments` is the download-media key (core/tool-media.ts). It must
+        // be admitted here or every fork, threadFork and actionRequest
+        // autoanswer fails on a transcript that merely contains a download.
         assertExactKeys(
             raw,
-            ['role', 'content', 'toolCallId', 'name'],
+            ['role', 'content', 'toolCallId', 'name', 'attachments'],
             `Branch history message ${field}`
         );
         if (typeof raw.content !== 'string') {
             throw new HarnessError(`Branch history message ${field}.content must be a string.`);
         }
 
-        return {
+        const message: Extract<HarnessMessage, { role: 'tool' }> = {
             role: 'tool',
             content: raw.content,
             toolCallId: requiredString(raw.toolCallId, `${field}.toolCallId`),
             name: requiredString(raw.name, `${field}.name`)
         };
+
+        // Revalidated with the DOWNLOAD profile (a branch carries exactly the
+        // bytes the source transcript committed).
+        //
+        // KNOWN LIMITATION, deliberate: the fork-history budget below measures
+        // `JSON.stringify(messages)`, so media bytes COUNT against
+        // `maxHistoryBytes` just like an uploaded user attachment already does.
+        // A single download larger than the configured bound therefore makes
+        // forking fail with its existing explicit error rather than silently
+        // forking a branch whose every request replays 20 MB of base64. No
+        // exclusion and no compaction subsystem: a broad "media is free" rule
+        // would let an unbounded number of 20 MiB files ride into every branch
+        // request. Raise `forks.maxHistoryBytes` (or delete the turn) when a
+        // conversation legitimately needs both.
+        if (raw.attachments !== undefined) {
+            try {
+                message.attachments = validateAttachments(
+                    raw.attachments as HarnessAttachment[] | undefined,
+                    DOWNLOAD_ATTACHMENT_LIMITS
+                );
+            } catch (error) {
+                throw new HarnessError(
+                    `Branch history message ${field}.attachments ${error instanceof Error ? error.message : String(error)}`
+                );
+            }
+        }
+
+        return message;
     }
 
     throw new HarnessError(

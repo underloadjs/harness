@@ -58,7 +58,9 @@ describe('browser catalogue fallback (T24)', () => {
         // Field for field: no live row may sneak in, and no generated row may be
         // rewritten by the projection.
         expect(TOOL_DESCRIPTORS).toEqual([...BUILTIN_TOOL_DESCRIPTORS]);
-        expect(TOOL_DESCRIPTORS).toHaveLength(28);
+        // 29 rows: the browser bundle carries the same generated inventory as the
+        // Node build, including the new `download` preset.
+        expect(TOOL_DESCRIPTORS).toHaveLength(29);
     });
 
     it('derives the preset and runtime groups from the generated data', () => {
@@ -71,7 +73,8 @@ describe('browser catalogue fallback (T24)', () => {
             'glob',
             'grep',
             'shell',
-            'gitDiff'
+            'gitDiff',
+            'download'
         ]);
         expect(PRESET_DESCRIPTORS).toEqual(
             BUILTIN_TOOL_DESCRIPTORS.filter((descriptor) => descriptor.group === 'preset')
@@ -81,20 +84,20 @@ describe('browser catalogue fallback (T24)', () => {
         // The runtime projection keeps its own documented rule (listed !== false,
         // activation ordering) over the generated rows.
         expect(RUNTIME_DESCRIPTORS.map((descriptor) => descriptor.name)).toEqual([
-            'toolRegistry',
-            'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'delegate',
-            'actionRequest',
-            'threadFork'
+        'toolRegistry',
+        'toolRequest',
+        'toolList',
+        'toolManage',
+        'toolCreate',
+        'task',
+        'profileManage',
+        'chapterManage',
+        'locationManage',
+        'agentManage',
+        'agentResult',
+        'delegate',
+        'actionRequest',
+        'threadFork',
         ]);
     });
 

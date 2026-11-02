@@ -23,7 +23,11 @@ export const AGENT_MANAGE_METADATA: CoreToolMetadata = {
     description:
         'List every configured agent in this harness session with previews of recent results. Each entry carries the agent\'s name, role (primary/subagent), model, invocationCount, and up to 5 recent invocations - roots, delegations, and forks - newest first. A result preview is at most 200 characters, flags whether it was truncated, and reports the full contentLength; a running invocation has status "running" and no content. Use agentResult with the agent name and optional invocationId to read a full completed result. Only completed answer text is ever exposed here: never system instructions, transcript messages, tool arguments, or tool bodies.',
     tags: ['agents', 'results', 'preview', 'subagent', 'team', 'inspect'],
-    visibility: 'core',
+    // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
+    // and enables it for this session instead of seeing it declared on every request.
+    // Registration itself is unchanged (the entry still joins the harness registry),
+    // so toolRequest always has something to surface.
+    visibility: 'searchable',
     parameters: {
         type: 'object',
         properties: {},
@@ -42,7 +46,7 @@ export const registration = {
     activation: 'always',
     order: 100,
     sessionBound: true,
-    alwaysDeclared: true,
+    alwaysDeclared: false,
     listed: true
 } as const;
 

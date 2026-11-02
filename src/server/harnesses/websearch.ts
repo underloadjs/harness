@@ -29,13 +29,14 @@ import type { CatalogueEntry, ToolAvailability } from './types';
 
 // Variable names only. These are advertised to the UI/CLI so an operator knows
 // what to set; the values are never read here (createWebSearchTool reads them).
-export const WEBSEARCH_ENVIRONMENT = ['EXA_API_KEY', 'TAVILY_API_KEY'] as const;
+// The order matches the provider preference order in src/tools/websearch/index.
+export const WEBSEARCH_ENVIRONMENT = ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY'] as const;
 
 // One sentence, safe to render anywhere. It names variables, never values, and
 // says that a restart is required because search keys are captured once when a
 // harness (or this entry) is constructed.
 export const WEBSEARCH_UNCONFIGURED_HINT =
-    'Web search is not configured on this server. Set EXA_API_KEY or TAVILY_API_KEY in packages/underload/harness/.env (or the process environment) and restart the harness server.';
+    'Web search is not configured on this server. Set EXA_API_KEY, TAVILY_API_KEY or LINKUP_API_KEY in packages/underload/harness/.env (or the process environment) and restart the harness server.';
 
 export type WebSearchCatalogueOptions = {
     // Forwarded to createWebSearchTool. Tests (and hosts with a secret store)

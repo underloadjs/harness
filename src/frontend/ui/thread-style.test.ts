@@ -11,7 +11,9 @@
 //     task preview is the single flexible, ellipsised item;
 //   - the body is `display:none` until the entry is expanded (collapsing an entry
 //     must not hide its descendants, which live outside the body);
-//   - status is visible text with colour reinforcement, not colour alone;
+//   - status stays TEXT in the DOM (never colour-only) but is clipped in BOTH header
+//     states (T2), so the nested measurement line reads `34.2s | 18,654 (37,376)` and
+//     its colour carries the state;
 //   - a compact narrow-screen indent that keeps depth 2 readable.
 
 import { existsSync, readFileSync } from 'node:fs';
@@ -147,14 +149,28 @@ it('keeps a collapsed entry to ONE compact line with an ellipsised preview', () 
         'display: none'
     );
     expect(blockOf(".thread-row[data-state='error'] .thread-status {")).toContain('color: var(--danger)');
-    // R1 parity: every state the nested entry can reach is coloured, and a compact
-    // nested word is clipped (not shown) exactly like the compact tile's.
+    // T2 parity: every state the nested entry can reach is coloured with the SAME value
+    // the main block uses (done green, streaming/waiting yellow, error red, queued and
+    // cancelled muted), so a child block never reads as a different state than its
+    // parent's rows. The word itself is clipped (never shown) in both header states,
+    // exactly like the main tile's.
     expect(blockOf(".thread-row[data-state='waiting'] .thread-status {")).toContain('color: var(--warn)');
+    expect(blockOf(".thread-row[data-state='streaming'] .thread-status {")).toContain('color: var(--warn)');
+    expect(blockOf(".thread-row[data-state='done'] .thread-status {")).toContain('color: var(--ok)');
+    expect(blockOf(".thread-row[data-state='queued'] .thread-status {")).toContain('color: var(--muted)');
+    expect(blockOf(".thread-row[data-state='cancelled'] .thread-status {")).toContain('color: var(--muted)');
+    expect(
+        blockOf(':is(.tile, .thread-tile) :is(.tile-status-text, .thread-status-text) {')
+    ).toContain('clip-path: inset(50%)');
+
+    // T2: the nested measurement line carries the state by colour through the SAME
+    // grouped rules as the main block (`data-state` is mirrored onto `.thread-tile`),
+    // so there is no nested-only copy of the colour mapping to drift.
     expect(
         blockOf(
-            ':is(.tile:not(.is-expanded), .thread-row:not(.is-expanded)) :is(.tile-status-text, .thread-status-text) {'
+            ":is(.tile, .thread-tile)[data-state='done'] :is(.tile-elapsed, .tile-tokens, .thread-elapsed, .thread-tokens) {"
         )
-    ).toContain('clip-path: inset(50%)');
+    ).toContain('color: var(--ok)');
 });
 
 // R1: the parent and nested blocks share ONE anatomy — header metadata, body and
@@ -180,6 +196,21 @@ it('shares the tile header metadata, body and prompt scale with the nested block
     expect(blockOf('.thread-preview {')).toContain('order: 1');
     expect(blockOf('.thread-top {')).toContain('order: 2');
     expect(blockOf('.thread-top {')).toContain('margin-left: auto');
+
+    // T2 (identifier sizing): the conversation code is an IDENTITY, so it is sized by its
+    // content and is never the item that truncates. `max-width: 40%` + `overflow: hidden`
+    // resolved against a SHRINKABLE flex parent, so the cap tightened exactly when the
+    // column got narrow and `IT12` became `I…`. `flex: 0 0 auto` with no cap keeps the code
+    // whole, and the flexible preview (below) is what loses a tail instead.
+    const code = blockOf(':is(.tile-agent, .thread-name) {');
+    expect(code).toContain('flex: 0 0 auto');
+    expect(code).not.toContain('max-width');
+    expect(code).not.toContain('overflow: hidden');
+    expect(code).not.toContain('text-overflow');
+    const preview = blockOf('.thread-preview {');
+    expect(preview).toContain('flex: 1 1 auto');
+    expect(preview).toContain('min-width: 0');
+    expect(preview).toContain('text-overflow: ellipsis');
 
     // F3: the root code is in the COMPACT header, so the expanded primary section
     // head (the same code again) is hidden. Flat legacy subagent heads stay visible

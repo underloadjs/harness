@@ -219,6 +219,9 @@ describe('tool turn policy (R2)', () => {
         expect(declared).toEqual([
             'actionRequest:async',
             'delegate:async',
+            // R3/R4: `download` declares 'sync' because the file IS the input to
+            // the next turn (same reasoning as read/search/fetch).
+            'download:sync',
             'edit:sync',
             'fetch:sync',
             'read:sync',

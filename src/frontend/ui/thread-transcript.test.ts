@@ -13,10 +13,21 @@
 //     execCommand fallback the LAN deployment depends on;
 //   - refresh updates an open dialog from a newer snapshot, ignores a stale
 //     session and CLOSES when the thread vanished;
-//   - T1/R2 header anatomy: the state word sits immediately right of the thread badge
-//     (identity line) and Delete occupies the header's right slot of an expanded tile,
-//     a nested card and the roster-only panel; Transcript keeps its toolbar, with
-//     desktop labels, mobile glyphs and accessible names;
+//   - T26 action-bar anatomy (the controls SWAPPED homes): ONE bar per surface — an
+//     expanded turn tile, an expanded nested child card and the roster-only focus
+//     panel — whose children are EXACTLY, in order, `Delete`, `Transcript` and the
+//     confirmation row. Delete leads the bar at the left edge and Transcript closes
+//     it (styles.css `margin-left: auto`), i.e. exactly where each other one used to
+//     be painted; there is NO header control host any more (`.tile-header-action`,
+//     `.thread-header-action` and `.thread-focus-head-action` are gone from the DOM
+//     and from the stylesheet) and the header's freed right edge carries the
+//     elapsed|tokens measurement line ON the badge's own line (row-wrap header).
+//     Labels are desktop text, mobile glyphs, and `aria-label` always carries the
+//     accessible name;
+//   - visibility is the BAR's own `hidden` (it follows the surface: a collapsed tile
+//     or card hides it, expansion/focus reveals it) — the paired header host that
+//     used to toggle alongside it no longer exists. Delete's own `hidden` is the
+//     default-conversation protection, and it never hides the bar's Transcript;
 //   - delete is two-step (no request before confirm), deduped while in flight,
 //     disabled for default/running/queued/descendant work, keeps data on failure
 //     and closes focus/transcript on success.
@@ -682,7 +693,7 @@ const openTranscriptFrom = (bar: HTMLElement): void => {
 };
 
 describe('responsive thread action bar', () => {
-    it('puts the state last on the measurement line and Delete on the badge line (R3/R4)', () => {
+    it('leads the bar with Delete and closes it with Transcript on an expanded turn tile (T26)', () => {
         const board = mount();
         const snapshot = snapshotOf({
             threads: [threadOf({ id: 'thread-a', label: 'RR1', messages: [] })],
@@ -693,16 +704,18 @@ describe('responsive thread action bar', () => {
         board.expand(turn);
 
         // R2 half one: the header's FIRST line is the identity — the persistent-thread
-        // badge ALONE (R3 took the state word off this line), which is also the line the
-        // header Delete control is centred on (R4).
+        // badge ALONE (R3 took the state word off this line).
         const identity = turn.element.querySelector<HTMLElement>('.tile-identity');
         expect(identity).not.toBeNull();
         expect([...(identity?.children ?? [])].map((node) => node.className)).toEqual(['tile-thread']);
         expect(identity?.firstElementChild?.textContent).toBe('RR1');
         expect(identity?.querySelector('.tile-status-text')).toBeNull();
-        // R3: the measurement line carries the clock, the tally and, LAST, the state word
-        // — the reader's line is `2.8s | 8,946 - done`; the ` - ` is generated CSS, so the
-        // word's own text node stays exactly `done`.
+        // R3/T2: the measurement line carries the clock, the tally and, LAST, the state box
+        // — the reader's line is `34.2s | 18,654 (37,376)` and the box is the state's
+        // accessible name (styles.css clips the word to screen-reader-only in both header
+        // states, so `- done` is never painted). The ` | ` between the figures is generated
+        // CSS, so no value's own text node carries any decoration: the word stays exactly
+        // `done` and each figure stays copy-pastable.
         expect([...(turn.element.querySelectorAll('.tile-top > *') ?? [])].map((node) => node.className)).toEqual([
             'tile-elapsed',
             'tile-tokens',
@@ -710,39 +723,42 @@ describe('responsive thread action bar', () => {
         ]);
         expect(turn.element.querySelector('.tile-top > .tile-status > .tile-status-text')?.textContent).toBe('done');
 
-        // R2 half two: Delete occupies the header's right slot, as a sibling of the
-        // header button (a <button> can never nest inside one).
-        const header = turn.element.querySelector<HTMLElement>('.tile-header-action');
-        expect(header).not.toBeNull();
-        expect(header?.parentElement).toBe(turn.element);
-        expect(header?.hidden).toBe(false);
-        expect([...(header?.children ?? [])].map((node) => node.className)).toEqual(['thread-delete']);
-        expect(header?.querySelector('.thread-delete .action-label')?.textContent).toBe('Delete');
-        expect(header?.querySelector('.thread-delete .action-glyph')?.textContent).toBe('X');
-        expect(actionButton(header as HTMLElement, '.thread-delete').getAttribute('aria-label')).toBe(
-            'Delete thread RR1'
-        );
-        // This standalone board has no DELETE transport; the control is honest
-        // about that instead of pretending the action is wired.
-        expect(actionButton(header as HTMLElement, '.thread-delete').title).toBe(
-            'Thread deletion is not wired in this host.'
-        );
+        // T26: the measurement line took the header's right-edge CONTROL slot, so it shares
+        // the badge's ONE line (styles.css `.tile.is-expanded .tile-select` is a row-wrap:
+        // identity `order: 0`, this line `order: 1; margin-left: auto`, meta `order: 2`
+        // forced onto its own line) and no control floats over it any more.
+        expect(turn.element.querySelector('.tile-header-action')).toBeNull();
+        // The card is exactly header → bar → body: the bar sits between them, so both of
+        // its actions are reachable without scrolling and vanish with expansion.
+        expect([...turn.element.children].map((node) => node.className)).toEqual([
+            'tile-select',
+            'tile-transcript-action',
+            'tile-body'
+        ]);
 
-        // The toolbar keeps Transcript (and the confirmation row it owns) and no longer
-        // carries a Delete button.
+        // T26: the bar holds BOTH actions now, in the requested order — destructive first,
+        // transcript last, and the confirmation row the bar has always owned.
         const bar = tileAction(turn);
         expect(bar.hidden).toBe(false);
         expect(bar.classList.contains('tile-transcript-action')).toBe(true);
         expect([...bar.children].map((node) => node.className)).toEqual([
+            'thread-delete',
             'transcript-open action-transcript',
             'thread-delete-confirm'
         ]);
-        expect(bar.querySelector('.transcript-open .action-label')?.textContent).toBe('Transcript');
-        expect(bar.querySelector('.transcript-open .action-glyph')?.textContent).toBe('{}');
-        expect(actionButton(bar, '.transcript-open').getAttribute('aria-label')).toBe(
-            'Open the JSON transcript of RR1'
-        );
-        expect(bar.querySelector('.thread-delete')).toBeNull();
+
+        const barDelete = actionButton(bar, '.thread-delete');
+        expect(barDelete.querySelector('.action-label')?.textContent).toBe('Delete');
+        expect(barDelete.querySelector('.action-glyph')?.textContent).toBe('X');
+        expect(barDelete.getAttribute('aria-label')).toBe('Delete thread RR1');
+        // This standalone board has no DELETE transport; the control is honest
+        // about that instead of pretending the action is wired.
+        expect(barDelete.title).toBe('Thread deletion is not wired in this host.');
+
+        const barTranscript = actionButton(bar, '.transcript-open');
+        expect(barTranscript.querySelector('.action-label')?.textContent).toBe('Transcript');
+        expect(barTranscript.querySelector('.action-glyph')?.textContent).toBe('{}');
+        expect(barTranscript.getAttribute('aria-label')).toBe('Open the JSON transcript of RR1');
 
         openTranscriptFrom(bar);
         expect(document.querySelector('.dialog-title')?.textContent).toBe(
@@ -765,104 +781,152 @@ describe('responsive thread action bar', () => {
         if (stylesheetPath === undefined) throw new Error('styles.css not found');
         const css = readFileSync(stylesheetPath, 'utf8');
 
+        // The line block helper: exact rule body of the FIRST rule whose selector starts a
+        // line (`\n` keeps `blockOf('.tile-top {')` off `.tile-top`-prefixed variants).
+        // Line endings are normalised because the contract is the declarations, not the
+        // file's newline style.
+        const blockOf = (selector: string): string => {
+            const at = css.indexOf(selector);
+            if (at < 0) throw new Error(`missing selector ${selector}`);
+            return css.slice(css.indexOf('{', at) + 1, css.indexOf('}', at)).replace(/\r\n/g, '\n');
+        };
+
         const barStart = css.indexOf(
             ':is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions) {'
         );
         expect(barStart).toBeGreaterThan(-1);
         const barBlock = css.slice(barStart, css.indexOf('}', barStart));
         expect(barBlock).toContain('flex-wrap: wrap');
-        // T1/R2: the bar has ONE action, so the two-ended layout is gone (nothing is
-        // pushed to the right edge any more).
+        // T1/R2 + T26: the bar never uses a two-ended `justify-content`; the trailing
+        // action is pushed right by its own `margin-left: auto` (below), which also keeps
+        // Transcript flush right when Delete is hidden on an undeletable conversation.
         expect(barBlock).not.toContain('justify-content');
+
+        // T26: Transcript is the TRAILING action — one rule, one declaration, so it is flush
+        // right whether or not Delete is rendered (an undeletable default conversation
+        // hides Delete and the transcript button must not slide into its place).
+        expect(blockOf('\n.transcript-open {')).toBe('\n    margin-left: auto;\n');
+        // T26: Delete is the LEADING action, so its ONLY own rule is the destructive colour
+        // pair — the `margin-left: auto` that used to push it to the bar's right edge (and
+        // the compact 92px header-slot sizing) is gone from every `.thread-delete` rule.
+        const deleteRules = (css.match(/^\.thread-delete \{[^}]*\}/gm) ?? []).map((block) =>
+            block.replace(/\r\n/g, '\n')
+        );
+        expect(deleteRules).toEqual([
+            '.thread-delete {\n    padding: 4px 10px;\n    border: 1px solid var(--border-strong);\n    border-radius: 6px;\n    background: var(--bg-elevated);\n    color: var(--text);\n    font: 500 11.5px/1.4 var(--sans);\n    cursor: pointer;\n}',
+            '.thread-delete {\n    border-color: rgba(248, 113, 113, 0.45);\n    color: var(--danger);\n}'
+        ]);
 
         // T1/R2: the state word is no longer right-aligned, and the identity pair is a
         // single order-0 line of the header.
         const statusRule = css.match(/:is\(\.tile-status, \.thread-status\) \{[\s\S]*?\}/)?.[0];
         expect(statusRule).toBeDefined();
         expect(statusRule).not.toContain('margin-left: auto');
+        // T2 (identifier sizing): the identity line is INTRINSIC (`flex: 0 0 auto`), so a
+        // narrow column shrinks the prompt instead of squeezing the badge wrapper — the
+        // shrinkable wrapper was what turned `IT1`/`IT2`/`IT3` into `I…`, because the
+        // badge's own `max-width` percentage resolved against it. T26: the cap now reserves
+        // the MEASUREMENT CLUSTER the badge shares its line with (`4m09s | 42,212
+        // (358,448)` ≈ 165px of 10.5px tabular mono + the 10px column gap), with a 120px
+        // `max()` floor so a narrow nested column still reads; the old 92px reserve was
+        // the absolutely positioned header Delete button.
         const identityRule = css.match(/\.tile-identity \{[\s\S]*?\}/)?.[0];
         expect(identityRule).toContain('order: 0');
         expect(identityRule).toContain('display: inline-flex');
+        expect(identityRule).toContain('flex: 0 0 auto');
+        expect(identityRule).toContain('max-width: max(120px, calc(100% - 176px))');
+        expect(identityRule).toContain('min-width: 0');
 
-        // R3: the state word closes the measurement line, and the ` - ` in front of it is
-        // GENERATED decoration (never part of the word), painted only when a measurement
-        // precedes it and only on an EXPANDED header — a compact row clips the word, and a
-        // dash in front of a clipped word would be a stray ` - `. Two rules, because the
-        // tally is hidden until a request reports usage and the clock is hidden for a
-        // replayed record with no end stamp; with neither visible the word stands alone.
-        const dashRules = [
-            ...css.matchAll(
-                /(:is\(\.tile\.is-expanded, \.thread-tile\.is-expanded\)[\s\S]*?:is\(\.tile-status, \.thread-status\)::before) \{([^}]*)\}/g
+        // R3/T2: the state word is no longer a VISIBLE suffix of the measurement line, so
+        // the generated ' - ' that joined it to the figures is gone from the stylesheet
+        // entirely (in either header state). `textContent` still holds the whole word, and
+        // the sr-only clip below is what hides it, so the state is never colour-only for
+        // assistive tech. Comments NAME the removed decoration (and the removed header
+        // slots), so the "gone" assertions run against the stylesheet with comments
+        // stripped.
+        const rules = css.replace(/\/\*[\s\S]*?\*\//g, '');
+        expect(rules).not.toContain("content: ' - '");
+        expect(rules).not.toContain(':is(.tile-status, .thread-status)::before');
+        // The line still renders EXACTLY as it reads: one spaced ` | ` between the two
+        // figures, generated (never part of either value), and NO flex gap on the line —
+        // a gap would leave dead space wherever a hidden label used to be.
+        expect(
+            blockOf(
+                ':is(.tile-elapsed, .thread-elapsed):not([hidden]) + :is(.tile-tokens, .thread-tokens):not([hidden])::before {'
             )
-        ];
-        expect(dashRules).toHaveLength(2);
-        for (const rule of dashRules) {
-            expect(rule[2]).toContain("content: ' - '");
-        }
-        expect(dashRules.map((rule) => rule[1])).toEqual([
-            expect.stringMatching(/:is\(\.tile-tokens, \.thread-tokens\):not\(\[hidden\]\)/),
-            expect.stringMatching(/:is\(\.tile-tokens, \.thread-tokens\)\[hidden\]/)
-        ]);
-        // The line carries no flex gap, so the generated separators hold ALL the spacing
-        // and the rendered line is exactly `2.8s | 8,946 - done` (and a compact row stays
-        // flush right, because its zero-width status box gets no gap of its own).
-        const blockOf = (selector: string): string => {
-            const at = css.indexOf(selector);
-            if (at < 0) throw new Error(`missing selector ${selector}`);
-            return css.slice(css.indexOf('{', at) + 1, css.indexOf('}', at));
-        };
+        ).toContain("content: ' | '");
         expect(blockOf('\n.tile-top {')).toContain('gap: 0');
         expect(blockOf('\n.thread-top {')).toContain('gap: 0');
-        // A compact row must not inherit the dash: the only ` - ` rules in the file are
-        // scoped to an expanded header.
-        expect(css).not.toMatch(/:is\(\.tile:not\(\.is-expanded\)[^{}]*::before\s*\{[^}]*content: ' - '/);
+        // T2: the state word is clipped in BOTH header states by ONE rule, and the two
+        // figures keep their ` | ` separator whether the block is collapsed or expanded.
+        expect(
+            blockOf(':is(.tile, .thread-tile) :is(.tile-status-text, .thread-status-text) {')
+        ).toContain('clip-path: inset(50%)');
 
-        // T1/R2: the header slots are positioned over the header of each card owner.
-        expect(css).toMatch(
-            /:is\(\.tile-header-action, \.thread-header-action, \.thread-focus-head-action\) \{\s*display: flex;\s*align-items: center;/
-        );
-        expect(css).toMatch(
-            /\.thread-tile > \.thread-header-action \{\s*position: absolute;[\s\S]*?right: 10px;/
-        );
-        expect(css).toMatch(/\.thread-focus-head-action \{\s*margin-left: auto;/);
+        // T26: the three header control hosts are gone from the DOM, so every rule that
+        // positioned, sized or reserved room for them is gone too (`.tile-header-action`
+        // on a turn tile, `.thread-header-action` on a nested card,
+        // `.thread-focus-head-action` on the roster panel, plus the 92px/84px reserves
+        // and the 17px/16px compact-slot sizing that used to centre the button on the
+        // badge line).
+        expect(rules).not.toContain('.tile-header-action');
+        expect(rules).not.toContain('.thread-header-action');
+        expect(rules).not.toContain('.thread-focus-head-action');
+        expect(rules).not.toContain('> .thread-delete');
+        expect(rules).not.toContain('padding-right: 92px');
+        expect(rules).not.toContain('padding-right: 84px');
+        expect(rules).not.toContain('max-width: calc(100% - 92px)');
 
-        // T3/R2 (reviewer finding 1): a nested card's header is ONE flex row and its
-        // only shrinkable item (`.thread-preview`) is hidden when expanded, so the
-        // flush-right measurement cluster used to sit under the absolutely positioned
-        // slot. The expanded header must RESERVE the slot's width instead.
-        expect(css).toMatch(/\.thread-tile\.is-expanded > \.thread-select \{\s*padding-right: 84px;/);
+        // T26: an expanded header is a flex ROW-WRAP — that is the whole mechanism that
+        // puts the measurement line where Delete used to be: identity (`order: 0`) leads,
+        // the figures (`order: 1`, `margin-left: auto`) close the SAME line flush right and
+        // the meta (`order: 2`, `flex: 1 0 100%`) is pushed onto its own line by its basis.
+        expect(css).toMatch(
+            /\.tile\.is-expanded \.tile-select \{\s*flex-flow: row wrap;\s*align-items: baseline;\s*column-gap: 10px;\s*row-gap: 4px;/
+        );
+        expect(css).toMatch(/\.tile\.is-expanded \.tile-top \{\s*order: 1;\s*margin-left: auto;/);
+        expect(css).toMatch(/\.tile\.is-expanded \.tile-meta \{\s*order: 2;\s*flex: 1 0 100%;/);
+        // The nested card was ALWAYS one row with its line flush right (this is the
+        // anatomy the main tile now matches), so nothing about it needed a reserve.
+        expect(css).toMatch(/\n\.thread-top \{\s*order: 2;[\s\S]*?margin-left: auto;/);
 
-        // T3/R2 + R4 (reviewer finding: "Delete slightly high"): the slot is no longer a
-        // `top` guessed from the button's own height. It gets the BADGE LINE's own box —
-        // the header's padding-top plus the pill's line box — and the shared
-        // `align-items: center` centres whatever the host holds (desktop label or phone
-        // glyph). Measured in real Chrome (`Temp/t2/probe-t2-header.html`, 384 cells): the
-        // two centres coincide to 0.00px on the main tile and 0.13px on a nested card.
+        // The mobile glyph swap is now ONE list of the three bars; the three header-slot
+        // variants are gone, because those hosts no longer exist. Each swap rule is pinned
+        // as the ONLY `:is(...) .action-*` override in the stylesheet, so a phone still
+        // gets `X`/`{}` and nothing else can hide a desktop label.
         expect(css).toMatch(
-            /\.tile\.is-expanded > \.tile-header-action \{\s*position: absolute;\s*z-index: 1;\s*top: 10px;\s*height: 17px;\s*right: 12px;/
+            /@media \(max-width: 600px\) \{[\s\S]*?:is\(\.tile-transcript-action, \.thread-transcript-action, \.thread-focus-actions\) \.action-label \{\s*display: none;/
         );
-        expect(css).toMatch(
-            /\.thread-tile > \.thread-header-action \{\s*position: absolute;\s*z-index: 1;\s*top: 6px;\s*height: 16px;\s*right: 10px;/
-        );
-        // R3/R4: the measurement line clears the same slot, because on an exchange that
-        // prints no badge (a conversation continuation) that line IS the header's first.
-        expect(css).toMatch(/\.tile\.is-expanded \.tile-top \{\s*padding-right: 92px;/);
+        expect(rules.match(/:is\([^)]*\) \.action-label \{/g)).toEqual([
+            ':is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions) .action-label {'
+        ]);
+        expect(rules.match(/:is\([^)]*\) \.action-glyph \{/g)).toEqual([
+            ':is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions) .action-glyph {'
+        ]);
+        // Desktop default: the glyph exists in the DOM but is not painted (the accessible
+        // name comes from `aria-label`, never from CSS).
+        expect(blockOf('\n.action-glyph {')).toContain('display: none');
 
-        // The glyph swap covers the header slots too, so a phone still gets `X`.
-        expect(css).toMatch(
-            /@media \(max-width: 600px\)[\s\S]*?\.thread-focus-head-action[\s\S]*?\)\s*\.action-label \{\s*display: none;[\s\S]*?\.action-glyph \{\s*display: inline;/
-        );
-        expect(css).toMatch(/\.action-glyph \{\s*display: none;/);
+        // T26: no disclosure chevron anywhere — `<summary>` is neutralised as a BASE
+        // element, so every `<details>` control (tool chip, think chip, anything added
+        // later) inherits it; the per-chip `::before` triangles are deleted rather than
+        // overridden. The endpoint accordion still draws its OWN glyph, which is why the
+        // base rule is a marker reset and not a `content` override.
+        expect(css).toMatch(/\nsummary \{\s*list-style: none;/);
+        expect(css).toMatch(/\nsummary::-webkit-details-marker \{\s*display: none;/);
+        expect(rules).not.toContain('.tool-summary::before');
+        expect(css).toMatch(/\.endpoint-summary::before \{\s*content: '▸';/);
     });
 
-    // T5/R2 (reviewer finding): an expanded header may CLIP the state word, but the word
-    // must never paint over the measurement cluster / Delete slot. `.tile-status` /
-    // `.thread-status` are shrinkable (`min-width: 0`), while `.tile-status-text` /
-    // `.thread-status-text` are `nowrap` — so without an explicit clip the ink leaves the
-    // box (real Chrome: `waiting for server` = 111px of ink in a 63px box at a 400px
-    // column). The rules below are what the browser probe in Temp/t5/probe-status.html
-    // settled on: clipped ink, a small legibility floor, and the T3 slot reserve intact.
-    it('clips the expanded state word inside its own box and keeps the slot clearance', () => {
+    // T2: the state word is not visible in EITHER header state, so the T5 clip machinery
+    // that protected the Delete slot from a long word is gone — a word clipped into a 1px
+    // box cannot paint over a neighbour. What the header still needs (and keeps) is a
+    // SHRINKABLE line whose FIGURES clip, because on an expanded tile that line now shares
+    // one row with the identity badge: the same overflow property the browser probes
+    // measured (real Chrome, `Temp/t5/probe-status.html` and
+    // `Temp/t2/probe-t2-header.html`: an un-shrinkable line ran 50px past a 300px nested
+    // card's own border, and an unclipped word put 111px of ink in a 63px box).
+    it('keeps the state word screen-reader-only and the measurement line shrinkable', () => {
         const stylesheetPath = ['src/frontend/styles.css', 'src/styles.css']
             .map((candidate) => resolve(process.cwd(), candidate))
             .find((candidate) => {
@@ -875,34 +939,34 @@ describe('responsive thread action bar', () => {
             });
         if (stylesheetPath === undefined) throw new Error('styles.css not found');
         const css = readFileSync(stylesheetPath, 'utf8');
+        const rules = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
-        // The word clips with an ellipsis, and it may shrink to the box.
-        const text = css.match(
-            /:is\(\.tile\.is-expanded, \.thread-tile\.is-expanded\) :is\(\.tile-status-text, \.thread-status-text\) \{([^}]*)\}/
+        // ONE unscoped rule: the word is clipped in the collapsed row AND the expanded
+        // header, and it is clipped rather than removed (`display: none` would drop it
+        // from the accessibility tree, which is the whole point of keeping it).
+        const word = css.match(
+            /:is\(\.tile, \.thread-tile\) :is\(\.tile-status-text, \.thread-status-text\) \{([^}]*)\}/
         )?.[1];
-        expect(text).toBeDefined();
-        expect(text).toContain('min-width: 0');
-        expect(text).toContain('overflow: hidden');
-        expect(text).toContain('text-overflow: ellipsis');
+        expect(word).toBeDefined();
+        expect(word).toContain('position: absolute');
+        expect(word).toContain('clip-path: inset(50%)');
+        expect(word).not.toContain('display: none');
 
-        // The box shrinks, with only a small floor (every un-shrinkable pixel is taken
-        // from the row: 2.5em/3.5em measured cluster-vs-Delete contact at a 340px column,
-        // 1.5em stays clean at 340/400/460 in both the label and the glyph layout).
-        const box = css.match(
-            /:is\(\.tile\.is-expanded, \.thread-tile\.is-expanded\) :is\(\.tile-status, \.thread-status\) \{([^}]*)\}/
-        )?.[1];
-        expect(box).toBeDefined();
-        expect(box).toContain('flex: 0 1 auto');
-        expect(box).toContain('min-width: 1.5em');
-        // R3: the box clips too. The generated ' - ' is a second, non-shrinkable flex
-        // item inside it, so the content can be wider than the box and ~19px of separator
-        // ink reached the Delete slot (real Chrome, Temp/t2/probe-t2-header.html). A
-        // clipped box keeps the promise that a clipped span's ink IS its rect.
-        expect(box).toContain('overflow: hidden');
+        // The per-state word rules must stay gone, including the `min-width: 1.5em`
+        // legibility floor: a floor on a box that holds only a clipped word is dead space
+        // at the END of the measurement line, which is now the line that owns the header's
+        // right edge.
+        expect(rules).not.toMatch(
+            /:is\(\.tile\.is-expanded, \.thread-tile\.is-expanded\) :is\(\.tile-status(-text)?, \.thread-status(-text)?\) \{/
+        );
+        expect(rules).not.toContain('min-width: 1.5em');
 
-        // R3: the word now shares the line with the clock and the tally, so the whole
-        // line has to be able to SHRINK and its numbers have to clip — an un-shrinkable
-        // line pushed its ink past the card's own edge on a 300px nested column.
+        // R3/T26: the line has to be able to SHRINK and its numbers have to clip inside
+        // their own boxes. T26 changed the reason, not the need: the figures no longer share
+        // the header's right edge with an absolutely positioned Delete button, they share it
+        // with the IDENTITY LINE on the same wrapped row, and an un-shrinkable
+        // `34.2s | 18,654 (37,376)` still ran past the card's own border on a 300px nested
+        // column. Clipping never rewrites `textContent`, so the figures stay selectable.
         const line = css.match(
             /:is\(\.tile\.is-expanded, \.thread-tile\.is-expanded\) :is\(\.tile-top, \.thread-top\) \{([^}]*)\}/
         )?.[1];
@@ -917,15 +981,18 @@ describe('responsive thread action bar', () => {
         expect(figures).toContain('overflow: hidden');
         expect(figures).toContain('text-overflow: ellipsis');
 
-        // Scope: `is-expanded` only, so the compact sr-only clip stays the single
-        // treatment for collapsed rows, and the T3 reserve that keeps Delete clear.
+        // The line's colour is still the only VISIBLE state cue (the word is clipped), on
+        // both block owners, and the reserve that used to defend the header slot is gone:
+        // no `padding-right` on either header, because the row layout itself places the
+        // figures and nothing floats over them.
         expect(css).toMatch(
-            /:is\(\.tile:not\(\.is-expanded\), \.thread-row:not\(\.is-expanded\)\) :is\(\.tile-status-text, \.thread-status-text\) \{\s*position: absolute;/
+            /:is\(\.tile, \.thread-tile\)\[data-state='done'\] :is\(\.tile-elapsed, \.tile-tokens, \.thread-elapsed, \.thread-tokens\) \{\s*color: var\(--ok\);/
         );
-        expect(css).toMatch(/\.thread-tile\.is-expanded > \.thread-select \{\s*padding-right: 84px;/);
+        expect(rules).not.toMatch(/\.tile\.is-expanded \.tile-top \{[^}]*padding-right:/);
+        expect(rules).not.toMatch(/\.thread-tile\.is-expanded > \.thread-select \{[^}]*padding-right:/);
     });
 
-    it('gives an expanded nested child conversation the same header control', () => {
+    it('gives an expanded nested child conversation the same action bar', () => {
         const board = mount();
         useSnapshot(board, transcriptSnapshot);
         const parent = board.adopt(parentTurn);
@@ -934,18 +1001,36 @@ describe('responsive thread action bar', () => {
             '.thread-row[data-persistent-thread="thread-child"]'
         );
         expect(childRow).not.toBeNull();
-        const childHeader = childRow?.querySelector<HTMLElement>('.thread-header-action');
-        const childBar = childRow?.querySelector<HTMLElement>('.thread-transcript-action');
-        // A collapsed card hides the header slot exactly like the toolbar.
-        expect(childHeader?.hidden).toBe(true);
+        // Scoped to THIS card: thread-child owns a grandchild row below it, and that row
+        // carries its own bar of the same class.
+        const tile = childRow?.querySelector<HTMLElement>(':scope > .thread-tile');
+        const childBar = childRow?.querySelector<HTMLElement>(
+            ':scope > .thread-tile > .thread-transcript-action'
+        );
+        // T26: a collapsed card has exactly ONE action surface and it is hidden; the header
+        // control host that used to hide with it no longer exists at all.
+        expect(tile?.querySelector('.thread-header-action')).toBeNull();
         expect(childBar?.hidden).toBe(true);
 
         expect(board.focusThread('thread-child')).toBe(true);
-        expect(childHeader?.hidden).toBe(false);
         expect(childBar?.hidden).toBe(false);
+        // T26: header → bar → body, and the bar is Delete, Transcript, confirmation — the
+        // identical anatomy of the main tile.
+        expect([...(tile?.children ?? [])].map((node) => node.className)).toEqual([
+            'thread-select',
+            'thread-transcript-action',
+            'thread-body'
+        ]);
+        expect([...(childBar?.children ?? [])].map((node) => node.className)).toEqual([
+            'thread-delete',
+            'transcript-open action-transcript',
+            'thread-delete-confirm'
+        ]);
         // R3: the nested card's identity half is its conversation code alone; the state
         // word sits at the END of the nested measurement line, exactly as it does on the
-        // main tile, so the two headers read as one component.
+        // main tile, so the two headers read as one component. That line was ALWAYS flush
+        // right (`.thread-top` is `order: 2; margin-left: auto`) — the anatomy the
+        // expanded tile now copies instead of an absolutely positioned Delete slot.
         const nestedSelect = childRow?.querySelector<HTMLElement>(':scope > .thread-tile > .thread-select');
         expect(
             [...(nestedSelect?.children ?? [])]
@@ -960,14 +1045,20 @@ describe('responsive thread action bar', () => {
         expect(nestedSelect?.querySelector('.thread-top > .thread-status')?.lastElementChild?.className).toBe(
             'thread-status-text'
         );
-        expect(childBar?.querySelector('.transcript-open .action-label')?.textContent).toBe('Transcript');
-        expect(childBar?.querySelector('.thread-delete')).toBeNull();
-        expect(actionButton(childHeader as HTMLElement, '.thread-delete').getAttribute('aria-label')).toBe(
-            'Delete thread RR2'
-        );
+        // T26: Delete reaches the child conversation from the bar now, still named by its
+        // own conversation code.
+        const nestedDelete = actionButton(childBar as HTMLElement, '.thread-delete');
+        expect(nestedDelete.getAttribute('aria-label')).toBe('Delete thread RR2');
+        expect(nestedDelete.querySelector('.action-label')?.textContent).toBe('Delete');
+        // This board has no DELETE transport, so the bar's Delete is honest about that
+        // rather than pretending to be wired (the shell test pins the wired case).
+        expect(nestedDelete.title).toBe('Thread deletion is not wired in this host.');
+        expect(
+            childBar?.querySelector('.transcript-open .action-label')?.textContent
+        ).toBe('Transcript');
     });
 
-    it('gives a roster-only focused thread the same header control', () => {
+    it('gives a roster-only focused thread the same action bar', () => {
         const board = mount();
         const snapshot = snapshotOf({
             threads: [
@@ -983,25 +1074,38 @@ describe('responsive thread action bar', () => {
         expect(board.focusThread('thread-roster')).toBe(true);
         const panel = document.querySelector<HTMLElement>('.thread-focus-panel');
         expect(panel).not.toBeNull();
-        // T1/R2: the panel head is one identity line (agent, name, state) with Delete
-        // flush right, and the toolbar under it keeps Transcript.
+        // T26: the panel head is ONE identity line (agent, name, state) and holds no control
+        // whatsoever — its former `.thread-focus-head-action` host is gone, so the head is
+        // pure text and the bar underneath owns both actions.
         expect(
             [...(panel?.querySelector<HTMLElement>('.thread-focus-head')?.children ?? [])].map(
                 (node) => node.className
             )
-        ).toEqual([
-            'thread-focus-agent',
-            'thread-focus-name',
-            'thread-focus-status',
-            'thread-focus-head-action'
+        ).toEqual(['thread-focus-agent', 'thread-focus-name', 'thread-focus-status']);
+        expect(panel?.querySelector('.thread-focus-head-action')).toBeNull();
+        expect([...(panel?.children ?? [])].map((node) => node.className)).toEqual([
+            'thread-focus-head',
+            'thread-transcript-action thread-focus-actions',
+            'thread-focus-messages'
         ]);
-        const head = panel?.querySelector<HTMLElement>('.thread-focus-head-action');
-        expect(head?.hidden).toBe(false);
-        expect(head?.querySelector('.thread-delete .action-label')?.textContent).toBe('Delete');
+
         const bar = panel?.querySelector<HTMLElement>('.thread-focus-actions');
         expect(bar?.hidden).toBe(false);
-        expect(bar?.querySelector('.transcript-open .action-label')?.textContent).toBe('Transcript');
-        expect(bar?.querySelector('.thread-delete')).toBeNull();
+        // The roster bar keeps its panel-specific transcript class and the same child
+        // order as a tile's bar: Delete leads, Transcript closes, confirmation last.
+        expect([...(bar?.children ?? [])].map((node) => node.className)).toEqual([
+            'thread-delete',
+            'transcript-open action-transcript thread-focus-transcript',
+            'thread-delete-confirm'
+        ]);
+        const rosterDelete = actionButton(bar as HTMLElement, '.thread-delete');
+        expect(rosterDelete.querySelector('.action-label')?.textContent).toBe('Delete');
+        expect(rosterDelete.getAttribute('aria-label')).toBe('Delete thread RR8');
+        // Same honesty as the other two surfaces: this board wires no DELETE transport.
+        expect(rosterDelete.title).toBe('Thread deletion is not wired in this host.');
+        const rosterTranscript = actionButton(bar as HTMLElement, '.transcript-open');
+        expect(rosterTranscript.querySelector('.action-label')?.textContent).toBe('Transcript');
+        expect(rosterTranscript.getAttribute('aria-label')).toBe('Open the JSON transcript of RR8');
 
         openTranscriptFrom(bar as HTMLElement);
         expect(document.querySelector('.dialog-title')?.textContent).toBe(
@@ -1009,11 +1113,11 @@ describe('responsive thread action bar', () => {
         );
     });
 
-    // T3/R2 (reviewer finding 2): a header host is appended to the card BEFORE the bar's
-    // first `sync` decides its visibility, so it must be CREATED hidden — exactly like the
-    // toolbar it pairs with — or a collapsed card paints one frame of a stray enabled
-    // Delete. `adopt` never expands, so it exposes the creation state.
-    it('creates every header slot hidden and reveals it only with the visible surface', () => {
+    // T3/R2 (reviewer finding 2) + T26: the bar IS the action surface now, and it is
+    // appended to the card BEFORE its first `sync` decides visibility, so it must be
+    // CREATED hidden — or a collapsed card paints one frame of a stray enabled
+    // Delete/Transcript pair. `adopt` never expands, so it exposes the creation state.
+    it('creates the action bar hidden and reveals it only with the visible surface', () => {
         const board = mount();
         const snapshot = snapshotOf({
             threads: [threadOf({ id: 'thread-slot', label: 'RR3', messages: [] })],
@@ -1023,34 +1127,43 @@ describe('responsive thread action bar', () => {
         const turn = board.adopt(snapshot.turns[0]);
 
         expect(turn.element.classList.contains('is-expanded')).toBe(false);
-        expect(turn.element.querySelector('.tile-header-action')?.hidden).toBe(true);
         expect(tileAction(turn).hidden).toBe(true);
 
-        // Expansion reveals BOTH halves of the surface together.
+        // Expansion reveals the whole surface (there is no second half to toggle).
         board.expand(turn);
-        expect(turn.element.querySelector('.tile-header-action')?.hidden).toBe(false);
         expect(tileAction(turn).hidden).toBe(false);
 
-        // A nested child card is created collapsed too: hidden slot, revealed by focus.
+        // And collapsing hides it again — the bar's own `hidden` is the mechanism that the
+        // removed header host used to mirror.
+        board.collapse();
+        expect(tileAction(turn).hidden).toBe(true);
+
+        // A nested child card is created collapsed too: hidden bar, revealed by focus.
         const nested = mount();
         useSnapshot(nested, transcriptSnapshot);
         const parent = nested.adopt(parentTurn);
         const childRow = parent.element.parentElement?.querySelector<HTMLElement>(
             '.thread-row[data-persistent-thread="thread-child"]'
         );
-        if (childRow === null) throw new Error('missing nested child row');
-        expect(childRow.querySelector('.thread-header-action')?.hidden).toBe(true);
+        // `parentElement` is nullable, so the guard narrows both halves (the board always
+        // wraps the card in a `.turn-row` with the child row under it).
+        if (!(childRow instanceof HTMLElement)) throw new Error('missing nested child row');
+        const childBar = childRow.querySelector<HTMLElement>(
+            ':scope > .thread-tile > .thread-transcript-action'
+        );
+        if (childBar === null) throw new Error('missing nested child action bar');
+        expect(childBar.hidden).toBe(true);
         expect(nested.focusThread('thread-child')).toBe(true);
-        expect(childRow.querySelector('.thread-header-action')?.hidden).toBe(false);
+        expect(childBar.hidden).toBe(false);
 
-        // The roster-only panel has no collapse state: its own sync reveals the slot.
+        // The roster-only panel has no collapse state: its own sync reveals the bar.
         const roster = mount();
         useSnapshot(
             roster,
             snapshotOf({ threads: [threadOf({ id: 'thread-roster-slot', label: 'RR7', messages: [] })] })
         );
         expect(roster.focusThread('thread-roster-slot')).toBe(true);
-        expect(document.querySelector('.thread-focus-head-action')?.hidden).toBe(false);
+        expect(document.querySelector<HTMLElement>('.thread-focus-actions')?.hidden).toBe(false);
     });
 
     it('keeps a JSON fallback available when a host does not provide a snapshot', () => {
@@ -1089,21 +1202,23 @@ const hostTarget = (overrides: Partial<SessionThread> = {}): SessionSnapshot =>
         turns: [turnOf({ id: 'turn-a', index: 0, threadId: 'thread-a' })]
     });
 
-// T1/R2: Delete lives in the CARD HEADER (`.tile-header-action` on a turn tile,
-// `.thread-header-action` on a nested card, `.thread-focus-head-action` on the
-// roster-only panel); its two-step confirmation stays in the toolbar below the header.
-// These helpers therefore take the SURFACE element (`turn.element`, a `.thread-row`,
-// or the `.thread-focus-panel`) and find the half they need inside it.
-const headerActionOf = (surface: ParentNode): HTMLElement => {
-    const host = surface.querySelector<HTMLElement>(
-        '.tile-header-action, .thread-header-action, .thread-focus-head-action'
+// T26: there is ONE action surface per card — the bar. It is a direct child of the tile
+// (`.tile-transcript-action`), of the nested card (`:scope > .thread-tile >
+// .thread-transcript-action`, scoped so a grandchild row's own bar can never answer
+// instead) or of the roster panel (`:scope > .thread-focus-actions`), and it holds Delete,
+// Transcript and the two-step confirmation in that order. These helpers therefore take the
+// SURFACE element (`turn.element`, a `.thread-row`, or the `.thread-focus-panel`) and find
+// both halves inside that one bar.
+const threadBarOf = (surface: ParentNode): HTMLElement => {
+    const bar = surface.querySelector<HTMLElement>(
+        ':scope > .tile-transcript-action, :scope > .thread-transcript-action, :scope > .thread-tile > .thread-transcript-action'
     );
-    if (host === null) throw new Error('missing thread header action slot');
-    return host;
+    if (bar === null) throw new Error('missing thread action bar');
+    return bar;
 };
 
 const deleteButton = (surface: HTMLElement): HTMLButtonElement =>
-    actionButton(headerActionOf(surface), '.thread-delete');
+    actionButton(threadBarOf(surface), '.thread-delete');
 const confirmBox = (bar: HTMLElement): HTMLElement => {
     const box = bar.querySelector<HTMLElement>('.thread-delete-confirm');
     if (box === null) throw new Error('missing delete confirmation');
@@ -1129,12 +1244,13 @@ describe('confirmed thread deletion', () => {
         const bar = tileAction(turn);
         const card = turn.element;
 
-        // T1/R2: the header owns the Delete control, the toolbar owns Transcript and
-        // the confirmation.
-        expect([...(headerActionOf(card).children ?? [])].map((node) => node.className)).toEqual([
-            'thread-delete'
+        // T26: the bar owns all three parts in the requested order — Delete first (it is
+        // clickable from there, no header host needed), Transcript second, confirmation last.
+        expect([...bar.children].map((node) => node.className)).toEqual([
+            'thread-delete',
+            'transcript-open action-transcript',
+            'thread-delete-confirm'
         ]);
-        expect(bar.querySelector('.thread-delete')).toBeNull();
 
         deleteButton(card).click();
         expect(confirmBox(bar).hidden).toBe(false);
@@ -1250,15 +1366,37 @@ describe('confirmed thread deletion', () => {
         const defaultTurn = board.adopt(snapshot.turns[0]);
         board.expand(defaultTurn);
         const defaultBar = tileAction(defaultTurn);
+        expect(defaultBar.hidden).toBe(false);
         expect(deleteButton(defaultTurn.element).hidden).toBe(true);
-        // T1/R2: with no Delete control, the header slot itself is hidden (it reserves
-        // nothing on an undeletable default conversation).
-        expect(headerActionOf(defaultTurn.element).hidden).toBe(true);
+        // T26: an undeletable default conversation hides ONLY the Delete button — the bar
+        // stays (Transcript is still owed) and `margin-left: auto` keeps that trailing
+        // action flush right instead of sliding it into the destructive action's place.
+        expect(
+            [...defaultBar.children]
+                .filter((node) => !(node instanceof HTMLElement && node.hidden))
+                .map((node) => node.className)
+        ).toEqual(['transcript-open action-transcript']);
         expect(actionButton(defaultBar, '.transcript-open').hidden).toBe(false);
+        expect(actionButton(defaultBar, '.transcript-open').disabled).toBe(false);
+        // The control is still there (just not painted), so its accessible name and honest
+        // reason survive the `hidden`.
+        expect(deleteButton(defaultTurn.element).getAttribute('aria-label')).toBe(
+            'Delete thread RR5'
+        );
+        expect(deleteButton(defaultTurn.element).title).toBe(
+            'The default agent conversation cannot be deleted; reset the session instead.'
+        );
 
         const runningTurn = board.adopt(snapshot.turns[1]);
         board.expand(runningTurn);
         const runningBar = tileAction(runningTurn);
+        // T26: a live thread keeps a VISIBLE but disabled Delete in the bar, and the click
+        // never reaches the confirmation row.
+        expect([...runningBar.children].map((node) => node.className)).toEqual([
+            'thread-delete',
+            'transcript-open action-transcript',
+            'thread-delete-confirm'
+        ]);
         expect(deleteButton(runningTurn.element).hidden).toBe(false);
         expect(deleteButton(runningTurn.element).disabled).toBe(true);
         expect(deleteButton(runningTurn.element).title).toBe(

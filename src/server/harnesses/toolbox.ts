@@ -28,12 +28,16 @@
 //                        so a keyless host is offline-safe. The global catalogue
 //                        still lists it as `unconfigured`, never fake-callable.
 //   - core tools       - the core file tools (read, write,
-//                        edit, glob, grep), search when the host configured a
-//                        key, and the harness-owned set (toolRegistry, toolRequest,
-//                        toolCreate, todoManage, profileManage, chapterManage,
-//                        locationManage, plus delegate for a preset that
-//                        declares subagents).
-//                        fileList and the other package/app tools stay
+//                        edit, glob, grep), search and fetch when the host
+//                        configured them (a provider key for search, the
+//                        `webfetch` flag for fetch), and the harness-owned pair
+//                        toolRequest (the discovery bootstrap) plus task (the
+//                        session plan), with delegate for a preset that declares
+//                        subagents.
+//                        fileList, the other package/app tools, and the runtime
+//                        rows R9-R11 demoted (toolRegistry/toolList/toolManage/
+//                        toolCreate/profileManage/chapterManage/locationManage/
+//                        agentManage/agentResult/actionRequest/threadFork) stay
 //                        searchable, so they wait for toolRequest.
 //
 // "core" is a declaration classification, not a session binding: only the
@@ -75,7 +79,7 @@
 //   - ../src/harness.ts — `presets: false` + `toolSources` startup compilation
 //   - ../api.ts  — descriptors resolved from the same preset metadata
 
-import { agent, harness, presetTools, WEB_SEARCH_TOOL_NAME } from '../../harness';
+import { agent, harness, presetTools, WEB_FETCH_TOOL_NAME, WEB_SEARCH_TOOL_NAME } from '../../harness';
 import type { Agent, Harness, HarnessConfiguration, HarnessProgress, Tool } from '../../harness';
 import { agentInstruction, agentProfile } from '../../agents';
 import { PRESET_DESCRIPTORS, RUNTIME_DESCRIPTORS, isCoreRegistered } from '../../tools/descriptors';
@@ -193,10 +197,12 @@ export const CORE_PRESET_TOOL_NAMES: readonly string[] = Object.freeze(
     )
 );
 
-// The configured environment-backed core tool. It appears only when the runtime
-// catalogue has an executable definition (a provider key resolved), which is why
-// it is not in the static list above.
-export const CORE_ENVIRONMENT_TOOL_NAMES = [WEB_SEARCH_TOOL_NAME] as const;
+// The configured environment-backed core tools. Each appears only when the
+// runtime catalogue has an executable definition (a provider key resolved for
+// search, the `webfetch` flag for fetch), which is why they are not in the
+// static list above. R9-R11: both entries declare `visibility: core`, so a
+// production preset that registers one must advertise it here as well.
+export const CORE_ENVIRONMENT_TOOL_NAMES = [WEB_SEARCH_TOOL_NAME, WEB_FETCH_TOOL_NAME] as const;
 
 // Project the core set for one preset descriptor.
 //
@@ -217,9 +223,12 @@ export const coreToolNames = (
     return [
         ...CORE_TOOL_NAMES,
         ...(subagents.length > 0 ? ['delegate'] : []),
-        // N6: always registered (forks default enabled), after delegate in
-        // the runtime's registration order.
-        'threadFork',
+        // R9-R11: the hardcoded `threadFork` row is gone. It promised a
+        // declaration because forks register by default, but the entry now
+        // declares searchable visibility, so it is discovered through
+        // toolRequest like the rest of the demoted runtime set. delegate keeps
+        // its special case only because it stays core WHEN a preset declares
+        // subagents.
         ...CORE_PRESET_TOOL_NAMES.filter((name) => available.has(name)),
         ...CORE_ENVIRONMENT_TOOL_NAMES.filter((name) => available.has(name))
     ];

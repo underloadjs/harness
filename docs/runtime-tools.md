@@ -74,7 +74,22 @@ sessionBound?, listed? }`. One loop in `src/harness.ts` registers every row whos
 | `interaction` | `interaction` is configured |
 | `forks` | `forks.enabled` |
 | `threads` | the session opens its first independent thread |
-| `websearch` / `webfetch` | that provider was configured and resolved |
+| `websearch` | `websearch` is configured AND a provider key resolved (`createWebSearchTool` returned a tool) |
+| `webfetch` | `webfetch` is configured (the factory always returns a tool: the `native` provider needs no key) |
+
+For both web rows a host-registered tool of the same wire name wins, and the
+provider surface (description, tags, and the per-harness `provider` enum)
+replaces the entry's generic literal at registration — credentials and the
+configured provider list never enter editable source. The `download` entry needs
+neither credential nor configuration: it is a `preset`-group row with
+`activation: always` and `visibility: searchable`, so every harness registers it and
+opens it through `toolRequest` (order 235, between `gitDiff` 230 and `search` 240).
+The two web rows are the opposite: `search.tool.ts` and `fetch.tool.ts` are
+`visibility: core` (R9-R11), so a harness that REGISTERED them declares them on every
+request - the gate is activation, never a discovery round. The server mirrors that
+pair with one catalogue module per name (`src/server/harnesses/websearch.ts` and
+`webfetch.ts`), and `describeHarness` advertises each environment name only when that
+catalogue carries an executable definition for it.
 
 The policy flags are bound to the published **definition object**, not the wire
 name, so replacing a tool publishes an ordinary tool that inherits nothing:
@@ -116,9 +131,14 @@ install; generated `dist/` files are not the editable source model.
 
 The opt-in web tools also ship independently as `tools/runtime/search.tool.ts`
 and `tools/runtime/fetch.tool.ts`; their editable provider implementations are shipped
-too. The registered entries delegate provider/credential operations to the
-harness that owns them; startup supplies the configured metadata/runtime closure.
-A replacement registered under those names is an ordinary source revision and
+too — `tools/websearch/` (`exa.ts`, `tavily.ts`, `linkup.ts`) and
+`tools/webfetch/` (`native.ts`, `exa.ts`, `linkup.ts`). The registered entries
+delegate provider/credential operations to the harness that owns them; startup
+supplies the configured metadata/runtime closure. `download` is different:
+`tools/webdownload/download.tool.ts` is a self-contained preset entry with no
+harness-owned closure (no credential, and its bounds and MIME tables are inline
+literals so a compiled revision keeps `dependencies: []`). A replacement
+registered under those names is an ordinary source revision and
 does not inherit the original harness's configured provider closure. Module-local
 provider state is not migrated between revisions. Credentials remain harness
 configuration, never candidate source or source records.

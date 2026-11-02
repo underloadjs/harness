@@ -1,18 +1,26 @@
-// Agent configuration dialog (T3) — module contract.
+// Agent configuration dialog (T3/R3) — module contract.
 //
 // composer-agent-control.test.ts and main.test.ts exercise this dialog through the
 // live shell (real fetch stubs, PATCH bodies). This file pins the DIALOG ITSELF,
 // without main.ts, so the rules the product depends on stay covered when the shell
 // changes:
-//   - ONE dropdown lists every agent, and selecting one shows its configuration;
-//   - selection, instruction edits, model edits and the membership toggle are LOCAL
-//     drafts: `onApply` is never called by them;
+//   - ONE strip of clickable badges lists the ROSTER (the saved team plus drafted
+//     adds) and nothing else: an agent the team does not select has no badge, and the
+//     removed dropdown/team-section/note paragraph never come back;
+//   - selecting a badge is a VIEW change: it moves the instruction and model area and
+//     never writes and never promotes;
+//   - `[+]` offers the nonmembers ONLY, drafting an add that becomes a badge;
+//   - `Make primary` / `Remove from team` are the only things that move the team, and
+//     they are LOCAL drafts until the action;
 //   - the bottom-right action is the only writer, it is disabled while nothing is
-//     pending, and it reports the exact delta (including the promotion);
+//     pending, and it reports the exact delta (including an armed promotion);
 //   - dismissal (X/backdrop/Escape/`close()`) discards every draft;
 //   - a failed apply keeps the dialog open with its drafts and states the reason;
 //   - a live `update()` refreshes untouched fields from the server, keeps a touched
 //     one, and restores focus (including the caret);
+//   - the badges are keyboard-operable (one tab stop, arrows move the selection);
+//   - a frozen saved session locks the roster and the instruction WITH the reason on
+//     each control, and keeps models live;
 //   - `paintActivity()` paints rings without rebuilding the body.
 //
 // Every assertion names the exact expected value — see the deterministic rule.
@@ -103,22 +111,49 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(
     return found;
 };
 
-const dropdown = (): HTMLSelectElement => byClass('.agent-dialog-agent-select', 'select');
 const instructionBox = (): HTMLTextAreaElement => byClass('.agent-dialog-instruction', 'textarea');
 const modelSelect = (): HTMLSelectElement => byClass('.agent-model-select', 'select');
-const memberToggle = (): HTMLInputElement => byClass('.agent-dialog-member', 'input');
 const applyButton = (): HTMLButtonElement => byClass('.agent-dialog-apply', 'button');
+const addButton = (): HTMLButtonElement => byClass('.agent-dialog-add', 'button');
+const promoteButton = (): HTMLButtonElement => byClass('.agent-dialog-promote', 'button');
+const removeButton = (): HTMLButtonElement => byClass('.agent-dialog-remove', 'button');
 
-// The dropdown entries as [value, visible label], so "every agent is in one dropdown"
-// is pinned against the exact server library, not a count.
-const entriesOf = (): [string, string][] =>
-    [...dropdown().options].map((option) => [option.value, option.textContent ?? '']);
+// The roster strip as the reader sees it: who has a badge, in which order, with the
+// role/model facts inside it and which one is selected.
+const tabsOf = (): [string, string, boolean, string, string][] =>
+    [...document.querySelectorAll<HTMLElement>('.agent-dialog-tab')].map((tab) => [
+        tab.dataset.agent ?? '',
+        tab.dataset.role ?? '',
+        tab.getAttribute('aria-selected') === 'true',
+        tab.querySelector('.agent-dialog-agent-name')?.textContent ?? '',
+        tab.querySelector('.agent-dialog-agent-model')?.textContent ?? ''
+    ]);
 
+// Selecting an agent is now a click on its badge (R3: the dropdown is gone).
 const selectAgent = (name: string): void => {
-    const select = dropdown();
-    select.value = name;
-    select.dispatchEvent(new Event('change', { bubbles: true }));
+    const tab = Array.from(document.querySelectorAll<HTMLElement>('.agent-dialog-tab')).find(
+        (element) => element.dataset.agent === name
+    );
+    if (tab === undefined) throw new Error(`no badge for ${name}`);
+
+    (tab as HTMLButtonElement).click();
 };
+
+const pressKey = (key: string): void => {
+    const active = document.activeElement;
+    if (!(active instanceof HTMLElement)) throw new Error('nothing is focused');
+    active.dispatchEvent(new KeyboardEvent('keydown', { key, bubbles: true, cancelable: true }));
+};
+
+const openPicker = (): void => {
+    addButton().click();
+};
+
+const pickerOptions = (): [string, string][] =>
+    [...document.querySelectorAll<HTMLElement>('.agent-dialog-add-option')].map((option) => [
+        option.dataset.agent ?? '',
+        option.textContent ?? ''
+    ]);
 
 const typeInstruction = (text: string): void => {
     const box = instructionBox();
@@ -139,47 +174,64 @@ const flush = async (): Promise<void> => {
     await Promise.resolve();
 };
 
-describe('the dropdown and the configuration panel', () => {
-    it('lists the team first, then every other catalogue agent, with its team state', () => {
+describe('the roster strip', () => {
+    it('lists only the team as badges, primary first, and shows its model', () => {
         dialog = openAgentDialog(
             base({
-                // A saved session can name an agent the catalogue no longer advertises.
+                // A saved conversation can name an agent the catalogue no longer
+                // advertises, so the roster comes from the members, never the library.
                 members: ['instruct', 'legacy'],
                 onApply: applyOf().onApply
             })
         );
 
         expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · Instruct');
-        expect(entriesOf()).toEqual([
-            ['instruct', 'Instruct · primary'],
-            ['legacy', 'Agent · team member'],
-            ['research', 'Researcher · not in the team'],
-            ['reviewer', 'Reviewer · not in the team']
+        expect(tabsOf()).toEqual([
+            ['instruct', 'primary', true, 'Instruct', 'm1'],
+            ['legacy', 'secondary', false, 'Agent', 'm1']
         ]);
 
-        // The primary is the default view: its instruction and model are on screen.
+        // R3: no dropdown, no duplicate Team section, no explanation paragraph, and no
+        // one-line team fact — the badge IS the team state.
+        expect(document.querySelector('.agent-dialog-agent-select')).toBeNull();
+        expect(document.querySelector('.agent-dialog-team-list')).toBeNull();
+        expect(document.querySelector('.agent-dialog-note')).toBeNull();
+        expect(document.querySelector('.agent-dialog-state')).toBeNull();
+        expect(document.querySelector('.agent-dialog-member')).toBeNull();
+
+        // The strip names itself for a screen reader and is a real tablist.
+        expect(byClass('.agent-dialog-tabs', 'div').getAttribute('role')).toBe('tablist');
+        expect(byClass('.agent-dialog-tabs', 'div').getAttribute('aria-label')).toBe('Agent team');
+
+        // The primary is the default view: its instruction and model are on screen, and
+        // the panel is the tab's declared controls.
+        const config = byClass('.agent-dialog-config', 'section');
+        expect(config.dataset.agent).toBe('instruct');
+        expect(config.getAttribute('role')).toBe('tabpanel');
+        expect(config.getAttribute('aria-labelledby')).toBe('agent-dialog-tab-instruct');
         expect(instructionBox().getAttribute('aria-label')).toBe('Instruction for Instruct');
         expect(instructionBox().value).toBe('Answer directly.');
         expect(modelSelect().getAttribute('aria-label')).toBe('Model for Instruct');
-        expect(memberToggle().checked).toBe(true);
-        expect(byClass('.agent-dialog-state', 'p').textContent).toBe('Instruct is the primary agent.');
-
-        // The team rows are the current members, primary first, with their models.
-        expect(
-            [...document.querySelectorAll<HTMLElement>('.agent-dialog-agent')].map((row) => [
-                row.dataset.agent,
-                row.dataset.role,
-                row.querySelector('.agent-dialog-agent-name')?.textContent,
-                row.querySelector('.agent-dialog-agent-role')?.textContent,
-                row.querySelector('.agent-dialog-agent-model')?.textContent
-            ])
-        ).toEqual([
-            ['instruct', 'primary', 'Instruct', 'primary', 'm1'],
-            ['legacy', 'secondary', 'Agent', 'subagent', 'm1']
-        ]);
+        expect(promoteButton().getAttribute('aria-pressed')).toBe('false');
+        expect(promoteButton().disabled).toBe(true);
+        expect(promoteButton().title).toBe('The primary agent is already the primary.');
+        expect(removeButton().disabled).toBe(true);
+        expect(removeButton().title).toBe('The primary agent is always part of the team.');
     });
 
-    it('shows the selected agent configuration without writing anything', () => {
+    it('never lists an agent the team does not select', () => {
+        dialog = openAgentDialog(base());
+
+        // `reviewer` is in the trusted catalogue but not on the team, so it has no
+        // badge at all; it reaches the strip through `[+]`.
+        expect(tabsOf()).toEqual([
+            ['instruct', 'primary', true, 'Instruct', 'm1'],
+            ['research', 'secondary', false, 'Researcher', 'm1']
+        ]);
+        expect(document.querySelector('.agent-dialog-tab[data-agent="reviewer"]')).toBeNull();
+    });
+
+    it('moves the instruction and model area on a badge click without writing', () => {
         const apply = applyOf();
         dialog = openAgentDialog(base({ onApply: apply.onApply }));
 
@@ -187,8 +239,7 @@ describe('the dropdown and the configuration panel', () => {
 
         // Every visible piece moved to the selected agent...
         expect(byClass('.dialog-title', 'h2').textContent).toBe('Agents · Researcher');
-        expect(byClass('.agent-dialog-config', 'div').dataset.agent).toBe('research');
-        expect(byClass('.agent-dialog-state', 'p').textContent).toBe('Researcher is a team member.');
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('research');
         expect(instructionBox().value).toBe('Investigate.');
         expect(modelSelect().getAttribute('aria-label')).toBe('Model for Researcher');
         // ...and the trusted guidelines are still shown as the preset reference.
@@ -198,8 +249,12 @@ describe('the dropdown and the configuration panel', () => {
             )
         ).toEqual(['Cite sources.']);
 
-        // Nothing was written: switching agents is a view change.
+        // R3: selecting a badge is a view change AND not a promotion. The action stays
+        // disabled, so reading a teammate's prompt cannot arm a promotion.
         expect(apply.calls).toEqual([]);
+        expect(applyButton().disabled).toBe(true);
+        expect(applyButton().textContent).toBe('Save configuration');
+        expect(tabsOf().map((tab) => tab[2])).toEqual([false, true]);
     });
 
     it('keeps a stored override as the editor baseline and offers the revert', () => {
@@ -219,41 +274,174 @@ describe('the dropdown and the configuration panel', () => {
         expect(instructionBox().value).toBe('');
         expect(apply.calls).toEqual([]);
     });
+});
 
-    it('shows an agent that is not in the team, unchecked, and explains what saving adds', () => {
+describe('the keyboard', () => {
+    it('gives the strip one tab stop and moves the selection with the arrows', () => {
         dialog = openAgentDialog(base());
 
-        selectAgent('reviewer');
+        // Roving tabindex: only the selected badge is in the tab order.
+        expect(
+            [...document.querySelectorAll<HTMLElement>('.agent-dialog-tab')].map((tab) => tab.tabIndex)
+        ).toEqual([0, -1]);
 
-        expect(memberToggle().checked).toBe(false);
-        expect(memberToggle().disabled).toBe(false);
-        expect(byClass('.agent-dialog-state', 'p').textContent).toBe('Reviewer is not in this team yet.');
+        const first = byClass('.agent-dialog-tab[data-agent="instruct"]', 'button');
+        first.focus();
+        pressKey('ArrowRight');
+
+        // Automatic activation: the view follows the focus, and focus survives the
+        // rebuild on the badge that is now selected.
+        expect(tabsOf().map((tab) => tab[2])).toEqual([false, true]);
+        expect(document.activeElement).toBe(document.querySelector('.agent-dialog-tab[data-agent="research"]'));
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('research');
+        expect(
+            [...document.querySelectorAll<HTMLElement>('.agent-dialog-tab')].map((tab) => tab.tabIndex)
+        ).toEqual([-1, 0]);
+
+        pressKey('ArrowRight');
+        expect(tabsOf().map((tab) => tab[2])).toEqual([true, false]);
+
+        pressKey('Home');
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('instruct');
+        pressKey('End');
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('research');
+    });
+});
+
+describe('the add picker', () => {
+    it('lists only the agents without a badge, in catalogue order', () => {
+        const apply = applyOf();
+        dialog = openAgentDialog(
+            base({
+                members: ['instruct', 'research'],
+                agents: [agents[2], agents[1], agents[0]],
+                onApply: apply.onApply
+            })
+        );
+
+        // The picker is closed until `[+]` is pressed, so nothing is listed by default.
+        expect(document.querySelector('.agent-dialog-add-list')).toBeNull();
+        expect(addButton().getAttribute('aria-expanded')).toBe('false');
+        expect(apply.calls).toEqual([]);
+
+        openPicker();
+
+        expect(addButton().getAttribute('aria-expanded')).toBe('true');
+        // `research` is a member (so it is never offered again) and the surviving
+        // nonmember keeps the library's own order and its display title.
+        expect(pickerOptions()).toEqual([['reviewer', 'Reviewer']]);
+        expect(apply.calls).toEqual([]);
+    });
+
+    it('drafts an add, gives it a badge, and keeps the other agents unsaved values', async () => {
+        const apply = applyOf();
+        dialog = openAgentDialog(base({ onApply: apply.onApply }));
+
+        // An edit on a current member first, to prove `[+]` does not lose it.
+        typeInstruction('Answer in three words.');
+
+        openPicker();
+        byClass('.agent-dialog-add-option[data-agent="reviewer"]', 'button').click();
+
+        // The added agent joins the strip, marked as a draft, and is the viewed agent.
+        expect(document.querySelector('.agent-dialog-add-list')).toBeNull();
+        expect(
+            [...document.querySelectorAll<HTMLElement>('.agent-dialog-tab')].map((tab) => [
+                tab.dataset.agent,
+                tab.dataset.added ?? '',
+                tab.getAttribute('aria-selected') === 'true'
+            ])
+        ).toEqual([
+            ['instruct', '', false],
+            ['research', '', false],
+            ['reviewer', 'true', true]
+        ]);
         expect(
             [...document.querySelectorAll<HTMLElement>('.agent-dialog-field-note')].map((node) => node.textContent)
-        ).toEqual(['Saving a configuration for an outside agent adds it; no current member is removed.']);
+        ).toEqual(['Reviewer joins the team when you save · nothing is sent yet.']);
+        expect(instructionBox().value).toBe('Hunt for bugs.');
+
+        // Instruct's unsaved instruction survived the add, and nothing was written.
+        selectAgent('instruct');
+        expect(instructionBox().value).toBe('Answer in three words.');
+        expect(apply.calls).toEqual([]);
+
+        applyButton().click();
+        await flush();
+
+        // One save adds exactly the new agent, and never invents a promotion.
+        expect(apply.calls).toEqual([
+            {
+                agent: 'instruct',
+                models: {},
+                instructions: { instruct: 'Answer in three words.' },
+                add: ['reviewer'],
+                remove: []
+            }
+        ]);
+    });
+
+    it('cancels a drafted add without leaving any delta', async () => {
+        const apply = applyOf();
+        dialog = openAgentDialog(base({ onApply: apply.onApply }));
+
+        openPicker();
+        byClass('.agent-dialog-add-option[data-agent="reviewer"]', 'button').click();
+        removeButton().click();
+
+        // Cancelling an add is not a removal: the saved team never listed that agent, so
+        // the roster is back to the server state and there is nothing to send.
+        expect(tabsOf()).toEqual([
+            ['instruct', 'primary', true, 'Instruct', 'm1'],
+            ['research', 'secondary', false, 'Researcher', 'm1']
+        ]);
+        expect(applyButton().disabled).toBe(true);
+
+        applyButton().click();
+        expect(apply.calls).toEqual([]);
+    });
+
+    it('disables the add control with the real reason when the team is locked', () => {
+        dialog = openAgentDialog(
+            base({ editable: false, hint: 'Wait for the current run to finish before switching agents.' })
+        );
+
+        expect(addButton().disabled).toBe(true);
+        expect(addButton().title).toBe('Wait for the current run to finish before switching agents.');
+
+        // A press on a disabled control adds nobody and sends nothing.
+        openPicker();
+        expect(document.querySelector('.agent-dialog-add-list')).toBeNull();
+    });
+
+    it('disables the add control when every offered agent already has a badge', () => {
+        dialog = openAgentDialog(base({ members: ['instruct', 'research', 'reviewer'] }));
+
+        expect(addButton().disabled).toBe(true);
+        expect(addButton().title).toBe('Every agent the server offers is already on this team.');
+        expect(tabsOf().map((tab) => tab[0])).toEqual(['instruct', 'research', 'reviewer']);
     });
 });
 
 describe('drafts', () => {
-    it('writes nothing for an instruction edit, a model edit or a membership toggle', () => {
+    it('writes nothing for an instruction edit, a model edit or an armed promotion', () => {
         const apply = applyOf();
         dialog = openAgentDialog(base({ onApply: apply.onApply }));
 
         typeInstruction('Answer in three words.');
         chooseModel('m2');
 
-        const toggle = memberToggle();
-        toggle.checked = false;
-        toggle.dispatchEvent(new Event('change', { bubbles: true }));
+        selectAgent('research');
+        promoteButton().click();
 
         expect(apply.calls).toEqual([]);
-        // The controls still show the reader's own choices (draft state, not the server's).
-        expect(instructionBox().value).toBe('Answer in three words.');
-        expect(modelSelect().value).toBe('m2');
-        expect(memberToggle().checked).toBe(false);
+        // The controls still show the reader own choices (draft state, not the server's).
+        expect(tabsOf().map((tab) => tab[2])).toEqual([false, true]);
+        expect(promoteButton().getAttribute('aria-pressed')).toBe('true');
+        expect(applyButton().textContent).toBe('Save & set primary');
     });
 
-    it('keeps every agent draft across dropdown switches and shows the pending action', async () => {
+    it('keeps every agent draft across badge switches and sends both deltas without promoting', async () => {
         const apply = applyOf();
         dialog = openAgentDialog(base({ onApply: apply.onApply }));
 
@@ -276,14 +464,14 @@ describe('drafts', () => {
         expect(instructionBox().value).toBe('Investigate with sources.');
         expect(modelSelect().value).toBe('m2');
 
-        // One save carries BOTH agents' deltas, and selecting a member promotes it.
+        // One save carries BOTH agents deltas, and the viewed agent stays a member
+        // without becoming the primary (R3: selection never promotes).
         applyButton().click();
         await flush();
 
         expect(apply.calls).toEqual([
             {
                 agent: 'research',
-                primary: 'research',
                 models: { research: 'm2' },
                 instructions: { instruct: 'Answer in three words.', research: 'Investigate with sources.' },
                 add: [],
@@ -292,43 +480,53 @@ describe('drafts', () => {
         ]);
     });
 
-    it('promotes a non-member and adds it, without touching current members', async () => {
+    it('promotes only when the panel control is pressed', async () => {
         const apply = applyOf();
         dialog = openAgentDialog(base({ onApply: apply.onApply }));
 
-        selectAgent('reviewer');
-        expect(applyButton().textContent).toBe('Save & set primary');
-        expect(applyButton().disabled).toBe(false);
+        selectAgent('research');
+        expect(applyButton().disabled).toBe(true);
 
-        // Choosing an outside agent is the only reason `add` is ever populated, and it
-        // never removes anyone.
+        promoteButton().click();
+        expect(applyButton().disabled).toBe(false);
+        expect(applyButton().textContent).toBe('Save & set primary');
+        expect(byClass('.agent-dialog-footer-note', 'p').textContent).toBe(
+            'Saves this harness and makes Researcher the primary.'
+        );
+
         applyButton().click();
         await flush();
 
         expect(apply.calls).toEqual([
-            {
-                agent: 'reviewer',
-                primary: 'reviewer',
-                models: {},
-                instructions: {},
-                add: ['reviewer'],
-                remove: []
-            }
+            { agent: 'research', primary: 'research', models: {}, instructions: {}, add: [], remove: [] }
         ]);
+    });
+
+    it('cancels an armed promotion on a second press', () => {
+        dialog = openAgentDialog(base());
+
+        selectAgent('research');
+        promoteButton().click();
+        expect(applyButton().disabled).toBe(false);
+
+        promoteButton().click();
+        expect(promoteButton().getAttribute('aria-pressed')).toBe('false');
+        expect(applyButton().disabled).toBe(true);
+        expect(applyButton().textContent).toBe('Save configuration');
     });
 
     it('reports an explicit removal of a member and never removes anyone else', async () => {
         const apply = applyOf();
         dialog = openAgentDialog(base({ onApply: apply.onApply }));
 
-        // Removing is about a member the reader is NOT promoting: uncheck Researcher,
-        // then go back to the current primary and save from there.
+        // Removing is a deliberate press on that agent own panel, and the view moves to
+        // a rostered agent rather than configuring an agent the save would drop.
         selectAgent('research');
-        const toggle = memberToggle();
-        toggle.checked = false;
-        toggle.dispatchEvent(new Event('change', { bubbles: true }));
+        removeButton().click();
 
-        selectAgent('instruct');
+        expect(tabsOf()).toEqual([['instruct', 'primary', true, 'Instruct', 'm1']]);
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('instruct');
+
         applyButton().click();
         await flush();
 
@@ -337,23 +535,22 @@ describe('drafts', () => {
         ]);
     });
 
-    it('never removes the agent it is promoting', async () => {
+    it('drops a removed agent drafted edits, because the server rejects a non-member key', async () => {
         const apply = applyOf();
         dialog = openAgentDialog(base({ onApply: apply.onApply }));
 
         selectAgent('research');
-
-        const toggle = memberToggle();
-        toggle.checked = false;
-        toggle.dispatchEvent(new Event('change', { bubbles: true }));
+        typeInstruction('Investigate with sources.');
+        chooseModel('m2');
+        removeButton().click();
 
         applyButton().click();
         await flush();
 
-        // `primary: research` + an empty remove list: promotion wins over a stale
-        // uncheck, so the harness cannot end up with a primary outside its team.
+        // Only the removal is sent: a leaving agent has no team entry to hold its model
+        // or instruction, so a delta there would be a 400 on the harness PATCH.
         expect(apply.calls).toEqual([
-            { agent: 'research', primary: 'research', models: {}, instructions: {}, add: [], remove: [] }
+            { agent: 'instruct', models: {}, instructions: {}, add: [], remove: ['research'] }
         ]);
     });
 
@@ -378,7 +575,7 @@ describe('drafts', () => {
         await flush();
 
         expect(apply.calls).toEqual([
-            { agent: 'research', primary: 'research', models: { research: '' }, instructions: {}, add: [], remove: [] }
+            { agent: 'research', models: { research: '' }, instructions: {}, add: [], remove: [] }
         ]);
     });
 });
@@ -478,6 +675,8 @@ describe('the transactional action', () => {
         typeInstruction('Never saved.');
         chooseModel('m2');
         selectAgent('research');
+        openPicker();
+        byClass('.agent-dialog-add-option[data-agent="reviewer"]', 'button').click();
 
         // X / backdrop / Escape all route here (ui/dialog.ts), as does a programmatic
         // close from a lifecycle change.
@@ -487,8 +686,13 @@ describe('the transactional action', () => {
         expect(closed).toEqual(['closed']);
         expect(dialog.isOpen).toBe(false);
 
-        // Re-opening starts from the server state, not from the dropped draft.
+        // Re-opening starts from the server state, not from the dropped draft: no
+        // invented badge, no dropped instruction, no dropped model choice.
         dialog = openAgentDialog(base({ onApply: apply.onApply }));
+        expect(tabsOf()).toEqual([
+            ['instruct', 'primary', true, 'Instruct', 'm1'],
+            ['research', 'secondary', false, 'Researcher', 'm1']
+        ]);
         expect(instructionBox().value).toBe('Answer directly.');
         expect(modelSelect().value).toBe('');
         expect(apply.calls).toEqual([]);
@@ -521,16 +725,11 @@ describe('live refresh while open', () => {
 
         // Touched: the draft wins over the refreshed baseline.
         expect(instructionBox().value).toBe('Investigate with sources.');
-        // The team list follows the server: new primary, new member.
-        expect(
-            [...document.querySelectorAll<HTMLElement>('.agent-dialog-agent')].map((row) => [
-                row.dataset.agent,
-                row.dataset.role
-            ])
-        ).toEqual([
-            ['research', 'primary'],
-            ['instruct', 'secondary'],
-            ['reviewer', 'secondary']
+        // The strip follows the server: new primary, new member, in the server order.
+        expect(tabsOf()).toEqual([
+            ['research', 'primary', true, 'Researcher', 'm2'],
+            ['instruct', 'secondary', false, 'Instruct', 'm1'],
+            ['reviewer', 'secondary', false, 'Reviewer', 'm1']
         ]);
         // An untouched agent shows the server value.
         selectAgent('instruct');
@@ -540,6 +739,21 @@ describe('live refresh while open', () => {
         selectAgent('reviewer');
         expect(instructionBox().value).toBe('Review every claim.');
         expect(apply.calls).toEqual([]);
+    });
+
+    it('closes an open picker when a refresh leaves nothing to add', () => {
+        dialog = openAgentDialog(base({ members: ['instruct'] }));
+
+        openPicker();
+        expect(pickerOptions()).toEqual([
+            ['research', 'Researcher'],
+            ['reviewer', 'Reviewer']
+        ]);
+
+        dialog.update(base({ members: ['instruct', 'research', 'reviewer'] }));
+
+        expect(document.querySelector('.agent-dialog-add-list')).toBeNull();
+        expect(addButton().disabled).toBe(true);
     });
 
     it('restores focus and the caret on the same instruction control after a rebuild', () => {
@@ -559,13 +773,16 @@ describe('live refresh while open', () => {
         expect(rebuilt.selectionStart).toBe(5);
     });
 
-    it('restores focus on the dropdown and the model select across a rebuild', () => {
+    it('restores focus on the same badge and the model select across a rebuild', () => {
         dialog = openAgentDialog(base());
 
-        const select = dropdown();
-        select.focus();
+        selectAgent('research');
+        const tab = byClass('.agent-dialog-tab[data-agent="research"]', 'button');
+        tab.focus();
         dialog.update(base({ primary: 'research', members: ['research', 'instruct'] }));
-        expect(document.activeElement).toBe(dropdown());
+        const rebuiltTab = byClass('.agent-dialog-tab[data-agent="research"]', 'button');
+        expect(rebuiltTab).not.toBe(tab);
+        expect(document.activeElement).toBe(rebuiltTab);
 
         const model = modelSelect();
         model.focus();
@@ -575,26 +792,34 @@ describe('live refresh while open', () => {
         expect(document.activeElement).toBe(rebuilt);
     });
 
-    it('falls back to the primary when the viewed agent leaves the team and the catalogue', () => {
+    it('falls back to the primary when the viewed agent leaves the roster and the catalogue', () => {
         dialog = openAgentDialog(base());
 
-        selectAgent('reviewer');
-        expect(byClass('.agent-dialog-config', 'div').dataset.agent).toBe('reviewer');
+        // The viewed agent is a drafted addition, so it only exists while the trusted
+        // library still advertises it.
+        openPicker();
+        byClass('.agent-dialog-add-option[data-agent="reviewer"]', 'button').click();
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('reviewer');
 
         dialog.update(base({ members: ['research', 'instruct'], primary: 'instruct', agents: [agents[0], agents[1]] }));
 
-        expect(byClass('.agent-dialog-config', 'div').dataset.agent).toBe('instruct');
-        expect(dropdown().value).toBe('instruct');
+        // Configuring an agent the server can no longer reach is meaningless, so the
+        // view returns to the primary instead of stranding the reader on a dead badge.
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('instruct');
+        expect(tabsOf().map((tab) => tab[0])).toEqual(['research', 'instruct']);
+        expect(tabsOf().map((tab) => tab[2])).toEqual([false, true]);
     });
 });
 
 describe('honest restrictions and lifecycle', () => {
-    it('locks the instruction and membership in a saved session and keeps models live', async () => {
+    it('locks the instruction and the roster in a saved session and keeps models live', async () => {
         const apply = applyOf();
+        const hint =
+            'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.';
         dialog = openAgentDialog(
             base({
                 editable: false,
-                hint: 'A saved conversation keeps the agent team and the instructions it was created with.',
+                hint,
                 models: {
                     models: { instruct: 'm1', research: 'm1' },
                     catalogue: ['m1', 'm2'],
@@ -606,11 +831,22 @@ describe('honest restrictions and lifecycle', () => {
             })
         );
 
-        expect(byClass('.agent-dialog-note', 'p').textContent).toBe(
-            'A saved conversation keeps the agent team and the instructions it was created with.'
-        );
+        // R3: the frozen roster is still the full team (a saved conversation lists ITS
+        // members), and there is no explanation paragraph anywhere.
+        expect(tabsOf().map((tab) => tab[0])).toEqual(['instruct', 'research']);
+        expect(document.querySelector('.agent-dialog-note')).toBeNull();
+
+        // Every locked control carries the real reason instead of a paragraph.
         expect(instructionBox().disabled).toBe(true);
-        expect(memberToggle().disabled).toBe(true);
+        expect(instructionBox().title).toBe(
+            'A saved conversation runs the instructions it was created with. Edit them on the harness to use them in a new session.'
+        );
+        expect(addButton().disabled).toBe(true);
+        expect(addButton().title).toBe(hint);
+        expect(promoteButton().disabled).toBe(true);
+        expect(promoteButton().title).toBe(hint);
+        expect(removeButton().disabled).toBe(true);
+        expect(removeButton().title).toBe(hint);
         // R2: models stay live in a saved session, so the select is still enabled.
         expect(modelSelect().disabled).toBe(false);
 
@@ -619,7 +855,8 @@ describe('honest restrictions and lifecycle', () => {
         expect(applyButton().textContent).toBe('Save configuration');
         expect(applyButton().disabled).toBe(true);
         expect(byClass('.agent-dialog-footer-note', 'p').textContent).toBe(
-            'This conversation keeps the team and instructions it was created with. Saving changes only Instruct’s model, from its next request.'        );
+            'Models only here · this conversation keeps the team and instructions it started with.'
+        );
 
         chooseModel('m2');
         expect(applyButton().disabled).toBe(false);
@@ -627,32 +864,54 @@ describe('honest restrictions and lifecycle', () => {
         applyButton().click();
         await flush();
 
-        expect(apply.calls).toEqual([{ agent: 'instruct', models: { instruct: 'm2' }, instructions: {}, add: [], remove: [] }]);
+        expect(apply.calls).toEqual([
+            { agent: 'instruct', models: { instruct: 'm2' }, instructions: {}, add: [], remove: [] }
+        ]);
     });
 
-    it('names the lock reason for the membership control on a locked team', () => {
+    it('still views every frozen member without attempting a team change', async () => {
+        const apply = applyOf();
         dialog = openAgentDialog(
-            base({ editable: false, hint: 'Wait for the current run to finish before switching agents.' })
+            base({
+                editable: false,
+                hint: 'Wait for the current run to finish before switching agents.',
+                onApply: apply.onApply
+            })
         );
 
         selectAgent('research');
 
-        expect(byClass('.agent-dialog-note', 'p').textContent).toBe(
-            'Wait for the current run to finish before switching agents.'
-        );
-        expect(
-            [...document.querySelectorAll<HTMLElement>('.agent-dialog-field-note')].map((node) => node.textContent)
-        ).toEqual(['The team is locked for this conversation.']);
+        // Viewing is not an edit, so the mid-run lock leaves the roster and the model
+        // area reachable while the team controls state the reason.
+        expect(byClass('.agent-dialog-config', 'section').dataset.agent).toBe('research');
+        expect(instructionBox().value).toBe('Investigate.');
+        expect(removeButton().title).toBe('Wait for the current run to finish before switching agents.');
+        expect(apply.calls).toEqual([]);
     });
 
-    it('paints activity rings on the team rows without rebuilding the body', () => {
+    it('names the lock reason for the whole strip when nothing can change', () => {
+        dialog = openAgentDialog(
+            base({
+                editable: false,
+                hint: 'A session is being created; try again in a moment.',
+                models: { models: {}, catalogue: ['m1'], editable: false }
+            })
+        );
+
+        expect(byClass('.agent-dialog-footer-note', 'p').textContent).toBe(
+            'Nothing can be changed in this conversation right now.'
+        );
+        expect(addButton().title).toBe('A session is being created; try again in a moment.');
+    });
+
+    it('paints activity rings on the badges without rebuilding the body', () => {
         dialog = openAgentDialog(base());
         const rowsBefore = [...document.querySelectorAll<HTMLElement>('.agent-dialog-agent')];
 
         dialog.paintActivity(new Set(['research']));
 
         const rowsAfter = [...document.querySelectorAll<HTMLElement>('.agent-dialog-agent')];
-        // Same nodes: a ring repaint must not recreate the rows (caret/details survive).
+        // Same nodes: a ring repaint must not recreate the badges (caret/details survive).
         expect(rowsAfter).toEqual(rowsBefore);
         expect(rowsAfter.map((row) => row.dataset.activity)).toEqual([undefined, 'active']);
         expect(rowsAfter.map((row) => row.getAttribute('aria-busy'))).toEqual([null, 'true']);
@@ -661,6 +920,20 @@ describe('honest restrictions and lifecycle', () => {
         expect(
             [...document.querySelectorAll<HTMLElement>('.agent-dialog-agent')].map((row) => row.dataset.activity)
         ).toEqual([undefined, undefined]);
+    });
+
+    it('seeds the activity ring on rebuild so a refresh cannot drop a working agent', () => {
+        dialog = openAgentDialog(base({ activity: ['research'] }));
+
+        expect(
+            [...document.querySelectorAll<HTMLElement>('.agent-dialog-tab')].map((tab) => [
+                tab.dataset.activity,
+                tab.getAttribute('aria-busy')
+            ])
+        ).toEqual([
+            [undefined, null],
+            ['active', 'true']
+        ]);
     });
 
     it('closes once and ignores updates after close', () => {

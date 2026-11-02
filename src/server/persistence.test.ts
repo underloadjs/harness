@@ -12,7 +12,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, describe, expect, it, vi } from 'vitest';
 import { agent, harness, tool } from '../harness';
 import type {
     HarnessMessage,
@@ -23,8 +23,11 @@ import type {
 } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
-import { createWebSearchCatalogueEntry, createToolCatalogue } from './harnesses';
+import { ALL_PRESET_TEMPLATES, createWebSearchCatalogueEntry, createToolCatalogue } from './harnesses';
+import { SessionStore } from './sessions';
 import {
+    HARNESS_DATABASE_DIRECTORY,
+    HARNESS_DATABASE_FILE,
     HARNESS_DATABASE_VERSION,
     HarnessPersistence,
     HarnessPersistenceError,
@@ -180,10 +183,11 @@ describe('R3b durable harness database', () => {
         // One completed turn: the transcript and the turn record must survive.
         await first.store.run(id, 'remember this', async () => {});
 
-        // A durable session record (todoManage) and a durable runtime-created tool.
-        expect(await first.store.callTool(id, 'todoManage', { action: 'add', text: 'keep me' })).toEqual({
-            todo: { id: '1', text: 'keep me', completed: false },
-            counts: { total: 1, completed: 0, remaining: 1 }
+        // A durable session record (task) and a durable runtime-created tool.
+        expect(await first.store.callTool(id, 'task', { tasks: [{ text: 'keep me' }] })).toEqual({
+            tasks: [{ id: '1', text: 'keep me', completed: false }],
+            counts: { total: 1, completed: 0, pending: 1 },
+            page: { offset: 0, limit: 20, hasMore: false }
         });
         expect(
             await first.store.callTool(id, 'toolCreate', {
@@ -215,10 +219,10 @@ describe('R3b durable harness database', () => {
 
         const before = first.store.get(id);
         expect(before.discoveredTools).toEqual(['echoed']);
-        const todosBefore = await first.store.callTool(id, 'todoManage', { action: 'list' });
+        const todosBefore = await first.store.callTool(id, 'task', {});
         expect(todosBefore).toEqual({
-            todos: [{ id: '1', text: 'keep me', completed: false }],
-            counts: { total: 1, completed: 0, remaining: 1 },
+            tasks: [{ id: '1', text: 'keep me', completed: false }],
+            counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false }
         });
 
@@ -256,7 +260,7 @@ describe('R3b durable harness database', () => {
         expect(restored.discoveredTools).toEqual(['echoed']);
         expect(restored.agentModels).toEqual({ one: 'next/model' });
         expect(restored.harnessDefinition).toEqual(before.harnessDefinition);
-        expect(await second.store.callTool(id, 'todoManage', { action: 'list' })).toEqual(todosBefore);
+        expect(await second.store.callTool(id, 'task', {})).toEqual(todosBefore);
         expect(await second.store.callTool(id, 'echoed', 'works')).toBe('WORKS');
 
         // Registry metadata re-created from disk (not from the seed list).
@@ -365,10 +369,13 @@ describe('R3b durable harness database', () => {
     it('keeps a session frozen after a registry patch and restores it from its own record', async () => {
         const root = tempRoot('frozen');
 
+        // T5: this pins the SCRIPTED demo's frozen factory, so it injects the
+        // fixtures explicitly — exactly what a host that wants the offline card does.
         const first = createHarnessRuntime({
             root,
             settings: SETTINGS,
             defaults: DEFAULTS,
+            registry: createHarnessRegistry(ALL_PRESET_TEMPLATES),
             catalogue: CATALOGUE,
             loadEnvironment: false
         });
@@ -388,6 +395,7 @@ describe('R3b durable harness database', () => {
             root,
             settings: SETTINGS,
             defaults: DEFAULTS,
+            registry: createHarnessRegistry(ALL_PRESET_TEMPLATES),
             catalogue: CATALOGUE,
             loadEnvironment: false
         });
@@ -653,8 +661,8 @@ describe('R3b durable harness database', () => {
                                     toolCalls: [
                                         {
                                             id: 'c1',
-                                            name: 'todoManage',
-                                            arguments: '{"action":"add","text":"done before crash"}'
+                                            name: 'task',
+                                            arguments: '{"tasks":[{"text":"done before crash"}]}'
                                         }
                                     ]
                                 };
@@ -689,9 +697,9 @@ describe('R3b durable harness database', () => {
         const restored = second.store.get(created.id);
 
         expect(restored.turns[0].status).toBe('error');
-        expect(await second.store.callTool(created.id, 'todoManage', { action: 'list' })).toEqual({
-            todos: [{ id: '1', text: 'done before crash', completed: false }],
-            counts: { total: 1, completed: 0, remaining: 1 },
+        expect(await second.store.callTool(created.id, 'task', {})).toEqual({
+            tasks: [{ id: '1', text: 'done before crash', completed: false }],
+            counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false }
         });
         // Interrupted, not replayed: the restored turn keeps the completed tool
@@ -739,7 +747,7 @@ describe('R3b durable harness database', () => {
                 {
                     role: 'assistant',
                     content: '',
-                    toolCalls: [{ id: 'c1', name: 'todoManage', arguments: '{}' }]
+                    toolCalls: [{ id: 'c1', name: 'task', arguments: '{}' }]
                 }
             ]
         });
@@ -750,13 +758,13 @@ describe('R3b durable harness database', () => {
             {
                 role: 'assistant',
                 content: '',
-                toolCalls: [{ id: 'c1', name: 'todoManage', arguments: '{}' }]
+                toolCalls: [{ id: 'c1', name: 'task', arguments: '{}' }]
             },
             {
                 role: 'tool',
                 content: INTERRUPTED_TOOL_RESULT_TEXT,
                 toolCallId: 'c1',
-                name: 'todoManage'
+                name: 'task'
             }
         ]);
 
@@ -769,11 +777,11 @@ describe('R3b durable harness database', () => {
                     role: 'assistant',
                     content: '',
                     toolCalls: [
-                        { id: 'done-1', name: 'todoManage', arguments: '{"action":"list"}' },
-                        { id: 'lost-2', name: 'todoManage', arguments: '{"action":"add","text":"x"}' }
+                        { id: 'done-1', name: 'task', arguments: '{}' },
+                        { id: 'lost-2', name: 'task', arguments: '{"tasks":[{"x"}]}' }
                     ]
                 },
-                { role: 'tool', content: '{"todos":[]}', toolCallId: 'done-1', name: 'todoManage' }
+                { role: 'tool', content: '{"tasks":[]}', toolCallId: 'done-1', name: 'task' }
             ]
         });
 
@@ -784,16 +792,16 @@ describe('R3b durable harness database', () => {
                 role: 'assistant',
                 content: '',
                 toolCalls: [
-                    { id: 'done-1', name: 'todoManage', arguments: '{"action":"list"}' },
-                    { id: 'lost-2', name: 'todoManage', arguments: '{"action":"add","text":"x"}' }
+                    { id: 'done-1', name: 'task', arguments: '{}' },
+                    { id: 'lost-2', name: 'task', arguments: '{"tasks":[{"x"}]}' }
                 ]
             },
-            { role: 'tool', content: '{"todos":[]}', toolCallId: 'done-1', name: 'todoManage' },
+            { role: 'tool', content: '{"tasks":[]}', toolCallId: 'done-1', name: 'task' },
             {
                 role: 'tool',
                 content: INTERRUPTED_TOOL_RESULT_TEXT,
                 toolCallId: 'lost-2',
-                name: 'todoManage'
+                name: 'task'
             }
         ]);
 
@@ -815,7 +823,7 @@ describe('R3b durable harness database', () => {
                 {
                     role: 'assistant',
                     content: '',
-                    toolCalls: [{ id: 'helper-1', name: 'todoManage', arguments: '{}' }]
+                    toolCalls: [{ id: 'helper-1', name: 'task', arguments: '{}' }]
                 }
             ]
         });
@@ -831,7 +839,7 @@ describe('R3b durable harness database', () => {
             role: 'tool',
             content: INTERRUPTED_TOOL_RESULT_TEXT,
             toolCallId: 'helper-1',
-            name: 'todoManage'
+            name: 'task'
         });
         expect(multiRepaired.records).toBe(multiAgent.records);
         expect(multiRepaired.discovery).toBe(multiAgent.discovery);
@@ -872,7 +880,7 @@ describe('R3b durable harness database', () => {
 
         const first = runtimeOf(root, [preset]);
         const created = first.store.create('probe');
-        await first.store.callTool(created.id, 'todoManage', { action: 'add', text: 'kept record' });
+        await first.store.callTool(created.id, 'task', { tasks: [{ text: 'kept record' }] });
         first.store.dispose();
 
         // Simulate the active-snapshot window T22 discovered: the persisted core
@@ -885,7 +893,7 @@ describe('R3b durable harness database', () => {
         transcript.messages.push({
             role: 'assistant',
             content: '',
-            toolCalls: [{ id: 'orphan-1', name: 'todoManage', arguments: '{"action":"add","text":"never run"}' }]
+            toolCalls: [{ id: 'orphan-1', name: 'task', arguments: '{"tasks":[{"never run"}]}' }]
         });
         fs.writeFileSync(file, JSON.stringify(database, null, 2), 'utf8');
 
@@ -899,13 +907,13 @@ describe('R3b durable harness database', () => {
             role: 'tool',
             content: INTERRUPTED_TOOL_RESULT_TEXT,
             toolCallId: 'orphan-1',
-            name: 'todoManage'
+            name: 'task'
         });
 
         // The orphan call was never executed: only the pre-crash record exists.
-        expect(await second.store.callTool(created.id, 'todoManage', { action: 'list' })).toEqual({
-            todos: [{ id: '1', text: 'kept record', completed: false }],
-            counts: { total: 1, completed: 0, remaining: 1 },
+        expect(await second.store.callTool(created.id, 'task', {})).toEqual({
+            tasks: [{ id: '1', text: 'kept record', completed: false }],
+            counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false }
         });
 
@@ -1049,9 +1057,10 @@ describe('R3b durable harness database', () => {
 
         // Durable session state on the doomed record: a todo (core snapshot), a
         // live per-agent model map and its own settings model.
-        expect(await first.store.callTool(doomed.id, 'todoManage', { action: 'add', text: 'delete me too' })).toEqual({
-            todo: { id: '1', text: 'delete me too', completed: false },
-            counts: { total: 1, completed: 0, remaining: 1 }
+        expect(await first.store.callTool(doomed.id, 'task', { tasks: [{ text: 'delete me too' }] })).toEqual({
+            tasks: [{ id: '1', text: 'delete me too', completed: false }],
+            counts: { total: 1, completed: 0, pending: 1 },
+            page: { offset: 0, limit: 20, hasMore: false }
         });
         expect(first.store.setAgentModels(doomed.id, { two: 'next/model' }).agentModels).toEqual({
             two: 'next/model'
@@ -1092,6 +1101,380 @@ describe('R3b durable harness database', () => {
         expect(() => second.store.get(doomed.id)).toThrow(`Unknown session "${doomed.id}".`);
         expect(second.store.get(keep.id)).toEqual(keptBefore);
         expect(doomedBefore.id).toBe(doomed.id);
+    });
+});
+
+// T5: deleting a harness has to be DURABLE, and `registry` alone cannot say "this
+// shipped built-in is gone" (a fresh registry always re-seeds the shipped templates).
+// The document therefore carries the deleted names in the additive `deleted` list,
+// which restore replays BEFORE the rows. The invariant under test is the saved
+// conversation: a session freezes its own preset record, so removing a card must
+// never lose, drop, or change a transcript — including the scripted fixture, whose
+// factory the restore looks up in the shipped-template superset.
+describe('T5 durable harness deletion', () => {
+    type Document = {
+        version: number;
+        savedAt: number;
+        registry: { name: string; title?: string; primary?: string; builtin?: boolean }[];
+        deleted?: string[];
+        sessions: { id: string; harness: string }[];
+    };
+
+    const readState = (root: string): Document =>
+        JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Document;
+
+    const writeState = (root: string, document: Document): void => {
+        fs.writeFileSync(stateFile(root), JSON.stringify(document, null, 2), 'utf8');
+    };
+
+    // A registry/store with a persistence owner whose WRITE always fails: the
+    // database directory sits under a path component that is a plain FILE, so the
+    // store's own `mkdirSync` fails for a real reason (no mock involved).
+    const failingStore = (label: string): { store: SessionStore; registry: ReturnType<typeof createHarnessRegistry> } => {
+        const root = tempRoot(label);
+        const blocker = path.join(root, 'blocked');
+        fs.writeFileSync(blocker, 'not a directory', 'utf8');
+
+        const registry = createHarnessRegistry();
+        const store = new SessionStore(SETTINGS, registry, undefined, {
+            persistence: new HarnessPersistence(path.join(blocker, 'nested'))
+        });
+
+        return { store, registry };
+    };
+
+    const failureOf = (run: () => unknown): { status: number; message: string } => {
+        try {
+            run();
+        } catch (error) {
+            const failure = error as { status?: number; message: string };
+            return { status: failure.status ?? 0, message: failure.message };
+        }
+
+        throw new Error('expected the mutation to fail');
+    };
+
+    it('keeps a deleted user harness gone across a restart without a tombstone', () => {
+        const root = tempRoot('delete-custom');
+        const first = runtimeOf(root, [liveScriptedPreset('one')]);
+
+        first.registry.create({ name: 'mine', title: 'Mine', primary: 'workspace' });
+        expect(first.store.mutateRegistry(() => first.registry.remove('mine')).name).toBe('mine');
+
+        // A user harness is absent from the document as soon as it is absent from
+        // `list()`; only a built-in needs the extra record.
+        const document = readState(root);
+        expect(document.registry.map((entry) => entry.name)).toEqual(['one']);
+        expect(document).not.toHaveProperty('deleted');
+
+        first.store.dispose();
+
+        const second = runtimeOf(root, [liveScriptedPreset('one')]);
+        expect(second.registry.find('mine')).toBeUndefined();
+        expect(second.registry.list().map((preset) => preset.name)).toEqual(['one']);
+        expect(second.registry.deletedBuiltins()).toEqual([]);
+    });
+
+    it('keeps a deleted built-in gone across a restart and records the tombstone', () => {
+        const root = tempRoot('delete-builtin');
+
+        const first = createHarnessRuntime({
+            root,
+            settings: SETTINGS,
+            defaults: DEFAULTS,
+            catalogue: CATALOGUE,
+            loadEnvironment: false
+        });
+
+        // A live session on the shipped default, created before the deletion.
+        const id = first.store.create('instruct').id;
+        const frozen = first.store.get(id).harnessDefinition;
+        expect(frozen?.title).toBe('Instruct');
+
+        first.store.mutateRegistry(() => first.registry.remove('instruct'));
+
+        // The card is gone for good, so a NEW session on it is a 404.
+        expect(failureOf(() => first.store.create('instruct'))).toEqual({
+            status: 404,
+            message: 'Unknown harness "instruct".'
+        });
+
+        const document = readState(root);
+        expect(document.deleted).toEqual(['instruct']);
+        expect(document.registry.map((entry) => entry.name)).toEqual([
+            'research',
+            'workspace',
+            'reviewer',
+            'planner'
+        ]);
+        expect(document.sessions.map((session) => session.harness)).toEqual(['instruct']);
+
+        first.store.dispose();
+
+        // A restart over the same root: the shipped template comes back from the
+        // module, and the tombstone takes it out again before any row is replayed.
+        const second = createHarnessRuntime({
+            root,
+            settings: SETTINGS,
+            defaults: DEFAULTS,
+            catalogue: CATALOGUE,
+            loadEnvironment: false
+        });
+
+        expect(second.registry.list().map((preset) => preset.name)).toEqual([
+            'research',
+            'workspace',
+            'reviewer',
+            'planner'
+        ]);
+        expect(second.registry.find('instruct')).toBeUndefined();
+
+        // An alias follows its target: `writer` named instruct, and instruct is gone.
+        expect(second.registry.find('writer')).toBeUndefined();
+        expect(second.registry.deletedBuiltins()).toEqual(['instruct']);
+
+        // The conversation survives the deletion untouched, and the restore dropped
+        // nothing: the frozen 'live' record rebuilds without a registry entry.
+        expect(second.store.restoreErrors).toEqual([]);
+        const restored = second.store.get(id);
+        expect(restored.harness).toBe('instruct');
+        expect(restored.harnessDefinition).toEqual(frozen);
+        expect(second.store.list().map((session) => session.id)).toEqual([id]);
+    });
+
+    it('keeps a deleted fixture session restorable AND runnable', async () => {
+        const root = tempRoot('delete-fixture-session');
+
+        // A host that injected the offline fixture records a real conversation, then
+        // deletes the card (it is a built-in in that registry, so it tombstones).
+        const first = createHarnessRuntime({
+            root,
+            settings: SETTINGS,
+            defaults: DEFAULTS,
+            registry: createHarnessRegistry(ALL_PRESET_TEMPLATES),
+            catalogue: CATALOGUE,
+            loadEnvironment: false
+        });
+
+        const id = first.store.create('demo').id;
+        await first.store.run(id, 'first question', async () => {});
+        const frozen = first.store.get(id).harnessDefinition;
+        expect(frozen?.title).toBe('Scripted demo');
+
+        expect(first.store.mutateRegistry(() => first.registry.remove('demo')).name).toBe('demo');
+        expect(readState(root).deleted).toEqual(['demo']);
+
+        first.store.dispose();
+
+        // Restart WITHOUT the fixture injection: `demo` is not in the production
+        // catalogue at all, and the old row cannot resurrect it. The session is still
+        // there, with its transcript, because its frozen record names the scripted
+        // factory this build still ships as a preset.
+        const second = createHarnessRuntime({
+            root,
+            settings: SETTINGS,
+            defaults: DEFAULTS,
+            catalogue: CATALOGUE,
+            loadEnvironment: false
+        });
+
+        expect(second.registry.find('demo')).toBeUndefined();
+        expect(second.registry.list().map((preset) => preset.name)).toEqual([
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner'
+        ]);
+        expect(second.store.restoreErrors).toEqual([]);
+
+        const restored = second.store.get(id);
+        expect(restored.harness).toBe('demo');
+        expect(restored.harnessDefinition).toEqual(frozen);
+        expect(restored.turns.map((turn) => turn.prompt)).toEqual(['first question']);
+        expect(restored.turns[0].status).toBe('done');
+
+        // The rebuilt frozen harness really runs: an offline turn on a harness the
+        // catalogue no longer lists.
+        await second.store.run(id, 'second question', async () => {});
+        expect(second.store.get(id).turns.map((turn) => turn.prompt)).toEqual([
+            'first question',
+            'second question'
+        ]);
+    });
+
+    it('re-creating a deleted built-in name clears the tombstone durably', () => {
+        const root = tempRoot('recreate-deleted');
+
+        const first = createHarnessRuntime({
+            root,
+            settings: SETTINGS,
+            defaults: DEFAULTS,
+            catalogue: CATALOGUE,
+            loadEnvironment: false
+        });
+
+        first.store.mutateRegistry(() => {
+            first.registry.remove('workspace');
+
+            return first.registry.create({ name: 'workspace', title: 'My coder', primary: 'reviewer' });
+        });
+
+        // Row and tombstone can never both name the harness: `create` cleared the
+        // tombstone in the same synchronous block that the commit then persisted.
+        const document = readState(root);
+        expect(document).not.toHaveProperty('deleted');
+
+        const row = document.registry.find((entry) => entry.name === 'workspace');
+        expect(row).toBeDefined();
+        expect({
+            name: row?.name,
+            title: row?.title,
+            primary: row?.primary,
+            builtin: row?.builtin
+        }).toEqual({ name: 'workspace', title: 'My coder', primary: 'reviewer', builtin: false });
+
+        first.store.dispose();
+
+        const second = createHarnessRuntime({
+            root,
+            settings: SETTINGS,
+            defaults: DEFAULTS,
+            catalogue: CATALOGUE,
+            loadEnvironment: false
+        });
+
+        expect(second.registry.deletedBuiltins()).toEqual([]);
+        expect(second.registry.find('workspace')?.title).toBe('My coder');
+        expect(second.registry.find('workspace')?.primary).toBe('reviewer');
+
+        // Documented limitation of the replay: a re-created name occupies the shipped
+        // row's position, so its `builtin` provenance flag comes back true (the
+        // configuration is the saved one, and R20.1 makes `builtin` informational —
+        // it never gates a mutation).
+        expect(second.registry.find('workspace')?.builtin).toBe(true);
+    });
+
+    it('answers failure, not success, when the durable write fails — and rolls the registry back', () => {
+        const { store, registry } = failingStore('delete-write-failure');
+
+        const failure = failureOf(() => store.mutateRegistry(() => registry.remove('research')));
+        expect(failure.status).toBe(500);
+        expect(failure.message).toContain('Could not save the harness database');
+
+        // In-memory state matches the (unchanged) disk: nothing was removed and no
+        // tombstone was left behind, in the original listing order.
+        expect(registry.find('research')?.title).toBe('Researcher');
+        expect(registry.deletedBuiltins()).toEqual([]);
+        expect(registry.list().map((preset) => preset.name)).toEqual([
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner'
+        ]);
+
+        // The same guarantee for a create: no phantom card.
+        expect(failureOf(() => store.mutateRegistry(() => registry.create({ name: 'ghost', primary: 'instruct' })))).toEqual(
+            {
+                status: 500,
+                message: expect.stringContaining('Could not save the harness database')
+            }
+        );
+        expect(registry.find('ghost')).toBeUndefined();
+
+        // A failed PATCH rolls back too, so the client never sees an edit the file
+        // does not carry.
+        expect(
+            failureOf(() => store.mutateRegistry(() => registry.update('planner', { title: 'Renamed' }))).status
+        ).toBe(500);
+        expect(registry.find('planner')?.title).toBe('Planner');
+    });
+
+    it('keeps an earlier tombstone when a later mutation fails', () => {
+        const { store, registry } = failingStore('tombstone-rollback');
+
+        // One committed deletion (in-memory), then a failure that must not undo it.
+        registry.restoreDeletedBuiltins(['workspace']);
+        expect(registry.deletedBuiltins()).toEqual(['workspace']);
+
+        expect(failureOf(() => store.mutateRegistry(() => registry.remove('reviewer'))).status).toBe(500);
+
+        // The snapshot is taken per mutation, so the rolled-back state is exactly the
+        // state at the start of THAT mutation: workspace still deleted, reviewer back.
+        expect(registry.deletedBuiltins()).toEqual(['workspace']);
+        expect(registry.find('reviewer')?.title).toBe('Reviewer');
+    });
+
+    it('reads a document without the additive field and validates it when present', () => {
+        const root = tempRoot('deleted-shape');
+        const first = runtimeOf(root, [liveScriptedPreset('one')]);
+        first.store.create('one');
+        first.store.dispose();
+
+        // A pre-T5 document has no `deleted` key, loads, and is reported as absent
+        // (not as an empty list) so a rewrite keeps its exact shape.
+        const before = readState(root);
+        expect(before).not.toHaveProperty('deleted');
+        expect(new HarnessPersistence(root).load()).not.toHaveProperty('deleted');
+
+        // Names are trimmed and de-duplicated (a name listed twice is one fact).
+        const tidied = readState(root);
+        tidied.deleted = ['instruct', 'instruct', ' research '];
+        writeState(root, tidied);
+        expect(new HarnessPersistence(root).load()?.deleted).toEqual(['instruct', 'research']);
+
+        // Everything else is corruption of the named slot, reported per slot.
+        const notAnArray = readState(root);
+        notAnArray.deleted = 'instruct' as never;
+        writeState(root, notAnArray);
+        expect(() => new HarnessPersistence(root).load()).toThrow(
+            'The harness database deleted must be an array of harness names.'
+        );
+
+        const blank = readState(root);
+        blank.deleted = ['ok', '   '];
+        writeState(root, blank);
+        expect(() => new HarnessPersistence(root).load()).toThrow('deleted[1] must not be blank.');
+
+        const notAString = readState(root);
+        notAString.deleted = [7 as never];
+        writeState(root, notAString);
+        expect(() => new HarnessPersistence(root).load()).toThrow('deleted[0] must be a string.');
+    });
+
+    it('does not resurrect a built-in the document never recorded as deleted', () => {
+        // The additive field must not change behaviour for an untouched document:
+        // every shipped default is still there, and the rows replay exactly as before.
+        const root = tempRoot('no-tombstone');
+        const first = createHarnessRuntime({
+            root,
+            settings: SETTINGS,
+            defaults: DEFAULTS,
+            catalogue: CATALOGUE,
+            loadEnvironment: false
+        });
+        first.registry.update('instruct', { title: 'Edited default' });
+        first.store.persistRegistry();
+        first.store.dispose();
+
+        const second = createHarnessRuntime({
+            root,
+            settings: SETTINGS,
+            defaults: DEFAULTS,
+            catalogue: CATALOGUE,
+            loadEnvironment: false
+        });
+
+        expect(second.registry.find('instruct')?.title).toBe('Edited default');
+        expect(second.registry.list().map((preset) => preset.name)).toEqual([
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner'
+        ]);
+        expect(second.registry.deletedBuiltins()).toEqual([]);
     });
 });
 

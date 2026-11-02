@@ -1,22 +1,28 @@
 // The runtime direct-call catalogue.
 //
-// These tests pin the C1 contract: search is ALWAYS listed, is executable
-// only when a provider key was resolved at catalogue-build time, and never puts a
-// key value into an entry. They also prove the catalogue is built at call time
-// (not module evaluation), which is what makes `.env` startup ordering safe.
+// These tests pin the C1 contract for the two environment-backed core tools:
+// `search` and `fetch` are ALWAYS listed, each is executable only when its own
+// gate resolved (a provider key for search, the `webfetch` opt-in for fetch), and no
+// key value ever enters an entry. They also prove the catalogue is built at call
+// time (not module evaluation), which is what makes `.env` startup ordering safe.
 //
 // Every assertion is exact: catalogue order, availability objects, metadata, and
 // the complete schema. No network and no host environment: the keyed entries use
 // an injected environment, and the default-entry tests stub process.env.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { WEB_SEARCH_METADATA } from '../../harness';
-import { createToolCatalogue } from './index';
+import { WEB_FETCH_METADATA, WEB_SEARCH_METADATA } from '../../harness';
+import { createToolCatalogue, describeHarness, findPreset } from './index';
 import {
     createWebSearchCatalogueEntry,
     WEBSEARCH_ENVIRONMENT,
     WEBSEARCH_UNCONFIGURED_HINT
 } from './websearch';
+import {
+    createWebFetchCatalogueEntry,
+    WEBFETCH_ENVIRONMENT,
+    WEBFETCH_UNCONFIGURED_HINT
+} from './webfetch';
 
 const TAGS = ['web', 'search', 'internet', 'news', 'research'];
 
@@ -60,7 +66,7 @@ describe('tool catalogue', () => {
             parameters: UNCONFIGURED_PARAMETERS,
             availability: {
                 state: 'unconfigured',
-                environment: ['EXA_API_KEY', 'TAVILY_API_KEY'],
+                environment: ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY'],
                 hint: WEBSEARCH_UNCONFIGURED_HINT
             }
         });
@@ -87,7 +93,7 @@ describe('tool catalogue', () => {
         expect(entry?.parameters).toBe(entry?.tool?.parameters);
         expect(entry?.availability).toEqual({
             state: 'available',
-            environment: ['EXA_API_KEY', 'TAVILY_API_KEY']
+            environment: ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY']
         });
 
         // Only a single key is configured, so no provider choice is offered.
@@ -99,7 +105,7 @@ describe('tool catalogue', () => {
         expect(JSON.stringify(entry?.availability)).not.toContain('exa-secret-key');
     });
 
-    it('keeps the preset and harness groups intact, then appends web search', () => {
+    it('keeps the preset and harness groups intact, then appends the web pair', () => {
         const catalogue = createToolCatalogue({ websearch: keyless() });
 
         expect(catalogue.entries.map((entry) => entry.name)).toEqual([
@@ -112,20 +118,107 @@ describe('tool catalogue', () => {
             'grep',
             'shell',
             'gitDiff',
+            'download',
             'timeNow',
             'textCount',
             'diceRoll',
             'noteSearch',
             'textSummarize',
             'testFlaky',
-            'search'
+            'search',
+            // R9-R11: the fetch entry rides with search. It is the second half of the
+            // environment-backed core pair, so a card can only advertise the
+            // declaration its harness will really make because this entry exists.
+            'fetch'
         ]);
 
-        // Existing tools keep working exactly as before; only search carries
+        // Existing tools keep working exactly as before; only the two web rows carry
         // availability, so a client that ignores the field sees no change.
         expect(catalogue.tools.timeNow).toBeDefined();
         expect(catalogue.find('timeNow')?.availability).toBeUndefined();
         expect(catalogue.find('search')?.availability?.state).toBe('unconfigured');
+        // Fetch needs no key: the default entry is executable (native provider).
+        expect(catalogue.find('fetch')?.availability?.state).toBe('available');
+        expect(catalogue.tools.fetch).toBeDefined();
+    });
+
+    it('advertises fetch on a live card only while the catalogue can run it', () => {
+        // The exact pairing R9-R11 needs: a card's advertised core set must equal the
+        // declarations its harness makes. `fetch` is declared whenever the toolbox
+        // opts into webfetch (every live preset does), so the card advertises it only
+        // when this catalogue carries an executable definition.
+        const keylessSearch = createWebSearchCatalogueEntry({ configuration: { env: {} } });
+        const instruct = findPreset('instruct');
+        expect(instruct).toBeDefined();
+
+        const enabled = describeHarness(instruct!, createToolCatalogue({ websearch: keylessSearch }));
+        // Keyless search never registers, so the only advertised web row is fetch.
+        expect(enabled.coreTools).toEqual([
+            'toolRequest',
+            'task',
+            'delegate',
+            'read',
+            'write',
+            'edit',
+            'glob',
+            'grep',
+            'fetch'
+        ]);
+        expect(enabled.tools).toContain('fetch');
+
+        const disabled = describeHarness(
+            instruct!,
+            createToolCatalogue({
+                websearch: keylessSearch,
+                webfetch: createWebFetchCatalogueEntry({ enabled: false })
+            })
+        );
+        // The entry is still LISTED in the global catalogue (an actionable
+        // 'unconfigured' state), but no card claims a tool it cannot run.
+        expect(disabled.coreTools).not.toContain('fetch');
+        expect(disabled.tools).not.toContain('fetch');
+        expect(
+            createToolCatalogue({
+                websearch: keylessSearch,
+                webfetch: createWebFetchCatalogueEntry({ enabled: false })
+            })
+                .find('fetch')
+                ?.availability?.state
+        ).toBe('unconfigured');
+    });
+
+    it('lists fetch as unconfigured, with the native metadata and no callable tool', () => {
+        const catalogue = createToolCatalogue({
+            websearch: keyless(),
+            webfetch: createWebFetchCatalogueEntry({ enabled: false })
+        });
+
+        expect(catalogue.find('fetch')).toEqual({
+            name: 'fetch',
+            group: 'Web fetch',
+            description: WEB_FETCH_METADATA.description,
+            tags: [...WEB_FETCH_METADATA.tags],
+            // Core either way: the visibility is the capability's policy, the
+            // availability says whether THIS host can run it today.
+            visibility: 'core',
+            parameters: WEB_FETCH_METADATA.parameters,
+            availability: {
+                state: 'unconfigured',
+                environment: [...WEBFETCH_ENVIRONMENT],
+                hint: WEBFETCH_UNCONFIGURED_HINT
+            }
+        });
+        expect(catalogue.tools.fetch).toBeUndefined();
+
+        // A credential is never part of the listing.
+        const keyed = createToolCatalogue({
+            websearch: keyless(),
+            webfetch: createWebFetchCatalogueEntry({ configuration: { env: { EXA_API_KEY: 'exa-secret-key' } } })
+        });
+        expect(JSON.stringify(keyed.entries)).not.toContain('exa-secret-key');
+        expect(
+            Object.keys((keyed.find('fetch')?.parameters as { properties: Record<string, unknown> }).properties)
+        ).toEqual(['url', 'format', 'provider']);
     });
 
     it('reads the environment when built, not when the module was imported', () => {
@@ -134,20 +227,24 @@ describe('tool catalogue', () => {
         // runtime factory sees the key and builds the executable tool.
         vi.stubEnv('EXA_API_KEY', 'runtime-exa-key');
         vi.stubEnv('TAVILY_API_KEY', '');
+        // Stubbed too, so a Linkup key in the machine/.env environment cannot
+        // change which providers this catalogue offers.
+        vi.stubEnv('LINKUP_API_KEY', '');
 
         const catalogue = createToolCatalogue();
 
         expect(catalogue.tools.search).toBeDefined();
         expect(catalogue.find('search')?.availability).toEqual({
             state: 'available',
-            environment: ['EXA_API_KEY', 'TAVILY_API_KEY']
+            environment: ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY']
         });
         expect(JSON.stringify(catalogue.entries)).not.toContain('runtime-exa-key');
     });
 
-    it('defaults to keyless when both provider variables are blank', () => {
+    it('defaults to keyless when every provider variable is blank', () => {
         vi.stubEnv('EXA_API_KEY', '   ');
         vi.stubEnv('TAVILY_API_KEY', '');
+        vi.stubEnv('LINKUP_API_KEY', '  ');
 
         const catalogue = createToolCatalogue();
 

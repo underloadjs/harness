@@ -1,6 +1,6 @@
 // chapterManage — the harness session chapter tracker.
 //
-// Same lifecycle as todoManage (./todo.ts) and profileManage (./profile.ts):
+// Same lifecycle as task (./todo.ts) and profileManage (./profile.ts):
 // factory closure per harness, shared by every agent, stable decimal string ids,
 // full validation before any mutation, defensive copies, cleared by reset().
 //
@@ -265,7 +265,7 @@ const paginate = (
 };
 
 // Read `status` once, for every action: a wrong value is a validation error even
-// on `list`, matching todoManage's up-front field checks. `undefined` means the
+// on `list`, matching task's up-front field checks. `undefined` means the
 // caller omitted it (add defaults to 'planned', update leaves it unchanged).
 const readStatus = (value: unknown): ChapterStatus | undefined => {
     if (value === undefined) return undefined;
@@ -429,7 +429,7 @@ export const createChapterTool = (): ChapterToolset => {
     };
 
     // Name, description, tags, schema, and visibility come from the shared
-    // metadata module. Core on purpose, like todoManage.
+    // metadata module. Core on purpose, like task.
     const implementation = tool<ChapterParameters, ChapterResult>({
         name: CHAPTER_MANAGE_METADATA.name,
         description: CHAPTER_MANAGE_METADATA.description,

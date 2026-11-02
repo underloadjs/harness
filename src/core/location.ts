@@ -1,6 +1,6 @@
 // locationManage — the harness session locations/places tracker.
 //
-// Same lifecycle as todoManage (./todo.ts) and profileManage (./profile.ts):
+// Same lifecycle as task (./todo.ts) and profileManage (./profile.ts):
 // factory closure per harness, shared by every agent, stable decimal string ids,
 // full validation before any mutation, defensive copies, cleared by reset().
 //
@@ -318,7 +318,7 @@ export const createLocationTool = (): LocationToolset => {
     };
 
     // Name, description, tags, schema, and visibility come from the shared
-    // metadata module. Core on purpose, like todoManage.
+    // metadata module. Core on purpose, like task.
     const implementation = tool<LocationParameters, LocationResult>({
         name: LOCATION_MANAGE_METADATA.name,
         description: LOCATION_MANAGE_METADATA.description,

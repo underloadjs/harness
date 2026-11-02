@@ -4,12 +4,12 @@
 //   - the harness is callable: `await writer('...')` runs the entry agent;
 //   - the first `agents` key is the entry point (unless `primary` names another),
 //     and its name is the harness name;
-//   - the harness-owned core tools are toolRequest, toolCreate, todoManage,
+//   - the harness-owned core tools are toolRequest, toolCreate, task,
 //     profileManage, chapterManage, and locationManage (delegate only when
 //     subagents exist); the rest of the preset catalogue — fileList and beyond —
 //     is searchable and toolRequest enables the matches for the next turn, until
 //     then it is invisible and uncallable;
-//   - toolCreate, todoManage, and the record tools are always core, and delegate
+//   - toolCreate, task, and the record tools are always core, and delegate
 //     is core only when subagents exist;
 //   - tools run, their results are fed back, and the loop repeats until the model
 //     answers with text;
@@ -132,18 +132,8 @@ describe('harness', () => {
         // configured core tool (plus the harness-owned set) is declared.
         expect(writer.tools.searchable.name).toBe('searchable');
         expect(declaredNames(seen[0])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork',
+            'task',
             // A configured core tool is a LATER registration, so it follows the
             // baseline in declaration order (later registration wins).
             'core'
@@ -176,24 +166,20 @@ describe('harness', () => {
         // ...so the first request declares exactly the core file tools plus the
         // harness-owned set.
         expect(declaredNames(seen[0])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork',
+            'task',
             'read',
             'write',
             'edit',
             'glob',
-            'grep'
+            'grep',
+            // R9-R11: `download` registers with the package presets but stays
+            // searchable, so it is absent here and shows up in toolRequest below.
         ]);
+
+        expect(writer.tools.download.visibility).toBe('searchable');
+        expect(writer.tools.agentManage.visibility).toBe('searchable');
+        expect(writer.tools.task.visibility).toBe('core');
     });
 
     it('never returns the core file tools from toolRequest', async () => {
@@ -210,31 +196,53 @@ describe('harness', () => {
 
         // read/write/edit/glob/grep are core, so a "files" query only
         // finds the searchable remainder. There is no fileSearch: glob and grep are
-        // the two search surfaces and both are already declared.
+        // the two search surfaces and both are already declared. `download` is
+        // searchable under R9-R11, so the 'file' tag offers it here.
         const fileSearch = JSON.parse((entry.messages[2] as { content: string }).content);
-        expect(fileSearch.enabled).toEqual(['fileList']);
+        expect(fileSearch.enabled).toEqual(['fileList', 'download', 'profileManage']);
         expect(fileSearch.tools).toEqual([
             {
                 name: 'fileList',
                 description: expect.stringContaining('List the immediate entries'),
                 tags: ['files', 'list', 'filesystem']
+            },
+            {
+                name: 'download',
+                description: expect.stringContaining('Download one file over http(s)'),
+                tags: ['download', 'file', 'image', 'pdf', 'media', 'binary', 'web', 'url']
+            },
+            {
+                name: 'profileManage',
+                description: expect.stringContaining('Manage character and people profiles'),
+                tags: ['profile', 'profiles', 'character', 'characters', 'person', 'people']
             }
         ]);
-        expect(fileSearch.matched).toBe(1);
+        expect(fileSearch.matched).toBe(3);
         expect(fileSearch.omitted).toBe(0);
 
-        // "javascript" finds the searchable syntax; the core search tools are excluded
-        // even though grep's description mentions file contents.
+        // "javascript" finds the searchable syntax AND the runtime rows that now
+        // advertise the same capability tags (toolCreate/toolRegistry are searchable
+        // after R9-R11). The core file tools are still never returned.
         const syntaxSearch = JSON.parse((entry.messages[4] as { content: string }).content);
-        expect(syntaxSearch.enabled).toEqual(['syntax']);
+        expect(syntaxSearch.enabled).toEqual(['syntax', 'toolCreate', 'toolRegistry']);
         expect(syntaxSearch.tools).toEqual([
             {
                 name: 'syntax',
                 description: expect.stringContaining('Check whether a code snippet PARSES'),
                 tags: ['code', 'syntax', 'javascript', 'typescript', 'json', 'python', 'validation']
+            },
+            {
+                name: 'toolCreate',
+                description: expect.stringContaining('Create a tool for yourself from JavaScript source'),
+                tags: ['tools', 'create', 'extension', 'dynamic']
+            },
+            {
+                name: 'toolRegistry',
+                description: expect.stringContaining('Compile and register a tool from editable source'),
+                tags: ['tools', 'registry', 'source', 'self-modifying', 'compile']
             }
         ]);
-        expect(syntaxSearch.matched).toBe(1);
+        expect(syntaxSearch.matched).toBe(3);
         expect(syntaxSearch.omitted).toBe(0);
 
         expect(writer.tools.read.visibility).toBe('core');
@@ -280,9 +288,10 @@ describe('harness', () => {
             'file-c',
             'file-d',
             'file-e',
-            'file-f'
+            'file-f',
+            'profileManage'
         ]);
-        expect(broad.matched).toBe(6);
+        expect(broad.matched).toBe(7);
         expect(broad.omitted).toBe(0);
 
         // Tag breadth remains a tiebreak: file-f has two matching query tags, so
@@ -294,19 +303,23 @@ describe('harness', () => {
             'file-b',
             'file-c',
             'file-d',
-            'file-e'
+            'file-e',
+            'profileManage',
+            'toolManage'
         ]);
-        expect(refined.matched).toBe(6);
+        expect(refined.matched).toBe(8);
         expect(refined.omitted).toBe(0);
 
-        // The newest selection leads the current order; all six still fit.
+        // The newest selection leads the current order; all eight still fit.
         expect(writer.discoveredTools).toEqual([
             'file-f',
             'file-a',
             'file-b',
             'file-c',
             'file-d',
-            'file-e'
+            'file-e',
+            'profileManage',
+            'toolManage'
         ]);
     });
 
@@ -323,7 +336,7 @@ describe('harness', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'todoManage',
+            'task',
             'profileManage',
             'chapterManage',
             'locationManage',
@@ -351,27 +364,20 @@ describe('harness', () => {
         const writer = harness({ agents: { writer: entry } });
         const message = await writer('check this snippet');
 
-        // "javascript" enables syntax; the core file tools are already
-        // declared, and glob/grep are two of them, so discovery adds only syntax.
+        // "javascript" enables syntax plus the searchable runtime rows that
+        // share its tags. The declared core set is unchanged ahead of them, and
+        // `download` is searchable (R9-R11), so it does not ride on the request.
         expect(declaredNames(seen[1])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork',
+            'task',
             'read',
             'write',
             'edit',
             'glob',
             'grep',
-            'syntax'
+            'syntax',
+            'toolCreate',
+            'toolRegistry'
         ]);
         expect((entry.messages[4] as { content: string }).content).toBe('true');
         expect(message.content).toBe('valid');
@@ -407,40 +413,28 @@ describe('harness', () => {
         // Round one: core only. Round two: the discovered tool joined the
         // declarations, and the unrelated tool stayed out.
         expect(declaredNames(seen[0])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork'
+            'task',
         ]);
         expect(declaredNames(seen[1])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork',
-            'read'
+            'task',
+            'read',
+            'profileManage'
         ]);
 
         // The discovery result is what the model sees: names plus metadata.
+        // R9-R11 moved profileManage into the candidate set, so a "files" query
+        // answers with the fixture and the demoted row in rank order.
         const discovery = JSON.parse((entry.messages[2] as { content: string }).content);
-        expect(discovery.enabled).toEqual(['read']);
+        expect(discovery.enabled).toEqual(['read', 'profileManage']);
         expect(discovery.tools).toEqual([
-            { name: 'read', description: 'Read a text file.', tags: ['files', 'read'] }
+            { name: 'read', description: 'Read a text file.', tags: ['files', 'read'] },
+            {
+                name: 'profileManage',
+                description: expect.stringContaining('Manage character and people profiles'),
+                tags: ['profile', 'profiles', 'character', 'characters', 'person', 'people']
+            }
         ]);
 
         expect(message.content).toBe('read it');
@@ -684,7 +678,7 @@ describe('harness', () => {
             // so the recovery hint lists exactly those and points at toolRequest
             // for the searchable remainder.
             content:
-                'Tool "nope" is not registered. Available tools: toolRegistry, toolRequest, toolList, toolManage, toolCreate, todoManage, profileManage, chapterManage, locationManage, agentManage, agentResult, threadFork, read, write, edit, glob, grep. Call toolRequest with capability tags to search the catalogue.'
+                'Tool "nope" is not registered. Available tools: toolRequest, task, read, write, edit, glob, grep. Call toolRequest with capability tags to search the catalogue.'
         });
     });
 
@@ -1000,21 +994,12 @@ describe('harness', () => {
 
         await writer('go');
         expect(declaredNames(seen[1])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork',
-            'hidden'
+            'task',
+            'hidden',
+            'profileManage'
         ]);
-        expect(writer.discoveredTools).toEqual(['hidden']);
+        expect(writer.discoveredTools).toEqual(['hidden', 'profileManage']);
 
         writer.reset();
         expect(writer.discoveredTools).toEqual([]);
@@ -1023,18 +1008,8 @@ describe('harness', () => {
 
         // Back to the core set: discovery is part of "start over".
         expect(declaredNames(seen[2])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork'
+            'task',
         ]);
     });
 
@@ -1066,42 +1041,39 @@ describe('harness', () => {
 
         await writer('first');
         expect(declaredNames(seen[1])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
+            'task',
+            'reader',
             'threadFork',
-            'reader'
+            'agentManage',
+            'agentResult'
         ]);
-        expect(writer.discoveredTools).toEqual(['reader']);
+        expect(writer.discoveredTools).toEqual([
+            'reader',
+            'threadFork',
+            'agentManage',
+            'agentResult'
+        ]);
 
         // A second call starts a NEW turn but not a new catalogue: toolRequest
-        // enabled `reader` for the harness, so the next request still declares it
-        // without another discovery round.
+        // enabled the matches (the fixture plus the demoted runtime rows that
+        // carry the tag), so the next request still declares them without
+        // another discovery round.
         await writer('second');
         expect(declaredNames(seen[3])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
+            'task',
+            'reader',
             'threadFork',
-            'reader'
+            'agentManage',
+            'agentResult'
         ]);
-        expect(writer.discoveredTools).toEqual(['reader']);
+        expect(writer.discoveredTools).toEqual([
+            'reader',
+            'threadFork',
+            'agentManage',
+            'agentResult'
+        ]);
     });
 
     it('requires at least one agent', () => {
@@ -1456,18 +1428,8 @@ describe('executeTool', () => {
         expect(writer.discoveredTools).toEqual([]);
         await writer('go');
         expect(declaredNames(seen[0])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork'
+            'task',
         ]);
     });
 
@@ -1475,7 +1437,7 @@ describe('executeTool', () => {
         const writer = harness({ agents: { writer: brain(scripted([answer('hi')])) } });
 
         // A core tool is NOT searchable, so it is never enabled by discovery. It IS
-        // reported in `alreadyAvailable` (tag "todo" is an exact tag on todoManage),
+        // reported in `alreadyAvailable` (tag "todo" is an exact tag on task),
         // and that report means the tag must not also appear in `unmatchedTags`.
         const result = await writer.executeTool('toolRequest', { tags: ['todo'] });
 
@@ -1486,8 +1448,8 @@ describe('executeTool', () => {
             omitted: 0,
             alreadyAvailable: [
                 {
-                    name: 'todoManage',
-                    tags: ['todo', 'todos', 'task', 'tasks', 'checklist', 'plan']
+                    name: 'task',
+                    tags: ['task', 'tasks', 'todo', 'todos', 'checklist', 'plan']
                 }
             ]
         });

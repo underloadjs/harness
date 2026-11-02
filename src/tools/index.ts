@@ -10,9 +10,14 @@
 //   runtime/  the harness-owned core entries (toolRequest, toolCreate, …) — moved
 //             here from the old top-level `runtime-tools/` folder (T21)
 //   websearch/ search — opt-in, per-harness (NOT in `presetTools`: it needs a
-//             provider key, which belongs to one harness; see createWebSearchTool)
-//   webfetch/  fetch — opt-in, per-harness (native GET by default, the `exa`
-//             provider only when a key exists; see createWebFetchTool)
+//             provider key, which belongs to one harness; Exa / Tavily / Linkup,
+//             default provider exa > tavily > linkup; see createWebSearchTool)
+//   webfetch/  fetch — opt-in, per-harness (the `native` GET is ALWAYS the
+//             default and needs no key; the `exa` / `linkup` crawler providers
+//             appear only when that provider's key exists; see createWebFetchTool)
+//   webdownload/ download — always-registered, searchable file retrieval
+//             (<=20 MiB, any content type) whose bytes travel to the model as
+//             multimodal input through the `toolMedia()` envelope
 //
 // NAMING: every wire name is an action a model would type. The file tools are
 // read/write/edit plus the two search surfaces (glob for names, grep for contents) and
@@ -52,11 +57,12 @@
 // only needs a named export if the tool is meant to be part of the public import
 // surface.
 //
-// R18: read/write/edit/glob/grep are **core** and declared up front;
-// fileList, syntax, shell, and gitDiff stay **searchable**, so the model
-// asks toolRequest for `files`/`list`, `shell`, `git`, … and discovery enables the
-// matches. A harness preloads `presetTools` unless it is created with
-// `presets: false`.
+// R18: read/write/edit/glob/grep are **core** and declared up front; download,
+// fileList, syntax, shell, and gitDiff stay **searchable**, so the model asks
+// toolRequest for `download`, `files`/`list`, `shell`, `git`, … and discovery
+// enables the matches. The opt-in web tools stay out of this table entirely (see
+// the two factory notes below). A harness preloads `presetTools` unless it is
+// created with `presets: false`.
 //
 // They are deliberately opinionated about *shape* and unopinionated about
 // *policy*: no sandboxing, no confirmation prompts, no allowlists. A harness that
@@ -83,7 +89,9 @@ import type {
 } from './files';
 import type { CommandRunParameters, CommandRunResult, GitDiffParameters, GitDiffResult } from './command';
 import type { SyntaxCheckParameters } from './syntax';
-import type { Tool } from '../types';
+// `download`'s argument/result shapes are owned by ../types (the single type
+// owner), not by the entry, because the harness and the server both name them.
+import type { DownloadParameters, DownloadResult, Tool } from '../types';
 
 // One lazy proxy per discovered preset, keyed by wire name, in descriptor order.
 // Built once at module evaluation: metadata only, so no implementation is loaded.
@@ -122,6 +130,13 @@ export const grep = presetProxy<FileGrepParameters, FileGrepResult>('grep');
 
 export const shell = presetProxy<CommandRunParameters, CommandRunResult>('shell');
 export const gitDiff = presetProxy<GitDiffParameters, GitDiffResult>('gitDiff');
+
+// `download` is a preset like the file tools, but its payload is BYTES: it
+// returns a `toolMedia()` envelope whose attachments the harness stores on the
+// committed tool message (core/tool-media.ts). It is registered always and
+// declared as core, because the user asked for file retrieval to be a standing
+// capability, not something discovery has to find.
+export const download = presetProxy<DownloadParameters, DownloadResult>('download');
 
 // NOTE: the bounded-read constants live in ./files/read and are deliberately
 // NOT re-exported here. A VALUE re-export from './files' would statically evaluate
@@ -174,16 +189,23 @@ export type {
 } from '../types';
 
 // Page fetch sits beside web search for the same reason: it is opt-in per
-// harness (the `exa` provider closes over that harness's key). Unlike search,
-// the factory always returns a tool, because its default provider (`native`)
-// needs no credential. harness.ts registers it only when `webfetch` is set.
-export { createWebFetchTool, WEB_FETCH_TOOL_NAME } from './webfetch';
+// harness (the `exa` and `linkup` providers close over that harness's keys).
+// Unlike search, the factory always returns a tool, because its default provider
+// (`native`) needs no credential and is never replaced by a hosted one silently —
+// `provider` picks the crawler per call. harness.ts registers it only when
+// `webfetch` is set.
+export { createWebFetchTool, WEB_FETCH_METADATA, WEB_FETCH_TOOL_NAME } from './webfetch';
 export type {
     WebFetchConfiguration,
     WebFetchParameters,
     WebFetchProvider,
     WebFetchResult
 } from '../types';
+
+// `download` IS in `presetTools` (no credential, no per-harness closure), but its
+// types are re-exported here like the web tools' so a direct caller can type the
+// envelope result without reaching into an internal path.
+export type { DownloadParameters, DownloadResult } from '../types';
 
 // The preload catalogue, keyed by the name the model calls. `harness()` spreads
 // this into its registry by default, and the harness app's server uses it to offer

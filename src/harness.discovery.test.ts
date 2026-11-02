@@ -186,13 +186,14 @@ describe('toolRequest selection', () => {
             { name: 'file-00', description: 'file-00 fixture.', tags: ['tools'] },
             { name: 'file-01', description: 'file-01 fixture.', tags: ['tools'] }
         ]);
-        expect(result.matched).toBe(5);
-        expect(result.omitted).toBe(3);
+        // R9-R11: five searchable fixtures plus the five demoted runtime rows that
+        // carry the "tools" tag (toolRegistry, toolList, toolManage, toolCreate,
+        // threadFork) match, and maxEnabledTools admits only the first two. Only
+        // toolRequest is still declared core, so it is the single already-available
+        // report — reported, never enabled, never counted against the bound.
+        expect(result.matched).toBe(10);
+        expect(result.omitted).toBe(8);
         expect(result.alreadyAvailable.map((match: { name: string }) => match.name)).toEqual([
-            'toolCreate',
-            'toolList',
-            'toolManage',
-            'toolRegistry',
             'toolRequest'
         ]);
         expect(writer.discoveredTools).toEqual(['file-00', 'file-01']);
@@ -488,12 +489,66 @@ describe('toolRequest selection', () => {
 
         await writer('go');
 
+        // R9-R11: an empty query reports the whole searchable vocabulary. Besides
+        // the two 'widgets' fixtures, that is the tag union of the eleven demoted
+        // runtime rows (toolRegistry, toolList, toolManage, toolCreate,
+        // profileManage, chapterManage, locationManage, agentManage, agentResult,
+        // actionRequest, threadFork); the declared core pair contributes nothing.
         expect(JSON.parse((entry.messages[2] as { content: string }).content)).toEqual({
             enabled: [],
             tools: [],
             matched: 0,
             omitted: 0,
-            availableTags: ['widgets']
+            availableTags: [
+                'agents',
+                'answer',
+                'book',
+                'branch',
+                'catalogue',
+                'chapter',
+                'chapters',
+                'character',
+                'characters',
+                'compile',
+                'create',
+                'dynamic',
+                'edit',
+                'extension',
+                'fork',
+                'history',
+                'inspect',
+                'inventory',
+                'list',
+                'location',
+                'locations',
+                'manage',
+                'outline',
+                'output',
+                'people',
+                'person',
+                'place',
+                'places',
+                'preview',
+                'profile',
+                'profiles',
+                'registry',
+                'reload',
+                'research',
+                'result',
+                'results',
+                'self-modifying',
+                'setting',
+                'source',
+                'story',
+                'subagent',
+                'summarize',
+                'team',
+                'thread',
+                'tools',
+                'widgets',
+                'world',
+                'writing'
+            ]
         });
         expect(writer.discoveredTools).toEqual(['file-00', 'file-01']);
 

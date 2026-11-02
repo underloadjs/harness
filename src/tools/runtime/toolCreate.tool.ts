@@ -16,7 +16,11 @@ export const TOOL_CREATE_METADATA: CoreToolMetadata = {
     description:
         "Create a tool for yourself from JavaScript source. `source` is the BODY of an async function, for example `return args.toUpperCase();`: it receives `args` (the call arguments; a one-property schema passes the value itself) and `context` (agent, agents, run). Registering validates and compiles the source and enables the tool for your next turn, without running it. The body runs with this process's full permissions - there is no sandbox - so only create tools you are willing to run, and keep them small.",
     tags: ['tools', 'create', 'extension', 'dynamic'],
-    visibility: 'core',
+    // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
+    // and enables it for this session instead of seeing it declared on every request.
+    // Registration itself is unchanged (the entry still joins the harness registry),
+    // so toolRequest always has something to surface.
+    visibility: 'searchable',
     parameters: {
         type: 'object',
         properties: {
@@ -59,7 +63,7 @@ export const registration = {
     activation: 'creation',
     order: 50,
     sessionBound: true,
-    alwaysDeclared: true,
+    alwaysDeclared: false,
     listed: true
 } as const;
 

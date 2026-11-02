@@ -52,7 +52,11 @@
 // ----------------------------------------------------
 //   - a file over 1 MiB is not read, and a file containing a NUL byte is treated as
 //     binary and skipped;
-//   - .git, node_modules and symlinks are never entered; .gitignore is NOT consulted;
+//   - .git and symlinks are never entered; node_modules is, unless the search is rooted
+//     inside it (naming a directory is how a caller asks for it);
+//   - `.gitignore` files AT OR BELOW each root are consulted (./gitignore.ts): a path an
+//     ignore rule excludes is never opened, while a root named explicitly is still
+//     searched even when a .gitignore above it ignores that directory;
 //   - a root that cannot be listed throws, while an unreadable file or subtree is
 //     skipped (a race with a delete is noise, not an answer the caller needs);
 //   - no sandbox: roots are resolved against the process working directory.
@@ -205,7 +209,7 @@ const searchContents = async (
 export const GREP_METADATA: PresetToolMetadata = {
     name: 'grep',
     description:
-        'Search file CONTENTS with a regular expression and return the matching lines. `pattern` (required) is JavaScript regular-expression SOURCE without delimiters or flags, e.g. "TODO|FIXME"; invalid source is an error naming the parser message, never "no matches". `patterns` (default ["**/*"]) is the glob filter for which files to read - same matcher as glob: *, ?, **, and [abc] classes, a pattern with no slash also matches file names at any depth, and patterns are matched against each path RELATIVE TO THE ROOT that found it. `paths` (default ["."]) lists the roots to walk in order; overlapping roots and patterns are deduplicated by real file identity, so a file is searched once, under the first root that reached it. Each hit is { path, line, text, textTruncated, bytes }: `line` is the 1-based line number in the file, `text` is at most a 1024-byte UTF-8 snippet (`textTruncated` says when the line was cut), and the whole result shares a 64 KiB aggregate budget reported as `bytes` / `contentBudget`. { "matches": [...], "truncated": boolean, "bytes": number, "contentBudget": number } - `truncated` is true only when the 100-match cap or the byte budget stopped the search, so a narrow rerun is the way to see the rest. Matching is time-bounded: a pattern that backtracks past the 30-second budget is stopped with an error rather than allowed to hang. Skips .git, node_modules, symlinks, binary files, and files larger than 1 MiB. Does not read .gitignore files, and does not list file names (use glob for that).',
+        'Search file CONTENTS with a regular expression and return the matching lines. `pattern` (required) is JavaScript regular-expression SOURCE without delimiters or flags, e.g. "TODO|FIXME"; invalid source is an error naming the parser message, never "no matches". `patterns` (default ["**/*"]) is the glob filter for which files to read - same matcher as glob: *, ?, **, and [abc] classes, a pattern with no slash also matches file names at any depth, and patterns are matched against each path RELATIVE TO THE ROOT that found it. `paths` (default ["."]) lists the roots to walk in order; overlapping roots and patterns are deduplicated by real file identity, so a file is searched once, under the first root that reached it. Each hit is { path, line, text, textTruncated, bytes }: `line` is the 1-based line number in the file, `text` is at most a 1024-byte UTF-8 snippet (`textTruncated` says when the line was cut), and the whole result shares a 64 KiB aggregate budget reported as `bytes` / `contentBudget`. { "matches": [...], "truncated": boolean, "bytes": number, "contentBudget": number } - `truncated` is true only when the 100-match cap or the byte budget stopped the search, so a narrow rerun is the way to see the rest. Matching is time-bounded: a pattern that backtracks past the 30-second budget is stopped with an error rather than allowed to hang. Skips .git, symlinks, binary files, and files larger than 1 MiB, and skips node_modules unless a root is placed inside it. Reads .gitignore files at or below each root, so an ignored path is never opened - while a root you name explicitly is searched even when an enclosing .gitignore ignores it. Does not list file names (use glob for that).',
     tags: ['files', 'grep', 'search', 'content', 'regex', 'filesystem'],
     // R18: grep is core because content search is the single most common way a coding
     // agent locates code. It replaces fileGlob's `content` mode; that property no
@@ -230,7 +234,7 @@ export const GREP_METADATA: PresetToolMetadata = {
                 type: 'array',
                 items: { type: 'string' },
                 description:
-                    'Root directories to walk, absolute or relative to the working directory, in the order they are visited. Results are prefixed with the root that found them. Defaults to ["."].'
+                    'Root directories to walk, absolute or relative to the working directory, in the order they are visited. Results are prefixed with the root that found them. A root you name explicitly is searched even when a .gitignore above it ignores that directory. Defaults to ["."].'
             },
             maxResults: {
                 type: 'number',

@@ -2,6 +2,12 @@
 // deletes the thread through the EXISTING `DELETE /sessions/:id/threads/:threadId`
 // endpoint, then reconciles the returned snapshot (focus/tiles/transcript/roster).
 //
+// T26 (the swap): that ONE toolbar is also the only Delete surface. Its children are
+// exactly `Delete`, `Transcript`, `confirmation` — no `.tile-header-action` (or
+// `.thread-header-action` / `.thread-focus-head-action`) exists anywhere, and the
+// header's freed right edge carries the elapsed|tokens measurement line instead. Every
+// Delete click here therefore goes through `.tile-transcript-action .thread-delete`.
+//
 // `main.ts` boots on import, so this file stubs fetch and opens a saved session
 // exactly like the real page (remembered id -> GET /sessions/:id). No server and no
 // provider are involved; the DELETE answer is the fixture's authoritative snapshot.
@@ -200,18 +206,39 @@ it('opens the JSON transcript and deletes a thread through the existing endpoint
     expect(tile.dataset.threadId).toBe('thread-a');
     const bar = byClass('.tile-transcript-action', 'div');
     expect(bar.hidden).toBe(false);
-    // T1/R2 (shell wiring): Delete is a header control of the card and Transcript stays
-    // in the toolbar. R3/R4: the identity line is the badge ALONE, and the state word
-    // closes the measurement line (`IN1` on top, `… - done` underneath).
-    const header = tile.querySelector<HTMLElement>('.tile-header-action');
-    expect(header?.parentElement).toBe(tile);
-    expect(header?.querySelector('.thread-delete')).not.toBeNull();
-    expect(bar.querySelector('.thread-delete')).toBeNull();
+    // T26 (shell wiring): the toolbar is the ONLY action surface of an expanded tile, and
+    // it holds Delete first, Transcript second and the confirmation row last — no
+    // `.tile-header-action` exists anywhere. R3/R4: the identity line is the badge ALONE
+    // (`IN1`) and the measurement line (`34.2s | 18,654`) now shares that line at the
+    // right edge where Delete used to be painted; T2 clips the state box to
+    // screen-reader-only, so no `- done` suffix is painted even though the word is still
+    // in the DOM (asserted below).
+    expect(tile.querySelector('.tile-header-action')).toBeNull();
+    expect([...bar.children].map((node) => node.className)).toEqual([
+        'thread-delete',
+        'transcript-open action-transcript',
+        'thread-delete-confirm'
+    ]);
+    // The shell DOES wire the DELETE transport, so the bar's leading action is live here
+    // (unlike the standalone board) and names the conversation it destroys.
+    const shellDelete = bar.querySelector<HTMLButtonElement>('.thread-delete');
+    if (shellDelete === null) throw new Error('missing toolbar delete button');
+    expect(shellDelete.hidden).toBe(false);
+    expect(shellDelete.disabled).toBe(false);
+    expect(shellDelete.getAttribute('aria-label')).toBe('Delete thread IN1');
+    expect(shellDelete.title).toBe('Delete this thread permanently');
+    expect(shellDelete.querySelector('.action-label')?.textContent).toBe('Delete');
+    const shellTranscript = bar.querySelector<HTMLButtonElement>('.transcript-open');
+    if (shellTranscript === null) throw new Error('missing toolbar transcript button');
+    expect(shellTranscript.getAttribute('aria-label')).toBe('Open the JSON transcript of IN1');
+    expect(shellTranscript.querySelector('.action-label')?.textContent).toBe('Transcript');
     expect(
         [...(tile.querySelectorAll<HTMLElement>('.tile-identity > *') ?? [])].map((node) => node.className)
     ).toEqual(['tile-thread']);
     // The fixture's thread is `IN1` and its turn is `done`, so the badge reads exactly
-    // `IN1` and the state word is the measurement line's last item (screenshot R3).
+    // `IN1` (full, un-truncated text — styles.css gives the pill no cap) and the state
+    // word is still the measurement line's last child as an accessible label, whatever
+    // the colour rule paints (screenshot R3/T2).
     expect(tile.querySelector('.tile-thread')?.textContent).toBe('IN1');
     expect(
         [...(tile.querySelectorAll<HTMLElement>('.tile-top > *') ?? [])].map((node) => node.className)
@@ -235,8 +262,9 @@ it('opens the JSON transcript and deletes a thread through the existing endpoint
     expect(pre?.textContent).toContain('"hello thread"');
     expect(pre?.textContent).toContain('"hello answer"');
 
-    // R9: first click only opens the inline confirmation; the API is untouched.
-    byClass('.tile-header-action .thread-delete', 'button').click();
+    // R9: first click only opens the inline confirmation; the API is untouched. T26: the
+    // click comes from the SAME toolbar that owns the confirmation row.
+    byClass('.tile-transcript-action .thread-delete', 'button').click();
     expect(byClass('.tile-transcript-action .thread-delete-confirm', 'div').hidden).toBe(false);
     expect(calls.some((call) => call.method === 'DELETE')).toBe(false);
 
@@ -281,7 +309,9 @@ it('reconciles the DELETE result even when the snapshot is stale for the waterma
     await flush();
     expect(document.querySelector('.thread-transcript-json')).not.toBeNull();
 
-    byClass('.tile-header-action .thread-delete', 'button').click();
+    // T26: Delete is reached through the toolbar now (`.tile-header-action` is gone), and
+    // the confirmation row sits in that same bar.
+    byClass('.tile-transcript-action .thread-delete', 'button').click();
     byClass('.thread-delete-confirm-delete', 'button').click();
     await flush();
 
@@ -395,7 +425,7 @@ it('recomputes tool panels from surviving records on a stale DELETE answer', asy
 
     expect(document.querySelector('.panel[data-panel-id="thread-panel"]')).not.toBeNull();
 
-    byClass('.tile-header-action .thread-delete', 'button').click();
+    byClass('.tile-transcript-action .thread-delete', 'button').click();
     byClass('.thread-delete-confirm-delete', 'button').click();
     await flush();
 

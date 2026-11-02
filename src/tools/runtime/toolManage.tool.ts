@@ -30,7 +30,11 @@ export const TOOL_MANAGE_METADATA: CoreToolMetadata = {
     description:
         'Inspect and edit registered tools. `list` returns registry metadata, `details` inspects one tool, `source` returns its captured module text and local dependencies, `path` resolves a tool source path or a candidate path inside the configured toolFolders, `create` and `update` register a module and, by default, persist it: `create` writes a safe `<name>.tool.ts` filename in the LAST configured toolFolders entry, and `update` rewrites the tool\'s owning source path (an explicit `path` overrides either). Set `persist: "runtime"` to opt out of disk writes explicitly; that mode keeps the module in this session\'s registry only and cannot be combined with `path` or `folder`. `reload` recompiles the installed source revision. Every mutation is validated and published atomically through the same kernel as toolCreate/toolRegistry; a failed compile leaves the previous tool registered. Loaded tool code runs with this process\'s full permissions - there is no sandbox.',
     tags: ['tools', 'manage', 'source', 'edit', 'reload'],
-    visibility: 'core',
+    // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
+    // and enables it for this session instead of seeing it declared on every request.
+    // Registration itself is unchanged (the entry still joins the harness registry),
+    // so toolRequest always has something to surface.
+    visibility: 'searchable',
     parameters: {
         type: 'object',
         properties: {
@@ -117,7 +121,7 @@ export const registration = {
     activation: 'always',
     order: 40,
     sessionBound: true,
-    alwaysDeclared: true,
+    alwaysDeclared: false,
     listed: true
 } as const;
 

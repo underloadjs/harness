@@ -2,13 +2,17 @@
 //
 // The scripted demo preset keeps this test offline and deterministic while still
 // covering the whole path: create a session, stream a task, keep the conversation,
-// reset it, and call a tool directly.
+// reset it, and call a tool directly. T5 moved that fixture out of the shipped
+// catalogue, so the server below is started with the explicit fixture injection (see
+// beforeAll); the un-injected production catalogue is pinned elsewhere.
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { ALL_PRESET_TEMPLATES, createHarnessRegistry } from './harnesses';
 import { startHarnessServer } from './index';
 import type { HarnessServer } from './index';
 import type {
     HarnessIndex,
+    DeleteHarnessResult,
     SessionSnapshot,
     SessionStreamItem,
     ToolCallResult,
@@ -22,7 +26,17 @@ let base: string;
 const CLIENT = { 'X-Harness-Client': 'ui' };
 
 beforeAll(async () => {
-    server = await startHarnessServer({ port: 0, staticRoot: null });
+    // T5: the shipped catalogue is the five real roles, none of which run without a
+    // provider. This file exercises the whole HTTP path offline (streams, resets,
+    // tool calls), so the server is started over the shipped catalogue PLUS the
+    // explicit fixtures — exactly the injection a host that wants the offline card
+    // performs. The production default (five presets, no fixtures) is pinned by
+    // src/server/api.test.ts and by the catalogue assertions in src/structure.test.ts.
+    server = await startHarnessServer({
+        port: 0,
+        staticRoot: null,
+        registry: createHarnessRegistry(ALL_PRESET_TEMPLATES)
+    });
     base = server.url;
 });
 
@@ -189,6 +203,39 @@ describe('harness server', () => {
         });
 
         expect(response.status).toBe(400);
+    });
+
+    // T5 over the standalone Node adapter (the `/api` mount the shipped UI uses):
+    // 200 with exactly `{ deleted: true }`, the card leaves the listing, and an
+    // unknown name is a real 404. The service-mount contract is pinned in
+    // src/server/api.test.ts; this pins the same route through the Node adapter.
+    it('deletes a harness through the standalone adapter', async () => {
+        const created = await fetch(`${base}/api/harnesses`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', ...CLIENT },
+            body: JSON.stringify({ name: 'temporary-server-card', primary: 'instruct' })
+        });
+        expect(created.status).toBe(201);
+
+        const removed = await fetch(`${base}/api/harnesses/temporary-server-card`, {
+            method: 'DELETE',
+            headers: CLIENT
+        });
+        expect(removed.status).toBe(200);
+        expect(await json<DeleteHarnessResult>(removed)).toEqual({ deleted: true });
+
+        const index = await json<HarnessIndex>(await fetch(`${base}/api/harnesses`, { headers: CLIENT }));
+        expect(index.harnesses.map((harness) => harness.name)).not.toContain('temporary-server-card');
+
+        // A repeat delete did not remove anything, so it is not a second success.
+        const again = await fetch(`${base}/api/harnesses/temporary-server-card`, {
+            method: 'DELETE',
+            headers: CLIENT
+        });
+        expect(again.status).toBe(404);
+        expect(await json<{ error: { message: string } }>(again)).toEqual({
+            error: { message: 'Unknown harness "temporary-server-card".' }
+        });
     });
 
     it('refuses a request without the client header', async () => {

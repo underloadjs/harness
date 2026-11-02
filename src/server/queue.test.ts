@@ -667,7 +667,7 @@ describe('SessionStore task queue', () => {
         expect(() => store.assertRunnable(created.id)).toThrow(
             'A task is already running in this session.'
         );
-        await expect(store.callTool(created.id, 'todoManage', { action: 'list' })).rejects.toMatchObject({
+        await expect(store.callTool(created.id, 'task', {})).rejects.toMatchObject({
             status: 409,
             message: 'A task is running in this session; try again when it finishes.'
         });

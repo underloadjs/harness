@@ -241,9 +241,9 @@ const seedSource = async (): Promise<Harness> => {
     await writer.executeTool('toolRequest', { tags: ['bulk'] });
     await writer.executeTool('toolCreate', repeatCreation);
 
-    await writer.executeTool('todoManage', { action: 'add', text: 'Plan' });
-    await writer.executeTool('todoManage', { action: 'add', text: 'Draft' });
-    await writer.executeTool('todoManage', { action: 'check', id: '2' });
+    await writer.executeTool('task', { tasks: [{ text: 'Plan' }] });
+    await writer.executeTool('task', { tasks: [{ text: 'Draft' }] });
+    await writer.executeTool('task', { tasks: [{ id: '2', completed: true }] });
 
     await writer.executeTool('profileManage', {
         action: 'add',
@@ -281,7 +281,7 @@ const seedSource = async (): Promise<Harness> => {
 // matrix. Kept small so each mutation is obvious.
 const seedSmall = async (): Promise<HarnessSnapshot> => {
     const writer = buildSession();
-    await writer.executeTool('todoManage', { action: 'add', text: 'One' });
+    await writer.executeTool('task', { tasks: [{ text: 'One' }] });
     await writer.executeTool('toolCreate', repeatCreation);
     return writer.snapshot();
 };
@@ -351,9 +351,14 @@ describe('harness snapshot/restore', () => {
         expect(target.agents.researcher.messages).toEqual(seededResearcherMessages);
 
         // Ids continue from the restored counters.
-        expect(await target.executeTool('todoManage', { action: 'add', text: 'Next' })).toEqual({
-            todo: { id: '3', text: 'Next', completed: false },
-            counts: { total: 3, completed: 1, remaining: 2 }
+        expect(await target.executeTool('task', { tasks: [{ text: 'Next' }] })).toEqual({
+            tasks: [
+                { id: '1', text: 'Plan', completed: false },
+                { id: '2', text: 'Draft', completed: true },
+                { id: '3', text: 'Next', completed: false }
+            ],
+            counts: { total: 3, completed: 1, pending: 2 },
+            page: { offset: 0, limit: 20, hasMore: false }
         });
 
         // Record bodies and trait arrays survived the copy.
@@ -445,20 +450,14 @@ describe('harness snapshot/restore', () => {
             ...seededWriterMessages,
             { role: 'user', content: 'continue' }
         ]);
+        // R9-R11: restore republishes the declared core pair (plus delegate, because
+        // this harness has subagents), the session-created tool, and the eleven
+        // bulk tools the snapshot carried as enabled. The demoted runtime rows are
+        // registered but not declared.
         expect((seen[0].tools ?? []).map((declaration) => declaration.name)).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
+            'task',
             'delegate',
-            'threadFork',
             'repeat',
             'bulk01',
             'bulk02',
@@ -599,7 +598,7 @@ describe('harness snapshot/restore', () => {
             releaseResolve = resolve;
         });
 
-        const toolArguments = '{"action":"add","text":"Durable"}';
+        const toolArguments = '{"tasks":[{"text":"Durable"}]}';
         let calls = 0;
 
         const stream: HarnessStream = async function* () {
@@ -609,7 +608,7 @@ describe('harness snapshot/restore', () => {
                 yield {
                     type: 'done',
                     stopReason: 'tool_calls',
-                    toolCalls: [{ id: 'c1', name: 'todoManage', arguments: toolArguments }]
+                    toolCalls: [{ id: 'c1', name: 'task', arguments: toolArguments }]
                 };
                 return;
             }
@@ -653,14 +652,14 @@ describe('harness snapshot/restore', () => {
             {
                 role: 'assistant',
                 content: '',
-                toolCalls: [{ id: 'c1', name: 'todoManage', arguments: toolArguments }]
+                toolCalls: [{ id: 'c1', name: 'task', arguments: toolArguments }]
             },
             {
                 role: 'tool',
                 content:
-                    '{"todo":{"id":"1","text":"Durable","completed":false},"counts":{"total":1,"completed":0,"remaining":1}}',
+                    '{"tasks":[{"id":"1","text":"Durable","completed":false}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false}}',
                 toolCallId: 'c1',
-                name: 'todoManage'
+                name: 'task'
             }
         ]);
 
@@ -671,7 +670,7 @@ describe('harness snapshot/restore', () => {
         await running;
 
         // Restart from the interrupted-turn checkpoint. Restore must not replay
-        // todoManage: the store already contains exactly one item.
+        // task: the store already contains exactly one item.
         const target = harness({
             agents: { writer: agent({ model: 'merge/ds4-flash', stream: scripted([answer('unused')]) }) },
             presets: false
@@ -679,9 +678,9 @@ describe('harness snapshot/restore', () => {
         target.restore(checkpoint);
 
         expect(target.snapshot()).toEqual(checkpoint);
-        expect(await target.executeTool('todoManage', { action: 'list' })).toEqual({
-            todos: [{ id: '1', text: 'Durable', completed: false }],
-            counts: { total: 1, completed: 0, remaining: 1 },
+        expect(await target.executeTool('task', {})).toEqual({
+            tasks: [{ id: '1', text: 'Durable', completed: false }],
+            counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false }
         });
     });
@@ -823,7 +822,7 @@ describe('state-change observer', () => {
         writer = buildSession({
             stateChange: (event) => events.push(event),
             turns: [
-                callTool('c1', 'todoManage', '{"action":"add","text":"Persist me"}'),
+                callTool('c1', 'task', '{"tasks":[{"text":"Persist me"}]}'),
                 answer('done')
             ]
         });
@@ -836,7 +835,7 @@ describe('state-change observer', () => {
             { type: 'state_change', reason: 'agent_message', agent: 'writer' },
             { type: 'state_change', reason: 'agent_message', agent: 'writer' },
             { type: 'state_change', reason: 'agent_message', agent: 'writer' },
-            { type: 'state_change', reason: 'tool_execute', agent: 'writer', tool: 'todoManage' },
+            { type: 'state_change', reason: 'tool_execute', agent: 'writer', tool: 'task' },
             { type: 'state_change', reason: 'agent_message', agent: 'writer' }
         ]);
 
@@ -877,11 +876,11 @@ describe('state-change observer', () => {
             }
         });
 
-        await writer.executeTool('todoManage', { action: 'add', text: 'Still here' });
+        await writer.executeTool('task', { tasks: [{ text: 'Still here' }] });
 
-        expect(await writer.executeTool('todoManage', { action: 'list' })).toEqual({
-            todos: [{ id: '1', text: 'Still here', completed: false }],
-            counts: { total: 1, completed: 0, remaining: 1 },
+        expect(await writer.executeTool('task', {})).toEqual({
+            tasks: [{ id: '1', text: 'Still here', completed: false }],
+            counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false }
         });
     });

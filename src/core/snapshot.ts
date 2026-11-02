@@ -28,7 +28,7 @@
 //   - ./creation.ts       — compileToolSource, the trusted-source compiler
 
 import { HarnessError } from '../util';
-import { validateAttachments } from '../shared/attachments';
+import { DOWNLOAD_ATTACHMENT_LIMITS, validateAttachments } from '../shared/attachments';
 import type {
     HarnessAgentResultSnapshot,
     HarnessAgentSnapshot,
@@ -56,7 +56,7 @@ import {
     readSnapshotRecord,
     readSnapshotString
 } from './snapshot-validation';
-import { readTodoStoreState } from './todo';
+import { readTaskStoreState } from './task';
 
 // The only schema this build reads. A snapshot from a future build is rejected by
 // version rather than guessed at: migration belongs to whoever changes the shape.
@@ -277,18 +277,42 @@ export const readHarnessMessages = (value: unknown, label: string): HarnessMessa
             }
 
             case 'tool': {
-                readSnapshotKeys(record, ['role', 'content', 'toolCallId', 'name'], entryLabel);
+                // `attachments` is OPTIONAL: a medialess tool result (and every
+                // snapshot written before download media existed) has exactly the
+                // four historical keys and restores byte-for-byte. When present,
+                // the bytes are re-checked with the DOWNLOAD profile — a
+                // 20 MiB file is legal here and would be rejected by the upload
+                // limits, and a corrupted payload must fail the restore loudly
+                // rather than replay garbage to the provider.
+                readSnapshotKeys(
+                    record,
+                    ['role', 'content', 'toolCallId', 'name', 'attachments'],
+                    entryLabel,
+                    ['attachments']
+                );
 
-                return {
+                const message: Extract<HarnessMessage, { role: 'tool' }> = {
                     role: 'tool',
                     content: readSnapshotString(record.content, `${entryLabel}.content`),
-                    toolCallId: readSnapshotString(
-                        record.toolCallId,
-                        `${entryLabel}.toolCallId`,
-                        { min: 1 }
-                    ),
+                    toolCallId: readSnapshotString(record.toolCallId, `${entryLabel}.toolCallId`, { min: 1 }),
                     name: readSnapshotString(record.name, `${entryLabel}.name`, { min: 1 })
                 };
+
+                if (record.attachments !== undefined) {
+                    try {
+                        message.attachments = validateAttachments(
+                            record.attachments,
+                            DOWNLOAD_ATTACHMENT_LIMITS
+                        );
+                    } catch (error) {
+                        // Keep restore's single error type: HarnessError.
+                        throw new HarnessError(
+                            `${entryLabel}.attachments ${error instanceof Error ? error.message : String(error)}`
+                        );
+                    }
+                }
+
+                return message;
             }
 
             default:
@@ -759,7 +783,7 @@ export const readHarnessSnapshot = (value: unknown): HarnessSnapshot => {
             ? {}
             : { threads, threadSequence }),
         records: {
-            todos: readTodoStoreState(records.todos),
+            todos: readTaskStoreState(records.todos),
             profiles: readProfileStoreState(records.profiles),
             chapters: readChapterStoreState(records.chapters),
             locations: readLocationStoreState(records.locations)

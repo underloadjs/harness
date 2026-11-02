@@ -103,7 +103,7 @@ const RUNTIME_SOURCE_ENTRIES = [
     'threadFork.tool.ts',
     'threadList.tool.ts',
     'threadSend.tool.ts',
-    'todoManage.tool.ts',
+    'task.tool.ts',
     'toolCancel.tool.ts',
     'toolCreate.tool.ts',
     'toolList.tool.ts',
@@ -133,7 +133,11 @@ const PRESET_SOURCE_ENTRIES = [
     'tools/files/fileList.tool.ts',
     'tools/files/read.tool.ts',
     'tools/files/write.tool.ts',
-    'tools/syntax/syntax.tool.ts'
+    'tools/syntax/syntax.tool.ts',
+    // R3/R4: the byte-retrieval preset. Shipped and independently loadable, like
+    // the other presets; it is registered by descriptor discovery, not by this
+    // inventory (which only proves the file ships and is non-empty).
+    'tools/webdownload/download.tool.ts'
 ];
 // Runtime entries that this no-subagent/no-interaction harness registers at
 // startup. Each must have a source record captured by the SAME operation runtime
@@ -145,7 +149,7 @@ const STARTUP_SOURCE_ENTRIES = {
     toolList: 'tools/runtime/toolList.tool.ts',
     toolManage: 'tools/runtime/toolManage.tool.ts',
     toolCreate: 'tools/runtime/toolCreate.tool.ts',
-    todoManage: 'tools/runtime/todoManage.tool.ts',
+    task: 'tools/runtime/task.tool.ts',
     profileManage: 'tools/runtime/profileManage.tool.ts',
     chapterManage: 'tools/runtime/chapterManage.tool.ts',
     locationManage: 'tools/runtime/locationManage.tool.ts',

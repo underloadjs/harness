@@ -4,18 +4,28 @@
 // progress sink. The CLI calls one directly; the HTTP server keeps one harness per
 // session and routes that session's events to its own stream.
 //
-// TWO KINDS OF PRESET
-// -------------------
-//   live  — instruct, research, workspace, reviewer, planner (and the flaky
-//           example). All built from TRUSTED agent profiles in src/agents through
-//           `createProfiledHarness` (./toolbox.ts), so they register the SAME
-//           toolbox: package coding tools, the app tools, environment-backed
-//           search, and the harness core tools. Only the agents differ: names,
-//           instructions, guidelines, primary, and subagents.
-//   fixture — demo is a scripted offline run with timeNow only. It is retained so
-//           the UI (and the service tests) can exercise the whole loop without a
-//           provider; it is deliberately not a live harness and is listed after
-//           the live presets.
+// TWO KINDS OF PRESET (T5: only the first kind SHIPS)
+// ---------------------------------------------------
+//   live  — instruct, research, workspace, reviewer, planner. All built from
+//           TRUSTED agent profiles in src/agents through `createProfiledHarness`
+//           (./toolbox.ts), so they register the SAME toolbox: package coding
+//           tools, the app tools, environment-backed search, and the harness core
+//           tools. Only the agents differ: names, instructions, guidelines,
+//           primary, and subagents. These five are `presets`, the default
+//           catalogue every registry and every `GET /harnesses` listing starts from.
+//   fixture — demo (a scripted offline run with timeNow only) and flaky (the
+//           recoverable-failure example with `testFlaky`). They are NOT in
+//           `presets`: a user opening the product must not be offered a scripted
+//           card or a card whose tool throws two calls in three. They stay exported
+//           as `FIXTURE_PRESETS` because they are still load-bearing:
+//             - a host or a test that wants an offline loop injects them explicitly
+//               (`createHarnessRegistry(ALL_PRESET_TEMPLATES)`);
+//             - a session saved on an older build when demo/flaky WERE shipped must
+//               still restore, and a 'scripted' record rebuilds its factory by name
+//               from `ALL_PRESET_TEMPLATES` (see ./registry.ts presetFromRecord).
+//           Deleting a shipped harness is therefore not the same as un-shipping a
+//           fixture: a deletion is a durable operator decision (a tombstone in the
+//           database), while un-shipping is this module no longer listing a row.
 //
 // THE FIVE REAL ROLES (T3)
 // ------------------------
@@ -148,10 +158,13 @@ const instruct: HarnessPreset = {
     subagents: instructTeam,
     agents: ['instruct', ...instructTeam],
     tools: SHARED_TOOL_NAMES,
-    // Same environment-backed declaration as every live preset: a keyless host
-    // simply does not append search to the descriptor (it stays listed as
-    // unconfigured in the global tool catalogue).
-    environmentTools: ['search'],
+    // Same environment-backed declarations as every live preset: this factory builds
+    // its toolbox with `websearch: true` AND `webfetch: true`, so both names belong
+    // here. A keyless host simply does not append search (it stays listed as
+    // unconfigured in the global tool catalogue); fetch registers either way because
+    // the native provider needs no key. Both are declared core when registered
+    // (R9-R11), so this list is what lets the card advertise what it will declare.
+    environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
     template: 'live',
@@ -174,7 +187,7 @@ const research: HarnessPreset = {
     subagents: researchTeam,
     agents: ['research', ...researchTeam],
     tools: SHARED_TOOL_NAMES,
-    environmentTools: ['search'],
+    environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
     template: 'live',
@@ -198,7 +211,7 @@ const workspace: HarnessPreset = {
     subagents: workspaceTeam,
     agents: ['workspace', ...workspaceTeam],
     tools: SHARED_TOOL_NAMES,
-    environmentTools: ['search'],
+    environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
     template: 'live',
@@ -220,7 +233,7 @@ const reviewer: HarnessPreset = {
     subagents: reviewerTeam,
     agents: ['reviewer', ...reviewerTeam],
     tools: SHARED_TOOL_NAMES,
-    environmentTools: ['search'],
+    environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
     template: 'live',
@@ -242,7 +255,7 @@ const planner: HarnessPreset = {
     subagents: plannerTeam,
     agents: ['planner', ...plannerTeam],
     tools: SHARED_TOOL_NAMES,
-    environmentTools: ['search'],
+    environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
     template: 'live',
@@ -346,7 +359,7 @@ const failure: HarnessPreset = {
     // R18: the factory below uses createToolboxHarness, which opts into search
     // exactly like the live presets. Declaring it here keeps descriptor.tools and
     // descriptor.coreTools equal to what the session actually registers.
-    environmentTools: ['search'],
+    environmentTools: ['search', 'fetch'],
     builtin: true,
     editable: true,
     template: 'flaky',
@@ -366,18 +379,41 @@ const failure: HarnessPreset = {
         )
 };
 
-// UI/CLI order: the five real roles first (instruct is the default/first card),
-// then the offline fixture and the failure example. This is what stops the demo
-// from dominating the initial UI now that it is not the headline preset.
+// ---------------------------------------------------------------------------
+// Catalogue exports (T5)
+// ---------------------------------------------------------------------------
+
+// The PRODUCTION catalogue, in UI/CLI order (instruct is the default/first card).
+// Every entry is a real, usable configuration: a live agent team on the shared
+// toolbox that runs against the configured provider. The scripted demo and the
+// failure example are deliberately absent — a catalogue a user picks from should
+// not contain a card that never calls a model, or one whose tool throws on purpose.
 export const presets: readonly HarnessPreset[] = [
     instruct,
     research,
     workspace,
     reviewer,
-    planner,
-    demo,
-    failure
+    planner
 ];
+
+// The offline/example fixtures, kept as first-class presets so a host or a test
+// can inject them explicitly (`createHarnessRegistry(FIXTURE_PRESETS)` or
+// `[...presets, ...FIXTURE_PRESETS]`). They are no longer part of `presets`, so
+// `GET /harnesses` and a new session cannot reach them by accident, but their
+// factories are unchanged: demo still scripts a full loop with no endpoint, and
+// flaky still registers `testFlaky`.
+export const FIXTURE_PRESETS: readonly HarnessPreset[] = [demo, failure];
+
+// Every template this build can rebuild a factory from: the shipped catalogue
+// PLUS the fixtures. Two consumers need the superset:
+//   - ./registry.ts `presetFromRecord`, whose 'scripted' branch resolves a frozen
+//     session's factory BY NAME, so a session created on an older build when demo
+//     shipped still restores (a legacy flaky record rebuilds from its `flaky`
+//     template and never needs this list);
+//   - a test/host that wants the old offline-capable registry in one call.
+// Order is catalogue-first, so an injected registry lists the real presets before
+// the fixtures, exactly as the UI used to.
+export const ALL_PRESET_TEMPLATES: readonly HarnessPreset[] = [...presets, ...FIXTURE_PRESETS];
 
 // Previous shipped EXECUTABLE definitions, keyed by preset id, for the restore
 // policy in ./registry.ts.

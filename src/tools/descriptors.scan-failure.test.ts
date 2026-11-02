@@ -60,7 +60,8 @@ describe('live catalogue scan failures (T24)', () => {
         const { TOOL_DESCRIPTORS, PRESET_DESCRIPTORS } = await freshDescriptors('missing-root');
 
         expect(TOOL_DESCRIPTORS).toEqual([...BUILTIN_TOOL_DESCRIPTORS]);
-        expect(TOOL_DESCRIPTORS).toHaveLength(28);
+        // 29 package rows: the 28 historical entries plus the `download` preset.
+        expect(TOOL_DESCRIPTORS).toHaveLength(29);
         expect(PRESET_DESCRIPTORS.map((descriptor) => descriptor.name)).toEqual([
             'syntax',
             'read',
@@ -70,7 +71,8 @@ describe('live catalogue scan failures (T24)', () => {
             'glob',
             'grep',
             'shell',
-            'gitDiff'
+            'gitDiff',
+            'download'
         ]);
     });
 

@@ -17,12 +17,17 @@
 // are defined once. Each `*.tool.ts` entry keeps only its own verdict step (list the
 // path, or read the file and match its lines).
 //
-// WALKER RULES (unchanged; owned by ./glob.ts and documented there)
+// WALKER RULES (owned by ./glob.ts and ./gitignore.ts, documented there)
 // ----------------------------------------------------------------
 //   - patterns are matched against each file's path RELATIVE TO THE ROOT that found
 //     it, never against an absolute path, and every result is prefixed with that root;
 //   - a pattern with no "/" additionally matches the bare file name at any depth;
-//   - .git, node_modules and symlinks are never entered; .gitignore is not consulted;
+//   - .git and symlinks are never entered; node_modules is skipped unless the caller
+//     roots the search inside it;
+//   - `.gitignore` files AT OR BELOW each root are honored (./gitignore.ts): an ignored
+//     path is neither listed nor read, while a root named explicitly is still walked even
+//     when a .gitignore above it ignores it. No rule from above a root reaches into it,
+//     which is what makes `paths: ['Temp']` answer for a directory the repo ignores;
 //   - the walk is depth-first over name-sorted entries, so a capped result is a
 //     deterministic prefix of the tree.
 //
@@ -40,13 +45,22 @@
 //   - ./glob.tool.ts    — filename search (this module's only list-paths caller)
 //   - ./grep.tool.ts    — content search (this module's only read-lines caller)
 //   - ./glob.ts         — the walker, the matcher and the size/binary helpers
+//   - ./gitignore.ts    — the per-root .gitignore matcher this module creates per root
 //   - ./identity.ts     — the canonical per-root / per-file comparison keys
 //   - ./bounded-regex.ts— the time-bounded regex grep runs inside `node:vm`
 
 import { join, resolve } from 'node:path';
 import { HarnessError } from '../../util';
 import { canonicalPathKey, fileIdentity } from './identity';
-import { globToRegExp, toPosixPath, walkFiles } from './glob';
+import {
+    ALWAYS_SKIPPED_DIRECTORIES,
+    SKIPPED_DIRECTORIES,
+    globToRegExp,
+    rootTargetsSkippedDirectory,
+    toPosixPath,
+    walkFiles
+} from './glob';
+import { createGitignoreMatcher } from './gitignore';
 
 // One compiled pattern plus the "slashless patterns also match the name" flag. This
 // is also where that rule is decided, so both search tools apply it identically.
@@ -101,6 +115,13 @@ export type SearchCandidate = {
 // already walked (a symlink alias, or 'src' and 'SRC' on Windows) is skipped
 // entirely. Both tools stream this generator, so a capped search stops walking
 // instead of materializing the whole tree.
+//
+// Each root gets its OWN gitignore matcher (./gitignore.ts): rules learned under 'src'
+// must not decide what is visible under 'packages/other', and a matcher is the only
+// place that knows which directory a rule was read from. The skip list is chosen per root
+// as well, so a caller that names an otherwise-skipped directory ('node_modules', or a
+// path under it) still gets it walked — the same "explicit path wins" rule gitignore
+// scoping already gives an ignored directory.
 export async function* collectCandidates(
     roots: readonly string[],
     compiled: readonly CompiledPattern[]
@@ -121,7 +142,12 @@ export async function* collectCandidates(
         if (seenRoots.has(rootKey)) continue;
         seenRoots.add(rootKey);
 
-        for await (const relativePath of walkFiles(absoluteRoot)) {
+        const ignores = createGitignoreMatcher();
+        const skipDirectories = rootTargetsSkippedDirectory(absoluteRoot)
+            ? ALWAYS_SKIPPED_DIRECTORIES
+            : SKIPPED_DIRECTORIES;
+
+        for await (const relativePath of walkFiles(absoluteRoot, { ignores, skipDirectories })) {
             if (!matchesAnyPattern(compiled, relativePath)) continue;
 
             const absolute = join(absoluteRoot, relativePath);

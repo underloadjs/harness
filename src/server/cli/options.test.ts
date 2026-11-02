@@ -60,7 +60,7 @@ describe('CLI preset selection', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'todoManage',
+            'task',
             'profileManage',
             'chapterManage',
             'locationManage',

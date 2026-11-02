@@ -56,8 +56,8 @@
 //
 // Execution is server-only. A catalogue tool is a direct call; a session-bound
 // core tool (`sessionBound`) is sent with the selected session's id so toolRequest,
-// toolCreate, todoManage and delegate change THAT conversation — and the snapshot is
-// re-read afterwards so discoveries/todos show up. The browser never evaluates a
+// toolCreate, task and delegate change THAT conversation — and the snapshot is
+// re-read afterwards so discoveries and the task list show up. The browser never evaluates a
 // tool.
 //
 // Activity: every `HarnessEvent` names an agent, and the live set per instance
@@ -98,7 +98,9 @@ import {
     cancelSession,
     createHarness,
     createSession,
+    deleteHarness,
     deleteSession,
+    deleteSessionOnUnload,
     deleteSessionThread,
     enqueueTask,
     getSession,
@@ -131,7 +133,7 @@ import { createAgentControl } from './ui/agent-control';
 import type { AgentControl } from './ui/agent-control';
 import { openAgentDialog } from './ui/agent-dialog';
 import type { AgentApplyResult, AgentConfigurationApply, AgentDialog } from './ui/agent-dialog';
-import { openDialog } from './ui/dialog';
+import { createTextCopyButton, openDialog } from './ui/dialog';
 import type { DialogHandle } from './ui/dialog';
 import {
     composerActionOf,
@@ -612,60 +614,275 @@ const createView = (
 // a function, with no harness, no agent, and no loop. The server runs the exact
 // implementation a session registers, so package presets work here too.
 
-// A few tools deserve a real starting value rather than a schema-derived blank.
+// Named starting payloads the playground offers per tool (R8).
 //
-// Every entry here must be an input the tool would actually accept: the box is
-// editable and nothing runs until "Call tool", so a value with empty tags, a
-// missing required string, or an optional field pinned to an invalid 0 only
-// teaches the wrong shape.
-const EXAMPLES: Readonly<Record<string, unknown>> = {
+// WHY THIS IS A LIST AND NOT ONE EXAMPLE (R8)
+// --------------------------------------------
+// The runner used to fill the arguments box with a single canned value, so trying a
+// second shape meant typing the whole JSON again. Each entry is now a BUTTON beside
+// the box: pressing it drops the payload into the textarea, which stays a fully
+// editable JSON field, and "Call tool" sends exactly what the box holds — never the
+// preset object. The FIRST entry of a tool's list is what the box shows when its
+// runner opens.
+//
+// Every value here must still be an input the tool would actually accept: a preset
+// with empty tags, a missing required string, or an optional field pinned to an
+// invalid 0 teaches the wrong shape, and the label promises a working call.
+type ToolPreset = { label: string; value: unknown };
+
+const PRESETS: Readonly<Record<string, readonly ToolPreset[]>> = {
     // Two properties, so the runner sends the whole object (no single-property
     // unwrapping): the language is part of the input, not a separate mode.
     // `language` is a free-text NAME now (the schema enum is gone): the tool
     // normalizes aliases (`ts`, `.tsx`, `Python3`) and errors on a language it has
-    // no parser for, so the example uses a canonical spelling.
-    syntax: { code: 'const answer = 42;\nconsole.log(answer);', language: 'javascript' },
+    // no parser for, so a preset uses a canonical spelling.
+    syntax: [
+        {
+            label: 'JavaScript snippet',
+            value: { code: 'const answer = 42;\nconsole.log(answer);', language: 'javascript' }
+        },
+        {
+            label: 'TypeScript snippet',
+            value: { code: 'const answer: number = 42;\nexport default answer;', language: 'typescript' }
+        }
+    ],
     // The batched file tools each declare ONE array property, so the textarea holds
     // the array itself, not a wrapper object (T14).
-    read: ['package.json'],
-    write: [{ path: 'notes/hello.txt', content: 'hello from the harness UI\n' }],
-    edit: [{ path: 'notes/hello.txt', oldString: 'hello', newString: 'hi' }],
+    read: [
+        { label: 'package.json', value: ['package.json'] },
+        { label: 'This UI', value: ['src/frontend/main.ts', 'src/frontend/api.ts'] }
+    ],
+    write: [
+        {
+            label: 'New note',
+            value: [{ path: 'notes/hello.txt', content: 'hello from the harness UI\n' }]
+        }
+    ],
+    edit: [
+        {
+            label: 'Fix the note',
+            value: [{ path: 'notes/hello.txt', oldString: 'hello', newString: 'hi' }]
+        }
+    ],
     // "." works from whatever directory the server runs in.
-    fileList: ['.'],
-    // glob declares three OPTIONAL properties, so it takes the whole object. Both
-    // lists are the documented defaults, and the optional `maxResults` is OMITTED:
-    // an absent `maxResults` means the documented cap, whereas `0` would be clamped.
-    // glob is FILE NAMES only — the old `content` property is gone (it is rejected
-    // as an unknown property), so a content search is the `grep` call below.
-    glob: { patterns: ['**/*'], paths: ['.'] },
+    fileList: [{ label: 'Current directory', value: ['.'] }],
+    // glob declares three OPTIONAL properties, so a preset takes the whole object.
+    // Both lists below are the documented defaults, and the optional `maxResults` is
+    // OMITTED: an absent `maxResults` means the documented cap, whereas `0` would be
+    // clamped. glob is FILE NAMES only — the old `content` property is gone (it is
+    // rejected as an unknown property), so a content search is the `grep` preset below.
+    glob: [
+        { label: 'All files', value: { patterns: ['**/*'], paths: ['.'] } },
+        { label: 'TypeScript sources', value: { patterns: ['**/*.ts'], paths: ['.'] } }
+    ],
     // grep is the content half of the old fileGlob: `pattern` is required, so the
     // schema alone would only produce `{"pattern": ""}`. A regex source with two
     // alternatives plus the file filter shows the whole shape in one editable call.
-    grep: { pattern: 'TODO|FIXME', patterns: ['*.ts'], paths: ['.'] },
-    shell: { command: 'git status --short' },
-    // Core tools: the manual runner can call these inside the selected session, so
-    // their examples have to satisfy the same schema the model sees (non-empty
+    grep: [
+        { label: 'TODO and FIXME', value: { pattern: 'TODO|FIXME', patterns: ['*.ts'], paths: ['.'] } },
+        { label: 'The runner itself', value: { pattern: 'createToolRunner', patterns: ['*.ts'], paths: ['.'] } }
+    ],
+    shell: [
+        { label: 'git status', value: { command: 'git status --short' } },
+        { label: 'node version', value: { command: 'node --version' } }
+    ],
+    // Session-bound tools: the playground runs these inside its OWN temporary session
+    // (R7), so their payloads have to satisfy the same schema the model sees (non-empty
     // tags, a real action, a body that would parse).
-    toolRequest: { tags: ['files', 'read'] },
-    toolCreate: {
-        name: 'shoutText',
-        description: 'Uppercase a short string.',
-        tags: ['text', 'upper'],
-        source: 'return args.trim().toUpperCase();'
-    },
-    todoManage: { action: 'add', text: 'Review the harness catalogue' },
-    // delegate has NO static example: its only valid target is one of the
-    // SELECTED harness's subagents, and a hard-coded id (the old 'summarizer' one)
-    // was wrong for every harness that does not configure it. The runner builds
-    // that example from `delegateTargets` at show time (see `show` below).
-    timeNow: 'UTC',
-    textCount: 'The harness finds tools by tag before it uses them.',
-    diceRoll: 6,
-    noteSearch: 'tool loop',
-    textSummarize: 'The harness runs tools until the model answers with text.',
-    // The server owns the provider key; the runner only needs a valid query. The
+    toolRequest: [
+        { label: 'Files and read', value: { tags: ['files', 'read'] } },
+        { label: 'Web search', value: { tags: ['web', 'search'] } }
+    ],
+    toolCreate: [
+        {
+            label: 'shoutText',
+            value: {
+                name: 'shoutText',
+                description: 'Uppercase a short string.',
+                tags: ['text', 'upper'],
+                source: 'return args.trim().toUpperCase();'
+            }
+        }
+    ],
+    // `task` (R9-R11: the old `todoManage`) is a merge/patch command, not an action
+    // enum, so each button below is one complete merge the tool accepts as-is:
+    //   - no properties at all reads the current list;
+    //   - a `tasks` entry WITHOUT `id` adds one, and `text` is what makes it valid;
+    //   - a `tasks` entry WITH `id` patches only the fields it names (here: completion);
+    //   - `remove` drops the ids it lists.
+    // Every success answers with the CURRENT bounded list, so the id placeholders below
+    // are edited from the result of the read/add call that precedes them. The read
+    // payload is identical to the schema-derived fallback (`{}`), so the runner shows one
+    // button for it, never two.
+    task: [
+        { label: 'Current tasks', value: {} },
+        { label: 'Add a task', value: { tasks: [{ text: 'Review the change' }] } },
+        {
+            label: 'Complete a task (edit id)',
+            value: { tasks: [{ id: '<id from the list above>', completed: true }] }
+        },
+        { label: 'Remove a task (edit id)', value: { remove: ['<id from the list above>'] } }
+    ],
+    // delegate has NO static preset: its only valid target is one of the PLAYGROUND
+    // harness's subagents, and a hard-coded id (the old 'summarizer' one) was wrong
+    // for every harness that does not configure it. The runner builds those presets
+    // from `delegateTargets` at show time (see `presetsFor` below).
+    timeNow: [{ label: 'UTC', value: 'UTC' }],
+    textCount: [{ label: 'A sentence', value: 'The harness finds tools by tag before it uses them.' }],
+    diceRoll: [
+        { label: 'd6', value: 6 },
+        { label: 'd20', value: 20 }
+    ],
+    noteSearch: [{ label: 'Tool loop', value: 'tool loop' }],
+    textSummarize: [
+        { label: 'A paragraph', value: 'The harness runs tools until the model answers with text.' }
+    ],
+    // The server owns the provider key; the playground only needs a valid query. The
     // exact key is never part of this value.
-    search: { query: 'harness tool discovery', maxResults: 5 }
+    search: [{ label: 'Tool discovery', value: { query: 'harness tool discovery', maxResults: 5 } }],
+    // ---------------------------------------------------------------------------
+    // Runtime registry + story tools. Every value below is schema-checked against the
+    // tool's own metadata (src/tools/runtime/*.tool.ts), including the enum spellings
+    // and the `additionalProperties: false` rule, because a preset the server rejects is
+    // worse than no preset. Anything that names a RUNTIME id (a call, a thread, an id
+    // minted by an earlier `add`) carries an obviously fake placeholder instead of an
+    // invented real-looking id: the reader edits it, and the label says so.
+    // ---------------------------------------------------------------------------
+    // No properties at all: the button names what the call returns, which is still more
+    // useful than the reader guessing that an empty object is the whole request.
+    toolList: [{ label: 'Full inventory', value: {} }],
+    // `operation` is the one required property, and 'read' is registered in every
+    // harness, so the target of these three is a name the playground can resolve.
+    toolManage: [
+        { label: 'List registered', value: { operation: 'list' } },
+        { label: 'Details for read', value: { operation: 'details', name: 'read' } },
+        { label: 'Source of read', value: { operation: 'source', name: 'read' } }
+    ],
+    // All properties are optional, so a name-less install is a valid request: the module
+    // text or legacy body declares the wire name itself.
+    toolRegistry: [
+        {
+            label: 'Install shoutText (body)',
+            value: {
+                name: 'shoutText',
+                description: 'Uppercase a short string.',
+                tags: ['text', 'upper'],
+                source: 'return args.trim().toUpperCase();'
+            }
+        }
+    ],
+    toolCancel: [
+        {
+            // ONE property, so the single-property rule applies: the box holds the id
+            // string itself, not a `{callId: …}` wrapper.
+            label: 'Cancel a call (edit id)',
+            value: '<callId from a running tool call>'
+        }
+    ],
+    // agentManage and threadList take no arguments; both are the discovery step whose
+    // answer supplies the ids the id-based presets below need.
+    agentManage: [{ label: 'Recent invocations', value: {} }],
+    // `agent` must be an agent THIS harness configures, so the runner builds these
+    // presets from the playground harness's subagent list (see `presetsFor`).
+    agentResult: [],
+    threadList: [{ label: 'Thread roster', value: {} }],
+    threadSend: [
+        {
+            label: 'Send to thread (edit id)',
+            value: {
+                thread: '<thread id from threadList>',
+                message: 'Here is the constraint you asked for; please fold it into the current task.'
+            }
+        }
+    ],
+    // A fork needs no id: it inherits the current history, so this whole call is valid
+    // without any editing.
+    threadFork: [
+        {
+            label: 'Fork an alternate take',
+            value: {
+                input: 'Try the opposite approach and report what breaks, with the evidence.',
+                label: 'Alternate take'
+            }
+        }
+    ],
+    // The story tables: `action` is required and each write action needs its own pair of
+    // fields, so the add presets carry complete records and the id-based one stays a
+    // clearly-marked placeholder.
+    profileManage: [
+        { label: 'List profiles', value: { action: 'list' } },
+        {
+            label: 'Add a profile',
+            value: {
+                action: 'add',
+                name: 'Iris',
+                description: 'A cautious planner who asks before acting.',
+                traits: ['brave', 'loyal']
+            }
+        },
+        { label: 'Get by id (edit id)', value: { action: 'get', id: '<id from add>' } }
+    ],
+    chapterManage: [
+        { label: 'List chapters', value: { action: 'list' } },
+        {
+            label: 'Add a draft chapter',
+            value: {
+                action: 'add',
+                title: 'The harness finds its tools',
+                summary: 'Discovery runs before the first model call.',
+                content: 'The registry answers with tags, and the model asks for what it needs.',
+                status: 'draft'
+            }
+        },
+        { label: 'Get by id (edit id)', value: { action: 'get', id: '<id from add>' } }
+    ],
+    locationManage: [
+        { label: 'List locations', value: { action: 'list' } },
+        {
+            label: 'Add a location',
+            value: {
+                action: 'add',
+                name: 'The archive',
+                description: 'A quiet room full of superseded plans.',
+                notes: 'Nobody throws anything away here.'
+            }
+        },
+        { label: 'Get by id (edit id)', value: { action: 'get', id: '<id from add>' } }
+    ],
+    // actionRequest's `recommended` MUST match one of the option ids, so the preset ships
+    // a self-consistent request rather than three independent fields.
+    actionRequest: [
+        {
+            label: 'Ask which path to take',
+            value: {
+                question: 'Should the fix change the shared schema or stay local to this tool?',
+                recommended: 'local',
+                options: [
+                    { id: 'shared', label: 'Change the shared schema', description: 'Every caller sees it.' },
+                    { id: 'local', label: 'Keep it local', description: 'Only this tool changes.' }
+                ]
+            }
+        }
+    ],
+    // ---------------------------------------------------------------------------
+    // Network and git presets.
+    // ---------------------------------------------------------------------------
+    // `fetch` declares ONE property, so the single-property rule applies and the box holds
+    // the URL itself — an object here would be sent as a literal `{url: …}` value.
+    fetch: [{ label: 'Fetch example.com', value: 'https://example.com' }],
+    download: [
+        {
+            label: 'Save a named file',
+            value: { url: 'https://example.com/report.html', name: 'report.html' }
+        }
+    ],
+    // gitDiff has NO required property: every one of these is a complete, different call.
+    gitDiff: [
+        { label: 'Working tree', value: {} },
+        { label: 'Against HEAD~1', value: { ref: 'HEAD~1' } },
+        { label: 'Staged index', value: { staged: true } },
+        { label: 'Only src, against main', value: { ref: 'main', paths: ['src'] } }
+    ]
 };
 
 // The single-property rule, mirrored for the UI: a one-property schema means the
@@ -695,7 +912,8 @@ const placeholderFor = (schema: Record<string, unknown> | undefined): unknown =>
     const values = schema?.enum;
 
     // An enum member is valid by construction. Taking the first keeps the template
-    // deterministic (todoManage.action; `syntax.language` is free text now, so the
+    // deterministic (the story tools' `action` and `toolManage.operation` enums;
+    // `syntax.language` is free text now, so the
     // curated example is what makes that call valid).
     if (Array.isArray(values) && values.length > 0) return values[0];
 
@@ -757,46 +975,123 @@ const templateFor = (parameters: Record<string, unknown> | undefined): string =>
     return JSON.stringify(value, null, 2);
 };
 
-// What the runner needs from the shell for a session-bound core tool.
+// The schema-derived preset for a tool with no curated payload. Its LABEL names the
+// shape it fills, because the button is the only hint a reader gets before pressing it:
+// `Only paths` for the single-property rule, `Required tags` for a required list, and
+// `Empty call` when the schema requires nothing.
+const schemaPreset = (entry: ToolDescriptor): ToolPreset => {
+    const parameters = entry.parameters;
+    const single = singleProperty(parameters);
+    const required = Array.isArray(parameters?.required)
+        ? (parameters.required as unknown[]).filter((key): key is string => typeof key === 'string')
+        : [];
+
+    const label =
+        single !== undefined
+            ? `Only ${single}`
+            : required.length === 0
+              ? 'Empty call'
+              : required.length <= 2
+                ? `Required ${required.join(' + ')}`
+                : 'Required fields';
+
+    // `templateFor` always returns JSON text, so this parse cannot fail; it exists so
+    // the preset list carries VALUES (the box renders them with 2-space formatting).
+    return { label, value: JSON.parse(templateFor(parameters)) as unknown };
+};
+
+// How many preset buttons one tool may show. Beyond this the argument box would be
+// pushed below the fold inside the runner dialog.
+const PRESET_LIMIT = 4;
+
+// The preset buttons for one catalogue entry: curated payloads first, then the
+// schema-derived fallback — so EVERY listed tool offers at least one named, valid
+// starting value, even a tool nobody curated (a runtime tool, or one a harness added).
 //
-// `context` is read at show time and before every call; `ensureSession` creates
-// the SELECTED harness's session when none exists yet; `refreshSession` re-reads
-// the server snapshot after a call so toolRequest discoveries and todo state are
-// on screen immediately. None of these live in this module: the runner must not
-// own the selection, and it must not guess a session id.
+// `playgroundAgents` is the subagent allowlist of the harness the PLAYGROUND picked (R7).
+// delegate and agentResult are the two tools whose target must name a configured agent,
+// so their presets are built from that list at show time — the selected conversation's
+// frozen team is irrelevant here, and a hard-coded agent name would be invalid for most
+// harnesses.
+const presetsFor = (
+    entry: ToolDescriptor,
+    playgroundAgents: readonly string[]
+): readonly ToolPreset[] => {
+    if (entry.name === 'delegate') {
+        // Each named target is a self-contained brief: an under-specified delegation is
+        // the call the model most often gets wrong, so the preset shows a real one.
+        return playgroundAgents.slice(0, PRESET_LIMIT).map((agent) => ({
+            label: `Delegate to ${agent}`,
+            value: {
+                agent,
+                input: `Give ${agent} everything it needs: the goal, the files or areas, the constraints, and the evidence you want back.`
+            }
+        }));
+    }
+
+    if (entry.name === 'agentResult') {
+        // `agent` must be a configured subagent, so offer one preset per real target and
+        // keep the paging shape reachable. With no subagents there is no valid target:
+        // the reader gets the clearly-marked placeholder to edit rather than a name this
+        // harness does not have.
+        const targets: ToolPreset[] = playgroundAgents.slice(0, PRESET_LIMIT - 1).map((agent) => ({
+            label: `Read ${agent}`,
+            value: { agent }
+        }));
+
+        targets.push({
+            label: 'Page a result (edit ids)',
+            value: { agent: '<agent from agentManage>', offset: 0, limit: 2000 }
+        });
+
+        return targets;
+    }
+
+    const presets = [...(PRESETS[entry.name] ?? [])];
+
+    // The fallback is deduplicated against a curated preset with the identical value
+    // (the common case for a tool that has exactly one curated payload), so a button
+    // never repeats itself.
+    const fallback = schemaPreset(entry);
+    if (!presets.some((preset) => JSON.stringify(preset.value) === JSON.stringify(fallback.value))) {
+        presets.push(fallback);
+    }
+
+    return presets.slice(0, PRESET_LIMIT);
+};
+
+// What the runner needs from the shell for a session-bound core tool (R7).
 //
-// `onPanels` delivers the tool's declarative panels (R21.3) TOGETHER WITH the
-// owner captured before the call: the caller decides which instance may draw
-// them. That is what keeps a slow manual call from painting into whatever harness
-// or session happens to be selected when the answer lands.
+// The runner is the GLOBAL playground's surface: it never reads the selected
+// conversation. `context` is read at show time and before every call and reports the
+// PLAYGROUND's own temporary context; `ensureSession` creates that temporary session on
+// the production harness the playground picked (never the reader's chat);
+// `refreshSession` re-reads the temporary session's snapshot after a call so
+// toolRequest discoveries and the task list are on screen immediately. None of these live
+// in this module: the runner must not own the temporary context, and it must not guess
+// a session id.
 //
-// `delegateTargets` reads the SELECTED harness's subagent allowlist (live
-// descriptor, or the frozen team of the open session). delegate is the one
-// core tool whose validity depends on the session's configuration: it is only
-// registered when the harness declares subagents, so the runner must not offer an
-// example naming an agent this harness does not have.
+// `delegateTargets` reads the SUBAGENT allowlist of the harness the playground picked.
+// delegate is the one core tool whose validity depends on that harness's configuration:
+// it is only registered when the harness declares subagents, so the runner must not
+// offer a preset naming an agent that harness does not have.
+//
+// There is NO panel routing any more: a playground call belongs to the temporary
+// context, so its declarative panels are shown in the response box (R21.3 panels never
+// enter the conversation the reader is looking at).
 export type ToolRunnerOptions = {
     context: () => { harness?: string; sessionId?: string };
     ensureSession: () => Promise<string | undefined>;
     refreshSession: (sessionId: string) => Promise<void>;
     delegateTargets?: () => readonly string[];
-    onPanels?: (
-        toolName: string,
-        panels: unknown,
-        owner: { harness?: string; sessionId?: string }
-    ) => void;
 };
 
 type ToolRunner = {
     pane: HTMLElement;
     show: (entry: ToolDescriptor) => void;
-    // Repaint the session-context line (selection or session changed underneath
-    // an already-open runner).
+    // Repaint the session-context line (the playground context changed underneath an
+    // already-open runner).
     sync: () => void;
-    // R5/T6: the CURRENT result-box data for the dialog Copy action. Evaluated at
-    // click time so a call that settles while the dialog is open copies its latest
-    // result, not the initial placeholder.
-    copyText: () => string;
 };
 
 // The cap the server applies to `toolRequest` (5). Kept here only to explain
@@ -837,8 +1132,9 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     const log = el('div', 'log');
     const card = el('section', 'tool-card');
 
-    // The introduction changes with the entry: a catalogue tool is a bare
-    // function call; a core tool needs a session and mutates that conversation.
+    // The introduction changes with the entry: a catalogue tool is a bare function
+    // call; a core tool runs in the playground's OWN temporary session (R7), so its
+    // wording never points at the conversation the reader is looking at.
     const note = el('p', 'tool-note', '');
     const sessionNote = el('p', 'tool-note tool-session', '');
     sessionNote.hidden = true;
@@ -860,12 +1156,36 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     const schemaBody = el('pre', 'transcript-body', '{}');
     schema.append(schemaBody);
 
-    const argsField = el('label', 'field');
-    argsField.append(el('span', 'field-label', 'Arguments (JSON)'));
+    // R8: the preset buttons. Pressing one FILLS the editable box and sends nothing;
+    // the payload the reader sees is the payload that is sent, so a preset is a
+    // starting value, never a hidden argument source.
+    const presetRow = el('div', 'tool-presets');
+    const presetLabel = el('span', 'field-label tool-label', 'Presets');
+    const presetButtons = el('div', 'tool-preset-buttons');
+    presetRow.append(presetLabel, presetButtons);
+    presetRow.hidden = true;
+
+    // R8: the payload section carries its OWN copy control. The wrapper is a `div`,
+    // not a `label`: a button inside a `<label>` would forward its activation to the
+    // textarea. The accessible name moves to an explicit `aria-label` on the field.
+    const argsField = el('div', 'field tool-section');
+    const argsHeading = el('div', 'tool-heading');
+    const argsLabel = el('span', 'field-label tool-label', 'Payload (JSON)');
+    argsHeading.append(
+        argsLabel,
+        createTextCopyButton({
+            label: 'Copy payload',
+            // Click-time provider: whatever the reader has typed is what lands on the
+            // clipboard, verbatim — not a re-serialized or prettified version.
+            text: () => args.value,
+            className: 'tool-copy'
+        })
+    );
     const args = el('textarea', 'composer-input tool-args');
     args.rows = 5;
     args.spellcheck = false;
-    argsField.append(args);
+    args.setAttribute('aria-label', 'Tool arguments as JSON');
+    argsField.append(argsHeading, args);
 
     const rule = el('p', 'field-hint', '');
 
@@ -874,16 +1194,30 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     const actions = el('div', 'composer-actions');
     actions.append(callButton);
 
-    const output = el('div', 'card tool-output');
-    const outputHead = el('div', 'card-head', 'result');
+    // R8: the response section, with its own copy control beside its own label. The
+    // dialog header has NO copy button any more (see `openToolDialog`): a whole-dialog
+    // copy would have to guess which of these two panes the reader meant.
+    const output = el('div', 'card tool-output tool-section');
+    const outputHead = el('div', 'card-head tool-heading');
+    const outputLabelNode = el('span', 'card-label tool-label', 'response');
+    outputHead.append(
+        outputLabelNode,
+        createTextCopyButton({
+            label: 'Copy response',
+            // The raw text behind the highlighted view, resolved at click time so a
+            // call that settles while the dialog is open copies the settled answer.
+            text: () => responseText,
+            className: 'tool-copy'
+        })
+    );
     const outputBody = el('pre', 'card-body', '');
     output.append(outputHead, outputBody);
 
-    // The raw text behind the rendered result box. Copy uses this instead of the
+    // The raw text behind the rendered response box. Copy uses this instead of the
     // highlighted DOM so no syntax spans, truncation or decoration leak into the
-    // clipboard; it is updated by every `setOutput`, including errors/prompts.
-    let outputText = '';
-    let outputLabel = 'result';
+    // clipboard; it is updated by every `setResponse`, including errors and prompts.
+    let responseText = '';
+    let responseLabel = 'response';
 
     // Guidance for a truncated toolRequest answer. Separate from the raw result:
     // the structured payload is never rewritten.
@@ -896,6 +1230,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
         safetyNote,
         availabilityNote,
         schema,
+        presetRow,
         argsField,
         rule,
         actions,
@@ -908,42 +1243,87 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
 
     let active: ToolDescriptor | undefined;
 
-    // Direct-call results get the same treatment as tool results inside a turn:
+    // Direct-call responses get the same treatment as tool results inside a turn:
     // pretty-printed JSON when it parses, escaped+highlighted otherwise. The
     // markup comes from `highlightCode`, which escapes its input, so assigning it
     // to `innerHTML` cannot execute anything.
-    const setOutput = (text: string, isError: boolean): void => {
-        outputText = text;
-        outputLabel = isError ? 'error' : 'result';
-        outputHead.textContent = outputLabel;
-        output.className = isError ? 'card tool-output is-error' : 'card tool-output';
+    const setResponse = (text: string, isError: boolean): void => {
+        responseText = text;
+        responseLabel = isError ? 'error' : 'response';
+        outputLabelNode.textContent = responseLabel;
+        output.className = isError
+            ? 'card tool-output tool-section is-error'
+            : 'card tool-output tool-section';
         outputBody.innerHTML = highlightCode(prettyJson(text), looksLikeJson(text) ? 'json' : undefined);
         outputBody.dataset.language = looksLikeJson(text) ? 'json' : 'text';
     };
 
-    // The runner's current useful data. The input controls are deliberately not
-    // copied: they are editable arguments, not a result. The tool identity and the
-    // result-box label give a pasted answer enough context to stand alone.
-    const copyText = (): string => {
-        const label = outputHead.textContent !== null && outputHead.textContent.length > 0
-            ? outputHead.textContent
-            : outputLabel;
-
-        return [`Tool: ${active?.name ?? 'tool'}`, `Result: ${label}`, '', outputText].join('\n');
+    // One writer for every failure the runner can produce (R8). The box is a JSON view,
+    // so a failure is written AS JSON: the reader (and anything parsing the box) gets a
+    // machine-readable `ok: false` envelope with the server's or the parser's own
+    // message, instead of a prose sentence that would make the box lie about its
+    // format. The payload textarea is never touched here — an invalid draft stays
+    // exactly as typed so it can be corrected and re-sent.
+    const setFailure = (kind: string, message: string, extra?: Record<string, unknown>): void => {
+        const error: Record<string, unknown> = { kind, message, ...extra };
+        setResponse(JSON.stringify({ ok: false, error }, null, 2), true);
     };
 
-    // Delegation is the one core tool whose VALIDITY depends on the selected
-    // harness: the server registers delegate only when the harness declares
-    // subagents, so a hard-coded example (the old 'summarizer' one) named an agent
-    // most harnesses do not have.
+    // The preset buttons for the entry being shown (R8). `fill` writes the FIRST
+    // preset into the textarea, which is what makes the box start with a valid call
+    // without ever locking the reader into it.
+    const paintPresets = (entry: ToolDescriptor, fill: boolean): void => {
+        const presets = presetsFor(entry, [...(options.delegateTargets?.() ?? [])]);
+
+        presetButtons.replaceChildren();
+        presetRow.hidden = presets.length === 0;
+
+        presets.forEach((preset, index) => {
+            // Owns its chip styling (no shared `.button` classes, for the same reason
+            // as `.harness-delete`: the generic `.button` rule sits later in the sheet).
+            const button = el('button', 'tool-preset');
+            button.type = 'button';
+            button.textContent = preset.label;
+            button.dataset.preset = preset.label;
+            // Which payload the box currently holds. The first preset is the one the
+            // runner filled, so the pressed state starts on it; a hand-edited box is
+            // re-filled by pressing the button again.
+            button.setAttribute('aria-pressed', index === 0 ? 'true' : 'false');
+            // A preset is still a CALL waiting to happen, so an entry the server says it
+            // cannot run offers none.
+            button.disabled = entry.availability?.state === 'unconfigured';
+            button.title = `Fill the arguments with ${preset.label}. Nothing runs until “Call tool”.`;
+
+            button.addEventListener('click', () => {
+                // R8: filling the box is the whole action. The text stays fully
+                // editable, so "Call tool" sends exactly this JSON plus any edit the
+                // reader makes on top of it.
+                args.value = JSON.stringify(preset.value, null, 2);
+
+                for (const other of presetButtons.children) {
+                    (other as HTMLButtonElement).setAttribute('aria-pressed', 'false');
+                }
+                button.setAttribute('aria-pressed', 'true');
+            });
+
+            presetButtons.append(button);
+        });
+
+        if (fill && presets.length > 0) args.value = JSON.stringify(presets[0].value, null, 2);
+    };
+
+    // Delegation is the one core tool whose VALIDITY depends on the harness the
+    // playground picked: the server registers delegate only when that harness declares
+    // subagents, so a hard-coded target (the old 'summarizer' one) named an agent most
+    // harnesses do not have.
     //
-    // `delegateKey` is the target list last painted (undefined = nothing painted
-    // yet), so an ordinary `sync()` (called before every call and after every
-    // selection change) only rewrites the example when the TEAM changed — never over
-    // something the reader typed.
+    // `delegateKey` is the target list last painted (undefined = nothing painted yet),
+    // so an ordinary `sync()` (called before every call and after every context change)
+    // only rewrites the presets when the TEAM changed — never over something the reader
+    // typed.
     //
-    // Returns true when the selected harness offers no target, which the caller
-    // must treat as "not callable here" (the server would answer 404).
+    // Returns true when the playground harness offers no target, which the caller must
+    // treat as "not callable here" (the server would answer 404).
     let delegateKey: string | undefined;
 
     const paintDelegate = (entry: ToolDescriptor): boolean => {
@@ -958,32 +1338,24 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
 
         if (key !== delegateKey) {
             delegateKey = key;
-            args.value = noTargets
-                ? '{}'
-                : JSON.stringify(
-                      {
-                          agent: targets[0],
-                          input: `Give ${targets[0]} everything it needs: the goal, the files or areas, the constraints, and the evidence you want back.`
-                      },
-                      null,
-                      2
-                  );
+            paintPresets(entry, !noTargets);
+            if (noTargets) args.value = '{}';
         }
 
         note.textContent = noTargets
-            ? 'Core tool — this harness declares no subagents, so delegation is not available in its sessions. Add an agent to the team to enable one-level delegation.'
-            : `Core tool — it runs inside the selected session and hands ONE subagent a self-contained brief. Targets for this harness: ${targets.join(', ')}. Subagents cannot delegate further.`;
+            ? 'Core tool — the playground harness declares no subagents, so delegation is not available in its session. Add an agent to that team to enable one-level delegation.'
+            : `Core tool — it runs in the playground’s temporary session and hands ONE subagent a self-contained brief. Targets for the playground harness: ${targets.join(', ')}. Subagents cannot delegate further.`;
 
         return noTargets;
     };
 
-    // Session context line. Read live so a session created after the runner
-    // opened is shown instead of "no session yet", and so a frozen chat reports
-    // the session the call will actually use.
+    // Context line (R7). Read live so a temporary session created after the runner
+    // opened is shown instead of "none yet", and so it always names the context the
+    // call will actually use — never the conversation the reader selected.
     const sync = (): void => {
-        // A selection change can change the team under an open runner: repaint the
-        // delegate example/availability so the pane never names an agent the
-        // selected harness no longer has.
+        // The playground harness can change underneath an open runner (a harness was
+        // deleted, or the roster reloaded): repaint the delegate presets/availability
+        // so the pane never names an agent that harness no longer has.
         if (active !== undefined) paintDelegate(active);
 
         if (active?.sessionBound !== true) {
@@ -997,14 +1369,14 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
         sessionNote.dataset.harness = context.harness ?? '';
         if (context.harness === undefined) {
             sessionNote.textContent =
-                'Session-bound: select a harness first. This tool executes inside that harness’s session.';
+                'Session-bound: this server reports no harness, so there is no context to run a core tool in. Create a harness first.';
             return;
         }
 
         sessionNote.textContent =
             context.sessionId === undefined
-                ? `Session-bound: runs inside ${context.harness}. No session yet — Call creates one for this harness.`
-                : `Session-bound: runs inside ${context.harness} · session ${context.sessionId}.`;
+                ? `Session-bound: runs in the playground’s own temporary session for ${context.harness}. None yet — Call creates one, and leaving the tools view deletes it.`
+                : `Session-bound: runs in the playground’s own temporary session for ${context.harness} · session ${context.sessionId}. The conversation you selected is untouched.`;
     };
 
     callButton.addEventListener('click', async () => {
@@ -1019,44 +1391,61 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
         // button plus this guard keeps the pane honest.
         if (paintDelegate(entry)) return;
 
+        // R8: the box IS the request. It is parsed (and only parsed) here, so a preset
+        // is never sent as an object and an edit is never lost. A parse failure is
+        // reported as a structured response and leaves the draft untouched, which is
+        // what makes it correctable.
         let parameters: unknown;
         try {
             parameters = args.value.trim().length === 0 ? {} : JSON.parse(args.value);
         } catch (error) {
-            setOutput(`Arguments are not valid JSON: ${messageOf(error)}`, true);
+            setFailure('invalid_json', `Arguments are not valid JSON: ${messageOf(error)}`);
             return;
         }
 
         callButton.disabled = true;
-        setOutput('running…', false);
+        setResponse('Calling…', false);
         resultHint.hidden = true;
 
         try {
-            // Capture the session id BEFORE any await. If the selection changes
-            // while the call is in flight, the request still runs in the session
-            // the runner displayed — never in whatever happens to be selected when
-            // the response lands.
+            // Capture the temporary session id BEFORE any await. If the playground
+            // context changes while the call is in flight, the request still runs in
+            // the session the runner displayed — never in whatever exists when the
+            // response lands.
             let sessionId: string | undefined;
             if (entry.sessionBound === true) {
                 sessionId = options.context().sessionId;
 
                 if (sessionId === undefined) {
-                    // A manual core call needs a real server session (the tool
-                    // mutates discovery/todos/runtime tools). Creating one here is
-                    // the documented equivalent of the chat's first submit.
-                    setOutput('No session for this harness yet — creating one…', false);
+                    // A core call needs a real server session (the tool mutates
+                    // discovery/tasks/runtime tools). The playground creates its OWN
+                    // (R7): never the reader's conversation, and never an id this view
+                    // invents.
+                    setResponse('Creating the playground session…', false);
                     try {
                         sessionId = await options.ensureSession();
                     } catch (error) {
-                        setOutput(`Could not create a session: ${messageOf(error)}`, true);
+                        setFailure('session_create_failed', `Could not create a session: ${messageOf(error)}`);
                         return;
                     }
 
                     if (sessionId === undefined) {
-                        setOutput(
-                            'No harness is selected, so this core tool has no session to run in. Select a harness first.',
-                            true
-                        );
+                        // Two honest reasons, and the pane says which one it is: this
+                        // server has no harness to run in, or the tools view was closed
+                        // while the create was in flight (that answer is discarded).
+                        const harness = options.context().harness;
+
+                        if (harness === undefined) {
+                            setFailure(
+                                'no_harness',
+                                'This server reports no harness, so this core tool has no session to run in. Create a harness in the sidebar, then call again.'
+                            );
+                        } else {
+                            setFailure(
+                                'playground_closed',
+                                `The tools view was closed while the temporary session for ${harness} was being created, so it was discarded and this call did not run.`
+                            );
+                        }
                         return;
                     }
                 }
@@ -1064,26 +1453,22 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
                 sync();
             }
 
-            // Capture the owner BEFORE the call. `ensureSession` above may have just
-            // created the session, so read `context()` now: this is the exact view
-            // the request is about to report into. A selection change during the
-            // await can no longer redirect the answer.
-            const owner = options.context();
-
             const response = await callTool(entry.name, parameters, sessionId);
 
             if (!response.ok) {
-                setOutput(response.error.message, true);
+                // A tool-level failure is still a JSON answer: the server's own error
+                // envelope is rendered verbatim instead of being flattened into a
+                // sentence, so the response box keeps one format for every outcome.
+                setResponse(JSON.stringify(response, null, 2), true);
                 return;
             }
 
-            const rendered =
-                response.result === undefined
-                    ? 'undefined'
-                    : (JSON.stringify(response.result, null, 2) ?? String(response.result));
-
-            setOutput(rendered, false);
-            outputHead.textContent = `result · ${response.durationMs}ms`;
+            // R8: the response box shows the response — the server's whole answer
+            // envelope (result, duration, and any declarative panels). A playground
+            // call's panels are data in THIS pane, not something injected into the
+            // conversation the reader is looking at.
+            setResponse(JSON.stringify(response, null, 2), false);
+            outputLabelNode.textContent = `response · ${response.durationMs}ms`;
 
             // toolRequest caps its answer (5 tools). The raw payload stays; the
             // hint names the remaining count and the next move.
@@ -1091,7 +1476,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
             resultHint.hidden = hint === undefined;
             resultHint.textContent = hint ?? '';
 
-            // Core calls mutate the session (enabled tools, created tools, todos),
+            // Core calls mutate the session (enabled tools, created tools, tasks),
             // so re-read the server's snapshot. A refresh failure must not hide the
             // result that just arrived; the caller's status pill reports it.
             if (entry.sessionBound === true && sessionId !== undefined) {
@@ -1103,15 +1488,15 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
                 }
             }
 
-            // Declarative panels come LAST: the refresh above recomputes instance
-            // panels from the server's turns and would drop a manual panel that has
-            // no backend storage yet. `panels` is optional on the success result, so
-            // an older/ordinary tool answer passes `undefined` (a no-op).
-            options.onPanels?.(entry.name, response.panels, owner);
+            // R7: there is NO panel routing here any more. A playground call produced
+            // its panels inside the temporary session it owns, so they are shown as
+            // part of the response envelope above and never injected into the
+            // conversation the reader happens to be looking at.
         } catch (error) {
             // Request-level failures (no session 400, unknown session 404, active
-            // run 409, offline) arrive here with the server's own message.
-            setOutput(messageOf(error), true);
+            // run 409, offline) arrive here with the server's own message, written as
+            // the same structured envelope the success path uses.
+            setFailure('request_failed', messageOf(error));
         } finally {
             // The early guard returned for an unconfigured entry, so reaching here
             // means the tool is callable and the button may be offered again.
@@ -1123,7 +1508,6 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
     return {
         pane,
         sync,
-        copyText,
         show: (entry) => {
             active = entry;
 
@@ -1136,19 +1520,21 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
             const sessionBound = entry.sessionBound === true;
 
             note.textContent = sessionBound
-                ? 'Core tool — it runs inside the selected session’s harness on the server, so its result changes that conversation.'
+                ? 'Core tool — it runs in the playground’s own temporary session (a harness session this view created for tool testing, deleted when the tools view closes), so its result never changes the conversation you are reading.'
                 : 'Direct call — no harness, no agent, no tool loop. This is the same implementation a session registers, invoked as a function.';
 
             schemaBody.textContent = JSON.stringify(entry.parameters, null, 2);
 
-            args.value = Object.prototype.hasOwnProperty.call(EXAMPLES, entry.name)
-                ? JSON.stringify(EXAMPLES[entry.name], null, 2)
-                : templateFor(entry.parameters);
+            // R8: the preset buttons are painted first and the first one fills the box,
+            // so the runner always starts from a named, schema-valid payload (curated
+            // example when one exists, schema-derived otherwise) that the reader can
+            // edit freely.
+            paintPresets(entry, true);
 
-            // delegate's example depends on the SELECTED team; every other
+            // delegate's presets depend on the PLAYGROUND harness's team; every other
             // entry (including the server-wide catalogue listing) is team-independent.
-            // Reset the painted-targets key so a re-show always repaints the example
-            // from the current team rather than keeping the schema template.
+            // Reset the painted-targets key so a re-show always repaints from the
+            // current roster rather than keeping the previous fill.
             delegateKey = undefined;
             const noDelegateTargets = paintDelegate(entry);
 
@@ -1165,7 +1551,7 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
                 entry.availability?.state === 'unconfigured'
                     ? (entry.availability.hint ?? '')
                     : noDelegateTargets
-                      ? 'Not available for the selected harness: it declares no subagents, so delegate is not registered in its sessions.'
+                      ? 'Not available for the playground harness: it declares no subagents, so delegate is not registered in its session.'
                       : '';
             availabilityNote.hidden = !unavailable && !noDelegateTargets;
 
@@ -1173,17 +1559,21 @@ const createToolRunner = (options: ToolRunnerOptions): ToolRunner => {
             callButton.disabled = blocked;
             args.disabled = blocked;
 
-            setOutput(
+            setResponse(
                 // The full hint is already rendered above the schema; repeating a
-                // paragraph in the result box would just be noise.
+                // paragraph in the response box would just be noise.
                 unavailable
                     ? 'Not configured on this server.'
                     : noDelegateTargets
-                      ? 'Delegation is unavailable for this harness.'
+                      ? 'Delegation is unavailable for the playground harness.'
                       : 'Nothing yet. Press “Call tool”.',
                 blocked
             );
-            outputHead.textContent = unavailable ? 'unconfigured' : noDelegateTargets ? 'unavailable' : 'result';
+            outputLabelNode.textContent = unavailable
+                ? 'unconfigured'
+                : noDelegateTargets
+                  ? 'unavailable'
+                  : 'response';
             resultHint.hidden = true;
             resultHint.textContent = '';
 
@@ -1306,19 +1696,22 @@ const leftRail = el('aside', 'rail rail-left');
 leftRail.id = 'rail-left';
 leftRail.setAttribute('aria-label', 'Harnesses');
 const harnessHead = el('div', 'rail-head');
-const harnessHeading = el('h2', 'rail-title', 'Harnesses');
+// R4: the "Harnesses" title IS the drawer toggle. It opens and closes the SAME left
+// sidebar as the "Harness UI" brand, so the small-screen `×` control is gone: one
+// labelled heading does the job the glyph did, and the drawer no longer needs a
+// second, easily-missed target. The `<h2>` stays (the rail keeps its accessible
+// section heading and the existing `.rail-title` styling); the BUTTON inside it is the
+// control, so the heading's textContent is still exactly "Harnesses".
+const harnessHeading = el('h2', 'rail-title');
+const harnessTitleToggle = el('button', 'rail-title-toggle', 'Harnesses');
+harnessTitleToggle.type = 'button';
+harnessHeading.append(harnessTitleToggle);
 const createHarnessButton = el('button', 'button small new-harness', '+ New');
 createHarnessButton.type = 'button';
 createHarnessButton.disabled = true;
 createHarnessButton.setAttribute('aria-expanded', 'false');
-// R2: close affordance for the phone drawer. It is hidden by CSS on wider layouts,
-// where the rail is permanent; main.ts wires it to the same `setRailOpen(undefined)`
-// path as Escape, the backdrop and picking a harness.
-const closeHarnessSidebar = el('button', 'button small rail-close', '×');
-closeHarnessSidebar.type = 'button';
-closeHarnessSidebar.setAttribute('aria-label', 'Close harnesses panel');
 const harnessHeadActions = el('div', 'rail-head-actions');
-harnessHeadActions.append(createHarnessButton, closeHarnessSidebar);
+harnessHeadActions.append(createHarnessButton);
 harnessHead.append(harnessHeading, harnessHeadActions);
 
 const harnessList = el('div', 'harness-list');
@@ -2866,7 +3259,23 @@ refreshSessionsButton.type = 'button';
 refreshSessionsButton.disabled = true;
 sessionsActions.append(newSessionButton, refreshSessionsButton);
 const sessionList = el('div', 'session-list');
-sessionsSection.append(sessionsHead, sessionsScope, sessionsActions, sessionList);
+
+// R6: conversations whose harness was deleted stay reachable. The registry lost the
+// definition, not the record, so they get their own labelled group at the bottom of the
+// rail: never mixed into the selected harness's rows (the rail's scoping rule), and never
+// unreachable just because a deleted harness has no rail row to select.
+const archivedSection = el('div', 'session-archived');
+archivedSection.hidden = true;
+const archivedHead = el('h3', 'rail-title session-archived-title', 'Archived harnesses');
+const archivedNote = el(
+    'p',
+    'field-hint',
+    'Saved sessions of a harness you deleted. They still open exactly as they were; starting a new session needs a harness that exists.'
+);
+const archivedList = el('div', 'session-list session-archived-list');
+archivedSection.append(archivedHead, archivedNote, archivedList);
+
+sessionsSection.append(sessionsHead, sessionsScope, sessionsActions, sessionList, archivedSection);
 
 rightRail.append(scratchSection, sessionsSection);
 
@@ -2926,20 +3335,29 @@ const hasFinePointer = (): boolean => finePointerMedia?.matches ?? false;
 // bluetooth keyboard, must not keep advertising a shortcut that no longer applies).
 finePointerMedia?.addEventListener?.('change', () => paintComposer());
 
-// Apply the platform-appropriate brand semantics:
+// Apply the platform-appropriate disclosure semantics to BOTH left-rail triggers (the
+// topbar brand and, R4, the "Harnesses" heading inside the drawer itself):
 //   - phone: a real disclosure trigger, enabled, with `aria-controls` and the live
 //     `aria-expanded` state;
-//   - desktop/tablet: the rail is permanently visible, so the brand is NOT a
+//   - desktop/tablet: the rail is permanently visible, so neither title is a
 //     disclosure. Native `disabled` removes it from the tab order and prevents the
 //     no-op click; the ARIA disclosure attributes and action title are removed so
-//     assistive tech never hears a false "collapsed" state. `.brand`'s author styles
-//     keep the title visually identical to the former text label.
+//     assistive tech never hears a false "collapsed" state. `.brand`'s and
+//     `.rail-title-toggle`'s author styles keep both titles visually identical to a
+//     plain label.
 const syncBrandTrigger = (): void => {
     if (isPhoneLayout()) {
         brand.disabled = false;
         brand.setAttribute('aria-controls', 'rail-left');
         brand.setAttribute('aria-expanded', openRail === 'left' ? 'true' : 'false');
         brand.title = 'Show or hide harnesses';
+
+        // R4: the heading is the drawer's own toggle — the control that replaced the
+        // small `×`. Same disclosure state, same target rail.
+        harnessTitleToggle.disabled = false;
+        harnessTitleToggle.setAttribute('aria-controls', 'rail-left');
+        harnessTitleToggle.setAttribute('aria-expanded', openRail === 'left' ? 'true' : 'false');
+        harnessTitleToggle.title = 'Show or hide harnesses';
         return;
     }
 
@@ -2947,6 +3365,11 @@ const syncBrandTrigger = (): void => {
     brand.removeAttribute('aria-controls');
     brand.removeAttribute('aria-expanded');
     brand.removeAttribute('title');
+
+    harnessTitleToggle.disabled = true;
+    harnessTitleToggle.removeAttribute('aria-controls');
+    harnessTitleToggle.removeAttribute('aria-expanded');
+    harnessTitleToggle.removeAttribute('title');
 };
 
 // One painter for the whole state: the shell attribute drives CSS, the two toggles'
@@ -2977,9 +3400,10 @@ const setRailOpen = (side: 'left' | 'right' | undefined, trigger?: HTMLElement):
                 ? active
                 : undefined);
 
-        // The harness drawer is modal-ish: move focus to its own close control so
-        // Escape/Tab and the dismiss affordance are immediately reachable.
-        if (side === 'left') closeHarnessSidebar.focus({ preventScroll: true });
+        // The harness drawer is modal-ish: move focus to its own dismiss control (R4:
+        // the heading toggle, which is what the removed `×` used to be) so Escape/Tab
+        // and the dismissal affordance are immediately reachable.
+        if (side === 'left') harnessTitleToggle.focus({ preventScroll: true });
         return;
     }
 
@@ -3010,10 +3434,14 @@ brand.addEventListener('click', () => {
     setRailOpen(openRail === 'left' ? undefined : 'left', brand);
 });
 
-// R2: the drawer's own close control. Backdrop, Escape and picking a harness all
-// converge on the same state reset, so no separate cleanup path is needed.
-closeHarnessSidebar.addEventListener('click', () => {
-    setRailOpen(undefined);
+// R4: the "Harnesses" heading toggles the same sidebar the brand does. The drawer is
+// the only place this control is reachable on a phone (the rail is `display:none`
+// when closed), so in practice this press collapses the drawer the reader is looking
+// at — and the toggle semantics stay identical to the brand, including a programmatic
+// open. Backdrop, Escape and picking a harness all converge on the same state reset.
+harnessTitleToggle.addEventListener('click', () => {
+    if (!isPhoneLayout()) return;
+    setRailOpen(openRail === 'left' ? undefined : 'left', harnessTitleToggle);
 });
 
 // Backdrop click is the pointer dismiss; Escape is the keyboard one. Both only act
@@ -3024,6 +3452,15 @@ railBackdrop.addEventListener('click', () => {
 });
 
 document.addEventListener('keydown', (event) => {
+    // R6: Escape also cancels an armed harness delete, so a confirmation can be
+    // abandoned from the keyboard without clicking elsewhere. This runs independently of
+    // the rail dismiss below: an armed row and an open rail are different states, and
+    // one press should not leave a pending confirmation behind.
+    if (event.key === 'Escape' && armedHarness !== undefined) {
+        armedHarness = undefined;
+        buildHarnesses();
+    }
+
     if (event.key === 'Escape' && openRail !== undefined) setRailOpen(undefined);
 });
 
@@ -3155,76 +3592,186 @@ let savingAgents = false;
 // rather than a boolean because the manual tool runner may also create one.
 let creatingSessions = 0;
 
-// Session context the manual runner needs. `current` is the selected harness (the
-// runner is opened from it and never changes the selection); `ensureSession`
-// creates that harness's session on demand, exactly like the first chat submit.
+// ---------------------------------------------------------------------------
+// The tools playground's own context (R7)
+// ---------------------------------------------------------------------------
+//
+// The Tools view in the top-right is a GLOBAL playground: it must behave the same no
+// matter which conversation is selected, and a session-bound tool (toolRequest,
+// toolCreate, task, delegate) must never mutate the chat the reader is looking
+// at. Calling such a tool therefore runs it in a TEMPORARY session this view owns:
+//
+//   - created through `createSession` against a PRODUCTION harness this function picks
+//     itself (the first descriptor the server reports) — never `ensureSession(current)`,
+//     and never a thread inside the real conversation;
+//   - kept for the whole playground visit, so a `toolRequest` discovery followed by a
+//     `toolCreate` and a `task` observe the same session — that chain is exactly
+//     what makes these tools worth testing here;
+//   - deleted when the playground closes, when it is superseded (a different harness is
+//     picked, the bound harness is deleted, or the page unloads).
+//
+// The id deliberately lives HERE, outside `Instance`/`current`/`sessions`: the reader's
+// selection state, the sessions rail, the scratch board and the remembered session are
+// all untouched by a playground call. The trade-off is honest and stated in the UI copy
+// AND in `playgroundSessions`: the server holds a real session record while the
+// playground is open, so the roster paths filter that id out until it is deleted.
+//
+// If no harness is reported there is no context to run in, and the runner says so with
+// an actionable error rather than quietly borrowing the selected conversation.
+type PlaygroundState = {
+    // The production harness the current temporary session belongs to.
+    harness: string | undefined;
+    // The temporary session's id; `undefined` until a session-bound tool is called.
+    sessionId: string | undefined;
+    // What toolRequest enabled inside that session (the playground note's truth).
+    discovered: string[] | undefined;
+    // Bumped by every close/supersede. An in-flight create or call that captured an
+    // older generation may not publish anything when it finally lands.
+    generation: number;
+    // A create is currently awaited (a close during that window is the race below).
+    creating: boolean;
+};
+
+const playground: PlaygroundState = {
+    harness: undefined,
+    sessionId: undefined,
+    discovered: undefined,
+    generation: 0,
+    creating: false
+};
+
+// Every session id THIS page created for the playground. The sessions roster filters
+// them out (see `upsertSession`/`refreshSessions`/`visibleSessions`), so a temporary
+// context never leaks into the list of conversations while it exists — and an id stays
+// marked even when the cleanup DELETE fails, because hiding a leaked record is better
+// than offering the reader a conversation they never started.
+const playgroundSessions = new Set<string>();
+
+// The harness the playground runs in: the FIRST descriptor the server reports. It is
+// independent of `selectedName`/`current` (so selecting a different conversation never
+// moves the playground), and stable while the roster is unchanged, which is what keeps
+// a chain of calls inside one session.
+const playgroundHarness = (): string | undefined => presetDescriptors[0]?.name;
+
+// Close the temporary context: invalidate the current generation FIRST (so an in-flight
+// create discards its own answer), then delete the record. `pagehide` uses the keepalive
+// variant because an ordinary fetch may not survive the unload.
+const releasePlaygroundSession = (options?: { unload?: boolean }): void => {
+    const id = playground.sessionId;
+
+    playground.sessionId = undefined;
+    playground.harness = undefined;
+    playground.discovered = undefined;
+    playground.creating = false;
+    // Always bumped, even with no id: a create in flight must see that its generation
+    // is gone and delete the session that arrives late.
+    playground.generation += 1;
+
+    if (id === undefined) return;
+
+    const request$ = options?.unload === true ? deleteSessionOnUnload(id) : deleteSession(id);
+
+    void request$.then(
+        // Removed from the roster filter only once the server confirms the record is
+        // gone; until then it stays hidden locally.
+        () => playgroundSessions.delete(id),
+        (error: unknown) => {
+            // On unload the page is going away, so reporting is pointless (and a
+            // status paint could not be read). Otherwise the leak is named, because an
+            // orphan session WOULD reappear in the roster after a reload.
+            if (options?.unload !== true) setStatus('error', `playground cleanup: ${messageOf(error)}`);
+        }
+    );
+
+    renderPlaygroundNote();
+};
+
+// The session a session-bound call runs in, creating the playground's own on demand.
+// Returns `undefined` when there is no harness to run in, or when this playground
+// generation was closed while the create was in flight (that answer is deleted).
+const ensurePlaygroundSession = async (): Promise<string | undefined> => {
+    const harness = playgroundHarness();
+    if (harness === undefined) return undefined;
+
+    if (playground.sessionId !== undefined) {
+        // Reuse: this is what lets toolRequest -> toolCreate -> toolManage see one
+        // growing session across playground calls.
+        if (playground.harness === harness) return playground.sessionId;
+
+        // Superseded: the chosen harness changed (the roster moved underneath us), so
+        // the old temporary session is dropped rather than left behind.
+        releasePlaygroundSession();
+    }
+
+    playground.harness = harness;
+    playground.creating = true;
+    const generation = playground.generation;
+
+    try {
+        // `settings` are the configured runtime defaults, exactly as a chat submit uses
+        // them — the playground never inherits another conversation's frozen model.
+        const session = await createSession(harness, settings);
+
+        // Closed (or superseded) while this request was in flight: this record is not
+        // the live playground's context, so it is removed immediately and the caller is
+        // told the call did not run. Best-effort: nothing awaits it.
+        if (generation !== playground.generation || !showingTools) {
+            playgroundSessions.add(session.id);
+            void deleteSession(session.id).catch(() => undefined);
+            return undefined;
+        }
+
+        playground.sessionId = session.id;
+        playgroundSessions.add(session.id);
+        playground.discovered = Array.isArray(session.discoveredTools)
+            ? [...session.discoveredTools]
+            : undefined;
+        renderPlaygroundNote();
+
+        return session.id;
+    } finally {
+        playground.creating = false;
+    }
+};
+
+// Session context the playground runner needs. It reads ONLY the state above: the
+// selected harness/conversation is never consulted, so opening the tools view from any
+// chat produces the same surface and the same request bodies.
 const runner = createToolRunner({
     context: () => {
-        const instance = current;
-        if (instance === undefined) return {};
+        const harness = playground.harness ?? playgroundHarness();
+        if (harness === undefined) return {};
+
         return {
-            harness: instance.descriptor.name,
-            ...(instance.sessionId === undefined ? {} : { sessionId: instance.sessionId })
+            harness,
+            ...(playground.sessionId === undefined ? {} : { sessionId: playground.sessionId })
         };
     },
-    ensureSession: async () => {
-        const instance = current;
-        if (instance === undefined) return undefined;
-
-        return ensureSession(instance);
-    },
-    // delegate is only registered when the harness declares subagents, so the
-    // manual runner asks the SELECTED instance for its real targets: the frozen
-    // team for a saved session, otherwise the live descriptor's allowlist. A
-    // harness with none cannot offer a callable delegation.
+    ensureSession: ensurePlaygroundSession,
+    // delegate is only registered when the harness declares subagents, so the runner
+    // asks the PLAYGROUND harness for its real allowlist (R7) — the selected
+    // conversation's frozen team is irrelevant here. A harness with none cannot offer a
+    // callable delegation.
     delegateTargets: () => {
-        const instance = current;
-        if (instance === undefined) return [];
+        const harness = playground.harness ?? playgroundHarness();
+        if (harness === undefined) return [];
 
-        return subagentsOf(instance.frozen ?? instance.descriptor);
+        const descriptor = descriptorFor(harness);
+
+        return descriptor === undefined ? [] : subagentsOf(descriptor);
     },
     refreshSession: async (sessionId) => {
-        // Re-read the captured session, not whatever is selected now: a core call
-        // changes the session it ran in, and the answer must land there.
+        // Re-read the playground's OWN snapshot for the playground note. The answer is
+        // never applied to an Instance and never enters the sessions roster, so a
+        // discovery inside the temporary context cannot repaint or adopt anything in the
+        // conversation the reader is looking at.
         const session = await getSession(sessionId);
+        if (playground.sessionId !== sessionId) return;
 
-        // Find the card that still points at that session. If the reader started a
-        // new session (or opened another one) meanwhile, no card owns it: do not
-        // re-point one, because that would undo their explicit choice.
-        let owner: Instance | undefined;
-        for (const instance of instances.values()) {
-            if (instance.sessionId === sessionId) {
-                owner = instance;
-                break;
-            }
-        }
-        if (owner === undefined) return;
-
-        applySnapshot(owner, session);
-        rememberSession(session.id);
-        runner.sync();
-    },
-    onPanels: (toolName, panels, owner) => {
-        // R21.3 manual-call routing. The owner was captured immediately before the
-        // request; the instance is resolved by harness name, then REQUIRED to still
-        // point at that same session. If the reader moved on (another harness, New
-        // session, another conversation) the panels are dropped rather than painted
-        // into a conversation they were never produced for.
-        //
-        // MANUAL PANELS ARE EPHEMERAL: there is no backend storage for a direct
-        // call's panels, so the next recompute (reload, poll, session reopen) derives
-        // the board from turns and this panel disappears. That is the documented
-        // trade-off; a tool that wants durable output must return it inside a run
-        // (recorded `tool_result.ui`).
-        if (owner.harness === undefined) return;
-
-        const instance = instances.get(owner.harness);
-        if (instance === undefined || instance.sessionId !== owner.sessionId) return;
-
-        // `applyPanels` is a no-op for a server that sends no `panels` field, so an
-        // older backend simply contributes nothing (no error, no empty card).
-        const changes = applyPanels(instance.panels, toolName, panels);
-        if (changes > 0 && current === instance) paintPanels();
+        playground.discovered = Array.isArray(session.discoveredTools)
+            ? [...session.discoveredTools]
+            : undefined;
+        renderPlaygroundNote();
     }
 });
 
@@ -3299,6 +3846,10 @@ const replaceDescriptor = (updated: HarnessDescriptor): void => {
 
 const harnessButtons = new Map<string, HTMLButtonElement>();
 
+// R6: the per-row delete controls, kept beside the select buttons so the busy-state
+// painter (`paintControls`) can enable/disable both from the same roster pass.
+const harnessDeleteButtons = new Map<string, HTMLButtonElement>();
+
 // Toggle visuals only. Content switching lives in `setToolsView` (declared with the
 // tool runner, because it needs `toolEntries`), so this is safe to call from
 // selection and busy-state code without re-entering the runner.
@@ -3358,8 +3909,11 @@ const harnessMeta = (descriptor: HarnessDescriptor): string => {
     return `${kind} · ${members} agent${members === 1 ? '' : 's'}`;
 };
 
-const selectHarness = (name: string): void => {
-    const descriptor = descriptorFor(name);
+// `fallback` is the definition to select when the registry no longer holds this name
+// (R6: opening a saved session of a DELETED harness). It never writes to the roster, so
+// selecting an archived conversation cannot resurrect its harness.
+const selectHarness = (name: string, fallback?: HarnessDescriptor): void => {
+    const descriptor = descriptorFor(name) ?? fallback;
     if (descriptor === undefined) return;
     // Picking a harness (or a session, which lands here through openSession) is the
     // end of a phone rail visit: collapse it so the chat is visible again. Harmless
@@ -3384,6 +3938,9 @@ const selectHarness = (name: string): void => {
     // collapsed for the new team (R1 default).
     showingTools = false;
     paintToolsToggle();
+    // R7: the playground was left, so its temporary session goes with it. This must
+    // happen BEFORE the new selection paints the chat, so no late frame can adopt it.
+    releasePlaygroundSession();
     // Lifecycle: the agent dialog belongs to the conversation being left. The new
     // harness/session starts with it closed.
     closeAgentDialog();
@@ -3417,11 +3974,172 @@ const selectHarness = (name: string): void => {
     setBusy(current.pending);
 };
 
+// ---------------------------------------------------------------------------
+// Deleting a harness (R6)
+// ---------------------------------------------------------------------------
+//
+// DELETE /harnesses/:name is DURABLE and removes the definition only: built-ins go
+// with it, and the server never cascades into sessions (src/server/api.ts). So a
+// conversation already started keeps its frozen definition and stays in the sessions
+// roster — the local state below must not throw those records away.
+//
+// Confirmation is TWO STEPS on purpose, unlike the one-click session delete: removing
+// a harness is not undoable from this UI (the reader would have to recreate it, and a
+// built-in is gone for every visitor of this server). The first press only ARMS the
+// row (`armedHarness`), the second press on the SAME control sends exactly one DELETE.
+// Nothing else about the row changes, so arming can never select or deselect it.
+//
+// Harnesses with a DELETE in flight are tracked in `removingHarnesses`; it doubles as
+// the dedupe guard for a double pointer event.
+const removingHarnesses = new Set<string>();
+
+// The row currently waiting for its second press. Only one row is armed at a time, so
+// arming another row moves the confirmation instead of creating a second pending state.
+let armedHarness: string | undefined;
+
+// A harness delete must not race a write that owns the same definitions, and must not
+// happen before the catalogue exists:
+//   - `submitting` is the POST /tasks window, which may be creating a session,
+//   - `savingAgents` is a harness/team PATCH,
+//   - `running`/`current.pending` means the centre column is showing work whose harness
+//     would vanish underneath it,
+//   - a session creation in flight (`creatingSessions`) would make "which harness is
+//     selected" ambiguous exactly when the delete has to reselect one.
+const harnessDeletionBlocked = (): boolean =>
+    !booted || submitting || savingAgents || running || creatingSessions > 0 || removingHarnesses.size > 0;
+
+// Forget one harness the server no longer holds (a 200, or a 404 that says it was
+// already gone). The roster is the only authority for the rail AND for the harness the
+// playground picks, so the descriptor goes first and everything else is derived.
+const applyHarnessRemoved = (name: string): void => {
+    presetDescriptors = presetDescriptors.filter((descriptor) => descriptor.name !== name);
+
+    // The instance (its transcript view, panels and observer bindings) dies with its
+    // harness. SAVED SESSIONS are untouched: they are server records, and the directory
+    // cache keeps them for any harness that still exists.
+    const instance = instances.get(name);
+    if (instance !== undefined) {
+        if (instance === current) {
+            stopWatching();
+            stopPolling();
+        }
+        instance.view.dispose();
+        instances.delete(name);
+    }
+
+    // R7: the playground's temporary session was created ON this harness. Its core
+    // tools can no longer resolve the definition, so the context goes with it.
+    if (playground.harness === name) releasePlaygroundSession();
+
+    // The agent library keeps its trusted entries: they belong to the server, not to
+    // the deleted harness, and other harnesses may name the same agents.
+    if (selectedName === name) {
+        selectedName = undefined;
+        current = undefined;
+        currentTool = undefined;
+        clearActivity();
+
+        // Reselect sensibly: the first harness the server still reports. `selectHarness`
+        // restores the composer, the head and the transcript from that instance.
+        const next = presetDescriptors[0];
+
+        if (next !== undefined) {
+            selectHarness(next.name);
+        } else if (showingTools) {
+            // The playground owns the centre column, so it stays: its note now says there
+            // is no context for a session-bound tool, and a direct call still works.
+            paintToolsHead();
+        } else {
+            // Empty roster without crashing: the chat has nowhere to go, so the centre
+            // column says what is available instead of showing a dead transcript. The
+            // playground stays reachable from the topbar for direct calls, and `+ New`
+            // is the way back.
+            agentSlot.hidden = true;
+            composer.hidden = true;
+            stage.replaceChildren(emptyStagePane());
+            renderSessions();
+        }
+    }
+
+    buildHarnesses();
+    // R6: the deleted harness's conversations become archived immediately — the group is
+    // painted from the same directory cache, which this delete never touches.
+    renderSessions();
+    renderPlaygroundNote();
+};
+
+// The centre column shown when no harness exists at all (R6: deleting the last one must
+// not leave a stale conversation or a blank column).
+const emptyStagePane = (): HTMLElement => {
+    const pane = el('div', 'pane');
+    const wrap = el('div', 'log-wrap');
+    const box = el('div', 'empty');
+
+    box.append(
+        el('p', 'field-hint', 'No harness is available. Create one with “+ New” in the harnesses panel.'),
+        el(
+            'p',
+            'field-hint',
+            'Saved sessions for the harness you deleted are still on the server; they stay in the sessions list.'
+        )
+    );
+
+    wrap.append(box);
+    pane.append(wrap);
+    return pane;
+};
+
+// One press arms, the second deletes. Every dismissal path (selecting another harness,
+// arming a different row, a successful delete) clears the arm, and Escape does too.
+const deleteHarnessRow = async (name: string): Promise<void> => {
+    if (harnessDeletionBlocked()) return;
+
+    if (armedHarness !== name) {
+        armedHarness = name;
+        buildHarnesses();
+        return;
+    }
+
+    // Second press on the armed row: consume the confirmation BEFORE the request, so a
+    // double pointer event cannot send two DELETEs.
+    armedHarness = undefined;
+    removingHarnesses.add(name);
+    buildHarnesses();
+
+    let deleted = false;
+
+    try {
+        deleted = await deleteHarness(name);
+    } catch (error) {
+        setStatus('error', `delete harness: ${messageOf(error)}`);
+        removingHarnesses.delete(name);
+        // The row is repainted from the roster the server agreed with, so the control
+        // is armed again rather than left showing a confirmation nobody asked for.
+        buildHarnesses();
+        return;
+    }
+
+    removingHarnesses.delete(name);
+
+    // `deleted: false` is the accepted 404: the harness is already gone, which is the
+    // desired end state (the same reasoning as a session delete).
+    applyHarnessRemoved(name);
+    setStatus('idle', deleted ? `deleted ${name}` : `${name} was already gone`);
+};
+
 const buildHarnesses = (): void => {
     harnessList.replaceChildren();
     harnessButtons.clear();
+    harnessDeleteButtons.clear();
 
     for (const descriptor of presetDescriptors) {
+        // Buttons cannot nest, so the row is a wrapper around the select button and its
+        // delete control (the same structure the sessions rail uses, R8). A press on the
+        // delete control can never select the harness, because the two controls are
+        // siblings and only the select button carries the selection handler.
+        const row = el('div', 'harness-row');
+        row.dataset.harness = descriptor.name;
+
         const button = el('button', 'harness-item');
         button.type = 'button';
         button.dataset.harness = descriptor.name;
@@ -3443,8 +4161,50 @@ const buildHarnesses = (): void => {
             selectHarness(descriptor.name);
         });
 
+        // No shared `.button` classes here: like `.session-delete`, this control owns
+        // its compact destructive styling outright, and a later `.button` rule would
+        // otherwise win on equal specificity.
+        const remove = el('button', 'harness-delete');
+        remove.type = 'button';
+        remove.dataset.harness = descriptor.name;
+        const armed = armedHarness === descriptor.name;
+        remove.textContent = armed ? 'Delete?' : '×';
+        remove.setAttribute(
+            'aria-label',
+            armed ? `Confirm delete harness ${descriptor.name}` : `Delete harness ${descriptor.name}`
+        );
+        // The warning lives on the control, so a reader who never arms it still knows
+        // what the second press costs.
+        remove.title = armed
+            ? `Delete ${descriptor.title} (${descriptor.name}) permanently. Press again to confirm, or pick another row to cancel.`
+            : `Delete ${descriptor.title} (${descriptor.name}) permanently. Its saved sessions stay.`;
+        remove.setAttribute('aria-describedby', armed ? `harness-delete-hint-${descriptor.name}` : '');
+        if (!armed) remove.removeAttribute('aria-describedby');
+        remove.disabled = harnessDeletionBlocked() || removingHarnesses.has(descriptor.name);
+
+        remove.addEventListener('click', () => void deleteHarnessRow(descriptor.name));
+
+        row.append(button, remove);
+
+        if (armed) {
+            // The confirmation is text, not only a repainted button: it names exactly
+            // what is about to happen and what survives, and it is the description the
+            // armed control points at.
+            row.dataset.armed = 'true';
+            const hint = el(
+                'p',
+                'field-hint harness-delete-hint',
+                `Delete “${descriptor.title}” (${descriptor.name}) permanently? Its saved sessions stay, and this cannot be undone from the UI.`
+            );
+            hint.id = `harness-delete-hint-${descriptor.name}`;
+            row.append(hint);
+        } else {
+            delete row.dataset.armed;
+        }
+
         harnessButtons.set(descriptor.name, button);
-        harnessList.append(button);
+        harnessDeleteButtons.set(descriptor.name, remove);
+        harnessList.append(row);
     }
 
     if (presetDescriptors.length === 0) {
@@ -3461,17 +4221,17 @@ const renderHarnessChrome = (): void => {
 
     const display = instance.frozen ?? instance.descriptor;
 
-    // The tools view's session line always describes the SELECTED harness (R21.2):
-    // the view is where tools are reviewed and called, and a snapshot refreshed by a
-    // manual core call must update "enabled for this session" there. The right rail
-    // no longer renders any tool list.
-    renderToolsSession(display, instance.sessionId, instance.discovered);
+    // The playground's own status line (R7): it describes the temporary context, so
+    // the tools view stays truthful about where a session-bound call runs no matter
+    // which conversation is selected.
+    renderPlaygroundNote();
 
-    // The manual runner lives on the tools view and shows an delegate example
-    // built from the selected team (see createToolRunner.paintDelegate). A team edit
-    // lands here, so re-sync it: the example becomes callable the moment a subagent
-    // exists, and stops being offered when the last one is removed. The runner
-    // itself only rewrites its argument box when the target list actually changed.
+    // The playground runner lives on the tools view and builds its delegate presets
+    // from the PLAYGROUND harness's allowlist (see createToolRunner.paintDelegate). A
+    // team edit can land on that harness from this very chrome, so re-sync it: the
+    // preset becomes callable the moment a subagent exists, and stops being offered
+    // when the last one is removed. The runner only rewrites its argument box when the
+    // target list actually changed, so this is a no-op for an untouched team.
     runner.sync();
 
     // While the tools view owns the centre, the head describes the list (or the
@@ -3498,11 +4258,22 @@ const renderHarnessChrome = (): void => {
     headName.hidden = true;
     // R21.1: no read-only branch. Editing a harness applies to its NEXT session;
     // a saved chat keeps what it started with (the conversation guarantee).
-    headNote.textContent = locked
-        ? instance.frozen !== undefined
-            ? 'Viewing a saved session · agent team frozen'
-            : 'Viewing a saved session'
-        : 'Edits apply to new sessions';
+    //
+    // R6: unless its harness is gone. A deleted harness has no registry row to edit, and
+    // the conversation on screen is running the definition frozen in its own record, so
+    // the note says what the reader is looking at instead of promising edits that have no
+    // target. Nothing here re-adds the harness to the roster.
+    const archived = descriptorFor(instance.descriptor.name) === undefined;
+
+    headNote.textContent = archived
+        ? instance.sessionId !== undefined
+            ? 'Deleted harness · saved session kept and reopened from its frozen definition'
+            : 'Deleted harness · read the saved session, or pick a harness that still exists'
+        : locked
+          ? instance.frozen !== undefined
+              ? 'Viewing a saved session · agent team frozen'
+              : 'Viewing a saved session'
+          : 'Edits apply to new sessions';
 
     // A locked session renders the definition it started with; the live harness
     // may already have moved on. The composer button opens the shared agent dialog
@@ -4094,28 +4865,32 @@ const patchSessionModels = async (
     }
 };
 
-// R21.2: the tool catalogue is the global tools view and nothing else. This line is
-// that view's informational session status (the one piece the removed right-rail
-// core dropdown actually carried that is still worth showing): which harness/session
-// a session-bound call will mutate, and which tools toolRequest enabled there.
+// R21.2/R7: the tool catalogue is the global playground and nothing else. This line is
+// that playground's OWN context status: which harness/session a session-bound call will
+// mutate, and which tools toolRequest enabled THERE.
 //
-// It is updated from the SELECTED instance on every chrome rebuild, so a manual
-// core call's snapshot refresh keeps it truthful without a reload.
-const renderToolsSession = (
-    descriptor: HarnessDescriptor,
-    sessionId: string | undefined,
-    discovered?: readonly string[]
-): void => {
+// It is deliberately NOT derived from the selected instance any more. The playground is
+// the same surface from every conversation, so the note names the temporary context (or
+// says why there is none) and states plainly that the reader's chat is untouched.
+const renderPlaygroundNote = (): void => {
+    const harness = playground.sessionId === undefined ? playgroundHarness() : playground.harness;
+
+    if (harness === undefined) {
+        toolsSessionNote.textContent =
+            'No harness is reported by this server, so session-bound tools have no context to run in. Create a harness first; every other tool can still be called directly.';
+        return;
+    }
+
     const target =
-        sessionId === undefined
-            ? `${descriptor.name} (no session yet — a call creates one)`
-            : `${descriptor.name} · session ${sessionId}`;
-    const enabled = discovered ?? [];
+        playground.sessionId === undefined
+            ? `${harness} (no temporary session yet — the first Call creates one)`
+            : `${harness} · temporary session ${shortId(playground.sessionId)}`;
+    const enabled = playground.discovered ?? [];
 
     toolsSessionNote.textContent =
-        enabled.length === 0
-            ? `Session-bound tools run inside ${target}.`
-            : `Session-bound tools run inside ${target} · enabled for this session: ${enabled.join(', ')}`;
+        `Session-bound tools run in the playground’s own context: ${target}` +
+        (enabled.length === 0 ? '' : ` · enabled there: ${enabled.join(', ')}`) +
+        '. The conversation you selected is never touched.';
 };
 
 // ---------------------------------------------------------------------------
@@ -4143,7 +4918,7 @@ const toolsTabHead = el('div', 'tools-tab-head');
 const toolsTabHint = el(
     'p',
     'tools-tab-hint',
-    'Every tool the server lists, core tools included. Select one to open its runner. Calls execute on the harness server — nothing runs in this browser. Session-bound tools (toolRequest, toolCreate, todoManage, and delegate when the selected harness has subagents) run inside the selected harness’s session; every other tool, including the core file and search tools, runs directly.'
+    'Every tool the server lists, core tools included. Select one to open its runner. Calls execute on the harness server — nothing runs in this browser. This playground is independent of the conversation you have selected: session-bound tools (toolRequest, toolCreate, task, and delegate when the playground harness has subagents) run in a temporary session the playground creates for itself and deletes when this view closes, and every other tool, including the core file and search tools, runs directly.'
 );
 const toolsSessionNote = el('p', 'tools-session-note field-hint', '');
 toolsTabHead.append(el('h2', 'tools-tab-title', 'Tools'), toolsTabHint, toolsSessionNote);
@@ -4200,10 +4975,10 @@ const openToolDialog = (entry: ToolDescriptor, trigger?: HTMLElement): void => {
         // dialog, so repeating it in the title would only wrap long names.
         title: entry.name,
         content: slot,
-        // R5/T6: the runner is also a data-inspection surface for its CURRENT result.
-        // The provider reads the live output box, so Copy after a call yields the
-        // settled payload even though the same dialog also contains input controls.
-        copy: () => runner.copyText(),
+        // R8: NO dialog-level copy any more. The runner is two panes with different
+        // payloads (the editable request and the server's answer), and each of them
+        // carries its own copy control beside its own label, so a single header button
+        // could only ever guess which one the reader meant.
         // `returnFocus` is the tool button that opened this dialog, so Escape/close
         // lands the reader back on the entry they picked (never the composer).
         ...(trigger === undefined ? {} : { returnFocus: trigger }),
@@ -4314,6 +5089,12 @@ const setToolsView = (open: boolean): void => {
         showingTools = false;
         paintToolsToggle();
 
+        // R7: leaving the playground is the end of the temporary context. The session
+        // a chain of core calls built up is deleted here (and an in-flight create
+        // discards its own answer through the generation bump), so the reader never
+        // keeps a conversation they did not start.
+        releasePlaygroundSession();
+
         currentTool = undefined;
         for (const button of toolTabButtons.values()) button.setAttribute('aria-pressed', 'false');
 
@@ -4334,6 +5115,10 @@ const setToolsView = (open: boolean): void => {
     paintToolsToggle();
     currentTool = undefined;
     for (const button of toolTabButtons.values()) button.setAttribute('aria-pressed', 'false');
+
+    // R7: a fresh playground visit starts with a fresh context (the previous one was
+    // released when the view closed), and the note states that up front.
+    renderPlaygroundNote();
 
     agentSlot.hidden = true;
     composer.hidden = true;
@@ -4427,6 +5212,11 @@ const upsertSession = (session: SessionSnapshot): void => {
     // late answer (see `deletedSessions` and `forgetDeletedSession`).
     if (deletedSessions.has(session.id)) return;
 
+    // R7: a playground session is a tool-testing context, not a conversation. Its id
+    // can arrive through any authoritative path (a directory poll, an observer frame,
+    // a POST answer), and none of them may add it to the reader's roster.
+    if (playgroundSessions.has(session.id)) return;
+
     const index = sessions.findIndex((candidate) => candidate.id === session.id);
     if (index >= 0) sessions[index] = session;
     else sessions.push(session);
@@ -4434,6 +5224,29 @@ const upsertSession = (session: SessionSnapshot): void => {
 
 // Eight characters is the same prefix the server's logs are readable by.
 const shortId = (id: string): string => (id.length <= 8 ? id : id.slice(0, 8));
+
+// Is this session's harness MISSING from the registry? R6: deleting a harness removes the
+// definition only — the server never cascades into sessions — so a conversation that
+// started before the delete survives as a durable record. `canonicalHarnessName` resolves a
+// legacy alias to its canonical name but returns an unknown name unchanged, so "archived"
+// is exactly the case where that canonical name has no descriptor: the record is intact, the
+// definition is gone.
+const archivedHarnessOf = (session: SessionSnapshot): string | undefined => {
+    const canonical = canonicalHarnessName(session.harness, presetDescriptors);
+
+    return descriptorFor(canonical) === undefined ? canonical : undefined;
+};
+
+// Sessions whose harness no longer exists, newest last (the directory order). They are
+// listed in their own group in the sessions rail, because the rail is otherwise scoped to
+// the SELECTED harness and the deleted harness has no row to be selected any more.
+const archivedSessions = (): SessionSnapshot[] =>
+    sessions.filter(
+        (session) =>
+            !deletedSessions.has(session.id) &&
+            !playgroundSessions.has(session.id) &&
+            archivedHarnessOf(session) !== undefined
+    );
 
 // Sessions belong to one canonical harness. The rail shows only the selected one,
 // which is the "locked to selected harness" rule in R3 — opening a row can never
@@ -4443,13 +5256,22 @@ const shortId = (id: string): string => (id.length <= 8 ? id : id.slice(0, 8));
 // if some other path assigned it into the cache. The authoritative filter is at the
 // assignment sites (`refreshSessions`, `upsertSession`), but the RENDER projection
 // is the last line of defence, so a deleted conversation cannot reappear as a row.
+//
+// R6: the one extra match is an ARCHIVED harness that is currently open. A deleted
+// harness has no registry entry to resolve through, so its still-readable conversations
+// are matched by the harness name the record itself carries.
 const visibleSessions = (): SessionSnapshot[] => {
     if (selectedName === undefined) return [];
 
     return sessions.filter(
         (session) =>
             !deletedSessions.has(session.id) &&
-            canonicalHarnessName(session.harness, presetDescriptors) === selectedName
+            // R7: the playground's temporary session is not a conversation. The cache
+            // filter above is authoritative; this is the last line of defence so a
+            // temporary context can never show up as a row the reader might open.
+            !playgroundSessions.has(session.id) &&
+            (canonicalHarnessName(session.harness, presetDescriptors) === selectedName ||
+                archivedHarnessOf(session) === selectedName)
     );
 };
 
@@ -4626,15 +5448,85 @@ const deleteSessionRow = async (id: string): Promise<void> => {
 // happens. The select button keeps its own `data-session-id`/`data-status`/
 // `data-active` as well, so the existing `.session[...]` styles and row queries keep
 // working.
+// One directory row. Shared by the selected harness's list and the archived group, so an
+// archived conversation is opened and deleted through exactly the same paths as a live one
+// (`openSession` / `deleteSessionRow`) — the difference is only WHERE it is listed.
+const renderSessionRow = (session: SessionSnapshot, activeId: string | undefined): HTMLElement => {
+    const rowWrap = el('div', 'session-row');
+    rowWrap.dataset.sessionId = session.id;
+    rowWrap.dataset.status = session.status;
+    if (session.id === activeId) rowWrap.dataset.active = 'true';
+
+    const row = el('button', 'session');
+    row.type = 'button';
+    row.dataset.sessionId = session.id;
+    row.dataset.status = session.status;
+    if (session.id === activeId) row.dataset.active = 'true';
+    row.disabled = running;
+
+    // `turns.length` is the server's count; the UI does not compute a turn
+    // count from event frames (it could disagree after a reload).
+    const turns = session.turns.length;
+    row.append(
+        el('span', 'session-harness', session.harness),
+        el(
+            'span',
+            'session-meta',
+            `${session.status} · ${turns} turn${turns === 1 ? '' : 's'} · ${shortId(session.id)}`
+        ),
+        el(
+            'span',
+            'session-prompt',
+            session.turns.length > 0 ? session.turns[session.turns.length - 1].prompt : 'no turns yet'
+        )
+    );
+    row.title = `${session.harness} · ${session.id}`;
+
+    row.addEventListener('click', () => {
+        // Switching sessions is a view change, not a cancellation (R4).
+        void openSession(session.id);
+    });
+
+    // Delete control. Disabled while a write owns the conversation, or while
+    // this row's own DELETE is in flight (see `deletionBlocked`).
+    const remove = el('button', 'session-delete');
+    remove.type = 'button';
+    remove.dataset.sessionId = session.id;
+    // A compact glyph with an explicit accessible name: the rail has no room
+    // for a word. T1/R1: with the inline confirmation removed, the control's own
+    // name and tooltip carry the whole warning (permanent, and it stops work).
+    remove.textContent = '\u00d7';
+    remove.setAttribute('aria-label', `Delete session ${shortId(session.id)}`);
+    remove.title = 'Delete this session permanently. Running or queued work in it stops.';
+    remove.disabled = deletionBlocked() || removingSessions.has(session.id);
+    // T1/R1: one click, one DELETE, no confirmation step. `deleteSessionRow`
+    // re-checks `deletionBlocked`/`removingSessions`, so a double click (or a
+    // rebuild that repaints the row mid-flight) still sends one request.
+    remove.addEventListener('click', () => void deleteSessionRow(session.id));
+
+    rowWrap.append(row, remove);
+    return rowWrap;
+};
+
 const renderSessions = (): void => {
     sessionList.replaceChildren();
+    archivedList.replaceChildren();
+
+    // R6: is the CURRENT selection itself an archived harness (a deleted harness whose
+    // saved conversation is open)? Its rows belong in the main list, so the archived group
+    // must not duplicate them.
+    const selectionArchived =
+        selectedName !== undefined && descriptorFor(selectedName) === undefined;
 
     sessionsScope.textContent =
         selectedName === undefined
             ? 'Select a harness to see its sessions.'
-            : `Locked to ${selectedName}.`;
+            : selectionArchived
+              ? `Locked to ${selectedName} · this harness was deleted.`
+              : `Locked to ${selectedName}.`;
 
     const visible = visibleSessions();
+    const activeId = current?.sessionId;
 
     if (visible.length === 0) {
         sessionList.append(
@@ -4643,69 +5535,25 @@ const renderSessions = (): void => {
                 'field-hint',
                 selectedName === undefined
                     ? 'Select a harness first.'
-                    : 'No sessions for this harness yet. Send a task to create one.'
+                    : selectionArchived
+                      ? 'No saved sessions for this deleted harness.'
+                      : 'No sessions for this harness yet. Send a task to create one.'
             )
         );
-        return;
     }
 
-    const activeId = current?.sessionId;
-
     for (const session of visible) {
-        const rowWrap = el('div', 'session-row');
-        rowWrap.dataset.sessionId = session.id;
-        rowWrap.dataset.status = session.status;
-        if (session.id === activeId) rowWrap.dataset.active = 'true';
+        sessionList.append(renderSessionRow(session, activeId));
+    }
 
-        const row = el('button', 'session');
-        row.type = 'button';
-        row.dataset.sessionId = session.id;
-        row.dataset.status = session.status;
-        if (session.id === activeId) row.dataset.active = 'true';
-        row.disabled = running;
+    // R6: the archived group. A session that belongs to the deleted harness currently
+    // being read is already above, so it is skipped here; everything else whose harness
+    // vanished stays reachable from any selection.
+    const archived = archivedSessions().filter((session) => session.harness !== selectedName);
+    archivedSection.hidden = archived.length === 0;
 
-        // `turns.length` is the server's count; the UI does not compute a turn
-        // count from event frames (it could disagree after a reload).
-        const turns = session.turns.length;
-        row.append(
-            el('span', 'session-harness', session.harness),
-            el(
-                'span',
-                'session-meta',
-                `${session.status} · ${turns} turn${turns === 1 ? '' : 's'} · ${shortId(session.id)}`
-            ),
-            el(
-                'span',
-                'session-prompt',
-                session.turns.length > 0 ? session.turns[session.turns.length - 1].prompt : 'no turns yet'
-            )
-        );
-        row.title = `${session.harness} · ${session.id}`;
-
-        row.addEventListener('click', () => {
-            // Switching sessions is a view change, not a cancellation (R4).
-            void openSession(session.id);
-        });
-
-        // Delete control. Disabled while a write owns the conversation, or while
-        // this row's own DELETE is in flight (see `deletionBlocked`).
-        const remove = el('button', 'session-delete');
-        remove.type = 'button';
-        remove.dataset.sessionId = session.id;
-        // A compact glyph with an explicit accessible name: the rail has no room
-        // for a word. T1/R1: with the inline confirmation removed, the control's own
-        // name and tooltip carry the whole warning (permanent, and it stops work).
-        remove.textContent = '\u00d7';
-        remove.setAttribute('aria-label', `Delete session ${shortId(session.id)}`);
-        remove.title = 'Delete this session permanently. Running or queued work in it stops.';
-        remove.disabled = deletionBlocked() || removingSessions.has(session.id);
-        // T1/R1: one click, one DELETE, no confirmation step. `deleteSessionRow`
-        // re-checks `deletionBlocked`/`removingSessions`, so a double click (or a
-        // rebuild that repaints the row mid-flight) still sends one request.
-        remove.addEventListener('click', () => void deleteSessionRow(session.id));
-
-        rowWrap.append(row, remove);
-        sessionList.append(rowWrap);
+    for (const session of archived) {
+        archivedList.append(renderSessionRow(session, activeId));
     }
 };
 
@@ -4723,7 +5571,12 @@ const refreshSessions = async (): Promise<void> => {
 
     try {
         const listed = await listSessions();
-        sessions = listed.filter((session) => !deletedSessions.has(session.id));
+        // R7: a temporary playground session that exists right now is filtered out of
+        // the directory too, so the sessions rail never grows a conversation the reader
+        // did not start (the id returns after cleanup, on the next refresh).
+        sessions = listed.filter(
+            (session) => !deletedSessions.has(session.id) && !playgroundSessions.has(session.id)
+        );
         renderSessions();
     } catch (error) {
         setStatus('error', `session list: ${messageOf(error)}`);
@@ -5507,10 +6360,25 @@ const openSession = async (id: string): Promise<void> => {
     // the row's harness is what is selected, so the chat never lands in another
     // harness's transcript.
     const harnessName = canonicalHarnessName(session.harness, presetDescriptors);
-    const descriptor = descriptorFor(harnessName);
+    let descriptor = descriptorFor(harnessName);
+
     if (descriptor === undefined) {
-        setStatus('error', `unknown harness "${session.harness}"`);
-        return;
+        // R6: the harness was deleted AFTER this conversation started. The delete removes
+        // the DEFINITION only — the server never cascades into sessions — so the record is
+        // still authoritative and still opens. What it opens WITH is the definition frozen
+        // inside the snapshot (the team, models and tools the run actually used), NOT a
+        // registry entry: nothing is re-added to `presetDescriptors`, so a deleted harness
+        // is never silently resurrected by reading one of its chats.
+        const frozen = frozenDefinitionOf(session);
+
+        if (frozen === undefined) {
+            // No frozen definition to rebuild from (a legacy record whose harness is also
+            // gone): the honest answer is still an error, not a invented descriptor.
+            setStatus('error', `unknown harness "${session.harness}"`);
+            return;
+        }
+
+        descriptor = frozen;
     }
 
     const target = ensureInstance(descriptor);
@@ -5555,7 +6423,10 @@ const openSession = async (id: string): Promise<void> => {
     target.view.bindSession(id);
     target.frozen = frozenDefinitionOf(session);
 
-    selectHarness(descriptor.name);
+    // R6: for an archived harness this passes the frozen definition, because the registry
+    // has no entry to look up. The instance key is the record's own harness name, so the
+    // conversation is scoped to itself and no harness row appears in the rail.
+    selectHarness(descriptor.name, descriptor);
     applySnapshot(target, session);
     rememberSession(id);
 
@@ -5577,6 +6448,10 @@ const openSession = async (id: string): Promise<void> => {
 const newSession = (): void => {
     const instance = current;
     if (instance === undefined) return;
+
+    // R6: the button is disabled for an archived harness, and this guard keeps a
+    // programmatic call from starting a session the server cannot resolve.
+    if (descriptorFor(instance.descriptor.name) === undefined) return;
 
     if (running) {
         instance.view.notice('cancel the running task before starting a new session');
@@ -5662,19 +6537,39 @@ const paintControls = (): void => {
     // other control. It is the only submit/stop control in the shell.
     paintComposer();
 
-    newSessionButton.disabled = submitting || pending || !booted;
+    // R6: a NEW session needs a harness the registry still has. An archived conversation
+    // (its harness deleted) is readable and can keep queuing tasks into its own record,
+    // but `POST /sessions` for a missing harness would only produce a server error, so the
+    // action is withheld rather than offered and failed.
+    const archivedSelection = selectedName !== undefined && descriptorFor(selectedName) === undefined;
+
+    newSessionButton.disabled = submitting || pending || !booted || archivedSelection;
     createHarnessButton.disabled = submitting || pending || !booted;
 
     // Harness/session switching is allowed while work is pending (R4): the queue
     // is server-owned, so leaving a conversation never stops it; the observer is
     // simply unsubscribed and reopened when the reader returns.
     for (const button of harnessButtons.values()) button.disabled = submitting || !booted;
+    // R6: the delete control is a write, so it is locked by the same conflicting
+    // windows (`harnessDeletionBlocked`) plus its own in-flight row. The click handler
+    // re-checks, so this is only the visible state.
+    const harnessDeletionsBlocked = harnessDeletionBlocked();
+    for (const [name, button] of harnessDeleteButtons) {
+        button.disabled = harnessDeletionsBlocked || removingHarnesses.has(name);
+    }
     for (const button of toolTabButtons.values()) button.disabled = submitting || pending;
     // R3: the global tools toggle is locked while a run is pending, like the tabs it
     // replaced; leaving the transcript of a streaming queue is not offered. It is also
     // locked before boot has a catalogue (`booted`) and after `showOffline` disables it.
     toolsToggle.disabled = submitting || pending || !booted;
-    for (const row of sessionList.querySelectorAll<HTMLButtonElement>('.session')) {
+    // R6: archived rows are the same controls, so the busy-state painter covers both
+    // lists (the live selection and the archived group).
+    const railRows = (): HTMLButtonElement[] => [
+        ...sessionList.querySelectorAll<HTMLButtonElement>('.session'),
+        ...archivedList.querySelectorAll<HTMLButtonElement>('.session')
+    ];
+
+    for (const row of railRows()) {
         row.disabled = submitting;
     }
 
@@ -5682,7 +6577,10 @@ const paintControls = (): void => {
     // that lock submits/saves (and for a row whose own DELETE is in flight). The
     // click handler re-checks `deletionBlocked`, so this is only the visible state.
     const deletionsBlocked = deletionBlocked();
-    for (const button of sessionList.querySelectorAll<HTMLButtonElement>('.session-delete')) {
+    for (const button of [
+        ...sessionList.querySelectorAll<HTMLButtonElement>('.session-delete'),
+        ...archivedList.querySelectorAll<HTMLButtonElement>('.session-delete')
+    ]) {
         const id = button.dataset.sessionId;
         button.disabled = deletionsBlocked || (id !== undefined && removingSessions.has(id));
     }
@@ -6337,6 +7235,13 @@ window.addEventListener('pagehide', () => {
     // the draft records (which this document is dropping anyway).
     for (const draft of draftAttachments) releaseAttachmentPreview(draft.previewUrl);
     draftAttachments = [];
+
+    // R7: the playground's temporary session must not outlive the page. This is
+    // BEST EFFORT by construction — `keepalive` gives the DELETE a chance to leave,
+    // but a background-kill can still drop it, and nothing here may block the unload.
+    // The worst case is one orphan conversation in the roster after a reload, which the
+    // reader can delete like any other session.
+    releasePlaygroundSession({ unload: true });
 
     for (const instance of instances.values()) instance.view.dispose();
 });

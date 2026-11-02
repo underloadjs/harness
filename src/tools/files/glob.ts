@@ -16,7 +16,10 @@
 //
 // Deliberate limits (reported, not claimed away):
 //   - no brace expansion ({a,b}) and no extglob;
-//   - `.gitignore` is NOT consulted — only the fixed skip list below is;
+//   - the walker itself does not read `.gitignore`: the caller passes a matcher built by
+//     ./gitignore.ts, which is what lets `glob`/`grep` honor the repository's ignore
+//     rules while a bare `walkFiles(root)` keeps its original "everything reachable"
+//     meaning;
 //   - symlinks are skipped while walking, so traversal cannot loop or escape the
 //     root through a link;
 //   - paths are posix-style ("a/b.ts") on every platform, because the model should
@@ -26,11 +29,32 @@
 // walked as given. Run the harness under the process boundary you trust.
 
 import { readdir, stat } from 'node:fs/promises';
-import { join, relative, resolve, sep } from 'node:path';
+import { join, resolve, sep } from 'node:path';
+import type { GitignoreMatcher } from './gitignore';
 
 // Directories that are never useful search results and would dominate a walk.
 // Matched by entry name at any depth, deliberately case-sensitive.
+//
+// This is a floor, not a law: a caller that deliberately roots a search inside one of
+// these names (paths: ['node_modules']) gets it walked — see
+// `rootTargetsSkippedDirectory` and `ALWAYS_SKIPPED_DIRECTORIES` below. It matches how
+// ripgrep behaves, where `node_modules/` is skipped because a .gitignore says so and an
+// explicitly named path overrides the ignore rules.
 export const SKIPPED_DIRECTORIES: readonly string[] = ['.git', 'node_modules'];
+
+// Names that stay skipped even for a deliberately chosen root. `.git` holds object
+// stores, packfiles and hooks; nothing a source question is answered by, and a root
+// inside it gains nothing from being descended into.
+export const ALWAYS_SKIPPED_DIRECTORIES: readonly string[] = ['.git'];
+
+// Whether the caller rooted the search inside a SKIPPED_DIRECTORIES name.
+//
+// Checked on the RESOLVED absolute root, because that is the only form in which '.'
+// and an absolute path agree. A drive prefix ('C:') or a UNC host can never equal one of
+// the names, so a plain segment scan is enough and stays consistent with the
+// case-sensitive matching used everywhere else in this module.
+export const rootTargetsSkippedDirectory = (absoluteRoot: string): boolean =>
+    toPosixPath(absoluteRoot).split('/').some((segment) => SKIPPED_DIRECTORIES.includes(segment));
 
 // A file larger than this is not read by grep. Generated bundles and data dumps
 // would otherwise turn one content search into a multi-second read.
@@ -139,6 +163,21 @@ export const matchGlob = (pattern: string, path: string): boolean => {
 // result order (and therefore a capped result set) depend on the host's ICU data.
 const compareNames = (left: string, right: string): number => (left < right ? -1 : left > right ? 1 : 0);
 
+// What a walk may be told to care about. Both options are optional by design: a bare
+// `walkFiles(root)` behaves exactly as it always did — every reachable regular file, the
+// fixed skip list pruned, and no `.gitignore` involved. `./search.ts` is the caller that
+// opts into the ignore-aware walk for `glob` and `grep`.
+export type WalkOptions = {
+    // Ignore matcher for this root (./gitignore.ts). The walker feeds it one directory at
+    // a time as it descends, so rules are discovered in the order the walk reaches them
+    // and an ignored directory's own .gitignore is never read.
+    ignores?: GitignoreMatcher;
+    // Directory names pruned by entry name. Defaults to SKIPPED_DIRECTORIES; a caller
+    // that deliberately rooted the search inside one of them passes
+    // ALWAYS_SKIPPED_DIRECTORIES so nested copies stay reachable.
+    skipDirectories?: readonly string[];
+};
+
 // Yield every regular file under `root`, as posix paths relative to `root`.
 //
 // Traversal is depth-first over name-sorted entries, so the sequence is fully
@@ -146,12 +185,20 @@ const compareNames = (left: string, right: string): number => (left < right ? -1
 // entries are skipped: a search should not fail because one subtree is not
 // readable. A root that cannot be listed does throw — that is a caller mistake,
 // not noise.
-export async function* walkFiles(root: string): AsyncGenerator<string> {
+export async function* walkFiles(
+    root: string,
+    options: WalkOptions = {}
+): AsyncGenerator<string> {
     const absoluteRoot = resolve(root);
+    const skipDirectories = options.skipDirectories ?? SKIPPED_DIRECTORIES;
+    const { ignores } = options;
 
     // Recursive generator: `yield*` keeps the depth-first order obvious, and the
     // recursion depth is bounded by the directory depth rather than the file count.
-    const walk = async function* (directory: string): AsyncGenerator<string> {
+    const walk = async function* (
+        directory: string,
+        relativeDirectory: string
+    ): AsyncGenerator<string> {
         let entries;
 
         try {
@@ -163,6 +210,11 @@ export async function* walkFiles(root: string): AsyncGenerator<string> {
             return;
         }
 
+        // Rules are picked up per directory that is actually listed. That is what keeps
+        // "an ignored directory is never inspected" true, and it is also why a
+        // .gitignore ABOVE the root never applies: it is simply never loaded.
+        if (ignores) await ignores.load(directory, relativeDirectory);
+
         entries.sort((left, right) => compareNames(left.name, right.name));
 
         for (const entry of entries) {
@@ -172,19 +224,31 @@ export async function* walkFiles(root: string): AsyncGenerator<string> {
 
             const fullPath = join(directory, entry.name);
 
+            // Built once per entry and already posix, so a yielded path never needs a
+            // second relative()/toPosixPath() pass.
+            const relativePath =
+                relativeDirectory.length === 0
+                    ? entry.name
+                    : `${relativeDirectory}/${entry.name}`;
+
+            // An excluded directory is pruned rather than descended into, and an excluded
+            // file is simply never yielded. A '!' rule is decided inside the matcher, not
+            // here, so the walk has exactly one ignore verdict to respect.
+            if (ignores && ignores.isIgnored(relativePath, entry.isDirectory())) continue;
+
             if (entry.isDirectory()) {
-                if (SKIPPED_DIRECTORIES.includes(entry.name)) continue;
-                yield* walk(fullPath);
+                if (skipDirectories.includes(entry.name)) continue;
+                yield* walk(fullPath, relativePath);
                 continue;
             }
 
-            if (entry.isFile()) {
-                yield toPosixPath(relative(absoluteRoot, fullPath));
-            }
+            if (entry.isFile()) yield relativePath;
         }
     };
 
-    yield* walk(absoluteRoot);
+    // The root's own name is never tested against the skip list or the ignore rules:
+    // naming a directory IS the caller saying "search here on purpose".
+    yield* walk(absoluteRoot, '');
 }
 
 // Whether a file is small enough for grep to read. A stat

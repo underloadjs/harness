@@ -12,7 +12,7 @@
 //   - all ids in the resulting conversation are unique.
 
 import { describe, expect, it } from 'vitest';
-import { presets } from './index';
+import { FIXTURE_PRESETS } from './index';
 
 const SETTINGS = {
     baseURL: 'http://provider.test/v1',
@@ -24,8 +24,11 @@ const progress = (): void => {
     // The scripted transport is the subject; events are irrelevant here.
 };
 
-const demoPreset = (): (typeof presets)[number] => {
-    const preset = presets.find((entry) => entry.name === 'demo');
+// T5: the scripted demo is a fixture, not a shipped catalogue entry, so this file
+// reaches it through FIXTURE_PRESETS (its transport is what is under test, and that
+// factory is unchanged by the move out of the production list).
+const demoPreset = (): (typeof FIXTURE_PRESETS)[number] => {
+    const preset = FIXTURE_PRESETS.find((entry) => entry.name === 'demo');
     if (!preset) throw new Error('demo preset is missing');
     return preset;
 };

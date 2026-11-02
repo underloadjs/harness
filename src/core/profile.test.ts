@@ -46,11 +46,11 @@ const elena = {
 };
 
 describe('createProfileTool', () => {
-    it('exposes the exact wire name, core visibility, and profile tags', () => {
+    it('exposes the exact wire name, searchable visibility, and profile tags', () => {
         const { tool } = createProfileTool();
 
         expect(tool.name).toBe('profileManage');
-        expect(tool.visibility).toBe('core');
+        expect(tool.visibility).toBe('searchable');
         expect(tool.tags).toEqual(['profile', 'profiles', 'character', 'characters', 'person', 'people']);
     });
 

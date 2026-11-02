@@ -180,20 +180,9 @@ describe('threadFork runtime', () => {
 
         // The requester only ever received normal tool results between its turns.
         expect(entry.messages.filter((message) => message.role === 'user')).toHaveLength(1);
-        expect(toolNames(seen[seen.length - 1])).toEqual([
-            'toolRegistry',
-            'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork'
-        ]);
+        // R9-R11: the requester's own declaration list is the bootstrap pair; the
+        // fork grant adds the runtime controls without declaring them.
+        expect(toolNames(seen[seen.length - 1])).toEqual(['toolRequest', 'task']);
 
         // Every branch frame is labelled with its branch thread.
         const branchStarts = events.filter((event) => event.type === 'branch_start');
@@ -259,7 +248,9 @@ describe('threadFork runtime', () => {
         // Role inheritance: a fork of the primary still sees delegate.
         expect(records[0].role).toBe('primary');
         expect(records[0].tools).toContain('delegate');
-        expect(records[0].tools).toContain('threadFork');
+        // R9-R11: threadFork is searchable, so it is no longer part of the declared
+        // list. The branch still gets the runtime control itself.
+        expect(records[0].tools).not.toContain('threadFork');
 
         // The depth refusal is a normal error-shaped tool result on the inner
         // branch, never a third branch record.
@@ -344,7 +335,9 @@ describe('threadFork runtime', () => {
             toolCallId: expect.stringMatching(/^call_branch-\d+_1$/),
             name: 'threadFork'
         });
-        expect(toolNames(branchRequest)).toContain('threadFork');
+        // R9-R11: the branch copies the requester's declaration list, which is now
+        // the bootstrap pair; threadFork is searchable and simply not in it.
+        expect(toolNames(branchRequest)).toEqual(['toolRequest', 'task']);
 
         const record = writer.branches()[0];
         expect(record.model).toBe('copy/model');
@@ -416,7 +409,9 @@ describe('threadFork runtime', () => {
         const names = toolNames(branchRequest);
         expect(names).not.toContain('delegate');
         expect(names).not.toContain('toolCreate');
-        expect(names).toContain('threadFork');
+        // R9-R11: threadFork is searchable for every role, so a subagent fork's
+        // declarations are exactly the bootstrap pair.
+        expect(names).toEqual(['toolRequest', 'task']);
     });
 
     it('rejects a branch that answers with no substantive text', async () => {
@@ -743,10 +738,12 @@ describe('threadFork runtime', () => {
                     return answer('root done');
                 }
                 if (latestUser(request) === 'mutate') {
-                    if (results.some((content) => content.includes('"todo"'))) {
+                    // The branch's own task page comes back with the `tasks` key, so
+                    // that is the marker for "the mutation already happened".
+                    if (results.some((content) => content.includes('"tasks"'))) {
                         return answer('branch done');
                     }
-                    return call('t1', 'todoManage', '{"action":"add","text":"Shared item"}');
+                    return call('t1', 'task', '{"tasks":[{"text":"Shared item"}]}');
                 }
                 if (!request.messages.some((message) => message.role === 'assistant')) {
                     return call('f1', 'threadFork', '{"input":"mutate"}');
@@ -775,10 +772,10 @@ describe('threadFork runtime', () => {
 
         // The branch shared the harness todo store, so its tool mutation is still
         // a persistence-worthy event.
-        expect(reasons).toContain('tool_execute:todoManage');
-        expect(await writer.executeTool('todoManage', { action: 'list' })).toEqual({
-            todos: [{ id: '1', text: 'Shared item', completed: false }],
-            counts: { total: 1, completed: 0, remaining: 1 },
+        expect(reasons).toContain('tool_execute:task');
+        expect(await writer.executeTool('task', {})).toEqual({
+            tasks: [{ id: '1', text: 'Shared item', completed: false }],
+            counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false }
         });
     });

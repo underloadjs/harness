@@ -145,21 +145,35 @@ const WIDGET_MANAGE = catalogueTool('widgetManage', {
     additionalProperties: false
 });
 
-// The real todoManage metadata, which DOES have a curated example: the example must
-// win over the generic template (it adds the `text` that "add" requires).
-const TODO_MANAGE = coreTool('todoManage', {
+// The real `task` metadata (R9-R11: the old `todoManage`), which DOES have curated
+// presets. The schema is a MERGE command, not an action enum: every property is
+// optional, so the schema alone can only offer `{}` (the documented read), and the
+// merge shapes the presets carry — an added entry with `text`, a patched entry with
+// `id` + `completed`, a `remove` id list — are what the curated presets contribute.
+const TASK = coreTool('task', {
     type: 'object',
     properties: {
-        action: {
-            type: 'string',
-            enum: ['add', 'remove', 'check', 'uncheck', 'list'],
-            description: 'One of: add, remove, check, uncheck, list.'
+        tasks: {
+            type: 'array',
+            items: {
+                type: 'object',
+                properties: {
+                    id: { type: 'string', description: 'Existing task id to patch.' },
+                    text: { type: 'string', description: 'Text for a task with no id.' },
+                    completed: { type: 'boolean', description: 'Completion flag.' }
+                },
+                additionalProperties: false
+            },
+            description: 'Tasks to add (no id) or patch (with id).'
         },
-        text: { type: 'string', description: 'Todo text for "add".' },
-        id: { type: 'string', description: 'Todo id.' },
-        completed: { type: 'boolean', description: 'For "check" only.' }
+        remove: {
+            type: 'array',
+            items: { type: 'string' },
+            description: 'Ids of tasks to remove.'
+        },
+        offset: { type: 'integer', minimum: 0, description: 'First index to return.' },
+        limit: { type: 'integer', minimum: 1, description: 'How many tasks to return.' }
     },
-    required: ['action'],
     additionalProperties: false
 });
 
@@ -183,7 +197,7 @@ const descriptor = {
     requiresEndpoint: false,
     agents: ['instruct'],
     tools: ['glob'],
-    coreTools: ['toolRequest', 'todoManage'],
+    coreTools: ['toolRequest', 'task'],
     primary: 'instruct',
     subagents: [],
     builtin: true,
@@ -192,7 +206,7 @@ const descriptor = {
 
 const TOOLS: readonly ToolDescriptor[] = [
     TOOL_REQUEST,
-    TODO_MANAGE,
+    TASK,
     WIDGET_MANAGE,
     SYNTAX,
     GLOB,
@@ -262,6 +276,21 @@ const argsFor = async (name: string): Promise<string> => {
     return box.value;
 };
 
+// Presses one named preset button in the runner that `argsFor` just opened and returns
+// the box text. A preset fill is the other half of the template contract: the button is
+// the only place a payload the schema cannot describe reaches the wire.
+const pressPreset = async (label: string): Promise<string> => {
+    const button = document.querySelector<HTMLButtonElement>(`.tool-preset[data-preset="${label}"]`);
+    if (button === null) throw new Error(`missing preset button: ${label}`);
+    button.click();
+    await flush();
+
+    const box = document.querySelector<HTMLTextAreaElement>('.tool-card .tool-args');
+    if (box === null) throw new Error('missing arguments box');
+
+    return box.value;
+};
+
 it('pre-fills every tool with an argument set that satisfies its schema', async () => {
     await toolMounted();
 
@@ -292,10 +321,28 @@ it('pre-fills every tool with an argument set that satisfies its schema', async 
     const grep = await argsFor('grep');
     expect(JSON.parse(grep)).toEqual({ pattern: 'TODO|FIXME', patterns: ['*.ts'], paths: ['.'] });
 
-    // The curated todoManage example is used verbatim: it carries the `text` that
-    // the "add" action requires, which the schema alone cannot know.
-    const todo = await argsFor('todoManage');
-    expect(JSON.parse(todo)).toEqual({ action: 'add', text: 'Review the harness catalogue' });
+    // `task` (the old todoManage) has NO required property, so the schema alone can only
+    // offer the documented read: the curated first preset `{}` and the schema fallback are
+    // the same value, and the runner dedupes that pair into one button.
+    const task = await argsFor('task');
+    expect(JSON.parse(task)).toEqual({});
+    expect(document.querySelectorAll('.tool-preset')).toHaveLength(4);
+    expect(
+        [...document.querySelectorAll<HTMLButtonElement>('.tool-preset')].map((button) => button.textContent)
+    ).toEqual(['Current tasks', 'Add a task', 'Complete a task (edit id)', 'Remove a task (edit id)']);
+
+    // The curated merge payloads are the part the schema could never generate: an added
+    // entry carries the `text` an add needs, a patched entry names only `id` +
+    // `completed`, and a removal is an id list under `remove`.
+    expect(JSON.parse(await pressPreset('Add a task'))).toEqual({
+        tasks: [{ text: 'Review the change' }]
+    });
+    expect(JSON.parse(await pressPreset('Complete a task (edit id)'))).toEqual({
+        tasks: [{ id: '<id from the list above>', completed: true }]
+    });
+    expect(JSON.parse(await pressPreset('Remove a task (edit id)'))).toEqual({
+        remove: ['<id from the list above>']
+    });
 
     // A schema with no example: ONLY the required property, taking enum[0], so the
     // action is a real one instead of "" and optional fields are absent.

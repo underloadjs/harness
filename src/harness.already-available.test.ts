@@ -1,21 +1,30 @@
-// toolRequest + already-available core tools (R1).
+// toolRequest + already-available core tools (R1, reshaped by R9-R11).
 //
 // Contract pinned here:
-//   - an exact wire name ("delegate") and its capability tags
-//     ("agents"/"delegate"/"delegation") report the tool in `alreadyAvailable`
-//     when the CALLER already has it declared, instead of claiming no match;
+//   - an exact capability tag ("delegate") reports the tool in `alreadyAvailable`
+//     when the CALLER already has it DECLARED, instead of claiming no match;
 //   - that report never enables anything, never appears in `enabled`/`tools`,
 //     never spends the maxEnabledTools bound, and never enters `discoveredTools`;
-//   - a one-agent harness (no delegate at all) and a SUBAGENT (delegate
-//     is primary-only) get no such entry - their absence stays honest, and every
-//     query tag is reported as unmatched;
-//   - the core declarations are unchanged: already-available tools were declared
-//     before the call and stay declared after it.
+//   - R9-R11 demotes eleven runtime rows (toolRegistry, toolList, toolManage,
+//     toolCreate, profileManage, chapterManage, locationManage, agentManage,
+//     agentResult, actionRequest, threadFork) to `searchable`. They are no longer
+//     already-available: a matching query ENABLES them like any other discovery,
+//     and only toolRequest/task/delegate can still land in `alreadyAvailable`;
+//   - when a query matches nothing, the honest answer pairs `unmatchedTags` (for a
+//     tag no registered tool carries) or `availableTags` (the searchable
+//     vocabulary) with an empty `enabled`;
+//   - a one-agent harness (no delegate at all) and a SUBAGENT (delegate is
+//     primary-only) get no already-available entry - their absence stays honest.
 
 import { describe, expect, it } from 'vitest';
 import { agent, harness, tool } from '@underload/harness';
 import type { HarnessStream, HarnessStreamEvent, HarnessStreamRequest } from '@underload/harness';
-import { AGENT_MANAGE_METADATA, AGENT_RESULT_METADATA } from './core/metadata';
+import {
+    AGENT_MANAGE_METADATA,
+    AGENT_RESULT_METADATA,
+    TOOL_CREATE_METADATA,
+    TOOL_REQUEST_METADATA
+} from './core/metadata';
 
 const scripted = (turns: HarnessStreamEvent[][], seen?: HarnessStreamRequest[]): HarnessStream => {
     let index = 0;
@@ -54,17 +63,78 @@ const DELEGATE_MATCH = {
     tags: ['agents', 'delegate', 'delegation', 'subagent', 'team']
 };
 
-// R3: agentManage/agentResult are core too, and their `agents` tag makes them
-// genuine matches for an agent-capability query. The literal metadata is imported
-// from the one declarative source the runtime registers, so this expectation
+// Discovery cards are metadata only: name, description, tags. The literals come
+// from the one declarative source the runtime registers, so an expectation here
 // cannot drift from what the model actually sees.
-const agentMatch = (metadata: { name: string; description: string; tags: readonly string[] }) => ({
+const match = (metadata: { name: string; description: string; tags: readonly string[] }) => ({
     name: metadata.name,
     description: metadata.description,
     tags: [...metadata.tags]
 });
 
-const AGENT_MATCHES = [agentMatch(AGENT_MANAGE_METADATA), agentMatch(AGENT_RESULT_METADATA)];
+const AGENT_MATCHES = [match(AGENT_MANAGE_METADATA), match(AGENT_RESULT_METADATA)];
+const TOOL_CREATE_MATCH = match(TOOL_CREATE_METADATA);
+
+// What an "agents" capability query enables now: the two demoted agent rows (their
+// tags/description carry the agent vocabulary) plus toolCreate, whose description
+// names `agent` and `agents` in the execution context.
+const AGENT_QUERY_ENABLED = ['agentManage', 'agentResult', 'toolCreate'];
+const AGENT_QUERY_TOOLS = [...AGENT_MATCHES, TOOL_CREATE_MATCH];
+
+// R9-R11: the searchable vocabulary a no-match query reports for this harness.
+// It is the sorted union of the eleven demoted rows' tags - toolRegistry, toolList,
+// toolManage, toolCreate, profileManage, chapterManage, locationManage, agentManage,
+// agentResult, actionRequest, and threadFork. delegate/toolRequest/task are declared
+// core, so their tags are not part of the discoverable vocabulary.
+const SEARCHABLE_TAGS = [
+    'agents',
+    'answer',
+    'book',
+    'branch',
+    'catalogue',
+    'chapter',
+    'chapters',
+    'character',
+    'characters',
+    'compile',
+    'create',
+    'dynamic',
+    'edit',
+    'extension',
+    'fork',
+    'history',
+    'inspect',
+    'inventory',
+    'list',
+    'location',
+    'locations',
+    'manage',
+    'outline',
+    'output',
+    'people',
+    'person',
+    'place',
+    'places',
+    'preview',
+    'profile',
+    'profiles',
+    'registry',
+    'reload',
+    'research',
+    'result',
+    'results',
+    'self-modifying',
+    'setting',
+    'source',
+    'story',
+    'subagent',
+    'summarize',
+    'team',
+    'thread',
+    'tools',
+    'world',
+    'writing'
+];
 
 describe('toolRequest already-available core tools', () => {
     it('reports delegate on an exact wire-name query instead of no match', async () => {
@@ -79,19 +149,20 @@ describe('toolRequest already-available core tools', () => {
         await writer('delegate?');
 
         // The primary HAS delegate declared, so the answer names it. Nothing is
-        // enabled, nothing is left over, and the tag is not called unmatched.
+        // enabled, nothing is left over, and the tag is not called unmatched. The
+        // demoted rows now offer their vocabulary instead of an empty list.
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
             enabled: [],
             tools: [],
             matched: 0,
             omitted: 0,
             alreadyAvailable: [DELEGATE_MATCH],
-            availableTags: []
+            availableTags: SEARCHABLE_TAGS
         });
         expect(writer.discoveredTools).toEqual([]);
     });
 
-    it('reports delegate for the capability tags agents/delegate/delegation', async () => {
+    it('enables the demoted agent rows and reports only delegate as already available', async () => {
         const entry = brain(
             scripted([
                 callTool('c1', 'toolRequest', '{"tags":["agents","delegate","delegation"]}'),
@@ -105,18 +176,19 @@ describe('toolRequest already-available core tools', () => {
 
         await writer('delegate?');
 
-        // All three synonyms are exact tags on delegate (the metadata carries
-        // "delegation" as the noun form), so `unmatchedTags` is absent from the
-        // exact shape. The two agent-inspection core tools also carry the exact
-        // "agents" tag, so they are reported (metadata only) beside it.
+        // delegate stays declared core, so it is reported and NOT re-enabled.
+        // agentManage/agentResult/toolCreate are searchable rows now: the query
+        // enables them, spends the match count, and lists their cards.
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
-            enabled: [],
-            tools: [],
-            matched: 0,
+            enabled: AGENT_QUERY_ENABLED,
+            tools: AGENT_QUERY_TOOLS,
+            matched: 3,
             omitted: 0,
-            alreadyAvailable: [DELEGATE_MATCH, ...AGENT_MATCHES],
-            availableTags: []
+            alreadyAvailable: [DELEGATE_MATCH]
         });
+
+        // Enabling a searchable row is a discovery: it lands in the session record.
+        expect(writer.discoveredTools).toEqual(AGENT_QUERY_ENABLED);
     });
 
     it('does not advertise delegate to a one-agent harness that lacks it', async () => {
@@ -134,18 +206,16 @@ describe('toolRequest already-available core tools', () => {
 
         await writer('delegate?');
 
-        // No subagents means no delegate was ever registered, so the honest
-        // answer is "nothing available" plus every tag reported as unmatched. Tags
+        // No subagents means no delegate was ever registered, so the honest answer
+        // has no alreadyAvailable key at all and reports the tag as unmatched. Tags
         // come back normalized (trimmed + lower-cased).
         expect(writer.tools.delegate).toBeUndefined();
         expect(JSON.parse(content(entry.messages[2]))).toEqual({
-            enabled: [],
-            tools: [],
-            matched: 0,
+            enabled: AGENT_QUERY_ENABLED,
+            tools: AGENT_QUERY_TOOLS,
+            matched: 3,
             omitted: 0,
-            unmatchedTags: ['delegate'],
-            alreadyAvailable: AGENT_MATCHES,
-            availableTags: []
+            unmatchedTags: ['delegate']
         });
     });
 
@@ -171,13 +241,11 @@ describe('toolRequest already-available core tools', () => {
 
         // Subagent history: [0] user, [1] assistant tool call, [2] tool result.
         expect(JSON.parse(content(researcher.messages[2]))).toEqual({
-            enabled: [],
-            tools: [],
-            matched: 0,
+            enabled: AGENT_QUERY_ENABLED,
+            tools: AGENT_QUERY_TOOLS,
+            matched: 3,
             omitted: 0,
-            unmatchedTags: ['delegate'],
-            alreadyAvailable: AGENT_MATCHES,
-            availableTags: []
+            unmatchedTags: ['delegate']
         });
     });
 
@@ -202,39 +270,24 @@ describe('toolRequest already-available core tools', () => {
         const result = JSON.parse(content(entry.messages[2]));
         const fixtureNames = fixtures.map((definition) => definition.name);
 
-        // Seven searchable matches, ALL enabled: selection is uncapped and the
-        // default enabled bound (32) is far above this fixture set. The core tools
-        // carrying the "tools" tag are REPORTED, never enabled and never counted.
-        expect(result.enabled).toEqual(fixtureNames);
-        expect(result.tools.map((match: { name: string }) => match.name)).toEqual(fixtureNames);
-        expect(result.matched).toBe(7);
+        // R9-R11: the "tools" tag now reaches four demoted rows as well, so twelve
+        // matches are enabled - selection is uncapped and the default enabled bound
+        // (32) is far above this set. Only the still-declared toolRequest row is
+        // REPORTED rather than enabled, and it never enters the discovered record.
+        const demotedMatches = ['toolCreate', 'toolList', 'toolManage', 'toolRegistry', 'threadFork'];
+        const enabledNames = [...fixtureNames, ...demotedMatches];
+        expect(result.enabled).toEqual(enabledNames);
+        expect(result.tools.map((matchEntry: { name: string }) => matchEntry.name)).toEqual(enabledNames);
+        expect(result.matched).toBe(12);
         expect(result.omitted).toBe(0);
-        expect(result.alreadyAvailable.map((match: { name: string }) => match.name)).toEqual([
-            'toolCreate',
-            'toolList',
-            'toolManage',
-            'toolRegistry',
-            'toolRequest'
+        expect(result.alreadyAvailable.map((matchEntry: { name: string }) => matchEntry.name)).toEqual([
+            TOOL_REQUEST_METADATA.name
         ]);
 
-        // Core exposure semantics are untouched: all seven searchable tools joined
-        // the discovery set, and the next request declares the core set plus those
-        // seven (already-available tools were always declared).
-        expect(writer.discoveredTools).toEqual(fixtureNames);
-        expect(declaredNames(seen[1])).toEqual([
-            'toolRegistry',
-            'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork',
-            ...fixtureNames
-        ]);
+        // Core exposure semantics are untouched: the twelve searchable tools joined
+        // the discovery set, and the next request declares the core pair, the
+        // configured fixtures, then the enabled rows in discovery order.
+        expect(writer.discoveredTools).toEqual(enabledNames);
+        expect(declaredNames(seen[1])).toEqual(['toolRequest', 'task', ...enabledNames]);
     });
 });

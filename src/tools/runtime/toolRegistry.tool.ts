@@ -39,7 +39,11 @@ export const TOOL_REGISTRY_METADATA: CoreToolMetadata = {
     description:
         'Compile and register a tool from editable source, replacing any existing registration with the same name. Provide `sourcePath` (a tool-source-relative or absolute path) or `moduleText` (full TypeScript/JavaScript module text). The module must export a Tool (named/default), a `tool` export, or `metadata` + `execute`. Local helper imports are compiled from source; `node:` imports and package dependencies resolve through Node. Success returns the installed name and source revision and makes the tool immediately callable; syntax, loading, or contract failures return diagnostics and leave the previous registration untouched. Transpilation checks syntax, NOT semantic types or runtime correctness, and loaded code runs with full process permissions.',
     tags: ['tools', 'registry', 'source', 'self-modifying', 'compile'],
-    visibility: 'core',
+    // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
+    // and enables it for this session instead of seeing it declared on every request.
+    // Registration itself is unchanged (the entry still joins the harness registry),
+    // so toolRequest always has something to surface.
+    visibility: 'searchable',
     parameters: {
         type: 'object',
         properties: {

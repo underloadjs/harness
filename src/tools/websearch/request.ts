@@ -2,12 +2,13 @@
 //
 // WHY THIS FILE EXISTS
 // --------------------
-// Exa and Tavily differ only in endpoint, auth header, body keys, and result
-// field names. Everything that is a *policy* — how long a request may take, how
-// much of a response is accepted, what an error may say, how a URL is validated,
-// how a snippet is truncated, how a configured key is redacted — lives here once
-// so the two adapters cannot drift. Both adapters are loaded by `import()` from
-// ../websearch/index, so importing this module costs no SDK and no network.
+// Exa, Tavily and Linkup differ only in endpoint, auth header, body keys, and
+// result field names. Everything that is a *policy* — how long a request may take,
+// how much of a response is accepted, what an error may say, how a URL is
+// validated, how a snippet is truncated, how a configured key is redacted — lives
+// here once so the adapters cannot drift. Every adapter is loaded by `import()`
+// from ../websearch/index (and the fetch tool's hosted providers reuse this file),
+// so importing this module costs no SDK and no network.
 //
 // Bounds (S1: "bounded normalized results"). These are constants, not knobs: the
 // harness promises a small, predictable tool result, so a provider cannot flood
@@ -17,7 +18,10 @@
 //     date, and 2,048 characters of URL (a longer URL drops the row instead of
 //     being truncated into a different link);
 //   - 512 KiB of response body, enforced while streaming so an oversized body is
-//     never allocated in full, plus a content-length pre-check;
+//     never allocated in full, plus a content-length pre-check. This is the
+//     *provider* budget and deliberately not the fetch tool's native page budget
+//     (../webfetch/request caps a page GET at 100 KiB): a search API returns a
+//     JSON list whose size it controls, while a native GET faces the open web;
 //   - 15 s per request, enforced with AbortController and cleaned up in `finally`.
 //
 // Redaction order is a security property, not a style choice: every field is
@@ -37,7 +41,9 @@
 // Cross-references:
 //   - ./exa        — Exa request body and result mapping
 //   - ./tavily     — Tavily request body and result mapping
+//   - ./linkup     — Linkup request body and result mapping
 //   - ./index      — createWebsearchTool: key resolution, validation, dispatch
+//   - ../webfetch/request — the fetch tool's own (100 KiB) page budget
 //   - ../../util   — HarnessError (the message the model ends up reading)
 
 import { HarnessError } from '../../util';
@@ -86,7 +92,7 @@ export type ProviderSearch = {
 // The request shape `requestSearch` accepts. `body` is JSON; `headers` are added
 // to the JSON content type (or replace it, for a provider that wants another).
 type SearchRequest = {
-    // Display name for error messages: "Exa", "Tavily".
+    // Display name for error messages: "Exa", "Tavily", "Linkup".
     label: string;
     endpoint: string;
     headers: Record<string, string>;
@@ -265,6 +271,26 @@ const statusFailure = (label: string, status: number): HarnessError => {
 const oversizedResponse = (label: string): HarnessError =>
     new HarnessError(`${label} search returned a response larger than ${MAX_RESPONSE_BYTES} bytes.`);
 
+// Best-effort release of a body that is rejected before it is read (a failing
+// status, or a declared size over the budget). Without it the connection stays
+// busy downloading bytes the tool has already decided to throw away.
+//
+// Deliberately NOT awaited: cancelling the body of a `Response.clone()` never
+// settles while its sibling branch is unread (measured: `clone().body.cancel()`
+// stays pending, a fresh body's settles), and an await here would therefore put
+// the model's error message behind a stream that can outlive the 15 s budget.
+// The transfer is released, and only the release, on a promise nobody waits on.
+const cancelBody = (response: Response): void => {
+    try {
+        void response.body?.cancel().catch(() => {
+            // The stream may already be closed; the caller's error is the one
+            // the model needs.
+        });
+    } catch {
+        // A runtime without a cancellable body: the error path is unaffected.
+    }
+};
+
 // Read a response body without ever holding more than MAX_RESPONSE_BYTES.
 //
 // `response.text()` allocates the whole body first, so a provider (or a proxy)
@@ -375,12 +401,22 @@ export const requestSearch = async (request: SearchRequest): Promise<unknown> =>
             throw networkFailure();
         }
 
-        if (!response.ok) throw statusFailure(request.label, response.status);
+        if (!response.ok) {
+            // An error page is HTML noise we never read: release the body so the
+            // connection is not held for it.
+            cancelBody(response);
+
+            throw statusFailure(request.label, response.status);
+        }
 
         // Reject an oversized declared body before reading it. The streaming budget
         // in `readBody` still applies when the header is absent or wrong.
         const declared = Number(response.headers.get('content-length') ?? '');
         if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+            // Nothing is read on this path: the declared size alone is the
+            // rejection, and cancelling stops the download.
+            cancelBody(response);
+
             throw oversizedResponse(request.label);
         }
 
@@ -399,9 +435,9 @@ export const requestSearch = async (request: SearchRequest): Promise<unknown> =>
 };
 
 // Read the provider's result list, or fail with a message that names the field.
-// Shared because both providers use `results`; keeping the check here means an
-// unexpected body (HTML error page, truncated JSON) becomes the same readable
-// error for either adapter.
+// Shared because every provider answers with `results`; keeping the check here
+// means an unexpected body (HTML error page, truncated JSON) becomes the same
+// readable error for any adapter.
 export const resultsArray = (payload: unknown, label: string): readonly unknown[] => {
     if (!payload || typeof payload !== 'object' || Array.isArray(payload)) {
         throw new HarnessError(`${label} search returned an unexpected response.`);

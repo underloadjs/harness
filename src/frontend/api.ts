@@ -330,7 +330,16 @@ const readError = async (response: Response): Promise<string> => {
     return `HTTP ${response.status} ${response.statusText}`.trim();
 };
 
-const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
+// `accept` lists extra statuses that are NOT failures: their body is parsed like a
+// success. The only caller that needs this is `deleteHarness`, where a 404 ("the
+// harness is already gone") is the caller's desired end state rather than an error.
+// Everything else keeps flattening a non-2xx answer into one Error with the server's
+// own message (`readError`), so a real failure stays actionable.
+const request = async <T>(
+    path: string,
+    init?: RequestInit,
+    accept?: readonly number[]
+): Promise<T> => {
     let response: Response;
 
     try {
@@ -349,7 +358,9 @@ const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
         throw new Error(`The harness server is unreachable: ${messageOf(error)}`);
     }
 
-    if (!response.ok) {
+    // An accepted status falls through to the parse below; `deleteHarness` reads the
+    // "already gone" answer out of the body instead of catching an Error.
+    if (!response.ok && !(accept !== undefined && accept.includes(response.status))) {
         throw new Error(await readError(response));
     }
 
@@ -362,6 +373,10 @@ const request = async <T>(path: string, init?: RequestInit): Promise<T> => {
     try {
         return (await response.json()) as T;
     } catch {
+        // An ACCEPTED status (a 404 whose body is a proxy's HTML page) is not a
+        // parse failure worth reporting: the caller already knows the answer.
+        if (accept !== undefined && accept.includes(response.status)) return undefined as unknown as T;
+
         throw new Error(
             `The harness server returned a non-JSON response for ${path.length > 0 ? path : '/'} (HTTP ${response.status}).`
         );
@@ -407,7 +422,26 @@ export const updateHarness = async (
     return body.harness;
 };
 
-// GET root. Only the canonical mount (`/v1/harness`) answers this with the
+// DELETE /harnesses/:name (R6) — permanently remove ONE harness definition.
+//
+// The server (src/server/api.ts -> harness registry) removes the entry durably,
+// built-ins included, and answers `{ deleted: true }`. It NEVER touches sessions:
+// conversations already started in this harness keep their frozen definition and stay
+// in the roster, so the caller must not drop them when the row disappears.
+//
+// An unknown harness is a 404. For a delete that IS the desired end state (the row is
+// gone either way), so the 404 is accepted at the transport and reported as
+// `deleted: false` instead of throwing; every other failure keeps the server's own
+// message. The name is URL-encoded because harness names are user data.
+export const deleteHarness = async (name: string): Promise<boolean> => {
+    const body = await request<{ deleted?: boolean } | undefined>(
+        `/harnesses/${encodeURIComponent(name)}`,
+        { method: 'DELETE' },
+        [404]
+    );
+
+    return body?.deleted === true;
+};
 // bootstrap document; the standalone `/api` root is a deliberate 404. Callers
 // use `loadBootstrap` rather than this directly.
 export const getBootstrap = (): Promise<HarnessBootstrap> => request<HarnessBootstrap>('');
@@ -533,6 +567,18 @@ export const resetSession = async (id: string): Promise<SessionSnapshot> => {
 // rather than a failed delete, so the wire contract stays exactly this method/path.
 export const deleteSession = async (id: string): Promise<void> => {
     await request<{ deleted: boolean }>(`/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' });
+};
+
+// Same DELETE, sent with `keepalive: true` for the unload path (R7). A plain fetch
+// started from `pagehide` may be cancelled before it leaves the browser, which would
+// orphan the record; keepalive lets an empty-bodied DELETE finish (the browser caps it
+// at ~64 KiB, and this request has no body). Callers treat it as BEST EFFORT: a mobile
+// background-kill can still drop it, and nothing may depend on the answer.
+export const deleteSessionOnUnload = async (id: string): Promise<void> => {
+    await request<{ deleted: boolean }>(
+        `/sessions/${encodeURIComponent(id)}`,
+        { method: 'DELETE', keepalive: true }
+    );
 };
 
 // POST /sessions/:id/threads/:threadId/cancel (R5/R7).
@@ -678,8 +724,8 @@ export const enqueueTask = async (
 // POST /tools/:name — call one tool on the server.
 //
 // `sessionId` is only meaningful for a `sessionBound` core tool (toolRequest,
-// toolCreate, todoManage, delegate): the server runs it inside that session's
-// harness, so discovery, runtime tools, todos and delegation change the
+// toolCreate, task, delegate): the server runs it inside that session's
+// harness, so discovery, runtime tools, the task list and delegation change the
 // conversation the user is looking at. It is omitted for a catalogue tool, whose
 // request body therefore stays byte-identical to the pre-R8 contract.
 export const callTool = (

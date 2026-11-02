@@ -8,6 +8,9 @@
 //     holds (shipped copies and user-created ones). Factories are NOT serialized;
 //     ./harnesses/registry.ts rebuilds them from the metadata with the same
 //     template rules the original create/patch used.
+//   - `deleted` (T5, optional) — the names of shipped built-ins the operator
+//     deleted. The registry array cannot express this: it is written from
+//     `list()`, while a fresh registry always re-seeds the shipped templates.
 //   - `sessions` — per-session identity, the FROZEN preset metadata and
 //     descriptor the session was created with (a later registry patch cannot
 //     change what an old session must rebuild), provider settings WITHOUT the
@@ -160,6 +163,14 @@ export type HarnessDatabase = {
     version: typeof HARNESS_DATABASE_VERSION;
     savedAt: number;
     registry: HarnessPresetRecord[];
+    // T5 (ADDITIVE): names of SHIPPED built-ins the operator deleted. `registry`
+    // cannot express this on its own — it is written from `registry.list()`, and a
+    // fresh registry always seeds itself from ./presets.ts, so a missing row would
+    // simply let the next start re-ship the card. An absent field means "no
+    // deletions recorded" (every pre-T5 document), and is preserved as absent on a
+    // round trip. A deleted USER harness needs no entry here: its row is gone, and
+    // nothing ships it.
+    deleted?: string[];
     sessions: HarnessSessionRecord[];
 };
 
@@ -736,6 +747,36 @@ export const readHarnessDatabase = (value: unknown): HarnessDatabase => {
     const registry = record.registry.map((entry, index) => readPresetRecord(entry, `registry[${index}]`));
     const sessions = record.sessions.map((entry, index) => readSessionRecord(entry, `sessions[${index}]`));
 
+    // T5: deleted-builtin names. OPTIONAL, and preserved as OPTIONAL: a pre-T5
+    // document must round-trip to its exact previous shape, so an absent field stays
+    // absent rather than becoming `[]`. Values are trimmed, and duplicates are
+    // collapsed (a name listed twice states one fact) while a blank or non-string
+    // entry is reported as corruption of the named slot. The names are NOT checked
+    // against the shipped catalogue: a tombstone may legitimately name a built-in
+    // this build stopped shipping or will ship again later.
+    const deleted =
+        record.deleted === undefined
+            ? undefined
+            : (() => {
+                  if (!Array.isArray(record.deleted)) {
+                      throw new TypeError('The harness database deleted must be an array of harness names.');
+                  }
+
+                  const names: string[] = [];
+
+                  for (const [index, entry] of (record.deleted as readonly unknown[]).entries()) {
+                      const name = requireString(entry, `deleted[${index}]`).trim();
+
+                      if (name.length === 0) {
+                          throw new TypeError(`deleted[${index}] must not be blank.`);
+                      }
+
+                      if (!names.includes(name)) names.push(name);
+                  }
+
+                  return names;
+              })();
+
     // Duplicate ids would make the Map silently keep only one session.
     const ids = new Set<string>();
     for (const session of sessions) {
@@ -750,6 +791,7 @@ export const readHarnessDatabase = (value: unknown): HarnessDatabase => {
         version: HARNESS_DATABASE_VERSION,
         savedAt: requireNumber(record.savedAt, 'The harness database savedAt'),
         registry,
+        ...(deleted === undefined ? {} : { deleted }),
         sessions
     };
 };

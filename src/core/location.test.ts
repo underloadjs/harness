@@ -36,11 +36,11 @@ const empty = {
 const filler = (length: number): string => 'x'.repeat(length);
 
 describe('createLocationTool', () => {
-    it('exposes the exact wire name, core visibility, and location tags', () => {
+    it('exposes the exact wire name, searchable visibility, and location tags', () => {
         const { tool } = createLocationTool();
 
         expect(tool.name).toBe('locationManage');
-        expect(tool.visibility).toBe('core');
+        expect(tool.visibility).toBe('searchable');
         expect(tool.tags).toEqual(['location', 'locations', 'place', 'places', 'setting', 'world']);
     });
 

@@ -1,9 +1,9 @@
-// websearch — the tool factory, key resolution, and both adapters.
+// websearch — the tool factory, key resolution, and every provider adapter.
 //
 // Everything here is offline and deterministic: the environment is injected
 // (`env`), fetch is a stub (`vi.stubGlobal`), and no host key or network is read.
 // The tests pin the exact wire request (URL, header, JSON body) and the exact
-// normalized result, because the contract with two third-party providers is
+// normalized result, because the contract with three third-party providers is
 // exactly where silent drift is expensive.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -55,7 +55,9 @@ afterEach(() => {
 describe('key resolution', () => {
     it('registers nothing without a key', () => {
         expect(createWebSearchTool({ env: {} })).toBeUndefined();
-        expect(createWebSearchTool({ env: { EXA_API_KEY: '   ', TAVILY_API_KEY: '' } })).toBeUndefined();
+        expect(
+            createWebSearchTool({ env: { EXA_API_KEY: '   ', TAVILY_API_KEY: '', LINKUP_API_KEY: '  ' } })
+        ).toBeUndefined();
     });
 
     it('offers only the provider that has a key', () => {
@@ -79,6 +81,63 @@ describe('key resolution', () => {
 
         expect(properties.provider.enum).toEqual(['exa', 'tavily']);
         expect(both.description).toContain('Exa or Tavily');
+    });
+
+    it('offers only Linkup when LINKUP_API_KEY is the single key', () => {
+        const linkup = configured({ LINKUP_API_KEY: 'linkup-secret-key' });
+
+        // One configured provider is not a choice, so the schema carries no
+        // `provider` property at all.
+        const properties = (linkup.parameters as { properties: Record<string, unknown> }).properties;
+        expect(Object.keys(properties)).toEqual(['query', 'maxResults']);
+
+        // The description names only the provider this harness can call.
+        expect(linkup.description).toContain('Search the web with Linkup');
+        expect(linkup.description).not.toContain('Exa');
+        expect(linkup.description).not.toContain('Tavily');
+    });
+
+    it('keeps Exa first and lists every configured provider', () => {
+        const all = configured({
+            EXA_API_KEY: 'exa-secret-key',
+            TAVILY_API_KEY: 'tavily-secret-key',
+            LINKUP_API_KEY: 'linkup-secret-key'
+        });
+        const properties = (all.parameters as { properties: Record<string, { enum?: string[] }> }).properties;
+
+        // The schema order is the preference order, and appending Linkup never
+        // reorders the providers an existing host already offers.
+        expect(properties.provider.enum).toEqual(['exa', 'tavily', 'linkup']);
+        expect(all.description).toContain('Exa, Tavily or Linkup');
+    });
+
+    it('prefers Exa over Linkup when only those two are configured', async () => {
+        const fetchMock = stubFetch(json({ results: [] }));
+        const tool = configured({ EXA_API_KEY: 'exa-secret-key', LINKUP_API_KEY: 'linkup-secret-key' });
+
+        const result = await tool({ query: 'q' });
+
+        expect(result.provider).toBe('exa');
+        expect(fetchMock.mock.calls[0][0]).toBe('https://api.exa.ai/search');
+    });
+
+    it('lets an explicit linkup key override the environment', async () => {
+        const fetchMock = stubFetch(json({ results: [] }));
+        const tool = configured({ LINKUP_API_KEY: 'env-linkup-key' }, { linkup: { apiKey: 'explicit-linkup-key' } });
+
+        await tool({ query: 'anything' });
+
+        expect(fetchMock.mock.calls[0][0]).toBe('https://api.linkup.so/v1/search');
+        expect(fetchMock.mock.calls[0][1].headers).toEqual({
+            'content-type': 'application/json',
+            authorization: 'Bearer explicit-linkup-key'
+        });
+    });
+
+    it('treats an explicit blank linkup key as "off", not as a fallback to env', () => {
+        expect(
+            createWebSearchTool({ env: { LINKUP_API_KEY: 'env-linkup-key' }, linkup: { apiKey: '' } })
+        ).toBeUndefined();
     });
 
     it('lets an explicit key override the environment', async () => {
@@ -138,7 +197,11 @@ describe('key resolution', () => {
     });
 
     it('keeps keys out of the schema, description, and tags', () => {
-        const tool = configured({ EXA_API_KEY: 'exa-secret-key', TAVILY_API_KEY: 'tavily-secret-key' });
+        const tool = configured({
+            EXA_API_KEY: 'exa-secret-key',
+            TAVILY_API_KEY: 'tavily-secret-key',
+            LINKUP_API_KEY: 'linkup-secret-key'
+        });
         const metadata = JSON.stringify({
             description: tool.description,
             parameters: tool.parameters,
@@ -148,8 +211,10 @@ describe('key resolution', () => {
 
         expect(metadata).not.toContain('exa-secret-key');
         expect(metadata).not.toContain('tavily-secret-key');
+        expect(metadata).not.toContain('linkup-secret-key');
         expect(metadata).not.toContain('EXA_API_KEY');
         expect(metadata).not.toContain('TAVILY_API_KEY');
+        expect(metadata).not.toContain('LINKUP_API_KEY');
     });
 });
 
@@ -375,6 +440,193 @@ describe('Tavily request and normalization', () => {
     });
 });
 
+describe('Linkup request and normalization', () => {
+    it('sends the documented request exactly', async () => {
+        const fetchMock = stubFetch(json({ results: [] }));
+        await configured({ LINKUP_API_KEY: 'linkup-secret-key' })({ query: 'harness tools', maxResults: 3 });
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+
+        const [url, init] = fetchMock.mock.calls[0];
+
+        expect(url).toBe('https://api.linkup.so/v1/search');
+        expect(init.method).toBe('POST');
+        expect(init.redirect).toBe('error');
+        expect(init.headers).toEqual({
+            'content-type': 'application/json',
+            authorization: 'Bearer linkup-secret-key'
+        });
+        // `q` (not `query`), the cheap `fast` depth, and the structured result
+        // type instead of Linkup's composed answer: pinned exactly, because the
+        // provider default would otherwise be free to change underneath us.
+        expect(JSON.parse(String(init.body))).toEqual({
+            q: 'harness tools',
+            depth: 'fast',
+            outputType: 'searchResults',
+            maxResults: 3
+        });
+    });
+
+    it('maps name to title and content to snippet, and ignores type and favicon', async () => {
+        stubFetch(
+            json({
+                results: [
+                    {
+                        type: 'text',
+                        name: '  First   result ',
+                        url: 'https://example.com/a',
+                        content: '  a   snippet ',
+                        favicon: 'https://example.com/favicon.ico'
+                    },
+                    { type: 'text', name: 'Second', url: 'https://example.com/b', content: '' }
+                ]
+            })
+        );
+
+        const result = await configured({ LINKUP_API_KEY: 'linkup-secret-key' })({ query: 'q' });
+
+        // Linkup sends no publication date, so `published` is absent rather than
+        // an empty string: the shape stays the one every provider normalizes into.
+        expect(result).toEqual({
+            provider: 'linkup',
+            query: 'q',
+            maxResults: 5,
+            results: [
+                { title: 'First result', url: 'https://example.com/a', snippet: 'a snippet' },
+                { title: 'Second', url: 'https://example.com/b', snippet: '' }
+            ]
+        });
+    });
+
+    it('drops rows without an http(s) URL and falls back to the URL as a title', async () => {
+        stubFetch(
+            json({
+                results: [
+                    { type: 'text', name: 'JS', url: 'javascript:alert(1)', content: 'x' },
+                    { type: 'text', name: 'Relative', url: '/somewhere', content: 'x' },
+                    { type: 'text', name: '', url: 'https://example.com/kept', content: 'x' }
+                ]
+            })
+        );
+
+        const result = await configured({ LINKUP_API_KEY: 'linkup-secret-key' })({ query: 'q' });
+
+        expect(result.results).toEqual([
+            { title: 'https://example.com/kept', url: 'https://example.com/kept', snippet: 'x' }
+        ]);
+    });
+
+    it('redacts every configured key, including the other provider keys', async () => {
+        stubFetch(
+            json({
+                results: [
+                    {
+                        type: 'text',
+                        name: 'leak linkup-secret-key',
+                        url: 'https://example.com/linkup-secret-key',
+                        content: 'body exa-secret-key and tavily-secret-key'
+                    }
+                ]
+            })
+        );
+
+        const result = await configured({
+            EXA_API_KEY: 'exa-secret-key',
+            TAVILY_API_KEY: 'tavily-secret-key',
+            LINKUP_API_KEY: 'linkup-secret-key'
+        })({ query: 'q', provider: 'linkup' });
+
+        expect(result).toEqual({
+            provider: 'linkup',
+            query: 'q',
+            maxResults: 5,
+            results: [
+                {
+                    title: 'leak [redacted]',
+                    url: 'https://example.com/[redacted]',
+                    snippet: 'body [redacted] and [redacted]'
+                }
+            ]
+        });
+
+        expect(JSON.stringify(result)).not.toContain('linkup-secret-key');
+        expect(JSON.stringify(result)).not.toContain('exa-secret-key');
+    });
+
+    it('clamps the requested count into the provider body', async () => {
+        const fetchMock = stubFetch(json({ results: [] }));
+        const tool = configured({ LINKUP_API_KEY: 'linkup-secret-key' });
+
+        expect((await tool({ query: 'q', maxResults: 500 })).maxResults).toBe(MAX_RESULTS_LIMIT);
+        expect(JSON.parse(String(fetchMock.mock.calls[0][1].body)).maxResults).toBe(MAX_RESULTS_LIMIT);
+    });
+
+    it('maps auth, rate-limit, and server statuses without echoing the body', async () => {
+        const cases: Array<{ status: number; message: string }> = [
+            {
+                status: 401,
+                message: 'Linkup search rejected the API key (HTTP 401). Check the configured key and account.'
+            },
+            {
+                status: 403,
+                message: 'Linkup search rejected the API key (HTTP 403). Check the configured key and account.'
+            },
+            { status: 429, message: 'Linkup search is rate limited (HTTP 429). Try again later.' },
+            { status: 500, message: 'Linkup search failed (HTTP 500).' }
+        ];
+
+        for (const { status, message } of cases) {
+            stubFetch(new Response(`provider body with linkup-secret-key (${status})`, { status }));
+
+            await expect(configured({ LINKUP_API_KEY: 'linkup-secret-key' })({ query: 'q' })).rejects.toThrow(
+                message
+            );
+        }
+    });
+
+    it('reports non-JSON and a missing results list', async () => {
+        stubFetch(new Response('<html>not json</html>', { status: 200 }));
+
+        await expect(configured({ LINKUP_API_KEY: 'linkup-secret-key' })({ query: 'q' })).rejects.toThrow(
+            'Linkup search returned a response that is not JSON.'
+        );
+
+        stubFetch(json({ ok: true }));
+
+        await expect(configured({ LINKUP_API_KEY: 'linkup-secret-key' })({ query: 'q' })).rejects.toThrow(
+            'Linkup search returned a response without a "results" list.'
+        );
+    });
+
+    it('reports a network failure as one fixed sentence', async () => {
+        stubFetch(async () => {
+            throw new TypeError('fetch failed: getaddrinfo ENOTFOUND api.linkup.so');
+        });
+
+        await expect(configured({ LINKUP_API_KEY: 'linkup-secret-key' })({ query: 'q' })).rejects.toThrow(
+            'Linkup search could not be reached (network error).'
+        );
+    });
+
+    it('keeps the provider byte budget at 512 KiB, separate from the native fetch bound', async () => {
+        // The search/provider cap is deliberately untouched by the fetch tool's
+        // 100 KiB page budget. Pinning the constant here turns an accidental
+        // "consolidation" of the two into a test failure.
+        expect(MAX_RESPONSE_BYTES).toBe(512 * 1024);
+
+        stubFetch(
+            new Response('{}', {
+                status: 200,
+                headers: { 'content-length': String(MAX_RESPONSE_BYTES + 1) }
+            })
+        );
+
+        await expect(configured({ LINKUP_API_KEY: 'linkup-secret-key' })({ query: 'q' })).rejects.toThrow(
+            `Linkup search returned a response larger than ${MAX_RESPONSE_BYTES} bytes.`
+        );
+    });
+});
+
 describe('bounds', () => {
     it('clamps maxResults to 1–20 and reports the value actually requested', async () => {
         const fetchMock = stubFetch(json({ results: [] }));
@@ -500,6 +752,22 @@ describe('validation', () => {
 
         await expect(tool({ query: 'q', provider: 'tavily' })).rejects.toThrow(
             'search provider "tavily" is not configured. Configured: exa.'
+        );
+    });
+
+    it('names the configured alternatives when Linkup is missing or another provider is', async () => {
+        // Linkup is a real provider, so the refusal has to name it in the same
+        // vocabulary and list what this harness can call.
+        const onlyExa = configured({ EXA_API_KEY: 'exa-secret-key' });
+
+        await expect(onlyExa({ query: 'q', provider: 'linkup' })).rejects.toThrow(
+            'search provider "linkup" is not configured. Configured: exa.'
+        );
+
+        const exaAndLinkup = configured({ EXA_API_KEY: 'exa-secret-key', LINKUP_API_KEY: 'linkup-secret-key' });
+
+        await expect(exaAndLinkup({ query: 'q', provider: 'tavily' })).rejects.toThrow(
+            'search provider "tavily" is not configured. Configured: exa, linkup.'
         );
     });
 });

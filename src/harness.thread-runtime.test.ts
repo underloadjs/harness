@@ -296,16 +296,16 @@ describe('persistent agent threads (R2)', () => {
         ]);
     });
 
-    it('shares session todos across threads without sharing transcripts', async () => {
+    it('shares session tasks across threads without sharing transcripts', async () => {
         const stream = routed(
             {
-                // Thread one adds a todo, thread two lists it from the same session.
+                // Thread one adds a task, thread two lists it from the same session.
                 plan: scripted([
-                    callTool('c1', 'todoManage', '{"action":"add","text":"Shared plan"}'),
+                    callTool('c1', 'task', '{"tasks":[{"text":"Shared plan"}]}'),
                     answer('added')
                 ]),
                 'list it': scripted([
-                    callTool('c2', 'todoManage', '{"action":"list"}'),
+                    callTool('c2', 'task', '{}'),
                     answer('listed')
                 ])
             },
@@ -326,7 +326,7 @@ describe('persistent agent threads (R2)', () => {
             .find((message) => message.role === 'tool') as { role: string; content: string };
         expect(toolMessage.role).toBe('tool');
         expect(toolMessage.content).toBe(
-            '{"todos":[{"id":"1","text":"Shared plan","completed":false}],"counts":{"total":1,"completed":0,"remaining":1},"page":{"offset":0,"limit":20,"hasMore":false}}'
+            '{"tasks":[{"id":"1","text":"Shared plan","completed":false}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false}}'
         );
 
         // Transcripts stay separate.
@@ -351,7 +351,8 @@ describe('persistent agent threads (R2)', () => {
         expect(textOf(writer.threadMessages(planner.id))).toEqual([
             'plan',
             '',
-            '{"todo":{"id":"1","text":"Shared plan","completed":false},"counts":{"total":1,"completed":0,"remaining":1}}',
+            // R9-R11: every successful task call answers with the same bounded list.
+            '{"tasks":[{"id":"1","text":"Shared plan","completed":false}],"counts":{"total":1,"completed":0,"pending":1},"page":{"offset":0,"limit":20,"hasMore":false}}',
             'added'
         ]);
     });
@@ -1121,19 +1122,12 @@ describe('cross-thread chat and delegation links (R4)', () => {
 
         const result = await writer.sendThreadInput(alpha.id, 'talk to beta');
         expect(result.content).toBe('alpha sent');
+        // R9-R11: the demoted runtime rows are searchable, so the declared set is
+        // the bootstrap pair plus the two thread controls this harness just
+        // registered.
         expect(seen[0]!.tools?.map((tool) => tool.name)).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork',
+            'task',
             'threadList',
             'threadSend'
         ]);

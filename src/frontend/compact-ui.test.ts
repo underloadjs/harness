@@ -423,12 +423,14 @@ it('keeps the agent configuration reachable from the composer button at every wi
     expect(document.querySelector('.agent-add')).toBeNull();
     expect(document.querySelector('.agent-main')).toBeNull();
 
-    expect(byClass('.agent-dialog-agent-select', 'select').getAttribute('aria-label')).toBe(
-        'Agent to configure'
-    );
-    expect([...byClass('.agent-dialog-agent-select', 'select').options].map((option) => option.value)).toEqual([
-        'instruct'
-    ]);
+    // R3: the roster is a strip of clickable badges, and it names itself for a screen
+    // reader. Only this harness's own members are listed.
+    expect(byClass('.agent-dialog-tabs', 'div').getAttribute('role')).toBe('tablist');
+    expect(byClass('.agent-dialog-tabs', 'div').getAttribute('aria-label')).toBe('Agent team');
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.agent-dialog-tab')].map((tab) => tab.dataset.agent)
+    ).toEqual(['instruct']);
+    expect(document.querySelector('.agent-dialog-agent-select')).toBeNull();
     expect(byClass('.agent-dialog-instruction', 'textarea').getAttribute('aria-label')).toBe(
         'Instruction for Instruct'
     );
@@ -437,11 +439,17 @@ it('keeps the agent configuration reachable from the composer button at every wi
     );
 
     // The only agent is the primary, so it cannot leave the team (the same rule the
-    // desktop deck enforced with a disabled remove button), stated in words.
-    expect(byClass('.agent-dialog-member', 'input').disabled).toBe(true);
-    expect(
-        [...document.querySelectorAll<HTMLElement>('.agent-dialog-field-note')].map((node) => node.textContent)
-    ).toEqual(['The primary agent is always part of the team.']);
+    // desktop deck enforced with a disabled remove button), stated on the control
+    // rather than in a paragraph, and `[+]` has nothing left to offer.
+    expect(byClass('.agent-dialog-remove', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-remove', 'button').title).toBe(
+        'The primary agent is always part of the team.'
+    );
+    expect(byClass('.agent-dialog-promote', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-add', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-add', 'button').title).toBe(
+        'Every agent the server offers is already on this team.'
+    );
 
     // One writer, and it is the action in the footer.
     expect(document.querySelectorAll('.agent-dialog-apply')).toHaveLength(1);

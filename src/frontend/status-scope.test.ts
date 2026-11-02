@@ -38,7 +38,7 @@ const descriptor = (overrides: Record<string, unknown> = {}): HarnessDescriptor 
         requiresEndpoint: true,
         agents: ['instruct'],
         tools: ['read'],
-        coreTools: ['read', 'write', 'edit', 'glob', 'toolRequest', 'toolCreate', 'todoManage'],
+        coreTools: ['read', 'write', 'edit', 'glob', 'toolRequest', 'toolCreate', 'task'],
         primary: 'instruct',
         subagents: [],
         builtin: true,

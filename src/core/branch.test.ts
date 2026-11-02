@@ -189,6 +189,117 @@ describe('materializeBranchHistory', () => {
         ).toThrow('attachments[0].size is 99, but its data decodes to 12 bytes.');
     });
 
+    // R3/R4: a `tool` message may carry download media. The strict key check that
+    // protects branch history from foreign shapes MUST admit `attachments`, or
+    // every fork / threadFork / actionRequest autoanswer of a conversation that
+    // used `download` would fail on a perfectly legal transcript.
+    it('carries tool download media through a fork with the remapped call id', () => {
+        const attachment = {
+            id: 'dl-1',
+            kind: 'image' as const,
+            marker: '[Image 1]',
+            name: 'pixel.png',
+            mime: 'image/png',
+            size: 12,
+            data: Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4]).toString('base64')
+        };
+
+        const source: HarnessMessage[] = [
+            { role: 'user', content: 'grab it' },
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'origin-1', name: 'download', arguments: '{}' }]
+            },
+            {
+                role: 'tool',
+                content: '{"media":"attached"}',
+                toolCallId: 'origin-1',
+                name: 'download',
+                attachments: [attachment]
+            }
+        ];
+
+        const result = materializeBranchHistory({ messages: source, branchId: 'b' });
+        const stored = result.messages[2] as Extract<HarnessMessage, { role: 'tool' }>;
+
+        expect(stored).toEqual({
+            role: 'tool',
+            content: '{"media":"attached"}',
+            toolCallId: 'call_b_1',
+            name: 'download',
+            attachments: [attachment]
+        });
+        expect(result.toolCallIds).toEqual([{ origin: 'origin-1', branch: 'call_b_1' }]);
+
+        // Detached: neither the array nor the attachment object is the source's.
+        expect(stored.attachments![0]).not.toBe(attachment);
+
+        // A media payload that contradicts its declared size is still refused.
+        expect(() =>
+            materializeBranchHistory({
+                messages: [
+                    {
+                        role: 'assistant',
+                        content: '',
+                        toolCalls: [{ id: 'x', name: 'download', arguments: '{}' }]
+                    },
+                    {
+                        role: 'tool',
+                        content: '{}',
+                        toolCallId: 'x',
+                        name: 'download',
+                        attachments: [{ ...attachment, size: 99 }]
+                    }
+                ],
+                branchId: 'b'
+            })
+        ).toThrow(/attachments\[0\]\.size is 99, but its data decodes to 12 bytes/);
+    });
+
+    // APPROVED FORK DECISION, pinned here so the limitation cannot drift silently:
+    // the history budget keeps counting attachment bytes (no broad media
+    // exclusion, no compaction subsystem), so a download larger than the
+    // configured bound fails with the SAME explicit guard an oversized upload
+    // already hits. A host that wants both raises `forks.maxHistoryBytes`.
+    it('keeps the maxHistoryBytes guard over download media', () => {
+        const payload = Buffer.alloc(4096, 0x41).toString('base64');
+        const messages: HarnessMessage[] = [
+            { role: 'assistant', content: '', toolCalls: [{ id: 'x', name: 'download', arguments: '{}' }] },
+            {
+                role: 'tool',
+                content: '{}',
+                toolCallId: 'x',
+                name: 'download',
+                attachments: [
+                    {
+                        id: 'dl-1',
+                        kind: 'file',
+                        marker: '[File 1]',
+                        name: 'blob.bin',
+                        mime: 'application/octet-stream',
+                        size: 4096,
+                        data: payload
+                    }
+                ]
+            }
+        ];
+
+        const fits = materializeBranchHistory({ messages, branchId: 'b', maxHistoryBytes: 8192 });
+
+        // The measurement includes the base64: a 4 KiB file is ~5.5 KiB of text.
+        expect(fits.bytes).toBeGreaterThan(5_000);
+        expect(() =>
+            materializeBranchHistory({ messages, branchId: 'b', maxHistoryBytes: fits.bytes - 1 })
+        ).toThrow(
+            new RegExp(
+                `Branch history is ${String(fits.bytes)} UTF-8 bytes, which exceeds maxHistoryBytes \\(${String(
+                    fits.bytes - 1
+                )}\\)\\. Forking does not truncate history\\.`
+            )
+        );
+    });
+
     it('rejects malformed source histories rather than repairing them', () => {
         expect(() =>
             materializeBranchHistory({

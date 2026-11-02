@@ -63,6 +63,10 @@ export type {
 export {
     AGENT_PROFILES,
     AGENT_PROFILE_NAMES,
+    // T5: the production catalogue is `presets`; these two are the explicit opt-in
+    // to the offline/failure fixtures (a lookup superset, and a registry a host or
+    // a test injects them into).
+    ALL_PRESET_TEMPLATES,
     CORE_ENVIRONMENT_TOOL_NAMES,
     CORE_PRESET_TOOL_NAMES,
     CORE_TOOL_GROUP,
@@ -88,10 +92,13 @@ export {
     createToolboxHarness,
     createToolCatalogue,
     createWebSearchCatalogueEntry,
+    // R9-R11: the fetch half of the environment-backed core pair.
+    createWebFetchCatalogueEntry,
     describeAgent,
     describeAgents,
     describeHarness,
     findPreset,
+    FIXTURE_PRESETS,
     harnessTools,
     isAgentProfileName,
     isLegacyShippedDefinition,
@@ -113,6 +120,8 @@ export type {
     HarnessPreset,
     HarnessRegistration,
     HarnessRegistry,
+    HarnessRegistryOptions,
+    HarnessRegistrySnapshot,
     LegacyPresetDefinition,
     RunnerSettings,
     ToolAvailability,
@@ -121,5 +130,7 @@ export type {
     ToolGroup,
     ToolboxHarnessConfiguration,
     WebSearchCatalogueEntry,
-    WebSearchCatalogueOptions
+    WebSearchCatalogueOptions,
+    WebFetchCatalogueEntry,
+    WebFetchCatalogueOptions
 } from './harnesses';

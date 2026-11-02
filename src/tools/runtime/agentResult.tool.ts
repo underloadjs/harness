@@ -18,7 +18,11 @@ export const AGENT_RESULT_METADATA: CoreToolMetadata = {
     description:
         `Read the completed result of one agent invocation. Pass "agent"; optionally pass "invocationId" from agentManage (omit it for that agent's latest completed result). The result contains content, contentLength, offset, limit, hasMore, and nextOffset when more remains; page through by passing nextOffset back as offset. Each page is at most 8000 characters (default 4000), so a long answer is returned in full across pages instead of being silently truncated. A running invocation returns status "running" with no content, a failed or cancelled invocation reports its error and no content, an unknown invocation is an error, and an agent that has not run yet returns status "empty". Only completed answer text is exposed - never system instructions, transcripts, tool arguments, or tool bodies.`,
     tags: ['agents', 'result', 'answer', 'output', 'subagent', 'inspect'],
-    visibility: 'core',
+    // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
+    // and enables it for this session instead of seeing it declared on every request.
+    // Registration itself is unchanged (the entry still joins the harness registry),
+    // so toolRequest always has something to surface.
+    visibility: 'searchable',
     parameters: {
         type: 'object',
         properties: {
@@ -62,7 +66,7 @@ export const registration = {
     activation: 'always',
     order: 110,
     sessionBound: true,
-    alwaysDeclared: true,
+    alwaysDeclared: false,
     listed: true
 } as const;
 

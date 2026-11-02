@@ -137,11 +137,11 @@ const usagePreset = (usage: HarnessUsage): HarnessPreset =>
         })
     );
 
-// One agent that ALWAYS takes exactly one `todoManage` tool round before
+// One agent that ALWAYS takes exactly one `task` tool round before
 // answering, so a single run makes two model requests. Entry 0 is the tool
 // round's usage, entry 1 the answer's; the harness reports each on a `usage`
 // event and then repeats the LAST one on `done` (the double-count trap).
-// `todoManage` is a CORE tool, declared on the first request without a
+// `task` is a CORE tool, declared on the first request without a
 // toolRequest round (src/harness.todo.test.ts pins that).
 const toolRoundPreset = (usage: readonly [HarnessUsage, HarnessUsage]): HarnessPreset =>
     presetOf('rounds', (settings, progress) =>
@@ -156,7 +156,7 @@ const toolRoundPreset = (usage: readonly [HarnessUsage, HarnessUsage]): HarnessP
                                 type: 'done',
                                 stopReason: 'tool_calls',
                                 toolCalls: [
-                                    { id: 'c1', name: 'todoManage', arguments: '{"action":"list"}' }
+                                    { id: 'c1', name: 'task', arguments: '{}' }
                                 ],
                                 usage: usage[0]
                             }
@@ -482,19 +482,19 @@ describe('SessionStore turns', () => {
             {
                 type: 'tool_call',
                 agent: 'rounds',
-                call: { id: 'c1', name: 'todoManage', arguments: '{"action":"list"}' }
+                call: { id: 'c1', name: 'task', arguments: '{}' }
             },
             { type: 'attempt_commit', agent: 'rounds', attempt: 1, maxAttempts: 11 },
             {
                 type: 'tool_result',
                 agent: 'rounds',
-                name: 'todoManage',
+                name: 'task',
                 callId: 'c1',
                 content:
-                    '{"todos":[],"counts":{"total":0,"completed":0,"remaining":0},"page":{"offset":0,"limit":20,"hasMore":false}}',
+                    '{"tasks":[],"counts":{"total":0,"completed":0,"pending":0},"page":{"offset":0,"limit":20,"hasMore":false}}',
                 // Every EXECUTED call reports its span, inline ones included
                 // (harness.ts deliverTask). The clock is pinned at 2_000, so the
-                // inline todoManage round is exactly 0 ms.
+                // inline task round is exactly 0 ms.
                 durationMs: 0,
                 isError: false,
                 outcome: 'completed'
@@ -615,7 +615,7 @@ describe('SessionStore turns', () => {
                         stream: async function* (request): AsyncGenerator<HarnessStreamEvent> {
                             const last = request.messages[request.messages.length - 1];
 
-                            if (last !== undefined && last.role === 'tool' && last.name === 'todoManage') {
+                            if (last !== undefined && last.role === 'tool' && last.name === 'task') {
                                 // Request 1 is now in flight; the test cancels from here.
                                 secondRequest.resolve();
 
@@ -638,7 +638,7 @@ describe('SessionStore turns', () => {
                                 type: 'done',
                                 stopReason: 'tool_calls',
                                 toolCalls: [
-                                    { id: 'c1', name: 'todoManage', arguments: '{"action":"list"}' }
+                                    { id: 'c1', name: 'task', arguments: '{}' }
                                 ],
                                 usage: first
                             };
@@ -1221,20 +1221,9 @@ describe('SessionStore turns', () => {
                 subagents: [],
                 agents: ['single'],
                 tools: [],
-                coreTools: [
-                    'toolRegistry',
-                    'toolRequest',
-                    'toolList',
-                    'toolManage',
-                    'toolCreate',
-                    'todoManage',
-                    'profileManage',
-                    'chapterManage',
-                    'locationManage',
-                    'agentManage',
-                    'agentResult',
-                    'threadFork'
-                ],
+                // R9-R11: the declared core is the bootstrap pair; the demoted
+                // runtime rows are registered and searchable only.
+                coreTools: ['toolRequest', 'task'],
                 builtin: true,
                 editable: true
             },
@@ -1313,7 +1302,7 @@ describe('SessionStore and the harness registry', () => {
                         model: settings.model,
                         instruction: 'Discover, then read.',
                         stream: scriptedStream([
-                            [{ type: 'done', stopReason: 'tool_calls', toolCalls: [{ id: 'c1', name: 'toolRequest', arguments: '{"tags":["read"]}' }] }],
+                            [{ type: 'done', stopReason: 'tool_calls', toolCalls: [{ id: 'c1', name: 'toolRequest', arguments: '{"names":["reader"]}' }] }],
                             [{ type: 'done', stopReason: 'tool_calls', toolCalls: [{ id: 'c2', name: 'reader', arguments: '{"path":"a.txt"}' }] }],
                             [{ type: 'text', delta: 'first' }, { type: 'done', stopReason: 'stop', toolCalls: [] }],
                             [{ type: 'text', delta: 'second' }, { type: 'done', stopReason: 'stop', toolCalls: [] }]
@@ -1618,21 +1607,22 @@ describe('SessionStore manual tool calls', () => {
         const mine = store.create('single');
         const other = store.create('single');
 
-        expect(await store.callTool(mine.id, 'todoManage', { action: 'add', text: '  only mine ' })).toEqual({
-            todo: { id: '1', text: 'only mine', completed: false },
-            counts: { total: 1, completed: 0, remaining: 1 }
+        expect(await store.callTool(mine.id, 'task', { tasks: [{ text: '  only mine ' }] })).toEqual({
+            tasks: [{ id: '1', text: 'only mine', completed: false }],
+            counts: { total: 1, completed: 0, pending: 1 },
+            page: { offset: 0, limit: 20, hasMore: false }
         });
 
         // The state lives in the session's harness: the same session sees the item,
         // a sibling session does not.
-        expect(await store.callTool(mine.id, 'todoManage', { action: 'list' })).toEqual({
-            todos: [{ id: '1', text: 'only mine', completed: false }],
-            counts: { total: 1, completed: 0, remaining: 1 },
+        expect(await store.callTool(mine.id, 'task', {})).toEqual({
+            tasks: [{ id: '1', text: 'only mine', completed: false }],
+            counts: { total: 1, completed: 0, pending: 1 },
             page: { offset: 0, limit: 20, hasMore: false }
         });
-        expect(await store.callTool(other.id, 'todoManage', { action: 'list' })).toEqual({
-            todos: [],
-            counts: { total: 0, completed: 0, remaining: 0 },
+        expect(await store.callTool(other.id, 'task', {})).toEqual({
+            tasks: [],
+            counts: { total: 0, completed: 0, pending: 0 },
             page: { offset: 0, limit: 20, hasMore: false }
         });
     });
@@ -1648,7 +1638,7 @@ describe('SessionStore manual tool calls', () => {
 
         // toolRequest through the same path enables it for the model, and the
         // snapshot reports the change (the session really was mutated).
-        expect(await store.callTool(session.id, 'toolRequest', { tags: ['text'] })).toEqual({
+        expect(await store.callTool(session.id, 'toolRequest', { names: ['digest'] })).toEqual({
             enabled: ['digest'],
             tools: [{ name: 'digest', description: 'Summarise text.', tags: ['text', 'summary'] }],
             matched: 1,
@@ -1661,7 +1651,7 @@ describe('SessionStore manual tool calls', () => {
         const store = new SessionStore(DEFAULTS, createHarnessRegistry([singlePreset()]));
         const session = store.create('single');
 
-        await expect(store.callTool('missing', 'todoManage', { action: 'list' })).rejects.toMatchObject({
+        await expect(store.callTool('missing', 'task', {})).rejects.toMatchObject({
             status: 404,
             message: 'Unknown session "missing".'
         });
@@ -1674,8 +1664,8 @@ describe('SessionStore manual tool calls', () => {
 
         // A tool that throws keeps its own message: the API layer reports it as
         // ok:false, exactly like a throwing catalogue tool.
-        await expect(store.callTool(session.id, 'todoManage', { action: 'add' })).rejects.toThrow(
-            'todoManage "add" requires a non-empty "text" string.'
+        await expect(store.callTool(session.id, 'task', { tasks: [{}] })).rejects.toThrow(
+            'task "tasks[0]" needs "text" to add a task, or an existing "id" to change one.'
         );
     });
 
@@ -1759,7 +1749,7 @@ describe('SessionStore manual tool calls', () => {
         // held promise is never reported as an unhandled rejection.
         const settled = pending.catch((error: unknown) => error);
 
-        await expect(store.callTool(session.id, 'todoManage', { action: 'list' })).rejects.toMatchObject({
+        await expect(store.callTool(session.id, 'task', {})).rejects.toMatchObject({
             status: 409
         });
 
@@ -1806,7 +1796,7 @@ describe('SessionStore manual tool calls', () => {
 
         // A manual mutation cannot interleave with a live turn: the running
         // transcript depends on the state it would change.
-        await expect(store.callTool(session.id, 'todoManage', { action: 'list' })).rejects.toMatchObject({
+        await expect(store.callTool(session.id, 'task', {})).rejects.toMatchObject({
             status: 409,
             message: 'A task is running in this session; try again when it finishes.'
         });
@@ -1815,9 +1805,9 @@ describe('SessionStore manual tool calls', () => {
         await running;
 
         // Once the turn is done, the same call works.
-        expect(await store.callTool(session.id, 'todoManage', { action: 'list' })).toEqual({
-            todos: [],
-            counts: { total: 0, completed: 0, remaining: 0 },
+        expect(await store.callTool(session.id, 'task', {})).toEqual({
+            tasks: [],
+            counts: { total: 0, completed: 0, pending: 0 },
             page: { offset: 0, limit: 20, hasMore: false }
         });
     });

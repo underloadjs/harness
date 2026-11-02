@@ -33,7 +33,7 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         requiresEndpoint: true,
         agents: ['instruct', 'summarizer'],
         tools: [],
-        coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'delegate'],
+        coreTools: ['toolRequest', 'toolCreate', 'task', 'delegate'],
         primary: 'instruct',
         subagents: ['summarizer'],
         builtin: true,
@@ -337,17 +337,17 @@ it('sends nothing while configuring and discards the drafts on every dismissal',
     await flush();
     await flush();
 
-    // Selecting another agent is a LOCAL view change (and the promotion it implies),
-    // and typing on the way back is local too.
+    // R3: clicking a badge is a LOCAL view change (it neither promotes nor writes), and
+    // typing on the way back is local too.
     openDialog();
 
-    const select = byClass('.agent-dialog-agent-select', 'select');
-    select.value = 'summarizer';
-    select.dispatchEvent(new Event('change', { bubbles: true }));
+    byClass('.agent-dialog-tab[data-agent="summarizer"]', 'button').click();
     expect(instructionBox().value).toBe('Compress into one paragraph.');
+    // Viewing a teammate is not a team edit: the action has nothing to send.
+    expect(patches).toEqual([]);
+    expect(applyAction().disabled).toBe(true);
 
-    select.value = 'instruct';
-    select.dispatchEvent(new Event('change', { bubbles: true }));
+    byClass('.agent-dialog-tab[data-agent="instruct"]', 'button').click();
     typeInstruction('Answer in one sentence.');
 
     // The armed action states what closing costs, so the no-op is not a guess.

@@ -2,24 +2,31 @@
 //
 // WHY THIS FILE EXISTS
 // --------------------
-// fetch has two providers — `native` (a direct GET) and `exa` (Exa's
-// /contents POST) — but only the GET policy lives here: how long a fetch may
-// take, how much of a response is accepted, which content types are readable,
-// what an error may say, and how a URL is validated. The Exa adapter reuses
-// ../websearch/request's JSON plumbing instead, because that file already owns
-// the provider-request policy for api.exa.ai (fixed endpoint, no redirects,
-// sanitized statuses).
+// fetch has three providers — `native` (a direct GET), `exa` (Exa's /contents
+// POST) and `linkup` (Linkup's /v1/fetch POST) — but only the GET policy lives
+// here: how long a fetch may take, how much of a response is accepted, which
+// content types are readable, what an error may say, and how a URL is validated.
+// The two hosted adapters reuse ../websearch/request's JSON plumbing instead,
+// because that file already owns the provider-request policy for api.exa.ai and
+// api.linkup.so (fixed endpoint, no redirects, sanitized statuses).
 //
 // Bounds (S1, same philosophy as websearch): these are constants, not knobs. A
 // tool result must stay small and predictable no matter what the open web
 // returns:
-//   - 512 KiB of response body, enforced while streaming so an oversized page
-//     is never allocated in full, plus a content-length pre-check;
+//   - 100 KiB of response body, enforced while streaming so an oversized page
+//     is never allocated in full, plus a content-length pre-check that rejects
+//     (and cancels) before a single byte is read;
 //   - 24,000 characters of returned content (the character budget is what the
 //     model actually pays; the byte bound is what the process is exposed to);
 //   - 15 s per request, enforced with AbortController and cleaned up in
 //     `finally`; one attempt per user agent, plus a single honest-UA retry when
 //     Cloudflare challenges the browser-impersonating one.
+//
+// 100 KiB (not the 512 KiB the provider requests in ../websearch/request allow)
+// is deliberate: this GET faces arbitrary hosts, and a page that does not fit is
+// a file, not an article. A non-text content type and an oversized body are both
+// refusals, and the tool description points the model at the host's download tool
+// for them instead of raising the bound here.
 //
 // Redirects are FOLLOWED here (up to fetch's implementation default), unlike
 // the fixed-endpoint search requests: a page URL legitimately redirects, and
@@ -35,6 +42,7 @@
 // Cross-references:
 //   - ./native      — the GET flow and the HTML conversion
 //   - ./exa         — Exa /contents wire body + result mapping
+//   - ./linkup      — Linkup /v1/fetch wire body + result mapping
 //   - ./index       — createWebFetchTool: key resolution, validation, dispatch
 //   - ../websearch/request — createRedactor (reused), the search-side twin
 
@@ -43,10 +51,14 @@ import { HarnessError } from '../../util';
 // Per-request budget. One attempt (plus the Cloudflare UA retry), then reported.
 export const FETCH_TIMEOUT_MS = 15_000;
 
-// Response ceiling, in bytes (512 KiB). The body is read through a stream and
+// Response ceiling, in bytes (100 KiB). The body is read through a stream and
 // the budget is checked per chunk, so a host cannot force a full allocation.
-// Content-length is checked too, when the host sends it.
-export const MAX_RESPONSE_BYTES = 512 * 1024;
+// Content-length is checked too, when the host sends it, and an advertised size
+// over this bound is rejected before the body is read at all. Network chunks are
+// not size-guaranteed, so the counter is checked after every chunk and the
+// reader is cancelled the moment the budget is crossed: bytes beyond the budget
+// are never consumed.
+export const MAX_RESPONSE_BYTES = 100 * 1024;
 
 // Returned-content ceiling, in characters. A cut page sets `truncated`.
 export const MAX_CONTENT_CHARS = 24_000;
@@ -97,6 +109,27 @@ const statusFailure = (status: number): HarnessError => {
 
 const oversizedResponse = (): HarnessError =>
     new HarnessError(`fetch received a response larger than ${MAX_RESPONSE_BYTES} bytes.`);
+
+// Best-effort release of a body that is rejected before it is read (a failing
+// status, a declared size over the budget, or an unreadable content type).
+// Without it the connection stays busy downloading bytes the tool has already
+// decided to throw away.
+//
+// Deliberately NOT awaited: cancelling the body of a `Response.clone()` never
+// settles while its sibling branch is unread, and an await here would put the
+// model's error message behind a stream that can outlive the 15 s budget. The
+// source `cancel()` callback still runs synchronously (measured), so "the body
+// was released, and nothing was consumed" remains observable and exact.
+const cancelBody = (response: Response): void => {
+    try {
+        void response.body?.cancel().catch(() => {
+            // The stream may already be closed; the caller's error is the one
+            // that matters.
+        });
+    } catch {
+        // A runtime without a cancellable body: the error path is unaffected.
+    }
+};
 
 // Read a response body without ever holding more than MAX_RESPONSE_BYTES.
 // Same streaming budget as ../websearch/request's reader: chunk-by-chunk byte
@@ -166,10 +199,22 @@ const readBody = async (response: Response, failure: () => HarnessError): Promis
 // A fetched page is only useful to the model as text. Images and binary
 // documents are rejected with one sentence rather than returned as mojibake;
 // svg+xml counts as text because it IS text and often carries readable content.
+// A host that wants the bytes (an image, a PDF, an archive) uses a download tool
+// instead — that is what the fetch description tells the model to do, so this
+// gate and that sentence are one policy stated twice.
 const IMAGE_MIMES = /^(image|audio|video)\//;
+
+// The one image type that IS text, and it has to be checked BEFORE the family
+// rejection: an `image/svg+xml` string matches IMAGE_MIMES, so the exception
+// that used to sit at the bottom of this function was unreachable and a real
+// SVG document was reported as an unsupported content type. Narrow on purpose —
+// every other image/audio/video type still falls through to the rejection, so
+// "non-text is refused" is exactly as strong as before.
+const TEXT_IMAGE_MIME = 'image/svg+xml';
 
 const readableMime = (mime: string): boolean => {
     if (mime.length === 0) return true; // no header: treat the body as text
+    if (mime === TEXT_IMAGE_MIME) return true;
     if (mime === 'application/pdf') return false;
     if (mime.startsWith('application/octet-stream')) return false;
     if (IMAGE_MIMES.test(mime)) return false;
@@ -183,8 +228,7 @@ const readableMime = (mime: string): boolean => {
         mime === 'application/xhtml+xml' ||
         mime === 'application/javascript' ||
         mime === 'application/x-javascript' ||
-        mime === 'application/typescript' ||
-        mime === 'image/svg+xml'
+        mime === 'application/typescript'
     );
 };
 
@@ -269,21 +313,29 @@ export const requestPage = async (url: string, format: 'markdown' | 'text' | 'ht
             response = await send(HONEST_USER_AGENT);
         }
 
-        if (!response.ok) throw statusFailure(response.status);
+        if (!response.ok) {
+            // An error page is HTML noise we never read: release the body so the
+            // connection is not held for it.
+            cancelBody(response);
+
+            throw statusFailure(response.status);
+        }
 
         const declared = Number(response.headers.get('content-length') ?? '');
-        if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) throw oversizedResponse();
+        if (Number.isFinite(declared) && declared > MAX_RESPONSE_BYTES) {
+            // Nothing is read on this path: the advertised size alone is the
+            // rejection, and cancelling stops the download of an oversized page.
+            cancelBody(response);
+
+            throw oversizedResponse();
+        }
 
         const contentType = (response.headers.get('content-type') ?? '').slice(0, MAX_CONTENT_TYPE_CHARS);
 
         const mime = mimeFrom(contentType);
         if (!readableMime(mime)) {
             // Cancel so the socket is not held for a body we will never read.
-            try {
-                await response.body?.cancel();
-            } catch {
-                // Best-effort: the rejection message is what the caller needs.
-            }
+            cancelBody(response);
 
             throw new HarnessError(`fetch does not support this content type (${mime || 'unknown'}).`);
         }

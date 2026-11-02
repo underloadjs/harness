@@ -380,14 +380,24 @@ export const descriptorSourcePath = (name: string): string | undefined =>
 export const isAlwaysDeclared = (descriptor: ToolDescriptor): boolean =>
     descriptor.alwaysDeclared === true;
 
-// True when a runtime row is part of the harness's unconditional core set: declared
-// on every request, registered at startup under either policy. Capability rows
-// (subagents/interaction/forks/threads/web) are excluded, which is what keeps a
-// single-agent preset from advertising a delegation tool it would never declare.
+// True when a runtime row belongs in the set a preset may ADVERTISE as core:
+// registered at startup under either baseline policy AND declaring
+// `visibility: 'core'` in its own entry.
+//
+// R9-R11 FIX: activation alone is not enough. The demoted runtime rows (the
+// record tools, the tool* inventory set, actionRequest, threadFork) stay
+// registered at startup so toolRequest can still enable them, but they are
+// searchable now, so a projection built from activation alone advertised a
+// declaration the harness never makes. Visibility is part of the predicate
+// here, which keeps this projection and harness.ts' visibleCoreTools() in
+// agreement. Capability rows (subagents/interaction/forks/threads/web) are
+// still excluded by activation, which is what keeps a single-agent preset
+// from advertising a delegation tool it would never declare.
 export const isCoreRegistered = (descriptor: ToolDescriptor): boolean =>
     descriptor.group === 'runtime' &&
     descriptor.listed !== false &&
     descriptor.control === undefined &&
+    descriptor.metadata.visibility === 'core' &&
     CORE_DECLARED_ACTIVATIONS.has(descriptor.activation);
 
 // The control marker a runtime entry carries when the harness dispatches it to a

@@ -121,14 +121,22 @@ export type HarnessPreset = {
     ) => Harness;
 };
 
-// How a tool is grouped in the direct-call catalogue. 'Web search' is separate
-// from the presets because search is credential-dependent and opt-in: a host
-// must see at a glance whether this deployment can run it. 'Core tools' holds the
-// harness-owned set (toolRequest, toolCreate, todoManage, delegate), which are
-// listed for review and manual execution but only ever run inside a session. R18:
-// the core FILE tools stay in 'Package presets' and are directly callable, because
-// 'core' visibility does not imply a session binding.
-export type ToolGroup = 'Package presets' | 'Harness tools' | 'Web search' | 'Core tools';
+// How a tool is grouped in the direct-call catalogue. 'Web search' and 'Web fetch'
+// are separate from the presets because they are environment-backed and opt-in: a
+// host must see at a glance whether this deployment can run them. R9-R11: both are
+// declared core WHEN registered, so each needs its own catalogue entry
+// (src/server/harnesses/{websearch,webfetch}.ts) — that is how a preset card can
+// advertise the declaration it will really make. 'Core tools' holds the
+// harness-owned set (toolRequest, task, and the registered-but-searchable rest),
+// which are listed for review and manual execution but only ever run inside a
+// session. R18: the core FILE tools stay in 'Package presets' and are directly
+// callable, because 'core' visibility does not imply a session binding.
+export type ToolGroup =
+    | 'Package presets'
+    | 'Harness tools'
+    | 'Web search'
+    | 'Web fetch'
+    | 'Core tools';
 
 // Whether a catalogue entry can actually run on this host.
 //
@@ -151,7 +159,7 @@ export type ToolAvailability = {
 // definition, which is what keeps "listed" from meaning "pretends to work".
 //
 // `sessionBound` marks the harness-owned CORE tools (R8): toolRegistry,
-// toolRequest, toolCreate, todoManage, delegate. They have no `tool` and can never be called with a
+// toolRequest, toolCreate, task, delegate. They have no `tool` and can never be called with a
 // dummy implementation: they run inside a session's harness, so the server requires
 // a `sessionId` and forwards the call to `harness.executeTool`. R18 keeps the flag
 // off the core file tools and search: they have real implementations and run

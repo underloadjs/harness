@@ -88,7 +88,7 @@
 //   - toolList     — name+description registry view. (every agent, core)
 //   - toolManage   — source/path/edit/reload.        (every agent, core)
 //   - toolCreate   — compile-and-register a tool.    (every agent, core)
-//   - todoManage   — the session todo list.          (every agent, core)
+//   - task         — the session task list.           (every agent, core)
 //   - profileManage — session character profiles.    (every agent, core)
 //   - chapterManage — session chapter tracking.      (every agent, core)
 //   - locationManage — session places/settings.      (every agent, core)
@@ -204,7 +204,7 @@
 // Manual execution (R8): `harness.executeTool(name, parameters)` runs one
 // REGISTERED tool directly, with this harness's context. It is the host/server path
 // behind the UI's Tools tab (server/sessions.ts → executeTool), so a manual
-// toolRequest/toolCreate/todoManage/delegate call changes this session rather
+// toolRequest/toolCreate/task/delegate call changes this session rather
 // than a detached copy. Core file tools (R18) also run here, exactly like a direct
 // call; only the harness-owned set needs session state. Discovery gates the model
 // only: an explicit user call may run a searchable tool that was never enabled.
@@ -213,10 +213,10 @@
 // check, and a tool this harness did not register (delegate without subagents)
 // is an honest error, never a fabricated implementation.
 //
-// todoManage is session state, not catalogue state: a fresh list is created for
+// task is session state, not catalogue state: a fresh list is created for
 // each harness() call, shared by every agent in that harness, and cleared by
 // reset() with the conversation. That is why it is built by a factory closure
-// (core/todo.ts) rather than registered as a module singleton. profileManage,
+// (core/task.ts) rather than registered as a module singleton. profileManage,
 // chapterManage, and locationManage follow the same pattern with their own
 // closures (core/profile.ts, chapter.ts, location.ts).
 //
@@ -240,7 +240,7 @@
 //   - core/tool      — what gets executed, and where tags/visibility live
 //   - core/discovery — the tag ranking behind toolRequest
 //   - core/creation  — compile-and-register behind toolCreate
-//   - core/todo      — the per-harness todo list behind todoManage
+//   - core/task      — the per-harness task list behind the task tool
 //   - types          — Harness, HarnessEvent, HarnessConfiguration
 //
 // This is the only source file at the root of src/. Everything else lives in a
@@ -253,7 +253,12 @@ import {
     tool as defineTool,
     selectTools,
     normalizeTags,
-    toolUiOf,
+    // Tool media (the `download` envelope). ONE unwrap helper for both brands,
+    // so the model path here and the manual path in server/api.ts cannot drift
+    // about what a tool's return value means (it also peels `toolUi()` panels,
+    // which is why `toolUiOf` is no longer imported here).
+    toolMediaDescriptors,
+    unwrapToolResult,
     resolveToolParameters,
     boundToolResult,
     DEFAULT_CREATED_TOOLS_LIMIT,
@@ -263,7 +268,7 @@ import {
     DEFAULT_TOOL_MODE,
     cloneToolSourceRecord,
     supportsToolCompilation,
-    createTodoTool,
+    createTaskTool,
     createProfileTool,
     createChapterTool,
     createLocationTool,
@@ -1973,7 +1978,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     //
     // ORDER is `descriptor.order` (the scan order), which is the historical
     // registration order: toolRegistry, toolRequest, toolList, toolManage,
-    // toolCreate, todo/profile/chapter/location, agentManage/agentResult,
+    // toolCreate, task/profile/chapter/location, agentManage/agentResult,
     // delegate, threadFork, actionRequest, toolCancel, then the presets.
     //
     // LIVE CLOSURES stay exactly where they were: this loop decides WHEN and FROM
@@ -2369,14 +2374,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         }
     }
 
-    // Session todos (R1/R2). One instance per harness: the tool closes over its
-    // own list and id counter, so two harnesses (and therefore two server
-    // sessions) can never share todos. Every agent in this harness calls the same
-    // tool, so the primary and its subagents see one list. reset() below clears
-    // it together with the conversation; nothing is persisted.
-    const todo = createTodoTool();
+    // Session tasks (R1/R2, renamed from todoManage by R9-R11). One instance per
+    // harness: the store closes over its own list and id counter, so two harnesses
+    // (and therefore two server sessions) can never share tasks. Every agent in
+    // this harness calls the same tool, so the primary and its subagents see one
+    // list. reset() below clears it with the conversation, and the snapshot keeps
+    // persisting it under the historical `records.todos` key (version 1 shape).
+    const taskStore = createTaskTool();
 
-    // Session records (profiles, chapters, locations). Same lifecycle as the todo
+    // Session records (profiles, chapters, locations). Same lifecycle as the task
     // list: one factory instance per harness, shared by every agent here, and
     // cleared by reset(). Separate closets and separate id sequences, so a
     // profile id and a chapter id may both be "1" without ambiguity.
@@ -2425,12 +2431,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return operation.execute(context);
         },
         executeRecordTool: (
-            name: 'todoManage' | 'profileManage' | 'chapterManage' | 'locationManage',
+            name: 'task' | 'profileManage' | 'chapterManage' | 'locationManage',
             context: ToolContext
         ) => {
             switch (name) {
-                case 'todoManage':
-                    return todo.tool.execute(context);
+                case 'task':
+                    return taskStore.tool.execute(context);
                 case 'profileManage':
                     return profile.tool.execute(context);
                 case 'chapterManage':
@@ -3206,7 +3212,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // -----------------------------------------------------------------------
     //
     // A THREAD is one persistent, agent-owned conversation. The session (one
-    // harness) owns the shared memory — tools, todo list, profiles, chapters,
+    // harness) owns the shared memory — tools, task list, profiles, chapters,
     // locations, discovery, creation budget — and every thread shares it; only
     // the TRANSCRIPT and the execution slot are per thread.
     //
@@ -4201,13 +4207,24 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
 
     // Insert one real result into the canonical transcript. Returns false when
     // there is nothing to insert (already answered, or originating block gone).
+    //
+    // `media` is the validated attachment list a tool attached with
+    // `toolMedia()` (core/tool-media.ts). The key is written ONLY when media
+    // exists: a medialess result keeps the exact historical
+    // `{ role, content, toolCallId, name }` shape, which is what every existing
+    // transcript assertion, snapshot fixture and branch record quotes.
+    //
+    // The bytes are stored, NOT serialized into `content`, so the 64 KiB
+    // model-facing text budget never truncates them and the transcript never
+    // pays JSON-escaped base64 twice.
     const insertToolMessage = (
         brain: Agent,
         call: HarnessToolCall,
         content: string,
         // N6: branch transcripts are ephemeral (snapshot v1 excludes them), so a
         // branch delivery must not ask a server to persist an agent_message.
-        notify = true
+        notify = true,
+        media?: HarnessAttachment[]
     ): boolean => {
         if (hasToolResult(brain, call.id)) return false;
 
@@ -4218,7 +4235,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             role: 'tool',
             content,
             toolCallId: call.id,
-            name: call.name
+            name: call.name,
+            ...(media === undefined || media.length === 0 ? {} : { attachments: media })
         });
 
         // Snapshot-managed mutation: notify after the splice, exactly like the
@@ -4382,6 +4400,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         let content: string;
         let outcome: HarnessToolOutcome;
         let panels: ToolUiPanel[] | undefined;
+        // Validated media a tool attached with `toolMedia()`. Stored on the tool
+        // MESSAGE (see insertToolMessage), reported on the event as descriptors
+        // only, and never part of `content` — that separation is the whole
+        // point of the envelope.
+        let media: HarnessAttachment[] | undefined;
 
         if (task.status === 'cancelled') {
             // A targeted cancellation is a result the model must see: without it
@@ -4409,10 +4432,15 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // missing tool message cannot abort the run (the delivery catch would
             // otherwise park a deliveryError and lose this result).
             try {
-                // Same unwrap/cap as the historical synchronous path (R10/R20.2).
-                const ui = toolUiOf(task.result);
-                content = boundToolResult(serialize(ui === undefined ? task.result : ui.content)).content;
-                panels = ui?.panels;
+                // Same unwrap/cap as the historical synchronous path (R10/R20.2),
+                // now for BOTH brands: `unwrapToolResult` peels `toolMedia()` and
+                // `toolUi()` in any nesting order and hands back the plain value.
+                // The bytes are NOT serialized here, so `boundToolResult` can
+                // never truncate a downloaded file into a filename.
+                const unwrapped = unwrapToolResult(task.result);
+                content = boundToolResult(serialize(unwrapped.content)).content;
+                panels = unwrapped.panels;
+                media = unwrapped.media;
                 outcome = 'completed';
             } catch (error) {
                 content = boundToolResult(
@@ -4427,7 +4455,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // two fields cannot drift apart.
         const isError = outcome !== 'completed';
 
-        insertToolMessage(brain, call, content, run.branch === undefined);
+        insertToolMessage(brain, call, content, run.branch === undefined, media);
 
         // The outcome is CANONICAL at this point (P1-A). Wake the loop BEFORE the
         // reporter runs: a slow progress callback must not be able to keep
@@ -4458,6 +4486,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             // consumers can render 0ms without special-casing background work.
             durationMs,
             ...(panels === undefined ? {} : { ui: panels }),
+            // DESCRIPTORS ONLY (id/kind/name/mime/size). The bytes live once, on
+            // the committed tool message; an event is JSON round-tripped through
+            // sessions.copyEvent and persisted with the turn, so echoing base64
+            // here would multiply a 20 MiB file across the whole journal.
+            ...(media === undefined ? {} : { media: toolMediaDescriptors(media) }),
             ...(pending.length === 0 ? {} : { pending })
         });
 
@@ -6715,7 +6748,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             ...(agentResults.length === 0 ? {} : { agentResults }),
             ...threadFields,
             records: {
-                todos: todo.snapshot(),
+                todos: taskStore.snapshot(),
                 profiles: profile.snapshot(),
                 chapters: chapter.snapshot(),
                 locations: location.snapshot()
@@ -7018,7 +7051,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // point (possibly all deleted); those tools were prepared and published
         // above without compiling after mutation.
 
-        todo.restore(next.records.todos);
+        taskStore.restore(next.records.todos);
         profile.restore(next.records.profiles);
         chapter.restore(next.records.chapters);
         location.restore(next.records.locations);
@@ -7071,7 +7104,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     // with the session it belongs to, exactly like the model would, but without
     // spending a discovery round trip. The server's `POST /tools/:name` calls this
     // through its session for the session-bound harness-owned tools, which is what
-    // makes a manual toolRequest/toolCreate/todoManage/delegate call mutate
+    // makes a manual toolRequest/toolCreate/task/delegate call mutate
     // THIS harness instead of a detached copy. Core file tools use the ordinary
     // direct-call path and do not require a session.
     //
@@ -7330,7 +7363,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // reset() is "start over": EVERY agent's conversation goes back to its
         // seeded instructions (R12 — a subagent used to keep its transcript, which
         // leaked one session into the next), tool discovery is forgotten, the
-        // session todo list and record stores (profiles, chapters, locations) are
+        // session task list and record stores (profiles, chapters, locations) are
         // cleared (ids restart at "1"), and the agent-result registry is emptied
         // (invocation ids are session-scoped), so the next run begins from the core
         // set and empty session state.
@@ -7357,7 +7390,7 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             for (const brain of Object.values(agents)) brain.reset();
             activeTools.clear();
             discoveryOffsets.clear();
-            todo.reset();
+            taskStore.reset();
             profile.reset();
             chapter.reset();
             location.reset();
@@ -7441,9 +7474,17 @@ export {
     compileToolSource,
     createDynamicTool,
     toolUi,
-    toolUiOf
+    toolUiOf,
+    // Tool media (`download` hand-off): a tool author builds the envelope, the
+    // harness/manual boundary unwraps it, and every consumer quotes the same
+    // descriptor projection.
+    toolMedia,
+    toolMediaDescriptors,
+    toolMediaOf,
+    unwrapToolResult
 } from './core';
 export type { ToolSelectionOptions, ToolSelectionQuery, ToolSelectionResult } from './core';
+export type { ToolMediaExtraction, ToolResultExtraction } from './core';
 // R3a persistence: the schema version a caller stores beside a snapshot. The
 // snapshot types (HarnessSnapshot, HarnessAgentSnapshot, ...) and the per-store
 // state types are part of `export type * from './types'` below.
@@ -7470,7 +7511,7 @@ export {
 export type { BoundedToolResult, SchemaCheck, ToolArgumentMode } from './core';
 // The session record factories are public too, so a host can build the same
 // stores the harness registers (e.g. for a server-side tool or a test). They
-// mirror the core/index.ts exports; todoManage's factory stays internal to keep
+// mirror the core/index.ts exports; task's factory stays internal to keep
 // this change scoped.
 export { createProfileTool, createChapterTool, createLocationTool } from './core';
 // R4 cross-thread chat descriptor. The tool is registered CONDITIONALLY (once a
@@ -7494,10 +7535,18 @@ export {
     grep,
     shell,
     gitDiff,
+    // Core file download with the multimodal hand-off (R3/R4). Declared on every
+    // request because the entry registers `activation: 'always'` and is
+    // `visibility: 'core'`; it needs no credential.
+    download,
     createWebSearchTool,
     WEB_SEARCH_METADATA,
     WEB_SEARCH_TOOL_NAME,
     createWebFetchTool,
+    // R9-R11: the static native-shaped copy, for a host (or the server catalogue)
+    // that must LIST fetch before the `webfetch` opt-in exists. Same role as
+    // WEB_SEARCH_METADATA plays for search.
+    WEB_FETCH_METADATA,
     WEB_FETCH_TOOL_NAME,
     presetTools
 } from './tools';

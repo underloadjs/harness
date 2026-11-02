@@ -4,8 +4,8 @@
 // These tests sit next to harness() because they pin harness integration, while
 // src/core/profile.test.ts, chapter.test.ts, and location.test.ts cover the tool
 // implementations:
-//   - all three are core, declared on the very first request, immediately after
-//     todoManage;
+//   - all three stay registered but are searchable, so they are absent from the
+//     first request until toolRequest opens their tags (R9-R11);
 //   - state persists across harness calls and is shared by every agent;
 //   - a second harness starts empty; reset() clears all three stores and restarts
 //     their id sequences;
@@ -50,29 +50,27 @@ const declaredNames = (request: HarnessStreamRequest | undefined): string[] =>
 const brain = (stream: HarnessStream, extra: Record<string, unknown> = {}): Agent =>
     agent({ model: 'merge/ds4-flash', stream, ...extra });
 
+// Tool results, in the order the model received them. Every scripted turn that
+// calls a tool appends one of these, so the tests can pin exact envelopes.
+const toolResults = (agent: Agent): string[] =>
+    agent.messages.filter((line) => line.role === 'tool').map((line) => line.content);
+
 // A harness with no presets, so the registry is exactly the core tools plus
 // whatever a test adds.
 const quiet = (entry: Agent, tools: Record<string, any> = {}) =>
     harness({ agents: { writer: entry }, tools, presets: false });
 
+// R9-R11: the record tools are registered and searchable, not declared, so the
+// first request only offers the bootstrap plus the session plan.
 const CORE_ORDER = [
-    'toolRegistry',
     'toolRequest',
-    'toolList',
-    'toolManage',
-    'toolCreate',
-    'todoManage',
-    'profileManage',
-    'chapterManage',
-    'locationManage',
-    'agentManage',
-    'agentResult'
+    'task'
 ];
 
-// N6: threadFork is core for every agent; delegate stays primary-only and is
-// declared BEFORE threadFork (registration order).
-const CORE_ORDER_PRIMARY = [...CORE_ORDER, 'delegate', 'threadFork'];
-const CORE_ORDER_SUBAGENT = [...CORE_ORDER, 'threadFork'];
+// delegate stays primary-only and is declared when the harness has subagents;
+// threadFork was demoted with the rest of the runtime set.
+const CORE_ORDER_PRIMARY = [...CORE_ORDER, 'delegate'];
+const CORE_ORDER_SUBAGENT = [...CORE_ORDER];
 
 // R9 bounded shapes (src/core/{profile,chapter,location}.ts):
 //   list  -> { <kind>s, counts, page }  (default 20, max 100, 64 KiB page budget)
@@ -93,13 +91,17 @@ const emptyLocations = { locations: [], counts: { total: 0 }, page: page() };
 const ELENA = { id: '1', name: 'Elena', description: 'A cartographer.', traits: [], notes: '' };
 
 describe('session record tools', () => {
-    it('are core and declared on the first request immediately after todoManage', async () => {
+    it('are searchable and only reach the model after toolRequest opens their tags', async () => {
         const seen: HarnessStreamRequest[] = [];
         const entry = brain(
             scripted(
                 [
+                    // One toolRequest is enough: the 'profile' tag opens exactly
+                    // profileManage (chapterManage and locationManage have their own
+                    // 'chapter' and 'location' tags).
+                    callTool('c1', 'toolRequest', '{"tags":["profile"]}'),
                     callTool(
-                        'c1',
+                        'c2',
                         'profileManage',
                         '{"action":"add","name":"Elena","description":"A cartographer."}'
                     ),
@@ -110,17 +112,21 @@ describe('session record tools', () => {
         );
         const writer = quiet(entry);
 
-        expect(writer.tools.profileManage.visibility).toBe('core');
-        expect(writer.tools.chapterManage.visibility).toBe('core');
-        expect(writer.tools.locationManage.visibility).toBe('core');
+        // Registered and searchable, never declared on their own.
+        expect(writer.tools.profileManage.visibility).toBe('searchable');
+        expect(writer.tools.chapterManage.visibility).toBe('searchable');
+        expect(writer.tools.locationManage.visibility).toBe('searchable');
 
         await writer('remember Elena');
 
-        // toolRequest is never called, yet the record tools were declared.
+        // The first request is bootstrap-only; the second carries the one record
+        // tool the 'profile' tag opened (chapterManage and locationManage have their
+        // own tags).
         expect(declaredNames(seen[0])).toEqual(CORE_ORDER_SUBAGENT);
-        expect((entry.messages[2] as { content: string }).content).toBe(
-            `{"profile":${JSON.stringify(ELENA)},"counts":{"total":1}}`
-        );
+        expect(declaredNames(seen[1])).toEqual([...CORE_ORDER_SUBAGENT, 'profileManage']);
+
+        // The add the model asked for, verbatim.
+        expect(toolResults(entry)[1]).toBe(`{"profile":${JSON.stringify(ELENA)},"counts":{"total":1}}`);
     });
 
     it('share one store of each kind with every agent in the same harness', async () => {
@@ -146,6 +152,9 @@ describe('session record tools', () => {
         const entry = brain(
             scripted(
                 [
+                    // Enablement is harness-wide: one toolRequest is enough for the
+                    // researcher's later call to be accepted.
+                    callTool('c0', 'toolRequest', '{"tags":["profile"]}'),
                     callTool(
                         'c1',
                         'profileManage',
@@ -174,10 +183,17 @@ describe('session record tools', () => {
         });
 
         // Configured tools precede the harness-owned set; delegate is
-        // primary-only, and threadFork follows it in registration order.
+        // primary-only, and threadFork was demoted with the runtime set.
         // `peek` was configured after the baseline, so it follows it.
         expect(declaredNames(writerSeen[0])).toEqual([...CORE_ORDER_PRIMARY, 'peek']);
-        expect(declaredNames(researcherSeen[0])).toEqual([...CORE_ORDER_SUBAGENT, 'peek']);
+        // The researcher's run starts after the enablement, so profileManage is
+        // declared for it too: configured tools first, then the record tool the
+        // 'profile' tag opened.
+        expect(declaredNames(researcherSeen[0])).toEqual([
+            ...CORE_ORDER_SUBAGENT,
+            'peek',
+            'profileManage'
+        ]);
     });
 
     it('keeps records across calls, isolates harnesses, and clears on reset', async () => {
@@ -296,15 +312,34 @@ describe('session record tools', () => {
             await expect(writer.executeTool(name, {})).resolves.toBe(1);
         }
 
-        // The quiet registry is exactly the core set, in order, plus the
-        // conditional toolCancel baseline.
+        // The quiet registry is the harness-owned set in registration order: the
+        // runtime tools (including the demoted, searchable ones) plus the
+        // conditional toolCancel baseline. delegate and actionRequest are absent
+        // because this harness has no subagents.
         const writer = quiet(brain(scripted([answer('hi')])));
-        expect(Object.keys(writer.tools)).toEqual([...CORE_ORDER_SUBAGENT, 'toolCancel']);
+        expect(Object.keys(writer.tools)).toEqual([
+            'toolRegistry',
+            'toolRequest',
+            'toolList',
+            'toolManage',
+            'toolCreate',
+            'task',
+            'profileManage',
+            'chapterManage',
+            'locationManage',
+            'agentManage',
+            'agentResult',
+            'threadFork',
+            'toolCancel'
+        ]);
     });
 
     it('turns invalid record input into recoverable tool results', async () => {
         const entry = brain(
             scripted([
+                // The trio is searchable, so the model opens the tags first; the
+                // three invalid calls then exercise the tools themselves.
+                callTool('c0', 'toolRequest', '{"tags":["chapter","profile","location"]}'),
                 callTool('c1', 'chapterManage', '{"action":"add","title":"No summary"}'),
                 callTool('c2', 'profileManage', '{"action":"update","id":"99","name":"Nobody"}'),
                 callTool('c3', 'locationManage', '{"action":"add","name":"Nowhere"}'),
@@ -317,12 +352,14 @@ describe('session record tools', () => {
 
         expect(message.content).toBe('recovered');
 
-        const toolMessages = entry.messages.filter((line) => line.role === 'tool');
-        expect(toolMessages.map((entry) => entry.content)).toEqual([
-            'Tool "chapterManage" failed: chapterManage "add" requires a non-empty "summary" string.',
-            'Tool "profileManage" failed: profileManage has no profile with id "99".',
+        const results = toolResults(entry);
+        expect(results[1]).toBe(
+            'Tool "chapterManage" failed: chapterManage "add" requires a non-empty "summary" string.'
+        );
+        expect(results[2]).toBe('Tool "profileManage" failed: profileManage has no profile with id "99".');
+        expect(results[3]).toBe(
             'Tool "locationManage" failed: locationManage "add" requires a non-empty "description" string.'
-        ]);
+        );
 
         // Nothing was created by the failed calls.
         expect(await writer.executeTool('profileManage', { action: 'list' })).toEqual(emptyProfiles);

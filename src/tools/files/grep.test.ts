@@ -17,7 +17,11 @@
 //     regex that stops a catastrophic pattern instead of hanging the process;
 //   - argument rules (T16): a non-object argument is rejected rather than defaulted,
 //     empty `patterns`/`paths` arrays are rejected rather than matching nothing, and
-//     patterns are matched relative to EACH root (results are root-prefixed).
+//     patterns are matched relative to EACH root (results are root-prefixed);
+//   - `.gitignore` files AT OR BELOW the root are honored (./gitignore.ts): an ignored
+//     path is never listed and never opened, while a root the caller NAMES is still
+//     walked because the ignore file above it is out of scope. The `MARK` fixtures at
+//     the bottom of this file pin both halves of that rule.
 //
 // The fixture tree is the process cwd for this file, so roots are relative and the
 // results are the documented root-prefixed relative paths (the same presentation
@@ -88,6 +92,34 @@ beforeAll(async () => {
     await seed('eol/crlf.txt', 'CRNEEDLE one\r\nplain line\r\nCRNEEDLE two\r\n');
     await seed('eol/big.txt', `${'.'.repeat(1024 * 1024)}BIGNEEDLE\n`);
 
+    // The `.gitignore` fixtures, on their own `MARK` token so none of the `TODO`
+    // expectations above move. Rules cover every interesting shape at once: a
+    // directory-only rule (`dist/`), an anchored directory rule (`/Temp/`), a
+    // depth-free extension rule (`*.log`) with its negation (`!keep.log`), and the
+    // name that is also on the walker's skip list (`node_modules/`).
+    await seed('.gitignore', 'dist/\n/Temp/\n*.log\n!keep.log\nnode_modules/\n');
+
+    // The two files that survive every rule: a plain one and a negated one.
+    await seed('notes.ts', 'MARK source\n');
+    await seed('keep.log', 'MARK kept-log\n');
+
+    // Reached by the walk, then skipped by grep's own binary policy rather than by an
+    // ignore rule — the exact control for `dist/binary.ts` below.
+    await seed('binary.ts', 'MARK binary\u0000\n');
+
+    // Each of these is `MARK`-bearing and only reachable through a named root.
+    await seed('dist/hidden.ts', 'MARK dist\n');
+    await seed('Temp/scratch.ts', 'MARK scratch\n');
+    await seed('a.log', 'MARK ignored-log\n');
+    await seed('node_modules/pkg/i.js', 'MARK dep\n');
+
+    // `dist/binary.ts` is deliberately tiny (the 1 MiB read cap can therefore never
+    // explain its absence) and byte-identical to the non-ignored sibling above, so the
+    // ONLY difference between the two is the `dist/` rule. `dist/huge.ts` crosses the
+    // 1 MiB cap on purpose as well: an ignored oversized file must cost nothing.
+    await seed('dist/binary.ts', 'MARK binary\u0000\n');
+    await seed('dist/huge.ts', `MARK ${'h'.repeat(1024 * 1024)}\n`);
+
     try {
         await symlink(join(workdir, 'src'), join(workdir, 'src-alias'), 'dir');
         rootAlias = 'src-alias';
@@ -129,7 +161,7 @@ describe('grep', () => {
                     type: 'array',
                     items: { type: 'string' },
                     description:
-                        'Root directories to walk, absolute or relative to the working directory, in the order they are visited. Results are prefixed with the root that found them. Defaults to ["."].'
+                        'Root directories to walk, absolute or relative to the working directory, in the order they are visited. Results are prefixed with the root that found them. A root you name explicitly is searched even when a .gitignore above it ignores that directory. Defaults to ["."].'
                 },
                 maxResults: {
                     type: 'number',
@@ -144,7 +176,14 @@ describe('grep', () => {
         // Beside glob (210) so the two search presets enumerate together, and NOT
         // session-bound, exactly like the tool it replaces.
         expect(GREP_METADATA.description).toContain('{ "matches": [...], "truncated": boolean');
-        expect(GREP_METADATA.description).toContain('Does not read .gitignore files');
+
+        // The old promise "Does not read .gitignore files" is withdrawn, and the exact
+        // replacement sentence is part of the published contract, so both halves are
+        // pinned: the new wording is present and the old wording is gone. The glob/tool
+        // split sentence after it must survive the rewrite untouched.
+        expect(GREP_METADATA.description).toContain('Reads .gitignore files at or below each root');
+        expect(GREP_METADATA.description).not.toContain('Does not read .gitignore files');
+        expect(GREP_METADATA.description).toContain('Does not list file names (use glob for that).');
     });
 
     it('reports the byte budget it enforces as exported constants', () => {
@@ -535,6 +574,158 @@ describe('grep', () => {
             ],
             truncated: false,
             bytes: 1024,
+            contentBudget: 65536
+        });
+    });
+});
+
+// The `.gitignore` scope rule is the whole contract: rules come ONLY from files at or
+// below the root, so the same directory is invisible from `paths: ['.']` and fully
+// searchable from `paths: ['dist']`. Both directions are asserted, because either one
+// alone is consistent with a broken walk.
+describe('grep - .gitignore scoping', () => {
+    it('excludes every path an ignore rule covers under the default root', async () => {
+        // From '.', the fixture .gitignore prunes `dist/` (directory rule), `/Temp/`
+        // (anchored directory rule) and `node_modules/`, and `*.log` excludes a.log —
+        // while keep.log survives because `!keep.log` is the LAST matching rule. The
+        // result is exactly the two survivors, in walk order (`keep.log` sorts before
+        // `notes.ts`), and nothing else: root binary.ts is reached but skipped as
+        // binary, and the .gitignore file itself holds no MARK.
+        await expect(grep({ pattern: 'MARK', paths: ['.'], maxResults: 100 })).resolves.toEqual({
+            matches: [
+                { path: 'keep.log', line: 1, text: 'MARK kept-log', textTruncated: false, bytes: 13 },
+                { path: 'notes.ts', line: 1, text: 'MARK source', textTruncated: false, bytes: 11 }
+            ],
+            truncated: false,
+            bytes: 24,
+            contentBudget: 65536
+        });
+    });
+
+    it('searches a deliberately named root that an enclosing .gitignore ignores', async () => {
+        // All three roots are named by the caller, so the .gitignore ABOVE them is out of
+        // scope and is never loaded — the ripgrep/OpenCode behaviour that makes an
+        // ignored build or scratch directory still searchable on purpose.
+        await expect(grep({ pattern: 'MARK', paths: ['Temp'] })).resolves.toEqual({
+            matches: [
+                { path: 'Temp/scratch.ts', line: 1, text: 'MARK scratch', textTruncated: false, bytes: 12 }
+            ],
+            truncated: false,
+            bytes: 12,
+            contentBudget: 65536
+        });
+
+        await expect(grep({ pattern: 'MARK', paths: ['dist'] })).resolves.toEqual({
+            matches: [
+                { path: 'dist/hidden.ts', line: 1, text: 'MARK dist', textTruncated: false, bytes: 9 }
+            ],
+            truncated: false,
+            bytes: 9,
+            contentBudget: 65536
+        });
+
+        // node_modules is BOTH on the fixed name-skip list and ignored here, so a result
+        // proves the relaxation (./glob.ts rootTargetsSkippedDirectory) as well: the
+        // neighbour `pkg/index.js` carries `TODO`, and only i.js carries MARK, so the
+        // single hit is the deliberate root's own content, not a leaked default walk.
+        await expect(grep({ pattern: 'MARK', paths: ['node_modules'] })).resolves.toEqual({
+            matches: [
+                {
+                    path: 'node_modules/pkg/i.js',
+                    line: 1,
+                    text: 'MARK dep',
+                    textTruncated: false,
+                    bytes: 8
+                }
+            ],
+            truncated: false,
+            bytes: 8,
+            contentBudget: 65536
+        });
+    });
+
+    it('applies the ignore filter together with the glob filter and the negation', async () => {
+        // `*.log` is a NAME filter and `*.log` is also an ignore rule, so only the file
+        // the `!` re-includes can appear. A result that ignored the negation would list
+        // a.log too; a result that ignored the name filter would list every survivor.
+        await expect(grep({ pattern: 'MARK', patterns: ['*.log'], paths: ['.'] })).resolves.toEqual({
+            matches: [
+                { path: 'keep.log', line: 1, text: 'MARK kept-log', textTruncated: false, bytes: 13 }
+            ],
+            truncated: false,
+            bytes: 13,
+            contentBudget: 65536
+        });
+    });
+
+    it('never opens a file an ignore rule excludes', async () => {
+        // The decisive pair. dist/hidden.ts is small and plain text, so no read cap and
+        // no binary rule can explain the empty result below — only "the walker never
+        // yielded the path" does. Rooting AT dist reads the very same file and matches it,
+        // which is what turns the empty array into proof instead of a coincidence.
+        await expect(grep({ pattern: 'MARK', patterns: ['hidden.ts'] })).resolves.toEqual({
+            matches: [],
+            truncated: false,
+            bytes: 0,
+            contentBudget: 65536
+        });
+
+        await expect(grep({ pattern: 'MARK', patterns: ['hidden.ts'], paths: ['dist'] })).resolves.toEqual({
+            matches: [
+                { path: 'dist/hidden.ts', line: 1, text: 'MARK dist', textTruncated: false, bytes: 9 }
+            ],
+            truncated: false,
+            bytes: 9,
+            contentBudget: 65536
+        });
+
+        // The two oversized/binary neighbours under the same ignored directory are also
+        // absent by name, so the rule prunes the subtree instead of filtering one entry:
+        // dist/huge.ts crosses the 1 MiB read cap and dist/binary.ts is byte-identical to
+        // the reachable root sibling binary.ts (which grep skips as binary), so the
+        // ignore rule is the only difference between those two paths.
+        await expect(grep({ pattern: 'MARK', patterns: ['huge.ts'] })).resolves.toEqual({
+            matches: [],
+            truncated: false,
+            bytes: 0,
+            contentBudget: 65536
+        });
+        await expect(grep({ pattern: 'MARK', patterns: ['binary.ts'] })).resolves.toEqual({
+            matches: [],
+            truncated: false,
+            bytes: 0,
+            contentBudget: 65536
+        });
+    });
+
+    it('keeps the ignore scope per root, in caller order', async () => {
+        // Two roots, two fresh matchers (./search.ts). Root '.' has `/Temp/` loaded and
+        // therefore never sees Temp/scratch.ts; root 'Temp' is the named-root escape
+        // hatch, so the file appears exactly once, contributed by the second root and
+        // prefixed with it. Order is the documented root order, and the first root keeps
+        // any path both could reach.
+        await expect(grep({ pattern: 'MARK', paths: ['.', 'Temp'] })).resolves.toEqual({
+            matches: [
+                { path: 'keep.log', line: 1, text: 'MARK kept-log', textTruncated: false, bytes: 13 },
+                { path: 'notes.ts', line: 1, text: 'MARK source', textTruncated: false, bytes: 11 },
+                { path: 'Temp/scratch.ts', line: 1, text: 'MARK scratch', textTruncated: false, bytes: 12 }
+            ],
+            truncated: false,
+            bytes: 36,
+            contentBudget: 65536
+        });
+
+        // Reversed roots: the same three files, re-ordered, and the scratch match now
+        // arrives first. A shared matcher across roots would have lost it in the first
+        // root's rules, which is the failure this direction catches.
+        await expect(grep({ pattern: 'MARK', paths: ['Temp', '.'] })).resolves.toEqual({
+            matches: [
+                { path: 'Temp/scratch.ts', line: 1, text: 'MARK scratch', textTruncated: false, bytes: 12 },
+                { path: 'keep.log', line: 1, text: 'MARK kept-log', textTruncated: false, bytes: 13 },
+                { path: 'notes.ts', line: 1, text: 'MARK source', textTruncated: false, bytes: 11 }
+            ],
+            truncated: false,
+            bytes: 36,
             contentBudget: 65536
         });
     });

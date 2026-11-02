@@ -36,9 +36,14 @@ export type HarnessAttachment = {
     // Stable, opaque, unique within one turn (used by the client to update a
     // preview in place and by snapshots to round-trip).
     id: string;
-    // What the attachment IS. `file` is representable but not transportable:
-    // the transport refuses it with an explicit unsupported error rather than
-    // stringifying binary data.
+    // What the attachment IS. `file` is representable in the transcript, and how
+    // the transport treats it depends on the profile the list came from: an
+    // UPLOAD `file` is refused with an explicit unsupported error (a browser may
+    // not push an arbitrary binary into a request body), while a tool-media
+    // `file` attached by `download` travels as the OpenAI-compatible file part
+    // (`{ type: 'file', file: { filename, file_data } }`) — whether the provider
+    // accepts that part is the provider's decision, answered with an explicit
+    // error rather than a silent drop.
     kind: 'image' | 'video' | 'audio' | 'pdf' | 'file';
     // The text marker as it appears in the user prompt: "[Image 1]".
     marker: string;
@@ -50,6 +55,46 @@ export type HarnessAttachment = {
     size: number;
     // Raw canonical base64 bytes (no prefix, no whitespace).
     data: string;
+};
+
+// The byte/count profile one attachment list is validated against.
+//
+// TWO profiles exist because the two sources of bytes have different trust and
+// different transport paths, and they must not be conflated:
+//
+//   UPLOAD   — a browser composer / HTTP submit. Public input: bounded hard,
+//              because the base64 arrives inside a JSON request body that the
+//              server has to buffer (`MAX_SUBMIT_BODY_BYTES`).
+//   DOWNLOAD — bytes this process fetched itself through the `download` tool.
+//              Trusted-side, streamed and capped at the source, and it never
+//              enters a submit body, so a single file may be five times larger.
+//
+// `shared/attachments.ts` owns the numbers and enforces them in one place; this
+// is the shape owner so the validator, the harness, the snapshot reader, the
+// branch materializer and the transport all quote the SAME profile type.
+export type HarnessAttachmentLimits = {
+    // Decoded byte ceiling for ONE attachment.
+    perAttachmentBytes: number;
+    // Decoded byte ceiling for one whole attachment list (one turn, or the one
+    // synthetic user message the transport builds from a tool block).
+    totalBytes: number;
+    // How many entries one list may hold.
+    count: number;
+};
+
+// The model-facing projection of tool media carried on a `tool` message. The
+// bytes stay on the transcript (and in the snapshot), but NOT on a progress
+// event: `sessions.copyEvent` JSON round-trips every event twice and turn
+// records are persisted, so a 20 MiB download would become ~100 MB of
+// serialized JSON per delivered call. A client renders this descriptor and
+// reaches the bytes through the transcript when it needs them.
+export type ToolMediaDescriptor = {
+    id: string;
+    kind: HarnessAttachment['kind'];
+    name: string;
+    mime: string;
+    // Decoded byte length, always < the download profile's per-attachment cap.
+    size: number;
 };
 
 // A tool invocation requested by the model. `arguments` stays a raw JSON string
@@ -95,6 +140,24 @@ export type HarnessMessage =
           content: string;
           toolCallId: string;
           name: string;
+          // Media a tool produced OUT OF BAND (the `download` preset, via
+          // `toolMedia()`). It is deliberately NOT part of `content`: the
+          // model-facing 64 KiB result budget (core/result-budget.ts) bounds
+          // serialized TEXT only, so a 20 MiB image can never be truncated or
+          // reduced to a filename by it.
+          //
+          // A tool message stays a valid plain-text tool response on the wire.
+          // The transport flushes these attachments as a clearly labelled
+          // USER-role multimodal message AFTER the complete contiguous tool
+          // block, which is what keeps strict tool-call pairing intact
+          // (transport/openai.ts).
+          //
+          // The key is OMITTED when there is no media, so every medialess tool
+          // result (and every pre-media transcript, snapshot, branch record and
+          // test fixture) keeps its exact previous shape. Validated with the
+          // DOWNLOAD profile at delivery (core/tool-media.ts), on restore
+          // (core/snapshot.ts) and on fork (core/branch.ts).
+          attachments?: HarnessAttachment[];
       };
 
 // A finished assistant turn. This is the value the harness resolves to and the
@@ -725,10 +788,11 @@ export type HarnessToolRuntime = {
     // use the configured provider can ignore them.
     search: (context: ToolContext) => Promise<unknown>;
     fetch: (context: ToolContext) => Promise<unknown>;
-    // Session record stores (todo/profile/chapter/location) executed by their
+    // Session record stores (task/profile/chapter/location) executed by their
     // source entries. State stays harness-owned and is cleared by reset().
+    // R9-R11: `task` is now `task`; the other three names are unchanged.
     executeRecordTool: (
-        name: 'todoManage' | 'profileManage' | 'chapterManage' | 'locationManage',
+        name: 'task' | 'profileManage' | 'chapterManage' | 'locationManage',
         context: ToolContext
     ) => Promise<unknown>;
 };
@@ -964,58 +1028,108 @@ export type ToolUiEnvelope<TContent = unknown> = {
 };
 
 // ---------------------------------------------------------------------------
-// todoManage (per-harness session todos)
+// Tool media: the same branded-envelope idea (R20.2) for BYTES, not panels
 // ---------------------------------------------------------------------------
 //
-// A harness-specific incremental todo API. It is intentionally NOT OpenCode's
-// experimental `todowrite`: actions mutate one item at a time, ids are stable
-// strings, and the list is session state rather than full-list replacement.
-// See src/core/todo.ts and README.md for the source-backed reference.
+// A tool that fetched real file data returns `toolMedia(result, attachments)`:
+//
+//     return toolMedia({ url, name, mime, bytes }, [attachment]);
+//
+// The envelope is INTERNAL, exactly like `toolUi()`. The harness unwraps it at
+// the ONE place a result is committed (`deliverTask`) and then:
+//   - the model-facing text is `serialize(result)` — byte-for-byte what an
+//     ordinary return value would have produced, still capped by
+//     `boundToolResult`, and NEVER carrying the bytes;
+//   - the validated attachments are stored on the committed `tool` message
+//     (`HarnessMessage` tool branch, `attachments`);
+//   - the `tool_result` event reports `ToolMediaDescriptor[]` only (no base64);
+//   - the transport turns them into a labelled user-role multimodal payload.
+//
+// COMPOSITION with `toolUi()` is order-independent: the harness unwraps media
+// and panels in a loop, so `toolMedia(toolUi(content, panels), media)` and
+// `toolUi(toolMedia(content, media), panels)` both yield the same
+// `{ content, panels, media }` triple.
+//
+// SECURITY: the attachments are validated against the DOWNLOAD profile at both
+// ends (fail-at-the-tool in `toolMedia()`, defence-at-the-boundary in
+// `toolMediaOf()`, mirroring `toolUi()`/`toolUiOf()`). A hand-built or forged
+// envelope with 500 MB of data is REJECTED, never spliced into history and
+// never silently dropped — an oversized payload is an explicit tool failure the
+// model can read.
+export type ToolMediaEnvelope<TContent = unknown> = {
+    readonly __toolMedia: HarnessAttachment[];
+    readonly content: TContent;
+};
 
-// Every accepted action. `uncheck` is an explicit alias for `check` with
-// `completed: false`.
-export type TodoAction = 'add' | 'remove' | 'check' | 'uncheck' | 'list';
+// ---------------------------------------------------------------------------
+// task (per-harness session task list — renamed from todoManage)
+// ---------------------------------------------------------------------------
+//
+// A harness-specific patch API. It is intentionally NOT OpenCode's experimental
+// `todowrite`: one call carries a partial patch (add/patch by entry, delete by
+// id), ids are stable strings, and the list is session state rather than
+// full-list replacement. See src/core/task.ts and README.md for the source-backed
+// reference.
 
-// One stored todo. `id` is a decimal string, monotonic within one harness
+// One stored task. `id` is a decimal string, monotonic within one harness
 // instance (and restarted by reset()).
-export type TodoItem = {
+export type TaskItem = {
     id: string;
     text: string;
     completed: boolean;
 };
 
-// The model-facing arguments. Only `action` is required; each action reads the
-// fields it needs (add → text, remove/check/uncheck → id, check → completed).
-export type TodoParameters = {
-    action: TodoAction;
-    text?: string;
+// One entry of the model-facing `tasks` patch. A new task omits `id` and must
+// carry `text`; an entry that names a known `id` patches that task, and every
+// field it omits keeps its stored value. A tool call may pass no arguments at all
+// (or `{}`), which is a read of the current page.
+export type TaskInput = {
     id?: string;
+    text?: string;
     completed?: boolean;
 };
 
-// Counts are derived on every call so the model does not have to list and count.
-export type TodoCounts = {
-    total: number;
-    completed: number;
-    remaining: number;
+// The model-facing arguments. Everything is optional: with nothing supplied the
+// call reads the list, and every success answers with the same bounded page.
+export type TaskParameters = {
+    tasks?: TaskInput[];
+    remove?: string[];
+    offset?: number;
+    limit?: number;
 };
 
-// The complete restorable todo store (R3a). `nextId` is persisted so a resumed
+// Counts are derived on every call so the model does not have to list and count.
+// R9-R11 names the not-yet-complete bucket `pending` (it was `remaining`).
+export type TaskCounts = {
+    total: number;
+    completed: number;
+    pending: number;
+};
+
+// The complete restorable task store (R3a). `nextId` is persisted so a resumed
 // session cannot reuse an id that already exists in `items`; both fields are
-// validated by core/todo.ts before a restore mutates anything.
-export type TodoStoreState = {
-    items: TodoItem[];
+// validated by core/task.ts before a restore mutates anything. The KEY this lives
+// under stays `records.todos` in snapshot version 1 (see HarnessSnapshot.records).
+export type TaskStoreState = {
+    items: TaskItem[];
     nextId: number;
 };
 
-// Every todoManage result is a bounded page or a single mutation result; the
-// canonical types live in ./core/todo.ts and are re-exported below (R9).
+// Legacy aliases: the tool was `todoManage` before R9-R11. Internal callers (and
+// any host that imported these names) keep compiling; the wire contract above is
+// the one the harness declares and executes.
+export type TodoItem = TaskItem;
+export type TodoCounts = TaskCounts;
+export type TodoStoreState = TaskStoreState;
+
+// Every task result is one bounded page of the current list; the canonical result
+// and toolset shapes live in ./core/task.ts and are re-exported below (R9).
 
 // ---------------------------------------------------------------------------
 // profileManage / chapterManage / locationManage (per-harness session records)
 // ---------------------------------------------------------------------------
 //
-// Three session record tools follow todoManage's lifecycle exactly:
+// Three session record tools follow task's lifecycle exactly:
 //   - one factory closure per harness (src/core/profile.ts, chapter.ts,
 //     location.ts), never a module singleton;
 //   - state is shared by every agent in that harness and cleared by reset();
@@ -1083,13 +1197,7 @@ export type ProfileStoreState = {
 // re-exported here so the public surface cannot drift. Type-only, so there is no
 // runtime cycle even though those modules import their item/parameter types from
 // this file.
-export type {
-    TodoPageInfo,
-    TodoListResult,
-    TodoChangeResult,
-    TodoResult,
-    TodoToolset
-} from '../core/todo';
+export type { TaskPageInfo, TaskResult, TaskToolset } from '../core/task';
 export type {
     ProfilePageInfo,
     ProfileListResult,
@@ -1340,14 +1448,18 @@ export type Tool<TParameters = any, TResult = any> = {
 // Web search (opt-in)
 // ---------------------------------------------------------------------------
 //
-// One model-facing tool, `search`, backed by a hosted search API. The keys are
-// provider credentials, so they are resolved once at harness construction and
-// never appear in a tool schema, argument, result, or progress event (W3).
+// One model-facing tool, `search`, backed by a hosted search API: Exa, Tavily
+// or Linkup. The default provider is the first one that has a key in that
+// preference order (exa > tavily > linkup), and `provider` overrides per call;
+// the argument is only offered when more than one provider is configured. The
+// keys are provider credentials, so they are resolved once at harness
+// construction and never appear in a tool schema, argument, result, or progress
+// event (W3).
 //
 // Cross-references:
 //   - tools/websearch/index.ts  — createWebSearchTool, the per-harness factory
 //   - harness.ts                — `websearch` configuration field wiring
-export type WebsearchProvider = 'exa' | 'tavily';
+export type WebsearchProvider = 'exa' | 'tavily' | 'linkup';
 
 // A key, or a getter that reads it from a store when the harness is constructed.
 // A getter is called once per harness construction and the captured key serves
@@ -1357,12 +1469,14 @@ export type WebsearchCredential = string | (() => string | undefined);
 
 export type WebsearchProviderConfiguration = {
     // Explicit override for this provider. When omitted the factory reads the
-    // provider's environment variable (EXA_API_KEY / TAVILY_API_KEY) instead.
+    // provider's environment variable (EXA_API_KEY / TAVILY_API_KEY /
+    // LINKUP_API_KEY) instead.
     apiKey?: WebsearchCredential;
 };
 
 export type WebsearchConfiguration = {
-    // Environment snapshot to read the two key variables from. Tests and
+    // Environment snapshot to read the three provider key variables from
+    // (EXA_API_KEY / TAVILY_API_KEY / LINKUP_API_KEY). Tests and
     // deployments can inject one; the default is `process.env` (never a dotenv
     // autoload — the caller owns that).
     env?: Readonly<Record<string, string | undefined>>;
@@ -1370,6 +1484,11 @@ export type WebsearchConfiguration = {
     // simply absent: it is not registered and not offered to the model.
     exa?: WebsearchProviderConfiguration;
     tavily?: WebsearchProviderConfiguration;
+    // Linkup (the third search provider). Same credential shape as `exa` /
+    // `tavily`: an explicit string or getter, otherwise LINKUP_API_KEY from the
+    // resolved environment. Resolution and provider ordering belong to
+    // tools/websearch/index.ts.
+    linkup?: WebsearchProviderConfiguration;
 };
 
 // The model-facing argument shape. `query` is the only required property; having
@@ -1380,7 +1499,7 @@ export type WebSearchParameters = {
     // Requested result count. Defaults to 5 and is clamped to 1–20.
     maxResults?: number;
     // Which configured provider to use. Omitted = the first configured one
-    // (Exa before Tavily), so a single-key setup needs no decision.
+    // (Exa, then Tavily, then Linkup), so a single-key setup needs no decision.
     provider?: WebsearchProvider;
 };
 
@@ -1406,27 +1525,36 @@ export type WebSearchResult = {
 // ---------------------------------------------------------------------------
 // fetch — one model-facing page-fetch tool (W4).
 //
-// `native` needs no credential: it is a bounded GET with global `fetch` and a
-// dependency-free HTML-to-markdown/text conversion. `exa` is an optional
-// provider, available only when an Exa key exists (the same EXA_API_KEY
-// search resolves), and reads pages through Exa's /contents endpoint.
+// `native` is ALWAYS the default provider and needs no credential: it is a
+// bounded GET with global `fetch`, a text-only content-type gate, and a
+// dependency-free HTML-to-markdown/text conversion. `exa` and `linkup` are
+// optional per-call providers, offered only when that provider's key exists
+// (the same EXA_API_KEY / LINKUP_API_KEY search resolves) and named after
+// Exa's /contents and Linkup's /v1/fetch endpoints. Tavily is search-only.
 //
 // Cross-references:
 //   - tools/webfetch/index.ts  — createWebFetchTool, the per-harness factory
 //   - harness.ts               — `webfetch` configuration field wiring
 // ---------------------------------------------------------------------------
-export type WebFetchProvider = 'native' | 'exa';
+export type WebFetchProvider = 'native' | 'exa' | 'linkup';
 
 export type WebFetchConfiguration = {
-    // Environment snapshot to read EXA_API_KEY from. Tests and deployments can
-    // inject one; the default is `process.env` (never a dotenv autoload — the
-    // caller owns that). With no key the tool still exists: `native` is the
-    // default provider and needs no credential.
+    // Environment snapshot to read EXA_API_KEY / LINKUP_API_KEY from. Tests and
+    // deployments can inject one; the default is `process.env` (never a dotenv
+    // autoload — the caller owns that). With no key at all the tool still
+    // exists: `native` is the default provider and needs no credential.
     env?: Readonly<Record<string, string | undefined>>;
     // Explicit Exa key override (string or getter, resolved once at
-    // construction). Omitted or blank means "read the environment", and a
-    // getter that yields nothing simply leaves `exa` unoffered.
+    // construction). Omitting it entirely means "read the environment"; an
+    // explicit blank value or a getter that yields nothing leaves `exa`
+    // unoffered WITHOUT falling back to the environment.
     exa?: WebsearchProviderConfiguration;
+    // Linkup key override for the `linkup` page-read provider (R1). Same
+    // credential shape as `exa`: an explicit string or getter, otherwise
+    // LINKUP_API_KEY from the resolved environment. A provider with no usable
+    // key is absent: not offered in the schema and not callable. Resolution and
+    // the wire adapter belong to tools/webfetch.
+    linkup?: WebsearchProviderConfiguration;
 };
 
 // The model-facing argument shape. `url` is the only required property; having
@@ -1434,11 +1562,13 @@ export type WebFetchConfiguration = {
 // rule in core/tool.ts), and every optional field is validated in execute.
 export type WebFetchParameters = {
     url: string;
-    // Output format. Defaults to "markdown". Non-HTML responses are returned
-    // as-is regardless of this field.
+    // Output format. Defaults to "markdown". A non-text content type is
+    // REFUSED (that is the `download` tool's job); any other textual body is
+    // returned as-is regardless of this field.
     format?: 'markdown' | 'text' | 'html';
-    // Which provider to use. Omitted = "native"; "exa" is only accepted (and
-    // only offered in the schema) when an Exa key is configured.
+    // Which provider to use. Omitted = "native"; "exa" and "linkup" are only
+    // accepted (and only offered in the schema) when that provider's key is
+    // configured.
     provider?: WebFetchProvider;
 };
 
@@ -1457,6 +1587,64 @@ export type WebFetchResult = {
     content: string;
     // Page title when either source can provide one.
     title?: string;
+};
+
+// ---------------------------------------------------------------------------
+// download — core file retrieval with multimodal hand-off (R3/R4)
+//
+// One model-facing tool, `download`. It fetches ANY http(s) resource as BYTES
+// (images, PDFs, audio, video, archives, documents, binaries), refuses anything
+// over its 20 MiB cap before the body is paid for, and returns the file through
+// the `toolMedia()` envelope so the bytes reach the model as real multimodal
+// input rather than as a filename inside truncated text.
+//
+// Cross-references:
+//   - tools/webdownload/download.tool.ts — the preset entry (the implementation)
+//   - core/tool-media.ts                 — the envelope + validation profiles
+//   - shared/attachments.ts              — DOWNLOAD_ATTACHMENT_LIMITS (20 MiB)
+//   - transport/openai.ts                — tool media -> labelled user parts
+// ---------------------------------------------------------------------------
+export type DownloadParameters = {
+    // Absolute http(s) URL. Credentials in the URL (userinfo) are rejected, as
+    // they are for `fetch`: they would put a secret on the wire.
+    url: string;
+    // Optional plain filename for the provider's file label. Sanitized either
+    // way (no path separators, no drive colon, at most 200 characters), so a
+    // model-supplied value can never smuggle a path.
+    name?: string;
+};
+
+// The MODEL-FACING summary. Deliberately small (a few hundred bytes): the file
+// itself travels on the tool message's `attachments`, never inside this value,
+// so the 64 KiB tool-result budget never touches it.
+export type DownloadResult = {
+    // The URL that was requested, normalized.
+    url: string;
+    // Where it actually landed after redirects.
+    finalUrl: string;
+    // The response content type, parameters stripped and lowercased (bounded).
+    // Empty when the host sent no header — `application/octet-stream` is then
+    // what the attachment carries.
+    contentType: string;
+    // How the bytes are represented to the model. `file` is the fallback for
+    // every content type the known-media tables do not claim.
+    kind: HarnessAttachment['kind'];
+    // The sanitized filename the provider part labels the file with.
+    name: string;
+    // Bytes actually transferred (equals the stored attachment's `size`).
+    bytes: number;
+    // The server's declared `content-length` when it sent one. Present or
+    // absent, and it is what distinguishes a pre-rejected oversize response
+    // from one caught while streaming.
+    declaredBytes?: number;
+    // Constant: the file's bytes are attached out of band. It exists so a
+    // transcript reader can never mistake this JSON for a filename-only answer.
+    media: 'attached';
+    // The id the attachment travels under on this tool message. The progress
+    // event's `media` descriptor and the tool message agree on it; only the
+    // transport may re-suffix it (deterministically) when one tool block
+    // aggregates several downloads whose ids would otherwise collide.
+    mediaId: string;
 };
 
 // ---------------------------------------------------------------------------
@@ -1640,6 +1828,14 @@ export type HarnessEvent =
           // sees this field: it is presentation data for the client only. Absent
           // for every ordinary tool, so recorded events keep their old shape.
           ui?: ToolUiPanel[];
+          // Files a tool attached with `toolMedia()` (see ToolMediaEnvelope).
+          // DESCRIPTORS ONLY — id/kind/name/mime/size, never the base64 —
+          // because every event is JSON round-tripped and persisted through the
+          // turn record (server/sessions.ts `copyEvent`), so multi-megabyte
+          // payloads here would be paid once per delivered call. The bytes live
+          // exactly once, on the committed `tool` message. Absent for every
+          // medialess tool, so recorded events keep their old shape.
+          media?: ToolMediaDescriptor[];
           // Wall-clock duration of the call, measured from launch to delivery.
           // Present for every EXECUTED call (including one that settled in the same
           // turn; an inline call is a real sub-millisecond measurement, not a
@@ -2081,20 +2277,23 @@ export type HarnessConfiguration = {
     // asked for. Set false to start from `tools` alone. A configured tool wins on
     // a name collision.
     presets?: boolean;
-    // Opt-in web search. `true` reads EXA_API_KEY / TAVILY_API_KEY from this
-    // process's environment and registers one searchable `search` tool; an
-    // object does the same with an injected env or explicit key overrides. Off
-    // when absent or false, and absent when neither key is present — so a
-    // default harness never carries a network tool it cannot use. Secrets stay in
-    // the constructed tool closure: no schema value, argument, result, or event
-    // carries them. A configured tool named `search` wins over this field.
+    // Opt-in web search. `true` reads EXA_API_KEY / TAVILY_API_KEY /
+    // LINKUP_API_KEY from this process's environment and registers one core
+    // `search` tool (default provider follows the exa > tavily > linkup
+    // preference order, `provider` overrides per call); an object does the same
+    // with an injected env or explicit key overrides. Off when absent or false,
+    // and absent when no key resolves — so a default harness never carries a
+    // network tool it cannot use. Secrets stay in the constructed tool closure:
+    // no schema value, argument, result, or event carries them. A configured
+    // tool named `search` wins over this field.
     websearch?: boolean | WebsearchConfiguration;
     // Opt-in page fetch (W4). `true` (or a configuration object) registers the
-    // `fetch` tool: a bounded native GET that needs no credential, plus the
-    // `exa` provider when EXA_API_KEY (or an explicit key) is available. Unlike
-    // `websearch`, this tool is registered even with no key at all, because its
-    // default provider is keyless. Off when absent or false. A configured tool
-    // named `fetch` wins over this field.
+    // `fetch` tool: a bounded, text-only native GET that needs no credential and
+    // is ALWAYS the default, plus the hosted `exa` / `linkup` per-call providers
+    // when EXA_API_KEY / LINKUP_API_KEY (or an explicit key) is available.
+    // Unlike `websearch`, this tool is registered even with no key at all,
+    // because its default provider is keyless. Off when absent or false. A
+    // configured tool named `fetch` wins over this field.
     webfetch?: boolean | WebFetchConfiguration;
     // N3 fork/branch bounds and the threadFork capability. Omitted = threadFork
     // is not registered and no branch may be created. Values are validated at
@@ -2130,7 +2329,7 @@ export type Harness = {
     // not configured.
     readonly subagents: Readonly<Record<string, Agent>>;
     // The registered tools, keyed by the names the model calls. Includes the
-    // built-in toolRequest, toolCreate, todoManage, profileManage,
+    // built-in toolRequest, toolCreate, task, profileManage,
     // chapterManage, and locationManage entries, plus delegate when there
     // is at least one subagent.
     readonly tools: Readonly<Record<string, Tool>>;

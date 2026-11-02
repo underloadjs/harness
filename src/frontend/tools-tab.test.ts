@@ -44,7 +44,7 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         requiresEndpoint: true,
         agents: ['instruct'],
         tools: ['read'],
-        coreTools: ['toolRequest', 'toolCreate', 'todoManage'],
+        coreTools: ['toolRequest', 'toolCreate', 'task'],
         primary: 'instruct',
         subagents: [],
         builtin: true,
@@ -265,7 +265,7 @@ it('lists core tools in the global tools view, calls with the captured session a
     expect(document.querySelector('.main-title')?.textContent).toBe('toolRequest');
     expect(byClass('.agent-slot', 'div').hidden).toBe(true);
     expect(document.querySelector('.tool-session')?.textContent).toBe(
-        'Session-bound: runs inside instruct. No session yet — Call creates one for this harness.'
+        'Session-bound: runs in the playground’s own temporary session for instruct. None yet — Call creates one, and leaving the tools view deletes it.'
     );
 
     byClass('.tool-args', 'textarea').value = '{"tags":["web"]}';
@@ -282,9 +282,16 @@ it('lists core tools in the global tools view, calls with the captured session a
         body: { parameters: { tags: ['web'] }, sessionId: 's1' }
     });
 
+    // R7: the session the runner created is the PLAYGROUND's own, so its id appears only
+    // in the playground copy — never as "your conversation".
     expect(document.querySelector('.tool-session')?.textContent).toBe(
-        'Session-bound: runs inside instruct · session s1.'
+        'Session-bound: runs in the playground’s own temporary session for instruct · session s1. The conversation you selected is untouched.'
     );
+
+    // R7: the temporary session is not adopted into the reader's chat. The sessions rail
+    // has no row for it, and no conversation was opened.
+    expect(document.querySelectorAll('.session-row')).toHaveLength(0);
+    expect(document.querySelector('.sessions-scope')?.textContent).toBe('Locked to instruct.');
 
     // The raw structured result is intact …
     const output = document.querySelector('.tool-output .card-body')?.textContent ?? '';
@@ -300,8 +307,10 @@ it('lists core tools in the global tools view, calls with the captured session a
     // the tools view still owns the centre (R21.2: this replaced the removed
     // right-rail core dropdown).
     expect(calls.filter((call) => call.url === '/api/sessions/s1')).toHaveLength(1);
+    // R7: the discovery line describes the PLAYGROUND context, and it is refreshed by
+    // the temporary session's snapshot — never by the selected conversation's one.
     expect(byClass('.tools-session-note', 'p').textContent).toBe(
-        'Session-bound tools run inside instruct · session s1 · enabled for this session: read, glob'
+        'Session-bound tools run in the playground’s own context: instruct · temporary session s1 · enabled there: read, glob. The conversation you selected is never touched.'
     );
 
     // An ordinary tool is unchanged: no sessionId key, no extra session traffic.
@@ -462,17 +471,24 @@ it('shows a server request failure for a core call instead of pretending it ran'
     await flush();
     await flush();
 
-    expect(byClass('.tool-output .card-head', 'div').textContent).toBe('error');
-    expect(document.querySelector('.tool-output .card-body')?.textContent).toBe(
-        'Session "s1" is running; retry when it is idle.'
-    );
-    expect(document.querySelector('.tool-output')?.className).toBe('card tool-output is-error');
+    // R8: a request-level failure is written AS a structured response, in the same JSON
+    // shape the success path uses, and the payload draft stays exactly as typed.
+    expect(byClass('.tool-output .card-label', 'span').textContent).toBe('error');
+    expect(JSON.parse(document.querySelector('.tool-output .card-body')?.textContent ?? '')).toEqual({
+        ok: false,
+        error: {
+            kind: 'request_failed',
+            message: 'Session "s1" is running; retry when it is idle.'
+        }
+    });
+    expect(byClass('.tool-args', 'textarea').value).toBe('{"tags":["web"]}');
+    expect(document.querySelector('.tool-output')?.className).toBe('card tool-output tool-section is-error');
 });
 
-// T3: delegate is configuration-dependent. The manual runner must build its
-// example from the SELECTED harness's subagents (the server registers the tool only
-// when there is a target) instead of the old hard-coded `summarizer`, which most
-// harnesses do not configure.
+// T3/R7: delegate is configuration-dependent. The runner must build its presets from
+// the PLAYGROUND harness's subagents (the server registers the tool only when there is
+// a target) instead of the old hard-coded `summarizer`, which most harnesses do not
+// configure — and never from the selected conversation's frozen team.
 const agentDelegateTool = coreTool('delegate', {
     type: 'object',
     properties: {
@@ -482,7 +498,7 @@ const agentDelegateTool = coreTool('delegate', {
     required: ['agent', 'input']
 });
 
-it('fills the delegation example from the selected team, not a hard-coded agent', async () => {
+it('fills the delegation presets from the playground harness, not a hard-coded agent', async () => {
     vi.stubGlobal(
         'fetch',
         vi.fn(async (input: RequestInfo | URL) => {
@@ -522,14 +538,19 @@ it('fills the delegation example from the selected team, not a hard-coded agent'
             'Give research everything it needs: the goal, the files or areas, the constraints, and the evidence you want back.'
     });
 
-    // The runner states the real targets and the one-level limit.
+    // R7: the runner states the playground harness's real targets and the one-level
+    // limit, and never claims the selected conversation is the one it writes into.
     expect(document.querySelector('.tool-note')?.textContent).toBe(
-        'Core tool — it runs inside the selected session and hands ONE subagent a self-contained brief. Targets for this harness: research, workspace. Subagents cannot delegate further.'
+        'Core tool — it runs in the playground’s temporary session and hands ONE subagent a self-contained brief. Targets for the playground harness: research, workspace. Subagents cannot delegate further.'
     );
-    expect(document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.disabled).toBe(false);
+    // R8: each target is its own named preset button, with the schema fallback after it.
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.tool-preset')].map((node) => node.textContent)
+    ).toEqual(['Delegate to research', 'Delegate to workspace']);
+    expect(document.querySelector('.tool-card button.primary')?.disabled).toBe(false);
 });
 
-it('reports delegation as unavailable when the selected harness has no subagents', async () => {
+it('reports delegation as unavailable when the playground harness has no subagents', async () => {
     const calls: Call[] = [];
 
     vi.stubGlobal(
@@ -553,9 +574,9 @@ it('reports delegation as unavailable when the selected harness has no subagents
     await flush();
 
     // The catalogue is host-wide, but the tab says when the tool is actually
-    // registered for a session, so a subagent-less harness claims nothing.
+    // registered for the playground's session, so a subagent-less harness claims nothing.
     expect(byClass('.tools-tab-hint', 'p').textContent).toContain(
-        'delegate when the selected harness has subagents'
+        'delegate when the playground harness has subagents'
     );
 
     // Delegation is blocked rather than offered with a target this team lacks.
@@ -563,9 +584,11 @@ it('reports delegation as unavailable when the selected harness has no subagents
     document.querySelector<HTMLButtonElement>('.tool-tab-button[data-tool="delegate"]')?.click();
 
     expect(byClass('.tool-args', 'textarea').value).toBe('{}');
+    // R8: no target means no preset to offer.
+    expect(document.querySelectorAll('.tool-preset')).toHaveLength(0);
     expect(document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.disabled).toBe(true);
     expect(document.querySelector('.tool-note')?.textContent).toBe(
-        'Core tool — this harness declares no subagents, so delegation is not available in its sessions. Add an agent to the team to enable one-level delegation.'
+        'Core tool — the playground harness declares no subagents, so delegation is not available in its session. Add an agent to that team to enable one-level delegation.'
     );
     expect(
         [...document.querySelectorAll<HTMLElement>('.tool-runner-slot .tool-note.is-warning')].map(
@@ -573,9 +596,9 @@ it('reports delegation as unavailable when the selected harness has no subagents
         )
     ).toEqual([
         'This runs on the harness server with the server process permissions. The file and command presets are not sandboxed.',
-        'Not available for the selected harness: it declares no subagents, so delegate is not registered in its sessions.'
+        'Not available for the playground harness: it declares no subagents, so delegate is not registered in its session.'
     ]);
-    expect(byClass('.tool-output .card-head', 'div').textContent).toBe('unavailable');
+    expect(byClass('.tool-output .card-label', 'span').textContent).toBe('unavailable');
 
     // A programmatic click cannot reach the server either.
     document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.click();

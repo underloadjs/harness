@@ -1,15 +1,20 @@
-// fetch — the tool factory, key resolution, the native conversion, and the
-// Exa contents adapter.
+// fetch — the tool factory, key resolution, the native conversion, and the two
+// hosted contents adapters.
 //
 // Everything here is offline and deterministic: the environment is injected
 // (`env`), fetch is a stub (`vi.stubGlobal`), and no host key or network is
-// read. The tests pin the exact wire request for the Exa provider and the exact
-// converted output for the native provider, because both are contracts a model
-// depends on and silent drift is expensive.
+// read. The tests pin the exact wire request for each hosted provider, the byte
+// and character bounds of the native GET, and the exact converted output,
+// because all of it is a contract a model depends on and silent drift is
+// expensive.
 
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createWebFetchTool } from '@underload/harness';
+import { createWebFetchTool, WEB_FETCH_METADATA } from '@underload/harness';
 import type { Tool, WebFetchParameters, WebFetchResult } from '@underload/harness';
+// The native page budget lives here (100 KiB); the hosted providers answer
+// through ../websearch/request's own, larger JSON budget (512 KiB). Importing
+// both under distinct names pins the fact that they are two different policies.
+import { MAX_RESPONSE_BYTES as PROVIDER_MAX_RESPONSE_BYTES } from '../websearch/request';
 import {
     BROWSER_USER_AGENT,
     FETCH_TIMEOUT_MS,
@@ -58,6 +63,12 @@ const stubFetch = (respond: (url: string, init: RequestInit) => Response | Promi
 
 const keyless = () => createWebFetchTool({ env: {} });
 const withExa = () => createWebFetchTool({ env: { EXA_API_KEY: 'exa-secret-key' } });
+const withLinkup = () => createWebFetchTool({ env: { LINKUP_API_KEY: 'linkup-secret-key' } });
+
+// Both hosted keys, so a test can prove `native` is still the default and that
+// the enum lists every provider this harness can call.
+const withHosted = () =>
+    createWebFetchTool({ env: { EXA_API_KEY: 'exa-secret-key', LINKUP_API_KEY: 'linkup-secret-key' } });
 
 const streamOf = (chunks: readonly string[]): ReadableStream<Uint8Array> => {
     const encoder = new TextEncoder();
@@ -70,6 +81,28 @@ const streamOf = (chunks: readonly string[]): ReadableStream<Uint8Array> => {
     });
 };
 
+// A pull-driven, endless stream: every `pull` enqueues exactly one `size`-byte
+// chunk, so a test counts how many chunks the tool actually consumed. The
+// highWaterMark of 0 means the stream never prefetches ahead of a read, which
+// turns "did not consume further after crossing the budget" into an exact number
+// instead of a range check.
+const countedStream = (
+    size: number,
+    counters: { produced: number; cancelled: boolean }
+): ReadableStream<Uint8Array> =>
+    new ReadableStream<Uint8Array>(
+        {
+            pull(controller) {
+                counters.produced += 1;
+                controller.enqueue(new Uint8Array(size));
+            },
+            cancel() {
+                counters.cancelled = true;
+            }
+        },
+        { highWaterMark: 0 }
+    );
+
 afterEach(() => {
     vi.unstubAllGlobals();
 });
@@ -80,9 +113,27 @@ describe('factory and schema', () => {
 
         expect(definition).toBeDefined();
         expect(definition.name).toBe('fetch');
-        // Discovery-eligible: fetching is the step after searching.
-        expect(definition.visibility).toBe('searchable');
+        // R9-R11: `fetch` is environment core, like a configured `search`. It stays
+        // activation-gated (no `webfetch` opt-in means no tool at all), but a harness
+        // that registers it declares it on every request.
+        expect(definition.visibility).toBe('core');
         expect(definition.tags).toEqual(['web', 'fetch', 'internet', 'read', 'url', 'research']);
+    });
+
+    it('publishes static native metadata for the not-yet-enabled listing', () => {
+        // The server catalogue (src/server/harnesses/webfetch.ts) lists `fetch`
+        // before any host opts in, and it copies this object. Pinning it to the
+        // keyless factory shape means "listed" can never drift from "callable".
+        const definition = keyless();
+
+        expect(WEB_FETCH_METADATA.name).toBe('fetch');
+        expect(WEB_FETCH_METADATA.visibility).toBe('core');
+        expect(WEB_FETCH_METADATA.description).toBe(definition.description);
+        expect(WEB_FETCH_METADATA.tags).toEqual(definition.tags);
+        expect(WEB_FETCH_METADATA.parameters).toEqual(definition.parameters);
+        expect(
+            Object.keys((WEB_FETCH_METADATA.parameters as { properties: Record<string, unknown> }).properties)
+        ).toEqual(['url', 'format']);
     });
 
     it('offers no provider property without a key', () => {
@@ -91,6 +142,20 @@ describe('factory and schema', () => {
 
         expect(Object.keys(properties)).toEqual(['url', 'format']);
         expect(definition.description).not.toContain('exa');
+        expect(definition.description).not.toContain('linkup');
+    });
+
+    it('describes the byte bound and points at a download tool for the rest', () => {
+        // Both sentences are one policy: a body that is too big or too binary to
+        // read is a download, and the model has to be told where to go instead of
+        // retrying the fetch.
+        const definition = keyless();
+
+        expect(definition.description).toContain(`bounded to ${MAX_RESPONSE_BYTES} bytes of body`);
+        expect(definition.description).toContain(`${MAX_CONTENT_CHARS} characters`);
+        expect(definition.description).toContain('a non-text content type is rejected');
+        expect(definition.description).toContain('use the `download` tool instead');
+        expect(MAX_RESPONSE_BYTES).toBe(100 * 1024);
     });
 
     it('offers the provider choice when an Exa key exists', () => {
@@ -100,6 +165,35 @@ describe('factory and schema', () => {
         expect(Object.keys(properties)).toEqual(['url', 'format', 'provider']);
         expect(properties.provider.enum).toEqual(['native', 'exa']);
         expect(definition.description).toContain('exa');
+    });
+
+    it('offers a native/linkup choice when only Linkup has a key', () => {
+        const definition = withLinkup();
+        const properties = (definition.parameters as { properties: Record<string, { enum?: string[] }> }).properties;
+
+        expect(Object.keys(properties)).toEqual(['url', 'format', 'provider']);
+        expect(properties.provider.enum).toEqual(['native', 'linkup']);
+        expect(definition.description).toContain('linkup');
+        expect(definition.description).not.toContain('exa');
+    });
+
+    it('lists every configured hosted provider, native first', () => {
+        const definition = withHosted();
+        const properties = (definition.parameters as { properties: Record<string, { enum?: string[] }> }).properties;
+
+        expect(properties.provider.enum).toEqual(['native', 'exa', 'linkup']);
+        expect(definition.description).toContain('provider "exa"');
+        expect(definition.description).toContain('provider "linkup"');
+    });
+
+    it('names the provider that has a key and stays silent about the one that does not', () => {
+        const exaOnly = withExa().description;
+        const linkupOnly = withLinkup().description;
+
+        // A keyless hosted provider must not appear in the description at all:
+        // advertising it would invite a call this harness cannot make.
+        expect(exaOnly).not.toContain('linkup');
+        expect(linkupOnly).not.toContain('provider "exa"');
     });
 
     it('reads EXA_API_KEY from the injected env only, never per call', async () => {
@@ -120,6 +214,59 @@ describe('factory and schema', () => {
 
         expect(Object.keys(properties)).toEqual(['url', 'format']);
     });
+
+    it('treats an explicit blank linkup key as "off" as well', () => {
+        const definition = createWebFetchTool({
+            env: { LINKUP_API_KEY: 'env-linkup-key' },
+            linkup: { apiKey: '' }
+        });
+        const properties = (definition.parameters as { properties: Record<string, unknown> }).properties;
+
+        expect(Object.keys(properties)).toEqual(['url', 'format']);
+        expect(definition.description).not.toContain('linkup');
+    });
+
+    it('calls a linkup key getter once, at construction', async () => {
+        let calls = 0;
+
+        const definition = createWebFetchTool({
+            env: {},
+            linkup: {
+                apiKey: () => {
+                    calls += 1;
+
+                    return 'linkup-secret-key';
+                }
+            }
+        });
+
+        stubFetch(() =>
+            response(JSON.stringify({ markdown: '# Page' }), { headers: { 'content-type': 'application/json' } })
+        );
+
+        await call(definition, { url: 'https://example.com', provider: 'linkup' });
+        await call(definition, { url: 'https://example.com', provider: 'linkup' });
+
+        expect(calls).toBe(1);
+    });
+
+    it('rejects an explicit linkup value that is not a string or getter', () => {
+        expect(() => createWebFetchTool({ linkup: { apiKey: 42 as never } })).toThrow(
+            'fetch provider "linkup" apiKey must be a string or a function returning one.'
+        );
+    });
+
+    it('rejects a throwing linkup getter without echoing its error', () => {
+        expect(() =>
+            createWebFetchTool({
+                linkup: {
+                    apiKey: () => {
+                        throw new Error('vault unavailable: lk-live-should-not-leak');
+                    }
+                }
+            })
+        ).toThrow('fetch provider "linkup" apiKey getter failed.');
+    });
 });
 
 describe('argument validation', () => {
@@ -134,6 +281,22 @@ describe('argument validation', () => {
         await expect(call(keyless(), { url: 'https://example.com', provider: 'exa' })).rejects.toThrow(/"exa" is not configured/);
     });
 
+    it('lists the alternatives when the asked-for provider has no key', async () => {
+        // A named provider the harness cannot run is refused with the exact list
+        // the model may choose from, so the next turn can correct itself.
+        await expect(call(withLinkup(), { url: 'https://example.com', provider: 'exa' })).rejects.toThrow(
+            'fetch provider "exa" is not configured. Configured: native, linkup.'
+        );
+
+        await expect(call(withExa(), { url: 'https://example.com', provider: 'linkup' })).rejects.toThrow(
+            'fetch provider "linkup" is not configured. Configured: native, exa.'
+        );
+
+        await expect(call(withHosted(), { url: 'https://example.com', provider: 'serper' as never })).rejects.toThrow(
+            'fetch provider "serper" is not configured. Configured: native, exa, linkup.'
+        );
+    });
+
     it('accepts a bare URL string from a direct caller', async () => {
         stubFetch(() => html('hello'));
 
@@ -145,6 +308,18 @@ describe('argument validation', () => {
 });
 
 describe('native provider', () => {
+    it('stays the default even when both hosted providers are configured', async () => {
+        const fetchMock = stubFetch(() => html('<p>direct</p>'));
+
+        const result = await call(withHosted(), { url: 'https://example.com/page' });
+
+        expect(result.provider).toBe('native');
+        // One request, to the page itself: a configured crawler key must never
+        // turn into a silent paid upgrade.
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+        expect(fetchMock.mock.calls[0][0]).toBe('https://example.com/page');
+    });
+
     it('sends a negotiating GET and reports the redirected URL', async () => {
         const fetchMock = stubFetch(() => html('<p>hi</p>', { url: 'https://example.com/final' }));
 
@@ -258,19 +433,104 @@ if (a &lt; 2) log(a);</pre>
         await expect(call(keyless(), { url: 'https://example.com' })).rejects.toThrow('fetch failed (HTTP 500).');
     });
 
-    it('rejects binary content types', async () => {
-        stubFetch(() => response(new Uint8Array([1, 2, 3]), { headers: { 'content-type': 'image/png' } }));
+    it('refuses every non-text content type instead of returning mojibake', async () => {
+        const cases: Array<{ mime: string; message: string }> = [
+            { mime: 'image/png', message: 'fetch does not support this content type (image/png).' },
+            { mime: 'application/pdf', message: 'fetch does not support this content type (application/pdf).' },
+            {
+                mime: 'application/octet-stream',
+                message: 'fetch does not support this content type (application/octet-stream).'
+            },
+            { mime: 'audio/mpeg', message: 'fetch does not support this content type (audio/mpeg).' },
+            { mime: 'video/mp4', message: 'fetch does not support this content type (video/mp4).' }
+        ];
 
-        await expect(call(keyless(), { url: 'https://example.com/cat.png' })).rejects.toThrow(/content type \(image\/png\)/);
+        for (const { mime, message } of cases) {
+            const counters = { produced: 0, cancelled: false };
+
+            stubFetch(
+                () =>
+                    response(countedStream(1024, counters), {
+                        headers: { 'content-type': `${mime}; charset=utf-8` }
+                    })
+            );
+
+            await expect(call(keyless(), { url: 'https://example.com/file' })).rejects.toThrow(message);
+
+            // The gate runs before the body is read: the type is decided from the
+            // header, so the bytes are released rather than downloaded.
+            expect(counters).toEqual({ produced: 0, cancelled: true });
+        }
     });
 
-    it('enforces the byte bound while streaming', async () => {
-        const chunk = 'a'.repeat(100 * 1024);
-        stubFetch(() => response(streamOf(Array.from({ length: 6 }, () => chunk)), { headers: { 'content-type': 'text/plain' } }));
+    it('accepts a text-bearing type the browser would download', async () => {
+        // svg+xml is text and often carries readable content, so the gate keeps it.
+        stubFetch(() => response('<svg><text>readable</text></svg>', { headers: { 'content-type': 'image/svg+xml' } }));
+
+        const result = await call(keyless(), { url: 'https://example.com/diagram.svg' });
+
+        expect(result.contentType).toBe('image/svg+xml');
+        expect(result.content).toBe('<svg><text>readable</text></svg>');
+    });
+
+    it('rejects an advertised Content-Length over the cap before reading the body', async () => {
+        const counters = { produced: 0, cancelled: false };
+
+        stubFetch(
+            () =>
+                response(countedStream(64 * 1024, counters), {
+                    headers: { 'content-type': 'text/plain', 'content-length': String(MAX_RESPONSE_BYTES + 1) }
+                })
+        );
 
         await expect(call(keyless(), { url: 'https://example.com/big' })).rejects.toThrow(
             `fetch received a response larger than ${MAX_RESPONSE_BYTES} bytes.`
         );
+
+        // Nothing was downloaded: the advertised size alone is the rejection, and
+        // cancelling releases the connection instead of streaming a page we throw
+        // away.
+        expect(counters).toEqual({ produced: 0, cancelled: true });
+    });
+
+    it('stops a streamed response at the byte budget and cancels the reader', async () => {
+        const counters = { produced: 0, cancelled: false };
+
+        // No content-length header at all, so only the per-chunk counter can catch
+        // this. Chunks are 64 KiB: two of them (131,072 bytes) cross the 100 KiB
+        // budget, and the network does not guarantee any particular chunk size.
+        stubFetch(
+            async () =>
+                new Response(countedStream(64 * 1024, counters), {
+                    status: 200,
+                    headers: { 'content-type': 'text/plain' }
+                })
+        );
+
+        await expect(call(keyless(), { url: 'https://example.com/big' })).rejects.toThrow(
+            `fetch received a response larger than ${MAX_RESPONSE_BYTES} bytes.`
+        );
+
+        // The reader was cancelled: the host must not keep sending after the cap.
+        expect(counters.cancelled).toBe(true);
+        // And it stopped with the chunk that crossed the budget — no third chunk is
+        // consumed on the way to the error.
+        expect(counters.produced).toBe(2);
+    });
+
+    it('accepts a body that is exactly at the byte budget', async () => {
+        // The bound rejects strictly larger, never equal: 1 KiB + 99 KiB is exactly
+        // MAX_RESPONSE_BYTES, so both chunks must be delivered.
+        const first = 'a'.repeat(1024);
+        const second = 'b'.repeat(MAX_RESPONSE_BYTES - 1024);
+
+        stubFetch(() => response(streamOf([first, second]), { headers: { 'content-type': 'text/plain' } }));
+
+        const result = await call(keyless(), { url: 'https://example.com/exact' });
+
+        expect(result.truncated).toBe(true);
+        expect(result.characters).toBe(MAX_CONTENT_CHARS);
+        expect(result.content).toBe(first + 'b'.repeat(MAX_CONTENT_CHARS - first.length));
     });
 
     it('bounds the returned content and flags truncation', async () => {
@@ -354,5 +614,104 @@ describe('exa provider', () => {
         const result = await call(withExa(), { url: 'https://example.com' });
 
         expect(result.content).toBe('the key is [redacted] inside the page');
+    });
+});
+
+describe('linkup provider', () => {
+    const markdown = '# Rendered\n\nLinkup gives markdown.';
+
+    const jsonBody = (payload: unknown): Response =>
+        response(JSON.stringify(payload), { headers: { 'content-type': 'application/json' } });
+
+    it('posts the documented request with the key in a header', async () => {
+        const fetchMock = stubFetch(() => jsonBody({ markdown, favicon: 'https://example.com/favicon.ico' }));
+
+        const result = await call(withLinkup(), { url: 'https://example.com/page', provider: 'linkup' });
+
+        const [url, init] = fetchMock.mock.calls[0];
+
+        expect(url).toBe('https://api.linkup.so/v1/fetch');
+        expect(init.method).toBe('POST');
+        expect(init.redirect).toBe('error');
+        expect(init.headers).toMatchObject({
+            'content-type': 'application/json',
+            authorization: 'Bearer linkup-secret-key'
+        });
+        expect(JSON.parse(String(init.body))).toEqual({ url: 'https://example.com/page' });
+
+        // The whole result, exactly: Linkup renders markdown and sends no title,
+        // so `title` is absent and the content type is the converted document.
+        expect(result).toEqual({
+            provider: 'linkup',
+            url: 'https://example.com/page',
+            contentType: 'text/markdown',
+            format: 'markdown',
+            characters: markdown.length,
+            truncated: false,
+            content: markdown
+        });
+    });
+
+    it('refuses an empty markdown answer', async () => {
+        stubFetch(() => jsonBody({ markdown: '   ', favicon: 'https://example.com/favicon.ico' }));
+
+        await expect(call(withLinkup(), { url: 'https://example.com/page', provider: 'linkup' })).rejects.toThrow(
+            'Linkup could not fetch that page.'
+        );
+    });
+
+    it('refuses a payload that is not an object', async () => {
+        stubFetch(() => jsonBody([]));
+
+        await expect(call(withLinkup(), { url: 'https://example.com/page', provider: 'linkup' })).rejects.toThrow(
+            'Linkup fetch returned an unexpected response.'
+        );
+    });
+
+    it('maps a rejected key and a network failure with the shared sentences', async () => {
+        // A provider body is never echoed: this one even contains the key.
+        stubFetch(() => response('{"error":"unauthorized","key":"linkup-secret-key"}', { status: 401 }));
+
+        await expect(call(withLinkup(), { url: 'https://example.com/page', provider: 'linkup' })).rejects.toThrow(
+            'Linkup search rejected the API key (HTTP 401). Check the configured key and account.'
+        );
+
+        stubFetch(async () => {
+            throw new TypeError('fetch failed: getaddrinfo ENOTFOUND api.linkup.so');
+        });
+
+        await expect(call(withLinkup(), { url: 'https://example.com/page', provider: 'linkup' })).rejects.toThrow(
+            'Linkup search could not be reached (network error).'
+        );
+    });
+
+    it('keeps the hosted provider byte budget at 512 KiB', async () => {
+        // The hosted adapters answer through ../websearch/request's JSON budget,
+        // which the 100 KiB native page bound deliberately did not change.
+        expect(PROVIDER_MAX_RESPONSE_BYTES).toBe(512 * 1024);
+
+        stubFetch(() =>
+            response('{}', { headers: { 'content-length': String(PROVIDER_MAX_RESPONSE_BYTES + 1) } })
+        );
+
+        await expect(call(withLinkup(), { url: 'https://example.com/page', provider: 'linkup' })).rejects.toThrow(
+            `Linkup search returned a response larger than ${PROVIDER_MAX_RESPONSE_BYTES} bytes.`
+        );
+    });
+
+    it('redacts every hosted key and applies the character bound locally', async () => {
+        // Linkup has no server-side character knob (unlike Exa's
+        // `text.maxCharacters`), so ./index's slice is the only bound here.
+        stubFetch(() =>
+            jsonBody({ markdown: `exa-secret-key then linkup-secret-key ${'x'.repeat(MAX_CONTENT_CHARS)}` })
+        );
+
+        const result = await call(withHosted(), { url: 'https://example.com/page', provider: 'linkup' });
+
+        const prefix = '[redacted] then [redacted] ';
+
+        expect(result.truncated).toBe(true);
+        expect(result.characters).toBe(MAX_CONTENT_CHARS);
+        expect(result.content).toBe(prefix + 'x'.repeat(MAX_CONTENT_CHARS - prefix.length));
     });
 });

@@ -1,15 +1,16 @@
-/* Agent configuration dialog (T3) — content of ui/agent-dialog.ts.
+/* Agent configuration dialog (T3/R3) — content of ui/agent-dialog.ts.
    ---------------------------------------------------------------------------
    Imported by ../styles.css, so it shares that file's tokens (--text/--muted/
    --accent/--bg-input/--border/--mono) and the shared `.field-input` /
-   `.field-select` / `.button` primitives. ui/dialog.css owns the modal frame
+   `.button` primitives. ui/dialog.css owns the modal frame
    (`.dialog`, `.dialog-body` padding/scroll, the close button); this file styles
    ONLY the body content, which is why nothing here sets a width or a position:
    the modal already does, and the body scrolls.
 
-   The layout is one column: the agent dropdown, that agent's configuration, the
-   team list (the only part a live activity frame repaints), and the footer whose
-   action sits bottom-right — the single control that writes to the server. */
+   R3 layout, one column: the roster strip of clickable badges (the ONLY listing of
+   the team — the dropdown and the duplicate "Team" section are gone), the viewed
+   agent's configuration, and the footer whose action sits bottom-right — the single
+   control that writes to the server. */
 
 .agent-dialog {
     display: flex;
@@ -34,34 +35,127 @@
     letter-spacing: 0.08em;
 }
 
-/* Honest restriction reason (frozen saved session / run in flight / session
-   creation). Painted only when editing really is locked. */
-.agent-dialog-note {
-    margin: 0;
-    padding: 8px 10px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--bg-input);
-    color: var(--muted);
-    font-size: 11.5px;
-    line-height: 1.4;
-}
-
-/* The one-line team fact above the editors ("Researcher is a team member."), so a
-   disabled membership control reads as a stated state rather than a broken button. */
-.agent-dialog-state {
-    margin: 0;
-    color: var(--muted);
-    font-size: 11.5px;
-}
-
-/* The dropdown that chooses which agent is being configured. It is a full-width
-   select, not a card wall: every agent the server advertises fits here at any
-   team size. */
-.agent-dialog-agent-select {
+/* The roster strip. Badges wrap rather than scroll: a team is short, and a badge
+   that needs scrolling to see is a member nobody configures. `flex-wrap` plus the
+   strip's own full width is what keeps `[+]` on the row instead of floating. */
+.agent-dialog-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: stretch;
+    gap: 6px;
     width: 100%;
 }
 
+/* A badge is a real button so Enter/Space and a screen reader's button verb work
+   with no ARIA scripting; `role="tab"` (set in the TS) layers the tablist semantics
+   on top. Name + role + model stay inside it, so the strip still answers "who is on
+   this team and what do they run" — that is why the separate Team section died. */
+.agent-dialog-tab {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-input);
+    color: var(--text);
+    font: inherit;
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.agent-dialog-tab:hover {
+    border-color: var(--border-strong);
+}
+
+/* The selected badge. The accent ring is the same colour language the activity ring
+   uses, so "this is the one you are editing" and "this one is working" are read as
+   different things by the `data-activity` rule below (which adds no background). */
+.agent-dialog-tab[aria-selected='true'] {
+    border-color: var(--accent);
+    background: var(--bg-elevated);
+}
+
+/* Roving tabindex means one badge in the strip is a tab stop at a time, so the
+   keyboard focus ring must be obvious on whichever one it is. */
+.agent-dialog-tab:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+/* A badge that only exists as a draft (added through `[+]`, not saved yet). */
+.agent-dialog-tab[data-added='true'] {
+    border-style: dashed;
+}
+
+/* The model text inside a badge is a fact, not a label the reader acts on. */
+.agent-dialog-agent-model {
+    margin-left: auto;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+}
+
+/* `[+]` sits at the end of the strip: it is the only way an agent outside the roster
+   gets a badge, and while the team is locked it stays visible but disabled with its
+   reason in `title` (never a silently missing affordance). */
+.agent-dialog-add {
+    flex: 0 0 auto;
+    align-self: flex-start;
+    min-width: 30px;
+    padding: 5px 10px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    background: transparent;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1.3;
+    cursor: pointer;
+}
+
+.agent-dialog-add:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+.agent-dialog-add:disabled {
+    cursor: default;
+    opacity: 0.55;
+}
+
+/* The add picker: nonmembers only, one button each. It is a plain group (no combobox
+   geometry), so jsdom/keyboard behaviour is just buttons and the layout is the
+   strip's own wrap. */
+.agent-dialog-add-list {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 8px;
+    border: 1px dashed var(--border);
+    border-radius: 10px;
+    background: var(--bg-input);
+}
+
+.agent-dialog-add-option {
+    padding: 5px 10px;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    color: var(--text);
+    font: inherit;
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+}
+
+.agent-dialog-add-option:hover {
+    border-color: var(--accent);
+}
+
+/* The configuration panel for the selected agent. */
 .agent-dialog-config {
     padding: 12px;
     border: 1px solid var(--border);
@@ -113,8 +207,10 @@
     line-height: 1.4;
 }
 
-/* Membership: one explicit checkbox. Nothing else can add or remove an agent, so a
-   team never changes shape without a visible tick. */
+/* Membership: the two explicit team controls, inside the viewed agent's panel.
+   Selecting a badge never changes the team, so `Make primary` and
+   `Remove from team` are the only things that can, and they read as facts rather
+   than as a checkbox whose effect the reader has to remember. */
 .agent-dialog-membership {
     display: flex;
     flex-wrap: wrap;
@@ -122,43 +218,40 @@
     gap: 8px;
 }
 
-.agent-dialog-member {
-    width: 14px;
-    height: 14px;
-    accent-color: var(--accent);
-}
-
-.agent-dialog-member-label {
-    color: var(--text);
-    font-size: 12px;
-}
-
-.agent-dialog-member:disabled + .agent-dialog-member-label {
+.agent-dialog-action {
+    padding: 4px 9px;
+    border: 1px solid var(--border-strong);
+    border-radius: 7px;
+    background: transparent;
     color: var(--muted);
+    font-family: var(--mono);
+    font-size: 10.5px;
+    cursor: pointer;
 }
 
-/* The team list. Rows are plain (no deck overlap): the dialog is a form, and the
-   deck's fan geometry would make a two-column read impossible. */
-.agent-dialog-team-list {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
+.agent-dialog-action:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
 }
 
-.agent-dialog-agent {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 8px;
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: var(--bg-input);
-    font-size: 12px;
+/* A locked team keeps its controls visible and disabled with the reason in `title`,
+   so the lock is stated where it bites instead of in a paragraph nobody reads. */
+.agent-dialog-action:disabled {
+    cursor: default;
+    opacity: 0.55;
 }
 
-/* Activity (ui/activity.ts paints `data-activity`/`aria-busy` here). A colour and
-   border change is the signal; the deck's animated ring belongs to the cards. */
+/* The armed toggle (`Make primary` pressed). The accent says a pending decision is
+   on the row, so the reader never has to remember whether they clicked it. */
+.agent-dialog-action[aria-pressed='true'] {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+/* The activity ring (ui/activity.ts paints `data-activity`/`aria-busy` on the
+   badges, which keep the `.agent-dialog-agent[data-agent]` host it queries). A
+   colour and border change is the signal; the deck's animated ring belongs to the
+   cards. */
 .agent-dialog-agent[data-activity='active'] {
     border-color: var(--accent);
 }
@@ -167,22 +260,13 @@
     color: var(--text);
 }
 
-.agent-dialog-agent-role {
+.agent-dialog-agent-role,
+.agent-dialog-agent-state {
     color: var(--muted);
     font-family: var(--mono);
     font-size: 10px;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-}
-
-/* The model id is the row's right-hand fact (the resolved model the team list shows
-   is the same map the editor's dropdown is built from), so it is pushed to the far
-   edge and the name/role pair stays readable on the left. */
-.agent-dialog-agent-model {
-    margin-left: auto;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 11px;
 }
 
 /* The footer. The action is the ONLY writer in this dialog, so it is the last thing

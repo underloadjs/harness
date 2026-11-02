@@ -80,4 +80,18 @@ it('places the thread identity left of the header measurements (R1)', () => {
     expect(blockOf('.tile:not(.is-expanded) .tile-top {')).toContain('margin-left: auto');
     // The expanded header stacks as a column: the pill must not stretch full width.
     expect(blockOf('.tile.is-expanded .tile-thread {')).toContain('align-self: flex-start');
+
+    // T2 (badge clipping): `IT1`/`IT2`/`IT3` are the reader's ONLY pointer to which
+    // conversation a row belongs, so the pill is sized by its CONTENT and is never the
+    // item that ellipsises. `max-width: 40%` + `overflow: hidden` resolved against the
+    // shrinkable `.tile-identity` wrapper, so the cap tightened exactly when the column got
+    // narrow and a 3-character badge became `I…`. The flexible prompt is what truncates
+    // (asserted in turn-tile-style.test.ts), and the wrapper keeps only the 92px Delete
+    // reserve (asserted in thread-transcript.test.ts).
+    const badge = blockOf('.tile-thread {');
+    expect(badge).toContain('flex: 0 0 auto');
+    expect(badge).toContain('white-space: nowrap');
+    expect(badge).not.toContain('max-width');
+    expect(badge).not.toContain('overflow: hidden');
+    expect(badge).not.toContain('text-overflow');
 });

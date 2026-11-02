@@ -160,7 +160,7 @@ it('lists an unconfigured search, explains it, and disables the call', async () 
     expect(notes[1].hidden).toBe(false);
     expect(notes[1].textContent).toBe(hint);
 
-    expect(document.querySelector('.tool-output .card-head')?.textContent).toBe('unconfigured');
+    expect(document.querySelector('.tool-output .card-label')?.textContent).toBe('unconfigured');
     expect(document.querySelector('.tool-output .card-body')?.textContent).toBe('Not configured on this server.');
 });
 
@@ -191,6 +191,8 @@ it('enables the same entry when the server reports it configured', async () => {
     expect(notes).toHaveLength(2);
     expect(notes[1].hidden).toBe(true);
 
-    expect(document.querySelector('.tool-output .card-head')?.textContent).toBe('result');
+    // R8: the runner's response pane labels itself `response` (its own copy control
+    // sits beside that label, and it contributes no text to the label line).
+    expect(document.querySelector('.tool-output .card-label')?.textContent).toBe('response');
     expect(document.querySelector('.tool-output .card-body')?.textContent).toBe('Nothing yet. Press “Call tool”.');
 });

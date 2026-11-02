@@ -38,7 +38,7 @@
 //
 // TOOL EXECUTION (R8): every tool runs on the server. GET /tools (and
 // /tools/bootstrap, and the bootstrap document) lists the whole catalogue PLUS the
-// harness-owned core tools — toolRegistry, toolRequest, toolCreate, todoManage,
+// harness-owned core tools — toolRegistry, toolRequest, toolCreate, task,
 // delegate — marked
 // `visibility: 'core'` and `sessionBound: true`. R18: only the harness-owned set
 // is sessionBound; core file tools/search keep a real `tool` and run directly.
@@ -53,9 +53,12 @@
 // directly callable catalogue tool keeps its session-less runner when no session
 // is named, so standalone calls still work without a harness.
 //
-// HARNESS REGISTRY: POST/PATCH /harnesses mutate the in-memory registry the store
-// resolves sessions through (see ./harnesses/registry.ts). They affect FUTURE
-// sessions only; an existing session keeps the preset and descriptor it captured.
+// HARNESS REGISTRY: POST/PATCH/DELETE /harnesses mutate the in-memory registry the
+// store resolves sessions through (see ./harnesses/registry.ts). They affect FUTURE
+// sessions only; an existing session keeps the preset and descriptor it captured,
+// which is why a session may keep running (and a saved one keep restoring) after
+// its harness was deleted. All three commit through `SessionStore.mutateRegistry`,
+// so a durability failure rolls the registry back instead of reporting success (T5).
 //
 // BOOTSTRAP ROOT: `rootPath` is the canonical API URL this document is served
 // from (`/v1/harness`), NOT a filesystem path. File tools resolve relative paths
@@ -75,7 +78,7 @@ import { createToolCatalogue, describeAgent, describeHarness } from './harnesses
 import { createCoreToolEntries } from './harnesses';
 import { createHarnessRegistry } from './harnesses';
 import type { CatalogueEntry, HarnessRegistry, ToolCatalogue } from './harnesses';
-import { toolUiOf, boundToolResult, resolveToolParameters } from '../harness';
+import { unwrapToolResult, toolMediaDescriptors, boundToolResult, resolveToolParameters } from '../harness';
 import { isInstanceOf, toErrorInfo } from '../util';
 import { listModels, ModelListError } from '../transport/models';
 import type { ModelListConfiguration } from '../transport/models';
@@ -86,6 +89,7 @@ import type {
     CancelSessionRequest,
     CreateHarnessRequest,
     CreateSessionRequest,
+    DeleteHarnessResult,
     HarnessAttachment,
     HarnessDescriptor,
     HarnessIndex,
@@ -411,28 +415,38 @@ const boundToolValue = (value: unknown): unknown => {
 const boundErrorMessage = (error: unknown): string => boundToolResult(messageOf(error)).content;
 
 // Build the success envelope for a manual tool call. R20.2: a tool may return the
-// branded `toolUi(content, panels)` envelope. The HTTP result must stay the
-// ordinary content (`result`) and may carry the optional declarative `panels`;
-// `toolUiOf` also re-validates and bounds them here, at the server boundary, so a
-// hand-built or malformed envelope cannot reach the client unbounded. An ordinary
-// value is returned untouched, which keeps standard tools byte-for-byte stable.
+// branded `toolUi(content, panels)` envelope, and `download` returns the
+// companion `toolMedia(content, attachments)` envelope. The HTTP result must stay
+// the ordinary content (`result`) and may carry the optional declarative
+// `panels` / `media`; `unwrapToolResult` peels BOTH brands in any nesting order
+// and re-validates them here, at the server boundary, so a hand-built or
+// malformed envelope cannot reach the client unbounded. An ordinary value is
+// returned untouched, which keeps standard tools byte-for-byte stable.
 //
 // R13: the result content is bounded AFTER the unwrap (panels are bounded by
-// core/tool-ui.ts, a separate surface), so a huge content cannot smuggle an
-// unbounded body through the UI envelope.
+// core/tool-ui.ts and media by the download profile in core/tool-media.ts,
+// separate surfaces), so a huge content cannot smuggle an unbounded body
+// through either envelope.
+//
+// `media` is the DESCRIPTOR projection (id/kind/name/mime/size), never base64:
+// a manual `download` executed straight from the catalogue returns a summary a
+// client can render, and the bytes stay in the process that fetched them.
 const successfulToolResult = (value: unknown, started: number): ToolCallResult => {
-    const ui = toolUiOf(value);
+    const unwrapped = unwrapToolResult(value);
+    const panels = unwrapped.panels;
+    const media = unwrapped.media;
 
-    if (ui === undefined) {
-        return { ok: true, result: boundToolValue(value), durationMs: Date.now() - started };
+    if (panels === undefined && media === undefined) {
+        return { ok: true, result: boundToolValue(unwrapped.content), durationMs: Date.now() - started };
     }
 
     return {
         ok: true,
-        result: boundToolValue(ui.content),
+        result: boundToolValue(unwrapped.content),
         // Omit an empty list: an envelope with nothing renderable is
         // indistinguishable from a standard tool response.
-        ...(ui.panels.length === 0 ? {} : { panels: ui.panels }),
+        ...(panels === undefined || panels.length === 0 ? {} : { panels }),
+        ...(media === undefined || media.length === 0 ? {} : { media: toolMediaDescriptors(media) }),
         durationMs: Date.now() - started
     };
 };
@@ -616,7 +630,7 @@ export const createHarnessApi = ({
     //     implementation, metadata, and schema currently registered in THAT
     //     session — never a detached copy from the static catalogue. This also
     //     covers the harness-owned core tools (toolRegistry, toolRequest, toolCreate,
-    //     todoManage, delegate): they have no standalone implementation and only mean
+    //     task, delegate): they have no standalone implementation and only mean
     //     something inside a harness. The store rejects a session that is already
     //     busy (running, resetting, or another manual call).
     //   no session — the direct runner that predates R8: no harness, no model, no
@@ -999,30 +1013,36 @@ export const createHarnessApi = ({
 
                     // Semantic validation (known agents, duplicate ids, reserved
                     // names, title bounds) belongs to the registry, which throws a
-                    // HarnessRegistryError with the right status.
-                    const preset = registry.create({
-                        name: body.name,
-                        ...(body.title === undefined ? {} : { title: body.title }),
-                        ...(body.description === undefined ? {} : { description: body.description }),
-                        primary: body.primary,
-                        ...(body.subagents === undefined ? {} : { subagents: body.subagents }),
-                        // Per-agent model overrides (R9). Shape (object of strings)
-                        // is the registry's semantic validation, not this layer's:
-                        // it knows the final member set and the id bounds.
-                        ...(body.agentModels === undefined
-                            ? {}
-                            : { agentModels: body.agentModels }),
-                        // Per-agent instruction overrides (T3). Same ownership: the
-                        // registry validates keys against the final members and
-                        // bounds the text, then applies it when it builds the agent.
-                        ...(body.agentInstructions === undefined
-                            ? {}
-                            : { agentInstructions: body.agentInstructions })
-                    });
-
-                    // R3b: a created harness is durable before the 201. This is a
-                    // no-op when the host runs in memory.
-                    store.persistRegistry();
+                    // HarnessRegistryError with the right status. T5: it also clears
+                    // a deleted built-in's tombstone when the new harness takes that
+                    // name, so a re-created `instruct` survives its own restart.
+                    //
+                    // R3b + T5: the entry is durable BEFORE the 201, and a failed
+                    // write rolls the registry back (no phantom card). This is a
+                    // no-op commit when the host runs in memory.
+                    const preset = store.mutateRegistry(() =>
+                        registry.create({
+                            name: body.name,
+                            ...(body.title === undefined ? {} : { title: body.title }),
+                            ...(body.description === undefined ? {} : { description: body.description }),
+                            primary: body.primary,
+                            ...(body.subagents === undefined ? {} : { subagents: body.subagents }),
+                            // Per-agent model overrides (R9). Shape (object of
+                            // strings) is the registry's semantic validation, not
+                            // this layer's: it knows the final member set and the id
+                            // bounds.
+                            ...(body.agentModels === undefined
+                                ? {}
+                                : { agentModels: body.agentModels }),
+                            // Per-agent instruction overrides (T3). Same ownership:
+                            // the registry validates keys against the final members
+                            // and bounds the text, then applies it when it builds the
+                            // agent.
+                            ...(body.agentInstructions === undefined
+                                ? {}
+                                : { agentInstructions: body.agentInstructions })
+                        })
+                    );
 
                     return {
                         kind: 'json',
@@ -1048,9 +1068,31 @@ export const createHarnessApi = ({
             // PATCH /harnesses/:name — change any harness's metadata or agent
             // routing. Registry changes affect FUTURE sessions only; an existing
             // session keeps its captured preset and descriptor.
+            //
+            // DELETE /harnesses/:name (T5) — remove the harness from the catalogue,
+            // including a shipped built-in. Same frozen-session rule, so the saved
+            // conversations that used it survive: each one rebuilds from its own
+            // record (./sessions.ts restoreSession), and a built-in's removal is
+            // remembered as a tombstone so the next start does not re-ship it.
             if (head === 'harnesses' && segments.length === 2) {
+                if (method === 'DELETE') {
+                    // No body: a delete is identified by the path alone, so reading
+                    // one would make a client that sends nothing wait for it.
+                    //
+                    // `mutateRegistry` commits the removal durably BEFORE the 200 and
+                    // puts the entry (and its tombstone) back if the write fails, so
+                    // `{ deleted: true }` is never an answer the next restart
+                    // contradicts. Unknown or already-deleted name: 404 from
+                    // HarnessRegistryError, mapped by the outer catch.
+                    store.mutateRegistry(() => registry.remove(first));
+
+                    const result: DeleteHarnessResult = { deleted: true };
+
+                    return { kind: 'json', status: 200, body: result };
+                }
+
                 if (method !== 'PATCH') {
-                    throw new HttpError(405, `Use PATCH for ${mount}/harnesses/:name.`);
+                    throw new HttpError(405, `Use PATCH or DELETE for ${mount}/harnesses/:name.`);
                 }
 
                 const body = requireObjectBody<UpdateHarnessRequest>(
@@ -1066,27 +1108,28 @@ export const createHarnessApi = ({
                     );
                 }
 
-                const preset = registry.update(first, {
-                    ...(body.title === undefined ? {} : { title: body.title }),
-                    ...(body.description === undefined ? {} : { description: body.description }),
-                    ...(body.primary === undefined ? {} : { primary: body.primary }),
-                    ...(body.subagents === undefined ? {} : { subagents: body.subagents }),
-                    // Present = REPLACE the override map; absent = keep it (minus
-                    // members the patch just removed, which the registry drops).
-                    ...(body.agentModels === undefined
-                        ? {}
-                        : { agentModels: body.agentModels }),
-                    // T3: same replace semantics for the instruction overrides, so
-                    // `{}` is the explicit "run the trusted preset instructions
-                    // again" action the UI offers.
-                    ...(body.agentInstructions === undefined
-                        ? {}
-                        : { agentInstructions: body.agentInstructions })
-                });
-
-                // R3b: persist the patched registry before answering. An existing
-                // session keeps its frozen preset, so this only affects future ones.
-                store.persistRegistry();
+                // R3b + T5: persist the patched registry before answering, and roll
+                // the entry back if that write fails. An existing session keeps its
+                // frozen preset, so this only affects future ones.
+                const preset = store.mutateRegistry(() =>
+                    registry.update(first, {
+                        ...(body.title === undefined ? {} : { title: body.title }),
+                        ...(body.description === undefined ? {} : { description: body.description }),
+                        ...(body.primary === undefined ? {} : { primary: body.primary }),
+                        ...(body.subagents === undefined ? {} : { subagents: body.subagents }),
+                        // Present = REPLACE the override map; absent = keep it (minus
+                        // members the patch just removed, which the registry drops).
+                        ...(body.agentModels === undefined
+                            ? {}
+                            : { agentModels: body.agentModels }),
+                        // T3: same replace semantics for the instruction overrides, so
+                        // `{}` is the explicit "run the trusted preset instructions
+                        // again" action the UI offers.
+                        ...(body.agentInstructions === undefined
+                            ? {}
+                            : { agentInstructions: body.agentInstructions })
+                    })
+                );
 
                 return {
                     kind: 'json',

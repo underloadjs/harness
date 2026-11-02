@@ -14,6 +14,7 @@ import type {
     HarnessEvent,
     HarnessMessage,
     HarnessUsage,
+    ToolMediaDescriptor,
     ToolUiPanel
 } from '../harness';
 import type { RunnerSettings } from './harnesses/types';
@@ -36,6 +37,7 @@ export type {
     HarnessThreadStatus,
     HarnessToolCall,
     HarnessUsage,
+    ToolMediaDescriptor,
     ToolUiBlock,
     ToolUiPanel
 } from '../harness';
@@ -168,7 +170,7 @@ export type HarnessDescriptor = {
     tools: string[];
     // The core tools this card's runs will declare (R18): the four core file tools
     // (read/write/edit/glob/grep) when registered, the harness-owned
-    // toolRequest/toolCreate/todoManage, delegate when a subagent allowlist
+    // toolRequest/toolCreate/task, delegate when a subagent allowlist
     // exists, and search when this host has a provider key. The UI core dropdown
     // renders this exact set, so it reflects runtime visibility rather than a
     // hard-coded harness list. fileList and the other presets stay searchable.
@@ -236,6 +238,23 @@ export type UpdateHarnessRequest = {
     agentInstructions?: Record<string, string>;
 };
 
+// Response of DELETE /harnesses/:name (T5).
+//
+// Removes the harness from the catalogue — a shipped built-in exactly like a
+// user-created one. Deliberately minimal, like the other destructive routes: the
+// authoritative record is the database (the entry is gone, and a built-in's name is
+// kept in `deleted` so a restart does not re-ship it), not a second copy of the
+// harness on this route. The UI already holds the list it needs to repaint.
+//
+// Status contract: 200 `{ deleted: true }`; 404 for an unknown name AND for a name
+// that is already deleted (a repeat delete did not remove anything). Existing
+// sessions are untouched — each one runs, and a saved one restores from, the
+// definition it captured — so deleting a harness with live or saved conversations is
+// not an error.
+export type DeleteHarnessResult = {
+    deleted: true;
+};
+
 // Whether the server can actually run a listed tool. Omitted means "available":
 // the field was added for credential-dependent tools (search), so leaving it
 // off keeps every existing entry byte-identical.
@@ -259,7 +278,7 @@ export type ToolDescriptor = {
     visibility: 'core' | 'searchable';
     parameters: Record<string, unknown>;
     availability?: ToolAvailability;
-    // True for the harness-owned core tools (toolRequest, toolCreate, todoManage,
+    // True for the harness-owned core tools (toolRequest, toolCreate, task,
     // delegate). They have no standalone implementation: a call must carry a
     // `sessionId` and executes through that session's harness. Omitted for every
     // directly callable entry, so existing descriptors keep their shape.
@@ -618,7 +637,7 @@ export type ToolCallRequest = {
     // Which session runs the call (R8; live routing per the self-modifying-tools
     // R4). When present and non-empty, the call resolves through THAT session's
     // live harness registry: session-bound core tools (toolRegistry, toolRequest,
-    // toolCreate, todoManage, delegate, …), replaced preset/app tools, and
+    // toolCreate, task, delegate, …), replaced preset/app tools, and
     // runtime-created names all execute there, so discovery, registration, todos,
     // and delegation affect the conversation the user is looking at. Omitted or
     // empty keeps the static direct runner for a directly callable catalogue tool
@@ -638,10 +657,16 @@ export type ToolCallResult =
           // `toolUi(content, panels)` envelope. Standard tools are unchanged.
           result: unknown;
           // Optional declarative panels the tool supplied with `toolUi()`
-          // (R20.2). Presentation data only — no HTML, script, or actions — and
+          // (R20.2). Presentation data only - no HTML, script, or actions - and
           // bounded by the server before it reaches a client. Omitted for every
           // ordinary tool so existing responses keep their exact shape.
           panels?: ToolUiPanel[];
+          // Optional file media the tool supplied with `toolMedia()` (R3/R4,
+          // the `download` preset). DESCRIPTORS ONLY - id/kind/name/mime/size -
+          // never the base64, which stays in the process that fetched the file
+          // (a manual catalogue call has no transcript to attach it to). Omitted
+          // for every medialess tool, so existing responses are unchanged.
+          media?: ToolMediaDescriptor[];
           durationMs: number;
       }
     | { ok: false; error: HarnessErrorInfo; durationMs: number };

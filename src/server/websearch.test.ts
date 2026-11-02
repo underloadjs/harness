@@ -7,6 +7,10 @@
 // port; the configured case intercepts only the outbound Exa request, so no
 // network is touched and the exact credential header can be asserted.
 //
+// A third case covers a Linkup-only host: the provider preference (Exa first)
+// must never turn into an Exa requirement, so the same endpoint executes through
+// Linkup's endpoint with the Linkup key in the header only.
+//
 // Environment values are stubbed per test, which also proves the catalogue is
 // built when the server starts (after `.env` loading), not at module import.
 
@@ -56,6 +60,7 @@ describe('search catalogue', () => {
         // singleton built before these stubs would have seen the host env.
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
+        vi.stubEnv('LINKUP_API_KEY', '');
 
         const server = await startHarnessServer({ port: 0, staticRoot: null });
 
@@ -92,6 +97,7 @@ describe('search catalogue', () => {
         const KEY = 'test-exa-key';
         vi.stubEnv('EXA_API_KEY', KEY);
         vi.stubEnv('TAVILY_API_KEY', '');
+        vi.stubEnv('LINKUP_API_KEY', '');
 
         // Capture the real transport before stubbing: the test's own requests to
         // the harness server must still go through, while Exa is intercepted.
@@ -177,6 +183,100 @@ describe('search catalogue', () => {
                 type: 'auto',
                 numResults: 5,
                 contents: { highlights: true }
+            });
+        } finally {
+            await server.close();
+        }
+    });
+
+    // A host whose only credential is a Linkup key gets the identical catalogue
+    // behaviour: search is available, the key never crosses the wire to the
+    // client, and one outbound request uses Linkup's endpoint and body.
+    it('executes through Linkup when only LINKUP_API_KEY is set', async () => {
+        const KEY = 'test-linkup-key';
+        vi.stubEnv('EXA_API_KEY', '');
+        vi.stubEnv('TAVILY_API_KEY', '');
+        vi.stubEnv('LINKUP_API_KEY', KEY);
+
+        const realFetch = globalThis.fetch;
+        const outbound: { url: string; init: RequestInit }[] = [];
+
+        vi.stubGlobal('fetch', async (input: RequestInfo | URL, init?: RequestInit): Promise<Response> => {
+            const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url;
+
+            if (url === 'https://api.linkup.so/v1/search') {
+                outbound.push({ url, init: init ?? {} });
+
+                return new Response(
+                    JSON.stringify({
+                        results: [
+                            {
+                                type: 'text',
+                                name: 'Linkup result',
+                                url: 'https://example.com/linkup',
+                                content: 'linkup answers with excerpts',
+                                favicon: 'https://example.com/favicon.ico'
+                            }
+                        ]
+                    }),
+                    { status: 200, headers: { 'content-type': 'application/json' } }
+                );
+            }
+
+            return realFetch(input, init);
+        });
+
+        const server = await startHarnessServer({ port: 0, staticRoot: null });
+
+        try {
+            const toolsResponse = await fetch(`${server.url}/api/tools`, { headers: CLIENT });
+            const toolsBody = await toolsResponse.text();
+            expect(toolsBody).not.toContain(KEY);
+
+            const index = JSON.parse(toolsBody) as ToolIndex;
+            const descriptor = index.tools.find((tool) => tool.name === 'search');
+
+            expect(descriptor?.availability).toEqual({
+                state: 'available',
+                environment: [...WEBSEARCH_ENVIRONMENT]
+            });
+
+            // Exactly one configured provider, so no `provider` argument is offered.
+            const properties = (descriptor?.parameters as { properties: Record<string, unknown> }).properties;
+            expect(Object.keys(properties)).toEqual(['query', 'maxResults']);
+
+            const result = await callTool(server.url, 'search', { query: 'harness', maxResults: 3 });
+
+            expect(withoutDuration(result)).toEqual({
+                ok: true,
+                result: {
+                    provider: 'linkup',
+                    query: 'harness',
+                    maxResults: 3,
+                    results: [
+                        {
+                            title: 'Linkup result',
+                            url: 'https://example.com/linkup',
+                            snippet: 'linkup answers with excerpts'
+                        }
+                    ]
+                }
+            });
+
+            expect(JSON.stringify(result)).not.toContain(KEY);
+
+            expect(outbound).toHaveLength(1);
+            expect(outbound[0].url).toBe('https://api.linkup.so/v1/search');
+            expect(outbound[0].init.method).toBe('POST');
+            expect(outbound[0].init.headers).toEqual({
+                'content-type': 'application/json',
+                authorization: `Bearer ${KEY}`
+            });
+            expect(JSON.parse(String(outbound[0].init.body))).toEqual({
+                q: 'harness',
+                depth: 'fast',
+                outputType: 'searchResults',
+                maxResults: 3
             });
         } finally {
             await server.close();

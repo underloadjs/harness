@@ -130,11 +130,29 @@ describe('standalone server launcher', () => {
                 expect(stdout).not.toContain('VITE');
                 expect(stdout).not.toContain('Local:');
 
+                // The catalogue the launcher ships is the production one: five real,
+                // runnable configurations, no scripted demo and no card that fails on
+                // purpose (T5). This is the whole point of the removal, so it is
+                // asserted against a REAL launched server, not only against the store.
+                const catalogue = await fetch(`${url}/api/harnesses`, { headers: CLIENT });
+                expect(catalogue.status).toBe(200);
+                const index = (await catalogue.json()) as { harnesses: { name: string }[] };
+                expect(index.harnesses.map((harness) => harness.name)).toEqual([
+                    'instruct',
+                    'research',
+                    'workspace',
+                    'reviewer',
+                    'planner'
+                ]);
+
                 // --database-root reached startHarnessServer: a session persists.
+                // A shipped role is used (not the offline fixture, which this build no
+                // longer lists); creating a session never contacts the provider, so the
+                // child stays offline while still exercising the durable write.
                 const created = await fetch(`${url}/api/sessions`, {
                     method: 'POST',
                     headers: { ...CLIENT, 'content-type': 'application/json' },
-                    body: JSON.stringify({ harness: 'demo' })
+                    body: JSON.stringify({ harness: 'instruct' })
                 });
                 expect(created.status).toBe(201);
 
@@ -142,11 +160,16 @@ describe('standalone server launcher', () => {
                 expect(fs.existsSync(stateFile)).toBe(true);
                 const state = JSON.parse(fs.readFileSync(stateFile, 'utf8')) as {
                     version: number;
+                    deleted?: string[];
                     sessions: { harness: string; status: string }[];
                 };
                 expect(state.version).toBe(1);
                 expect(state.sessions).toHaveLength(1);
-                expect(state.sessions[0]).toMatchObject({ harness: 'demo', status: 'idle' });
+                expect(state.sessions[0]).toMatchObject({ harness: 'instruct', status: 'idle' });
+
+                // Nothing was deleted, so the additive T5 field is absent: a document
+                // written by this build keeps the pre-T5 shape.
+                expect(state).not.toHaveProperty('deleted');
             } finally {
                 await stop(child);
                 fs.rmSync(work, { recursive: true, force: true });

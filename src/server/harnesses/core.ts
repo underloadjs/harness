@@ -4,7 +4,7 @@
 // ----------------------------------------------
 // `createToolCatalogue()` (./index.ts) lists tools a host can call DIRECTLY: no
 // harness, no model, no session. The harness-owned core tools are the opposite —
-// toolRegistry, toolRequest, todoManage, profileManage, chapterManage,
+// toolRegistry, toolRequest, task, profileManage, chapterManage,
 // locationManage, agentManage, agentResult, delegate, actionRequest,
 // threadFork only mean something inside one session's harness, because they mutate
 // that harness's registry, enabled set, todo list, record stores, or agent

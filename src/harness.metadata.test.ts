@@ -4,14 +4,14 @@
 // These are the facts a model and an operator actually see: the toolRequest
 // schema (names/regex/tags, uncapped selection, an optional per-query limit), the
 // toolList inventory contract, the toolManage operations, the toolCreate security
-// statement, the todoManage actions, the record tools' schemas and partial-update
+// statement, the task actions, the record tools' schemas and partial-update
 // contract, and the delegate allowlist. The server describes the same tools
 // in its catalogue from `src/core/metadata.ts` - the copy these registrations use
 // - so pinning the registered text here also pins what a descriptor advertises;
 // `server/api.test.ts` asserts that projection end to end.
 //
 // T14: the wire names are toolRequest / toolList / toolManage / toolCreate /
-// todoManage / profileManage / chapterManage / locationManage / agentManage /
+// task / profileManage / chapterManage / locationManage / agentManage /
 // agentResult / delegate.
 
 import { describe, expect, it } from 'vitest';
@@ -95,7 +95,7 @@ describe('core tool metadata', () => {
                 'toolList',
                 'toolManage',
                 'toolCreate',
-                'todoManage',
+                'task',
                 'profileManage',
                 'chapterManage',
                 'locationManage',
@@ -103,16 +103,16 @@ describe('core tool metadata', () => {
                 'agentResult'
             ].map((name) => writer.tools[name].visibility)
         ).toEqual([
-            'core',
-            'core',
-            'core',
-            'core',
-            'core',
-            'core',
-            'core',
-            'core',
-            'core',
-            'core'
+            'core', // toolRequest — the discovery bootstrap stays declared
+            'searchable', // toolList
+            'searchable', // toolManage
+            'searchable', // toolCreate
+            'core', // task — the session plan stays declared
+            'searchable', // profileManage
+            'searchable', // chapterManage
+            'searchable', // locationManage
+            'searchable', // agentManage
+            'searchable' // agentResult
         ]);
 
         expect(writer.tools.toolCreate.description).toBe(
@@ -151,60 +151,72 @@ describe('core tool metadata', () => {
         expect(writer.tools.toolCreate.tags).toEqual(['tools', 'create', 'extension', 'dynamic']);
     });
 
-    it('declares the todoManage actions and result contract', () => {
+    it('declares the task patch shape and the one result contract', () => {
         const writer = solo();
 
-        // The enum is the accepted action list; ./todo.ts validates against the same
-        // values and owns their order in error messages. R9 adds the paging cursor
-        // and the text cap to the schema the model reads.
-        expect(writer.tools.todoManage.parameters).toEqual({
+        // R9-R11: one optional patch replaces the action enum. Nothing is required,
+        // because the documented empty call is the READ: an entry without `id` adds
+        // a task, an entry with a known `id` patches it, and `remove` deletes.
+        expect(writer.tools.task.parameters).toEqual({
             type: 'object',
             properties: {
-                action: {
-                    type: 'string',
-                    enum: ['add', 'remove', 'check', 'uncheck', 'list'],
-                    description: 'One of: add, remove, check, uncheck, list.'
-                },
-                text: {
-                    type: 'string',
+                tasks: {
+                    type: 'array',
                     description:
-                        'Todo text for "add". Required for that action; trimmed. Maximum 4000 characters.'
+                        'Changes to apply, in order. Omit "id" to add a task (its "text" is required); give a known "id" to patch that task, leaving omitted fields unchanged. An empty list is a read.',
+                    items: {
+                        type: 'object',
+                        properties: {
+                            id: {
+                                type: 'string',
+                                description:
+                                    'Existing task id to patch. Omit it to add a new task. Unknown ids are rejected.'
+                            },
+                            text: {
+                                type: 'string',
+                                description:
+                                    'Task text: required to add, and an optional rename when patching an "id". Trimmed, maximum 4000 characters, never blank.'
+                            },
+                            completed: {
+                                type: 'boolean',
+                                description:
+                                    'true marks the task done, false reopens it. Omitted leaves the stored flag unchanged.',
+                            }
+                        },
+                        additionalProperties: false
+                    }
                 },
-                id: {
-                    type: 'string',
-                    description: 'Todo id returned by "add". Required for remove/check/uncheck.'
-                },
-                completed: {
-                    type: 'boolean',
+                remove: {
+                    type: 'array',
+                    items: { type: 'string' },
                     description:
-                        'For "check" only: true (default) marks complete, false unchecks. "uncheck" is the same as false.'
+                        'Exact task ids to delete. Every id must exist; an id may not also appear in "tasks".'
                 },
                 offset: {
                     type: 'integer',
                     minimum: 0,
                     description:
-                        'For "list" only: 0-based index of the first item. Defaults to 0; use page.nextOffset from the previous page.'
+                        '0-based index of the first returned task. Defaults to 0; use page.nextOffset from the previous page.'
                 },
                 limit: {
                     type: 'integer',
                     minimum: 1,
                     maximum: 100,
-                    description: 'For "list" only: page size, 1-100. Defaults to 20.'
+                    description: 'Page size, 1-100. Defaults to 20.'
                 }
             },
-            required: ['action'],
             additionalProperties: false
         });
-        expect(writer.tools.todoManage.tags).toEqual([
-            'todo',
-            'todos',
+        expect(writer.tools.task.tags).toEqual([
             'task',
             'tasks',
+            'todo',
+            'todos',
             'checklist',
             'plan'
         ]);
-        expect(writer.tools.todoManage.description).toBe(
-            'Manage the todo list for this harness session. Actions: "add" (requires text), "remove" (requires id), "check" (requires id; completed defaults to true, false unchecks), "uncheck" (requires id), and "list". Ids are stable strings returned by "add". The list is shared by every agent in this harness, kept across turns, and cleared by reset. "list" returns ONE PAGE: { todos, counts { total, completed, remaining }, page { offset, limit, hasMore, nextOffset? } } - 20 items by default, at most 100, and a 64 KiB serialized page budget, so pass page.nextOffset back as offset while page.hasMore. Every mutation returns { todo|removed, counts } with NO list, so call "list" to read it. Caps: 200 todos, 4000 characters of text each.'
+        expect(writer.tools.task.description).toBe(
+            "Maintain the task list for this harness session. Call with NO arguments (or {}) to read it. `tasks` is a list of changes: an entry with no \"id\" ADDS a task and must carry \"text\"; an entry with a known \"id\" PATCHES that task and every field it omits stays unchanged. `remove` is a list of task ids to delete. Unknown ids are invalid, an id may not appear twice in `tasks` or in both `tasks` and `remove`, and the whole call is validated before anything changes - so a rejected call leaves the list exactly as it was. Ids are stable strings returned by earlier calls. The list is shared by every agent in this harness, kept across turns, and cleared by reset. EVERY successful call returns the SAME bounded page of the current list: { tasks, counts { total, completed, pending }, page { offset, limit, hasMore, nextOffset? } } - 20 items by default, at most 100, and a 64 KiB serialized page budget, so pass page.nextOffset back as `offset` while page.hasMore, or set `offset`/`limit` to choose the page. Caps: 200 tasks, 4000 characters of text each."
         );
     });
 

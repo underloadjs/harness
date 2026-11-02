@@ -1,4 +1,5 @@
-// Tool-call chips with dialog-only details.
+// Tool-call chips with dialog-only details, plus the reasoning ("think") chip that
+// shares that exact anatomy.
 //
 // Every harness tool call arrives as two SSE events — `tool_call` (name +
 // arguments) and later `tool_result` (name + content + isError) — and the result
@@ -18,13 +19,16 @@
 //   - the summary is still the compact chip (arrow + name); the state word and the
 //     argument preview live in the DOM and in the aria-label, and styles.css keeps
 //     them hidden while the chip is collapsed;
-//   - R2: EVERY chip carries its OWN elapsed-duration badge as an OVERLAY in the
-//     chip's top-right corner (`.tool-duration` is absolutely positioned against
-//     `.tool`). Out of flow is the point: the live label changes every 250ms and a
-//     final server span replaces it once known, and an in-flow label of changing
-//     width is what made the whole chip row jitter. The pill is padded clear of the
-//     name, sits inside the border box so nothing clips it, and stays `[hidden]`
-//     when there is no honest span (never an invented `0.0s`);
+//   - R2/T2: EVERY chip carries its OWN elapsed-duration label INLINE, right after the
+//     name, so the collapsed chip reads `[Search 1.3s]` at its intrinsic width. It used to
+//     be an absolutely positioned corner overlay, which forced the summary to reserve
+//     ~76px of dead space so the pill could never paint over the name — that reservation
+//     is what made every chip look stretched. In flow, the label's own width is the only
+//     width the chip has; `formatToolDuration` keeps the value at a fixed character count
+//     for any given magnitude (and styles.css uses tabular figures), so the only reflow is
+//     the rare digit-count step (`9.9s` -> `10.0s`). The pill is padded clear of the name
+//     by the summary's flex gap, is never clipped, and stays `[hidden]` when there is no
+//     honest span (never an invented `0.0s`);
 //   - activating it (mouse, Enter or Space) calls `openDialog` from ui/dialog.ts;
 //     the dialog adopts the very same `.tool-body` node, so arguments, the full
 //     available result/error and live updates share one DOM source of truth;
@@ -74,6 +78,14 @@
 //
 // Consecutive calls are still grouped by turns.ts (`.tool-group`), which makes the
 // chips flow horizontally and wrap.
+//
+// THE THINK CHIP (`createReasoningCard`): a streamed reasoning round uses the SAME
+//   chip-plus-dialog anatomy as a tool call, so it sits INLINE in the `.tool-group` row
+//   instead of being a full-width block that breaks it. It is labelled `think` (the
+//   requested word, not `reasoning`), is painted amber, and its pill shows the share of
+//   the block's accumulated CONTEXT the round occupies — not a character count, because
+//   what matters is how much context the thinking is using. Its whole text is readable in
+//   the dialog with its own per-pane Copy. See the section above `THINK_LABEL`.
 //
 // Cross-references:
 //   - created by: src/frontend/ui/turns.ts (per-agent flow)
@@ -176,12 +188,13 @@ const DURATION_TICK_MS = 250;
 //   - >=60s                                -> '4m12s' (delegates), so a long call
 //     never becomes an unreadable `252.0s`.
 //
-// Width contract for the corner badge (R2/T5): the delegated minutes form has NO
+// Width contract for the inline label (R2/T2): the delegated minutes form has NO
 // hours unit, so the string keeps growing with the minutes — 6 chars `59m59s`,
-// 7 chars `600m00s` (10h), 8 chars `5999m00s` (99.98h). styles.css reserves the
-// chip's corner for 8 tabular characters so a long run can never paint the pill over
-// the tool name; the format itself is shared with the turn clock and the retry line,
-// so it is deliberately NOT shortened here (that would move those surfaces).
+// 7 chars `600m00s` (10h), 8 chars `5999m00s` (99.98h). The label flows inside the chip,
+// so a pathological run past 99 hours simply takes more of the chip (the tool NAME is the
+// item that ellipsises, and the chip is capped at the row's width); the format itself is
+// shared with the turn clock and the retry line, so it is deliberately NOT shortened here
+// (that would move those surfaces).
 export const formatToolDuration = (milliseconds: number | undefined): string => {
     if (milliseconds === undefined || !Number.isFinite(milliseconds) || milliseconds < 0) return '';
     if (milliseconds < 1000) return `${(milliseconds / 1000).toFixed(1)}s`;
@@ -402,6 +415,9 @@ const createPaneHeading = (label: HTMLElement, copyLabel: string, text: () => st
 // call's life so the announced state ("Copied") is the only thing that changes.
 const COPY_ARGUMENTS_LABEL = 'Copy arguments';
 const COPY_RESULT_LABEL = 'Copy result';
+// The think chip has ONE pane, so its copy control names that pane's text; the label is
+// fixed (not `think · 1,234 chars`) for the same reason the two above are.
+const COPY_THINK_LABEL = 'Copy thinking';
 
 // `openFile` is supplied only for the tool dialog's argument/result blocks. The
 // transform runs on a detached highlighter host first (never inside `pre`/`code`,
@@ -508,11 +524,11 @@ export const createToolCallCard = (
     state.className = 'tool-state';
     state.textContent = STATE_TEXT.running;
 
-    // The measured span as its own element, painted as the chip's duration badge
-    // (`read 0.8s`); styles.css owns WHERE it sits (a pill in the chip's corner) and
-    // keeps it visible while the chip is collapsed. It ticks live while running and
-    // freezes on the server's duration when one arrives. Always text, never
-    // colour-only, and an unknown span is `[hidden]`, never an invented `0.0s`.
+    // The measured span as its own element, painted as the chip's inline duration label
+    // (`read 0.8s`); styles.css owns HOW it looks (a pill after the name, inside the chip's
+    // own content width). It ticks live while running and freezes on the server's duration
+    // when one arrives. Always text, never colour-only, and an unknown span is `[hidden]`,
+    // never an invented `0.0s`.
     const duration = document.createElement('span');
     duration.className = 'tool-duration';
 
@@ -809,6 +825,275 @@ export const createToolCallCard = (
             // dialog left behind by a cleared turn would be an orphaned modal with a
             // stale focus trap; `onClose` also restores the body into the card.
             stopTicker();
+            if (dialog !== undefined && dialog.isOpen) dialog.close();
+        }
+    };
+};
+
+// --- Reasoning chip ("think") ----------------------------------------------
+//
+// One streamed `reasoning` round of ONE model request, rendered with the SAME anatomy as
+// a tool call: a compact chip that stays INLINE in the `.tool-group` row and whose full
+// text is only ever readable in the dialog (the R12 modal contract above). It is labelled
+// `think`, not `reasoning`, and it is painted AMBER so the eye can tally how much of a run
+// was thinking at a glance.
+//
+// The pill is a PERCENTAGE OF THE CONTEXT, not a character count. Nobody reads the
+// thinking or cares how intricate it was; what is worth seeing is how much of the
+// context the conversation now carries went into it. The denominator is the block's own
+// latest-request context — the same figure the header tally prints (`blockMeta`) — so one
+// chip answers "how much of what this conversation currently costs did this round add?",
+// every chip in one block stays comparable, and the shares sum to the thinking budget.
+// The exact character count is not lost: it is in the hover title and in the dialog
+// title, which is where a reader who wants it looks.
+//
+// Why not the old full-width `.thinking` block: it broke the chip row on every round and
+// turned `[glob][read]` into alternating rows of chips and wide grey bars.
+//
+// Live contract (owned by ui/turns.ts, which appends the deltas):
+//   - `setText` is called with the CUMULATIVE buffer, never a delta, so the pill, the
+//     dialog body, the accessible name and an OPEN dialog all repaint from one source;
+//   - `setContext` is called with the block's freshest context figure. turns.ts repaints
+//     EVERY chip of a block when a `usage` event advances that figure, so a percentage can
+//     never be measured against a denominator the header has already moved past;
+//   - the pill is `[hidden]` — never `0%`, never a dash — while there is no honest
+//     denominator (a provider that reports no usage) or no text yet, exactly like the tool
+//     chip's duration pill;
+//   - `destroy` only closes a dialog this card owns (a retry discards the chip, and an
+//     orphaned modal with a stale focus trap is the bug that prevents it).
+export const THINK_LABEL = 'think';
+
+// Rough token estimate behind the share. Providers report usage per REQUEST, never per
+// message, so the only figure this module owns is a character count and the ratio uses the
+// ~4-characters-per-token rule of thumb for Latin-script text. It is therefore labelled an
+// estimate (`≈` in the hover title) and is only ever shown as a PERCENTAGE of a context
+// that is itself an approximation — a share of a fraction of a point is a decision cue,
+// not a number anyone adds up.
+const CHARS_PER_TOKEN = 4;
+
+// Pinned locale, the same rule ui/tokens.ts documents: these figures must be identical on
+// every host and every Node default (`12,108`, never `12.108` or `12 108`).
+const THINK_NUMBER = new Intl.NumberFormat('en-US');
+const thinkCount = (value: number): string => THINK_NUMBER.format(Math.trunc(Math.max(value, 0)));
+
+const thinkTokens = (characters: number): number =>
+    Math.max(1, Math.ceil(Math.max(characters, 0) / CHARS_PER_TOKEN));
+
+// Exact pill text for one round:
+//   - no text, or no honest denominator (undefined / non-finite / <= 0) -> '' and the
+//     caller hides the pill (an unknown context must not become a fabricated `0%`);
+//   - a real share below 0.1% reads `<0.1%`, because `0.0%` would claim the model never
+//     thought at all;
+//   - below 10% keeps one decimal — that is the range where the comparison happens — and
+//     anything larger rounds to whole percent, so the pill stays three or four characters
+//     and never twitches a decimal place while the round streams.
+export const formatThinkShare = (
+    characters: number,
+    contextTokens: number | undefined
+): string => {
+    if (characters <= 0) return '';
+    if (contextTokens === undefined || !Number.isFinite(contextTokens) || contextTokens <= 0)
+        return '';
+
+    const percent = (thinkTokens(characters) / contextTokens) * 100;
+    if (percent < 0.1) return '<0.1%';
+
+    return percent < 10 ? `${percent.toFixed(1)}%` : `${Math.round(percent)}%`;
+};
+
+export type ReasoningCard = {
+    // The chip itself, appended into the agent's `.tool-group` row by turns.ts.
+    element: HTMLDetailsElement;
+    // The clickable surface (`aria-haspopup="dialog"`, the dialog's return-focus target).
+    summary: HTMLElement;
+    // `think` — the visible name of the control.
+    label: HTMLElement;
+    // The share pill (`0.4%`), hidden while the block has no honest context figure.
+    count: HTMLElement;
+    // The reasoning text as a plain-text block; adopted by the dialog while one is open.
+    body: HTMLElement;
+    // Paint the CUMULATIVE text of this round.
+    setText: (text: string) => void;
+    // Repaint against the block's freshest context figure (the denominator above). Safe to
+    // call repeatedly; an unchanged figure repaints identically.
+    setContext: (tokens: number | undefined) => void;
+    // The text currently held (the dialog's Copy button reads it at CLICK time, so it is
+    // always the whole round, never a streaming prefix of it).
+    text: () => string;
+    // The denominator currently in force, for a caller that wants to batch repaints.
+    context: () => number | undefined;
+    // The exact pill text, for tests and for a caller composing its own label.
+    share: () => string;
+    // Close a dialog this card owns. Called when the card leaves the DOM (a discarded
+    // attempt or a superseded projection), never when the round merely finishes.
+    destroy: () => void;
+};
+
+export const createReasoningCard = (): ReasoningCard => {
+    const element = document.createElement('details');
+    // `.tool` is deliberate: the chip is the SAME box vocabulary as a tool call
+    // (border, radius, surface, intrinsic width, wrap behaviour). `.think` only
+    // restyles the label/pill, because thinking is not an outcome.
+    element.className = 'tool think';
+
+    const summary = document.createElement('summary');
+    summary.className = 'tool-summary';
+
+    const label = document.createElement('span');
+    label.className = 'tool-name';
+    label.textContent = THINK_LABEL;
+
+    // The share flows right after the name, exactly like `.tool-duration` does on a call
+    // chip; styles.css paints both with the same pill rules (and `.think` paints it
+    // amber, so a run's thinking budget is scannable without reading a single number).
+    const count = document.createElement('span');
+    count.className = 'think-count';
+    count.hidden = true;
+
+    summary.append(label, count);
+    // Same popup vocabulary as the tool chip: activation opens a modal, never an
+    // inline disclosure, so assistive tech is told which kind of popup to expect.
+    summary.setAttribute('aria-haspopup', 'dialog');
+    summary.tabIndex = 0;
+
+    // Built once, moved into the dialog while one is open and back on close — the
+    // identical ownership model `createToolCallCard` documents above, which is why a
+    // streaming round updates an already-open dialog without re-adopting anything.
+    const body = document.createElement('div');
+    body.className = 'tool-body';
+
+    // The cumulative text of this round and the context figure it is measured against.
+    // Both are declared BEFORE the panes because the pane's copy provider closes over the
+    // text (`() => current`, read at click time), exactly like `resultText` in
+    // `createToolCallCard`.
+    let current = '';
+    let contextTokens: number | undefined;
+
+    const section = document.createElement('section');
+    section.className = 'tool-section';
+    const heading = document.createElement('div');
+    heading.className = 'tool-label';
+    heading.textContent = THINK_LABEL;
+    // `.reasoning` keeps its class (and its plain-text scroll box) so the transcript's
+    // long thinking text stays readable in the modal exactly as it was in the block.
+    const textHost = document.createElement('div');
+    textHost.className = 'reasoning';
+    section.append(createPaneHeading(heading, COPY_THINK_LABEL, () => current), textHost);
+    body.append(section);
+    element.append(summary, body);
+
+    let dialog: DialogHandle | undefined;
+
+    // The dialog is the surface that still spells the figure out in full: the share, the
+    // exact character count and the estimated tokens, so the compact chip can show one
+    // honest number without hiding the arithmetic behind it.
+    const dialogTitle = (): string => {
+        if (current.length === 0) return THINK_LABEL;
+
+        const chars = `${thinkCount(current.length)} chars`;
+        const share = formatThinkShare(current.length, contextTokens);
+
+        return share.length === 0
+            ? `${THINK_LABEL} · ${chars}`
+            : `${THINK_LABEL} · ${share} · ${chars}`;
+    };
+
+    // ONE paint path for every derived surface, so the pill, the accessible name, the
+    // hover title and an open dialog's title cannot disagree about the same round.
+    const paint = (): void => {
+        const share = formatThinkShare(current.length, contextTokens);
+
+        // An empty round or an unknown context hides the pill; the chip then keeps its
+        // intrinsic `think` width instead of claiming a measurement it does not have.
+        count.textContent = share;
+        count.hidden = share.length === 0;
+
+        // Plain text, never Markdown: scratch space can contain anything the model wrote,
+        // and this path adds no HTML parse of its own.
+        textHost.textContent = current;
+
+        summary.setAttribute(
+            'aria-label',
+            share.length === 0
+                ? THINK_LABEL
+                : `${THINK_LABEL}: ${share} of the context so far`
+        );
+
+        // The arithmetic stays on hover. In the row it would be noise; to a reader who
+        // wonders what the percentage was built from it is the whole answer.
+        summary.title =
+            current.length === 0
+                ? THINK_LABEL
+                : contextTokens === undefined
+                  ? `${thinkCount(current.length)} characters ≈ ${thinkCount(thinkTokens(current.length))} tokens · no context size reported yet`
+                  : `≈ ${thinkCount(thinkTokens(current.length))} of ${thinkCount(contextTokens)} context tokens (${share || '<0.1%'})`;
+
+        // The open dialog tracks the round live, the way a running tool chip's dialog
+        // tracks its state.
+        if (dialog !== undefined && dialog.isOpen) dialog.update({ title: dialogTitle() });
+    };
+
+    const openDetails = (): void => {
+        if (dialog !== undefined && dialog.isOpen) {
+            dialog.element.focus({ preventScroll: true });
+            return;
+        }
+
+        const handle = openDialog({
+            title: dialogTitle(),
+            content: body,
+            returnFocus: summary,
+            onClose: () => {
+                if (dialog === handle) dialog = undefined;
+                // Return the body to the closed chip so a reopen adopts the up-to-date
+                // node and a later `setText` still reaches it.
+                if (!element.contains(body)) element.append(body);
+            }
+        });
+
+        dialog = handle;
+    };
+
+    // Chip activation opens the modal; the native toggle is cancelled and guarded,
+    // exactly like the tool chip, so the chip can never expand inline.
+    summary.addEventListener('click', (event) => {
+        event.preventDefault();
+        openDetails();
+    });
+
+    // Keyboard parity for jsdom/embedded webviews where a keydown is not turned into a
+    // click. `openDetails` is idempotent while the dialog is open.
+    summary.addEventListener('keydown', (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ' && event.key !== 'Spacebar') return;
+        event.preventDefault();
+        openDetails();
+    });
+
+    element.addEventListener('toggle', () => {
+        if (element.open) element.open = false;
+    });
+
+    return {
+        element,
+        summary,
+        label,
+        count,
+        body,
+        setText: (text: string): void => {
+            current = text;
+            paint();
+        },
+        setContext: (tokens: number | undefined): void => {
+            const finite = tokens !== undefined && Number.isFinite(tokens) && tokens > 0 ? tokens : undefined;
+            if (finite === contextTokens) return;
+
+            contextTokens = finite;
+            paint();
+        },
+        text: () => current,
+        context: () => contextTokens,
+        share: () => formatThinkShare(current.length, contextTokens),
+        destroy: () => {
             if (dialog !== undefined && dialog.isOpen) dialog.close();
         }
     };

@@ -140,36 +140,16 @@ describe('delegate', () => {
         const writer = harness({ agents: { writer: writerAgent, researcher }, presets: false });
         await writer('go');
 
-        // The primary sees toolRequest, toolCreate, delegate. The subagent never sees
-        // the delegation control.
+        // The primary sees the bootstrap pair plus delegate. The subagent never sees
+        // the delegation control, so its declarations are exactly the pair.
         expect(declaredNames(seenWriter[0])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
+            'task',
             'delegate',
-            'threadFork',
         ]);
         expect(declaredNames(seenResearcher[0])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork'
+            'task'
         ]);
     });
 

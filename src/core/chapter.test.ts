@@ -36,11 +36,11 @@ const empty = {
 const filler = (length: number): string => 'x'.repeat(length);
 
 describe('createChapterTool', () => {
-    it('exposes the exact wire name, core visibility, and chapter tags', () => {
+    it('exposes the exact wire name, searchable visibility, and chapter tags', () => {
         const { tool } = createChapterTool();
 
         expect(tool.name).toBe('chapterManage');
-        expect(tool.visibility).toBe('core');
+        expect(tool.visibility).toBe('searchable');
         expect(tool.tags).toEqual(['chapter', 'chapters', 'story', 'writing', 'outline', 'book']);
     });
 

@@ -465,18 +465,8 @@ describe('background tool calls', () => {
             { role: 'tool', content: expect.any(String), toolCallId: 'b1', name: 'beta' }
         ]);
         expect(seen[0].toolNames).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork',
+            'task',
             'alpha',
             'beta'
         ]);

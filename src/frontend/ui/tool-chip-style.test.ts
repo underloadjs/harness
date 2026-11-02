@@ -6,10 +6,18 @@
 //   - the chip keeps its compact intrinsic width; the detail body is dialog
 //     content (R12) and never an inline panel;
 //   - the state word and the argument preview stay hidden while the chip is
-//     closed, but the duration BADGE does not (R2): every chip overlays its own
-//     measured span in its top-right corner, absolutely positioned so a live label
-//     cannot move the name or a neighbour, and an unknown span stays hidden through
-//     `[hidden]` so no empty pill is painted;
+//     closed, but the duration label does not (R2/T2): every chip carries its own
+//     measured span INLINE after the name, so the collapsed chip reads
+//     `[Search 1.3s]` at exactly its content width. The label used to be an
+//     absolutely positioned corner pill, and the summary had to reserve ~76px of
+//     dead space for it — that reservation is what stretched every chip, so the
+//     contract below pins that it is GONE, not merely different;
+//   - an unknown span stays hidden through `[hidden]` so no empty pill is painted
+//     and no space is taken for it;
+//   - NO disclosure chevron anywhere on the chip (R: "the user knows clicking opens a
+//     dialog"). The chip's painted parts are exactly the state glyph, the name and the
+//     duration pill, and the marker removal is a BASE-ELEMENT `summary` rule so every
+//     future chip inherits it instead of re-declaring it;
 //   - the tool name is green on success and red on failure, neutral otherwise.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts
@@ -26,6 +34,11 @@ const stylesheet = ['src/frontend/styles.css', 'src/styles.css']
 if (stylesheet === undefined) throw new Error('styles.css not found');
 
 const css = readFileSync(stylesheet, 'utf8');
+
+// Comments NAME the removed rules ("there is deliberately NO width reservation"), so
+// "this rule is gone" assertions must run against the stylesheet with comments
+// stripped, otherwise the documentation itself fails the test.
+const rules = css.replace(/\/\*[\s\S]*?\*\//g, '');
 
 const blockOf = (selector: string): string => {
     const start = css.indexOf(selector);
@@ -46,6 +59,34 @@ const selectorListOf = (selector: string): string => {
     const open = css.indexOf('{', start);
     return css.slice(start, open);
 };
+
+// The FULL body of an `@media` block, brace-matched. `blockOf` stops at the first `}`,
+// which inside an at-rule is the end of the FIRST nested rule — and the chevron's
+// `transition` lived in the second one, so a nested-aware reader is what pins its
+// removal from the motion list.
+const mediaBlockOf = (atRule: string): string => {
+    const start = rules.indexOf(atRule);
+    if (start < 0) throw new Error(`missing at-rule ${atRule}`);
+
+    const open = rules.indexOf('{', start);
+    let depth = 0;
+    for (let index = open; index < rules.length; index += 1) {
+        if (rules[index] === '{') depth += 1;
+        if (rules[index] === '}') {
+            depth -= 1;
+            if (depth === 0) return rules.slice(open + 1, index);
+        }
+    }
+    throw new Error(`unterminated at-rule ${atRule}`);
+};
+
+// Every rule in the stylesheet (comment-stripped) as `[selectorList, declarations]`.
+// Used to prove a generated glyph belongs to ONE surface: a `::before` chevron on a chip
+// is exactly what the base `summary` reset exists to make unnecessary.
+const ruleList = [...rules.matchAll(/([^{}]*)\{([^{}]*)\}/g)].map((rule) => [
+    rule[1].trim(),
+    rule[2]
+]);
 
 it('flows consecutive chips horizontally and wraps them', () => {
     const group = blockOf('.tool-group {');
@@ -86,23 +127,38 @@ it('hides verbose summary pieces but keeps the duration badge while the chip is 
     expect(blockOf('.tool-body {')).toContain('gap: 8px');
 });
 
-it('overlays each chip with its own duration badge in the top-right corner', () => {
-    // R2: the badge is an OVERLAY, not a label in the flow. The live span changes
-    // every 250ms and a final server span replaces it, so an in-flow pill of
-    // changing width is exactly what made the chip row jitter. Out of flow and
-    // anchored to the chip, it can never move the name or a neighbouring chip.
+it('flows each chip with its own measured span so the chip is content-width', () => {
+    // R2/T2: the collapsed chip is `[Search 1.3s]` — THREE painted parts, the state
+    // glyph, the name and the duration pill, with nothing else between them. The old
+    // leading `▸` is not a part of the chip any more (see the chevron contract at the end
+    // of this test), so the width is exactly glyph + name + pill + one flex gap.
+    // The span is a label IN FLOW, after the name, so the chip's width IS its content:
+    // nothing on the chip may reserve space for a label that is not there, and nothing may
+    // take the label out of flow (an overlay is precisely what needed the ~76px reservation
+    // below).
     expect(blockOf('.tool {')).toContain('position: relative');
+    expect(blockOf('.tool {')).toContain('flex: 0 1 auto');
+    expect(blockOf('.tool {')).not.toContain('min-width');
 
-    // MUI-Badge-like pill built from the existing tokens only — no component
-    // library and no new dependency. The border is the separator now, so the old
-    // `·` pseudo-element is gone.
-    const badge = blockOf('.tool-duration {');
-    expect(badge).toContain('position: absolute');
-    expect(badge).toContain('top: 2px');
-    expect(badge).toContain('right: 3px');
-    expect(badge).toContain('z-index: 1');
-    expect(badge).toContain('pointer-events: none');
+    // The pill vocabulary is unchanged (existing tokens only — no component library and
+    // no new dependency), only its position in the layout. T26: the box is now SHARED with
+    // the think chip's figure (`:is(.tool-duration, .think-count)`), so the chip contract
+    // is read off that one list; a second standalone `.tool-duration` rule would let the
+    // two chips drift apart.
+    const badge = blockOf(':is(.tool-duration, .think-count) {');
+    expect(badge).not.toContain('position: absolute');
+    expect(badge).not.toContain('z-index');
+    expect(badge).not.toContain('top:');
+    expect(badge).not.toContain('right:');
+    // Out-of-flow leftovers: `pointer-events: none` existed so clicking the OVERLAY was
+    // still clicking the disclosure. In flow the label is a descendant of the summary, so
+    // its clicks already bubble there, and `none` would only block selecting the figure.
+    expect(badge).not.toContain('pointer-events');
+    // A max-width on the label would let the span itself be cut; the NAME is the item
+    // that truncates (asserted in the name test below).
+    expect(badge).not.toContain('max-width');
     expect(badge).toContain('display: inline-flex');
+    expect(badge).toContain('flex: 0 0 auto');
     expect(badge).toContain('border: 1px solid var(--border-strong)');
     expect(badge).toContain('border-radius: 999px');
     expect(badge).toContain('background: var(--bg-input)');
@@ -110,46 +166,102 @@ it('overlays each chip with its own duration badge in the top-right corner', () 
     expect(badge).toContain('font-variant-numeric: tabular-nums');
     expect(badge).toContain('white-space: nowrap');
     expect(css).not.toContain('.tool-duration:not(:empty)::before');
+    // The standalone pill selectors are gone (grouped into the `:is()` list above).
+    expect(rules).not.toMatch(/^\s*\.tool-duration\s*\{/m);
+    expect(rules).not.toMatch(/^\s*\.tool-duration\[hidden\]\s*\{/m);
 
-    // Not clipped: the pill sits INSIDE the chip's border box, and nothing on the
-    // chip, its summary or the wrapping row may cut it off.
+    // The row's separation is the summary's own flex gap — one value, applied between
+    // the glyph, the name and the label, and NOT a per-side padding trick that re-introduces
+    // slack. With the chevron gone that gap is the ONLY horizontal decoration there is.
+    const summary = blockOf('.tool-summary {');
+    expect(summary).toContain('display: flex');
+    expect(summary).toContain('gap: 5px');
+    expect(summary).toContain('padding: 3px 8px');
+    // The summary generates nothing of its own: no `content`, so no arrow is painted
+    // before or after the label.
+    expect(summary).not.toContain('content:');
+
+    // THE STRETCH REGRESSION: the corner reservation must stay gone. `.tool:has()` was
+    // the if-exists check and `padding-right: calc(8ch + 22px)` (~76px) was the dead
+    // space; either one coming back re-stretches every chip in the transcript.
+    expect(rules).not.toContain('.tool:has(.tool-duration');
+    expect(summary).not.toContain('padding-right');
+    // The reservation itself, in any form: the 8-character budget is what made a 4-char
+    // `0.8s` chip the width of a 12-char one.
+    expect(rules).not.toContain('padding-right: calc(8ch');
+
+    // Not clipped: the pill sits inside the chip's border box in flow, and nothing on
+    // the chip, its summary or the wrapping row may cut it off.
     expect(blockOf('.tool {')).not.toContain('overflow: hidden');
     expect(blockOf('.tool-summary {')).not.toContain('overflow: hidden');
     expect(blockOf('.tool-group {')).not.toContain('overflow: hidden');
 
-    // The chip reserves the corner only while a badge is actually painted, so a call
-    // with an unknown span keeps its tighter width and the row stays compact.
-    //
-    // T5: the reservation must cover the LONGEST legitimate pill, not the common one.
-    // `formatDuration` prints minutes with no hours unit, so the pill keeps growing:
-    // `59m59s` (6 chars) is 47.7px wide and `5999m00s` (8 chars, 99.98h) is 59.6px,
-    // while the pill's right edge sits 4px inside the chip. A flat 46px (the old
-    // 5-character budget) left `59m59s` covering 4.7px of the tool NAME on a real chip
-    // and 16.6px for the 8-character form — see Temp/t5/badge-geometry.json.
-    // The rule is therefore `8ch` of the summary's own mono (`ch` = 6.75px vs the
-    // pill's 5.95px, so the budget is font-relative and conservative) plus 22px of
-    // pill chrome, inset and gap = 76px >= the 70px the widest sensible span needs.
-    expect(blockOf('.tool-summary {')).toContain('padding: 3px 8px');
-    const reservation = blockOf('.tool:has(.tool-duration:not([hidden])) > .tool-summary {');
-    expect(reservation).toContain('padding-right: calc(8ch + 22px)');
-    // A flat pixel value here is how the 4-character case crept back in.
-    expect(reservation).not.toContain('padding-right: 46px');
-    expect(reservation).toMatch(/padding-right:\s*calc\(\s*8ch\s*\+\s*22px\s*\)/);
-
     // `[hidden]` is the only suppression path (an unknown span), and it has to win
-    // over the badge's own `display` above — otherwise an empty pill would paint.
-    expect(blockOf('.tool-duration[hidden] {')).toContain('display: none');
+    // over the label's own `display` above — otherwise an empty pill would paint AND
+    // take up its slot in the in-flow chip. T26: one grouped rule covers both chip kinds,
+    // so a think chip with no context denominator disappears the same way.
+    expect(blockOf(':is(.tool-duration, .think-count)[hidden] {')).toContain('display: none');
 
-    // No plain `.tool-duration` rule may hide it: the phone breakpoint keeps the
-    // badge and drops only `.tool-peek`, so the span stays visible at every width.
-    const hiding = [...css.matchAll(/\.tool-duration\s*\{[^}]*\}/g)].filter((rule) =>
-        rule[0].includes('display: none')
-    );
-    expect(hiding).toHaveLength(0);
+    // No plain pill rule may hide it: the phone breakpoint keeps the label and drops only
+    // `.tool-peek`, so the span stays visible at every width. (The `[hidden]` rules above
+    // are the only `display: none` these class names get.)
+    for (const pattern of [/\.tool-duration\s*\{[^}]*\}/g, /\.think-count\s*\{[^}]*\}/g]) {
+        expect([...css.matchAll(pattern)].filter((rule) => rule[0].includes('display: none'))).toEqual([]);
+    }
 
-    // The badge carries the call's state colour, like the name and the glyph do.
+    // The label carries the call's state colour, like the name and the glyph do.
     expect(blockOf(".tool[data-state='ok'] .tool-duration {")).toContain('color: var(--ok)');
     expect(blockOf(".tool[data-state='error'] .tool-duration {")).toContain('color: var(--danger)');
+
+    // --- No disclosure chevron, on this chip or on any future one ---------------------
+    // The arrow was `content: '▸'` painted by `.tool-summary::before`, rotated 90deg when
+    // the card opened. A chip row of identical triangles restates what the click already
+    // proves, so the whole vocabulary is gone: the chip's painted parts are the state
+    // glyph, the name and the duration pill, each with its own rule.
+    expect(rules).toContain('.tool-glyph {');
+    expect(rules).toContain('.tool-name {');
+    expect(rules).not.toContain('.tool-summary::before');
+    expect(rules).not.toContain('.tool[open] > .tool-summary::before');
+    expect(rules).not.toContain('.tool-summary::-webkit-details-marker');
+
+    // Every rule that still names `.tool-summary`, exactly: three layout/hover rules, and
+    // none of them generates content (a fourth one with a `::before` is what would put the
+    // arrow back).
+    const summaryRules = ruleList.filter(([selector]) => selector.includes('.tool-summary'));
+    expect(summaryRules.map(([selector]) => selector)).toEqual([
+        '.tool-summary',
+        '.tool[open] > .tool-summary',
+        '.tool-summary:focus-visible'
+    ]);
+    for (const [, declarations] of summaryRules) {
+        expect(declarations).not.toContain('content:');
+    }
+
+    // The only triangle the stylesheet paints any more belongs to the endpoint accordion,
+    // which genuinely IS an inline disclosure. One rule, one surface.
+    expect(ruleList.filter(([, d]) => d.includes("content: '▸'")).map(([s]) => s)).toEqual([
+        '.endpoint-summary::before'
+    ]);
+
+    // THE inheritable half: the marker reset is written on the ELEMENT, so a chip added
+    // tomorrow is arrow-free without declaring anything. `list-style: none` is the Gecko
+    // marker, `::-webkit-details-marker` the Blink/WebKit one. Line-anchored so an
+    // indented `.endpoint-summary {` can never satisfy them by accident.
+    expect(rules).toMatch(/^summary \{\s*list-style: none;\s*\}/m);
+    expect(rules).toMatch(/^summary::-webkit-details-marker \{\s*display: none;\s*\}/m);
+    // Base layer, not a component rule: both reset lines precede the topbar, and therefore
+    // every chip, in the cascade.
+    expect(rules.indexOf('summary {') < rules.indexOf('.topbar {')).toBe(true);
+    expect(rules.indexOf('summary::-webkit-details-marker {') < rules.indexOf('.topbar {')).toBe(true);
+    // `.tool-summary` keeps its own `list-style: none` (harmless duplication of the base
+    // rule, asserted above next to the gap/padding it shares a block with).
+    expect(summary).toContain('list-style: none');
+
+    // The arrow's rotation and its motion opt-out left together: reduced motion no longer
+    // has a `.tool-summary` transition to freeze, and the accordion's still does.
+    const reduced = mediaBlockOf('@media (prefers-reduced-motion: reduce) {');
+    expect(reduced).not.toContain('tool-summary');
+    expect(reduced).toContain('.endpoint-summary::before');
 });
 
 it('fills the dialog height with the result pane instead of leaving a blank tail', () => {

@@ -18,7 +18,13 @@ import { mkdir, mkdtemp, rm, writeFile as writeTextFile } from 'node:fs/promises
 import { randomUUID } from 'node:crypto';
 import { basename, dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createToolCatalogue, createWebSearchCatalogueEntry, WEBSEARCH_UNCONFIGURED_HINT } from './harnesses';
+import {
+    ALL_PRESET_TEMPLATES,
+    createHarnessRegistry,
+    createToolCatalogue,
+    createWebSearchCatalogueEntry,
+    WEBSEARCH_UNCONFIGURED_HINT
+} from './harnesses';
 // The trusted catalogue text, so an instruction-override assertion can name the
 // words an agent runs when a harness does NOT override it.
 import { AGENT_PROFILES } from '../agents';
@@ -29,7 +35,9 @@ import type { HarnessRuntime } from './runtime';
 import { createHarnessServiceHandler } from './service';
 import type { ServiceEndpointContext } from './service';
 import { startHarnessServer } from './index';
-import type { HarnessDescriptor, HarnessIndex, SessionSnapshot, SessionStreamItem, ToolCallResult, ToolIndex } from './protocol';
+import { SessionStore } from './sessions';
+import { HarnessPersistence } from './persistence';
+import type { DeleteHarnessResult, HarnessDescriptor, HarnessIndex, SessionSnapshot, SessionStreamItem, ToolCallResult, ToolIndex } from './protocol';
 
 const SETTINGS = {
     baseURL: 'http://provider.test/v1',
@@ -44,7 +52,7 @@ const DEFAULTS = {
 };
 
 // The session record tools (src/core/metadata.ts coreToolMetadata): registered
-// right after todoManage, in this order, by every harness. Spread into the exact
+// right after task, in this order, by every harness. Spread into the exact
 // core lists below so one edit keeps every projection in step.
 const RECORD_TOOL_NAMES = ['profileManage', 'chapterManage', 'locationManage'];
 
@@ -53,13 +61,15 @@ const RECORD_TOOL_NAMES = ['profileManage', 'chapterManage', 'locationManage'];
 // review and manually execute them against a session.
 const CORE_TOOL_NAMES = [
     // The source-registration entry is ordinary and session-bound too; the kernel
-    // registers it before every other core tool.
+    // registers it before every other core tool. R9-R11 changed VISIBILITY, not
+    // the catalogue: every session-bound runtime row is still listed here so a
+    // client can review and manually execute it against a session.
     'toolRegistry',
     'toolRequest',
     'toolList',
     'toolManage',
     'toolCreate',
-    'todoManage',
+    'task',
     ...RECORD_TOOL_NAMES,
     'agentManage',
     'agentResult',
@@ -71,8 +81,8 @@ const CORE_TOOL_NAMES = [
     'threadFork'
 ];
 
-// The exact catalogue order after the core set: eight package presets, six harness
-// tools, search.
+// The exact catalogue order after the core set: eight package presets, six
+// harness tools, then the environment-backed core pair (search, fetch).
 const CATALOGUE_TOOL_NAMES = [
     'syntax',
     'read',
@@ -83,17 +93,25 @@ const CATALOGUE_TOOL_NAMES = [
     'grep',
     'shell',
     'gitDiff',
+    'download',
     'timeNow',
     'textCount',
     'diceRoll',
     'noteSearch',
     'textSummarize',
     'testFlaky',
-    'search'
+    'search',
+    // R9-R11: the fetch entry rides with search; it is listed by every
+    // runtime catalogue because the native provider needs no credential.
+    'fetch'
 ];
 
 const TOOL_NAMES = [...CORE_TOOL_NAMES, ...CATALOGUE_TOOL_NAMES];
 
+// The registry every HTTP assertion here sees: the five shipped production presets
+// PLUS the two fixtures the file injects (T5 moved demo/flaky out of `presets`; see
+// `createRuntime`). A runtime built without an injection lists only the first five —
+// pinned by 'ships only the real production presets over HTTP'.
 const PRESET_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'demo', 'flaky'];
 
 // Filesystem fixtures live under a `Temp/` directory INSIDE the checkout (never
@@ -203,6 +221,7 @@ const posix = (value: string): string => value.split(sep).join('/');
 const stubEmptySearchKeys = (): void => {
     vi.stubEnv('EXA_API_KEY', '');
     vi.stubEnv('TAVILY_API_KEY', '');
+    vi.stubEnv('LINKUP_API_KEY', '');
 };
 
 const createRuntime = (
@@ -213,6 +232,14 @@ const createRuntime = (
     return createHarnessRuntime({
         settings,
         defaults,
+        // T5: the shipped catalogue is the five real roles only, but this file's
+        // HTTP contract needs a harness that runs with NO provider — the scripted
+        // demo — and it also pins the flaky template's descriptors. So the fixtures
+        // are injected EXPLICITLY here, exactly as a host that wants them does, and
+        // `PRESET_NAMES` below lists catalogue + fixtures. The production default
+        // (no injection) is pinned by its own test:
+        // 'ships only the real production presets over HTTP'.
+        registry: createHarnessRegistry(ALL_PRESET_TEMPLATES),
         loadEnvironment: false
     });
 };
@@ -397,29 +424,27 @@ describe('canonical bootstrap document', () => {
                 'grep',
                 'shell',
                 'gitDiff',
+                'download',
                 'timeNow',
                 'textCount',
                 'diceRoll',
                 'noteSearch',
-                'textSummarize'
+                'textSummarize',
+                // R9-R11: the live toolbox opts into webfetch, and the runtime
+                // catalogue carries an executable fetch entry, so a card lists and
+                // declares it even on a keyless host.
+                'fetch'
             ],
             coreTools: [
-                'toolRegistry',
                 'toolRequest',
-                'toolList',
-                'toolManage',
-                'toolCreate',
-                'todoManage',
-                ...RECORD_TOOL_NAMES,
-                'agentManage',
-                'agentResult',
+                'task',
                 'delegate',
-                'threadFork',
                 'read',
                 'write',
                 'edit',
                 'glob',
-                'grep'
+                'grep',
+                'fetch',
             ],
             builtin: true,
             editable: true
@@ -440,7 +465,7 @@ describe('canonical bootstrap document', () => {
             subagents: [],
             agents: ['demo'],
             tools: ['timeNow'],
-            coreTools: ['toolRegistry', 'toolRequest', 'toolList', 'toolManage', 'toolCreate', 'todoManage', ...RECORD_TOOL_NAMES, 'agentManage', 'agentResult', 'threadFork'],
+            coreTools: ['toolRequest', 'task'],
             builtin: true,
             editable: true
         });
@@ -497,6 +522,7 @@ describe('preset descriptor tool metadata', () => {
         'grep',
         'shell',
         'gitDiff',
+        'download',
         'timeNow',
         'textCount',
         'diceRoll',
@@ -507,29 +533,24 @@ describe('preset descriptor tool metadata', () => {
     // The five real roles (T3). Each one declares subagents, so each one advertises
     // delegate; the two examples do not.
     const REAL = ['instruct', 'research', 'workspace', 'reviewer', 'planner'] as const;
+    // The core-declared preset rows, in registration order. R9-R11 keeps `download`
+    // searchable, so it stays in the registered `tools` toolbox and never appears
+    // in a `coreTools` list.
     const FILES = ['read', 'write', 'edit', 'glob', 'grep'];
-    const CORE_BASE = [
-        'toolRegistry',
-        'toolRequest',
-        'toolList',
-        'toolManage',
-        'toolCreate',
-        'todoManage',
-        ...RECORD_TOOL_NAMES,
-        'agentManage',
-        'agentResult'
-    ];
+    // R9-R11: the declared harness-owned core is exactly the bootstrap plus the
+    // session plan. The record, agent, fork and tool-management rows are searchable.
+    const CORE_BASE = ['toolRequest', 'task'];
 
     const CONFIGURED_PRESET_TOOLS = {
-        instruct: [...TOOLBOX, 'search'],
-        research: [...TOOLBOX, 'search'],
-        workspace: [...TOOLBOX, 'search'],
-        reviewer: [...TOOLBOX, 'search'],
-        planner: [...TOOLBOX, 'search'],
+        instruct: [...TOOLBOX, 'search', 'fetch'],
+        research: [...TOOLBOX, 'search', 'fetch'],
+        workspace: [...TOOLBOX, 'search', 'fetch'],
+        reviewer: [...TOOLBOX, 'search', 'fetch'],
+        planner: [...TOOLBOX, 'search', 'fetch'],
         demo: ['timeNow'],
         // The example adds its own failure tool and shares the same opt-in search
         // wiring as the real presets (createToolboxHarness).
-        flaky: [...TOOLBOX, 'testFlaky', 'search']
+        flaky: [...TOOLBOX, 'testFlaky', 'search', 'fetch']
     };
 
     // R18 core sets. Every real preset/flaky registers the four file tools; the demo
@@ -538,23 +559,23 @@ describe('preset descriptor tool metadata', () => {
     // the demo do not. A configured host adds search after the file tools (the
     // order coreToolNames emits).
     const CORE_TOOLS = {
-        instruct: [...CORE_BASE, 'delegate', 'threadFork', ...FILES],
-        research: [...CORE_BASE, 'delegate', 'threadFork', ...FILES],
-        workspace: [...CORE_BASE, 'delegate', 'threadFork', ...FILES],
-        reviewer: [...CORE_BASE, 'delegate', 'threadFork', ...FILES],
-        planner: [...CORE_BASE, 'delegate', 'threadFork', ...FILES],
-        demo: [...CORE_BASE, 'threadFork'],
-        flaky: [...CORE_BASE, 'threadFork', ...FILES]
+        instruct: [...CORE_BASE, 'delegate', ...FILES, 'fetch'],
+        research: [...CORE_BASE, 'delegate', ...FILES, 'fetch'],
+        workspace: [...CORE_BASE, 'delegate', ...FILES, 'fetch'],
+        reviewer: [...CORE_BASE, 'delegate', ...FILES, 'fetch'],
+        planner: [...CORE_BASE, 'delegate', ...FILES, 'fetch'],
+        demo: [...CORE_BASE],
+        flaky: [...CORE_BASE, ...FILES, 'fetch']
     };
 
     const CONFIGURED_CORE_TOOLS = {
-        instruct: [...CORE_BASE, 'delegate', 'threadFork', ...FILES, 'search'],
-        research: [...CORE_BASE, 'delegate', 'threadFork', ...FILES, 'search'],
-        workspace: [...CORE_BASE, 'delegate', 'threadFork', ...FILES, 'search'],
-        reviewer: [...CORE_BASE, 'delegate', 'threadFork', ...FILES, 'search'],
-        planner: [...CORE_BASE, 'delegate', 'threadFork', ...FILES, 'search'],
-        demo: [...CORE_BASE, 'threadFork'],
-        flaky: [...CORE_BASE, 'threadFork', ...FILES, 'search']
+        instruct: [...CORE_BASE, 'delegate', ...FILES, 'search', 'fetch'],
+        research: [...CORE_BASE, 'delegate', ...FILES, 'search', 'fetch'],
+        workspace: [...CORE_BASE, 'delegate', ...FILES, 'search', 'fetch'],
+        reviewer: [...CORE_BASE, 'delegate', ...FILES, 'search', 'fetch'],
+        planner: [...CORE_BASE, 'delegate', ...FILES, 'search', 'fetch'],
+        demo: [...CORE_BASE],
+        flaky: [...CORE_BASE, ...FILES, 'search', 'fetch']
     };
 
     const configuredRuntime = (): HarnessRuntime => {
@@ -568,6 +589,10 @@ describe('preset descriptor tool metadata', () => {
         return createHarnessRuntime({
             settings: SETTINGS,
             defaults: DEFAULTS,
+            // T5: the per-preset tool/coreTools tables below include the scripted
+            // demo and the failure example, so this runtime injects the fixtures
+            // (the production default lists only the five real roles).
+            registry: createHarnessRegistry(ALL_PRESET_TEMPLATES),
             loadEnvironment: false,
             catalogue
         });
@@ -597,7 +622,7 @@ describe('preset descriptor tool metadata', () => {
         const tools = await jsonBody<ToolIndex>(await callHandler(runtime, 'GET', '/v1/harness/tools'));
         expect(tools.body.tools.find((tool) => tool.name === 'search')?.availability).toEqual({
             state: 'available',
-            environment: ['EXA_API_KEY', 'TAVILY_API_KEY']
+            environment: ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY']
         });
 
         // /harnesses and the /presets alias resolve through the same descriptors.
@@ -614,14 +639,16 @@ describe('preset descriptor tool metadata', () => {
             await callHandler(runtime, 'GET', '/v1/harness')
         );
 
+        // R9-R11: keyless still registers fetch (the native provider needs no key),
+        // so every live card's registered list ends with it; only `search` is absent.
         expect(toolLists(bootstrap.body.presets)).toEqual({
-            instruct: TOOLBOX,
-            research: TOOLBOX,
-            workspace: TOOLBOX,
-            reviewer: TOOLBOX,
-            planner: TOOLBOX,
+            instruct: [...TOOLBOX, 'fetch'],
+            research: [...TOOLBOX, 'fetch'],
+            workspace: [...TOOLBOX, 'fetch'],
+            reviewer: [...TOOLBOX, 'fetch'],
+            planner: [...TOOLBOX, 'fetch'],
             demo: ['timeNow'],
-            flaky: [...TOOLBOX, 'testFlaky']
+            flaky: [...TOOLBOX, 'testFlaky', 'fetch']
         });
 
         // Keyless honesty: no card advertises a core search it cannot run, and
@@ -633,7 +660,7 @@ describe('preset descriptor tool metadata', () => {
         const tools = await jsonBody<ToolIndex>(await callHandler(runtime, 'GET', '/v1/harness/tools'));
         expect(tools.body.tools.find((tool) => tool.name === 'search')?.availability).toEqual({
             state: 'unconfigured',
-            environment: ['EXA_API_KEY', 'TAVILY_API_KEY'],
+            environment: ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY'],
             hint: WEBSEARCH_UNCONFIGURED_HINT
         });
     });
@@ -1268,12 +1295,13 @@ describe('all-tools manual execution', () => {
 
         // toolRegistry is first and exact: it is the ordinary session-bound
         // registration entry, described from the kernel's single metadata copy.
+        // R9-R11 demotes it (searchable), so the index says so honestly.
         expect(core[0]).toEqual({
             name: 'toolRegistry',
             group: 'Core tools',
             description: TOOL_REGISTRY_METADATA.description,
             tags: TOOL_REGISTRY_METADATA.tags,
-            visibility: 'core',
+            visibility: 'searchable',
             parameters: TOOL_REGISTRY_METADATA.parameters,
             availability: { state: 'available', hint: coreHint },
             sessionBound: true
@@ -1292,13 +1320,17 @@ describe('all-tools manual execution', () => {
             sessionBound: true
         });
 
-        // The rest are core-marked, session-bound, and carry a real schema.
+        // The rest are session-bound and carry a real schema. R9-R11 splits the
+        // visibility honestly: only the bootstrap pair, the session plan, and
+        // delegate stay `core`; the eleven demoted runtime rows report
+        // `searchable` while staying listed and manually executable.
+        const DECLARED_CORE = new Set(['toolRequest', 'task', 'delegate']);
         expect(core.slice(2)).toEqual(
             [
                 'toolList',
                 'toolManage',
                 'toolCreate',
-                'todoManage',
+                'task',
                 ...RECORD_TOOL_NAMES,
                 'agentManage',
                 'agentResult',
@@ -1310,7 +1342,7 @@ describe('all-tools manual execution', () => {
                 group: 'Core tools',
                 description: expect.any(String),
                 tags: expect.any(Array),
-                visibility: 'core',
+                visibility: DECLARED_CORE.has(name) ? 'core' : 'searchable',
                 parameters: expect.any(Object),
                 availability: { state: 'available', hint: coreHint },
                 sessionBound: true
@@ -1380,6 +1412,74 @@ describe('all-tools manual execution', () => {
         expect(viaSession.body.panels).toEqual(panelsFor(sessionValue));
     });
 
+    // R3/R4: `download` returns the companion `toolMedia(content, attachments)`
+    // envelope. The manual route must unwrap it EXACTLY like the model path
+    // (harness.ts deliverTask): `result` is the small JSON summary, `media` is
+    // the descriptor projection, and the base64 never enters the response body.
+    it('unwraps tool media into a descriptor list for a manual download', async () => {
+        const runtime = createRuntime();
+
+        // A real PNG header so the shared magic-signature check passes, served
+        // with an explicit content-length so the pre-check path is exercised.
+        const png = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+
+        vi.stubGlobal(
+            'fetch',
+            vi.fn(async () => {
+                const headers = new Headers();
+                headers.set('content-type', 'image/png');
+                headers.set('content-length', String(png.length));
+
+                return new Response(
+                    new ReadableStream<Uint8Array>({
+                        start(controller) {
+                            controller.enqueue(Uint8Array.from(png));
+                            controller.close();
+                        }
+                    }),
+                    { status: 200, headers }
+                );
+            })
+        );
+
+        try {
+            const { status, body } = await jsonBody<ToolCallResult>(
+                await callHandler(runtime, 'POST', '/v1/harness/tools/download', {
+                    // `download` declares two properties, so the whole object is
+                    // handed to execute (the single-property rule does not apply).
+                    body: { parameters: { url: 'https://files.test/img/pixel.png' } }
+                })
+            );
+
+            expect(status).toBe(200);
+            if (!body.ok) throw new Error(`expected a successful download, got ${JSON.stringify(body)}`);
+
+            expect(body.result).toEqual({
+                url: 'https://files.test/img/pixel.png',
+                finalUrl: 'https://files.test/img/pixel.png',
+                contentType: 'image/png',
+                kind: 'image',
+                name: 'pixel.png',
+                bytes: 12,
+                declaredBytes: 12,
+                media: 'attached',
+                mediaId: 'dl-1'
+            });
+            expect(body.media).toEqual([
+                { id: 'dl-1', kind: 'image', name: 'pixel.png', mime: 'image/png', size: 12 }
+            ]);
+
+            // The payload itself stays out of the HTTP body: 12 bytes of PNG are
+            // `iVBORw0KGgoBAgME` in canonical base64.
+            expect(JSON.stringify(body)).not.toContain('iVBORw0KGgoBAgME');
+            expect(typeof body.durationMs).toBe('number');
+        } finally {
+            // This file's afterEach only unstubs envs; a leaked global fetch would
+            // break the streaming and model tests that run after this one.
+            vi.unstubAllGlobals();
+        }
+    });
+
     it('lists core file tools as direct-call entries and runs one without a session', async () => {
         const runtime = createRuntime();
         const { body } = await jsonBody<ToolIndex>(
@@ -1405,7 +1505,7 @@ describe('all-tools manual execution', () => {
             visibility: 'core',
             availability: {
                 state: 'unconfigured',
-                environment: ['EXA_API_KEY', 'TAVILY_API_KEY'],
+                environment: ['EXA_API_KEY', 'TAVILY_API_KEY', 'LINKUP_API_KEY'],
                 hint: WEBSEARCH_UNCONFIGURED_HINT
             }
         });
@@ -1483,7 +1583,7 @@ describe('all-tools manual execution', () => {
 
         const result = await jsonBody<ToolCallResult>(
             await callHandler(runtime, 'POST', '/v1/harness/tools/toolRequest', {
-                body: { sessionId: session.id, parameters: { tags: ['time'] } }
+                body: { sessionId: session.id, parameters: { names: ['timeNow'] } }
             })
         );
 
@@ -1576,7 +1676,7 @@ describe('all-tools manual execution', () => {
                 body: {
                     sessionId: session.id,
                     parameters: {
-                        name: 'todoManage',
+                        name: 'task',
                         description: 'Mine.',
                         tags: ['text'],
                         source: 'return 1;'
@@ -1586,41 +1686,43 @@ describe('all-tools manual execution', () => {
         );
         expect(reserved.body.ok).toBe(true);
         if (reserved.body.ok) {
-            expect(reserved.body.result.name).toBe('todoManage');
+            expect(reserved.body.result.name).toBe('task');
         }
     });
 
-    it('runs todoManage against the session list', async () => {
+    it('runs task against the session list', async () => {
         const runtime = createRuntime();
         const session = await createDemo(runtime);
 
         const added = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
-                body: { sessionId: session.id, parameters: { action: 'add', text: '  check bounds ' } }
+            await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
+                body: { sessionId: session.id, parameters: { tasks: [{ text: '  check bounds ' }] } }
             })
         );
 
         expect(added.body).toEqual({
             ok: true,
             result: {
-                todo: { id: '1', text: 'check bounds', completed: false },
-                counts: { total: 1, completed: 0, remaining: 1 }
+                tasks: [{ id: '1', text: 'check bounds', completed: false }],
+                counts: { total: 1, completed: 0, pending: 1 },
+                // R9-R11: every successful task call returns the current page.
+                page: { offset: 0, limit: 20, hasMore: false }
             },
             durationMs: expect.any(Number)
         });
 
         // A second call sees the SAME list: the tool lives in the session harness.
         const listed = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
-                body: { sessionId: session.id, parameters: { action: 'list' } }
+            await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
+                body: { sessionId: session.id, parameters: {} }
             })
         );
 
         expect(listed.body).toEqual({
             ok: true,
             result: {
-                todos: [{ id: '1', text: 'check bounds', completed: false }],
-                counts: { total: 1, completed: 0, remaining: 1 },
+                tasks: [{ id: '1', text: 'check bounds', completed: false }],
+                counts: { total: 1, completed: 0, pending: 1 },
                 // R9: `list` is one bounded page (default 20).
                 page: { offset: 0, limit: 20, hasMore: false }
             },
@@ -1634,15 +1736,15 @@ describe('all-tools manual execution', () => {
 
         expect(
             await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
-                    body: { parameters: { action: 'list' } }
+                await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
+                    body: { parameters: {} }
                 })
             )
         ).toEqual({
             status: 400,
             body: {
                 error: {
-                    message: 'Tool "todoManage" runs inside a session; send a "sessionId" with the call.'
+                    message: 'Tool "task" runs inside a session; send a "sessionId" with the call.'
                 }
             }
         });
@@ -1650,15 +1752,15 @@ describe('all-tools manual execution', () => {
         // An empty id is "no session" for this purpose, not a lookup.
         expect(
             await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
-                    body: { sessionId: '', parameters: { action: 'list' } }
+                await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
+                    body: { sessionId: '', parameters: {} }
                 })
             )
         ).toEqual({
             status: 400,
             body: {
                 error: {
-                    message: 'Tool "todoManage" runs inside a session; send a "sessionId" with the call.'
+                    message: 'Tool "task" runs inside a session; send a "sessionId" with the call.'
                 }
             }
         });
@@ -1666,8 +1768,8 @@ describe('all-tools manual execution', () => {
         // A present-but-unusable type is a 400, never coerced into a 404 lookup.
         expect(
             await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
-                    body: { sessionId: 7, parameters: { action: 'list' } }
+                await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
+                    body: { sessionId: 7, parameters: {} }
                 })
             )
         ).toEqual({
@@ -1679,7 +1781,7 @@ describe('all-tools manual execution', () => {
         // answers 404 before the body is read.
         expect(
             await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
+                await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
                     body: { sessionId: session.id }
                 })
             )
@@ -1713,8 +1815,8 @@ describe('all-tools manual execution', () => {
 
         expect(
             await jsonBody(
-                await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage', {
-                    body: { sessionId: 'missing', parameters: { action: 'list' } }
+                await callHandler(runtime, 'POST', '/v1/harness/tools/task', {
+                    body: { sessionId: 'missing', parameters: {} }
                 })
             )
         ).toEqual({ status: 404, body: { error: { message: 'Unknown session "missing".' } } });
@@ -1790,23 +1892,23 @@ describe('all-tools manual execution', () => {
         const session = await createDemo(runtime);
 
         const alias = await jsonBody<ToolCallResult>(
-            await callHandler(runtime, 'POST', '/v1/harness/tools/todoManage/call', {
-                body: { sessionId: session.id, parameters: { action: 'list' } }
+            await callHandler(runtime, 'POST', '/v1/harness/tools/task/call', {
+                body: { sessionId: session.id, parameters: {} }
             })
         );
 
         expect(alias.body).toEqual({
             ok: true,
             result: {
-                todos: [],
-                counts: { total: 0, completed: 0, remaining: 0 },
+                tasks: [],
+                counts: { total: 0, completed: 0, pending: 0 },
                 page: { offset: 0, limit: 20, hasMore: false }
             },
             durationMs: expect.any(Number)
         });
 
         expect(
-            await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/tools/todoManage/call'))
+            await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/tools/task/call'))
         ).toEqual({
             status: 405,
             body: { error: { message: 'Use POST for /v1/harness/tools/:name/call.' } }
@@ -2357,29 +2459,27 @@ describe('harness registry over HTTP', () => {
                 'grep',
                 'shell',
                 'gitDiff',
+                'download',
                 'timeNow',
                 'textCount',
                 'diceRoll',
                 'noteSearch',
-                'textSummarize'
+                'textSummarize',
+                // R9-R11: the live toolbox opts into webfetch, and the runtime
+                // catalogue carries an executable fetch entry, so a card lists and
+                // declares it even on a keyless host.
+                'fetch'
             ],
             coreTools: [
-                'toolRegistry',
                 'toolRequest',
-                'toolList',
-                'toolManage',
-                'toolCreate',
-                'todoManage',
-                ...RECORD_TOOL_NAMES,
-                'agentManage',
-                'agentResult',
+                'task',
                 'delegate',
-                'threadFork',
                 'read',
                 'write',
                 'edit',
                 'glob',
-                'grep'
+                'grep',
+                'fetch',
             ],
             builtin: false,
             editable: true
@@ -2797,22 +2897,15 @@ describe('harness registry over HTTP', () => {
             subagents: ['research'],
             agents: ['workspace', 'research'],
             coreTools: [
-                'toolRegistry',
                 'toolRequest',
-                'toolList',
-                'toolManage',
-                'toolCreate',
-                'todoManage',
-                ...RECORD_TOOL_NAMES,
-                'agentManage',
-                'agentResult',
+                'task',
                 'delegate',
-                'threadFork',
                 'read',
                 'write',
                 'edit',
                 'glob',
-                'grep'
+                'grep',
+                'fetch',
             ],
             builtin: true,
             editable: true
@@ -2935,6 +3028,9 @@ describe('harness registry over HTTP', () => {
             builtin: true,
             editable: true
         });
+        // The upgrade replaces the script with the live toolbox, so the card now
+        // registers the shared toolbox PLUS the environment rows it can run: fetch
+        // (native, no credential) always, search only with a key (R9-R11).
         expect(live.body.harness.tools).toEqual([
             'syntax',
             'read',
@@ -2945,28 +3041,23 @@ describe('harness registry over HTTP', () => {
             'grep',
             'shell',
             'gitDiff',
+            'download',
             'timeNow',
             'textCount',
             'diceRoll',
             'noteSearch',
-            'textSummarize'
+            'textSummarize',
+            'fetch'
         ]);
         expect(live.body.harness.coreTools).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            ...RECORD_TOOL_NAMES,
-            'agentManage',
-            'agentResult',
-            'threadFork',
+            'task',
             'read',
             'write',
             'edit',
             'glob',
-            'grep'
+            'grep',
+            'fetch',
         ]);
 
         // A NEW session runs the live agent configuration with the shared toolbox.
@@ -2997,12 +3088,16 @@ describe('harness registry over HTTP', () => {
             'grep',
             'shell',
             'gitDiff',
+            'download',
             'timeNow',
             'textCount',
             'diceRoll',
             'noteSearch',
             'textSummarize',
-            'testFlaky'
+            'testFlaky',
+            // R9-R11: flaky builds its toolbox through createToolboxHarness too. This
+            // runtime is keyless, so only fetch (native, no credential) registers.
+            'fetch'
         ]);
 
         const live = await jsonBody<{ harness: HarnessDescriptor }>(
@@ -3020,6 +3115,238 @@ describe('harness registry over HTTP', () => {
         });
         // The executable rebuild retains the example-only extra.
         expect(live.body.harness.tools).toContain('testFlaky');
+    });
+});
+
+// T5: the remove action the UI calls. `DELETE /harnesses/:name` takes any harness out
+// of the catalogue — a shipped default exactly like a user-created one — and the
+// response is the minimal `{ deleted: true }` (the authoritative record is the
+// database, not a second copy of the harness). An unknown name and a repeat delete are
+// both 404, and a durability failure answers 500 WITHOUT having deleted anything.
+describe('deleting a harness over HTTP', () => {
+    it('ships only the real production presets over HTTP (T5)', async () => {
+        // No injected registry: exactly what `startHarnessServer` and the discovered
+        // service route build. The catalogue a user sees must contain no scripted
+        // card and no card that fails on purpose.
+        stubEmptySearchKeys();
+        const runtime = createHarnessRuntime({
+            settings: SETTINGS,
+            defaults: DEFAULTS,
+            loadEnvironment: false
+        });
+
+        const PRODUCTION_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner'];
+
+        const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
+        expect(index.body.harnesses.map((harness) => harness.name)).toEqual(PRODUCTION_NAMES);
+
+        // Every shipped card is a live configuration: it needs the provider and it
+        // carries the shared toolbox, so nothing here can only answer from a script.
+        expect(index.body.harnesses.map((harness) => harness.requiresEndpoint)).toEqual([
+            true,
+            true,
+            true,
+            true,
+            true
+        ]);
+        expect(index.body.harnesses.every((harness) => harness.tools.includes('testFlaky'))).toBe(false);
+
+        // The boot document and the `/presets` alias carry the same list.
+        const bootstrap = await jsonBody<{ presets: { name: string }[] }>(
+            await callHandler(runtime, 'GET', '/v1/harness')
+        );
+        expect(bootstrap.body.presets.map((harness) => harness.name)).toEqual(PRODUCTION_NAMES);
+
+        const alias = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/presets'));
+        expect(alias.body.harnesses.map((harness) => harness.name)).toEqual(PRODUCTION_NAMES);
+
+        // The fixtures are not runnable by accident: the offline demo is a preset this
+        // build ships, but not a catalogue entry, so a session on it is a 404.
+        expect(
+            await jsonBody(
+                await callHandler(runtime, 'POST', '/v1/harness/sessions', { body: { harness: 'demo' } })
+            )
+        ).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown harness "demo".' } }
+        });
+    });
+
+    it('deletes a user harness and drops it from every listing', async () => {
+        const runtime = createRuntime();
+
+        const created = await jsonBody<{ harness: HarnessDescriptor }>(
+            await callHandler(runtime, 'POST', '/v1/harness/harnesses', {
+                body: { name: 'temporary', primary: 'instruct' }
+            })
+        );
+        expect(created.status).toBe(201);
+
+        const removed = await jsonBody<DeleteHarnessResult>(
+            await callHandler(runtime, 'DELETE', '/v1/harness/harnesses/temporary')
+        );
+        // The exact frontend contract: 200 with one field.
+        expect(removed).toEqual({ status: 200, body: { deleted: true } });
+
+        const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
+        expect(index.body.harnesses.map((harness) => harness.name)).toEqual(PRESET_NAMES);
+
+        // A new session cannot reach it any more.
+        expect(
+            await jsonBody(
+                await callHandler(runtime, 'POST', '/v1/harness/sessions', { body: { harness: 'temporary' } })
+            )
+        ).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown harness "temporary".' } }
+        });
+
+        // A repeat delete removed nothing, so it is not reported as a success.
+        expect(
+            await jsonBody(await callHandler(runtime, 'DELETE', '/v1/harness/harnesses/temporary'))
+        ).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown harness "temporary".' } }
+        });
+    });
+
+    it('deletes a shipped built-in and leaves the conversation that used it', async () => {
+        const runtime = createRuntime();
+
+        // A real recorded conversation on the shipped fixture, created first.
+        const session = await createDemo(runtime);
+        const firstFrames = await streamItems(
+            await callHandler(runtime, 'POST', `/v1/harness/sessions/${session.id}/messages`, {
+                body: { input: 'What time is it?' }
+            })
+        );
+        const firstTerminal = firstFrames.at(-1);
+        expect(firstTerminal?.type).toBe('snapshot');
+        if (firstTerminal?.type !== 'snapshot') throw new Error('expected a terminal snapshot frame');
+        expect(firstTerminal.session.turns.map((turn) => turn.status)).toEqual(['done']);
+
+        const removed = await jsonBody<DeleteHarnessResult>(
+            await callHandler(runtime, 'DELETE', '/v1/harness/harnesses/demo')
+        );
+        expect(removed).toEqual({ status: 200, body: { deleted: true } });
+
+        // Gone from the catalogue, exactly like a user harness.
+        const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
+        expect(index.body.harnesses.map((harness) => harness.name)).toEqual(
+            PRESET_NAMES.filter((name) => name !== 'demo')
+        );
+
+        // A NEW session on the deleted card is a 404 ...
+        expect(
+            await jsonBody(
+                await callHandler(runtime, 'POST', '/v1/harness/sessions', { body: { harness: 'demo' } })
+            )
+        ).toEqual({ status: 404, body: { error: { message: 'Unknown harness "demo".' } } });
+
+        // ... while the existing conversation is untouched: it still lists, still
+        // reports the harness it captured, and its turns are intact.
+        const listed = await jsonBody<{ sessions: { id: string; harness: string }[] }>(
+            await callHandler(runtime, 'GET', '/v1/harness/sessions')
+        );
+        expect(listed.body.sessions.map((entry) => entry.id)).toEqual([session.id]);
+
+        const after = await jsonBody<{ session: SessionSnapshot }>(
+            await callHandler(runtime, 'GET', `/v1/harness/sessions/${session.id}`)
+        );
+        expect(after.status).toBe(200);
+        expect(after.body.session.harness).toBe('demo');
+        expect(after.body.session.harnessDefinition?.title).toBe('Scripted demo');
+        expect(after.body.session.turns.map((turn) => turn.prompt)).toEqual(['What time is it?']);
+        expect(after.body.session.turns.map((turn) => turn.status)).toEqual(['done']);
+
+        // The live session is still usable: its frozen harness runs the next turn,
+        // offline, exactly as before the deletion.
+        const streamed = await callHandler(runtime, 'POST', `/v1/harness/sessions/${session.id}/messages`, {
+            body: { input: 'And again?' }
+        });
+        expect(streamed.status).toBe(200);
+        const frames = await streamItems(streamed);
+        const terminal = frames.at(-1);
+        expect(terminal?.type).toBe('snapshot');
+        if (terminal?.type !== 'snapshot') throw new Error('expected a terminal snapshot frame');
+        expect(terminal.session.harness).toBe('demo');
+        expect(terminal.session.turns.map((turn) => turn.prompt)).toEqual(['What time is it?', 'And again?']);
+        expect(terminal.session.turns.map((turn) => turn.status)).toEqual(['done', 'done']);
+    });
+
+    it('refuses to delete through a legacy alias, which is not an identity', async () => {
+        const runtime = createRuntime();
+
+        expect(
+            await jsonBody(await callHandler(runtime, 'DELETE', '/v1/harness/harnesses/writer'))
+        ).toEqual({ status: 404, body: { error: { message: 'Unknown harness "writer".' } } });
+
+        // The target survived the attempt.
+        const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
+        expect(index.body.harnesses.map((harness) => harness.name)).toEqual(PRESET_NAMES);
+    });
+
+    it('answers 405 naming both accepted methods, and keeps the alias mount read-only', async () => {
+        const runtime = createRuntime();
+
+        expect(
+            await jsonBody(await callHandler(runtime, 'PUT', '/v1/harness/harnesses/instruct'))
+        ).toEqual({
+            status: 405,
+            body: { error: { message: 'Use PATCH or DELETE for /v1/harness/harnesses/:name.' } }
+        });
+        expect(
+            await jsonBody(await callHandler(runtime, 'GET', '/v1/harness/harnesses/instruct'))
+        ).toEqual({
+            status: 405,
+            body: { error: { message: 'Use PATCH or DELETE for /v1/harness/harnesses/:name.' } }
+        });
+
+        // `/presets` stays a read-only alias: only the canonical mount mutates, so
+        // there is no second surface that could delete a harness.
+        expect(
+            await jsonBody(await callHandler(runtime, 'DELETE', '/v1/harness/presets/instruct'))
+        ).toEqual({
+            status: 404,
+            body: { error: { message: 'Unknown API route: DELETE /v1/harness/presets/instruct' } }
+        });
+    });
+
+    it('answers 500 without deleting anything when the durable write fails', async () => {
+        const root = await createFixture('harness-delete-blocked-');
+
+        try {
+            // The database directory cannot be created: its parent is a plain file, so
+            // the store's own write fails for a real reason (no mock).
+            await writeTextFile(join(root, 'blocked'), 'not a directory', 'utf8');
+
+            const registry = createHarnessRegistry(ALL_PRESET_TEMPLATES);
+            const store = new SessionStore(SETTINGS, registry, undefined, {
+                persistence: new HarnessPersistence(join(root, 'blocked', 'nested'))
+            });
+            const runtime = createHarnessRuntime({
+                settings: SETTINGS,
+                defaults: DEFAULTS,
+                loadEnvironment: false,
+                store,
+                registry
+            });
+
+            const failure = await jsonBody<{ error: { message: string } }>(
+                await callHandler(runtime, 'DELETE', '/v1/harness/harnesses/demo')
+            );
+            expect(failure.status).toBe(500);
+            expect(failure.body.error.message).toContain('Could not save the harness database');
+
+            // Nothing half-happened: the card is still listed, and no tombstone was
+            // left behind to delete it on the next start.
+            const index = await jsonBody<HarnessIndex>(await callHandler(runtime, 'GET', '/v1/harness/harnesses'));
+            expect(index.body.harnesses.map((harness) => harness.name)).toEqual(PRESET_NAMES);
+            expect(registry.find('demo')).toBeDefined();
+            expect(registry.deletedBuiltins()).toEqual([]);
+        } finally {
+            await rm(root, { recursive: true, force: true });
+        }
     });
 });
 
@@ -3054,7 +3381,16 @@ describe('recorded run timing', () => {
 
         // Discovery is part of the recorded snapshot: the scripted demo enabled
         // `timeNow` through toolRequest, so a reload can show it.
-        expect(terminal.session.discoveredTools).toEqual(['timeNow']);
+        // R9-R11: the demoted runtime rows carry the same free-text vocabulary, so
+        // the demo's tags:['time'] request now matches five tools; they are all
+        // recorded as discovered for the session.
+        expect(terminal.session.discoveredTools).toEqual([
+            'timeNow',
+            'actionRequest',
+            'threadFork',
+            'toolManage',
+            'toolRegistry',
+        ]);
 
         // R20.2: the demo's timeNow call carries declarative panels in the SAME
         // recorded event, both on the stream frame and after a reload. The model
@@ -3098,6 +3434,14 @@ describe('recorded run timing', () => {
 
         // And the record survives the reload path unchanged, UI panels included.
         expect(runtime.store.get(session.id).turns).toEqual(terminal.session.turns);
-        expect(runtime.store.get(session.id).discoveredTools).toEqual(['timeNow']);
+        // R9-R11: the demoted runtime rows share the 'time' vocabulary the scripted
+        // demo asks for, so all five matches stay recorded on the session.
+        expect(runtime.store.get(session.id).discoveredTools).toEqual([
+            'timeNow',
+            'actionRequest',
+            'threadFork',
+            'toolManage',
+            'toolRegistry',
+        ]);
     });
 });

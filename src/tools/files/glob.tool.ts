@@ -56,8 +56,11 @@
 //
 // PRESERVED POLICY (unchanged from fileGlob's filename mode)
 // ----------------------------------------------------------
-//   - .git, node_modules, and symlinks are never entered;
-//   - .gitignore is NOT consulted;
+//   - .git and symlinks are never entered; node_modules is, unless the search is rooted
+//     inside it (naming a directory is how a caller asks for it);
+//   - `.gitignore` files AT OR BELOW each root are consulted (./gitignore.ts): a path an
+//     ignore rule excludes is not listed. No rule from ABOVE a root applies, so
+//     `paths: ['Temp']` still answers for a directory the enclosing repo ignores;
 //   - a root that cannot be listed throws; unreadable subtrees are skipped;
 //   - no sandbox: roots are resolved against the process working directory.
 //
@@ -136,7 +139,7 @@ const listMatchingFiles = async (
 export const GLOB_METADATA: PresetToolMetadata = {
     name: 'glob',
     description:
-        'Find FILES by glob pattern: names only, never file contents (use grep for that). `patterns` (default ["**/*"]) supports *, ?, **, and [abc] classes; a pattern with no slash also matches file names at any depth. Patterns are matched against each file\'s path RELATIVE TO THE ROOT that found it, never against an absolute path, and every result is prefixed with that root: { "paths": ["src"], "patterns": ["**/*.ts"] } returns "src/a.ts" and "src/nested/b.ts" - so the same root with "src/*.ts" matches nothing. `paths` (default ["."]) lists the roots to walk, in order; overlapping roots and patterns are deduplicated by real file identity (a symlink alias or a case-alias root is walked once), so a file is reported once, under the first root that reached it. The result is { files, truncated }, with `truncated` true only when the cap was reached and more matches exist. Skips .git, node_modules and symlinks. Results are capped (100 by default) across all roots. Does not read .gitignore files, and does not search text.',
+        'Find FILES by glob pattern: names only, never file contents (use grep for that). `patterns` (default ["**/*"]) supports *, ?, **, and [abc] classes; a pattern with no slash also matches file names at any depth. Patterns are matched against each file\'s path RELATIVE TO THE ROOT that found it, never against an absolute path, and every result is prefixed with that root: { "paths": ["src"], "patterns": ["**/*.ts"] } returns "src/a.ts" and "src/nested/b.ts" - so the same root with "src/*.ts" matches nothing. `paths` (default ["."]) lists the roots to walk, in order; overlapping roots and patterns are deduplicated by real file identity (a symlink alias or a case-alias root is walked once), so a file is reported once, under the first root that reached it. The result is { files, truncated }, with `truncated` true only when the cap was reached and more matches exist. Skips .git and symlinks, and skips node_modules unless a root is placed inside it. Reads .gitignore files at or below each root, so an ignored path is not listed - while a root you name explicitly is walked even when an enclosing .gitignore ignores it. Results are capped (100 by default) across all roots. Does not search text.',
     tags: ['files', 'glob', 'find', 'paths', 'filesystem'],
     // R18: glob is core: naming a file is the everyday first step of any code task,
     // and there is deliberately no old `fileGlob` alias and no `content` property.
@@ -154,7 +157,7 @@ export const GLOB_METADATA: PresetToolMetadata = {
                 type: 'array',
                 items: { type: 'string' },
                 description:
-                    'Root directories to walk, absolute or relative to the working directory, in the order they are visited. Results are prefixed with the root that found them. Defaults to ["."].'
+                    'Root directories to walk, absolute or relative to the working directory, in the order they are visited. Results are prefixed with the root that found them. A root you name explicitly is walked even when a .gitignore above it ignores that directory. Defaults to ["."].'
             },
             maxResults: {
                 type: 'number',

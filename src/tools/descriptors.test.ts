@@ -93,7 +93,7 @@ const ALL_PACKAGE_NAMES = [
     'toolList',
     'toolManage',
     'toolCreate',
-    'todoManage',
+    'task',
     'profileManage',
     'chapterManage',
     'locationManage',
@@ -112,6 +112,8 @@ const ALL_PACKAGE_NAMES = [
     'grep',
     'shell',
     'gitDiff',
+    // R3/R4 core byte retrieval: registered always, declared core, order 235.
+    'download',
     'search',
     'fetch',
     'threadSend',
@@ -127,7 +129,8 @@ const PRESET_NAMES = [
     'glob',
     'grep',
     'shell',
-    'gitDiff'
+    'gitDiff',
+    'download'
 ];
 
 // Scratch fixtures live under the repo-root Temp/ (AGENTS.md), never OS temp.
@@ -144,9 +147,12 @@ describe('live Node descriptor catalogue (T24)', () => {
         expect(BUILTIN_TOOL_DESCRIPTORS.map((descriptor) => descriptor.name)).not.toContain(
             'syntax'
         );
-        // The generated manifest ships 28 package rows today; the filter above removes
-        // `syntax`, so 27 is the stale table this simulation really contains.
-        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(27);
+        // The generated manifest ships 29 package rows (the 28 historical
+        // entries plus the `download` preset, order 235); the filter above
+        // removes `syntax`, so 28 is the stale table this simulation really
+        // contains. Kept exact on purpose: a row count that silently moves is
+        // how a new `.tool.ts` stops being covered by this file.
+        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(28);
 
         // The live scan still reports the whole package tree, in scan order. The
         // generated table is one row shorter: it lost `syntax` to the filter above.
@@ -276,20 +282,20 @@ describe('live Node descriptor catalogue (T24)', () => {
         // RUNTIME_DESCRIPTORS is the server's listable core set: `listed !== false`
         // and no session-only capability rows.
         expect(RUNTIME_DESCRIPTORS.map((descriptor) => descriptor.name)).toEqual([
-            'toolRegistry',
-            'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'delegate',
-            'actionRequest',
-            'threadFork'
+        'toolRegistry',
+        'toolRequest',
+        'toolList',
+        'toolManage',
+        'toolCreate',
+        'task',
+        'profileManage',
+        'chapterManage',
+        'locationManage',
+        'agentManage',
+        'agentResult',
+        'delegate',
+        'actionRequest',
+        'threadFork',
         ]);
         // A package catalogue can never contain a host-folder row.
         expect(EXTERNAL_DESCRIPTORS).toEqual([]);
@@ -302,11 +308,13 @@ describe('live Node descriptor catalogue (T24)', () => {
             return descriptor!;
         };
 
-        // toolRegistry is always-registered but never in the DECLARED projection.
-        expect(isCoreRegistered(row('toolRegistry'))).toBe(true);
+        // R9-R11: `isCoreRegistered` is the DECLARED projection, so it now respects
+        // visibility. toolRegistry is always-registered but searchable, so it is in
+        // neither core list. toolCreate was demoted with it.
+        expect(isCoreRegistered(row('toolRegistry'))).toBe(false);
         expect(isAlwaysDeclared(row('toolRegistry'))).toBe(false);
-        // toolCreate is declared always but policy-gated at registration time.
-        expect(isAlwaysDeclared(row('toolCreate'))).toBe(true);
+        expect(isCoreRegistered(row('toolCreate'))).toBe(false);
+        expect(isAlwaysDeclared(row('toolCreate'))).toBe(false);
         // Capability rows are neither.
         expect(isCoreRegistered(row('delegate'))).toBe(false);
         expect(isAlwaysDeclared(row('delegate'))).toBe(false);

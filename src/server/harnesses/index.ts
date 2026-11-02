@@ -28,15 +28,23 @@
 import { presetTools } from '../../harness';
 import type { Tool } from '../../harness';
 import { harnessTools } from './tools';
-import { presets, PRESET_MAX_ITERATIONS } from './presets';
+import { ALL_PRESET_TEMPLATES, presets, PRESET_MAX_ITERATIONS } from './presets';
 // Value import for the local findPreset() below. The barrel also re-exports the
 // constant so callers keep importing it from here.
 import { PRESET_ALIASES } from './registry';
 import { createWebSearchCatalogueEntry } from './websearch';
 import type { WebSearchCatalogueEntry } from './websearch';
+import { createWebFetchCatalogueEntry } from './webfetch';
+import type { WebFetchCatalogueEntry } from './webfetch';
 import type { CatalogueEntry, HarnessPreset, ToolGroup } from './types';
 
 export { presets, harnessTools, PRESET_MAX_ITERATIONS };
+// T5: the offline/failure fixtures are no longer part of `presets` (the shipped
+// catalogue must be real, usable configurations), but they stay reachable so a
+// host or a test injects them EXPLICITLY, and so `presetFromRecord` can still
+// rebuild a scripted session frozen on an older build. `ALL_PRESET_TEMPLATES` is
+// that superset in one call.
+export { ALL_PRESET_TEMPLATES, FIXTURE_PRESETS } from './presets';
 // The derived roster (T3): one specialist list, one `teamOf()` helper, and the
 // previous shipped definitions the restore policy compares against. Exported so
 // tests and any caller can reason about the same data the registry uses.
@@ -76,7 +84,7 @@ export {
     presetToRecord,
     restoreHarnessRegistry
 } from './registry';
-export type { HarnessPatch, HarnessRegistration, HarnessRegistry } from './registry';
+export type { HarnessPatch, HarnessRegistration, HarnessRegistry, HarnessRegistryOptions, HarnessRegistrySnapshot } from './registry';
 export { describeAgent, describeAgents, describeHarness } from './descriptor';
 export type { DescriptorCatalogue } from './descriptor';
 export {
@@ -87,6 +95,10 @@ export {
 export { scriptedDemo } from './demo';
 export { createWebSearchCatalogueEntry, WEBSEARCH_ENVIRONMENT, WEBSEARCH_UNCONFIGURED_HINT } from './websearch';
 export type { WebSearchCatalogueEntry, WebSearchCatalogueOptions } from './websearch';
+// R9-R11: the fetch half of the environment-backed core pair. A host swaps its own
+// entry through `createToolCatalogue({ webfetch })` exactly like websearch.
+export { createWebFetchCatalogueEntry, WEBFETCH_ENVIRONMENT, WEBFETCH_UNCONFIGURED_HINT } from './webfetch';
+export type { WebFetchCatalogueEntry, WebFetchCatalogueOptions } from './webfetch';
 export type { CatalogueEntry, HarnessPreset, RunnerSettings, ToolAvailability, ToolGroup } from './types';
 
 // The trusted agent registry is re-exported through the app barrel because the
@@ -116,6 +128,12 @@ export type ToolCatalogueOptions = {
     // the current process environment — at call time, never at import time.
     // Tests pass an explicitly configured or keyless entry.
     websearch?: WebSearchCatalogueEntry;
+    // R9-R11: the web fetch entry. Defaults to enabled (every live preset builds
+    // its toolbox with `webfetch: true`, so a real server DOES register and declare
+    // fetch). Pass `createWebFetchCatalogueEntry({ enabled: false })` for a host that
+    // never opts in: fetch stays listed with an actionable `unconfigured` state and
+    // no card advertises it.
+    webfetch?: WebFetchCatalogueEntry;
 };
 
 // Copy a Tool into a catalogue entry. The metadata is snapshotted so a disabled
@@ -171,6 +189,22 @@ export const createToolCatalogue = (options: ToolCatalogueOptions = {}): ToolCat
 
     if (websearch.tool !== undefined) tools[websearch.entry.name] = websearch.tool;
 
+    // R9-R11: web fetch joins the same environment-backed pair. It is always listed
+    // (enabled or not), and it carries a callable `tool` exactly when the host opted
+    // into `webfetch` — the native provider needs no key, so unlike search the
+    // default IS enabled, which is what the shipped preset factories do. A card can
+    // only advertise fetch because this entry exists: see ./descriptor.ts.
+    const webfetch = options.webfetch ?? createWebFetchCatalogueEntry();
+
+    if (seen.has(webfetch.entry.name)) {
+        throw new Error(`The tool catalogue has two entries named "${webfetch.entry.name}".`);
+    }
+
+    seen.add(webfetch.entry.name);
+    entries.push(webfetch.entry);
+
+    if (webfetch.tool !== undefined) tools[webfetch.entry.name] = webfetch.tool;
+
     return {
         entries,
         tools,
@@ -179,13 +213,16 @@ export const createToolCatalogue = (options: ToolCatalogueOptions = {}): ToolCat
 };
 
 // Resolve a preset name, including an alias, against any static catalogue. The
-// catalogue parameter lets a caller (the CLI) keep using the shipped list; the
-// server resolves sessions through a live HarnessRegistry instead, so a
-// user-created harness participates there. Aliases themselves are re-exported
-// from ./registry.ts above.
+// default is `ALL_PRESET_TEMPLATES` (the shipped catalogue PLUS the offline
+// fixtures, T5): this is a LOOKUP surface, and the CLI documents `--preset demo` as
+// its endpoint-free escape hatch, so a fixture must stay resolvable by name even
+// though it is no longer something the product lists or offers. A caller that wants
+// production-only resolution passes `presets` explicitly (that is what a listing
+// does, e.g. the CLI's `--list`). Aliases themselves are re-exported from
+// ./registry.ts above.
 export const findPreset = (
     name: string,
-    catalogue: readonly HarnessPreset[] = presets
+    catalogue: readonly HarnessPreset[] = ALL_PRESET_TEMPLATES
 ): HarnessPreset | undefined => {
     const direct = catalogue.find((preset) => preset.name === name);
     if (direct !== undefined) return direct;

@@ -43,34 +43,42 @@ import type {
 // the shell renders them.
 //
 // T14 discovery upgrade: the wire inventory is toolRequest / toolList / toolManage /
-// toolCreate / todoManage (see src/tools/runtime/*.tool.ts and
-// src/harness.metadata.test.ts), so the fallback lists them in that order. A
-// pre-T14 server only ever declared the old three names; listing the new pair here
-// is what keeps an old payload's derived core set matching today's catalogue.
+// toolRegistry / toolCreate plus the record and story tools (see
+// src/tools/runtime/*.tool.ts and src/harness.metadata.test.ts).
+//
+// R9-R11 core policy (the user's rename request): `todoManage` is `task`, and only
+// `toolRequest` (discovery bootstrap) and `task` are harness-owned CORE tools.
+// toolList / toolManage / toolRegistry / toolCreate, the story tools, agentManage /
+// agentResult, actionRequest and threadFork are special tools the session can ENABLE,
+// so they are deliberately NOT listed here: a fallback that named them would report
+// every runtime tool as core for an old payload. The server's own `coreTools` stays
+// authoritative whenever it is present (see `coreToolsOf`); this list only fills the
+// gap for a payload that predates the field.
 export const HARNESS_CORE_TOOL_NAMES = [
     'toolRequest',
-    'toolList',
-    'toolManage',
-    'toolCreate',
-    'todoManage'
+    'task'
 ] as const;
 
-// One-line explanations for the historical core set. Retained as documentation
-// data; no UI location lists core tools any more (R21.2). The toolList/toolManage
-// lines summarize the canonical descriptions in src/tools/runtime/toolList.tool.ts
-// and src/tools/runtime/toolManage.tool.ts (that module is authoritative; these are
-// only the one-line form kept here for callers that render a hint).
+// One-line explanations, keyed by WIRE NAME, for the tools a caller can look up here.
+// Retained as documentation data; no UI location lists core tools any more (R21.2).
+// The noncore special tools (toolList / toolManage / toolCreate) keep their entries
+// because the map is a name→hint lookup, not a core set. The lines summarize the
+// canonical descriptions in src/tools/runtime/toolList.tool.ts and
+// src/tools/runtime/toolManage.tool.ts (that module is authoritative; these are only
+// the one-line form kept here for callers that render a hint).
 //
 // RENAME (wire names): `fileWrite` is `write`, and the two-mode `fileGlob` is now
 // `glob` (file NAMES only) plus `grep` (file CONTENTS); `syntaxCheck` is `syntax`
-// with a free-text `language`. Keys follow the wire names, because that is what a
-// caller can look a tool up by.
+// with a free-text `language`; `todoManage` is `task` and its `action` enum is gone —
+// the same call merges `tasks` (add without `id`, patch with `id`), `remove`, and the
+// paging fields, then answers with the current list.
+// Keys follow the wire names, because that is what a caller can look a tool up by.
 export const HARNESS_CORE_TOOL_DESCRIPTIONS: Readonly<Record<string, string>> = {
     toolRequest: 'Find tools by capability tag and enable them for this chat.',
     toolList: 'List every registered tool by name and description.',
     toolManage: 'Inspect and edit registered tools: details, source, path, create, update, reload.',
     toolCreate: 'Add a small session-local tool when the catalogue cannot help.',
-    todoManage: 'Keep a task list for the current work.',
+    task: 'Read, add, patch, or remove the task list for this chat.',
     delegate: 'Hand a self-contained task to one of this harness’s agents.',
     read: 'Read one or more text files on the server host.',
     write: 'Write one or more text files on the server host.',
@@ -143,11 +151,11 @@ export const editableOf = (_descriptor: HarnessDescriptor): boolean => true;
 export const builtinOf = (descriptor: HarnessDescriptor): boolean => descriptor.builtin === true;
 
 // Core tools for the dropdown. R18: the SERVER's `coreTools` is authoritative —
-// it already contains the four file tools, a configured search, and
+// it already contains the four file tools, a configured search, `task`, and
 // delegate when applicable — so the UI reflects catalogue/runtime visibility
 // instead of hard-coding the harness-owned names. Only an older payload without
-// the field falls back to the legacy harness-owned list (adding delegate when the
-// local team has a second member).
+// the field falls back to the harness-owned core list in this module (adding
+// delegate when the local team has a second member).
 export const coreToolsOf = (descriptor: HarnessDescriptor, memberCount: number): string[] => {
     if (Array.isArray(descriptor.coreTools)) {
         return descriptor.coreTools.filter(

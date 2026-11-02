@@ -1,4 +1,4 @@
-// search — one model-facing search tool over Exa or Tavily.
+// search — one model-facing search tool over Exa, Tavily, or Linkup.
 //
 // WHY A FACTORY, NOT A PRESET
 // ---------------------------
@@ -16,10 +16,11 @@
 //
 // Key resolution (S2)
 // -------------------
-//   - explicit `exa.apiKey` / `tavily.apiKey` (string or getter) wins;
-//   - otherwise EXA_API_KEY / TAVILY_API_KEY from `configuration.env`, defaulting
-//     to `process.env` (guarded — this module must not crash where `process` is
-//     absent);
+//   - explicit `exa.apiKey` / `tavily.apiKey` / `linkup.apiKey` (string or
+//     getter) wins;
+//   - otherwise EXA_API_KEY / TAVILY_API_KEY / LINKUP_API_KEY from
+//     `configuration.env`, defaulting to `process.env` (guarded — this module
+//     must not crash where `process` is absent);
 //   - a provider with no non-blank key is absent, not broken: it is not offered in
 //     the schema and not callable;
 //   - no provider at all means no tool (`undefined`), so opt-in never registers a
@@ -29,29 +30,32 @@
 // Secrets never leave this closure. They are not in the tool description, the
 // JSON Schema, the default arguments, the result, or a progress event. Every
 // string a provider sends back passes through a redactor built from *all*
-// configured keys, because a response could echo either provider's key.
+// configured keys, because a response could echo another provider's key.
 //
 // Bounds and cost (S1)
 // --------------------
 //   5 results by default, 20 maximum (clamped, not rejected);
 //   1,000-character snippets, 300-character titles;
 //   15 s timeout, one attempt, no retry and no failover.
-// Exa is preferred when both keys are present; `provider` overrides per call and
-// is only offered when more than one provider is configured. A failed provider is
-// reported, not silently retried against the other one — a retry would double the
-// cost without the caller asking for it.
+// Exa is preferred when several keys are present (the order below is the
+// preference order); `provider` overrides per call and is only offered when more
+// than one provider is configured. A failed provider is reported, not silently
+// retried against another one — a retry would double the cost without the caller
+// asking for it.
 //
 // Laziness (S4)
 // -------------
 // This module imports only `tool`, the types, HarnessError, and the small shared
-// request helpers. The Exa/Tavily adapters are `import()`ed inside `execute`, so
-// constructing a harness, listing tools, or calling toolRequest never loads them.
-// There is no SDK dependency: both adapters use `fetch` and plain JSON.
+// request helpers. The Exa/Tavily/Linkup adapters are `import()`ed inside
+// `execute`, so constructing a harness, listing tools, or calling toolRequest
+// never loads them. There is no SDK dependency: every adapter uses `fetch` and
+// plain JSON.
 //
 // Cross-references:
 //   - ./request   — bounds, fetch/timeout, error sanitizing, normalization
 //   - ./exa       — Exa wire body + result mapping
 //   - ./tavily    — Tavily wire body + result mapping
+//   - ./linkup    — Linkup wire body + result mapping
 //   - ../../harness.ts — registers this tool when `websearch` is configured
 //   - ../../types      — WebsearchConfiguration / WebSearchResult
 
@@ -77,19 +81,26 @@ import type { ProviderSearch } from './request';
 const TOOL_NAME = 'search';
 
 // Preference order, used both for the default provider and for the description.
-// Exa is index 0, so it is chosen when both keys exist (design decision: Exa is
-// the primary integration; Tavily is the fallback a host can configure alone).
-const PROVIDERS: readonly WebsearchProvider[] = ['exa', 'tavily'];
+// Exa is index 0, so it is chosen when several keys exist (design decision: Exa
+// is the primary integration; Tavily and Linkup are fallbacks a host can
+// configure alone). Appending here never reorders the older providers, so an
+// existing deployment keeps the provider it already resolves to.
+const PROVIDERS: readonly WebsearchProvider[] = ['exa', 'tavily', 'linkup'];
 
 // The environment variable each provider reads when no explicit key is given.
 const ENVIRONMENT_KEYS: Record<WebsearchProvider, string> = {
     exa: 'EXA_API_KEY',
-    tavily: 'TAVILY_API_KEY'
+    tavily: 'TAVILY_API_KEY',
+    linkup: 'LINKUP_API_KEY'
 };
 
 // Display names used in descriptions and error messages (never in metadata as a
 // value: these are constants, not credentials).
-const LABELS: Record<WebsearchProvider, string> = { exa: 'Exa', tavily: 'Tavily' };
+const LABELS: Record<WebsearchProvider, string> = {
+    exa: 'Exa',
+    tavily: 'Tavily',
+    linkup: 'Linkup'
+};
 
 // The capability tags. Shared by the executable tool and by WEB_SEARCH_METADATA so
 // a catalogue's disabled entry advertises exactly the tags discovery would match.
@@ -239,21 +250,38 @@ const readInvocation = (
 // Resolve adapter on execute. A failed import is reported as a plain tool error
 // (never a stack or module path), and it is not cached, so a later call can retry
 // after a deployment that actually ships the chunk.
-const loadSearch = async (provider: WebsearchProvider): Promise<((search: ProviderSearch) => Promise<WebSearchMatch[]>)> =>
-    provider === 'exa'
-        ? (await import('./exa')).searchExa
-        : (await import('./tavily')).searchTavily;
+const loadSearch = async (
+    provider: WebsearchProvider
+): Promise<(search: ProviderSearch) => Promise<WebSearchMatch[]>> => {
+    // One branch per provider rather than a ternary chain: adding a fourth
+    // provider must fail loudly here instead of silently running Linkup's
+    // adapter against it.
+    if (provider === 'exa') return (await import('./exa')).searchExa;
+    if (provider === 'tavily') return (await import('./tavily')).searchTavily;
+    if (provider === 'linkup') return (await import('./linkup')).searchLinkup;
+
+    throw new HarnessError(`search provider "${String(provider)}" has no adapter.`);
+};
+
+// Name the configured providers in one readable list: "Exa", "Exa or Tavily",
+// "Exa, Tavily or Linkup". The two-provider form is deliberately unchanged — the
+// description a host already shows keeps its wording — and the final "or" keeps
+// the list an alternatives list rather than a bundle.
+const listLabels = (labels: readonly string[]): string =>
+    labels.length <= 1
+        ? labels.join('')
+        : `${labels.slice(0, -1).join(', ')} or ${labels[labels.length - 1]}`;
 
 // Build the model-facing description and schema for a set of configured
 // providers. Shared by the executable tool and the keyless catalogue metadata,
 // so the two can never drift on names, tags, or argument bounds.
 //
-// With no configured provider the description still names both providers (what a
-// host could enable), but the `provider` property is absent: offering a choice
-// with no legal value would be a lie.
+// With no configured provider the description still names every provider a host
+// could enable, but the `provider` property is absent: offering a choice with no
+// legal value would be a lie.
 const metadataFor = (configured: readonly WebsearchProvider[]): WebSearchMetadata => {
     const offered = configured.length > 0 ? configured : PROVIDERS;
-    const labels = offered.map((provider) => LABELS[provider]).join(' or ');
+    const labels = listLabels(offered.map((provider) => LABELS[provider]));
     const fallback = configured[0] ?? PROVIDERS[0];
 
     // `provider` is only offered when there is a choice, so a single-key setup
@@ -311,7 +339,8 @@ export const createWebSearchTool = (
 
     const keys: Record<WebsearchProvider, string | undefined> = {
         exa: resolveKey('exa', configuration, environment),
-        tavily: resolveKey('tavily', configuration, environment)
+        tavily: resolveKey('tavily', configuration, environment),
+        linkup: resolveKey('linkup', configuration, environment)
     };
 
     const configured = PROVIDERS.filter((provider) => keys[provider] !== undefined);

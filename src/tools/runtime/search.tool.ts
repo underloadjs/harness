@@ -13,7 +13,12 @@ export const metadata = {
     description:
         'Search the web through the provider configured for this harness. The configured provider/schema is supplied at registration; this generic revision is replaceable source.',
     tags: ['web', 'search', 'internet', 'news', 'research'],
-    visibility: 'searchable' as const,
+    // R9-R11: core, so a harness that HAS this capability declares it on every
+    // request (no toolRequest round needed to start researching). Registration is
+    // still config-gated by the activation below - a host without a provider key
+    // (search) or without `webfetch` (fetch) never registers the row, so nothing is
+    // promised that the session cannot run.
+    visibility: 'core' as const,
     parameters: {
         type: 'object',
         properties: {
@@ -38,7 +43,7 @@ export const registration = {
     mode: 'sync',
     order: 240,
     sessionBound: true,
-    alwaysDeclared: false,
+    alwaysDeclared: true,
     listed: false
 } as const;
 

@@ -88,6 +88,132 @@ describe('snapshot attachments', () => {
         ]);
     });
 
+    // R3/R4: the same reader/writer pair also carries TOOL media (the `download`
+    // hand-off). A pre-media snapshot has no `attachments` key on a tool message
+    // and must keep restoring byte-for-byte; a media-bearing one must round-trip
+    // with detached copies and the DOWNLOAD profile.
+    it('records tool download media exactly and restores it detached', () => {
+        const attachment = image({ id: 'dl-1', name: 'pixel.png' });
+        const writer = session([
+            {
+                role: 'assistant',
+                content: '',
+                toolCalls: [{ id: 'c1', name: 'download', arguments: '{}' }]
+            },
+            { role: 'tool', content: '{"media":"attached"}', toolCallId: 'c1', name: 'download', attachments: [attachment] }
+        ]);
+
+        const snapshot = writer.snapshot();
+
+        expect(snapshot.agents.writer.messages[1]).toEqual({
+            role: 'tool',
+            content: '{"media":"attached"}',
+            toolCallId: 'c1',
+            name: 'download',
+            attachments: [attachment]
+        });
+
+        const target = session();
+        target.restore(snapshot);
+
+        const restored = target.agent.messages[1] as Extract<HarnessMessage, { role: 'tool' }>;
+        expect(restored.attachments).toEqual([attachment]);
+        expect(restored.attachments?.[0]).not.toBe(attachment);
+
+        restored.attachments![0].data = 'AAAA';
+        expect(writer.snapshot().agents.writer.messages[1]).toEqual({
+            role: 'tool',
+            content: '{"media":"attached"}',
+            toolCallId: 'c1',
+            name: 'download',
+            attachments: [attachment]
+        });
+    });
+
+    it('keeps a medialess tool message free of an attachments key', () => {
+        const writer = session([
+            { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'read', arguments: '{}' }] },
+            { role: 'tool', content: 'text', toolCallId: 'c1', name: 'read' }
+        ]);
+
+        expect(writer.snapshot().agents.writer.messages[1]).toStrictEqual({
+            role: 'tool',
+            content: 'text',
+            toolCallId: 'c1',
+            name: 'read'
+        });
+        expect(JSON.stringify(writer.snapshot())).not.toContain('attachments');
+    });
+
+    it('measures a tool attachment against the download profile, not the upload one', () => {
+        const fiveMeb = Buffer.alloc(5 * 1024 * 1024, 0x21);
+        const media: HarnessAttachment = {
+            id: 'dl-1',
+            kind: 'file',
+            marker: '[File 1]',
+            name: 'payload.bin',
+            mime: 'application/octet-stream',
+            size: fiveMeb.byteLength,
+            data: fiveMeb.toString('base64')
+        };
+
+        // Legal on a tool message: 5 MiB is below 20 MiB and above the 4 MiB
+        // upload cap, which is exactly the split the two profiles encode.
+        const writer = session([
+            { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'download', arguments: '{}' }] },
+            { role: 'tool', content: '{}', toolCallId: 'c1', name: 'download', attachments: [media] }
+        ]);
+
+        const target = session();
+        target.restore(writer.snapshot());
+        expect((target.agent.messages[1] as Extract<HarnessMessage, { role: 'tool' }>).attachments?.[0].size).toBe(
+            5242880
+        );
+
+        // The identical bytes are still refused as a user upload.
+        expect(() =>
+            session([{ role: 'user', content: 'see [File 1]', attachments: [media] }]).snapshot()
+        ).toThrow('attachments[0].data exceeds the 4194304-byte attachment limit.');
+    });
+
+    it('refuses a stored tool attachment whose bytes contradict its declared size', () => {
+        const writer = session([
+            { role: 'assistant', content: '', toolCalls: [{ id: 'c1', name: 'download', arguments: '{}' }] },
+            {
+                role: 'tool',
+                content: '{}',
+                toolCallId: 'c1',
+                name: 'download',
+                attachments: [image({ id: 'dl-1' })]
+            }
+        ]);
+
+        // Corrupt the DOCUMENT the way a hand-edited or truncated state file
+        // would: the restore reader must fail loudly with the message that names
+        // the exact record, rather than resuming a transcript whose bytes lie
+        // about their size.
+        const corrupted = writer.snapshot();
+        (corrupted.agents.writer.messages[1] as Extract<HarnessMessage, { role: 'tool' }>).attachments![0].size = 99;
+
+        expect(() => session().restore(corrupted)).toThrow(
+            'snapshot.agents["writer"].messages[1].attachments attachments[0].size is 99, but its data decodes to 12 bytes.'
+        );
+
+        // Seeding a transcript with the same broken payload fails the same way,
+        // so a bad media record can never enter history at all.
+        expect(() =>
+            session([
+                {
+                    role: 'tool',
+                    content: '{}',
+                    toolCallId: 'c1',
+                    name: 'download',
+                    attachments: [image({ id: 'dl-1', size: 99 })]
+                }
+            ])
+        ).toThrow('attachments[0].size is 99, but its data decodes to 12 bytes.');
+    });
+
     it('round-trips through JSON without loss', () => {
         const source = session([{ role: 'user', content: 'See [Image 1]', attachments: [image()] }]);
         const target = session();

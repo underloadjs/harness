@@ -1208,8 +1208,48 @@ export class SessionStore {
     // the dispatcher calls this after a successful create/patch. It must persist
     // before the HTTP result: a harness the next restart forgets is a lie. With no
     // database root it is a no-op (the previous in-memory behaviour).
+    //
+    // A caller that needs "the mutation is real only if it is durable" uses
+    // `mutateRegistry` below instead; this stays for a host that mutates the
+    // registry itself and commits afterwards.
     persistRegistry(): void {
         this.persistOrThrow();
+    }
+
+    // T5: run a registry mutation (create / patch / DELETE) and commit it as ONE
+    // unit. The registry is in-memory and the document is what a restart rebuilds,
+    // so a failed write must not leave the mutation applied: that is a catalogue
+    // whose next start disagrees with the answer the client just got.
+    //
+    // The rollback restores the entries AND their listing order AND the deleted
+    // built-in tombstones (T5), because `snapshot()` captured all three. It is
+    // safe as a wholesale replace because the dispatcher reads the request body
+    // BEFORE the mutation and the commit is synchronous, so no other request can
+    // have touched the registry in between.
+    //
+    // Failure is honest: the caller's mutation result is never returned. A write
+    // failure throws the 500 from `persistOrThrow` (and a post-shutdown write throws
+    // its 503), after the registry is back exactly as it was.
+    mutateRegistry<T>(mutate: () => T): T {
+        // In-memory store: nothing to commit, nothing to roll back.
+        if (this.persistence === undefined) return mutate();
+
+        const captured = this.registry.snapshot();
+
+        let result: T;
+
+        try {
+            result = mutate();
+            this.persistOrThrow();
+        } catch (error) {
+            // A HarnessRegistryError from `mutate` itself lands here too; that
+            // mutation never touched the registry, so restoring the snapshot is a
+            // no-op and one path covers both failures.
+            this.registry.restore(captured);
+            throw error;
+        }
+
+        return result;
     }
 
     // -----------------------------------------------------------------------
@@ -1280,10 +1320,19 @@ export class SessionStore {
     // destructive mutation (thread deletion) can be made DURABLE before the live
     // harness is touched: a failed write leaves both memory and disk untouched.
     private databaseRecord(overrides?: ReadonlyMap<string, HarnessSessionRecord>): HarnessDatabase {
+        const deletedBuiltins = this.registry.deletedBuiltins();
+
         return {
             version: HARNESS_DATABASE_VERSION,
             savedAt: Date.now(),
             registry: this.registry.list().map(presetToRecord),
+            // T5: the deleted built-in tombstones, written only when there are any
+            // (a document without the field is exactly the pre-T5 shape, and a
+            // re-created built-in clears its tombstone so the field disappears
+            // again). This is the ONLY way a deletion of a shipped default survives:
+            // the row is simply missing from `registry`, and a fresh registry seeds
+            // itself from the shipped templates.
+            ...(deletedBuiltins.length === 0 ? {} : { deleted: [...deletedBuiltins] }),
             sessions: [...this.sessions.values()].map(
                 (session) => overrides?.get(session.id) ?? this.sessionRecord(session)
             )
@@ -1401,6 +1450,15 @@ export class SessionStore {
             // common case, including the scripted demo's captured factory). A
             // changed entry falls back to rebuilding from the SESSION's frozen
             // record, which is why a PATCH after creation does not break restart.
+            //
+            // T5: a DELETED harness lands in the fallback for the same reason. The
+            // registry no longer resolves the name (`current === undefined`), so the
+            // frozen record's `template` rebuilds the factory — a 'live'/'flaky'
+            // record from its saved team and models, a 'scripted' record from the
+            // shipped-template lookup. Deleting a card therefore never drops or
+            // rewrites a saved conversation. (An injected factory-less preset is the
+            // one case that cannot rebuild without its entry; R6 drops such a session
+            // with a named restore error.)
             const current = this.registry.find(record.harness);
             const preset =
                 current !== undefined && presetRecordEquals(presetToRecord(current), record.preset)
@@ -1636,7 +1694,7 @@ export class SessionStore {
     // Run one REGISTERED tool inside a session's harness (R8).
     //
     // This is the server path behind `POST /tools/:name` when the caller supplies a
-    // sessionId: the core tools (toolRequest/toolCreate/todoManage/delegate) have
+    // sessionId: the core tools (toolRequest/toolCreate/task/delegate) have
     // no standalone implementation, so they must execute against the harness the
     // session owns — a manual discovery or todo call then affects the very
     // conversation the user is looking at. Registered, non-core tools are also

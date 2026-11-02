@@ -81,7 +81,7 @@ beforeEach(() => {
                             requiresEndpoint: false,
                             agents: ['instruct'],
                             tools: ['fileList'],
-                            coreTools: ['toolRequest', 'toolCreate', 'todoManage'],
+                            coreTools: ['toolRequest', 'toolCreate', 'task'],
                             primary: 'instruct',
                             subagents: [],
                             builtin: true,

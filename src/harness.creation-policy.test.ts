@@ -64,7 +64,11 @@ describe('toolCreation policy', () => {
         await writer('go');
 
         expect(writer.tools.toolCreate).toBeDefined();
-        expect(declaredNames(seenResearcher[0])).toContain('toolCreate');
+        // R9-R11: 'all' still REGISTERS the row for every agent, but it is
+        // searchable now, so a subagent reaches it through toolRequest instead of
+        // seeing it declared on the first request.
+        expect(writer.tools.toolCreate.visibility).toBe('searchable');
+        expect(declaredNames(seenResearcher[0])).toEqual(['toolRequest', 'task']);
     });
 
     it('primary: hides the tool from subagents and rejects a guessed call', async () => {
@@ -83,19 +87,12 @@ describe('toolCreation policy', () => {
 
         await writer('go');
 
-        // Not declared to the subagent ...
+        // R9-R11: toolCreate is not declared to anybody; `primary` additionally
+        // keeps it out of the subagent registry, so the guessed call below is
+        // refused by the policy rather than by the declaration list.
         expect(declaredNames(seenResearcher[0])).toEqual([
-            'toolRegistry',
             'toolRequest',
-            'toolList',
-            'toolManage',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult',
-            'threadFork'
+            'task',
         ]);
 
         // ... and a guessed call is answered, not executed.

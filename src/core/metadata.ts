@@ -10,7 +10,7 @@
 //   tools/runtime/toolManage.tool.ts       TOOL_MANAGE_NAME / TOOL_MANAGE_METADATA
 //   tools/runtime/toolCreate.tool.ts       TOOL_CREATE_NAME / TOOL_CREATE_METADATA
 //   tools/runtime/toolRegistry.tool.ts     TOOL_REGISTRY_NAME / TOOL_REGISTRY_METADATA
-//   tools/runtime/todoManage.tool.ts       TODO_MANAGE_NAME / TODO_MANAGE_METADATA
+//   tools/runtime/task.tool.ts             TASK_NAME / TASK_METADATA
 //   tools/runtime/profileManage.tool.ts    PROFILE_MANAGE_NAME / PROFILE_MANAGE_METADATA
 //   tools/runtime/chapterManage.tool.ts    CHAPTER_MANAGE_NAME / CHAPTER_MANAGE_METADATA
 //   tools/runtime/locationManage.tool.ts   LOCATION_MANAGE_NAME / LOCATION_MANAGE_METADATA
@@ -108,8 +108,10 @@ const metadataOf = (name: string): ToolMetadata => {
     };
 };
 
-// The core rows state `visibility: 'core'` in their entries, so this projection
-// narrows the optional field to the stated union once, here.
+// R9-R11 rows state their visibility explicitly (core for the declared set,
+// searchable for the demand-discovery set), so this projection narrows the
+// optional field to the stated union once, here. The function name is
+// historical: it means "states visibility", not "is core".
 const coreMetadataOf = (name: string): CoreToolMetadata => {
     const metadata = metadataOf(name);
 
@@ -132,7 +134,7 @@ export const TOOL_LIST_NAME = descriptorOf('toolList').name;
 export const TOOL_MANAGE_NAME = descriptorOf('toolManage').name;
 export const TOOL_CREATE_NAME = descriptorOf('toolCreate').name;
 export const TOOL_REGISTRY_NAME = descriptorOf('toolRegistry').name;
-export const TODO_MANAGE_NAME = descriptorOf('todoManage').name;
+export const TASK_NAME = descriptorOf('task').name;
 export const PROFILE_MANAGE_NAME = descriptorOf('profileManage').name;
 export const CHAPTER_MANAGE_NAME = descriptorOf('chapterManage').name;
 export const LOCATION_MANAGE_NAME = descriptorOf('locationManage').name;
@@ -157,7 +159,7 @@ export const TOOL_CREATE_METADATA = coreMetadataOf(TOOL_CREATE_NAME);
 export const TOOL_REGISTRY_METADATA = coreMetadataOf(TOOL_REGISTRY_NAME);
 
 // Session record tools.
-export const TODO_MANAGE_METADATA = coreMetadataOf(TODO_MANAGE_NAME);
+export const TASK_METADATA = coreMetadataOf(TASK_NAME);
 export const PROFILE_MANAGE_METADATA = coreMetadataOf(PROFILE_MANAGE_NAME);
 export const CHAPTER_MANAGE_METADATA = coreMetadataOf(CHAPTER_MANAGE_NAME);
 export const LOCATION_MANAGE_METADATA = coreMetadataOf(LOCATION_MANAGE_NAME);

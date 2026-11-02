@@ -27,7 +27,7 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         requiresEndpoint: true,
         agents: ['instruct', 'summarizer'],
         tools: [],
-        coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'delegate'],
+        coreTools: ['toolRequest', 'toolCreate', 'task', 'delegate'],
         primary: 'instruct',
         subagents: ['summarizer'],
         builtin: true,
@@ -95,10 +95,10 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(selector: string, tag: K
     return found;
 };
 
-// T3: the per-agent select lives in the shared agent dialog and belongs to the agent
-// the dropdown currently configures, so reading one opens the dialog (idempotent once
-// open) and switching agents is `selectConfigured`. The dialog refreshes itself after
-// each confirmed PATCH.
+// T3/R3: the per-agent select lives in the shared agent dialog and belongs to the agent
+// the roster strip currently views, so reading one opens the dialog (idempotent once
+// open) and switching agents is `selectConfigured` (a badge click). The dialog refreshes
+// itself after each confirmed PATCH.
 const openDeck = (): void => {
     if (document.querySelector('.dialog') !== null) return;
     byClass('.agent-control-button', 'button').click();
@@ -113,9 +113,27 @@ const modelSelects = (): HTMLSelectElement[] => {
 const selectConfigured = (name: string): void => {
     openDeck();
 
-    const select = byClass('.agent-dialog-agent-select', 'select');
-    select.value = name;
-    select.dispatchEvent(new Event('change', { bubbles: true }));
+    byClass(`.agent-dialog-tab[data-agent="${name}"]`, 'button').click();
+};
+
+// R3: `[+]` is the only way an agent outside the roster gets a badge.
+const addAgent = (name: string): void => {
+    openDeck();
+    byClass('.agent-dialog-add', 'button').click();
+    byClass(`.agent-dialog-add-option[data-agent="${name}"]`, 'button').click();
+};
+
+// The two explicit team controls inside the viewed agent's panel.
+const promoteAction = (): HTMLButtonElement => {
+    openDeck();
+
+    return byClass('.agent-dialog-promote', 'button');
+};
+
+const removeAction = (): HTMLButtonElement => {
+    openDeck();
+
+    return byClass('.agent-dialog-remove', 'button');
 };
 
 // The dialog's single writer.
@@ -123,12 +141,6 @@ const applyAction = (): HTMLButtonElement => {
     openDeck();
 
     return byClass('.agent-dialog-apply', 'button');
-};
-
-const memberToggle = (): HTMLInputElement => {
-    openDeck();
-
-    return byClass('.agent-dialog-member', 'input');
 };
 
 const optionTexts = (select: HTMLSelectElement): (string | null)[] =>
@@ -223,10 +235,9 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
     expect(modelSelects()[0].selectedOptions[0].textContent).toBe('m1');
 
     // --- adding a member preserves existing entries -----------------------
-    selectConfigured('critic');
-    const add = memberToggle();
-    add.checked = true;
-    add.dispatchEvent(new Event('change', { bubbles: true }));
+    // R3: `[+]` is what drafts the membership; the picker lists only agents without a
+    // badge, and adding one never promotes it.
+    addAgent('critic');
     expect(patches).toHaveLength(1);
 
     // Saved from the PRIMARY's configuration so adding does not also promote.
@@ -258,9 +269,11 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
     });
 
     // --- promotion preserves every mapping --------------------------------
-    // Selecting the outside member arms the promotion its label states; saving from
-    // there restates the complete team with the new primary first.
+    // R3: the promotion is armed by the panel control, and its label states it; saving
+    // from there restates the complete team with the new primary first.
     selectConfigured('critic');
+    expect(applyAction().textContent).toBe('Save configuration');
+    promoteAction().click();
     expect(applyAction().textContent).toBe('Save & set primary');
     applyAction().click();
     await flush();
@@ -275,12 +288,11 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
     ).toEqual(['critic', 'instruct', 'summarizer']);
 
     // --- removal drops only the removed member's key ----------------------
+    // R3: `Remove from team` is the deliberate press, and the removed agent loses its
+    // badge at once, so the view lands on the primary instead of a dropped agent.
     selectConfigured('summarizer');
-    const remove = memberToggle();
-    remove.checked = false;
-    remove.dispatchEvent(new Event('change', { bubbles: true }));
+    removeAction().click();
 
-    selectConfigured('critic');
     applyAction().click();
     await flush();
 
@@ -581,16 +593,27 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     await flush();
     await flush();
 
-    // The TEAM and the INSTRUCTIONS are still frozen: the membership toggle and the
-    // instruction editor are disabled, and the action cannot promote. R7: there is no
-    // lock notice and no in-row "New session" link; the Sessions rail keeps its own
-    // independent New session action, which stays usable.
+    // The TEAM and the INSTRUCTIONS are still frozen: the roster controls and the
+    // instruction editor are disabled with the real reason on each of them, `[+]`
+    // cannot add, and the action cannot promote. R7: there is no lock notice and no
+    // in-row "New session" link; the Sessions rail keeps its own independent New
+    // session action, which stays usable.
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         'Viewing a saved session · agent team frozen'
     );
     openDeck();
+    const frozenReason =
+        'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.';
     expect(byClass('.agent-dialog-instruction', 'textarea').disabled).toBe(true);
-    expect(byClass('.agent-dialog-member', 'input').disabled).toBe(true);
+    expect(byClass('.agent-dialog-instruction', 'textarea').title).toBe(
+        'A saved conversation runs the instructions it was created with. Edit them on the harness to use them in a new session.'
+    );
+    expect(byClass('.agent-dialog-remove', 'button').disabled).toBe(true);
+    expect(byClass('.agent-dialog-remove', 'button').title).toBe(frozenReason);
+    expect(byClass('.agent-dialog-add', 'button').disabled).toBe(true);
+    // R3: the explanation paragraph is gone; the frozen roster is the saved team, and
+    // a nonmember never appears in it.
+    expect(document.querySelector('.agent-dialog-note')).toBeNull();
     expect(applyAction().textContent).toBe('Save configuration');
     expect(applyAction().disabled).toBe(true);
     expect(document.querySelector('.agent-lock')).toBeNull();
@@ -601,7 +624,7 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
 
     // Effective live values (not the live descriptor's map, which only has instruct)
     // with the MODEL control enabled (R2). One select per configuration, reached
-    // through the dropdown.
+    // through the roster strip.
     const instructSelect = modelSelects()[0];
     expect(instructSelect.value).toBe('m2');
     expect(instructSelect.selectedOptions[0].textContent).toBe('m2');

@@ -70,7 +70,11 @@ Options:
 
 Environment:
   HARNESS_BASE_URL, HARNESS_API_KEY, HARNESS_MODEL
-  EXA_API_KEY, TAVILY_API_KEY   web search for live presets (opt-in, per key)
+  EXA_API_KEY, TAVILY_API_KEY, LINKUP_API_KEY
+                         web search (default provider: exa > tavily > linkup),
+                         and the optional hosted fetch providers (exa, linkup)
+  Native fetch and download need no key. A web key is read once at startup, so
+  restart after editing .env. --tools lists the direct-call catalogue.
 `);
 };
 
@@ -410,7 +414,7 @@ const main = async (): Promise<void> => {
 };
 
 // Load the package-root `.env` before `main()` can read HARNESS_* in
-// `settingsFrom` or construct a preset that captures EXA_/TAVILY_API_KEY.
+// `settingsFrom` or construct a preset that captures EXA_/TAVILY_/LINKUP_API_KEY.
 loadEnvironmentFile();
 
 await main();

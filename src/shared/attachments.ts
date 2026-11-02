@@ -6,9 +6,15 @@
 // server re-validates the exact same value on the way in (never trust a client).
 //
 // Contract (frozen cross-worker):
-//   - `validateAttachments(value)` returns detached copies of well-formed
-//     attachments, `[]` for `undefined`, and throws a plain `Error` on anything
-//     malformed. It never returns the caller's objects.
+//   - `validateAttachments(value, limits?)` returns detached copies of
+//     well-formed attachments, `[]` for `undefined`, and throws a plain `Error`
+//     on anything malformed. It never returns the caller's objects.
+//   - `limits` is the trust PROFILE: `UPLOAD_ATTACHMENT_LIMITS` (default: 4 MiB
+//     per file, 8 MiB per turn, 4 files — the public composer/submit contract,
+//     unchanged) or `DOWNLOAD_ATTACHMENT_LIMITS` (20 MiB per file, for media a
+//     tool fetched itself). The profile changes ONLY the byte/count gates:
+//     grammar, MIME tables, magic signatures and canonical base64 are common,
+//     so a download is never held to a looser standard than an upload.
 //   - `data` is RAW canonical base64 (no `data:` prefix, no whitespace).
 //   - `size` is the DECODED byte length and must agree with `data`.
 //   - ids and markers are unique within one turn.
@@ -27,9 +33,11 @@
 //   - ../core/agent.ts           — validates user()/stream() input before append
 //   - ../harness.ts              — validates HarnessRunOptions.attachments
 //   - ../transport/openai.ts     — maps attachments onto provider parts
+//   - ../core/tool-media.ts      — the tool-media profiles' main consumer
+//   - ../tools/webdownload/download.tool.ts — produces download media
 //   - ./index.ts                 — public shared barrel
 
-import type { HarnessAttachment } from '../types';
+import type { HarnessAttachment, HarnessAttachmentLimits } from '../types';
 
 // ---------------------------------------------------------------------------
 // Public constants
@@ -49,6 +57,44 @@ export const MAX_TOTAL_ATTACHMENT_BYTES = 8 * 1024 * 1024;
 // The server uses this when reading a request body; the composer uses it as the
 // client-side ceiling. Kept here so both sides quote one number.
 export const MAX_SUBMIT_BODY_BYTES = 16 * 1024 * 1024;
+
+// The public UPLOAD profile. These are the numbers a browser composer and the
+// HTTP submit route enforce, and they are the DEFAULT of `validateAttachments`,
+// so every existing caller (composer, submit route, agent, snapshot, transport)
+// keeps validating byte-for-byte what it always did.
+export const UPLOAD_ATTACHMENT_LIMITS: HarnessAttachmentLimits = {
+    perAttachmentBytes: MAX_ATTACHMENT_BYTES,
+    totalBytes: MAX_TOTAL_ATTACHMENT_BYTES,
+    count: MAX_ATTACHMENTS_PER_TURN
+};
+
+// One file the `download` tool fetched for the model: 20 MiB DECODED bytes.
+//
+// Binary units, matching every other byte bound in this package (4 MiB and
+// 8 MiB above, the 64 KiB result budget, the 8 MiB fork history budget) — "20mb"
+// in a user request means 20 * 1024 * 1024 here.
+//
+// Larger than the upload cap ON PURPOSE: these bytes were fetched by this
+// process through a streamed, capped transfer, so the submit-body argument
+// does not apply to them. They are a separate trust class, which is why they
+// get their own profile instead of a raised public limit — a public 20 MiB
+// upload cap would let a browser push 4 * 20 MiB of base64 into one request
+// body and into every later model request.
+export const MAX_DOWNLOAD_ATTACHMENT_BYTES = 20 * 1024 * 1024;
+
+// The trusted DOWNLOAD profile, used for media attached to a `tool` message.
+//
+// `count`/`totalBytes` are wider than one download because ONE validated list
+// is also what the transport builds when it aggregates the media of a whole
+// contiguous tool block (up to four 20 MiB files may legitimately land in one
+// block). The per-file cap is the one the user asked for; it is enforced
+// against RAW bytes, never against the base64 text, so the ~4/3 base64
+// expansion can never collide with the upload caps.
+export const DOWNLOAD_ATTACHMENT_LIMITS: HarnessAttachmentLimits = {
+    perAttachmentBytes: MAX_DOWNLOAD_ATTACHMENT_BYTES,
+    totalBytes: 4 * MAX_DOWNLOAD_ATTACHMENT_BYTES,
+    count: 4
+};
 
 // Marker label per kind. PDF also accepts "File" so a composer that treats a
 // document as a generic file still produces a marker this validator accepts.
@@ -115,6 +161,31 @@ export const attachmentMarker = (
     }
 
     return `[${resolved} ${index}]`;
+};
+
+// ---------------------------------------------------------------------------
+// MIME -> kind classification (shared by the download tool's policy and its test)
+// ---------------------------------------------------------------------------
+
+// The kinds a MIME table can CLAIM a payload for, in the order the table is
+// consulted. `file` is excluded because its list is empty by design: an unknown
+// type is never classified as a known kind, it falls through to `file` in the
+// caller.
+const CLASSIFIABLE_KINDS: readonly HarnessAttachment['kind'][] = ['image', 'video', 'audio', 'pdf'];
+
+// Which known kind (if any) this MIME belongs to, read from the SAME
+// `MIME_BY_KIND` table `readAttachment` enforces. A tool that classifies with
+// this rule cannot produce an attachment the validator then refuses for a MIME
+// mismatch, and the focused test pins that the two tables cannot drift.
+//
+// Returns `undefined` for anything the table does not claim, including the
+// empty/missing MIME a server may send.
+export const attachmentKindOfMime = (mime: string): HarnessAttachment['kind'] | undefined => {
+    for (const kind of CLASSIFIABLE_KINDS) {
+        if (MIME_BY_KIND[kind].includes(mime)) return kind;
+    }
+
+    return undefined;
 };
 
 // ---------------------------------------------------------------------------
@@ -307,7 +378,14 @@ const verifySignature = (mime: string, bytes: Uint8Array, label: string): void =
 
 // Read one record exactly: every field present and no unknown field, mirroring
 // the snapshot readers (a silently dropped field would be silent data loss).
-const readAttachment = (value: unknown, index: number): HarnessAttachment => {
+// `limits` is the caller's PROFILE (upload by default); only the byte/count
+// gates read it, so an upload and a download file are checked by the SAME
+// grammar, MIME, signature and canonical-base64 rules.
+const readAttachment = (
+    value: unknown,
+    index: number,
+    limits: HarnessAttachmentLimits
+): HarnessAttachment => {
     const label = `attachments[${index}]`;
 
     if (typeof value !== 'object' || value === null || Array.isArray(value)) {
@@ -398,9 +476,12 @@ const readAttachment = (value: unknown, index: number): HarnessAttachment => {
     }
 
     // Cheap ceiling before the regex so a hostile multi-megabyte string cannot
-    // spend time matching beyond anything that could be accepted.
-    if (data.length > Math.ceil(MAX_ATTACHMENT_BYTES / 3) * 4 + 4) {
-        throw new Error(`${label}.data exceeds the ${MAX_ATTACHMENT_BYTES}-byte attachment limit.`);
+    // spend time matching beyond anything that could be accepted. The ceiling is
+    // derived from the PROFILE's decoded-byte cap, so a 20 MiB download (about
+    // 26.7 MB of base64) is measured against the download bound and never
+    // collides with the 4 MiB upload cap.
+    if (data.length > Math.ceil(limits.perAttachmentBytes / 3) * 4 + 4) {
+        throw new Error(`${label}.data exceeds the ${limits.perAttachmentBytes}-byte attachment limit.`);
     }
 
     if (!isCanonicalBase64(data)) {
@@ -412,8 +493,8 @@ const readAttachment = (value: unknown, index: number): HarnessAttachment => {
         throw new Error(`${label}.data must decode to at least one byte.`);
     }
 
-    if (bytes > MAX_ATTACHMENT_BYTES) {
-        throw new Error(`${label}.data is ${bytes} bytes, above the ${MAX_ATTACHMENT_BYTES}-byte attachment limit.`);
+    if (bytes > limits.perAttachmentBytes) {
+        throw new Error(`${label}.data is ${bytes} bytes, above the ${limits.perAttachmentBytes}-byte attachment limit.`);
     }
 
     if ((size as number) !== bytes) {
@@ -426,21 +507,31 @@ const readAttachment = (value: unknown, index: number): HarnessAttachment => {
     return { id, kind, marker, name, mime, size: size as number, data };
 };
 
-// Validate one turn's attachments and return detached copies. `undefined` is the
+// Validate one attachment list and return detached copies. `undefined` is the
 // historical text-only call and yields `[]`; anything else is checked completely
 // before the caller mutates history or sends a request.
-export const validateAttachments = (value: unknown): HarnessAttachment[] => {
+//
+// `limits` defaults to UPLOAD_ATTACHMENT_LIMITS, which is the exact historical
+// behaviour of every existing caller (composer, submit route, agent user(),
+// snapshot user attachments, transport). A caller that validates tool media
+// passes DOWNLOAD_ATTACHMENT_LIMITS; nothing else about the check changes —
+// grammar, MIME tables, magic signatures and canonical base64 are shared, so a
+// download cannot be more sloppy about its bytes than an upload is.
+export const validateAttachments = (
+    value: unknown,
+    limits: HarnessAttachmentLimits = UPLOAD_ATTACHMENT_LIMITS
+): HarnessAttachment[] => {
     if (value === undefined) return [];
 
     if (!Array.isArray(value)) {
         throw new Error('attachments must be an array.');
     }
 
-    if (value.length > MAX_ATTACHMENTS_PER_TURN) {
-        throw new Error(`attachments may contain at most ${MAX_ATTACHMENTS_PER_TURN} entries; received ${value.length}.`);
+    if (value.length > limits.count) {
+        throw new Error(`attachments may contain at most ${limits.count} entries; received ${value.length}.`);
     }
 
-    const attachments = value.map((entry, index) => readAttachment(entry, index));
+    const attachments = value.map((entry, index) => readAttachment(entry, index, limits));
     const seenIds = new Set<string>();
     const seenMarkers = new Set<string>();
     let totalBytes = 0;
@@ -459,9 +550,9 @@ export const validateAttachments = (value: unknown): HarnessAttachment[] => {
         totalBytes += attachment.size;
     }
 
-    if (totalBytes > MAX_TOTAL_ATTACHMENT_BYTES) {
+    if (totalBytes > limits.totalBytes) {
         throw new Error(
-            `attachments total ${totalBytes} bytes, above the ${MAX_TOTAL_ATTACHMENT_BYTES}-byte per-turn limit.`
+            `attachments total ${totalBytes} bytes, above the ${limits.totalBytes}-byte per-turn limit.`
         );
     }
 

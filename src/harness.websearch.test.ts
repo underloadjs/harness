@@ -52,6 +52,20 @@ const exaPayload = {
     ]
 };
 
+// Linkup's own row shape: `name` is the title, `content` the excerpt, and the
+// `type`/`favicon` fields the tool has no place for.
+const linkupPayload = {
+    results: [
+        {
+            type: 'text',
+            name: 'Harness result',
+            url: 'https://example.com/harness',
+            content: 'the harness loops tools',
+            favicon: 'https://example.com/favicon.ico'
+        }
+    ]
+};
+
 const stubFetch = (body: unknown = exaPayload) => {
     const mock = vi.fn<(url: string, init: RequestInit) => Promise<Response>>(
         async () =>
@@ -89,6 +103,7 @@ describe('registration', () => {
     it('is not registered when opted in but no key is available', () => {
         vi.stubEnv('EXA_API_KEY', '');
         vi.stubEnv('TAVILY_API_KEY', '');
+        vi.stubEnv('LINKUP_API_KEY', '');
 
         const writer = harness({
             agents: { writer: idle() },
@@ -101,6 +116,7 @@ describe('registration', () => {
     it('registers a core tool from process.env when opted in with true', () => {
         vi.stubEnv('EXA_API_KEY', 'exa-secret-key');
         vi.stubEnv('TAVILY_API_KEY', '');
+        vi.stubEnv('LINKUP_API_KEY', '');
 
         const writer = harness({
             agents: { writer: idle() },
@@ -226,6 +242,59 @@ describe('execution', () => {
         expect(transcript).not.toContain('EXA_API_KEY');
         expect(events.join('\n')).not.toContain('exa-secret-key');
         expect(events.join('\n')).not.toContain('EXA_API_KEY');
+    });
+
+    it('searches through Linkup when Linkup is the only configured key', async () => {
+        const fetchMock = stubFetch(linkupPayload);
+
+        const entry = agent({ model: 'm', stream: scripted(searchOnly()) });
+
+        const writer = harness({
+            agents: { writer: entry },
+            presets: false,
+            websearch: { env: { LINKUP_API_KEY: 'linkup-secret-key' } }
+        });
+
+        // A single configured provider is not a choice: no `provider` argument is
+        // offered, so the model cannot spend a turn naming the only legal value.
+        const properties = (writer.tools.search.parameters as { properties: Record<string, unknown> }).properties;
+        expect(Object.keys(properties)).toEqual(['query', 'maxResults']);
+
+        await writer('search the web');
+
+        expect(fetchMock).toHaveBeenCalledTimes(1);
+
+        const [url, init] = fetchMock.mock.calls[0];
+        expect(url).toBe('https://api.linkup.so/v1/search');
+        expect(init.headers).toEqual({
+            'content-type': 'application/json',
+            authorization: 'Bearer linkup-secret-key'
+        });
+        expect(JSON.parse(String(init.body))).toEqual({
+            q: 'harness',
+            depth: 'fast',
+            outputType: 'searchResults',
+            maxResults: 2
+        });
+
+        // The provider answer is normalized into the same result shape Exa and
+        // Tavily produce: `name` -> title, `content` -> snippet, no date.
+        const resultMessage = entry.messages[2] as { role: string; content: string };
+        expect(resultMessage.role).toBe('tool');
+        expect(JSON.parse(resultMessage.content)).toEqual({
+            provider: 'linkup',
+            query: 'harness',
+            maxResults: 2,
+            results: [
+                {
+                    title: 'Harness result',
+                    url: 'https://example.com/harness',
+                    snippet: 'the harness loops tools'
+                }
+            ]
+        });
+
+        expect(JSON.stringify(entry.messages)).not.toContain('linkup-secret-key');
     });
 
     it('uses each harness\'s own credential', async () => {

@@ -81,10 +81,10 @@ describe('tools folder consolidation (R7)', () => {
             'locationManage.tool.ts',
             'profileManage.tool.ts',
             'search.tool.ts',
+            'task.tool.ts',
             'threadFork.tool.ts',
             'threadList.tool.ts',
             'threadSend.tool.ts',
-            'todoManage.tool.ts',
             'toolCancel.tool.ts',
             'toolCreate.tool.ts',
             'toolList.tool.ts',
@@ -105,7 +105,7 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'todoManage',
+            'task',
             'profileManage',
             'chapterManage',
             'locationManage',
@@ -124,6 +124,7 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'grep',
             'shell',
             'gitDiff',
+            'download',
             'search',
             'fetch',
             'threadSend',
@@ -251,7 +252,7 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'toolList',
             'toolManage',
             'toolCreate',
-            'todoManage',
+            'task',
             'profileManage',
             'chapterManage',
             'locationManage',
@@ -447,7 +448,9 @@ describe('generated manifest parity (R9)', () => {
     });
 
     it('describes every package entry, and no folder entry', () => {
-        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(28);
+        // 29 generated rows: the 28 historical package entries plus the
+        // `download` preset (order 235) added by R3/R4.
+        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(29);
 
         for (const descriptor of BUILTIN_TOOL_DESCRIPTORS) {
             expect(descriptor.origin).toBe('package');
@@ -493,16 +496,10 @@ describe('compatibility facade (R9)', () => {
 
     it('keeps the historical always-declared core order', () => {
         expect(coreToolMetadata().map((row) => row.name)).toEqual([
-            'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult'
+        'toolRequest',
+        'task',
+        'search',
+        'fetch',
         ]);
     });
 

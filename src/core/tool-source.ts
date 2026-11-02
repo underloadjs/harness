@@ -98,12 +98,18 @@ import * as discoveryApi from './discovery';
 import * as creationApi from './creation';
 import * as resultBudgetApi from './result-budget';
 import * as schemaValidationApi from './schema-validation';
-import * as todoApi from './todo';
+import * as taskApi from './task';
 import * as profileApi from './profile';
 import * as chapterApi from './chapter';
 import * as locationApi from './location';
 import * as snapshotApi from './snapshot';
 import * as toolUiApi from './tool-ui';
+// Tool media (`download`'s byte envelope) joins the LIVE core namespace for the
+// same reason `tool-ui` does: a compiled source entry must reach the SAME
+// `toolMedia()`/brand the harness unwraps, or a tool-built envelope would be a
+// different module's brand and the delivery boundary would serialize the
+// wrapper itself instead of the summary.
+import * as toolMediaApi from './tool-media';
 import * as schedulerApi from './scheduler';
 import * as metadataApi from './metadata';
 import * as actionApi from './action';
@@ -386,12 +392,13 @@ const liveCoreApi = (): Record<string, unknown> => {
         creationApi,
         resultBudgetApi,
         schemaValidationApi,
-        todoApi,
+        taskApi,
         profileApi,
         chapterApi,
         locationApi,
         snapshotApi,
         toolUiApi,
+        toolMediaApi,
         schedulerApi,
         metadataApi,
         actionApi,
@@ -421,6 +428,10 @@ const LIVE_MODULE_KEYS: Record<string, LiveModuleLookup> = {
     'core/creation': () => creationApi,
     'core/metadata': () => metadataApi,
     'core/schema-validation': () => schemaValidationApi,
+    // A source entry (or a host revision) that imports the media envelope module
+    // directly must resolve the SAME brand + validator as `../core` does.
+    'core/tool-media': () => toolMediaApi,
+    'core/tool-ui': () => toolUiApi,
     util: () => utilApi,
     'util/index': () => utilApi,
     types: () => ({}),

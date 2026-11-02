@@ -33,6 +33,7 @@ import * as globEntry from '../tools/files/glob.tool';
 import * as grepEntry from '../tools/files/grep.tool';
 import * as commandRunEntry from '../tools/command/shell.tool';
 import * as gitDiffEntry from '../tools/command/gitDiff.tool';
+import * as downloadEntry from '../tools/webdownload/download.tool';
 import * as coreMetadata from './metadata';
 import { ACTION_REQUEST_LIMITS } from './action';
 import {
@@ -50,7 +51,7 @@ import * as toolListEntry from '../tools/runtime/toolList.tool';
 import * as toolManageEntry from '../tools/runtime/toolManage.tool';
 import * as toolCreateEntry from '../tools/runtime/toolCreate.tool';
 import * as toolRegistryEntry from '../tools/runtime/toolRegistry.tool';
-import * as todoManageEntry from '../tools/runtime/todoManage.tool';
+import * as taskEntry from '../tools/runtime/task.tool';
 import * as profileManageEntry from '../tools/runtime/profileManage.tool';
 import * as chapterManageEntry from '../tools/runtime/chapterManage.tool';
 import * as locationManageEntry from '../tools/runtime/locationManage.tool';
@@ -121,11 +122,11 @@ const runtimeEntries: RuntimeEntry[] = [
         aggregated: coreMetadata.TOOL_REGISTRY_METADATA
     },
     {
-        wireName: 'todoManage',
-        sourcePath: '../tools/runtime/todoManage.tool.ts',
-        metadata: todoManageEntry.TODO_MANAGE_METADATA,
-        moduleMetadata: todoManageEntry.metadata,
-        aggregated: coreMetadata.TODO_MANAGE_METADATA
+        wireName: 'task',
+        sourcePath: '../tools/runtime/task.tool.ts',
+        metadata: taskEntry.TASK_METADATA,
+        moduleMetadata: taskEntry.metadata,
+        aggregated: coreMetadata.TASK_METADATA
     },
     {
         wireName: 'profileManage',
@@ -272,6 +273,15 @@ const presetEntries: PresetEntry[] = [
         sourcePath: '../tools/command/gitDiff.tool.ts',
         metadata: gitDiffEntry.GIT_DIFF_METADATA,
         tool: gitDiffEntry.gitDiff
+    },
+    {
+        // R3/R4: byte retrieval with the `toolMedia()` hand-off. Core like the
+        // file tools, and the same single-owner metadata literal contract.
+        key: 'download',
+        metadataName: 'DOWNLOAD_METADATA',
+        sourcePath: '../tools/webdownload/download.tool.ts',
+        metadata: downloadEntry.DOWNLOAD_METADATA,
+        tool: downloadEntry.download
     }
 ];
 
@@ -428,16 +438,10 @@ describe('runtime entry metadata ownership', () => {
 
     it('keeps the always-registered projection in its historical order', () => {
         expect(coreToolMetadata().map((metadata) => metadata.name)).toEqual([
-            'toolRequest',
-            'toolList',
-            'toolManage',
-            'toolCreate',
-            'todoManage',
-            'profileManage',
-            'chapterManage',
-            'locationManage',
-            'agentManage',
-            'agentResult'
+        'toolRequest',
+        'task',
+        'search',
+        'fetch',
         ]);
     });
 

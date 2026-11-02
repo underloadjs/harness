@@ -3,8 +3,10 @@
 // These tests pin the product rule that replaced the old writer/assistant/
 // researcher tool subsets, plus the T3 roster:
 //   - five REAL roles (instruct, research, workspace, reviewer, planner) are the
-//     first five cards, with the visible titles Instruct/Researcher/Coder/
-//     Reviewer/Planner; demo and flaky stay after them as examples;
+//     WHOLE shipped catalogue, with the visible titles Instruct/Researcher/Coder/
+//     Reviewer/Planner; the scripted demo and the flaky example are presets too, but
+//     T5 un-shipped them — they stay available through FIXTURE_PRESETS/
+//     ALL_PRESET_TEMPLATES so a host or a test injects them explicitly;
 //   - every real preset registers the exact same tool keys, configured and keyless —
 //     package coding tools, the app tools, search when a key resolves, then the
 //     harness core tools;
@@ -27,11 +29,13 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { HarnessProgress } from '../../harness';
 import {
+    ALL_PRESET_TEMPLATES,
     createHarnessRegistry,
     createToolCatalogue,
     createWebSearchCatalogueEntry,
     describeHarness,
     findPreset,
+    FIXTURE_PRESETS,
     presets,
     PRESET_ALIASES,
     PRESET_MAX_ITERATIONS,
@@ -81,6 +85,7 @@ const TOOLBOX = [
     'grep',
     'shell',
     'gitDiff',
+    'download',
     'timeNow',
     'textCount',
     'diceRoll',
@@ -88,7 +93,9 @@ const TOOLBOX = [
     'textSummarize'
 ];
 
-// The harness-owned core set, in descriptor order, without delegate.
+// The harness-owned core set, in descriptor order, without delegate. This is the
+// REGISTERED list: R9-R11 changed visibility (what a request declares), not which
+// rows the kernel registers, so every row below still exists in `harness.tools`.
 // toolRegistry leads because the kernel registers it before every other core tool.
 const CORE = [
     'toolRegistry',
@@ -96,7 +103,7 @@ const CORE = [
     'toolList',
     'toolManage',
     'toolCreate',
-    'todoManage',
+    'task',
     'profileManage',
     'chapterManage',
     'locationManage',
@@ -112,30 +119,47 @@ afterEach(() => {
 });
 
 describe('preset catalogue', () => {
-    it('lists the five real roles first, then the two examples', () => {
+    it('ships the five real roles and keeps the two examples as explicit fixtures (T5)', () => {
+        // The shipped catalogue is exactly the real roles: every card is a live
+        // harness a user can actually run. The scripted demo and the failure example
+        // are presets, but they are no longer product configurations.
         expect(presets.map((preset) => preset.name)).toEqual([
             'instruct',
             'research',
             'workspace',
             'reviewer',
-            'planner',
-            'demo',
-            'flaky'
+            'planner'
         ]);
         expect(presets.map((preset) => preset.title)).toEqual([
             'Instruct',
             'Researcher',
             'Coder',
             'Reviewer',
-            'Planner',
-            'Scripted demo',
-            'Recoverable failures (example)'
+            'Planner'
         ]);
 
         // The UI selects the first descriptor at boot, so the first card must be a
         // real harness rather than the scripted demo.
         expect(presets[0].name).toBe('instruct');
         expect(presets[0].requiresEndpoint).toBe(true);
+
+        // The review the removal came with: nothing in the shipped catalogue is
+        // offline, scripted, or registers a tool that fails on purpose.
+        expect(presets.every((preset) => preset.requiresEndpoint)).toBe(true);
+        expect(presets.every((preset) => preset.template === 'live')).toBe(true);
+        expect(presets.flatMap((preset) => preset.tools)).not.toContain('testFlaky');
+
+        // The fixtures stay available for explicit injection and for restoring an
+        // older session, in the same order they used to ship in.
+        expect(FIXTURE_PRESETS.map((preset) => [preset.name, preset.title])).toEqual([
+            ['demo', 'Scripted demo'],
+            ['flaky', 'Recoverable failures (example)']
+        ]);
+        expect(ALL_PRESET_TEMPLATES.map((preset) => preset.name)).toEqual([
+            ...presets.map((preset) => preset.name),
+            'demo',
+            'flaky'
+        ]);
     });
 
     it('keeps the live tool-loop budget at 1000 and the library default untouched', () => {
@@ -171,7 +195,7 @@ describe('preset catalogue', () => {
                 subagents: teamOf('instruct'),
                 agents: ['instruct', ...teamOf('instruct')],
                 tools: TOOLBOX,
-                environmentTools: ['search']
+                environmentTools: ['search', 'fetch']
             },
             {
                 name: 'research',
@@ -179,7 +203,7 @@ describe('preset catalogue', () => {
                 subagents: teamOf('research'),
                 agents: ['research', ...teamOf('research')],
                 tools: TOOLBOX,
-                environmentTools: ['search']
+                environmentTools: ['search', 'fetch']
             },
             {
                 name: 'workspace',
@@ -187,7 +211,7 @@ describe('preset catalogue', () => {
                 subagents: teamOf('workspace'),
                 agents: ['workspace', ...teamOf('workspace')],
                 tools: TOOLBOX,
-                environmentTools: ['search']
+                environmentTools: ['search', 'fetch']
             },
             {
                 name: 'reviewer',
@@ -195,7 +219,7 @@ describe('preset catalogue', () => {
                 subagents: teamOf('reviewer'),
                 agents: ['reviewer', ...teamOf('reviewer')],
                 tools: TOOLBOX,
-                environmentTools: ['search']
+                environmentTools: ['search', 'fetch']
             },
             {
                 name: 'planner',
@@ -203,26 +227,50 @@ describe('preset catalogue', () => {
                 subagents: teamOf('planner'),
                 agents: ['planner', ...teamOf('planner')],
                 tools: TOOLBOX,
-                environmentTools: ['search']
-            },
+                environmentTools: ['search', 'fetch']
+            }
+        ]);
+
+        // T5: the fixture exceptions are still declared honestly — demo is offline
+        // with timeNow only, flaky adds its example tool — they are simply not part
+        // of what the product ships.
+        expect(
+            FIXTURE_PRESETS.map((preset) => ({
+                name: preset.name,
+                primary: preset.primary,
+                subagents: preset.subagents,
+                agents: preset.agents,
+                environmentTools: preset.environmentTools,
+                template: preset.template
+            }))
+        ).toEqual([
             {
                 name: 'demo',
                 primary: 'demo',
                 subagents: [],
                 agents: ['demo'],
-                tools: ['timeNow'],
-                environmentTools: undefined
+                environmentTools: undefined,
+                template: 'scripted'
             },
             {
                 name: 'flaky',
                 primary: 'flaky',
                 subagents: [],
                 agents: ['flaky'],
-                tools: [...TOOLBOX, 'testFlaky'],
-                // The factory opts into search via createToolboxHarness, so the
-                // metadata says so too (descriptor/runtime agreement).
-                environmentTools: ['search']
+                // The factory opts into search AND webfetch through
+                // createToolboxHarness, so the metadata says so too
+                // (descriptor/runtime agreement).
+                environmentTools: ['search', 'fetch'],
+                template: 'flaky'
             }
+        ]);
+
+        // The one exception spelled out: demo declares exactly `timeNow`, and flaky is
+        // the shared toolbox plus `testFlaky` (the factory opts into search, so the
+        // metadata says so too — descriptor/runtime agreement).
+        expect(FIXTURE_PRESETS.map((preset) => [...preset.tools])).toEqual([
+            ['timeNow'],
+            [...SHARED_TOOL_NAMES, 'testFlaky']
         ]);
 
         // The exported table is the same list, not a second hand-maintained copy.
@@ -345,6 +393,9 @@ describe('one toolbox, different agents', () => {
             grep: 'core',
             shell: 'searchable',
             gitDiff: 'searchable',
+            // R9-R11: download is registered but searchable, so it is discovered
+            // through toolRequest instead of declared on every request.
+            download: 'searchable',
             timeNow: 'searchable',
             textCount: 'searchable',
             diceRoll: 'searchable',
@@ -359,11 +410,13 @@ describe('one toolbox, different agents', () => {
         // W4: the toolbox factory also opts into webfetch, but fetching stays
         // discovery-gated (SEARCHABLE), so it is never a core declaration and
         // never appears in a descriptor's coreTools.
-        expect(harness.tools.fetch.visibility).toBe('searchable');
+        // R9-R11: fetch is environment core, so a live card can advertise the
+        // declaration its harness really makes (src/server/harnesses/webfetch.ts).
+        expect(harness.tools.fetch.visibility).toBe('core');
         expect(harness.tools.fetch.tags).toEqual(['web', 'fetch', 'internet', 'read', 'url', 'research']);
         expect(harness.tools.toolRequest.visibility).toBe('core');
-        expect(harness.tools.toolCreate.visibility).toBe('core');
-        expect(harness.tools.todoManage.visibility).toBe('core');
+        expect(harness.tools.toolCreate.visibility).toBe('searchable');
+        expect(harness.tools.task.visibility).toBe('core');
         expect(harness.tools.delegate.visibility).toBe('core');
         expect(presetOf('demo').create(SETTINGS, progress).tools.delegate).toBeUndefined();
     });
@@ -413,20 +466,27 @@ describe('one toolbox, different agents', () => {
         }
 
         // Pin the configured real order too, so a descriptor cannot drift silently.
+        // R9-R11: only the bootstrap pair, delegate (this card has a team), the five
+        // core file presets, and the configured search are declared up front.
         expect(describeHarness(presetOf('instruct'), configured).coreTools).toEqual([
-            ...CORE,
+            'toolRequest',
+            'task',
             'delegate',
-            'threadFork',
             'read',
             'write',
             'edit',
             'glob',
             'grep',
-            'search'
+            'search',
+            // R9-R11: the web pair is advertised together; fetch is registered on
+            // every live card because the native provider needs no credential.
+            'fetch'
         ]);
-        // W4: fetch is registered by the live factory but is SEARCHABLE, so a
-        // descriptor must never advertise it as a core declaration.
-        expect(describeHarness(presetOf('instruct'), configured).coreTools).not.toContain('fetch');
+        // R9-R11: fetch IS a core declaration on a live card, and the descriptor
+        // says so because the catalogue carries the executable entry. A host that
+        // opts out (webfetch disabled) gets the opposite, and catalogue.test.ts pins
+        // that pairing.
+        expect(describeHarness(presetOf('instruct'), configured).coreTools).toContain('fetch');
     });
 
     it('gives each real preset distinct instructions and the right subagents', () => {
@@ -525,7 +585,7 @@ describe('one toolbox, different agents', () => {
 
     it('marks every template editable (compatibility field only)', () => {
         expect(
-            presets.map((preset) => ({
+            ALL_PRESET_TEMPLATES.map((preset) => ({
                 name: preset.name,
                 builtin: preset.builtin,
                 editable: preset.editable,

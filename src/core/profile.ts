@@ -1,6 +1,6 @@
 // profileManage — the harness session character/people profiles.
 //
-// Same lifecycle as todoManage (./todo.ts), deliberately:
+// Same lifecycle as task (./todo.ts), deliberately:
 //   - the store lives in this factory closure, so it is per harness (and
 //     therefore per server session), shared by every agent in that harness, and
 //     cleared by harness.reset();
@@ -216,7 +216,7 @@ const paginate = (
 };
 
 // Read `traits` once, for every action: a wrong type is a validation error even
-// on `list`, matching todoManage's up-front field checks. Entries are trimmed,
+// on `list`, matching task's up-front field checks. Entries are trimmed,
 // deduplicated, and must be non-empty - silently dropping a blank trait would
 // make the stored profile differ from what the model sent. `undefined` means the
 // caller omitted the field (add defaults to [], update leaves it unchanged).
@@ -574,7 +574,7 @@ export const createProfileTool = (): ProfileToolset => {
     return {
         tool: implementation,
         // "Start over": clear the records and restart the id sequence, matching
-        // harness.reset()'s contract and todoManage's reset.
+        // harness.reset()'s contract and task's reset.
         reset: () => {
             items.splice(0, items.length);
             nextId = 1;

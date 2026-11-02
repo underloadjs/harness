@@ -15,10 +15,14 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+    DOWNLOAD_ATTACHMENT_LIMITS,
     MAX_ATTACHMENT_BYTES,
     MAX_ATTACHMENTS_PER_TURN,
+    MAX_DOWNLOAD_ATTACHMENT_BYTES,
     MAX_SUBMIT_BODY_BYTES,
     MAX_TOTAL_ATTACHMENT_BYTES,
+    UPLOAD_ATTACHMENT_LIMITS,
+    attachmentKindOfMime,
     attachmentMarker,
     validateAttachments
 } from '@underload/harness/shared';
@@ -66,6 +70,131 @@ describe('constants', () => {
         expect(MAX_ATTACHMENT_BYTES).toBe(4 * 1024 * 1024);
         expect(MAX_TOTAL_ATTACHMENT_BYTES).toBe(8 * 1024 * 1024);
         expect(MAX_SUBMIT_BODY_BYTES).toBe(16 * 1024 * 1024);
+        expect(MAX_DOWNLOAD_ATTACHMENT_BYTES).toBe(20 * 1024 * 1024);
+    });
+
+    it('derives the two profiles from those numbers, never from each other', () => {
+        // The public upload contract is unchanged: a browser still cannot push a
+        // 20 MiB file through a submit body.
+        expect(UPLOAD_ATTACHMENT_LIMITS).toEqual({
+            perAttachmentBytes: 4 * 1024 * 1024,
+            totalBytes: 8 * 1024 * 1024,
+            count: 4
+        });
+
+        // The download profile is the trusted one: 20 MiB PER FILE, and a whole
+        // validated list may hold up to four of them because the transport builds
+        // one list per tool block.
+        expect(DOWNLOAD_ATTACHMENT_LIMITS).toEqual({
+            perAttachmentBytes: 20 * 1024 * 1024,
+            totalBytes: 83886080,
+            count: 4
+        });
+    });
+});
+
+describe('attachmentKindOfMime', () => {
+    it('classifies exactly the kinds MIME_BY_KIND claims', () => {
+        expect(attachmentKindOfMime('image/png')).toBe('image');
+        expect(attachmentKindOfMime('image/jpeg')).toBe('image');
+        expect(attachmentKindOfMime('image/jpg')).toBe('image');
+        expect(attachmentKindOfMime('image/webp')).toBe('image');
+        expect(attachmentKindOfMime('image/gif')).toBe('image');
+        expect(attachmentKindOfMime('video/mp4')).toBe('video');
+        expect(attachmentKindOfMime('video/webm')).toBe('video');
+        expect(attachmentKindOfMime('video/ogg')).toBe('video');
+        expect(attachmentKindOfMime('video/quicktime')).toBe('video');
+        expect(attachmentKindOfMime('audio/wav')).toBe('audio');
+        expect(attachmentKindOfMime('audio/x-wav')).toBe('audio');
+        expect(attachmentKindOfMime('audio/wave')).toBe('audio');
+        expect(attachmentKindOfMime('audio/mpeg')).toBe('audio');
+        expect(attachmentKindOfMime('audio/mp3')).toBe('audio');
+        expect(attachmentKindOfMime('application/pdf')).toBe('pdf');
+    });
+
+    it('claims nothing else, so a caller cannot invent a known kind', () => {
+        for (const mime of ['image/tiff', 'image/svg+xml', 'application/zip', 'text/plain', 'application/json', '']) {
+            expect(attachmentKindOfMime(mime)).toBeUndefined();
+        }
+    });
+});
+
+describe('limits profiles', () => {
+    // A 5 MiB generic file: legal for a tool download, illegal as an upload.
+    const fiveMeb = Buffer.alloc(5 * 1024 * 1024, 0x21);
+    const fiveMebFile: HarnessAttachment = {
+        id: 'dl-1',
+        kind: 'file',
+        marker: '[File 1]',
+        name: 'payload.bin',
+        mime: 'application/octet-stream',
+        size: fiveMeb.byteLength,
+        data: fiveMeb.toString('base64')
+    };
+
+    it('refuses above 4 MiB under the default (upload) profile', () => {
+        expect(() => validateAttachments([fiveMebFile])).toThrow(
+            'attachments[0].data exceeds the 4194304-byte attachment limit.'
+        );
+    });
+
+    it('accepts the same bytes under the download profile', () => {
+        expect(validateAttachments([fiveMebFile], DOWNLOAD_ATTACHMENT_LIMITS)).toEqual([fiveMebFile]);
+    });
+
+    it('accepts a file at exactly the 20 MiB download cap', () => {
+        const exact = Buffer.alloc(MAX_DOWNLOAD_ATTACHMENT_BYTES, 0x21);
+
+        expect(
+            validateAttachments(
+                [
+                    {
+                        ...fiveMebFile,
+                        size: exact.byteLength,
+                        data: exact.toString('base64')
+                    }
+                ],
+                DOWNLOAD_ATTACHMENT_LIMITS
+            )[0].size
+        ).toBe(20971520);
+    });
+
+    it('refuses one byte past the download cap, measured on decoded bytes', () => {
+        const over = Buffer.alloc(MAX_DOWNLOAD_ATTACHMENT_BYTES + 1, 0x21);
+
+        expect(() =>
+            validateAttachments(
+                [{ ...fiveMebFile, size: over.byteLength, data: over.toString('base64') }],
+                DOWNLOAD_ATTACHMENT_LIMITS
+            )
+        ).toThrow('attachments[0].data is 20971521 bytes, above the 20971520-byte attachment limit.');
+    });
+
+    it('keeps the grammar, MIME and signature rules identical across profiles', () => {
+        // A download may not be sloppier than an upload: same marker grammar,
+        // same kind/MIME agreement, same magic signature requirement.
+        expect(() => validateAttachments([image({ marker: '[File 1]' })], DOWNLOAD_ATTACHMENT_LIMITS)).toThrow(
+            'attachments[0].marker "[File 1]" does not match kind "image".'
+        );
+        expect(() =>
+            validateAttachments([image({ mime: 'image/jpeg' })], DOWNLOAD_ATTACHMENT_LIMITS)
+        ).toThrow('attachments[0].data does not match its declared MIME "image/jpeg" (magic signature mismatch).');
+        expect(() =>
+            validateAttachments([image({ mime: 'image/tiff' })], DOWNLOAD_ATTACHMENT_LIMITS)
+        ).toThrow('attachments[0].mime "image/tiff" is not valid for kind "image".');
+    });
+
+    it('applies the profile count, not a hidden global one', () => {
+        const four = [1, 2, 3, 4].map((index) => ({
+            ...image(),
+            id: `dl-${String(index)}`,
+            marker: `[Image ${String(index)}]`
+        }));
+
+        expect(validateAttachments(four, DOWNLOAD_ATTACHMENT_LIMITS)).toHaveLength(4);
+        expect(() =>
+            validateAttachments([...four, { ...four[0], id: 'dl-5', marker: '[Image 5]' }], DOWNLOAD_ATTACHMENT_LIMITS)
+        ).toThrow('attachments may contain at most 4 entries; received 5.');
     });
 });
 

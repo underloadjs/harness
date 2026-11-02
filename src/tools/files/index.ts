@@ -29,9 +29,10 @@
 //   glob  ({ patterns?, paths?, maxResults? })          -> { files, truncated }
 //   grep  ({ pattern, patterns?, paths?, maxResults? }) -> { matches, truncated, bytes, contentBudget }
 //
-// Both use ./glob's walker and ./search's shared candidate collection, so .git,
-// node_modules, and symlinks are skipped, roots are deduplicated by real file
-// identity, results are capped, and .gitignore is deliberately not read. grep is also
+// Both use ./glob's walker and ./search's shared candidate collection, so .git and
+// symlinks are skipped (node_modules only until a root is placed inside it), .gitignore
+// files at or below each root are honored, roots are deduplicated by real file
+// identity, and results are capped. grep is also
 // byte-bounded: each match text is cut to 1 KiB with an explicit `textTruncated`, and a
 // call stops at 64 KiB of match text with `truncated: true` (see ./grep).
 //
@@ -50,11 +51,13 @@
 // constants (FILE_LIST_CONTENT_BUDGET, FILE_GREP_CONTENT_BUDGET, …) are imported from
 // the entry file itself by the implementation and its focused tests.
 //
-// Three private helpers sit beside the tools and are shared by the batch:
+// Four private helpers sit beside the tools and are shared by the batch:
 //   - ./identity       — one canonical key per real file, so duplicate targets (Windows
 //     case aliases, symlink aliases, aliased roots) cannot slip through;
 //   - ./search         — the pattern/root/candidate plumbing both search presets walk,
 //     so glob and grep cannot drift apart;
+//   - ./gitignore      — the per-root `.gitignore` matcher ./search builds for each root,
+//     so an ignored directory is skipped by both tools and skipped identically;
 //   - ./bounded-regex  — content matching inside node:vm with a timeout, so a
 //     catastrophic pattern fails instead of hanging the process.
 export type { FileReadEntry, FileReadParameters, FileReadResult, FileReadTarget } from './read.tool';

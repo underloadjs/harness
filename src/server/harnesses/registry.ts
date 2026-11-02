@@ -41,6 +41,22 @@
 //       'flaky'    → rebuild the live toolbox with the testFlaky extra retained.
 // A hand-built/injected preset without a `template` defaults to 'live'.
 //
+// DELETION (T5)
+// -------------
+// `remove()` takes a harness out of the catalogue for good. Two different problems
+// have to stay distinct:
+//   - a USER harness (builtin:false): its row is written from `list()`, so removing
+//     the entry removes the row and the next restart has nothing to resurrect.
+//   - a SHIPPED built-in: the registry always starts from the templates in
+//     ./presets.ts, so "the row is gone" is not enough — a restart would ship it
+//     again. A deleted built-in therefore leaves an additive TOMBSTONE (the name in
+//     `deletedBuiltins`, persisted as `deleted` in the database). Restore replays
+//     tombstones BEFORE the saved rows, and `create()` clears the tombstone for the
+//     name it takes so a re-created harness survives its own restart.
+// Aliases follow their target: `writer` is an alias of `instruct`, so it resolves
+// to nothing while `instruct` is deleted and resolves again once it is re-created.
+// The alias NAMES themselves stay reserved, deleted target or not.
+//
 // SHIPPED-DEFAULT REFRESH (T3)
 // ----------------------------
 // restoreHarnessRegistry() replays a saved built-in row only when it differs from
@@ -70,7 +86,7 @@ import { agentProfiles, isAgentProfileName } from '../../agents';
 import type { AgentProfile } from '../../agents';
 import type { HarnessPreset } from './types';
 import type { HarnessPresetRecord } from '../persistence';
-import { LEGACY_PRESET_DEFINITIONS, presets } from './presets';
+import { ALL_PRESET_TEMPLATES, LEGACY_PRESET_DEFINITIONS, presets } from './presets';
 import type { LegacyPresetDefinition } from './presets';
 import {
     EXAMPLE_APP_TOOL_SOURCES,
@@ -170,9 +186,28 @@ export type HarnessPatch = {
     agentInstructions?: Readonly<Record<string, string>>;
 };
 
+// A synchronous capture of everything a registry mutation can change: the entries
+// (in listing order) and the deleted-builtin tombstones (T5). Entries hold the SAME
+// preset objects the registry holds — a preset is never mutated in place (update()
+// replaces it), so a capture is cheap and restoring one cannot disagree with what
+// an existing session already captured.
+//
+// WHY THIS EXISTS: a harness mutation is only real once it is durable, so the
+// dispatcher's create/patch/delete route commits through the session store, which
+// writes the whole document. If that write fails, an in-memory registry that still
+// shows the mutation is a lie the next restart will undo. Snapshot/restore gives
+// that commit path ONE rollback mechanism for all three mutations instead of a
+// hand-written undo per mutation (and it preserves insertion order, which a
+// "re-create it" rollback would not).
+export type HarnessRegistrySnapshot = {
+    entries: readonly (readonly [string, HarnessPreset])[];
+    deletedBuiltins: readonly string[];
+};
+
 export type HarnessRegistry = {
     // Shipped harnesses first (preset order), then user-created ones in creation
-    // order. Overrides replace an entry in place, so ordering is stable.
+    // order. Overrides replace an entry in place, so ordering is stable. A deleted
+    // built-in (T5) is absent here and stays absent across restarts.
     list: () => readonly HarnessPreset[];
     // Resolve a name, including a legacy alias. Undefined means 404 for a session
     // request.
@@ -181,6 +216,25 @@ export type HarnessRegistry = {
     agents: () => readonly AgentProfile[];
     create: (registration: HarnessRegistration) => HarnessPreset;
     update: (name: string, patch: HarnessPatch) => HarnessPreset;
+    // T5: remove one harness. Direct name only, like update() — a legacy alias is a
+    // read compatibility redirect, not an identity that can be deleted. Throws 404
+    // for an unknown or already-deleted name. A deleted BUILT-IN leaves a tombstone
+    // (see `deletedBuiltins`); a deleted user harness leaves nothing, because its
+    // saved row is simply gone. Sessions are untouched: an existing session runs the
+    // preset it captured, and a saved session restores from its own frozen record.
+    remove: (name: string) => HarnessPreset;
+    // The built-in names the operator deleted (T5), in deletion order. This is
+    // durable state: ./persistence.ts writes it as `deleted` so a restart does not
+    // resurrect a shipped card the operator removed.
+    deletedBuiltins: () => readonly string[];
+    // Replay durable deletions onto a freshly built registry (startup restore). The
+    // entry is dropped when this build ships it, and the tombstone is recorded even
+    // when it does not, so the decision survives a build that renames a default.
+    // Idempotent and never throws — a startup replay has no request to answer.
+    restoreDeletedBuiltins: (names: readonly string[]) => void;
+    // Rollback support for the durable commit path (see HarnessRegistrySnapshot).
+    snapshot: () => HarnessRegistrySnapshot;
+    restore: (snapshot: HarnessRegistrySnapshot) => void;
 };
 
 // A registry failure with an HTTP status, so the dispatcher maps it like
@@ -573,9 +627,11 @@ const presetToRecordShape = (record: HarnessPresetRecord): HarnessPresetRecord =
 // exactly like update() does:
 //   - 'live'     → the standard profiled factory;
 //   - 'flaky'    → live toolbox with testFlaky retained;
-//   - 'scripted' → the shipped scripted factory for that name (a scripted entry's
-//                  executable fields can never have changed: an executable PATCH
-//                  promotes it to 'live');
+//   - 'scripted' → the shipped scripted factory for that name, looked up in
+//                  ALL_PRESET_TEMPLATES so a fixture that left the shipped
+//                  catalogue (T5: demo) still rebuilds for an old session (a
+//                  scripted entry's executable fields can never have changed: an
+//                  executable PATCH promotes it to 'live');
 //   - absent     → an injected/custom preset. Its factory is not serializable, so
 //                  a caller must pass the still-available entry as `fallback`; a
 //                  mismatch is an error instead of a silently different harness.
@@ -586,7 +642,12 @@ export const presetFromRecord = (
     let create: HarnessPreset['create'];
 
     if (record.template === 'scripted') {
-        const shipped = presets.find(
+        // T5: the lookup is the SUPERSET (catalogue + fixtures), not `presets`. A
+        // session frozen on an older build recorded only the NAME of a scripted
+        // harness, and its factory lives in exactly one place; if that place is no
+        // longer in the shipped catalogue, the session still has to rebuild. Same
+        // reason the fixture presets stay exported.
+        const shipped = ALL_PRESET_TEMPLATES.find(
             (preset) => preset.name === record.name && preset.template === 'scripted'
         );
 
@@ -723,10 +784,20 @@ export const isLegacyShippedDefinition = (
 // A `builtin` record absent from the target registry is a seeded/injected preset
 // this build does not ship; it is left to the caller (its sessions still restore
 // from their own frozen preset record).
+//
+// T5 `deletedBuiltins`: the names the operator deleted, replayed FIRST so this
+// build's shipped copy of one of them is gone before the record loop can compare or
+// patch it. A deleted built-in has no saved row (the document is written from
+// `list()`), so the two lists never disagree about the same name; a row that DOES
+// name a tombstoned entry is the newer decision and re-creates it (which clears the
+// tombstone in `create()`).
 export const restoreHarnessRegistry = (
     registry: HarnessRegistry,
-    records: readonly HarnessPresetRecord[]
+    records: readonly HarnessPresetRecord[],
+    deletedBuiltins: readonly string[] = []
 ): void => {
+    registry.restoreDeletedBuiltins(deletedBuiltins);
+
     const known = new Map(registry.list().map((preset) => [preset.name, presetToRecord(preset)]));
 
     for (const record of records) {
@@ -802,12 +873,42 @@ export const restoreHarnessRegistry = (
     }
 };
 
-export const createHarnessRegistry = (initial: readonly HarnessPreset[] = presets): HarnessRegistry => {
+export type HarnessRegistryOptions = {
+    // T5: built-in names the operator deleted, already recorded in the durable
+    // database (`deleted` in <root>/harness/state.json). A template whose name
+    // appears here is NOT inserted, so a shipped default stays removed across
+    // restarts. Order is preserved, which keeps the saved document stable.
+    deletedBuiltins?: readonly string[];
+};
+
+export const createHarnessRegistry = (
+    initial: readonly HarnessPreset[] = presets,
+    options: HarnessRegistryOptions = {}
+): HarnessRegistry => {
     // Insertion-ordered map: list() is stable, and update() preserves position.
     const entries = new Map<string, HarnessPreset>();
 
+    // Deleted built-in tombstones (T5). An insertion-ordered Set, so
+    // `deletedBuiltins()` — and therefore the saved document — does not reshuffle
+    // between restarts.
+    const deleted = new Set<string>();
+
+    // Seed the tombstones BEFORE the templates are copied in, because a tombstoned
+    // template must never appear in `entries` at all.
+    for (const value of options.deletedBuiltins ?? []) {
+        if (typeof value !== 'string') continue;
+
+        const name = value.trim();
+
+        if (name.length > 0) deleted.add(name);
+    }
+
     // R20.1: start from independent template copies, never the module constants.
-    for (const preset of initial) entries.set(preset.name, copyTemplate(preset));
+    for (const preset of initial) {
+        if (deleted.has(preset.name)) continue;
+
+        entries.set(preset.name, copyTemplate(preset));
+    }
 
     // The shipped title/description per template. An executable upgrade of a
     // non-live template adopts its `live` metadata only while these strings are
@@ -893,10 +994,12 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
             agents,
             // One toolbox for every live harness, user-created included. The four
             // core file tools are declared up front (R18); the searchable remainder
-            // waits for toolRequest, and search is core when configured.
+            // waits for toolRequest. The factory is createToolboxHarness, which opts
+            // into BOTH web rows, and each is declared core when it registers
+            // (R9-R11) - so both belong in this declaration.
             // Copied so no registry entry aliases the shared module array.
             tools: [...SHARED_TOOL_NAMES],
-            environmentTools: ['search'],
+            environmentTools: ['search', 'fetch'],
             // Absent vs `{}` are the same thing: no overrides. Stored as a plain
             // object so update() has one shape to reason about.
             agentModels,
@@ -915,6 +1018,15 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
         };
 
         entries.set(name, preset);
+
+        // T5: taking a deleted built-in's NAME is an explicit decision to have that
+        // harness again, so the tombstone goes with it. Without this the document
+        // would carry the new row AND the tombstone, and the next restore would
+        // remove the harness the operator just created. The commit order is what
+        // keeps the two consistent: the dispatcher persists AFTER this returns, and
+        // a failed write restores the tombstone through `restore()`.
+        deleted.delete(name);
+
         return preset;
     };
 
@@ -1043,9 +1155,11 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
             agentInstructions,
             ...(upgradedScripted
                 ? {
+                      // The upgrade replaces the script with the live toolbox, which
+                      // registers search AND fetch; both are core declarations (R9-R11).
                       requiresEndpoint: true,
                       tools: [...SHARED_TOOL_NAMES],
-                      environmentTools: ['search'],
+                      environmentTools: ['search', 'fetch'],
                       template: 'live' as const
                   }
                 : {}),
@@ -1056,11 +1170,87 @@ export const createHarnessRegistry = (initial: readonly HarnessPreset[] = preset
         return preset;
     };
 
+    // T5: remove one harness. Returns the entry that was removed (the dispatcher's
+    // DELETE route answers `{ deleted: true }`, but a host that rolls back or logs
+    // the removal needs to know what it removed).
+    const remove = (name: string): HarnessPreset => {
+        // Direct lookup, like update(): `PATCH/DELETE /harnesses/writer` must never
+        // rewrite `instruct` through a compatibility redirect.
+        const current = entries.get(name);
+
+        if (current === undefined) {
+            // A repeat DELETE is 404, not a second success: the caller believed it
+            // removed something. The wording says which kind of miss this is, so a
+            // UI cannot confuse "never existed" with "already deleted".
+            throw new HarnessRegistryError(
+                404,
+                deleted.has(name)
+                    ? `Harness "${name}" has already been deleted.`
+                    : `Unknown harness "${name}".`
+            );
+        }
+
+        entries.delete(name);
+
+        // Only a built-in needs a tombstone, because only a built-in comes back on
+        // the next start (the registry always seeds from ./presets.ts). A user
+        // harness is durable-absent as soon as it is absent from `list()`, which is
+        // what the saved document is written from.
+        if (current.builtin) deleted.add(name);
+
+        return current;
+    };
+
+    // Startup replay of durable deletions (restoreHarnessRegistry). Deliberately
+    // total: an unknown or already-deleted name is a no-op rather than an error,
+    // because a tombstone may name a built-in this build stopped shipping (a
+    // re-shipped default must still come back deleted) and a restart has no request
+    // to answer with a status.
+    const restoreDeletedBuiltins = (names: readonly string[]): void => {
+        for (const value of Array.isArray(names) ? names : []) {
+            if (typeof value !== 'string') continue;
+
+            const name = value.trim();
+
+            if (name.length === 0) continue;
+
+            entries.delete(name);
+            deleted.add(name);
+        }
+    };
+
+    const snapshot = (): HarnessRegistrySnapshot => ({
+        entries: [...entries.entries()],
+        deletedBuiltins: [...deleted]
+    });
+
+    // Replace the whole mutable state with a captured one. Order is rebuilt from the
+    // snapshot's entry list, so a rolled-back registry lists exactly what it listed
+    // before the failed commit. Safe as a wholesale replace because a registry
+    // mutation and its commit are one synchronous block in the dispatcher (the body
+    // is read before the mutation), so no other request can have changed the map in
+    // between; a preset object itself is never mutated in place, so an existing
+    // session's captured preset is identical either way.
+    const restore = (captured: HarnessRegistrySnapshot): void => {
+        entries.clear();
+
+        for (const [name, preset] of captured.entries) entries.set(name, preset);
+
+        deleted.clear();
+
+        for (const name of captured.deletedBuiltins) deleted.add(name);
+    };
+
     return {
         list: () => [...entries.values()],
         find,
         agents: () => agentProfiles(),
         create,
-        update
+        update,
+        remove,
+        deletedBuiltins: () => [...deleted],
+        restoreDeletedBuiltins,
+        snapshot,
+        restore
     };
 };

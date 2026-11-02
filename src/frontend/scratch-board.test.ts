@@ -212,26 +212,20 @@ it('keeps a legacy editable:false preset fully editable and never says read-only
     expect(document.querySelector('.agent-lock')).toBeNull();
     expect(document.querySelector('.harness-meta')?.textContent).not.toContain('editable');
 
-    // T3: the team is genuinely editable — the instruction editor, the model select and
-    // the membership toggle are all live (nothing here is a read-only "not editable"
-    // surface, and the entry still never says read-only).
+    // T3/R3: the team is genuinely editable — the instruction editor, the model select
+    // and the team controls are all live (nothing here is a read-only "not editable"
+    // surface, and the entry still never says read-only). The only agent is the primary,
+    // so it cannot leave its own team.
     openDeck();
     expect(byClass('.agent-dialog-instruction', 'textarea').disabled).toBe(false);
     expect(byClass('.agent-model-select', 'select').disabled).toBe(false);
-    expect(byClass('.agent-dialog-member', 'input').disabled).toBe(true); // the primary
+    expect(byClass('.agent-dialog-remove', 'button').disabled).toBe(true); // the primary
 
-    // Adding a trusted agent: select it, tick membership, save from the primary so the
-    // add does not also promote.
-    const select = byClass('.agent-dialog-agent-select', 'select');
-    select.value = 'summarizer';
-    select.dispatchEvent(new Event('change', { bubbles: true }));
-
-    const member = byClass('.agent-dialog-member', 'input');
-    member.checked = true;
-    member.dispatchEvent(new Event('change', { bubbles: true }));
-
-    select.value = 'instruct';
-    select.dispatchEvent(new Event('change', { bubbles: true }));
+    // Adding a trusted agent: `[+]` lists only the agents without a badge, picking one
+    // drafts the membership, and saving from the primary adds without promoting.
+    byClass('.agent-dialog-add', 'button').click();
+    byClass('.agent-dialog-add-option[data-agent="summarizer"]', 'button').click();
+    byClass('.agent-dialog-tab[data-agent="instruct"]', 'button').click();
 
     byClass('.agent-dialog-apply', 'button').click();
     await flush();
@@ -558,7 +552,7 @@ it('derives panels from a polled snapshot without replaying old activity', async
     expect(panelIds('scratch')).toEqual(['polled']);
 });
 
-it('routes a manual tool result to the owner captured before the call', async () => {
+it('keeps a manual playground result out of every conversation board (R7)', async () => {
     const alpha = descriptor({ name: 'alpha', title: 'Alpha', agents: ['instruct'], primary: 'instruct' });
     const beta = descriptor({ name: 'beta', title: 'Beta', agents: ['instruct'], primary: 'instruct' });
 
@@ -614,6 +608,10 @@ it('routes a manual tool result to the owner captured before the call', async ()
     expect(document.querySelectorAll('.tool-runner-slot > .pane > .log-wrap > .log > .tool-card')).toHaveLength(1);
 
     byClass('.tool-args', 'textarea').value = '{}';
+    // Captured BEFORE the harness switch: the runner pane is persistent and keeps its
+    // answer even while it is detached from the closed dialog, so this same node is what
+    // the late answer writes into (R7/R8: the response box, not the scratch board).
+    const responseBox = byClass('.tool-output .card-body', 'pre');
     document.querySelector<HTMLButtonElement>('.tool-card button.primary')?.click();
 
     // The request is in flight; the reader moves to the OTHER harness before the
@@ -647,13 +645,26 @@ it('routes a manual tool result to the owner captured before the call', async ()
     expect(panelIds('scratch')).toEqual([]);
     expect(host('scratch').hidden).toBe(true);
 
-    // The panel belongs to the harness that made the call.
+    // R7: a playground call's panels are NOT injected into any conversation. The answer
+    // belongs to the playground's own temporary context, so the board of the harness that
+    // made the call stays exactly as empty as the board of the harness the reader moved
+    // to — the panels are visible as data in the runner's response box instead.
     byClass('.harness-item[data-harness="alpha"]', 'button').click();
     await flush();
 
-    expect(panelIds('scratch')).toEqual(['manual']);
-    expect(panelText('scratch')).toEqual(['ok']);
-    expect(document.querySelector('.scratch-note')?.textContent).toBe('1 tool panel for alpha.');
+    expect(panelIds('scratch')).toEqual([]);
+    expect(panelText('scratch')).toEqual([]);
+    expect(document.querySelector('.scratch-note')?.textContent).toBe(
+        'No tool panels yet. A tool that publishes ui/panels lands here.'
+    );
+
+    // The response box carries the whole answer envelope, panels included, so nothing is
+    // lost by not painting them: the reader can read and copy them from the runner.
+    const response = responseBox.textContent ?? '';
+    expect(response).toContain('"value": 1');
+    expect(response).toContain('"panels"');
+    expect(response).toContain('"Manual"');
+
     // Exactly one server call was made: the panel is presentation, not a retry.
     expect(
         calls.filter((call) => call.url === '/api/tools/publish' && call.method === 'POST')

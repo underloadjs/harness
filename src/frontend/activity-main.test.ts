@@ -25,7 +25,7 @@ const descriptor = (overrides: Partial<HarnessDescriptor> = {}): HarnessDescript
         requiresEndpoint: true,
         agents: ['instruct', 'helper'],
         tools: [],
-        coreTools: ['toolRequest', 'toolCreate', 'todoManage', 'delegate'],
+        coreTools: ['toolRequest', 'toolCreate', 'task', 'delegate'],
         primary: 'instruct',
         subagents: ['helper'],
         builtin: true,

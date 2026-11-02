@@ -17,7 +17,9 @@
 // make the service call `killPort`): the driver patches `http.Server.listen` and
 // prints the OS-assigned port for the port-0 bind. No process is ever killed.
 //
-// Network: loopback HTTP only. The demo preset is scripted and offline.
+// Network: loopback HTTP only. The demo preset this suite streams against is scripted
+// and offline; T5 moved it out of the shipped catalogue, so the driver below injects
+// the fixtures explicitly (see the setHarnessRuntime call).
 
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
@@ -48,6 +50,8 @@ const DRIVER = `// Scratch integration driver written by src/server/service-star
 // Scans the harness package for endpoint modules and serves them on port 0.
 import http from 'node:http';
 import { startServer } from '../../packages/underload/service/src/server/start';
+import { ALL_PRESET_TEMPLATES, createHarnessRegistry } from '../../packages/underload/harness/src/server/harnesses';
+import { createHarnessRuntime, setHarnessRuntime } from '../../packages/underload/harness/src/server/runtime';
 
 const target = http.Server.prototype as unknown as { listen: (...args: unknown[]) => unknown };
 const originalListen = target.listen;
@@ -69,6 +73,22 @@ target.listen = function (this: http.Server, ...args: unknown[]) {
 
     return originalListen.apply(this, args);
 };
+
+// T5: the production service catalogue is the five real roles, none of which run
+// without a provider. This suite's end-to-end assertions (a streamed turn, a reset,
+// a persisted session under the loader's variables.root) need an OFFLINE harness, so
+// the driver pre-seeds the root-keyed runtime with the shipped catalogue plus the
+// explicit fixtures. getHarnessRuntime keeps one runtime per resolved root, so the
+// discovered route reuses this one instead of building the default: everything else
+// (loader -> endpoint -> handler -> <root>/harness/state.json) is the real path.
+const serviceRoot = process.env.HARNESS_SERVICE_DATABASE_ROOT;
+setHarnessRuntime(
+    createHarnessRuntime({
+        ...(serviceRoot === undefined ? {} : { root: serviceRoot }),
+        registry: createHarnessRegistry(ALL_PRESET_TEMPLATES)
+    }),
+    serviceRoot
+);
 
 const server = await startServer({
     root: process.env.HARNESS_SERVICE_SCAN_ROOT,
@@ -93,17 +113,22 @@ process.on('SIGTERM', shutdown);
 process.on('SIGINT', shutdown);
 `;
 
+// The catalogue the driver-injected runtime serves (T5): the five shipped production
+// presets plus the two fixtures the driver registers so this suite can run a real
+// turn offline. An un-injected runtime lists only the first five.
 const PRESET_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'demo', 'flaky'];
 
 // Core tools lead the catalogue (R8) in every listing surface, including the
-// bootstrap document the service loader serves at GET /v1/harness.
+// bootstrap document the service loader serves at GET /v1/harness. R9-R11 changed
+// DECLARATION (visibility), not the catalogue: every session-bound runtime row is
+// still listed here, in kernel registration order.
 const TOOL_NAMES = [
     'toolRegistry',
     'toolRequest',
     'toolList',
     'toolManage',
     'toolCreate',
-    'todoManage',
+    'task',
     'profileManage',
     'chapterManage',
     'locationManage',
@@ -122,13 +147,16 @@ const TOOL_NAMES = [
     'grep',
     'shell',
     'gitDiff',
+    'download',
     'timeNow',
     'textCount',
     'diceRoll',
     'noteSearch',
     'textSummarize',
     'testFlaky',
-    'search'
+    'search',
+    // R9-R11: the web core pair is listed together (src/server/harnesses/webfetch.ts).
+    'fetch'
 ];
 
 const parseSse = (text: string): SessionStreamItem[] => {

@@ -73,6 +73,22 @@ button {
     font: inherit;
 }
 
+/* T26: NO disclosure chevron on any control that opens a dialog. A tool chip, a think
+   chip and anything added later answer "what is this?" by their own label; the triangle
+   restates what the click already proves, and a chip row full of identical triangles is
+   noise. This is a BASE-ELEMENT rule precisely so a future `<details>` control inherits
+   it instead of re-declaring it: `list-style: none` is the Gecko marker,
+   `::-webkit-details-marker` the Blink/WebKit one. A surface that genuinely wants its
+   own disclosure glyph (the endpoint accordion) still draws it with `::before`, which
+   this rule does not touch. */
+summary {
+    list-style: none;
+}
+
+summary::-webkit-details-marker {
+    display: none;
+}
+
 :focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
@@ -359,8 +375,9 @@ button {
     gap: 8px;
 }
 
-/* Keep the New action and the phone-only drawer close control together, so the
-   heading stays on the left and the controls do not spread across the header. */
+/* Keep the New action on the right of the heading, so the title stays on the left and
+   the controls do not spread across the header. R4: the phone drawer's `×` control is
+   gone — the heading itself is the toggle — so this cluster is the New button. */
 .rail-head-actions {
     display: flex;
     flex: 0 0 auto;
@@ -368,28 +385,35 @@ button {
     gap: 8px;
 }
 
-/* The drawer close affordance is phone-only: desktop/tablet rails are permanent
-   and have no open/closed state to dismiss. The phone block reveals it. */
-.rail-close {
-    display: none;
-    align-items: center;
-    justify-content: center;
-    width: 30px;
-    height: 30px;
+/* R4: the "Harnesses" heading IS the drawer toggle (it replaced the phone-only `×`).
+   It lives inside the `<h2 class="rail-title">`, so it inherits the heading's mono
+   caption styling and only removes the button chrome — the rail still reads as one
+   title, not a title plus a control. Above 860px main.ts disables the button (the rail
+   is permanent there), so the pointer affordance is phone-only. */
+.rail-title-toggle {
+    margin: 0;
     padding: 0;
-    border: 1px solid var(--border-strong);
-    border-radius: 8px;
+    border: 0;
     background: transparent;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 16px;
-    line-height: 1;
-    cursor: pointer;
+    /* `font: inherit` keeps the toggle byte-identical to the heading's caption style
+       (family, size, weight, spacing, uppercase all come from `.rail-title`). */
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    text-transform: inherit;
+    letter-spacing: inherit;
+    cursor: default;
 }
 
-.rail-close:hover {
-    border-color: var(--accent);
-    color: var(--text);
+.rail-title-toggle:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 4px;
+}
+
+.rail-title-toggle:disabled {
+    color: inherit;
+    cursor: default;
 }
 
 .rail-title {
@@ -442,6 +466,81 @@ button {
 .harness-item:disabled {
     opacity: 0.5;
     cursor: not-allowed;
+}
+
+/* R6: one roster entry = the selection button PLUS its delete control. Buttons cannot
+   nest, so the row is a wrapper (the same structure the sessions rail uses, R8):
+     .harness-row[data-harness]( [data-armed] )   ← layout only, no surface
+       .harness-item                              ← select (all its own styling kept)
+       .harness-delete                            ← delete / confirm-again control
+       .harness-delete-hint                       ← armed confirmation text
+   The wrapper deliberately owns no background or frame: `.harness-item[aria-pressed]`
+   stays the selection indicator, so an armed row cannot look selected/deselected. */
+.harness-row {
+    display: grid;
+    /* Column 1 shrinks (long titles/names); the delete control keeps its intrinsic
+       width. `minmax(0, 1fr)` is the R6 overflow guard inside the 248px rail. */
+    grid-template-columns: minmax(0, 1fr) auto;
+    align-items: stretch;
+    gap: 3px;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.harness-row > .harness-item {
+    grid-column: 1;
+    min-width: 0;
+}
+
+.harness-row > .harness-delete {
+    grid-column: 2;
+}
+
+/* A hint is a full-width third line, never a third column. */
+.harness-delete-hint {
+    grid-column: 1 / -1;
+    margin: 0;
+}
+
+/* Compact delete control, stated as destructive at rest (red glyph, faint red frame)
+   and intensified when armed, so the pending confirmation is visible without colour
+   being the only cue (`Delete?` text + the hint line carry it). */
+.harness-delete {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: 0 0 auto;
+    min-width: 26px;
+    padding: 0 7px;
+    border: 1px solid rgba(248, 113, 113, 0.35);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--danger);
+    font-family: var(--mono);
+    font-size: 12px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.harness-delete:hover:not(:disabled) {
+    border-color: var(--danger);
+    background: rgba(248, 113, 113, 0.12);
+}
+
+.harness-delete:focus-visible {
+    outline: 2px solid var(--danger);
+    outline-offset: 1px;
+}
+
+.harness-delete:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.harness-row[data-armed='true'] > .harness-delete {
+    border-color: var(--danger);
+    background: rgba(248, 113, 113, 0.16);
+    color: var(--text);
 }
 
 .harness-title {
@@ -1740,19 +1839,19 @@ button {
     line-height: 1.4;
 }
 
-/* The measurement cluster (elapsed clock, token tally, state word) is the LAST item of
-   a compact row, so the row reads identity → prompt → measurements. It never shrinks.
-   R3: the state word is back INSIDE this cluster, closing the line
-   (`2.8s | 8,946 - done`); the identity line above it is the badge alone. */
+/* The measurement cluster (elapsed clock, token tally) is the LAST item of a compact row,
+   so the row reads identity → prompt → measurements. It never shrinks. R3: the state word
+   is still its last child; T2 clips that word to screen-reader-only, so the compact line
+   prints `34.2s | 18,654 (37,376)` and its COLOUR says which state it is. */
 .tile:not(.is-expanded) .tile-top {
     order: 2;
     flex: 0 0 auto;
     margin-left: auto;
-    /* R3: `gap: 0`, not a pixel gap. The separators are the text between the labels
-       (' | ' and ' - ', rules below), so the line renders EXACTLY as written and a
-       hidden label leaves no dead gap behind. This also keeps a compact row flush to
-       its right padding edge: the status box contributes nothing there (its word is
-       sr-only), and a gap would push the tally 6px in from the edge. */
+    /* R3: `gap: 0`, not a pixel gap. The separator is the text between the labels
+       (' | ', rule below), so the line renders EXACTLY as written and a hidden label leaves
+       no dead gap behind. This also keeps a compact row flush to its right padding edge: the
+       status box contributes nothing there (its word is sr-only), and a gap would push the
+       tally 6px in from the edge. */
     gap: 0;
 }
 
@@ -1917,11 +2016,13 @@ button {
 }
 
 /* R1/R3: ONE measurement LINE, shared by the main block (`.tile-top`) and the nested
-   block (`.thread-top`): clock, tally, then the state word. `gap: 0` because the
-   separators (' | ' and ' - ') are generated text between the labels, so the line
-   renders exactly as it reads — `2.8s | 8,946 - done` — and a hidden label never
-   leaves a dead gap. `min-width: 0` lets the labels ellipsise instead of pushing the
-   state word out of the row. */
+   block (`.thread-top`): the elapsed clock, then the token tally, and nothing else visible
+   (`34.2s | 18,654 (37,376)`). `gap: 0` because the separator (' | ') is generated text
+   between the labels, so the line renders exactly as it reads and a hidden label never
+   leaves a dead gap. The state word is still the last child for assistive tech but is
+   clipped to screen-reader-only in both header states (see the sr-only rule), and the
+   line's COLOUR is the visible state cue (see the state-colour rules).
+   `min-width: 0` lets the labels ellipsise instead of pushing the line out of the row. */
 .tile-top {
     display: flex;
     align-items: center;
@@ -1929,23 +2030,34 @@ button {
     min-width: 0;
 }
 
-/* T1/R3: the header's IDENTITY LINE — the persistent-thread badge (`IT1`) on its own.
-   One wrapper span is the only way to keep the badge on a SINGLE line in BOTH header
-   layouts: the compact row is a flex ROW that orders this span as one `order: 0` item,
-   the expanded header is a flex COLUMN that stacks it as its first line. R4: that first
-   line is exactly the line the header Delete control is centred on (see
-   `.tile.is-expanded > .tile-header-action`), and its `max-width` reserves the
-   right-edge slot the control occupies, so a long badge ellipsises instead of running
-   under the button. The state word used to sit here; R3 moved it to the measurement
-   line below. */
+/* T1/R3: the header's IDENTITY LINE - the persistent-thread badge (`IT1`) plus, T26, the
+   measurement cluster on the SAME line. One wrapper span is still the only way to keep the
+   badge on a SINGLE line in BOTH header layouts: the compact row is a flex ROW that orders
+   this span as one `order: 0` item at the head, and the expanded header is a flex ROW-WRAP
+   (see `.tile.is-expanded .tile-select`) whose first line is this span followed by the
+   figures. R4/T26: the `max-width` no longer reserves an absolutely positioned Delete slot —
+   it reserves the room the measurement cluster needs on the shared line, so an over-long
+   conversation label stops short of `4m09s | 42,212 (358,448)` (~165px of 10.5px tabular
+   mono) plus the 10px column gap. The `max()` floor is what keeps a badge readable in a
+   narrow nested column, where the reserve alone would squeeze it to nothing; below that
+   floor the FIGURES ellipsise instead (they already shrink and clip).
+   T2 (identifier sizing): `flex: 0 0 auto`, i.e. the identity NEVER shrinks. With
+   `flex: 0 1 auto` the wrapper took a share of the row's shrinkage, and that share became
+   the badge's percentage cap — `IT1`/`IT2`/`IT3` ellipsised on a narrow column while a
+   machine-parsed prompt still had characters to spare. Making the wrapper intrinsic moves
+   all of the pressure onto the flexible prompt (`.tile-prompt`), which is the item the
+   reader can afford to lose a tail of. `min-width: 0` stays so the reserve still bites on
+   an extremely long badge instead of the row overflowing the card.
+   The state word used to sit here; R3 moved it to the measurement line, and T2 clipped it
+   out of sight entirely. */
 .tile-identity {
     order: 0;
     display: inline-flex;
     align-items: center;
     gap: 6px;
-    flex: 0 1 auto;
+    flex: 0 0 auto;
     min-width: 0;
-    max-width: calc(100% - 92px);
+    max-width: max(120px, calc(100% - 176px));
 }
 
 /* R3: no `.tile-index` rule exists — the turn ordinal was removed from the DOM,
@@ -1979,39 +2091,33 @@ button {
     content: ' | ';
 }
 
-/* R3: the state word is the LAST item of the measurement line, and the ` - ` before it
-   is decoration in the SAME way the `|` above is — it is generated here, never part of
-   the word (`textContent` stays `done`, so the state stays copyable and searchable).
-   Two rules, because either measurement may be absent: the tally is hidden until a
-   request reports usage, and the clock is hidden for a replayed record with no end
-   stamp. With neither visible the word stands alone, with no dangling dash.
-   Scoped to an EXPANDED header: a compact row clips the word itself (sr-only, below),
-   and a separator painted in front of a clipped word would be a stray ` - `. */
-:is(.tile.is-expanded, .thread-tile.is-expanded)
-    :is(.tile-tokens, .thread-tokens):not([hidden])
-    + :is(.tile-status, .thread-status)::before {
-    content: ' - ';
-}
+/* R3: the state word is NOT a visible suffix of the measurement line. The line reads
+   `34.2s | 18,654 (37,376)` — the two figures and the generated ` | ` between them, and
+   nothing else. What used to be painted here was a generated ' - ' separator plus the word
+   (`- done`); the separator rules are gone because the word is now clipped to
+   screen-reader-only in BOTH header states (see the sr-only rule below), and a dash in
+   front of a clipped word would be a stray `-` hanging off the tally.
+   The state is still fully conveyed: `data-state` drives the line's COLOUR (see the
+   state-colour rules), the word stays in the DOM for assistive tech, and the dialog/JSON
+   transcript still carry it. Nothing about the measured figures changed — each span stays
+   a clean, copy-pastable value because the separator is decoration, and the separator
+   disappears together with the label it follows. */
 
-:is(.tile.is-expanded, .thread-tile.is-expanded)
-    :is(.tile-elapsed, .thread-elapsed):not([hidden])
-    + :is(.tile-tokens, .thread-tokens)[hidden]
-    + :is(.tile-status, .thread-status)::before {
-    content: ' - ';
-}
-
-/* R3: the state word is the last item of the measurement LINE (`2.8s | 8,946 - done`),
-   not part of the conversation identity. It used to lead next to the badge, and before
-   that it was right-aligned in this cluster; the right-edge slot belongs to the header
-   Delete control (`.tile-header-action` / `.thread-header-action`), which R4 centres on
-   the badge line above. Typography is shared so the nested word stays the same
-   size/register as the main block's. */
+/* R3: the state box is the measurement line's LAST child, and it contributes NOTHING to
+   the rendered line: the word inside it is clipped to screen-reader-only in both header
+   states (rule below), so the box collapses to 0 width. It is not decoration and it is not
+   removed — a `<span>` the assistive tech reads is the difference between "the colour means
+   the state" and "the state is unlabelled". `position: relative` is required by that
+   sr-only clip (the absolutely positioned word anchors here, not to the card). Typography
+   is shared so the nested word stays the same size/register as the main block's, and the
+   colour rules below keep the box's own colour in step with the line's, so any surface that
+   ever reveals the word (forced colors, a future change) agrees with the numbers. */
 :is(.tile-status, .thread-status) {
     position: relative;
     display: inline-flex;
     align-items: center;
-    /* R3: the box's only job is the word (no dot) plus the generated separator, and the
-       separator carries its own spacing — a flex gap here would paint ` -   done`. */
+    /* The word carries its own text; no flex gap, because a gap here would push the
+       collapsed 0-width box away from the tally it follows. */
     gap: 0;
     min-width: 0;
     color: var(--muted);
@@ -2020,84 +2126,20 @@ button {
     white-space: nowrap;
 }
 
-/* T5/R2: an EXPANDED header must SHRINK the state word, never let it overpaint its
-   neighbour. `.tile-status` / `.thread-status` already carry `min-width: 0`, so a narrow
-   transcript column compresses the flex box — but the word inside is `white-space:
-   nowrap` with the default `overflow: visible`, so it PAINTS OUTSIDE the box (a rect-only
-   probe reports 0 and misses it). Real Chrome, `Temp/t5/probe-status.html`, 84 cells
-   (nested card + main tile x 7 column widths x {done, "waiting for server"} x
-   {fork tag, none} x {short, long} token tallies, desktop labels and the <=600px glyph):
-   the pre-fix control collides in 25/84 cells — the ink runs over `.thread-kind` /
-   `.thread-top` from 420px down to 300px (e.g. a 400px column: 111px of ink in a 63px
-   box). Clipping the WORD inside its own box removes every one of those cells in both
-   viewport configurations, because a clipped span's ink IS its rect:
-     - `text-overflow` never rewrites `textContent`, so the complete state stays available
-       to assistive tech, and the un-truncated identity stays in the existing badge/row
-       title (`Thread RR2 · Helper · idle`, ui/turns.ts `threadTitleOf`);
-     - `min-width: 1.5em` is a legibility floor measured to be the largest value that
-       still keeps 340/400/460px columns collision-free in both viewports (~2 glyphs plus
-       the ellipsis, e.g. `wa…`). It is NOT free: every pixel of un-shrinkable status
-       width is taken from the row, which is why 2.5em/3.5em reintroduced cluster-vs-Delete
-       contact at 340px (2/12 cells) while 1.5em stays clean (0/12). A 0 floor is clean to
-       300px but measured a 0px box there, i.e. the state cue disappears entirely;
-     - this block is `is-expanded`-only, so the sr-only clip below (compact rows) and the
-       shared colour rules are untouched.
-     R3 ADDENDUM (the floor re-measured for the WIDER line): the word now shares the
-     measurement line with the clock and the tally, and that line can become the header's
-     FIRST line (a conversation continuation prints no badge). Re-run in real Chrome,
-     `Temp/t2/probe-t2-header.html` — 384 expanded cells plus the collapsed row of every
-     one: {nested card, main tile with badge, main tile without badge} x {300, 320, 340,
-     360, 400, 420, 460, 900}px x {done, "waiting for server"} x {short, long} tallies x
-     {fork tag, none}, desktop labels and the <=600px glyph — leaves 1.5em clean (no
-     same-line ink reaches the Delete slot, no ink leaves the card) once the BOX clips and
-     the line is shrinkable: the numbers ellipsise first, the word keeps its own ellipsis,
-     and `textContent` stays the complete state in every cell. The same matrix with the
-     box unclipped puts ~19px of generated ' - ' ink into the Delete slot at 300-400px,
-     which is why `overflow: hidden` belongs on the box and not only on the word. */
-:is(.tile.is-expanded, .thread-tile.is-expanded) :is(.tile-status, .thread-status) {
-    flex: 0 1 auto;
-    min-width: 1.5em;
-    /* R3: the generated ' - ' is a SECOND, non-shrinkable flex item inside this box, so
-       the box's content can be wider than the box (real Chrome,
-       `Temp/t2/probe-t2-header.html`: ~19px of separator ink reached the Delete slot on
-       300-400px nested columns and on a 300px badge-less main row, the exact rows where
-       the measurement line shares the header's first line). Clipping the box restores the
-       property the rules below depend on — a clipped span's ink IS its rect — so the
-       header reserve actually holds. The word keeps its own ellipsis; `textContent` is
-       untouched either way. */
-    overflow: hidden;
-}
-
-:is(.tile.is-expanded, .thread-tile.is-expanded) :is(.tile-status-text, .thread-status-text) {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-/* R3: the state word joined the measurement line, so an EXPANDED header must let that
-   line SHRINK. `.thread-top`'s `flex: 0 0 auto` (and the compact tile's copy of it)
-   pinned the line to its natural width — fine while it held two short numbers, but with
-   `waiting for server` behind them the un-shrinkable line pushed its ink past the card's
-   own edge (real Chrome, `Temp/t2/probe-t2-header.html`: a 300px nested card ran 50px
-   beyond its border, and a 360px one ran 39px into the Delete slot). Allowing the shrink
-   hands the pressure to the clip rules above, which ellipsise the tally and then the
-   word inside their boxes. A COMPACT row keeps `flex: 0 0 auto`: there the word is
-   sr-only, so the line is still just the two figures the row has always fitted. */
+/* R3: the state word left the VISIBLE line, so the T5/T2 clip machinery that protected the
+   Delete slot from a long word (`min-width: 1.5em` legibility floor, the expanded word
+   ellipsis, the box clip) is gone: a clipped-to-nothing word cannot paint over anything.
+   What the line still needs is the ability to SHRINK and to ellipsise its FIGURES. T26: the
+   reason changed but the need did not — the figures no longer share the header's right edge
+   with an absolutely positioned button, they share it with the IDENTITY LINE on the same
+   row, and an un-shrinkable `34.2s | 18,654 (37,376)` still ran past the card's own border
+   on a 300px nested column. Clipping never rewrites `textContent`, so the full figures
+   stay selectable and searchable. */
 :is(.tile.is-expanded, .thread-tile.is-expanded) :is(.tile-top, .thread-top) {
     flex: 0 1 auto;
     min-width: 0;
 }
 
-/* R3 (the T5 discipline, now guarding a WIDER cluster): the state word sits at the end
-   of the measurement line, so a narrow transcript column squeezes three nowrap labels
-   into it. The box shrinks and the WORD clips inside it, and the two numbers get the
-   same treatment they already had on a compact row — otherwise the cluster's ink leaves
-   its box and reaches the header Delete slot (the nested card is one row with the slot
-   floating over its right edge; the main tile's cluster line shares the card's right
-   edge with the slot whenever the badge line is empty, e.g. a conversation continuation
-   row). Clipping never rewrites `textContent`, so the full figures stay selectable and
-   the full state stays available to assistive tech. */
 :is(.tile.is-expanded, .thread-tile.is-expanded)
     :is(.tile-elapsed, .thread-elapsed, .tile-tokens, .thread-tokens) {
     min-width: 0;
@@ -2106,13 +2148,16 @@ button {
     white-space: nowrap;
 }
 
-/* Compact tiles convey the state by colour and the activity ring below, so the
-   status word would be a second visible label ("done" next to the meta line).
-   It stays in the DOM for assistive tech — clipped, not removed. Expanded tiles
-   keep the word: there, the header is the only place the state is spelled out.
-   R1: the NESTED row's status word gets the identical treatment, so a collapsed
-   parent and a collapsed child both show state by colour, not by a second label. */
-:is(.tile:not(.is-expanded), .thread-row:not(.is-expanded)) :is(.tile-status-text, .thread-status-text) {
+/* R3: the state word is CLIPPED, never removed, in BOTH header states — compact and
+   expanded. It used to be visible on an expanded tile (the header was the only place the
+   state was spelled out); the requested measurement line is the two figures only, so the
+   word becomes a screen-reader label instead. `clip-path` + the 1px box is the standard
+   visually-hidden pattern: assistive tech still announces `done` / `streaming` / `error`,
+   and the state is never colour-only for the small number of readers who cannot use the
+   clip (forced-colors modes keep the box, and the tile border/ring still carry it).
+   R1 parity: ONE grouped rule for both block owners, so a collapsed child is exactly as
+   compact as a collapsed parent and an expanded child exactly as sparse. */
+:is(.tile, .thread-tile) :is(.tile-status-text, .thread-status-text) {
     position: absolute;
     width: 1px;
     height: 1px;
@@ -2124,11 +2169,37 @@ button {
     white-space: nowrap;
 }
 
-/* State colours on the rows (R4): queued is NEUTRAL (not working yet, so no
-   pulse and no green), waiting is amber, and streaming is the single green
-   "active task" state. Text still spells the state out on an expanded tile; on a
-   compact row the colour, border and activity ring carry it — there is no
-   decorative dot (the plain-row rule from R1 applies to every state cue). */
+/* State colours (R4/T2). The state WORD is now clipped to screen-reader-only in both
+   header states, so the measurement LINE carries the state by colour. Requested mapping:
+     done      -> GREEN  (`--ok`)      this block finished
+     streaming -> YELLOW (`--warn`)    it is still producing output right now
+     waiting   -> YELLOW (`--warn`)    same "not finished" meaning, no output yet
+     error     -> RED    (`--danger`)  it ended failed
+     queued / cancelled -> MUTED       neutral: not started, or deliberately stopped
+   The rules are written against the FIGURE labels as well as the state box: the box holds
+   only a clipped word, so colouring it alone would colour nothing a human can see, and the
+   two must never disagree about which state a block is in.
+   Grouped across BOTH block owners (ui/turns.ts mirrors `data-state` onto `.thread-tile`)
+   so a main block and a nested card cannot drift. Specificity (a block class + an
+   attribute + `:is()`) beats the shared `color: var(--muted)` typography rules, and
+   `:is()` takes the specificity of its widest argument, so the base rules still paint the
+   states listed as muted (queued/cancelled) without a rule of their own.
+   The ROW SURFACE (border/background/activity ring, rules below) keeps its own long-standing
+   language: green frames the one ACTIVE row. That cue is a frame, not the measurement line.
+   There is no decorative dot (the plain-row rule from R1 applies to every state cue). */
+:is(.tile, .thread-tile)[data-state='done'] :is(.tile-elapsed, .tile-tokens, .thread-elapsed, .thread-tokens) {
+    color: var(--ok);
+}
+
+:is(.tile, .thread-tile)[data-state='streaming'] :is(.tile-elapsed, .tile-tokens, .thread-elapsed, .thread-tokens),
+:is(.tile, .thread-tile)[data-state='waiting'] :is(.tile-elapsed, .tile-tokens, .thread-elapsed, .thread-tokens) {
+    color: var(--warn);
+}
+
+:is(.tile, .thread-tile)[data-state='error'] :is(.tile-elapsed, .tile-tokens, .thread-elapsed, .thread-tokens) {
+    color: var(--danger);
+}
+
 .tile[data-state='queued'] .tile-status {
     color: var(--muted);
 }
@@ -2137,7 +2208,12 @@ button {
     color: var(--warn);
 }
 
+/* Streaming is amber and `done` is green (T2): the line colour, not a second label. */
 .tile[data-state='streaming'] .tile-status {
+    color: var(--warn);
+}
+
+.tile[data-state='done'] .tile-status {
     color: var(--ok);
 }
 
@@ -2177,10 +2253,6 @@ button {
 
 /* Cancelled is a deliberate stop, not a failure: it stays neutral (default
    border) and only the dot is muted — no green and no red would both be lies. */
-
-.tile[data-state='done'] .tile-status {
-    color: var(--muted);
-}
 
 .tile[data-state='error'] .tile-status {
     color: var(--danger);
@@ -2326,7 +2398,7 @@ button {
    says WHO owns the block and the nesting says WHERE it belongs. Structure:
      .thread-row          ← data-depth (1 = direct child of the turn root), state
        .thread-tile       ← agent-coloured outline (same surface as `.tile`)
-         .thread-select   ← button: ONE row = code [kind] · preview · [elapsed | tokens - state]
+         .thread-select   ← button: ONE row = code [kind] · preview · [elapsed | tokens (state = colour)]
          .thread-body     ← input prompt, agent flow, outcome (hidden collapsed)
        .thread-children   ← this entry's own descendants, in spawn order
    The children host is OUTSIDE the body and BELOW the tile, so collapsing a parent
@@ -2394,7 +2466,7 @@ button {
 }
 
 /* Compact entry (R1): ONE row with the same anatomy as a compact turn tile —
-   `agent code [kind] · preview · [elapsed | tokens - state]`. Same paddings/line height
+   `agent code [kind] · preview · [elapsed | tokens (state = colour)]`. Same paddings/line height
    as `.tile:not(.is-expanded) .tile-select`, so a collapsed parent and a collapsed
    child are the same height. The children are ordered here (not in the DOM) exactly
    like the tile's `prompt`/`tile-top` pair: the code leads, the preview is the flexible
@@ -2421,11 +2493,12 @@ button {
     outline-offset: -2px;
 }
 
-/* The nested measurement line: the counterpart of `.tile-top` (R1/R3). It holds the
-   elapsed clock, the token tally and the state word IN THAT ORDER, with the same
-   generated separators (' | ' and ' - ') and no flex gap, so a child block and the
-   main block print one identical line. `min-width: 0` lets the labels ellipsise
-   instead of pushing the state word out of the row. */
+/* The nested measurement line: the counterpart of `.tile-top` (R1/R3). It holds the elapsed
+   clock, the token tally and the state box IN THAT ORDER, with the same generated ' | '
+   separator and no flex gap, so a child block and the main block print one identical line
+   (`34.2s | 18,654 (37,376)`). T2: the state word is clipped to screen-reader-only here too,
+   and the line's colour is the visible state cue. `min-width: 0` lets the labels ellipsise
+   instead of pushing the line out of the row. */
 .thread-top {
     order: 2;
     display: flex;
@@ -2441,25 +2514,32 @@ button {
    `.thread-name`, so a collapsed parent and a collapsed child show the code in the
    same position, register and size. The label is the compact agent code (`RH1`),
    never the raw agent id (R3). Numbering is conversation-scoped, so two threads of
-   one agent read RR1/RR2 across turns. */
+   one agent read RR1/RR2 across turns.
+   T2 (identifier sizing): the code is an IDENTITY, so it is never the thing that gets
+   truncated. `max-width: 40%` + `overflow: hidden` capped it at a fraction of the row and
+   ellipsised `IT12` into `I…` on a narrow column — and the percentage was measured against
+   a shrinkable flex parent, so the cap tightened as the row tightened. `flex: 0 0 auto`
+   with no cap keeps the whole code at its intrinsic width; the flexible item that gives way
+   is the prompt/preview (`.tile-prompt`, `.thread-preview`: `flex: 1 1 auto; min-width: 0`
+   with the ellipsis). A pathological label is still bounded by the card, because the row
+   itself cannot exceed it. */
 :is(.tile-agent, .thread-name) {
     order: 0;
     flex: 0 0 auto;
-    max-width: 40%;
-    overflow: hidden;
     color: var(--agent-color);
     font-family: var(--mono);
     font-size: 10.5px;
     letter-spacing: 0.09em;
     text-transform: uppercase;
-    text-overflow: ellipsis;
     white-space: nowrap;
 }
 
-/* Status is TEXT (never colour-only); colour only reinforces it. Typography and
-   layout come from the grouped `:is(.tile-status, .thread-status)` rule, so the
-   nested word is the same size/register as the main block's. R1 parity: the state
-   colours below cover every state a nested entry can reach. */
+/* Status is TEXT (never colour-only) — the word stays in the DOM even though the line
+   colour now carries the state visibly. Typography and layout come from the grouped
+   `:is(.tile-status, .thread-status)` rule, so the nested word is the same size/register
+   as the main block's. T2 parity: the nested colours match the main block's exactly
+   (done green, streaming/waiting amber, error red, queued/cancelled muted), covering every
+   state a nested entry can reach. */
 .thread-row[data-state='queued'] .thread-status {
     color: var(--muted);
 }
@@ -2469,11 +2549,11 @@ button {
 }
 
 .thread-row[data-state='streaming'] .thread-status {
-    color: var(--ok);
+    color: var(--warn);
 }
 
 .thread-row[data-state='done'] .thread-status {
-    color: var(--muted);
+    color: var(--ok);
 }
 
 .thread-row[data-state='error'] .thread-status {
@@ -2514,13 +2594,13 @@ button {
     display: none;
 }
 
-/* R7/R8: the transcript toolbar of an EXPANDED block, shared by a turn tile, a
-   nested invocation card and the roster-only focus panel. Transcript is the leading
-   action and the inline Delete confirmation wraps onto its own full-width row so
-   nothing moves. ui/turns.ts toggles `hidden` with expansion, so a collapsed row
-   never shows a permanent second row. T1/R2: Delete itself moved to the card header
-   (see `.tile-header-action` below), which is why this bar no longer spaces two
-   buttons apart. */
+/* R7/R8/T26: the toolbar of an EXPANDED block, shared by a turn tile, a nested invocation
+   card and the roster-only focus panel. It owns BOTH actions now, in the requested order:
+   DELETE leads (left, where Transcript used to be) and TRANSCRIPT closes the row (right,
+   the slot Delete used to be painted in above the header). The inline Delete confirmation
+   still wraps onto its own full-width row so nothing moves. ui/turns.ts toggles `hidden`
+   with expansion, so a collapsed row never shows a permanent second row. The header's
+   right edge is no longer a control slot at all: the measurement line lives there. */
 :is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions) {
     display: flex;
     flex-wrap: wrap;
@@ -2546,12 +2626,18 @@ button {
     cursor: pointer;
 }
 
-/* R8: Delete is the trailing action; `margin-left: auto` keeps it on the right
-   even if the transcript button is the only other child. */
+/* R8/T26: Delete is the LEADING action of the bar (destructive first, the way the session
+   rail puts its stop control before its labels). It keeps only its colour here. */
 .thread-delete {
-    margin-left: auto;
     border-color: rgba(248, 113, 113, 0.45);
     color: var(--danger);
+}
+
+/* T26: Transcript is the trailing action. `margin-left: auto` puts it flush right whether
+   or not Delete is rendered — an undeletable default conversation hides Delete, and the
+   transcript button must not slide over to where the destructive action was. */
+.transcript-open {
+    margin-left: auto;
 }
 
 .transcript-open:hover {
@@ -2631,86 +2717,55 @@ button {
     color: var(--danger);
 }
 
-/* T1/R2: Delete's slot in the CARD HEADER — the right-edge position the state word
-   used to occupy. Both card owners are already `position: relative` (`.tile`,
-   `.thread-tile`), so the control is painted over the header without reparenting the
-   header's own <button> (a <button> can never nest). ui/turns.ts toggles `hidden`
-   with the toolbar, so a collapsed row never shows it. */
-:is(.tile-header-action, .thread-header-action, .thread-focus-head-action) {
-    display: flex;
-    align-items: center;
-    gap: 6px;
+/* T26: the header's right-edge CONTROL slot is GONE. `.tile-header-action`,
+   `.thread-header-action` and `.thread-focus-head-action` no longer exist in the DOM:
+   Delete moved into the toolbar under the header, and the slot that button was painted
+   over is now where the MEASUREMENT LINE lives (`34.2s | 18,654 (37,376)`, flush right
+   on the badge's own line). With both figures ordinary flex items of the same line there
+   is nothing to float, no z-index to win and no reserved padding to defend — an overlap
+   cannot happen because the line lays them out. */
+
+/* Expanded turn tile: the header wraps as a ROW instead of a column.
+      line 1:  RR1                                    4m09s | 42,212 (358,448)
+      line 2:  1 agent · 23 tool calls · local/basalt
+   `flex-flow: row wrap` plus the existing `order` values is the whole mechanism: the
+   identity cluster (`order: 0`) leads, the measurement line (`order: 1`,
+   `margin-left: auto`) closes the first line flush right, and the meta (`order: 2`,
+   `flex: 1 0 100%`) is forced onto the line below by its own basis. The prompt preview is
+   already `display: none` here, so the first line has exactly two items.
+   `align-items: baseline` puts the badge pill and the 10.5px mono figures on ONE text
+   baseline — the request is "the figures where the Delete button was", not "the figures
+   floating 2px off the badge". Row gap is 4px, less than the column gap it replaces,
+   because the two lines are one reading unit rather than separate blocks. */
+.tile.is-expanded .tile-select {
+    flex-flow: row wrap;
+    align-items: baseline;
+    column-gap: 10px;
+    row-gap: 4px;
 }
 
-:is(.tile-header-action, .thread-header-action, .thread-focus-head-action)[hidden] {
-    display: none;
-}
-
-/* Expanded turn tile: the header stacks as a column whose FIRST line is the identity
-   line (the badge), so the control is centred on THAT line. R4: instead of guessing a
-   `top` from the button's own height (the previous 5px, which drifted the moment the
-   label or the line changed), the slot is given the identity line's OWN box — it starts
-   where the header's padding starts (`padding: 10px 12px`) and is as tall as the
-   `.tile-thread` pill's line box (10px font × line-height 1.5 + the 2px border = 17px).
-   The shared `align-items: center` rule then centres whatever button the host holds,
-   at any label width or glyph/label breakpoint. `right: 12px` matches the header's
-   horizontal padding. */
-.tile.is-expanded > .tile-header-action {
-    position: absolute;
-    z-index: 1;
-    top: 10px;
-    height: 17px;
-    right: 12px;
-}
-
-/* A nested card's header is always ONE row, so the slot is the same box as that row's
-   content line: it starts at the row's `padding: 6px 10px` and is one 10.5px mono line
-   tall (line-height 1.5 → 15.75px, rounded to 16px). Centring on that line centres the
-   control on the conversation code — the nested counterpart of R4 above — and matches
-   the 84px reserve below rather than the card's outer edge. */
-.thread-tile > .thread-header-action {
-    position: absolute;
-    z-index: 1;
-    top: 6px;
-    height: 16px;
-    right: 10px;
-}
-
-/* R3/R4: the main tile's measurement line ends clear of the same slot. The identity
-   line reserves it via its own `max-width`, but that line is EMPTY for an exchange that
-   does not print the badge (a conversation continuation, a resumed child), and then the
-   measurement line is the first line — the one the control floats over. 92px is the
-   identity line's own reserve, so the clock/tally/state line clips inside the header
-   exactly like the badge does instead of painting under the button. */
 .tile.is-expanded .tile-top {
-    padding-right: 92px;
+    order: 1;
+    margin-left: auto;
 }
 
-/* T3/R2: the slot must be RESERVED, not merely painted. `.thread-select` is a flex row
-   and `.thread-preview` — its only shrinkable item — is `display:none` once the card is
-   expanded, so `.thread-top` (`order: 2; margin-left: auto`) slides flush to the row's
-   right edge: exactly the pixels `.thread-header-action` floats over (reviewer-measured
-   56x16px overlap at desktop width, 29x16px at a narrow one). The header gives up the
-   slot's width while the card is expanded, so the line ends INSIDE it: 84px covers the
-   ~66px desktop label button (and the ~34px phone glyph) plus the 10px right inset,
-   leaving clearance instead of overlap. R3 made the reserve matter MORE, not less: the
-   line now also carries the state word, and the line is allowed to shrink into it. A
-   collapsed card needs no reserve because ui/turns.ts keeps the host `hidden`. */
-.thread-tile.is-expanded > .thread-select {
-    padding-right: 84px;
+.tile.is-expanded .tile-meta {
+    order: 2;
+    flex: 1 0 100%;
 }
 
-/* The roster-only panel is a plain block (no absolute ancestor needed): the head is a
-   flex row, so Delete goes flush right with `margin-left: auto`. */
+/* The nested card's header was ALWAYS one row (`.thread-select` is a flex row whose
+   measurement line is `order: 2; margin-left: auto`), so the figures already read at the
+   right edge next to the conversation code — that is the anatomy this change asks the
+   main tile to match, and it needed nothing but the 84px Delete reservation removed. */
+
+/* The roster-only panel's head is a plain label row now (no control slot); the bar under
+   it carries Delete and Transcript exactly like a tile's. */
 .thread-focus-head {
     display: flex;
     align-items: center;
     flex-wrap: wrap;
     gap: 8px;
-}
-
-.thread-focus-head-action {
-    margin-left: auto;
 }
 
 .thread-focus-transcript {
@@ -2862,28 +2917,14 @@ button {
         --thread-indent: 10px;
     }
 
-    /* R8/T10: sm/mobile action bars show `{}` (Transcript) and `X` (Delete)
-       glyphs. aria-label still supplies the full accessible name. T1/R2: the glyph
-       swap also covers the header slots, where Delete now lives. */
-    :is(
-        .tile-transcript-action,
-        .thread-transcript-action,
-        .thread-focus-actions,
-        .tile-header-action,
-        .thread-header-action,
-        .thread-focus-head-action
-    ) .action-label {
+    /* R8/T10: sm/mobile action bars show `X` (Delete) and `{}` (Transcript)
+       glyphs. aria-label still supplies the full accessible name. T26: both actions live
+       in the bar again, so the glyph swap needs no header-slot variants. */
+    :is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions) .action-label {
         display: none;
     }
 
-    :is(
-        .tile-transcript-action,
-        .thread-transcript-action,
-        .thread-focus-actions,
-        .tile-header-action,
-        .thread-header-action,
-        .thread-focus-head-action
-    ) .action-glyph {
+    :is(.tile-transcript-action, .thread-transcript-action, .thread-focus-actions) .action-glyph {
         display: inline;
     }
 }
@@ -2953,7 +2994,8 @@ button {
 
 /* R5: the block footer is NOT a metadata line any more — the model / stop reason /
    token figures it used to print are measurements, and the block HEADERS already
-   carry theirs (`.tile-top`, `.thread-top`: `elapsed | tokens - state`). What the
+   carry theirs (`.tile-top`, `.thread-top`: `elapsed | tokens`, with the state word clipped
+   to screen-reader-only and the line colour carrying the state). What the
    end of an answer offers is one action: copy this block's final Markdown.
    Right-aligned, so the control reads as an affordance of the answer above it and
    the transcript's left column stays clean at every depth. */
@@ -3098,26 +3140,39 @@ button {
     font-variant-numeric: tabular-nums;
 }
 
-/* Reasoning: available, never shouting. Collapsed by default; the summary counts
-   characters so it is obvious the model said something. */
-.thinking {
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    background: #0c0f15;
+/* Reasoning ("think") ---------------------------------------------------
+   A streamed reasoning round is a CHIP in the agent's tool row (ui/tools.ts
+   `createReasoningCard`), not the full-width `<details>` bar that used to sit here.
+   `.think` borrows the whole `.tool` box (border, radius, surface, intrinsic width,
+   wrapping — declared below and selected with a HIGHER specificity than `.tool`, so the
+   cascade order does not matter) and changes only the register: AMBER. Thinking has no
+   pass/fail outcome, so the state glyph/colour vocabulary of a call does not apply; what
+   is worth seeing at a glance is how much of the conversation's context it is buying,
+   and `--warn` is already the app's "noteworthy / still working" tone. That keeps a
+   thinking-heavy run obvious without a new colour and without a second measurement line.
+   The pill (`.think-count`) is that share of the block's accumulated context and is
+   painted by the same pill rules as `.tool-duration` below; the whole text, the exact
+   character count and the estimate behind the percentage are in the dialog. */
+.tool.think {
+    border-color: rgba(251, 191, 36, 0.35);
 }
 
-.thinking-summary {
-    padding: 6px 10px;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 11px;
-    cursor: pointer;
+.think .think-count {
+    border-color: rgba(251, 191, 36, 0.4);
 }
 
+:is(.think .tool-name, .think .think-count) {
+    color: var(--warn);
+}
+
+/* The dialog body: available, never shouting. Plain text in its own scroll box, so one
+   long thinking dump cannot grow a page-level scrollbar on the transcript column
+   (layout-containment.test.ts pins `overflow: auto`). Inside the modal the flex chain
+   below replaces the 260px cap with the height the dialog actually has. */
 .reasoning {
     max-height: 260px;
     margin: 0;
-    padding: 0 10px 9px 10px;
+    padding: 7px 10px 9px 10px;
     overflow: auto;
     border-left: 2px solid var(--border-strong);
     color: var(--muted);
@@ -3143,10 +3198,14 @@ button {
     gap: 4px;
 }
 
-/* A chip is the positioning context for its OWN duration badge (R2). The badge is an
-   overlay in the top-right corner, so it must anchor to THIS box — not to the
-   `.tool-group` row, which is why the group is not the anchor. No `overflow: hidden`
-   anywhere on this box: an overlay that had to overhang would be clipped. */
+/* A chip is sized by its OWN content (R1): `flex: 0 1 auto` with no reserved corner and
+   no in-row spacer, so a settled call is exactly `[Search 1.3s]` wide — state
+   glyph, name, duration — and nothing else. `flex-shrink: 1` + `max-width: 100%` is the
+   only squeeze, and the name (`.tool-name`) is the item that gives way.
+   `position: relative` keeps the chip its own positioning context (the duration label
+   used to be an overlay anchored here; it now flows, and the anchor stays so a future
+   decoration cannot reparent onto the `.tool-group` row). No `overflow: hidden` anywhere
+   on this box: the chip has a rounded border and the pill must never be cut by it. */
 .tool {
     position: relative;
     flex: 0 1 auto;
@@ -3184,34 +3243,12 @@ button {
     list-style: none;
 }
 
-/* R2: the duration badge overlays this corner, so the chip reserves the corner's full
-   width and the tool name can never slide underneath the pill. The reservation is
-   FIXED (not measured per value), which is what keeps the row still: the live label
-   repaints every 250ms and a final server span replaces it, and a reservation that
-   tracked the text would reflow the name on every step.
-
-   The width is sized from real Chrome geometry on the production chip (the pill is
-   `12px` of border+padding + `5.95px` per tabular character at its 9.5px mono with
-   `0.04em` letter-spacing), for the longest LEGITIMATE span:
-     `formatDuration` (ui/time.ts) has no hours unit, so minutes keep growing:
-       5 chars `4m12s`     -> pill 41.8px, needs 52px   (the old 46px was short here)
-       6 chars `59m59s`    -> pill 47.7px, needs 58px
-       7 chars `600m00s`   -> 10h   pill 53.6px, needs 64px
-       8 chars `5999m00s`  -> 99.98h pill 59.6px, needs 70px   <-- reserved for this
-   `8ch` is the SUMMARY's own `ch` (measured 6.75px vs the pill's 5.95px), so the
-   character budget already carries ~13% of slack for a substituted mono font, and
-   `+22px` is the pill's 12px chrome + its 4px inset from the chip's outer edge + a
-   6px gap between the last name glyph and the pill. Total 76px >= the 70px need.
-   Anything past 99 hours (9 chars, a hung call) is outside the budget and may reach
-   the name's ellipsis — the pill paints on its own background, and it is never
-   clipped, never truncated, never hidden, and no duration is ever invented.
-
-   The reservation stays conditional on a badge actually being painted, so a call with
-   an unknown span keeps its tighter width and the row stays compact. `:has()` is the
-   if-exists check; the badge is `[hidden]` in exactly that case anyway. */
-.tool:has(.tool-duration:not([hidden])) > .tool-summary {
-    padding-right: calc(8ch + 22px);
-}
+/* R1: there is deliberately NO width reservation on the collapsed summary. The duration
+   label used to be an absolutely positioned corner pill, and the summary had to reserve
+   `calc(8ch + 22px)` (~76px) so the pill could never paint over the tool name. That
+   reservation is what stretched every chip far past its content — with the label in flow
+   (see `.tool-duration`) the chip's own content is the only width there is, and the
+   summary's `gap: 5px` is the whole separation between the name and the pill. */
 
 /* An opened card has room for the verbose summary line again. */
 .tool[open] > .tool-summary {
@@ -3219,26 +3256,18 @@ button {
     padding: 7px 10px;
 }
 
-.tool-summary::-webkit-details-marker {
-    display: none;
-}
-
-.tool-summary::before {
-    content: '▸';
-    color: var(--muted);
-    transition: transform 120ms ease;
-}
-
-.tool[open] > .tool-summary::before {
-    transform: rotate(90deg);
-}
+/* T26: no `::before` chevron here any more. The chip's whole affordance is its label plus
+   the dialog it opens (`aria-haspopup="dialog"`), and the base `summary` reset at the top
+   of this file already removes the native marker for every details element, including any
+   chip added later. The `transform`/`transition` that went with the rotating arrow left
+   with it. */
 
 .tool-summary:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: -2px;
 }
 
-/* Collapsed chip = disclosure arrow + tool name + duration badge. The state word
+/* Collapsed chip = tool name + duration badge. The state word
    and the argument preview are verbose metadata; they stay in the DOM (and in the
    accessible `aria-label` on the summary) but are hidden until expanded.
    The duration badge is deliberately NOT in this list: a completed call already
@@ -3314,32 +3343,33 @@ button {
     color: var(--muted);
 }
 
-/* R2: the measured span as a BADGE OVERLAY in the chip's top-right corner
-   (`✓ read` with `0.8s` floating over the corner). Absolutely positioned against
-   `.tool`, which is the whole point of the overlay:
-   - one badge per chip, because each card owns its own `.tool-duration`;
-   - out of flow, so the live label (which changes every 250ms) and the final server
-     span that replaces it can change the pill's width without moving the name, the
-     arrow, or a single neighbouring chip — the row cannot jitter;
-   - `top`/`right` INSIDE the border box, so the pill is never clipped: `.tool`,
-     `.tool-summary` and `.tool-group` set no `overflow`, and the chip keeps its
-     rounded corner (the pill has its own radius);
-   - `pointer-events: none`, so hovering or clicking the badge is still hovering and
-     clicking the chip's disclosure.
+/* R1: the measured span is an IN-FLOW label of the chip, right after the tool name
+   (`[Search 1.3s]`), not an overlay in the corner. Two things follow:
+   - the chip has no reserved space to fill, so its width is its content and a row of
+     chips packs tightly instead of leaving a wide gap after every name;
+   - the label participates in the flex row, so `flex: 0 0 auto` keeps the SPAN whole —
+     an ellipsised tool name is what gives way (`.tool-name` `max-width`), never a
+     duration that would then have to be read from the dialog.
+   Jitter, which is why this was an overlay before: the live label repaints every 250ms,
+   but `font-variant-numeric: tabular-nums` makes every same-LENGTH step (`0.8s` -> `1.3s`,
+   `9.8s` -> `9.9s`) pixel-identical, so the chip only re-measures when the label gains a
+   character (`9.9s` -> `10.0s`, `59.9s` -> `1m00s`). That is a step of a few px a
+   handful of times per call, against a permanent ~76px of dead space per chip — the
+   compact chip is the surface a reader scans, so the width wins.
+   `pointer-events`/`z-index`/`top`/`right` are gone with the overlay: the pill sits in the
+   summary, so activating it IS activating the chip's disclosure.
    Same pill vocabulary as `.thread-kind` / `.tile-thread` (1px `--border-strong`,
-   999px radius, mono, tabular figures), so no component library and no new
-   dependency. The text is already seconds with one decimal (`0.8s`), from
-   ui/tools.ts `formatToolDuration`; the old `·` separator is gone because the border
-   is the separator. The chip reserves this corner's width (see the `:has()` rule
-   above), so the badge never covers the tool name. */
-.tool-duration {
-    position: absolute;
-    z-index: 1;
-    top: 2px;
-    right: 3px;
+   999px radius, mono, tabular figures), so no component library and no new dependency.
+   The text is already seconds with one decimal (`0.8s`), from ui/tools.ts
+   `formatToolDuration`; there is no `·` separator because the summary's flex gap is the
+   separation.
+   T26: `.think-count` shares this box because a think chip's figure is the SAME kind of
+   measurement in the SAME position — one short, tabular, intrinsic-width pill after the
+   name (`think 0.4%`). Only the colour differs (see `.think` below). */
+:is(.tool-duration, .think-count) {
     display: inline-flex;
     align-items: center;
-    max-width: calc(100% - 6px);
+    flex: 0 0 auto;
     padding: 0 5px;
     border: 1px solid var(--border-strong);
     border-radius: 999px;
@@ -3349,25 +3379,25 @@ button {
     font-size: 9.5px;
     line-height: 1.5;
     letter-spacing: 0.04em;
-    pointer-events: none;
-    /* The live label changes every 250ms; tabular figures keep the pill's width
-       steady between `0.9s` and `1.0s`, so even the overlay does not twitch. */
+    /* The live label changes every 250ms; tabular figures keep the pill's width steady
+       between `0.9s` and `1.0s`, so the chip does not twitch while it ticks. */
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
 }
 
-/* `[hidden]` is the ONLY suppression path, and it must beat the badge's own
-   `display` above — otherwise an unknown span (a legacy record with no
-   `eventTimes`, or a call that never returned) would paint an empty pill.
-   ui/tools.ts sets `duration.hidden` for exactly those cases; 0ms is a REAL span
-   and renders `0.0s`. */
-.tool-duration[hidden] {
+/* `[hidden]` is the ONLY suppression path, and it must beat the label's own `display`
+   above — otherwise an unknown span (a legacy record with no `eventTimes`, or a call
+   that never returned) would paint an empty pill AND take up its slot in the chip.
+   ui/tools.ts sets `duration.hidden` for exactly those cases; 0ms is a REAL span and
+   renders `0.0s`. T26: the same rule covers a think chip whose context denominator is
+   still unknown — no honest share, no pill (never `0%`). */
+:is(.tool-duration, .think-count)[hidden] {
     display: none;
 }
 
-/* The badge takes the call's state colour, like the name and the glyph already do,
-   so the collapsed row stays scannable. Running keeps the neutral border/muted
-   text above; a cancelled call stays muted (it is history, not a failure). */
+/* The label takes the call's state colour, like the name and the glyph already do, so
+   the collapsed row stays scannable. Running keeps the neutral border/muted text above;
+   a cancelled call stays muted (it is history, not a failure). */
 .tool[data-state='ok'] .tool-duration {
     border-color: rgba(74, 222, 128, 0.4);
     color: var(--ok);
@@ -3475,6 +3505,59 @@ button {
     white-space: nowrap;
 }
 
+/* R8: the runner's named preset buttons. They sit in ONE row directly above the payload
+   field, because the button's whole job is to write into the textarea below: the label
+   of the group is `Presets`, each button names its payload, and pressing one fills the
+   fully editable box without sending anything. */
+.tool-presets {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+}
+
+.tool-preset-buttons {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+/* A preset is a compact chip, not a primary action: the call button underneath stays the
+   one obvious press. The pressed state says which payload the box currently holds. */
+.tool-preset {
+    padding: 3px 8px;
+    border: 1px solid var(--border-strong);
+    border-radius: 999px;
+    background: var(--bg-elevated);
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.4;
+    cursor: pointer;
+    transition: border-color 120ms ease, background 120ms ease, color 120ms ease;
+}
+
+.tool-preset:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
+.tool-preset:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.tool-preset[aria-pressed='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
+}
+
+.tool-preset:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
 .tool-pending {
     margin: 0;
     color: var(--muted);
@@ -3563,6 +3646,17 @@ button {
 }
 
 .dialog-body > .tool-body > .tool-section:last-child > .tool-result > .code-block {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
+}
+
+/* T26: a think chip's dialog has ONE pane, so the section is both `:first-child` and
+   `:last-child` — the rules above already give it `flex: 1 1 auto` and the readable
+   floor, and its payload is `.reasoning` instead of `.tool-result > .code-block`. Same
+   fill-and-scroll contract: the dialog owns the height, the text box scrolls its own
+   overflow, and the card's 260px cap does not follow the node into the modal. */
+.dialog-body > .tool-body > .tool-section > .reasoning {
     flex: 1 1 auto;
     min-height: 0;
     max-height: none;
@@ -5198,6 +5292,30 @@ button {
 /* T1/R1: the `.session-confirm*` rules are GONE with the inline confirmation panel —
    one click on `.session-delete` deletes, so the rail has no second row to style. */
 
+/* R6: sessions of a harness that was DELETED. The server keeps the record (a harness
+   delete never cascades), so the rail keeps a separate, labelled group for them instead
+   of letting them vanish behind a harness row that no longer exists. The rows themselves
+   are ordinary `.session-row` entries — same open and delete paths — and this block only
+   separates and captions the group. */
+.session-archived {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+}
+
+.session-archived[hidden] {
+    display: none;
+}
+
+.session-archived-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
 /* R8: each line of the entry clips with an ellipsis rather than pushing the grid
    column wider (a long harness name or id would otherwise break the rail width). */
 .session-harness {
@@ -5287,10 +5405,15 @@ button {
         color: var(--text);
     }
 
-    /* The drawer owns a visible close control; Escape and the backdrop remain the
-       keyboard and pointer dismiss paths (main.ts). */
-    .rail-close {
-        display: inline-flex;
+    /* R4: the drawer's heading is its own toggle (the `×` control is gone). Escape and
+       the backdrop remain the keyboard and pointer dismiss paths (main.ts), and the
+       heading is where focus lands when the drawer opens. */
+    .rail-title-toggle {
+        cursor: pointer;
+    }
+
+    .rail-title-toggle:hover {
+        color: var(--text);
     }
 
     /* Collapsed by default: no `data-rail-open` means neither rail is shown (they
@@ -5492,7 +5615,6 @@ button {
     }
 
     .tile,
-    .tool-summary::before,
     .endpoint-summary::before,
     .harness-item {
         transition: none;
@@ -5747,12 +5869,18 @@ button {
    slot as the nested block's `.thread-name`: identity first, then the prompt, then
    the right-aligned measurements. `order: 0` is what places it before the flexible
    prompt in the compact row even though the DOM also carries `.tile-top`. The full
-   id stays in `title`/`data-thread-id`. */
+   id stays in `title`/`data-thread-id`.
+   T2 (identifier sizing): the badge is sized by its CONTENT, not by a share of the row.
+   `max-width: 40%` + `overflow: hidden` clipped `IT1`/`IT2`/`IT3` to `I…`: that percentage
+   resolved against `.tile-identity`, a shrinkable flex item, so the cap tightened exactly
+   when the column got narrow. `flex: 0 0 auto` with no cap makes the pill intrinsic
+   (`white-space: nowrap` keeps the label on one line), and the item that truncates instead
+   is the prompt. The label allocator (ui/turns.ts) produces short codes, so the pill can
+   only outgrow the card if a future label is long — and `.tile-identity`'s own `max-width`
+   reserve still stops it short of the header Delete control. */
 .tile-thread {
     order: 0;
     flex: 0 0 auto;
-    max-width: 40%;
-    overflow: hidden;
     padding: 0 5px;
     border: 1px solid var(--border-strong);
     border-radius: 999px;
@@ -5760,7 +5888,6 @@ button {
     font-size: 10px;
     line-height: 1.5;
     letter-spacing: 0.04em;
-    text-overflow: ellipsis;
     white-space: nowrap;
 }
 

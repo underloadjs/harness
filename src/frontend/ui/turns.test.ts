@@ -3,6 +3,16 @@
 // newest tile open, older tiles compact, expansion never destroyed by stream
 // deltas, and every event routed to the agent that emitted it.
 //
+// REASONING is an inline CHIP, not a block: one `details.tool.think` per model
+// REQUEST, appended INTO the agent's `.tool-group` row (ui/turns.ts
+// `appendReasoning` + ui/tools.ts `createReasoningCard`), so `[read][think][search]`
+// is ONE wrapping row. Because the chip IS a `details.tool`, every TOOL-CALL
+// assertion here selects `details.tool:not(.think)` and every REASONING assertion
+// selects `.tool.think` / `.think .tool-name` / `.think .reasoning`. Its pill
+// (`.think-count`) is a SHARE of the block's accumulated context — the figure the
+// header tally prints (`BlockMeta.context()`), repainted on every `usage` event —
+// never a character count; see the `inline reasoning chips (think)` section below.
+//
 // Run: npx vitest run --config src/frontend/vitest.config.ts
 import type { HarnessAssistantMessage, HarnessEvent, SessionTurn } from '../../server/protocol';
 import { createTurnBoard } from './turns';
@@ -1079,8 +1089,9 @@ describe('elapsed timing', () => {
 
     // Consecutive calls must read as one compact row. jsdom cannot compute the
     // flex layout, so the DOM contract is the group boundary: calls between two
-    // prose/reasoning blocks share one `.tool-group`, and every card stays a
-    // direct child of that group (never a direct child of `.agent-flow`).
+    // prose blocks share one `.tool-group`, and every card stays a direct child of
+    // that group (never a direct child of `.agent-flow`). A reasoning round joins the
+    // same group as an inline `think` chip instead of breaking the row.
     it('puts consecutive tool calls in one wrapping group', () => {
         const { board } = mount();
         const turn = board.begin('two calls');
@@ -1136,9 +1147,22 @@ describe('elapsed timing', () => {
             })
         ]);
 
+        // R1/the think chip: a recorded reasoning round joins the row instead of
+        // breaking it, so the whole batch replays as ONE row — three call chips plus the
+        // chip for that request's thinking, in event order.
         const groups = [...turn.element.querySelectorAll('.agent-flow > .tool-group')];
-        expect(groups.map((group) => group.querySelectorAll('details.tool').length)).toEqual([2, 1]);
-        expect(groups[1].querySelector('.tool-name')?.textContent).toBe('read');
+        expect(groups).toHaveLength(1);
+        expect(groups[0].querySelectorAll('details.tool').length).toBe(4);
+        expect([...groups[0].querySelectorAll('.tool-name')].map((node) => node.textContent)).toEqual([
+            'websearch',
+            'websearch',
+            'think',
+            'read'
+        ]);
+        // The call tally excludes the chip, and the round's text is inside the chip.
+        expect(groups[0].querySelectorAll('details.tool:not(.think)').length).toBe(3);
+        expect(turn.element.querySelectorAll('.agent-flow > .thinking')).toHaveLength(0);
+        expect(turn.element.querySelector('.tool.think .reasoning')?.textContent).toBe('thinking');
     });
 });
 
@@ -1179,9 +1203,11 @@ describe('token tally', () => {
     });
 
     // The MEASUREMENT spans, in DOM order: `tile-tokens` follows the elapsed label, and
-    // R3 puts the state word LAST (`2.8s | 8,946 - done`) — the state measures this block,
-    // it is not part of the conversation's identity. The persistent-thread badge stays
-    // identity (`.tile-identity`, asserted below and in turns-threads.test.ts).
+    // R3 puts the state box LAST — the state measures this block, it is not part of the
+    // conversation's identity. T2 clips that box's word to screen-reader-only, so the
+    // VISIBLE line is `34.2s | 18,654 (37,376)`; the text node stays for assistive tech
+    // and the line's colour is the state. The persistent-thread badge stays identity
+    // (`.tile-identity`, asserted below and in turns-threads.test.ts).
     const topClasses = (turn: { element: HTMLElement }): (string | null)[] =>
         [...(turn.element.querySelector('.tile-top')?.children ?? [])].map((child) => child.className);
 
@@ -1789,8 +1815,10 @@ describe('background tools (R6)', () => {
 // ---------------------------------------------------------------------------
 //
 // A run of tool calls is ONE wrapping flow unless something the reader can
-// actually SEE separates it (prose, reasoning, an error, a retry notice, a
-// steer). `attempt_commit`, `done` and `wakeup` are scheduler frames: they add
+// actually SEE separates it (prose, an error, a retry notice, a steer). A
+// reasoning round is no longer one of those separators: it is an inline `think`
+// CHIP that joins the same row, so `[read][think][search]` stays one line.
+// `attempt_commit`, `done` and `wakeup` are scheduler frames: they add
 // no readable output between two calls, so they must not split four consecutive
 // calls into two rows of two. jsdom cannot compute the flex layout, so the DOM
 // boundary IS the contract: one `.tool-group` child of `.agent-flow` holding
@@ -1915,7 +1943,10 @@ describe('tool grouping across model batches (R1)', () => {
         expect(flowClasses(turn)).toEqual(['tool-group', 'markdown agent-text', 'tool-group']);
     });
 
-    it('splits the row when reasoning separates the batches', () => {
+    // R1/the think chip: reasoning is an INLINE chip now, so it no longer counts as a
+    // readable block between two batches — `[read][think][search]` is ONE row, and the
+    // round's text lives inside the chip (`.tool.think .reasoning`).
+    it('keeps the row and puts reasoning in it as an inline think chip', () => {
         const { board } = mount();
         const turn = board.begin('reasoning between batches');
 
@@ -1925,8 +1956,24 @@ describe('tool grouping across model batches (R1)', () => {
         turn.apply({ type: 'reasoning', agent: 'writer', delta: 'checking' });
         turn.apply(call('c2', 'search'));
 
-        expect(rows(turn)).toEqual([['read'], ['search']]);
-        expect(flowClasses(turn)).toEqual(['tool-group', 'thinking', 'tool-group']);
+        expect(rows(turn)).toEqual([['read', 'think', 'search']]);
+        expect(flowClasses(turn)).toEqual(['tool-group']);
+        // Nothing of the old full-width block survives: no `.thinking`, and no chip
+        // that escaped the row into the flow column.
+        expect(turn.element.querySelectorAll('.agent-flow > details.tool')).toHaveLength(0);
+        expect(turn.element.querySelectorAll('.thinking, .thinking-summary')).toHaveLength(0);
+        // The chip is a `details.tool`, so a CALL count has to exclude it: three chips
+        // in the row, two of them calls.
+        expect(turn.element.querySelectorAll('details.tool')).toHaveLength(3);
+        expect(turn.element.querySelectorAll('details.tool:not(.think)')).toHaveLength(2);
+        // The chip's own anatomy (ui/tools.ts `createReasoningCard`): amber label plus
+        // the round's text in its dialog body.
+        const chip = turn.element.querySelector<HTMLElement>('details.tool.think');
+        expect(chip?.className).toBe('tool think');
+        expect(chip?.querySelector('.tool-name')?.textContent).toBe('think');
+        expect(chip?.querySelector('.reasoning')?.textContent).toBe('checking');
+        // A reasoning round is not a tool call, so it never enters the call tally.
+        expect(turn.element.querySelector('.tile-meta')?.textContent).toBe('1 agent · 2 tool calls');
     });
 
     it('replays a batched recording into one row without duplicate chips', () => {
@@ -2229,5 +2276,238 @@ describe('final answer copy action (R5)', () => {
         expect(turn.element.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(false);
         expect(turn.element.querySelector('.tile-status-text')?.textContent).toBe('streaming');
         expect(turn.element.querySelector('.agent')?.getAttribute('data-model')).toBe('m1');
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Inline reasoning chips ("think")
+// ---------------------------------------------------------------------------
+//
+// A streamed `reasoning` round is NOT a full-width block any more: `appendReasoning`
+// (ui/turns.ts) mints ONE chip per model REQUEST and appends it INTO the agent's
+// `.tool-group` row (it does NOT call `closeToolGroup`), using the tool chip's anatomy
+// (ui/tools.ts `createReasoningCard`). So a round between two calls reads
+// `[read][think][search]` as ONE wrapping row instead of splitting it.
+//
+// The chip is a `details.tool`, which is why every CALL assertion in this file selects
+// `details.tool:not(.think)` and every REASONING assertion selects `.tool.think`
+// (`.think .tool-name` for the label, `.think .reasoning` for the whole round).
+//
+// The pill (`.think-count`) is the share of the block's accumulated CONTEXT the round
+// occupies, never a character count. The denominator is `BlockMeta.context()`
+// (`latestInput ?? tally.input`) — the same figure the header `.tile-tokens` prints —
+// so:
+//   - no usage reported anywhere -> the pill is `[hidden]` and its text is ''
+//     (never a fabricated `0%` or a dash);
+//   - a `usage` event, or the server tally via `setUsage`, advances that figure ->
+//     `syncThinkingShares` repaints EVERY chip of the tile against the new denominator,
+//     so a pill can never disagree with the header two lines above it;
+//   - the text is `ceil(chars / 4)` tokens over that context: `<0.1%` strictly below a
+//     tenth of a percent, one decimal below 10%, whole percent from 10% up
+//     (`formatThinkShare`, ui/tools.ts).
+describe('inline reasoning chips (think)', () => {
+    const start = (): HarnessEvent => ({ type: 'start', agent: 'writer', model: 'm1' });
+
+    const reasoning = (delta: string): HarnessEvent => ({ type: 'reasoning', agent: 'writer', delta });
+
+    // One request's reported usage: `input` IS the context figure a pill divides by.
+    const usage = (input: number): HarnessEvent => ({
+        type: 'usage',
+        agent: 'writer',
+        usage: { input, output: 0, total: input }
+    });
+
+    // The success boundary of one model request. It drops the reasoning WRITER pointer
+    // only (T8), so the next request mints its own chip.
+    const commit = (): HarnessEvent => ({
+        type: 'attempt_commit',
+        agent: 'writer',
+        attempt: 1,
+        maxAttempts: 11
+    });
+
+    // The think chips of one block, in DOM order.
+    const chips = (turn: { element: HTMLElement }): HTMLDetailsElement[] =>
+        [...turn.element.querySelectorAll<HTMLDetailsElement>('details.tool.think')];
+
+    // Each chip's cumulative round text, as the dialog body holds it.
+    const thinkingTexts = (turn: { element: HTMLElement }): string[] =>
+        chips(turn).map((chip) => chip.querySelector('.reasoning')?.textContent ?? '');
+
+    // Each chip's pill text, and whether that pill is hidden.
+    const pills = (turn: { element: HTMLElement }): string[] =>
+        chips(turn).map((chip) => chip.querySelector('.think-count')?.textContent ?? '');
+
+    const pillsHidden = (turn: { element: HTMLElement }): boolean[] =>
+        chips(turn).map((chip) => chip.querySelector<HTMLElement>('.think-count')?.hidden === true);
+
+    // (b) ONE chip per request, never one chip per round of deltas, and never one chip
+    // shared by two requests.
+    it('mints one chip per request and never fuses two rounds into it', () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        // Request 1 streams in two deltas: the first mints the chip, the second repaints
+        // it with the CUMULATIVE buffer (plain text, no parse).
+        turn.apply(reasoning('plan the '));
+        turn.apply(reasoning('read'));
+        turn.apply(commit());
+        // Request 2 reasons after the commit, so it gets a chip of its own.
+        turn.apply(reasoning('plan the search'));
+        turn.flush();
+
+        expect(chips(turn)).toHaveLength(2);
+        expect(chips(turn).map((chip) => chip.querySelector('.tool-name')?.textContent)).toEqual([
+            'think',
+            'think'
+        ]);
+        expect(thinkingTexts(turn)).toEqual(['plan the read', 'plan the search']);
+        // Both chips are in the ONE row this block's calls would share: no flow-level
+        // block sits between them, and a thinking round is not a tool call.
+        const rows = [...turn.element.querySelectorAll('.agent-flow > .tool-group')];
+        expect(rows).toHaveLength(1);
+        expect([...rows[0].children].map((child) => child.className)).toEqual([
+            'tool think',
+            'tool think'
+        ]);
+        expect(turn.element.querySelectorAll('details.tool:not(.think)')).toHaveLength(0);
+        expect(turn.element.querySelector('.tile-meta')?.textContent).toBe('1 agent');
+    });
+
+    // Plain text, never Markdown: scratch space can contain markup and it must survive
+    // byte-for-byte (no HTML parse of its own, no sanitizer round-trip).
+    it('keeps the round verbatim instead of parsing it as Markdown', () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(reasoning('# not **markdown** <script>'));
+        turn.flush();
+
+        const text = '# not **markdown** <script>';
+        expect(thinkingTexts(turn)).toEqual([text]);
+        expect(chips(turn)[0].querySelector('.reasoning')?.innerHTML).toBe(
+            '# not **markdown** &lt;script&gt;'
+        );
+    });
+
+    // (d) half 1: with no denominator there is no percentage. The pill claims nothing
+    // rather than `0%`, exactly like a tool chip with no honest span.
+    it('hides the pill while the block has no context figure', () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(reasoning('a provider that reports no usage'));
+        turn.flush();
+
+        expect(pills(turn)).toEqual(['']);
+        expect(pillsHidden(turn)).toEqual([true]);
+        // The header agrees: it prints no tally either.
+        expect(turn.element.querySelector<HTMLElement>('.tile-tokens')?.hidden).toBe(true);
+        expect(turn.tokens()).toBe('');
+    });
+
+    // (d) half 2 + the hover arithmetic. Every figure below is derived from
+    // `formatThinkShare`'s contract, not read off a run.
+    it('paints the share of the block context a round occupies', () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        // 387 chars -> `ceil(387 / 4)` = 97 tokens; 97 / 42,212 = 0.2297% -> one decimal.
+        turn.apply(start());
+        turn.apply(reasoning('x'.repeat(387)));
+        expect(pills(turn)).toEqual(['']);
+
+        turn.apply(usage(42_212));
+        expect(pills(turn)).toEqual(['0.2%']);
+        expect(pillsHidden(turn)).toEqual([false]);
+
+        // Request 2: 12,108 chars -> 3,027 tokens over the SAME 42,212 context =
+        // 7.1709% -> `7.2%`. The pill is three or four characters; the exact counts stay
+        // on hover, grouped with the pinned `en-US` locale.
+        turn.apply(commit());
+        turn.apply(reasoning('y'.repeat(12_108)));
+        expect(pills(turn)).toEqual(['0.2%', '7.2%']);
+
+        const second = chips(turn)[1];
+        expect(second.querySelector('.tool-name')?.textContent).toBe('think');
+        expect(second.querySelector('.think-count')?.textContent).toBe('7.2%');
+        expect(second.querySelector('summary')?.getAttribute('aria-haspopup')).toBe('dialog');
+        expect(second.querySelector('summary')?.getAttribute('aria-label')).toBe(
+            'think: 7.2% of the context so far'
+        );
+        expect(second.querySelector('summary')?.title).toBe(
+            '≈ 3,027 of 42,212 context tokens (7.2%)'
+        );
+        expect(second.querySelector('.reasoning')?.textContent).toBe('y'.repeat(12_108));
+    });
+
+    // (e) the denominator is the block's FRESHEST context, so a later `usage` event
+    // re-measures every chip of the tile — not just the newest one.
+    it('repaints every chip when a later usage event advances the context', () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(reasoning('x'.repeat(387)));
+        turn.apply(usage(42_212));
+        turn.apply(commit());
+        turn.apply(reasoning('y'.repeat(12_108)));
+        expect(pills(turn)).toEqual(['0.2%', '7.2%']);
+
+        // The context moves to 358,448: 97 tokens is now a fraction of a tenth of a
+        // percent (`<0.1%`, never `0.0%`) and 3,027 tokens is 0.8444% -> `0.8%`.
+        turn.apply(usage(358_448));
+        expect(pills(turn)).toEqual(['<0.1%', '0.8%']);
+        // The header prints the same figure the pills divided by.
+        expect(turn.tokens()).toBe('358,448');
+    });
+
+    // A record whose usage EVENTS were trimmed still has the server's cumulative tally,
+    // and `context()` falls back to it — so `setUsage` is a real denominator too.
+    it('measures against the server tally when no usage event was recorded', () => {
+        const { board } = mount();
+        const turn = board.begin('ask');
+
+        turn.apply(start());
+        turn.apply(reasoning('x'.repeat(400_000)));
+        expect(pills(turn)).toEqual(['']);
+
+        // 400,000 chars = 100,000 tokens over a 1,000,000 context: exactly 10%, which
+        // leaves the one-decimal range and rounds to a whole percent.
+        turn.setUsage({ input: 1_000_000, output: 0, total: 1_000_000 });
+        expect(pills(turn)).toEqual(['10%']);
+        expect(pillsHidden(turn)).toEqual([false]);
+    });
+
+    // The three rounding branches of `formatThinkShare`, each hand-computed.
+    it('rounds a share at each branch boundary', () => {
+        const { board } = mount();
+
+        // `0.1%` EXACTLY: the `<` branch is strictly below a tenth of a percent, so the
+        // boundary value itself keeps its decimal.
+        const exact = board.begin('exact tenth');
+        exact.apply(start());
+        exact.apply(reasoning('abc'));
+        exact.apply(usage(1_000));
+        expect(pills(exact)).toEqual(['0.1%']);
+
+        // 200 chars = 50 tokens over 100,000 = 0.05%: a real share below a tenth reads
+        // `<0.1%`, because `0.0%` would claim the model never thought at all.
+        const tiny = board.begin('sub tenth');
+        tiny.apply(start());
+        tiny.apply(reasoning('x'.repeat(200)));
+        tiny.apply(usage(100_000));
+        expect(pills(tiny)).toEqual(['<0.1%']);
+
+        // 40 chars = 10 tokens over 100 = exactly 10%: the first value that drops the
+        // decimal, so the pill never twitches one while a round streams.
+        const whole = board.begin('whole percent');
+        whole.apply(start());
+        whole.apply(reasoning('x'.repeat(40)));
+        whole.apply(usage(100));
+        expect(pills(whole)).toEqual(['10%']);
     });
 });

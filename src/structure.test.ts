@@ -489,7 +489,20 @@ describe('import safety', () => {
         expect(typeof root.createHarnessRuntime).toBe('function');
         expect(typeof root.createHarnessServiceHandler).toBe('function');
         expect(typeof root.SessionStore).toBe('function');
+        // T5: the published catalogue is exactly the real production
+        // configurations. The scripted demo and the failure example are still
+        // exported (FIXTURE_PRESETS / ALL_PRESET_TEMPLATES) so a host can inject
+        // them and an older session can still be rebuilt, but the shipped list a UI
+        // or CLI offers must not contain them.
         expect(root.presets.map((preset) => preset.name)).toEqual([
+            'instruct',
+            'research',
+            'workspace',
+            'reviewer',
+            'planner'
+        ]);
+        expect(root.FIXTURE_PRESETS.map((preset) => preset.name)).toEqual(['demo', 'flaky']);
+        expect(root.ALL_PRESET_TEMPLATES.map((preset) => preset.name)).toEqual([
             'instruct',
             'research',
             'workspace',

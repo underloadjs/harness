@@ -15,7 +15,11 @@ export const ACTION_REQUEST_METADATA: CoreToolMetadata = {
     description:
         'Ask the owner a bounded question when the request is genuinely ambiguous and guessing would be unsafe or wasteful. Supply ONE question, 2-8 distinct options (each an id plus a short label and optional description), and `recommended` set to the id of the option you suggest. The owner may still answer with free text, so never assume your recommendation was accepted; the tool result tells you exactly which answer was chosen. Ask at most one focused question at a time, and never use this for a decision you can make safely yourself.',
     tags: ['question', 'ask', 'clarify', 'owner', 'user', 'choice', 'interaction'],
-    visibility: 'core',
+    // R9-R11 demand discovery: searchable, so the model finds it through toolRequest
+    // and enables it for this session instead of seeing it declared on every request.
+    // Registration itself is unchanged (the entry still joins the harness registry),
+    // so toolRequest always has something to surface.
+    visibility: 'searchable',
     parameters: {
         type: 'object',
         properties: {

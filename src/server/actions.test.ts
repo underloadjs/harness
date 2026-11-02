@@ -164,11 +164,11 @@ describe('SessionStore owner interaction', () => {
         const withInteraction = createToolboxHarness({ agents, primary: 'worker' }, DEFAULTS, () => undefined, {
             interaction: { actionRequest: handler }
         });
-        expect(withInteraction.tools.actionRequest.visibility).toBe('core');
+        expect(withInteraction.tools.actionRequest.visibility).toBe('searchable');
         expect(withInteraction.tools.actionRequest.name).toBe('actionRequest');
 
         // Forks are on by default (N6), so threadFork is declared either way.
-        expect(withInteraction.tools.threadFork.visibility).toBe('core');
+        expect(withInteraction.tools.threadFork.visibility).toBe('searchable');
 
         // No interaction report -> the runtime does not register actionRequest.
         const withoutInteraction = createToolboxHarness({ agents, primary: 'worker' }, DEFAULTS, () => undefined);

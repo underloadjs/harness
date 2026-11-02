@@ -11,9 +11,9 @@
 //                  MAX_DISCOVERY_MATCHES is its five-match cap, not toolRequest's.
 //   createDynamicTool() — validate + compile a tool from an async function body.
 //                  The primitive behind the harness's toolCreate tool.
-//   createTodoTool() — the harness's per-session todoManage state, as a factory.
+//   createTaskTool() — the harness's per-session task list, as a factory.
 //                  State stays in the closure so a harness (and nothing global)
-//                  owns it. See ../core/todo.ts.
+//                  owns it. See ../core/task.ts.
 //   createProfileTool()/createChapterTool()/createLocationTool() — the same
 //                  factory pattern for the session record tools (profiles,
 //                  chapters, locations). See ../core/profile.ts, chapter.ts,
@@ -126,12 +126,12 @@ export {
     validateSchemaValue
 } from './schema-validation';
 export type { SchemaCheck, ToolArgumentMode } from './schema-validation';
-export { createTodoTool } from './todo';
+export { createTaskTool } from './task';
 export { createProfileTool } from './profile';
 export { createChapterTool } from './chapter';
 export { createLocationTool } from './location';
 // R3a persistence: schema/version + the pure snapshot reader. The store readers
-// live in their own modules (todo/profile/chapter/location) because each owns its
+// live in their own modules (task/profile/chapter/location) because each owns its
 // invariants; harness.ts is the only caller of the harness-wide reader.
 export {
     HARNESS_SNAPSHOT_VERSION,
@@ -146,6 +146,11 @@ export {
     toolUiOf
 } from './tool-ui';
 export type { ToolUiExtraction } from './tool-ui';
+// Tool media (the `download` hand-off): the branded byte envelope, its unwrap,
+// the event-safe descriptor projection, and the BOTH-brand unwrapper the
+// harness and the manual API path share. Profiles live in ../shared/attachments.
+export { toolMedia, toolMediaDescriptors, toolMediaOf, unwrapToolResult } from './tool-media';
+export type { ToolMediaExtraction, ToolResultExtraction } from './tool-media';
 // Background tool scheduling (T3): one board per harness. Internal to the
 // package surface (the harness is the only owner), exported here so the harness
 // module and focused tests share one implementation.
@@ -190,8 +195,8 @@ export {
     THREAD_SEND_NAME,
     TOOL_REQUEST_METADATA,
     TOOL_REQUEST_NAME,
-    TODO_MANAGE_METADATA,
-    TODO_MANAGE_NAME,
+    TASK_METADATA,
+    TASK_NAME,
     PROFILE_MANAGE_METADATA,
     PROFILE_MANAGE_NAME,
     CHAPTER_MANAGE_METADATA,

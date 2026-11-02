@@ -59,7 +59,7 @@
 
 import { HarnessError, toErrorInfo } from '../util';
 import { openAICompatible } from '../transport';
-import { validateAttachments } from '../shared/attachments';
+import { DOWNLOAD_ATTACHMENT_LIMITS, validateAttachments } from '../shared/attachments';
 import {
     agentBranchOf,
     assertForkDepth,
@@ -120,6 +120,12 @@ const resolveStream = (configuration: AgentConfiguration): HarnessStream => {
 // reset repeatedly, so the baseline is cloned on EVERY seed rather than handed
 // out as a shared array. Attachments are re-validated by the shared gate (which
 // also returns detached copies); tool calls are copied one by one.
+//
+// TOOL media uses the SAME rule with the DOWNLOAD profile: a branch that shares
+// the source's attachment ARRAY would let a later mutation of one transcript
+// reach the other. The attachment objects are copied shallowly on purpose —
+// `data` is an immutable string, so detaching costs a pointer rather than a
+// second 20 MiB allocation.
 const copyBaselineMessage = (message: HarnessMessage): HarnessMessage => {
     switch (message.role) {
         case 'user':
@@ -130,6 +136,20 @@ const copyBaselineMessage = (message: HarnessMessage): HarnessMessage => {
                       attachments: validateAttachments(message.attachments)
                   }
                 : { role: 'user', content: message.content };
+
+        case 'tool':
+            return message.attachments !== undefined
+                ? {
+                      role: 'tool',
+                      content: message.content,
+                      toolCallId: message.toolCallId,
+                      name: message.name,
+                      // Re-validated with the profile the bytes were produced
+                      // under, so a corrupted tool message cannot survive a
+                      // fork/reset boundary quietly.
+                      attachments: validateAttachments(message.attachments, DOWNLOAD_ATTACHMENT_LIMITS)
+                  }
+                : { role: 'tool', content: message.content, toolCallId: message.toolCallId, name: message.name };
 
         case 'assistant':
             return {
@@ -333,6 +353,18 @@ const createAgent = (
                 continue;
             }
 
+            // A seeded TOOL message may carry download media. Same rule as the
+            // user branch above, with the download profile: validate and detach
+            // before the live array is replaced, so a bad seed fails construction
+            // and history never aliases the caller's objects.
+            if (message.role === 'tool' && message.attachments !== undefined) {
+                next.push({
+                    ...message,
+                    attachments: validateAttachments(message.attachments, DOWNLOAD_ATTACHMENT_LIMITS)
+                });
+                continue;
+            }
+
             next.push({ ...message });
         }
 
@@ -411,15 +443,27 @@ const createAgent = (
         const source = options?.transcript ?? messages;
         // Copy the transcript shallowly, and COPY an attachment array so the
         // transport never receives a live array it could mutate (the same rule
-        // that governs the message list itself).
-        const transcript = source.map((message) =>
-            message.role === 'user' && message.attachments !== undefined
-                ? {
-                      ...message,
-                      attachments: message.attachments.map((attachment) => ({ ...attachment }))
-                  }
-                : { ...message }
-        );
+        // that governs the message list itself). Both attachment-carrying roles
+        // are detached: a user's composer upload AND a tool message's download
+        // media. The attachment objects are copied, not their `data` strings, so
+        // a 20 MiB file costs a pointer per request rather than a re-allocation.
+        const transcript = source.map((message) => {
+            if (message.role === 'user' && message.attachments !== undefined) {
+                return {
+                    ...message,
+                    attachments: message.attachments.map((attachment) => ({ ...attachment }))
+                };
+            }
+
+            if (message.role === 'tool' && message.attachments !== undefined) {
+                return {
+                    ...message,
+                    attachments: message.attachments.map((attachment) => ({ ...attachment }))
+                };
+            }
+
+            return { ...message };
+        });
 
         // One attempt. Its accumulators are local, so a throw discards them.
         //
