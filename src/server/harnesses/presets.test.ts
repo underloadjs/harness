@@ -15,6 +15,10 @@
 //     coder/reviewer targets exist by id;
 //   - the profiles' delegation wording is conditional and one level deep: a subagent
 //     is never asked to delegate again;
+//   - every profile-built agent is seeded with exactly ONE system message: the
+//     identity sentence and the guidelines joined into a single prompt by
+//     `agentInstruction()` (../../agents/index.ts), because two seeded `system`
+//     messages lose the guidelines on gateways that accept only one system turn;
 //   - `testFlaky` is not part of the shared set (it is an example-only extra);
 //   - the scripted demo is a documented fixture exception;
 //   - the legacy preset ids still resolve as aliases (`coder` → `workspace`);
@@ -43,7 +47,7 @@ import {
     SPECIALIST_AGENT_NAMES,
     teamOf
 } from './index';
-import { AGENT_PROFILES } from '../../agents';
+import { AGENT_PROFILES, agentInstruction } from '../../agents';
 
 // Provider settings are never used by construction; they only feed `agent(...)`.
 const SETTINGS = {
@@ -63,6 +67,10 @@ const presetOf = (name: string) => {
 
 const registeredTools = (name: string): string[] => Object.keys(presetOf(name).create(SETTINGS, progress).tools);
 
+// THE system prompt an agent actually runs: `agentInstruction()` joins the identity
+// sentence and the guidelines into ONE string (../../agents/index.ts), and
+// `agent({ instruction })` seeds exactly one `system` message per string, so
+// `messages[0]` is the whole prompt — not its first half.
 const instructionOf = (presetName: string, agentName: string): string => {
     const harness = presetOf(presetName).create(SETTINGS, progress);
     const message = harness.agents[agentName].messages[0];
@@ -492,13 +500,29 @@ describe('one toolbox, different agents', () => {
     it('gives each real preset distinct instructions and the right subagents', () => {
         const instructions = REAL.map((name) => instructionOf(name, name));
 
+        // Each real preset runs the WHOLE prompt its profile composes, verbatim: the
+        // expected value is `agentInstruction(profile)`, so a guideline added to a
+        // profile is covered here without touching this test again.
+        expect(instructions).toEqual(REAL.map((name) => agentInstruction(AGENT_PROFILES[name])));
+
+        // No two real roles share a prompt, so a picker choice is a real choice.
         expect(new Set(instructions).size).toBe(REAL.length);
-        expect(instructions[0]).toContain('You are the Instruct agent.');
-        expect(instructions[1]).toContain('You are the Research agent.');
-        expect(instructions[2]).toContain('You are a workspace coding agent.');
-        expect(instructions[3]).toContain('You are the Reviewer agent.');
-        expect(instructions[4]).toContain('You are the Planner agent.');
-        expect(instructionOf('research', 'summarizer')).toContain('You compress technical notes');
+
+        // The identity sentence, quoted exactly, is the text ABOVE the joined
+        // `Guidelines:` block. Splitting on the literal separator pins both the
+        // sentence and the `\n\nGuidelines:\n` structure the runtime must produce.
+        expect(instructions.map((prompt) => prompt.split('\n\nGuidelines:\n')[0])).toEqual([
+            'You are the Instruct agent. Follow the brief exactly, answer directly, and do only what was asked.',
+            'You are the Research agent. Investigate before you answer, and keep what you found separate from what you inferred.',
+            'You are the Coder agent. Read, edit, and verify files in the server workspace, and keep every change as small as the task allows.',
+            'You are the Reviewer agent. Find real defects in the work you are given, and report only what you can point to.',
+            'You are the Planner agent. Plan before you build, route each step to the narrowest configured specialist, and verify the result yourself.'
+        ]);
+
+        // The delegated summarizer is a profile too: same composition, one string.
+        expect(instructionOf('research', 'summarizer')).toBe(
+            'You compress technical notes into at most two sentences.\n\nGuidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
+        );
 
         // Every real preset has exactly its team; the primary is never a subagent.
         expect(
@@ -551,36 +575,42 @@ describe('one toolbox, different agents', () => {
     it('seeds the trusted profile instruction and guidelines into the runtime', () => {
         const research = presetOf('research').create(SETTINGS, progress);
 
-        // Agent messages start with the profile's instruction, then ONE composed
-        // guidelines block. The same composition is used for the summarizer, so a
-        // guideline cannot be documentation that never reaches a model.
-        expect(research.agents.research.messages.slice(0, 2)).toEqual([
-            { role: 'system', content: AGENT_PROFILES.research.instruction },
-            {
-                role: 'system',
-                content: [
-                    'Guidelines:',
-                    ...AGENT_PROFILES.research.guidelines.map((line) => `- ${line}`)
-                ].join('\n')
-            }
+        // ONE system message per agent, holding the identity sentence AND the
+        // composed guidelines block. `agentInstruction()` joins them because a
+        // profile used to seed two `system` messages, and several OpenAI-compatible
+        // gateways accept only one system turn — the guidelines were dropped there
+        // and the role ran on its identity sentence alone (../../agents/index.ts).
+        // The same composition runs for the summarizer, so a guideline cannot be
+        // documentation that never reaches a model.
+        expect(research.agents.research.messages.slice(0, 1)).toEqual([
+            { role: 'system', content: agentInstruction(AGENT_PROFILES.research) }
         ]);
-        expect(research.agents.summarizer.messages.slice(0, 2)).toEqual([
-            { role: 'system', content: AGENT_PROFILES.summarizer.instruction },
-            {
-                role: 'system',
-                content: [
-                    'Guidelines:',
-                    ...AGENT_PROFILES.summarizer.guidelines.map((line) => `- ${line}`)
-                ].join('\n')
-            }
+        expect(research.agents.summarizer.messages.slice(0, 1)).toEqual([
+            { role: 'system', content: agentInstruction(AGENT_PROFILES.summarizer) }
         ]);
+
+        // Nothing else in either transcript is a system turn: the join is what makes
+        // the prompt complete, so a second seeded system message is a regression.
+        expect(research.agents.research.messages.filter((message) => message.role === 'system')).toHaveLength(1);
+        expect(research.agents.summarizer.messages.filter((message) => message.role === 'system')).toHaveLength(1);
+
+        // The joined text byte for byte: identity sentence, a BLANK line, then
+        // `Guidelines:` with one `- ` bullet per profile guideline, in profile order.
+        expect(research.agents.research.messages[0]).toEqual({
+            role: 'system',
+            content: [
+                'You are the Research agent. Investigate before you answer, and keep what you found separate from what you inferred.',
+                '',
+                'Guidelines:',
+                ...AGENT_PROFILES.research.guidelines.map((line) => `- ${line}`)
+            ].join('\n')
+        });
 
         // The exact identity sentence, not just a substring: the profile is the
         // source and the harness must not append or rewrite it.
-        expect(research.agents.research.messages[0]).toEqual({
-            role: 'system',
-            content: 'You are the Research agent. Investigate before you answer, and separate what you found from what you inferred.'
-        });
+        expect(research.agents.research.messages[0].content.split('\n\nGuidelines:\n')[0]).toBe(
+            'You are the Research agent. Investigate before you answer, and keep what you found separate from what you inferred.'
+        );
     });
 
     it('marks every template editable (compatibility field only)', () => {

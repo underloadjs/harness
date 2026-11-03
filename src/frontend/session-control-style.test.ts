@@ -1,24 +1,25 @@
-// R7/R8 session-control CSS contract, restated for T3/R1.
+// R7/R8 session-control CSS contract, restated for T3/R1 and T9.
 //
 // The server-owned directory used to be a stack of rail ROWS (`.session-row` + a full
-// meta block). T3/R1 moved it out of the right rail into a compact pill strip under the
-// Instruct header (`main.ts` `createSessionPillBar`), and the same strip is inserted at
-// the top of the harness details dialog on a phone. The behaviour layer owns the DOM;
-// this file pins the CSS half of the agreed contract, and holds no import of main.ts so
-// it stays runnable while the behaviour is changing:
+// meta block). T3/R1 moved it out of the right rail into a compact pill strip, and T9 moved
+// it one step further: the strip now lives ONLY at the top of the harness details dialog
+// (`main.ts` `createSessionPillBar`, called from `harnessDetailsBody`) at every width, while
+// the header keeps the compact cycler and its `+`. The behaviour layer owns the DOM; this
+// file pins the CSS half of the agreed contract, and holds no import of main.ts so it stays
+// runnable while the behaviour is changing:
 //
-//   .session-pills-bar[.session-pills-bar-head|.session-pills-bar-dialog] ← the strip
+//   .session-pills-bar.session-pills-bar-dialog                        ← the dashboard strip
 //     .session-pills                                                       ← role="list"
 //       .session-pill[data-session-id][data-status][data-active][data-archived]
 //         .session-pill-select                                             ← open
 //           .session-pill-id                                               ← 8 chars ONLY
 //         .session-pill-delete                                             ← one click
 //       .session-pills-empty                                               ← empty hint
-//     .new-session / .refresh-sessions                                     ← the actions
+//     .new-session (`.session-new`)                                        ← the dashboard `+`
 //
 // Requirements pinned here:
-//   - the strip is a WRAPPING row (it lives under the title, where horizontal overflow
-//     would widen the chat column) and every level can shrink (`min-width: 0`);
+//   - the strip is a WRAPPING row (horizontal overflow would widen the column that holds it)
+//     and every level can shrink (`min-width: 0`);
 //   - the pill is compact and rounded-full, with the id in monospace;
 //   - the active, running and archived states are painted from the data attributes the
 //     behaviour layer writes — never from a class the DOM does not produce;
@@ -72,8 +73,8 @@ const blockOf = (selector: string): string => {
 it('lays the directory out as one wrapping strip that can shrink', () => {
     const bar = blockOf('.session-pills-bar {');
 
-    // A row, but one that WRAPS: the strip sits under the title, where a single long line
-    // of conversations would push the composer and the transcript wider than the column.
+    // A row, but one that WRAPS: the strip is the top of the details layer, where a single
+    // long line of conversations would push that dialog wider than its column.
     expect(bar).toContain('display: flex');
     expect(bar).toContain('flex-wrap: wrap');
     expect(bar).toContain('align-items: center');

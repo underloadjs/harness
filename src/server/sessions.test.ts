@@ -14,6 +14,7 @@ import { agent, harness, tool } from '../harness';
 import type { HarnessEvent, HarnessStream, HarnessStreamEvent, HarnessUsage } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
+import { AGENT_PROFILES, agentInstruction } from '../agents';
 import { SessionError, SessionStore } from './sessions';
 import type { SessionStreamItem } from './protocol';
 
@@ -1101,7 +1102,9 @@ describe('SessionStore turns', () => {
         const reset = store.reset(first.id);
         expect(reset.turns).toEqual([]);
         expect(reset.status).toBe('idle');
-        expect(reset.messages.every((message) => message.role === 'system')).toBe(true);
+        // A reset returns the seeded transcript and nothing else: ONE system message
+        // for this scripted fixture (a plain string instruction seeds one turn).
+        expect(reset.messages).toEqual([{ role: 'system', content: 'You are a scripted test agent.' }]);
         expect(reset.lastError).toBeUndefined();
 
         // The other session is untouched by the reset.
@@ -1260,11 +1263,15 @@ describe('SessionStore and the harness registry', () => {
         const before = store.create('instruct');
 
         expect(before.harnessDefinition?.title).toBe('Instruct');
+        // A profile-built agent starts with exactly ONE system message: the identity
+        // sentence and the guidelines joined into one prompt by `agentInstruction()`
+        // (../agents/index.ts), because two seeded `system` messages lost the
+        // guidelines on gateways that accept only one system turn.
         expect(before.messages[0]).toEqual({
             role: 'system',
-            content:
-                'You are the Instruct agent. Answer the request directly and keep the answer focused.'
+            content: agentInstruction(AGENT_PROFILES.instruct)
         });
+        expect(before.messages.filter((message) => message.role === 'system')).toHaveLength(1);
 
         // A registry override replaces the entry; it cannot reach the session that
         // captured the old preset (and its factory). The allowlist is restated so the
@@ -1274,8 +1281,7 @@ describe('SessionStore and the harness registry', () => {
         expect(store.get(before.id).harnessDefinition?.primary).toBe('instruct');
         expect(store.get(before.id).messages[0]).toEqual({
             role: 'system',
-            content:
-                'You are the Instruct agent. Answer the request directly and keep the answer focused.'
+            content: agentInstruction(AGENT_PROFILES.instruct)
         });
 
         // A new session resolves the patched entry and is built from it.
@@ -1283,7 +1289,10 @@ describe('SessionStore and the harness registry', () => {
         expect(after.harnessDefinition?.title).toBe('Edited');
         expect(after.harnessDefinition?.primary).toBe('workspace');
         expect(after.harnessDefinition?.agents).toEqual(['workspace']);
-        expect(after.messages[0]).toEqual({ role: 'system', content: 'You are a workspace coding agent.' });
+        expect(after.messages[0]).toEqual({
+            role: 'system',
+            content: agentInstruction(AGENT_PROFILES.workspace)
+        });
     });
 
     it('keeps discovery enabled across two turns in one session', async () => {

@@ -25,9 +25,16 @@ import {
     createWebSearchCatalogueEntry,
     WEBSEARCH_UNCONFIGURED_HINT
 } from './harnesses';
-// The trusted catalogue text, so an instruction-override assertion can name the
-// words an agent runs when a harness does NOT override it.
-import { AGENT_PROFILES } from '../agents';
+// The shared policy lines of the trusted catalogue (src/agents/guidelines.ts). The
+// profile-specific sentences and rules are hardcoded below, but these are imported so
+// the arrays asserted here can never disagree with the single source they compose from.
+import {
+    DELEGATION_GUIDELINE,
+    DISCOVERY_GUIDELINE,
+    PERMISSIONS_GUIDELINE,
+    TOOL_CREATE_GUIDELINE,
+    WEB_SEARCH_GUIDELINE
+} from '../agents/guidelines';
 import { TOOL_REGISTRY_METADATA, TOOL_REQUEST_METADATA } from '../core';
 import { MAX_API_BODY_BYTES } from './api';
 import { createHarnessRuntime } from './runtime';
@@ -113,6 +120,76 @@ const TOOL_NAMES = [...CORE_TOOL_NAMES, ...CATALOGUE_TOOL_NAMES];
 // `createRuntime`). A runtime built without an injection lists only the first five —
 // pinned by 'ships only the real production presets over HTTP'.
 const PRESET_NAMES = ['instruct', 'research', 'workspace', 'reviewer', 'planner', 'demo', 'flaky'];
+
+// ---------------------------------------------------------------------------
+// The trusted prompt text (src/agents), as it reaches the wire.
+//
+// `agentInstruction()` (src/agents/index.ts) returns ONE string per agent: the
+// identity sentence, a BLANK line, then a `Guidelines:` block with one `- ` bullet per
+// profile guideline, in profile order (blank guidelines dropped). It is one string and
+// NOT `[instruction, guidelines]` because `agent({ instruction })` seeds one `system`
+// message per entry (src/core/agent.ts `seed`) and the transport forwards them verbatim
+// — several OpenAI-compatible gateways accept only a single system turn, so the previous
+// two-message seed silently dropped the guidelines there. Every profile-built agent
+// therefore seeds exactly ONE `system` message, which the assertions below pin.
+//
+// The guideline ARRAYS are the raw profile fields (`GET /agents` exposes them unjoined,
+// so the picker still renders identity and rules separately); the PROMPT constants are
+// what an agent actually runs. Identity sentences are hardcoded because they are
+// profile-specific catalogue text; shared lines come from ../agents/guidelines so the
+// two copies inside this file cannot drift from each other.
+// ---------------------------------------------------------------------------
+
+// Mirrors the single documented join rule in src/agents/index.ts `agentInstruction()`.
+const joinedPrompt = (identity: string, guidelines: readonly string[]): string =>
+    [identity, '', 'Guidelines:', ...guidelines.map((line) => `- ${line}`)].join('\n');
+
+const INSTRUCT_IDENTITY = 'You are the Instruct agent. Follow the brief exactly, answer directly, and do only what was asked.';
+const INSTRUCT_GUIDELINES = [
+    'Treat the request as the specification: keep the scope it states, and say plainly when it is ambiguous or when a claim cannot be checked.',
+    DISCOVERY_GUIDELINE,
+    WEB_SEARCH_GUIDELINE,
+    DELEGATION_GUIDELINE,
+    'Prefer a tool result over memory when a declared tool can answer more accurately, and name the tool you used.',
+    PERMISSIONS_GUIDELINE,
+    TOOL_CREATE_GUIDELINE,
+    'Be concise: no preamble, no restating the question.'
+];
+
+const RESEARCH_IDENTITY = 'You are the Research agent. Investigate before you answer, and keep what you found separate from what you inferred.';
+const RESEARCH_GUIDELINES = [
+    'Search the repository before reasoning about it: grep({ pattern, patterns, paths }) returns matching lines with file and line numbers; glob returns paths only.',
+    'Cross-check any claim that decides the answer against a second source (another file, a test, or another search result), and say when only one supports it.',
+    DISCOVERY_GUIDELINE,
+    WEB_SEARCH_GUIDELINE,
+    DELEGATION_GUIDELINE,
+    'Delegate narrow follow-ups: summarizer condenses notes, workspace verifies a code path, reviewer challenges a conclusion.',
+    'Finish with the answer, cite the file and line, tool, or URL behind each claim, and label anything you could not verify.'
+];
+
+// The `workspace` profile is titled "Coder", and the identity sentence says so too.
+const WORKSPACE_IDENTITY = 'You are the Coder agent. Read, edit, and verify files in the server workspace, and keep every change as small as the task allows.';
+const WORKSPACE_GUIDELINES = [
+    'Batch file work into one call: read takes `paths`, write takes `files: [{ path, content }]`, edit takes `edits: [{ path, oldString, newString }]`.',
+    'Paths are absolute or relative to the server working directory; glob with no arguments lists every file under it.',
+    'Read before writing, prefer edit over rewriting a whole file, and confirm the result by re-reading it or running the check that covers it.',
+    'shell, gitDiff, syntax and fileList are searchable, not declared: enable the one you need with toolRequest before calling it.',
+    DISCOVERY_GUIDELINE,
+    DELEGATION_GUIDELINE,
+    PERMISSIONS_GUIDELINE,
+    'Report exactly what you changed and what you actually ran to verify it.'
+];
+
+const SUMMARIZER_GUIDELINES = ['Keep names, numbers, and conclusions.', 'Drop preamble and repetition.'];
+
+const INSTRUCT_PROMPT = joinedPrompt(INSTRUCT_IDENTITY, INSTRUCT_GUIDELINES);
+const RESEARCH_PROMPT = joinedPrompt(RESEARCH_IDENTITY, RESEARCH_GUIDELINES);
+const WORKSPACE_PROMPT = joinedPrompt(WORKSPACE_IDENTITY, WORKSPACE_GUIDELINES);
+const SUMMARIZER_PROMPT = joinedPrompt('You compress technical notes into at most two sentences.', SUMMARIZER_GUIDELINES);
+const DEMO_PROMPT = joinedPrompt('You are the offline demo agent. The transport is scripted; nothing is sent to a model.', [
+    'Narrate the loop the transport demonstrates: a toolRequest discovery round, one tool call, then the answer.',
+    'The demo registry is timeNow-only; the shared toolbox is not part of this fixture.'
+]);
 
 // Filesystem fixtures live under a `Temp/` directory INSIDE the checkout (never
 // OS temp). The location is resolved by walking the tree instead of counting `..`
@@ -704,9 +781,10 @@ describe('canonical sessions', () => {
         expect(session.model).toBe('demo-model');
         expect(session.createdAt).toBe(session.updatedAt);
         expect(session.turns).toEqual([]);
-        // The demo agent's profile seeds two system messages: the instruction and
-        // the composed guidelines block.
-        expect(session.messages.map((message) => message.role)).toEqual(['system', 'system']);
+        // ONE seeded system message, not two: `agentInstruction()` joins the demo
+        // profile's identity sentence and its guidelines block into a single string, so
+        // a gateway that accepts only one system turn still receives the guidelines.
+        expect(session.messages).toEqual([{ role: 'system', content: DEMO_PROMPT }]);
 
         const list = await jsonBody<{ sessions: SessionSnapshot[] }>(
             await callHandler(runtime, 'GET', '/v1/harness/sessions')
@@ -988,8 +1066,9 @@ describe('canonical sessions', () => {
         expect(status).toBe(200);
         expect(body.session.status).toBe('idle');
         expect(body.session.turns).toEqual([]);
-        // Two seeded system messages: profile instruction + guidelines.
-        expect(body.session.messages.map((message) => message.role)).toEqual(['system', 'system']);
+        // A reset re-seeds the frozen harness's prompts: exactly ONE joined system
+        // message (identity + guidelines), never the old instruction/guidelines pair.
+        expect(body.session.messages).toEqual([{ role: 'system', content: DEMO_PROMPT }]);
     });
 
     it('rejects a second run while the first is still open with 409', async () => {
@@ -2364,19 +2443,6 @@ describe('standalone /api compatibility', () => {
 // live harness's metadata/routing. Both are in-memory; both affect future
 // sessions only, which the frozen-definition assertions below pin directly.
 describe('harness registry over HTTP', () => {
-    // Exact because it is catalogue data: these are the shared lines of
-    // src/agents/guidelines.ts plus instruct's own rules, and the picker renders them
-    // verbatim. Availability is NOT here — the tool declarations carry it.
-    const INSTRUCT_GUIDELINES = [
-        'Your tool list is not the whole catalogue: use toolRequest (tag, name, or regex) to enable a searchable tool for your next turn before concluding a capability is missing.',
-        'search exists only when the host configured a key; if it is not declared, say so instead of inventing sources. fetch is searchable under "web" and "fetch".',
-        'If you are the primary agent and this harness configures subagents, delegate is declared to you: give ONE target a self-contained brief (a subagent never sees this conversation) and verify its answer. A subagent never receives delegate and cannot delegate further; otherwise do the work yourself.',
-        'Prefer a tool over memory when a tool can answer more accurately, and name the tool you used.',
-        'File and command tools run unsandboxed with the server process permissions, so inspect before you change anything.',
-        'If a small capability is still missing, toolCreate can add one for this session.',
-        'Be concise.'
-    ];
-
     const createSessionFor = async (runtime: HarnessRuntime, harness: string): Promise<SessionSnapshot> => {
         const result = await callHandler(runtime, 'POST', '/v1/harness/sessions', {
             body: { harness }
@@ -2394,14 +2460,17 @@ describe('harness registry over HTTP', () => {
 
         expect(status).toBe(200);
         // The first descriptor is exact: the profile text is catalogue data, and a
-        // picker renders it verbatim.
+        // picker renders it verbatim. The wire shape is UNCHANGED by the joined-prompt
+        // work — `GET /agents` still exposes the RAW `instruction` sentence and the RAW
+        // `guidelines` array, because only the runtime composition in
+        // src/agents/index.ts `agentInstruction()` joined them. Availability is NOT here
+        // — the tool declarations carry it.
         expect(body.agents[0]).toEqual({
             name: 'instruct',
             title: 'Instruct',
             description:
                 'General instruction-following agent. Answers directly and concisely with the tools it is given; every other role is available to it as a subagent.',
-            instruction:
-                'You are the Instruct agent. Answer the request directly and keep the answer focused.',
+            instruction: INSTRUCT_IDENTITY,
             guidelines: INSTRUCT_GUIDELINES
         });
         expect((body.agents as { name: string }[]).map((agent) => agent.name)).toEqual([
@@ -2500,27 +2569,13 @@ describe('harness registry over HTTP', () => {
         expect(index.body.harnesses.at(-1)).toEqual(body.harness);
 
         // A session resolved by the same registry runs it; the snapshot freezes
-        // the descriptor and the two seeded agents.
+        // the descriptor and the seeded agents. The research primary contributes exactly
+        // ONE system message — the joined identity + guidelines prompt — and a subagent
+        // seeds nothing into the primary's transcript.
         const session = await createSessionFor(runtime, 'review');
         expect(session.harness).toBe('review');
         expect(session.harnessDefinition).toEqual(body.harness);
-        expect(session.messages).toEqual([
-            {
-                role: 'system',
-                content:
-                    'You are the Research agent. Investigate before you answer, and separate what you found from what you inferred.'
-            },
-            {
-                role: 'system',
-                content: [
-                    'Guidelines:',
-                    ...runtime.registry
-                        .agents()
-                        .find((agent) => agent.name === 'research')!
-                        .guidelines.map((line) => `- ${line}`)
-                ].join('\n')
-            }
-        ]);
+        expect(session.messages).toEqual([{ role: 'system', content: RESEARCH_PROMPT }]);
     });
 
     it('applies per-agent models and freezes them per session', async () => {
@@ -2616,20 +2671,24 @@ describe('harness registry over HTTP', () => {
         // un-overridden state (and offers to revert to).
         expect(body.harness.agentInstructions).toEqual({ summarizer: 'Condense to one line.' });
 
-        // The factory the registry stored builds the real agents with it.
+        // The factory the registry stored builds the real agents with it. `instructions`
+        // is a ONE-entry array now: the joined prompt, in which the override replaced only
+        // the identity sentence — the trusted guidelines block still rides below it inside
+        // the same system message, so a saved configuration can retune a role without
+        // dropping shared policy.
         const built = runtime.registry.find('voiced')!.create(SETTINGS, () => undefined);
-        expect(built.agents.summarizer.instructions[0]).toBe('Condense to one line.');
-        expect(built.agents.research.instructions[0]).toBe(AGENT_PROFILES.research.instruction);
-        // Guidelines survive an override: only the identity sentence is replaced.
-        expect(built.agents.summarizer.instructions[1]).toBe(
-            'Guidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
-        );
+        expect(built.agents.summarizer.instructions).toEqual([
+            joinedPrompt('Condense to one line.', SUMMARIZER_GUIDELINES)
+        ]);
+        expect(built.agents.research.instructions).toEqual([RESEARCH_PROMPT]);
 
-        // A session records the override in its frozen definition...
+        // A session records the override in its frozen definition, and the words really
+        // reach that session's prompt.
         const session = await createSessionFor(runtime, 'voiced');
         expect(session.harnessDefinition?.agentInstructions).toEqual({
             summarizer: 'Condense to one line.'
         });
+        expect(session.messages).toEqual([{ role: 'system', content: RESEARCH_PROMPT }]);
 
         // ...and a later PATCH cannot rewrite what that session was built with.
         const patched = await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/voiced', {
@@ -2644,15 +2703,20 @@ describe('harness registry over HTTP', () => {
         });
 
         // A NEW session runs the new words, and the agent the replacement map dropped
-        // is back on its trusted instruction (replace, not merge).
+        // is back on its trusted prompt (replace, not merge).
         const next = await createSessionFor(runtime, 'voiced');
         expect(next.harnessDefinition?.agentInstructions).toEqual({ research: 'Ask before acting.' });
-        expect(runtime.registry.find('voiced')!.create(SETTINGS, () => undefined).agents.research.instructions[0]).toBe(
-            'Ask before acting.'
-        );
-        expect(runtime.registry.find('voiced')!.create(SETTINGS, () => undefined).agents.summarizer.instructions[0]).toBe(
-            'You compress technical notes into at most two sentences.'
-        );
+        expect(
+            runtime.registry.find('voiced')!.create(SETTINGS, () => undefined).agents.research.instructions
+        ).toEqual([joinedPrompt('Ask before acting.', RESEARCH_GUIDELINES)]);
+        expect(
+            runtime.registry.find('voiced')!.create(SETTINGS, () => undefined).agents.summarizer.instructions
+        ).toEqual([SUMMARIZER_PROMPT]);
+        // The session snapshot carries the same single joined message, so a reload shows
+        // exactly what the model was sent.
+        expect(next.messages).toEqual([
+            { role: 'system', content: joinedPrompt('Ask before acting.', RESEARCH_GUIDELINES) }
+        ]);
 
         // `{}` clears every override, and the descriptor drops the field again.
         const cleared = await callHandler(runtime, 'PATCH', '/v1/harness/harnesses/voiced', {
@@ -2911,18 +2975,18 @@ describe('harness registry over HTTP', () => {
             editable: true
         });
 
-        // The existing session still reports (and runs) the captured definition.
+        // The existing session still reports (and runs) the captured definition: the ONE
+        // joined prompt the instruct profile seeds.
         expect(runtime.store.get(before.id).harnessDefinition).toEqual(before.harnessDefinition);
-        expect(runtime.store.get(before.id).messages[0]).toEqual({
-            role: 'system',
-            content:
-                'You are the Instruct agent. Answer the request directly and keep the answer focused.'
-        });
+        expect(runtime.store.get(before.id).messages).toEqual([
+            { role: 'system', content: INSTRUCT_PROMPT }
+        ]);
 
-        // A session created after the patch sees the new configuration.
+        // A session created after the patch sees the new configuration, so its single
+        // system message is now the workspace ("Coder") profile's joined prompt.
         const after = await createSessionFor(runtime, 'instruct');
         expect(after.harnessDefinition).toEqual(body.harness);
-        expect(after.messages[0]).toEqual({ role: 'system', content: 'You are a workspace coding agent.' });
+        expect(after.messages).toEqual([{ role: 'system', content: WORKSPACE_PROMPT }]);
     });
 
     it('patches every template (no read-only category) and keeps invalid patches rejected', async () => {
@@ -3060,13 +3124,17 @@ describe('harness registry over HTTP', () => {
             'fetch',
         ]);
 
-        // A NEW session runs the live agent configuration with the shared toolbox.
+        // A NEW session runs the live agent configuration with the shared toolbox, so its
+        // one system message is the workspace ("Coder") profile's joined prompt.
         const after = await createSessionFor(runtime, 'demo');
         expect(after.harnessDefinition).toEqual(live.body.harness);
-        expect(after.messages[0]).toEqual({ role: 'system', content: 'You are a workspace coding agent.' });
+        expect(after.messages).toEqual([{ role: 'system', content: WORKSPACE_PROMPT }]);
 
         // The old scripted session is untouched: its definition and prompt stay.
         expect(runtime.store.get(scripted.id).harnessDefinition).toEqual(scripted.harnessDefinition);
+        expect(runtime.store.get(scripted.id).messages).toEqual([
+            { role: 'system', content: DEMO_PROMPT }
+        ]);
     });
 
     it('keeps flaky extras through metadata edits and on an executable edit', async () => {

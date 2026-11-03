@@ -627,9 +627,10 @@ it('gaps the transcript bottom by three scratch-button heights', () => {
 it('collapses both rails only inside the phone breakpoint', () => {
     const phone = blockOf('@media (max-width: 860px)');
 
-    // R1 (T3): the harness header keeps only the title row, the session strip and the
-    // note, and on a phone the strip moves into the title's dialog.
-    expect(phone).toContain('.session-pills-bar-head {\n        display: none;\n    }');
+    // R1 (T9): the header carries NO session strip at any width — the directory lives in the
+    // title's dialog — so the phone block has no strip-hiding rule left to keep.
+    expect(rules).not.toContain('.session-pills-bar-head');
+    expect(phone).not.toContain('.session-pills');
 
     // Default collapsed: neither rail is displayed without an open state.
     expect(phone).toContain('.rail-left,\n    .rail-right {\n        display: none;\n    }');

@@ -25,9 +25,10 @@
 //   - ../../server/protocol.ts   — AgentDescriptor, the wire view of a profile
 
 // One trusted agent. `instruction` is the identity sentence; `guidelines` are the
-// rules that follow it. Both are seeded into the model's system messages — the
-// runtime composition lives in `agentInstruction()` so "guidelines affect runtime"
-// is a single, testable path rather than per-preset string concatenation.
+// rules that follow it. Both are seeded into ONE system message (a model that
+// accepts only a single system turn still gets the complete prompt) — the runtime
+// composition lives in `agentInstruction()` so "guidelines affect the prompt" is a
+// single, testable path rather than per-preset string concatenation.
 export type AgentProfile = {
     // Stable registry id. A harness selects agents by this name, and a session
     // records the names it was built with.

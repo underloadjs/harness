@@ -16,10 +16,12 @@
 //     `maxEnabledTools` bound, newest-request precedence, `matched`/`omitted` — lives in
 //     toolRequest's description and is read with that declaration, so it is deliberately
 //     NOT restated here.
-//   - WEB_SEARCH — `search` is declared only when the host configured a key
-//     (src/tools/websearch/index.ts registers it `visibility: 'core'`), so its absence
-//     is a real answer that must produce an honest statement, not invented sources.
-//     `fetch` stays searchable (src/tools/webfetch/index.ts).
+//   - WEB_SEARCH — the web trio is asymmetric in a way no schema states: `search` is
+//     core but only registered when the host configured a key
+//     (src/tools/websearch/index.ts), `fetch` is core and needs no key
+//     (src/tools/webfetch/index.ts + the `webfetch: true` every live factory passes),
+//     and `download` is searchable. Its absence is therefore a real answer that must
+//     produce an honest statement, not invented sources.
 //   - DELEGATION — `delegate` is declared to a PRIMARY only when the harness has
 //     subagents, and delegation is one level deep (src/harness.ts
 //     `primaryOnlyDefinitions`). One sentence therefore has to be correct for a primary,
@@ -29,8 +31,10 @@
 //   - PERMISSIONS / TOOL_CREATE — facts no schema states: nothing is sandboxed, and a
 //     missing capability can be authored.
 //
-// A profile composes these with `agentInstruction()` (./index.ts) into its system
-// messages, so one edit reaches all five real roles and the wording cannot drift.
+// A profile composes these with `agentInstruction()` (./index.ts) into its ONE system
+// prompt, so one edit reaches all five real roles and the wording cannot drift. Every
+// tool named below must match the visibility in src/core/tool-manifest.ts: a line that
+// claims a tool is (or is not) declared is only trustworthy while the manifest says so.
 //
 // Cross-references:
 //   - ./types.ts        — AgentProfile (instruction + guidelines)
@@ -39,11 +43,21 @@
 
 // Tools outside the declaration list are searchable, not missing.
 export const DISCOVERY_GUIDELINE =
-    'Your tool list is not the whole catalogue: use toolRequest (tag, name, or regex) to enable a searchable tool for your next turn before concluding a capability is missing.';
+    'Your declared tool list is not the whole catalogue: call toolRequest (exact names, a regex, or capability tags) to enable a searchable tool before concluding a capability is missing.';
 
-// A keyless host has no web search; say so rather than inventing sources.
+// Web access is asymmetric, and only the prompt can say so honestly:
+//   - `search` is `visibility: 'core'` but its ACTIVATION is `websearch`, so a
+//     keyless host never registers it and it is simply absent from the declaration
+//     list (src/tools/websearch/index.ts, src/server/harnesses/websearch.ts);
+//   - `fetch` is core with activation `webfetch`, which every live factory turns on,
+//     and its native provider needs no credential — so it IS declared even without a
+//     key (src/server/harnesses/toolbox.ts sets `webfetch: true`);
+//   - `download` is the only web capability that is `visibility: 'searchable'`
+//     (tags include "web" and "url"), so it has to be enabled before it can be used.
+// Naming all three prevents the two opposite failures: claiming a keyless host has
+// search, and ignoring a fetch that is sitting in the declaration list.
 export const WEB_SEARCH_GUIDELINE =
-    'search exists only when the host configured a key; if it is not declared, say so instead of inventing sources. fetch is searchable under "web" and "fetch".';
+    'search is declared only when the host configured a web-search key; when it is not declared, say so instead of inventing sources. fetch is declared without a key, and download is searchable under "web" or "url".';
 
 // One wording for all five real roles: correct for a primary, a subagent, and a lone agent.
 export const DELEGATION_GUIDELINE =
@@ -53,5 +67,8 @@ export const DELEGATION_GUIDELINE =
 export const PERMISSIONS_GUIDELINE =
     'File and command tools run unsandboxed with the server process permissions, so inspect before you change anything.';
 
-// The self-extending escape hatch, one line rather than a tool manual.
-export const TOOL_CREATE_GUIDELINE = 'If a small capability is still missing, toolCreate can add one for this session.';
+// The self-extending escape hatch, one line rather than a tool manual. `toolCreate`
+// is itself searchable (src/core/tool-manifest.ts), so the line states the order:
+// discover it through toolRequest first, then author the missing capability.
+export const TOOL_CREATE_GUIDELINE =
+    'toolCreate is searchable, not declared: enable it with toolRequest before using it to add a small missing capability to this session.';

@@ -282,7 +282,7 @@ it('keeps the tools toggle disabled until the catalogue has loaded', async () =>
 
 // --- R1: phone disclosures, DOM/state --------------------------------------
 
-it('opens harness details from the clickable title and keeps tools headings inert', async () => {
+it('opens harness details from the clickable title and keeps the dashboard reachable from the tools head', async () => {
     await boot();
 
     const head = byClass('.harness-head', 'header');
@@ -336,33 +336,49 @@ it('opens harness details from the clickable title and keeps tools headings iner
     expect(document.querySelector('.dialog')).toBeNull();
     expect(document.activeElement).toBe(button);
 
-    // R2: while the TOOLS view owns the head, the title describes the catalogue (or a
-    // tool), so it must not open a harness dialog — the button is disabled and out of
-    // the tab order, and a programmatic click is a no-op.
+    // R2 (T9): while the TOOLS view owns the head, the title describes the catalogue, so
+    // the popup it opens is the SESSION dashboard — the reader's only way to a saved
+    // conversation from here. The trigger stays enabled and in the tab order, and its
+    // tooltip says what it really opens instead of promising "harness details".
     byClass('.tools-toggle', 'button').click();
     await flush();
 
     expect(title.textContent).toBe('Tools');
-    expect(button.disabled).toBe(true);
-    // The disabled heading also drops the popup claim and the action tooltip.
-    expect(button.hasAttribute('aria-haspopup')).toBe(false);
-    expect(button.hasAttribute('title')).toBe(false);
+    expect(button.disabled).toBe(false);
+    expect(button.getAttribute('aria-haspopup')).toBe('dialog');
+    expect(button.title).toBe('Show sessions');
+
     button.click();
+    await flush();
+
+    const toolsDialog = byClass('.dialog', 'div');
+    // Sessions only: the head is naming the catalogue, not the selected harness, so no
+    // harness copy/metadata/note/totals ride along (harness-delete-main.test.ts pins the
+    // same shape for the empty-roster case).
+    expect(toolsDialog.querySelector('.dialog-title')?.textContent).toBe('Sessions');
+    expect(toolsDialog.querySelector('.harness-details-section')?.textContent).toBe('Sessions');
+    expect(toolsDialog.querySelector('.harness-details-description')).toBeNull();
+    expect(toolsDialog.querySelector('.harness-details-meta')).toBeNull();
+    expect(toolsDialog.querySelector('.harness-details-note')).toBeNull();
+    // The tools view keeps its own state underneath: the catalogue is still the stage.
+    expect(byClass('.stage', 'div').querySelector('.tools-pane')).not.toBeNull();
+
+    byClass('.dialog-close', 'button').click();
     await flush();
     expect(document.querySelector('.dialog')).toBeNull();
 
-    // Selecting a tool keeps the head inert as well.
+    // Selecting a tool retitles the head but not the affordance: the heading names the
+    // tool, the runner is the front layer, and no harness details leak in.
     byClass('.tool-tab-button', 'button').click();
     await flush();
     expect(title.textContent).toBe('read');
-    expect(button.disabled).toBe(true);
-    button.click();
-    await flush();
+    expect(button.disabled).toBe(false);
+    expect(button.title).toBe('Show sessions');
     // Only the tool runner dialog is open (its title is the tool), never a harness one.
     expect(document.querySelector('.dialog-title')?.textContent).toBe('read');
     expect(document.querySelector('.harness-details')).toBeNull();
 
-    // Leaving the tools view restores the chat head and re-enables the trigger.
+    // Leaving the tools view restores the chat head and its details wording.
     byClass('.dialog-close', 'button').click();
     await flush();
     byClass('.tools-toggle', 'button').click();
@@ -392,9 +408,9 @@ it('closes the harness details dialog when navigating to another harness', async
 });
 
 it('moves focus to the tools toggle when the details dialog is closed by that switch', async () => {
-    // T4: `setToolsView(true)` closes the harness dialog (returning focus to the
-    // title) and then disables that title, so without an explicit target the reader
-    // would be dropped on <body>. The toggle that performed the switch is the target.
+    // T4: `setToolsView(true)` closes the harness dialog (returning focus to the title) and
+    // then re-titles that same trigger for the tools view, so without an explicit target the
+    // reader would be dropped on <body>. The toggle that performed the switch is the target.
     await boot();
 
     const button = byClass('.harness-title-button', 'button');
@@ -407,7 +423,10 @@ it('moves focus to the tools toggle when the details dialog is closed by that sw
     await flush();
 
     expect(document.querySelector('.dialog')).toBeNull();
-    expect(button.disabled).toBe(true);
+    // T9: the trigger is NOT disabled by the switch — it is how the reader still reaches the
+    // session dashboard from the tools view — it just changes what it advertises.
+    expect(button.disabled).toBe(false);
+    expect(button.title).toBe('Show sessions');
     expect(document.activeElement).toBe(toggle);
 });
 
@@ -632,7 +651,9 @@ it('reveals the compact harness head and agent strip only at <=860px', () => {
     // The compact rows are shorter than the desktop padding they replace.
     expect(phone).toContain('.agent-slot {\n        padding: 6px 14px;\n    }');
     expect(phone).toContain('.harness-head {\n        padding: 8px 14px;\n    }');
-    // T4: the phone row centres the title button against the rail toggle, so the
-    // focus outline and the toggle share one baseline.
-    expect(phone).toContain('.harness-title-row {\n        align-items: center;\n    }');
+    // T9: the title row now carries the session cycler and its `+` at EVERY width, so the
+    // centring that used to be a phone-only override is the base rule (and the phone block
+    // has nothing left to override).
+    expect(blockOf('.harness-title-row {')).toContain('align-items: center');
+    expect(phone).not.toContain('.harness-title-row');
 });

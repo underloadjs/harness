@@ -1,26 +1,29 @@
-// T3/R1 + R2: the session directory as pills under the Instruct header, and the same
-// strip inside the Instruct dialog on a phone.
+// T3/R1 + R2/R3 (T9): the session directory as the Sessions dashboard of the dialog the
+// harness title opens — at every width — and the compact header controls beside it.
 //
 // What this file pins (the rail contract these replace lives in main.test.ts /
 // harness-delete-main.test.ts, and the CSS half lives in session-control-style.test.ts
 // and rail-toggle.test.ts):
-//   - placement: the strip is a header child between the title row and the note, and the
-//     right rail holds ONLY the scratch board (no session surface at all);
+//   - placement: the header is the title row plus the note and NOTHING else — the pill
+//     strip that used to sit there is gone (T9/R1) — while the right rail holds ONLY the
+//     scratch board (no session surface at all);
 //   - projection: one pill per saved session of the SELECTED harness, visible text is
 //     `shortId(session.id)` — the first eight characters — and the full uuid appears only
 //     in the tooltip, never in rendered text;
 //   - state: the open conversation's pill carries `data-active="true"`;
-//   - actions: a pill opens its session, `×` deletes it, `+ New` starts a fresh
-//     conversation, `↻` re-reads the directory (the busy/disabled rules the rail buttons
-//     carried are unchanged);
+//   - actions: a pill opens its session, `×` deletes it, the `+` (in the header row AND in
+//     the dashboard) starts a fresh conversation. T9 removed the manual Refresh control;
+//     the directory re-read that used to sit behind it is still automatic (see the
+//     rejected-submit test below) and the busy/disabled rules the rail buttons carried are
+//     unchanged;
 //   - empty state: a short hint, not the old "Locked to <harness>" sentence;
-//   - R2: on a phone (`isPhoneLayout()` is true wherever `matchMedia` is absent, which is
-//     every jsdom run) `openHarnessDetails` puts a Sessions section with the SAME pills,
-//     New and Refresh at the top of the dialog body; a pill there opens the conversation
-//     and closes the dialog; closing the dialog drops the strip so the single painter
-//     never touches a detached node.
+//   - R3 (T9): `openHarnessDetails` puts that Sessions section at the top of the dialog at
+//     EVERY width (jsdom answers `matchMedia` as phone by default, and the desktop stub
+//     below proves the other half); a pill there opens the conversation and closes the
+//     dialog; closing the dialog drops the strip so the single painter never touches a
+//     detached node.
 //
-// Run: npx vitest run --config src/frontend/vitest.config.ts
+// Run: npx vitest run --config src/frontend/vitest.config.ts session-pills.test.ts
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { HarnessDescriptor, SessionSnapshot, SessionTurn } from '../server/protocol';
@@ -132,9 +135,22 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(
     return found;
 };
 
-// The header strip and its pills. Addressed by variant so an open dialog (which carries
-// its own copy on a phone) is never counted by accident.
-const headBar = (): HTMLElement => byClass('.session-pills-bar-head', 'div');
+// T9: the directory exists in ONE place — the Sessions section of the dialog the harness
+// title opens — so "reach the pills" means "open the dashboard". A pill press dismisses
+// that layer (it must never describe the conversation the reader just left), so this
+// helper re-opens it whenever it is gone: `openDialog` adopts the body synchronously and
+// `openHarnessDetails` paints the strip before returning, so no extra tick is needed.
+const dashboard = (): HTMLElement => {
+    if (document.querySelector('.session-pills-bar-dialog') === null) {
+        byClass('.harness-title-button', 'button').click();
+    }
+
+    return byClass('.session-pills-bar-dialog', 'div');
+};
+
+// The header's own create control, addressed inside the title row so the dashboard's
+// identical `+` is never counted by accident.
+const headerNew = (): HTMLButtonElement => byClass('.harness-title-row .new-session', 'button');
 const pills = (root: ParentNode = document): HTMLElement[] => [
     ...root.querySelectorAll<HTMLElement>('.session-pill')
 ];
@@ -164,7 +180,27 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-it('lists every saved session of the selected harness as pills under the Instruct title', async () => {
+// jsdom has no `matchMedia`, which the app reads as "phone-sized" (main.ts
+// `isPhoneLayout`). R3 (T9) has to be proved at the OTHER width too, so this stub answers
+// the query the way a real desktop browser does. It must be installed BEFORE
+// `import('./main')`: main.ts samples `window.matchMedia` once, at module init.
+const stubDesktopViewport = (): void => {
+    vi.stubGlobal(
+        'matchMedia',
+        (query: string) => ({
+            matches: false,
+            media: query,
+            onchange: null,
+            addEventListener: () => undefined,
+            removeEventListener: () => undefined,
+            addListener: () => undefined,
+            removeListener: () => undefined,
+            dispatchEvent: () => false
+        })
+    );
+};
+
+it('lists every saved session of the harness in the dashboard behind the Instruct title', async () => {
     const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
     const second = snapshot({
         id: 's2',
@@ -196,18 +232,28 @@ it('lists every saved session of the selected harness as pills under the Instruc
     expect(rail.querySelector('.session-pills-bar')).toBeNull();
     expect(rail.getAttribute('aria-label')).toBe('Scratch board');
 
-    // R1: the strip sits between the title row and the note, inside the header.
+    // R1 (T9): the header is the title row and the note — the pill strip that used to sit
+    // between them is gone, and the directory is behind the title button instead.
     const head = byClass('.harness-head', 'header');
     expect([...head.children].map((node) => node.className)).toEqual([
         'harness-title-row',
-        'session-pills-bar session-pills-bar-head',
         'harness-note'
     ]);
+    // The row itself carries the two compact session controls: the cycler and its `+`.
+    expect([...byClass('.harness-title-row', 'div').children].map((node) => node.className)).toEqual([
+        'main-title',
+        'session-cycle',
+        'new-session session-new',
+        'harness-id'
+    ]);
+    // No header strip survives anywhere, at any width.
+    expect(document.querySelector('.session-pills-bar-head')).toBeNull();
 
     // Directory order is the server's; the remembered session (s1) is the active one.
-    expect(pillIds(headBar())).toEqual(['s1', 's2']);
-    expect(headBar().querySelector('.session-pills')?.getAttribute('role')).toBe('list');
-    expect(structure(headBar())).toEqual([
+    const bar = dashboard();
+    expect(pillIds(bar)).toEqual(['s1', 's2']);
+    expect(bar.querySelector('.session-pills')?.getAttribute('role')).toBe('list');
+    expect(structure(bar)).toEqual([
         {
             id: 's1',
             status: 'idle',
@@ -232,15 +278,21 @@ it('lists every saved session of the selected harness as pills under the Instruc
 
     // The active pill is the open conversation, and the open conversation is the pointer.
     expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
-    expect(headBar().querySelector('.session-pills-empty')).toBeNull();
+    expect(bar.querySelector('.session-pills-empty')).toBeNull();
 
-    // The two actions the rail used to own, with their labels intact.
-    expect(headBar().querySelector('.new-session')?.textContent).toBe('+ New');
-    expect(headBar().querySelector('.new-session')?.getAttribute('aria-label')).toBe('New session');
-    expect(headBar().querySelector('.refresh-sessions')?.textContent).toBe('↻');
-    expect(headBar().querySelector('.refresh-sessions')?.getAttribute('aria-label')).toBe(
-        'Refresh sessions'
-    );
+    // R4 (T9): the dashboard's create control is the compact `+`, named in full because a
+    // bare glyph is not a name an AT can act on…
+    expect(bar.querySelector('.new-session')?.textContent).toBe('+');
+    expect(bar.querySelector('.new-session')?.getAttribute('aria-label')).toBe('New session');
+    expect(bar.querySelector('.new-session')?.title).toBe('New session');
+    // …and the header's `+` is the SAME control, same name, same class.
+    expect(headerNew().textContent).toBe('+');
+    expect(headerNew().getAttribute('aria-label')).toBe('New session');
+    expect(headerNew().title).toBe('New session');
+    expect(headerNew().disabled).toBe(false);
+    // The manual refresh control is gone from every surface (R4) — its class may not come
+    // back, in the DOM or in the stylesheet.
+    expect(document.querySelector('.refresh-sessions')).toBeNull();
 });
 
 it('shows only the first eight characters of a session id, never the full uuid', async () => {
@@ -258,7 +310,9 @@ it('shows only the first eight characters of a session id, never the full uuid',
     await flush();
     await flush();
 
-    const select = byClass('.session-pill-select', 'button');
+    // T9: the pill is in the dashboard behind the title.
+    dashboard();
+    const select = byClass('.session-pills-bar-dialog .session-pill-select', 'button');
     // The visible text is the eight-character prefix, exactly.
     expect(select.querySelector('.session-pill-id')?.textContent).toBe('3f2a9c1b');
     expect(select.textContent).toBe('3f2a9c1b');
@@ -290,16 +344,24 @@ it('opens a session from its pill, marking it active, and keeps the harness sele
     await flush();
     await flush();
 
-    byClass('.session-pill-select[data-session-id="s2"]', 'button').click();
+    // T9: the pills live behind the title button, so reaching one means opening the
+    // dashboard. Pressing it then dismisses that layer (see the dialog test below), which
+    // is why the reads after it go through `dashboard()` again.
+    dashboard();
+    byClass('.session-pills-bar-dialog .session-pill-select[data-session-id="s2"]', 'button').click();
     await flush();
     await flush();
 
     // The pointer and the projection both moved to s2, through one GET of the record.
     expect(localStorage.getItem(SESSION_KEY)).toBe('s2');
     expect(calls.filter((call) => call.url === '/api/sessions/s2')).toHaveLength(1);
-    expect(pillIds(headBar())).toEqual(['s1', 's2']);
-    expect(headBar().querySelector('.session-pill[data-session-id="s1"]')?.dataset.active).toBeUndefined();
-    expect(headBar().querySelector('.session-pill[data-session-id="s2"]')?.dataset.active).toBe('true');
+    expect(pillIds(dashboard())).toEqual(['s1', 's2']);
+    expect(
+        dashboard().querySelector('.session-pill[data-session-id="s1"]')?.dataset.active
+    ).toBeUndefined();
+    expect(dashboard().querySelector('.session-pill[data-session-id="s2"]')?.dataset.active).toBe(
+        'true'
+    );
     expect(document.querySelector('.tile')?.textContent).toContain('second in');
     // Switching sessions is a view change: the harness stays selected, and nothing was
     // written. (`/api/models` is the background model lookup the boot flow always fires;
@@ -335,20 +397,29 @@ it('deletes a session from its pill with one click', async () => {
     await flush();
     await flush();
 
-    byClass('.session-pill[data-session-id="s2"] .session-pill-delete', 'button').click();
+    // T9: deletion is a dashboard action — the header carries no `×` at any width.
+    dashboard();
+    byClass(
+        '.session-pills-bar-dialog .session-pill[data-session-id="s2"] .session-pill-delete',
+        'button'
+    ).click();
     await flush();
     await flush();
 
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
         { url: '/api/sessions/s2', method: 'DELETE', body: undefined }
     ]);
-    expect(pillIds(headBar())).toEqual(['s1']);
+    // A DELETE leaves the layer open (only opening a conversation dismisses it), so this is
+    // the same strip the click landed on.
+    expect(pillIds(dashboard())).toEqual(['s1']);
     // The current conversation is untouched by deleting another one.
     expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
-    expect(headBar().querySelector('.session-pill[data-session-id="s1"]')?.dataset.active).toBe('true');
+    expect(dashboard().querySelector('.session-pill[data-session-id="s1"]')?.dataset.active).toBe(
+        'true'
+    );
 });
 
-it('starts a fresh conversation from the strip and clears the active mark', async () => {
+it('starts a fresh conversation from the header `+`, without opening the dashboard', async () => {
     const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
     localStorage.setItem(SESSION_KEY, 's1');
 
@@ -363,9 +434,14 @@ it('starts a fresh conversation from the strip and clears the active mark', asyn
     await flush();
     await flush();
 
-    expect(headBar().querySelector('.session-pill-select')?.dataset.active).toBe('true');
+    // R2 (T9): the whole create path is one header control — no dialog, no dashboard. The
+    // conversation in view is named by the cycler beside it, which is how the test knows
+    // s1 was active WITHOUT opening the dashboard.
+    expect(document.querySelector('.dialog')).toBeNull();
+    expect(byClass('.session-cycle', 'button').dataset.sessionId).toBe('s1');
+    expect(headerNew().disabled).toBe(false);
 
-    byClass('.new-session', 'button').click();
+    headerNew().click();
     await flush();
 
     // Same contract the rail's New session had: no conversation write is sent, the pointer
@@ -376,11 +452,16 @@ it('starts a fresh conversation from the strip and clears the active mark', asyn
     ).toEqual([]);
     expect(localStorage.getItem(SESSION_KEY)).toBeNull();
     expect(document.querySelectorAll('.tile')).toHaveLength(0);
-    expect(pillIds(headBar())).toEqual(['s1']);
-    expect(headBar().querySelector('.session-pill-select')?.dataset.active).toBeUndefined();
+    expect(byClass('.session-cycle', 'button').hidden).toBe(true);
+    expect(pillIds(dashboard())).toEqual(['s1']);
+    expect(dashboard().querySelector('.session-pill-select')?.dataset.active).toBeUndefined();
 });
 
-it('re-reads the directory when Refresh is pressed', async () => {
+// T9 removed the manual Refresh BUTTON; this pins what replaced it as the contract: the
+// directory re-read itself. A rejected submit is one of the automatic paths (`run()`'s
+// failure branch calls `refreshSessions()`), so the reader gets the current server list
+// without ever being handed a ↻ to press.
+it('re-reads the directory automatically when a submit is rejected, with no refresh control', async () => {
     const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
 
     let listed = [first];
@@ -390,27 +471,34 @@ it('re-reads the directory when Refresh is pressed', async () => {
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions/s1') return json({ session: first });
         if (url === '/api/sessions' && method === undefined) return json({ sessions: listed });
+        if (url === '/api/sessions/s1/tasks' && method === 'POST')
+            return json({ error: { message: 'provider is offline' } }, 500);
         return undefined;
     });
 
+    localStorage.setItem(SESSION_KEY, 's1');
     await import('./main');
     await flush();
     await flush();
 
-    expect(pillIds(headBar())).toEqual(['s1']);
+    expect(pillIds(dashboard())).toEqual(['s1']);
 
     // The server gained a conversation while the page was open.
     listed = [first, snapshot({ id: 's9', turns: [doneTurn('from another tab')] })];
 
-    const refresh = byClass('.refresh-sessions', 'button');
-    refresh.click();
+    byClass('.composer-input', 'textarea').value = 'say hi';
+    byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
     await flush();
     await flush();
 
+    // Boot never lists on its own (the catalogue carries the sessions), so the ONE list read
+    // here is the automatic re-read the rejected run triggered.
     expect(calls.filter((call) => call.url === '/api/sessions' && call.method === undefined)).toHaveLength(1);
-    expect(pillIds(headBar())).toEqual(['s1', 's9']);
-    // The read finished, so the control is live again.
-    expect(refresh.disabled).toBe(false);
+    expect(pillIds(dashboard())).toEqual(['s1', 's9']);
+    // Nothing manual is left to press, and the create control is live again once the failed
+    // run released its lock.
+    expect(document.querySelector('.refresh-sessions')).toBeNull();
+    expect(headerNew().disabled).toBe(false);
 });
 
 it('shows a short hint when the selected harness has no conversation', async () => {
@@ -424,7 +512,7 @@ it('shows a short hint when the selected harness has no conversation', async () 
     await flush();
     await flush();
 
-    const bar = headBar();
+    const bar = dashboard();
     expect(pills(bar)).toHaveLength(0);
     expect(bar.querySelector('.session-pills-empty')?.textContent).toBe('No sessions yet.');
     // An empty strip is not announced as a list of nothing.
@@ -433,16 +521,17 @@ it('shows a short hint when the selected harness has no conversation', async () 
     expect(bar.textContent).not.toContain('Locked to');
 });
 
-// --- R2: the phone dialog carries the directory --------------------------
+// --- R3 (T9): the dialog carries the directory at EVERY width ------------
 //
-// jsdom has no `matchMedia`, so `isPhoneLayout()` is true in every test here: that is the
-// phone branch of `openHarnessDetails`, which is exactly what R2 asks for.
+// jsdom has no `matchMedia`, so every test above runs as the PHONE layout. `stubDesktop-
+// Viewport` answers the query the way a real desktop browser does, which is how the "same
+// dashboard at ≥861px" half of R3 is proved instead of assumed.
 
 const openDetails = (): void => {
     byClass('.harness-title-button', 'button').click();
 };
 
-it('puts the same pills, New and Refresh at the top of the Instruct dialog', async () => {
+it('puts the pills, the `+` and no refresh control at the top of the Instruct dialog', async () => {
     const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
     const second = snapshot({ id: 's2', harnessDefinition: descriptor() });
 
@@ -467,13 +556,13 @@ it('puts the same pills, New and Refresh at the top of the Instruct dialog', asy
     expect(dialog.contains(details)).toBe(true);
     expect(dialog.getAttribute('aria-modal')).toBe('true');
 
-    // Two strips exist while the dialog is open: the header one (hidden by CSS on a
-    // phone) and the dialog one. Both are the same factory's output.
-    expect(document.querySelectorAll('.session-pills-bar')).toHaveLength(2);
+    // T9: exactly one strip in the whole page — the dialog's. The header copy this test
+    // used to compare against is gone, so nothing needs a variant to be told apart.
+    expect(document.querySelectorAll('.session-pills-bar')).toHaveLength(1);
     const bar = byClass('.session-pills-bar-dialog', 'div');
     expect(dialog.contains(bar)).toBe(true);
 
-    // R2: the directory is the FIRST thing in the dialog, under its own caption — above
+    // R3: the directory is the FIRST thing in the dialog, under its own caption — above
     // the description/meta the dialog already carried.
     expect([...details.children].map((node) => node.className)).toEqual([
         'harness-details-section',
@@ -490,12 +579,62 @@ it('puts the same pills, New and Refresh at the top of the Instruct dialog', asy
     expect(details.querySelector('.harness-details-section')?.textContent).toBe('Sessions');
     expect(pillIds(bar)).toEqual(['s1', 's2']);
     expect(bar.querySelector('.session-pills')?.getAttribute('role')).toBe('list');
-    expect(bar.querySelector('.new-session')).not.toBeNull();
-    expect(bar.querySelector('.refresh-sessions')).not.toBeNull();
+    expect(bar.querySelector('.new-session')?.textContent).toBe('+');
+    expect(bar.querySelector('.refresh-sessions')).toBeNull();
     // The existing harness context is still below it, unchanged.
     expect(details.querySelector('.harness-details-description')?.textContent).toBe(
         'A general instruction-following agent.'
     );
+});
+
+// R3 (T9), the width the phone tests above cannot prove: with `matchMedia` answering like
+// a desktop browser, the header keeps the SAME two compact controls, no pill strip appears
+// under it, and the title button still opens the session dashboard with its pills.
+it('keeps the same compact header and the same dashboard at a desktop width', async () => {
+    const first = snapshot({ harnessDefinition: descriptor(), turns: [doneTurn('hello')] });
+    const second = snapshot({ id: 's2', harnessDefinition: descriptor() });
+
+    localStorage.setItem(SESSION_KEY, 's1');
+    stubDesktopViewport();
+
+    stubFetch((url) => {
+        if (url === '/api') return json(bootstrap({ sessions: [first, second] }));
+        if (url === '/api/models') return json({ models: ['m1'] });
+        if (url === '/api/sessions/s1') return json({ session: first });
+        return undefined;
+    });
+
+    await import('./main');
+    await flush();
+    await flush();
+
+    // The header row is byte-for-byte the phone row: title, cycler, `+`, id line — and the
+    // cycler is not hidden, because a desktop conversation is open.
+    expect([...byClass('.harness-title-row', 'div').children].map((node) => node.className)).toEqual([
+        'main-title',
+        'session-cycle',
+        'new-session session-new',
+        'harness-id'
+    ]);
+    const pill = byClass('.session-cycle', 'button');
+    expect(pill.hidden).toBe(false);
+    expect(pill.dataset.sessionId).toBe('s1');
+    expect(pill.getAttribute('aria-label')).toBe('Current session s1. Switch to the next session.');
+
+    // No directory strip anywhere in the header at this width either (R1).
+    expect(document.querySelector('.session-pills-bar-head')).toBeNull();
+    expect(byClass('.harness-head', 'header').querySelector('.session-pills')).toBeNull();
+
+    // And the dashboard behind the title behaves exactly like the phone's (R3).
+    openDetails();
+    await flush();
+
+    expect(document.querySelectorAll('.session-pills-bar')).toHaveLength(1);
+    const bar = byClass('.session-pills-bar-dialog', 'div');
+    expect(pillIds(bar)).toEqual(['s1', 's2']);
+    expect(bar.querySelector('.session-pill[data-session-id="s1"]')?.dataset.active).toBe('true');
+    expect(bar.querySelectorAll('.session-pill-delete')).toHaveLength(2);
+    expect(byClass('.session-pills-bar-dialog .new-session', 'button').textContent).toBe('+');
 });
 
 // --- the dialog's aggregate totals ---------------------------------------
@@ -648,6 +787,12 @@ it("keeps an open dialog's totals in step with a directory read, on the same nod
         if (url === '/api') return json(bootstrap({ sessions: listed }));
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions' && method === undefined) return json({ sessions: listed });
+        // T9: no session is open here, so the submit's create lands on the SAME s1 the
+        // directory already holds, and the rejected task is what fires the automatic
+        // directory re-read.
+        if (url === '/api/sessions' && method === 'POST') return json({ session: listed[0] });
+        if (url === '/api/sessions/s1/tasks' && method === 'POST')
+            return json({ error: { message: 'provider is offline' } }, 500);
         if (url === '/api/sessions/s1') return json({ session: listed[0] });
         return undefined;
     });
@@ -681,15 +826,16 @@ it("keeps an open dialog's totals in step with a directory read, on the same nod
         })
     ];
 
-    // The header strip's refresh is the enabled control (a strip created at open time is
-    // not repainted until the next `paintSessionActions`), and either one routes through
-    // the same `refreshSessions()` → `renderSessions()` painter.
-    byClass('.session-pills-bar-head .refresh-sessions', 'button').click();
+    // T9: with no Refresh control left, the automatic re-read is what keeps the dialog in
+    // step — a rejected run re-asks the server for the directory, and that read routes
+    // through the same `refreshSessions()` → `renderSessions()` painter.
+    byClass('.composer-input', 'textarea').value = 'bill me';
+    byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
     await flush();
     await flush();
 
     // Same node, same layer: only the figures were replaced, so the open dialog never
-    // flickers or loses the reader's place (`refreshHarnessDialog` would).
+    // flickers or loses the reader's place (a full body rebuild would).
     expect(byClass('.harness-details', 'div').querySelector('.harness-details-stats')).toBe(before);
     expect([...before?.querySelectorAll<HTMLElement>('.harness-details-stat') ?? []].map((node) => node.textContent))
         .toEqual(['2 threads', '1,000 input', '30.0s', '250 cache']);
@@ -744,15 +890,16 @@ it('opens a session from a dialog pill and closes the dialog, and deletes from t
     expect(document.querySelector('.dialog')).toBeNull();
     expect(localStorage.getItem(SESSION_KEY)).toBe('s2');
     expect(document.querySelector('.tile')?.textContent).toContain('second in');
-    expect(headBar().querySelector('.session-pill[data-session-id="s2"]')?.dataset.active).toBe('true');
+    // T9: the dismiss took the strip with it, so the assertion reopens the dashboard — and
+    // proves the rebuilt layer describes the conversation the reader switched TO.
+    expect(dashboard().querySelector('.session-pill[data-session-id="s2"]')?.dataset.active).toBe(
+        'true'
+    );
 
-    // R2: the dialog is rebuilt on every open, so the pill strip is rebuilt with it and
-    // shows the CURRENT selection. Deleting from a dialog pill is the same one-click path
-    // as from the header.
-    openDetails();
-    await flush();
-
-    const bar = byClass('.session-pills-bar-dialog', 'div');
+    // T9: the dashboard the reader is looking at is the one directory surface there is, and
+    // it repaints from the live projection on every mutation, so it already shows the
+    // CURRENT selection. Deleting from a dialog pill is the same one-click path it ever was.
+    const bar = dashboard();
     expect(bar.querySelector('.session-pill[data-session-id="s2"]')?.dataset.active).toBe('true');
     // T3/R1: the saved session on screen prints no header note, so the dialog repeats
     // none either — the removed frozen-session caption cannot come back through here.
@@ -765,7 +912,10 @@ it('opens a session from a dialog pill and closes the dialog, and deletes from t
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
         { url: '/api/sessions/s3', method: 'DELETE', body: undefined }
     ]);
-    expect(pillIds(headBar())).toEqual(['s1', 's2']);
+    // T9 leaves exactly one strip in the page, so the reopen returns the SAME live node the
+    // delete repainted — no header copy to fall out of step.
+    expect(pillIds(dashboard())).toEqual(['s1', 's2']);
+    expect(dashboard()).toBe(bar);
     expect(pillIds(bar)).toEqual(['s1', 's2']);
 });
 
@@ -779,6 +929,11 @@ it('drops the dialog strip when the dialog closes, so the painter only touches l
         if (url === '/api/models') return json({ models: ['m1'] });
         if (url === '/api/sessions/s1') return json({ session: first });
         if (url === '/api/sessions' && method === undefined) return json({ sessions: listed });
+        // T9: the automatic directory re-read is fired by a rejected run, so the submit's
+        // create and its task POST need answers (the create lands on the s1 on the server).
+        if (url === '/api/sessions' && method === 'POST') return json({ session: first });
+        if (url === '/api/sessions/s1/tasks' && method === 'POST')
+            return json({ error: { message: 'provider is offline' } }, 500);
         return undefined;
     });
 
@@ -788,24 +943,27 @@ it('drops the dialog strip when the dialog closes, so the painter only touches l
 
     openDetails();
     await flush();
-    expect(document.querySelectorAll('.session-pills-bar')).toHaveLength(2);
+    expect(document.querySelectorAll('.session-pills-bar')).toHaveLength(1);
 
     // Closing through the dialog's own control removes the adopted body with the layer.
     byClass('.dialog-close', 'button').click();
     await flush();
 
+    // T9: with the dialog gone there is NO strip left anywhere — the header keeps only the
+    // cycler and its `+`.
     expect(document.querySelector('.session-pills-bar-dialog')).toBeNull();
-    expect(document.querySelectorAll('.session-pills-bar')).toHaveLength(1);
+    expect(document.querySelectorAll('.session-pills-bar')).toHaveLength(0);
 
-    // The directory then changes (a conversation disappears on the server) and the
-    // header strip repaints. Painting only the LIVE bars is what keeps a closed dialog's
-    // detached strip from holding a ghost pill — or from throwing.
+    // The directory then changes (a conversation disappears on the server) and the next
+    // automatic re-read repaints. Painting only the LIVE bars is what keeps a closed
+    // dialog's detached strip from holding a ghost pill — or from throwing.
     listed = [first];
-    byClass('.refresh-sessions', 'button').click();
+    byClass('.composer-input', 'textarea').value = 'say hi';
+    byClass('.composer', 'form').dispatchEvent(new Event('submit', { cancelable: true, bubbles: true }));
     await flush();
     await flush();
 
-    expect(pillIds(headBar())).toEqual(['s1']);
+    expect(pillIds(dashboard())).toEqual(['s1']);
     expect(document.querySelectorAll('.session-pill')).toHaveLength(1);
 });
 

@@ -24,6 +24,7 @@ import type {
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { createHarnessRegistry } from './harnesses';
 import { ALL_PRESET_TEMPLATES, createWebSearchCatalogueEntry, createToolCatalogue } from './harnesses';
+import { AGENT_PROFILES, agentInstruction } from '../agents';
 import { SessionStore } from './sessions';
 import {
     HARNESS_DATABASE_DIRECTORY,
@@ -305,9 +306,11 @@ describe('R3b durable harness database', () => {
         const restored = second.registry.find('voiced');
 
         expect(restored?.agentInstructions).toEqual({ summarizer: 'Condense to one line.' });
+        // The override replaces ONLY the identity sentence, and both sections live in
+        // ONE entry: `agentInstruction()` joins them into a single string so the
+        // rebuilt factory seeds one system message (../agents/index.ts).
         expect(restored?.create(SETTINGS, () => undefined).agents.summarizer.instructions).toEqual([
-            'Condense to one line.',
-            'Guidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
+            'Condense to one line.\n\nGuidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
         ]);
     });
 
@@ -410,7 +413,12 @@ describe('R3b durable harness database', () => {
         expect(restored.harnessDefinition?.title).toBe('Scripted demo');
         // The scripted factory survives a metadata-only patch: messages are the
         // seeded scripted system transcript (the demo fixture does not run here).
-        expect(restored.messages.map((message) => message.role)).toEqual(['system', 'system']);
+        // ONE system message, because `agentInstruction()` joins the demo profile's
+        // identity sentence and guidelines into a single prompt (../agents/index.ts).
+        expect(restored.messages.map((message) => message.role)).toEqual(['system']);
+        expect(restored.messages).toEqual([
+            { role: 'system', content: agentInstruction(AGENT_PROFILES.demo) }
+        ]);
     });
 
     it('rebuilds a live session from its frozen record after an executable registry patch', () => {
@@ -457,8 +465,13 @@ describe('R3b durable harness database', () => {
             planner: SETTINGS.model,
             summarizer: SETTINGS.model
         });
-        // The frozen harness was rebuilt (not the patched registry entry).
-        expect(restored.messages.map((message) => message.role)).toEqual(['system', 'system']);
+        // The frozen harness was rebuilt (not the patched registry entry), and its
+        // primary's prompt is the frozen instruct profile joined into ONE system
+        // message (../agents/index.ts `agentInstruction`).
+        expect(restored.messages.map((message) => message.role)).toEqual(['system']);
+        expect(restored.messages).toEqual([
+            { role: 'system', content: agentInstruction(AGENT_PROFILES.instruct) }
+        ]);
     });
 
     it('isolates distinct roots and reuses one runtime per root', async () => {

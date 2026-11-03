@@ -257,7 +257,11 @@ it('does not poison the next session with the previous session thread ids (N1)',
     expect(conversations()).toEqual(['thread-1', 'thread-2']);
     expect(tiles().map((tile) => tile.dataset.turnId)).toEqual(['turn-1', 'turn-2']);
 
-    document.querySelector<HTMLButtonElement>('.session-pill-select[data-session-id="s2"]')?.click();
+    // T9: switching conversations goes through the dashboard behind the harness title.
+    byClass('.harness-title-button', 'button').click();
+    document
+        .querySelector<HTMLButtonElement>('.session-pills-bar-dialog .session-pill-select[data-session-id="s2"]')
+        ?.click();
     await flush(3);
 
     // Only s2's own conversation is on screen: the previous session's tiles and

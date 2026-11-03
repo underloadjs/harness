@@ -288,11 +288,13 @@ it('lists core tools in the global tools view, calls with the captured session a
         'Session-bound: runs in the playground’s own temporary session for instruct · session s1. The conversation you selected is untouched.'
     );
 
-    // R7: the temporary session is not adopted into the reader's chat. The pill strip has
-    // no entry for it, and no conversation was opened.
+    // R7: the temporary session is not adopted into the reader's chat. No pill appears
+    // anywhere, and no conversation was opened. (T9 moved the directory into the dashboard
+    // behind the title, which the DISABLED title button cannot open while the tools view
+    // owns the head — the empty-directory hint it used to assert is pinned in
+    // session-pills.test.ts, where the dashboard is reachable.)
     expect(document.querySelectorAll('.session-pill')).toHaveLength(0);
-    // T3/R1: the strip is empty for a harness with no conversation, and says so shortly.
-    expect(document.querySelector('.session-pills-empty')?.textContent).toBe('No sessions yet.');
+    expect(document.querySelector('.session-pills-bar-head')).toBeNull();
 
     // The raw structured result is intact …
     const output = document.querySelector('.tool-output .card-body')?.textContent ?? '';

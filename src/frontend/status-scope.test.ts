@@ -283,8 +283,11 @@ it('keeps the header neutral and the failure detail scoped when switching sessio
     expect(noteText()).toBe(FAILURE);
     expect(statusText()).toBe('idle');
 
-    // Another conversation: its own tiles, its own (empty) note.
-    byClass('.session-pill-select[data-session-id="s2"]', 'button').click();
+    // Another conversation: its own tiles, its own (empty) note. T9: the pills live in the
+    // dashboard behind the harness title, so switching goes through that layer (the press
+    // then dismisses it).
+    byClass('.harness-title-button', 'button').click();
+    byClass('.session-pills-bar-dialog .session-pill-select[data-session-id="s2"]', 'button').click();
     await flush();
     await flush();
 
@@ -296,7 +299,8 @@ it('keeps the header neutral and the failure detail scoped when switching sessio
 
     // Back to the failed session: the detail belongs to it and comes back with it,
     // still without touching the header.
-    byClass('.session-pill-select[data-session-id="s1"]', 'button').click();
+    byClass('.harness-title-button', 'button').click();
+    byClass('.session-pills-bar-dialog .session-pill-select[data-session-id="s1"]', 'button').click();
     await flush();
     await flush();
 

@@ -1,36 +1,39 @@
-// T7: the phone session CYCLER next to the Instruct title (main.ts `sessionCycle`).
+// T7 + T9: the session CYCLER beside the Instruct title (main.ts `sessionCycle`) and the
+// `+` next to it (`sessionNew`) — the header's whole session surface, at EVERY width.
 //
 // Why it exists (user feedback, verbatim): "Lower screen (mobile) this is fine but needed
 // to highlight which session is being viewed, but I want a pill next to the instruct button
 // here … clicking it will rotate through the session available. There is no need for delete
 // button in this mode. If i want to delete, I click on Instruct and delete it from the
-// proper dashboard."
+// proper dashboard." T9 then asked for the same compact header on the desktop, a `+` beside
+// the cycler instead of `+ New`, and the dashboard (with deletion) behind `Instruct`.
 //
-// Under 861px the header strip is `display:none` (`.session-pills-bar-head`, styles.css) and
-// the directory moves INSIDE the Instruct dialog, so a phone reader has no on-screen answer
-// to "which conversation am I looking at?". This file pins the small surface that answers it:
+// The header pill strip is gone at every width (`.session-pills-bar-head` no longer exists),
+// so this file pins the small surface that answers "which conversation am I looking at?":
 //   - PLACEMENT: one real <button> in `.harness-title-row`, a SIBLING of the `h1` — never
-//     nested in `.harness-title-button`, which is itself a button and owns the dialog;
+//     nested in `.harness-title-button`, which is itself a button and owns the dialog — with
+//     the `+` immediately after it;
 //   - PROJECTION: it reads `sessionDirectory()`, the very list `renderSessions()` paints, so
-//     the strip, the dialog copy and the pill can never disagree about what exists;
+//     the dashboard and the pill can never disagree about what exists;
 //   - PAINT: eight characters only (the harness, the status and the full uuid are tooltip
 //     facts), the name `Current session <id>. Switch to the next session.`, and `hidden`
 //     whenever no conversation is open — repainted from `renderSessions()`, which every
-//     mutation path (open / new / delete / refresh / a snapshot frame) already calls;
+//     mutation path (open / new / delete / an automatic directory re-read / a snapshot frame)
+//     already calls;
 //   - CYCLE: the next entry of that projection, wrapping last → first, starting at the FIRST
 //     entry when the open conversation is not in the list, and doing NOTHING when the
 //     directory is empty. Every press is exactly one `openSession` — a view change, never a
 //     write (R4);
 //   - LOCK: `submitting || running`, the strip's own "can I switch" rule, because the pill
 //     calls the same `openSession` — and the tooltip says why rather than going quiet;
-//   - NO DELETE here. The full dashboard (pills + `×` + New + Refresh) stays behind the
-//     title button, where the ACTIVE pill is both painted (`data-active`) and announced
-//     (`aria-current`) and follows the pointer.
+//   - NO DELETE here. The full dashboard (pills + `×` + `+`, and NO refresh control since
+//     T9/R4) stays behind the title button, where the ACTIVE pill is both painted
+//     (`data-active`) and announced (`aria-current`) and follows the pointer.
 //
-// Desktop keeps the strip: the base `.session-cycle` rule is `display: none` and ONLY the
-// `@media (max-width: 860px)` block shows it. jsdom computes no layout, so the stylesheet
-// half is read as text — the discipline of session-control-style.test.ts and
-// compact-ui.test.ts.
+// jsdom computes no layout, so the stylesheet half is read as text — the discipline of
+// session-control-style.test.ts and compact-ui.test.ts. The directory half of those reads
+// goes through the dialog behind the title (`dashboard()` below), because that is the only
+// place it exists now.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts session-cycle.test.ts
 
@@ -155,16 +158,51 @@ const byClass = <K extends keyof HTMLElementTagNameMap>(
 // The pill, and the surfaces it has to agree with.
 const cycle = (): HTMLButtonElement => byClass('.session-cycle', 'button');
 const cycleId = (): string | undefined => cycle().querySelector('.session-cycle-id')?.textContent;
-const headBar = (): HTMLElement => byClass('.session-pills-bar-head', 'div');
+// R2 (T9): the `+` that sits immediately after the cycler in the same row.
+const headerNew = (): HTMLButtonElement => byClass('.harness-title-row .new-session', 'button');
+// T9: the directory is the Sessions section of the dialog behind the title, so "does the
+// strip agree with the pill?" means "open the dashboard, read it, and put the layer away".
+// Neither gesture touches the pointer or the transcript, so the walk stays deterministic.
+const dashboard = (): HTMLElement => {
+    if (document.querySelector('.session-pills-bar-dialog') === null) {
+        byClass('.harness-title-button', 'button').click();
+    }
+
+    return byClass('.session-pills-bar-dialog', 'div');
+};
+// Scoped to the SESSION layer: a deck dialog may be stacked, and the first `.dialog-close`
+// in the document would then belong to the other one.
+const closeDashboard = (): void => {
+    const panel = document.querySelector('.session-pills-bar-dialog')?.closest('.dialog');
+    panel?.querySelector<HTMLButtonElement>('.dialog-close')?.click();
+};
+const readActivePills = (): (string | undefined)[] => {
+    const ids = activePillIds(dashboard());
+    closeDashboard();
+    return ids;
+};
 const dialogBar = (): HTMLElement => byClass('.session-pills-bar-dialog', 'div');
 const openDetails = (): void => {
     byClass('.harness-title-button', 'button').click();
 };
 // The strip's own "which one is open" marker, read the way the stylesheet reads it.
-const activePillIds = (root: ParentNode = document): (string | undefined)[] =>
-    [...root.querySelectorAll<HTMLElement>('.session-pill[data-active="true"]')].map(
+function activePillIds(root: ParentNode = document): (string | undefined)[] {
+    return [...root.querySelectorAll<HTMLElement>('.session-pill[data-active="true"]')].map(
         (node) => node.dataset.sessionId
     );
+}
+
+// T9: there is no Refresh control any more, so a test that needs the page to re-read the
+// server's CURRENT directory fires one of the automatic paths instead — a rejected submit,
+// whose failure branch in `run()` calls `refreshSessions()`.
+const rereadDirectory = async (): Promise<void> => {
+    byClass('.composer-input', 'textarea').value = 'say hi';
+    byClass('.composer', 'form').dispatchEvent(
+        new Event('submit', { cancelable: true, bubbles: true })
+    );
+    await flush();
+    await flush();
+};
 
 // Reads of a conversation RECORD — i.e. exactly the `openSession` calls, in order. Neither
 // `/api/models` (the provider list boot always asks for) nor `/api/sessions` (the directory
@@ -203,7 +241,7 @@ afterEach(() => {
     vi.unstubAllGlobals();
 });
 
-describe('the phone session cycler (T7)', () => {
+describe('the header session cycler and its `+` (T7/T9)', () => {
     it('sits beside the Instruct title as one sibling button, with no delete affordance', async () => {
         localStorage.setItem(SESSION_KEY, 's1');
         stubFetch(routeDirectory);
@@ -222,11 +260,20 @@ describe('the phone session cycler (T7)', () => {
         expect([...(pill.parentElement?.children ?? [])].map((node) => node.className)).toEqual([
             'main-title',
             'session-cycle',
+            'new-session session-new',
             'harness-id'
         ]);
         expect(byClass('.harness-title-button', 'button').contains(pill)).toBe(false);
         expect(pill.previousElementSibling?.className).toBe('main-title');
-        expect(pill.nextElementSibling?.className).toBe('harness-id');
+        // R2 (T9): the create control is the very next item, so the two read as one group.
+        expect(pill.nextElementSibling).toBe(headerNew());
+        expect(headerNew().textContent).toBe('+');
+        expect(headerNew().getAttribute('aria-label')).toBe('New session');
+        expect(headerNew().title).toBe('New session');
+        expect(headerNew().parentElement?.className).toBe('harness-title-row');
+        // R1 (T9): no directory strip anywhere in the header.
+        expect(byClass('.harness-head', 'header').querySelector('.session-pills')).toBeNull();
+        expect(document.querySelector('.session-pills-bar-head')).toBeNull();
 
         // Its whole content is the id plus a decorative rotation mark: NO delete button, NO
         // nested control of any kind. Deletion stays in the dialog's dashboard.
@@ -252,7 +299,7 @@ describe('the phone session cycler (T7)', () => {
         expect(pill.disabled).toBe(false);
 
         // And it agrees with the directory it was projected from.
-        expect(activePillIds(headBar())).toEqual(['s1']);
+        expect(readActivePills()).toEqual(['s1']);
     });
 
     it('shows eight characters only, with the harness, status and uuid kept in the tooltip', async () => {
@@ -313,8 +360,11 @@ describe('the phone session cycler (T7)', () => {
         expect(pill.hasAttribute('title')).toBe(false);
         expect(pill.disabled).toBe(false);
 
-        // Opening a conversation repaints it — no reload, no separate pass.
-        byClass('.session-pill-select[data-session-id="s1"]', 'button').click();
+        // Opening a conversation repaints it — no reload, no separate pass. T9: that pill is
+        // in the dashboard behind the title, so reaching it means opening that layer (which
+        // the press then dismisses).
+        dashboard();
+        byClass('.session-pills-bar-dialog .session-pill-select[data-session-id="s1"]', 'button').click();
         await flush();
         await flush();
 
@@ -323,9 +373,11 @@ describe('the phone session cycler (T7)', () => {
         expect(pill.dataset.sessionId).toBe('s1');
         expect(pill.getAttribute('aria-label')).toBe('Current session s1. Switch to the next session.');
 
-        // `+ New` (which forgets the conversation without deleting anything) hides it again:
-        // the pill can only ever name a conversation that is actually on screen.
-        byClass('.new-session', 'button').click();
+        // The header `+` — the compact create control R2 (T9) put beside the cycler — forgets
+        // the conversation without deleting anything and hides the pill again, WITHOUT
+        // opening the dashboard. The pill can only ever name a conversation on screen.
+        expect(document.querySelector('.dialog')).toBeNull();
+        headerNew().click();
         await flush();
 
         expect(pill.hidden).toBe(true);
@@ -356,7 +408,7 @@ describe('the phone session cycler (T7)', () => {
         expect(cycleId()).toBe('s2');
         expect(pill.getAttribute('aria-label')).toBe('Current session s2. Switch to the next session.');
         expect(localStorage.getItem(SESSION_KEY)).toBe('s2');
-        expect(activePillIds(headBar())).toEqual(['s2']);
+        expect(readActivePills()).toEqual(['s2']);
         expect(document.querySelector('.tile')?.textContent).toContain('second in');
 
         // s2 → s3.
@@ -366,7 +418,7 @@ describe('the phone session cycler (T7)', () => {
 
         expect(pill.dataset.sessionId).toBe('s3');
         expect(localStorage.getItem(SESSION_KEY)).toBe('s3');
-        expect(activePillIds(headBar())).toEqual(['s3']);
+        expect(readActivePills()).toEqual(['s3']);
         expect(document.querySelector('.tile')?.textContent).toContain('third in');
 
         // s3 → s1: the walk WRAPS instead of running off the end of the list.
@@ -376,7 +428,7 @@ describe('the phone session cycler (T7)', () => {
 
         expect(pill.dataset.sessionId).toBe('s1');
         expect(localStorage.getItem(SESSION_KEY)).toBe('s1');
-        expect(activePillIds(headBar())).toEqual(['s1']);
+        expect(readActivePills()).toEqual(['s1']);
         expect(document.querySelector('.tile')?.textContent).toContain('first in');
 
         // Exactly one record GET per hop, in directory order, and no write of any kind:
@@ -400,6 +452,9 @@ describe('the phone session cycler (T7)', () => {
             if (url === '/api') return json(bootstrap({ sessions: listed }));
             if (url === '/api/models') return json({ models: ['m1'] });
             if (url === '/api/sessions' && method === undefined) return json({ sessions: listed });
+            // T9: the rejected task is what fires the automatic directory re-read.
+            if (url === '/api/sessions/s1/tasks' && method === 'POST')
+                return json({ error: { message: 'provider is offline' } }, 500);
             const record = recordOf(url);
             return record === undefined ? undefined : json({ session: record });
         });
@@ -411,15 +466,13 @@ describe('the phone session cycler (T7)', () => {
         // Another tab replaced the directory while this page was open: s1 is gone from the
         // list, but the conversation itself stays on screen — so the pill still names it.
         listed = directory().slice(1);
-        byClass('.refresh-sessions', 'button').click();
-        await flush();
-        await flush();
+        await rereadDirectory();
 
         const pill = cycle();
         expect(pill.hidden).toBe(false);
         expect(pill.dataset.sessionId).toBe('s1');
         expect(pill.title).toBe('instruct · idle · s1 · click to switch');
-        expect(activePillIds(headBar())).toEqual([]);
+        expect(readActivePills()).toEqual([]);
 
         // An id the list does not contain resolves to `index === -1`, and the handler turns
         // that into the FIRST entry rather than wrapping past the end.
@@ -429,7 +482,7 @@ describe('the phone session cycler (T7)', () => {
 
         expect(opened(calls)).toEqual(['s1', 's2']);
         expect(pill.dataset.sessionId).toBe('s2');
-        expect(activePillIds(headBar())).toEqual(['s2']);
+        expect(readActivePills()).toEqual(['s2']);
     });
 
     it('does nothing when the directory is empty', async () => {
@@ -441,6 +494,9 @@ describe('the phone session cycler (T7)', () => {
             if (url === '/api/models') return json({ models: ['m1'] });
             if (url === '/api/sessions' && method === undefined) return json({ sessions: listed });
             if (url === '/api/sessions/s1') return json({ session: listed[0] });
+            // T9: the rejected task is what fires the automatic directory re-read.
+            if (url === '/api/sessions/s1/tasks' && method === 'POST')
+                return json({ error: { message: 'provider is offline' } }, 500);
             return undefined;
         });
 
@@ -450,12 +506,12 @@ describe('the phone session cycler (T7)', () => {
 
         // The conversation the reader is looking at was deleted elsewhere.
         listed = [];
-        byClass('.refresh-sessions', 'button').click();
-        await flush();
-        await flush();
+        await rereadDirectory();
 
-        expect(headBar().querySelector('.session-pills-empty')?.textContent).toBe('No sessions yet.');
-        expect(activePillIds(headBar())).toEqual([]);
+        const bar = dashboard();
+        expect(bar.querySelector('.session-pills-empty')?.textContent).toBe('No sessions yet.');
+        expect(activePillIds(bar)).toEqual([]);
+        closeDashboard();
 
         const pill = cycle();
         // It still names what is on screen (the record this instance was built from), and a
@@ -495,12 +551,20 @@ describe('the phone session cycler (T7)', () => {
         expect(pill.hidden).toBe(false);
         expect(pill.dataset.sessionId).toBe('s1');
 
-        // One click on the strip's `×` removes the conversation THAT pill was naming. The
-        // delete is permanent (the server drops the record), so the cycler has nothing left
-        // to name: it goes hidden with its attributes, and a press cannot resurrect it.
-        byClass('.session-pill[data-session-id="s1"] .session-pill-delete', 'button').click();
+        // One click on the dashboard's `×` removes the conversation THAT pill was naming.
+        // T9: the `×` exists only behind the title button, at every width. The delete is
+        // permanent (the server drops the record), so the cycler has nothing left to name:
+        // it goes hidden with its attributes, and a press cannot resurrect it.
+        dashboard();
+        byClass(
+            '.session-pills-bar-dialog .session-pill[data-session-id="s1"] .session-pill-delete',
+            'button'
+        ).click();
         await flush();
         await flush();
+        // A delete leaves the layer open (only OPENING a conversation dismisses it).
+        expect(document.querySelector('.dialog')).not.toBeNull();
+        closeDashboard();
 
         expect(pill.hidden).toBe(true);
         expect(pill.dataset.sessionId).toBeUndefined();
@@ -519,7 +583,7 @@ describe('the phone session cycler (T7)', () => {
         expect(pill.hidden).toBe(false);
         expect(pill.dataset.sessionId).toBe('s2');
         expect(localStorage.getItem(SESSION_KEY)).toBe('s2');
-        expect(activePillIds(headBar())).toEqual(['s2']);
+        expect(readActivePills()).toEqual(['s2']);
         expect(pill.disabled).toBe(false);
     });
 
@@ -556,18 +620,22 @@ describe('the phone session cycler (T7)', () => {
         // network layer; the answer never arrives, which is what holds the lock open.
         await flush();
 
-        const select = headBar().querySelector<HTMLElement>('.session-pill-select');
-
         // `paintControls()` owns this lock and runs in the same synchronous paint that
         // disables a strip pill, so the two surfaces can never disagree about whether a
         // switch is possible — and the tooltip explains the lock instead of only muting it.
+        // T9: the strip that proves the other half of that sentence is the dashboard.
         expect(taskRequests).toBe(1);
         expect(pill.disabled).toBe(true);
         expect(pill.title).toBe('instruct · idle · s1 · wait for the run to finish before switching');
-        expect(headBar().querySelector('.session-pill-select')?.disabled).toBe(true);
+        const bar = dashboard();
+        expect(bar.querySelector<HTMLElement>('.session-pill-select')?.disabled).toBe(true);
+        // R2 (T9): the header `+` carries the same enqueue lock, so the reader cannot start a
+        // second conversation while the first one's task is still being posted.
+        expect(headerNew().disabled).toBe(true);
+        closeDashboard();
     });
 
-    it('leaves the Instruct dialog highlighting the conversation the pill switched to', async () => {
+    it('leaves the session dashboard highlighting the conversation the cycler switched to', async () => {
         localStorage.setItem(SESSION_KEY, 's1');
         stubFetch(routeDirectory);
 
@@ -578,9 +646,9 @@ describe('the phone session cycler (T7)', () => {
         openDetails();
         await flush();
 
-        // The dialog carries the same strip on a phone, and its ACTIVE pill is both painted
-        // (styles.css keys the accent frame off `.session-pill[data-active='true']`) and
-        // ANNOUNCED (`aria-current` on the open button, written under exactly the same
+        // T9: this IS the directory — the same strip, at every width — and its ACTIVE pill is
+        // both painted (styles.css keys the accent frame off `.session-pill[data-active='true']`)
+        // and ANNOUNCED (`aria-current` on the open button, written under exactly the same
         // condition as `data-active`).
         const before = dialogBar();
         const s1 = before.querySelector<HTMLElement>('.session-pill[data-session-id="s1"] .session-pill-select');
@@ -618,11 +686,11 @@ describe('the phone session cycler (T7)', () => {
             )
         ).toBe(false);
 
-        // Deletion is still where the user asked for it: three pills, each with its `×`, plus
-        // New and Refresh. The phone pill supplements this dashboard, it never replaces it.
+        // R3 (T9): deletion is still where the user asked for it — three pills, each with its
+        // `×`, plus the dashboard's own `+`. And R4: no refresh control anywhere.
         expect(after.querySelectorAll('.session-pill-delete')).toHaveLength(3);
-        expect(after.querySelector('.new-session')).not.toBeNull();
-        expect(after.querySelector('.refresh-sessions')).not.toBeNull();
+        expect(after.querySelector('.new-session')?.textContent).toBe('+');
+        expect(after.querySelector('.refresh-sessions')).toBeNull();
     });
 });
 
@@ -684,44 +752,51 @@ const mediaBlockOf = (query: string): string => {
     throw new Error(`unbalanced media block for ${query}`);
 };
 
-describe('the phone cycler stylesheet (T7)', () => {
-    it('is hidden by default, so desktop keeps the full pill strip', () => {
-        // The assumption this file protects: the cycler is a PHONE addition. The base rule is
-        // the only visibility decision outside the phone block, so ≥861px keeps the strip
-        // under the header exactly as it was.
-        expect(blockOf('.session-cycle {').trim()).toBe('display: none;');
-        // Exactly two rules size this control: the base hide and the phone opt-in.
-        expect(rules.match(/\.session-cycle \{/g)).toHaveLength(2);
+describe('the header session controls stylesheet (T7/T9)', () => {
+    it('paints one compact cycler and `+` for every width, with no header strip to hide', () => {
+        // The assumption T9 replaces: the cycler used to be a PHONE addition behind a base
+        // `display: none`. Its box now lives in the shared BASE rule, so desktop and phone
+        // get the same control and no breakpoint decides visibility.
+        const compact = blockOf('.session-cycle,\n.session-new {');
+        expect(compact).toContain('display: inline-flex');
+        // Exactly one rule still declares `.session-cycle` on its own, and it is the width
+        // ceiling — not a visibility flip.
+        expect(rules.match(/\.session-cycle \{/g)).toHaveLength(1);
 
-        // The strip it supplements is still a strip, and is still the thing a phone hides.
+        // The alignment the phone block used to own is now the row's base rule, so the two
+        // bordered controls line up with the title at every width.
+        expect(blockOf('.harness-title-row {')).toContain('align-items: center');
+
+        // R1 (T9): the desktop header strip is gone, so its class may not come back as a rule
+        // anywhere — base or phone.
+        expect(rules).not.toContain('.session-pills-bar-head');
+        const phone = mediaBlockOf('(max-width: 860px)');
+        expect(phone).not.toContain('.session-pills-bar');
+        expect(phone).not.toContain('.session-cycle');
+        expect(phone).not.toContain('.session-new');
+
+        // The strip that survives is the dashboard's, and it is still a wrapping flex row.
         expect(blockOf('.session-pills-bar {')).toContain('display: flex');
-        expect(mediaBlockOf('(max-width: 860px)')).toContain(
-            '.session-pills-bar-head {\n        display: none;\n    }'
-        );
+        // R4 (T9): the manual refresh control is gone from the stylesheet as well as the DOM.
+        expect(rules).not.toContain('.refresh-sessions');
     });
 
-    it('shows one compact accent pill inside the phone breakpoint only', () => {
-        const phone = mediaBlockOf('(max-width: 860px)');
-
-        // The row the user pointed at ("a pill next to the instruct button here").
-        expect(phone).toContain('.session-cycle {\n        display: inline-flex;');
-
-        const compact = blockIn(phone, '.session-cycle {');
+    it('gives the cycler and the `+` one matched box, differentiated only by fill', () => {
+        const compact = blockOf('.session-cycle,\n.session-new {');
         for (const declaration of [
             'align-items: center',
+            'justify-content: center',
             'gap: 4px',
-            // A fixed, small flex item beside a title that stays free to ellipsize: the pill
-            // can push the title, never the other way round, and it never wraps to a second
-            // line. `42vw` is the ceiling that leaves the title the rest of the row.
+            // A fixed, small flex item beside a title that stays free to ellipsize: the
+            // controls can push the title, never the other way round, and they never wrap to
+            // a second line.
             'flex: 0 0 auto',
-            'max-width: 42vw',
             'padding: 3px 9px',
-            // The strip's ACTIVE-pill vocabulary (accent frame + soft fill), so this control
+            // The strip's ACTIVE-pill vocabulary (accent frame + soft fill), so the cycler
             // reads as "the conversation in view" rather than as one more header button.
             'border: 1px solid var(--accent)',
-            // Same control radius as every other button/chip (`--radius-sm`), so the phone
-            // cycle control matches the session strip it replaces instead of reading as a
-            // third capsule shape in the header.
+            // The same control radius as every other button/chip (`--radius-sm`), so the pair
+            // matches the dashboard strip it replaced instead of adding a new shape.
             'border-radius: var(--radius-sm)',
             'background: var(--accent-soft)',
             'color: var(--text)',
@@ -733,15 +808,61 @@ describe('the phone cycler stylesheet (T7)', () => {
             expect(compact).toContain(declaration);
         }
 
-        // Hover confirms the press, focus is the app's accent ring, and a locked control
-        // reads locked (the guard `paintSessionCycle` paints from `submitting || running`).
-        expect(blockIn(phone, '.session-cycle:hover:not(:disabled) {')).toContain(
+        // `42vw` is the ceiling that leaves the title the rest of the row, and it belongs to
+        // the text-carrying control only (the `+` is content-sized).
+        expect(blockOf('.session-cycle {')).toContain('max-width: 42vw');
+
+        // R2 (T4): the two controls must be the same size IN FACT, not only in look. The
+        // shared rule is the single source of every box metric, and the `+` rule may not
+        // restate any of them — a `font-size` or `line-height` override (the 13px this
+        // contract used to pin) moves the intrinsic height of one control away from the
+        // other and reopens the size mismatch the user objected to.
+        const plus = blockIn(rules, '.session-new {\n    min-width');
+        for (const metric of [
+            'font-size',
+            'line-height',
+            'padding',
+            'border-radius',
+            'border-width',
+            'height',
+            'min-height',
+            'gap',
+            'letter-spacing'
+        ]) {
+            expect(plus).not.toContain(`${metric}:`);
+        }
+        // The metrics both controls therefore inherit from ONE declaration each.
+        for (const declaration of [
+            'font-size: 11px',
+            'line-height: 1.4',
+            'padding: 3px 9px',
+            'border: 1px solid var(--accent)',
+            'border-radius: var(--radius-sm)'
+        ]) {
+            expect(compact).toContain(declaration);
+        }
+
+        // Only the paint, and a minimum width for a single glyph, belong to the `+`: same
+        // box, neutral frame, so it matches its neighbour without claiming the "current
+        // session" highlight the cycler carries.
+        expect(plus).toContain('min-width: 26px');
+        expect(plus).toContain('border-color: var(--border-strong)');
+        expect(plus).toContain('background: var(--bg-elevated)');
+        expect(blockOf('.session-new:hover:not(:disabled) {')).toContain(
+            'border-color: var(--accent)'
+        );
+
+        // Hover confirms the press, focus is the app's accent ring for BOTH controls (and
+        // therefore an IDENTICAL ring — same width, style, colour and offset — on the `+`),
+        // and a locked control reads locked (the guards `paintSessionCycle` and
+        // `paintSessionActions` paint from `submitting || running` / the busy contract).
+        expect(blockOf('.session-cycle:hover:not(:disabled) {')).toContain(
             'background: var(--accent)'
         );
-        expect(blockIn(phone, '.session-cycle:focus-visible {')).toContain(
-            'outline: 2px solid var(--accent)'
-        );
-        const disabled = blockIn(phone, '.session-cycle:disabled {');
+        const focus = blockOf('.session-cycle:focus-visible,\n.session-new:focus-visible {');
+        expect(focus).toContain('outline: 2px solid var(--accent)');
+        expect(focus).toContain('outline-offset: 2px');
+        const disabled = blockOf('.session-cycle:disabled,\n.session-new:disabled {');
         expect(disabled).toContain('cursor: not-allowed');
         expect(disabled).toContain('border-color: var(--border)');
 
@@ -753,7 +874,7 @@ describe('the phone cycler stylesheet (T7)', () => {
         expect(id).toContain('white-space: nowrap');
         expect(blockOf('.session-cycle-glyph {')).toContain('color: var(--muted)');
 
-        // No `×` lives in this control, so no destructive styling may exist for one either.
+        // No `×` lives in the header, so no destructive styling may exist for one either.
         expect(rules).not.toContain('.session-cycle-delete');
         expect(rules).not.toContain('.session-cycle-remove');
     });

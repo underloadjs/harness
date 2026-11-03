@@ -3046,8 +3046,11 @@ read-only document, the editor, and the unreadable-thread open).
 
 `src/agents/` is the trusted catalogue: one `AgentProfile` per agent with `name`,
 `title`, `description`, `instruction`, and `guidelines`. `agentInstruction()`
-composes the profile into the seeded system messages (`[instruction, 'Guidelines:\n- …']`),
-and the application builds agents with `agent({ model, instruction: agentInstruction(profile), provider })`.
+composes the profile into ONE system prompt — `` `${instruction}\n\nGuidelines:\n- …` `` —
+because several OpenAI-compatible gateways accept only a single system turn, so an
+`[instruction, guidelines]` pair used to seed two `system` messages and silently lost
+the policy on those models. The application builds agents with
+`agent({ model, instruction: agentInstruction(profile), provider })`.
 Nothing in a profile is secret, and a client cannot supply one.
 
 `src/harnesses/registry.ts` is the in-memory harness registry shared by the store and

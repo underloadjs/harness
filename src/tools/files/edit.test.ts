@@ -7,11 +7,18 @@
 // so a partial assert would test nothing.
 //
 // The batch guarantees are the new part:
-//   - all edits are validated and every resolved target must be unique BEFORE any
-//     read;
+//   - every edit is validated (shape, non-empty oldString, distinct strings, no NUL)
+//     BEFORE any read;
+//   - entries are grouped by FILE IDENTITY (./identity.ts), so several entries may
+//     name one file — the same path twice, two case spellings on Windows, or a
+//     symlink alias on any platform. They are applied in ARRAY order, each matched
+//     against the text the previous one produced;
 //   - every file is then read and match-checked BEFORE the first write, so a
-//     failure on the LAST entry leaves the FIRST file untouched;
-//   - the result is ordered and reports replacements + resulting byte size.
+//     failure on the LAST entry leaves the FIRST file untouched, and each distinct
+//     file is written exactly ONCE with its final text;
+//   - the result is one entry per requested edit, in request order, naming the path
+//     that entry asked for and reporting replacements + the file's final byte size
+//     (entries sharing a file therefore report the same size).
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import {
@@ -146,9 +153,10 @@ describe('edit', () => {
 
     it('applies several entries that name one file, in array order', async () => {
         // CURRENT contract: one edit per file is no longer a rule. Two entries may name
-        // the same file, they are applied in ARRAY order, and each result entry reports
-        // the bytes that file had after ITS OWN edit. (Aligned with the shipped
-        // implementation; an earlier revision rejected the batch outright.)
+        // the same file, they are applied in ARRAY order, each matched against the text
+        // the previous one produced, and the file is written ONCE with the final text.
+        // (Aligned with the shipped implementation; an earlier revision rejected the
+        // batch outright.)
         const path = await seed('duplicate.txt', 'alpha\nbeta\n');
 
         await expect(
@@ -192,31 +200,42 @@ describe('edit', () => {
             return;
         }
 
+        // Linux keeps the two spellings apart, so `other` below is a SECOND file: both
+        // entries then name different identities and each result reports the bytes of
+        // the file that entry named. `lower` still holds the text seeded above, so its
+        // oldString comes from that text.
         const other = await seed('ALIAS.TXT', 'other\n');
 
         await expect(
             edit([
-                { path: lower, oldString: 'same', newString: 'one' },
+                { path: lower, oldString: 'alpha', newString: 'one' },
                 { path: other, oldString: 'other', newString: 'two' }
             ])
         ).resolves.toEqual([
-            { path: lower, replacements: 1, bytes: Buffer.byteLength('one\n', 'utf8') },
+            { path: lower, replacements: 1, bytes: Buffer.byteLength('one\nbeta\n', 'utf8') },
             { path: other, replacements: 1, bytes: Buffer.byteLength('two\n', 'utf8') }
         ]);
-        await expect(readTextFile(lower, 'utf8')).resolves.toBe('one\n');
+        await expect(readTextFile(lower, 'utf8')).resolves.toBe('one\nbeta\n');
         await expect(readTextFile(other, 'utf8')).resolves.toBe('two\n');
     });
 
-    it('rejects a second spelling that reaches the file through a symlink', async () => {
+    it('applies two spellings that reach one file through a symlink as one file', async () => {
         // Creating a symlink is privileged on Windows (Developer Mode or elevated),
-        // so the guard is "could we create it", not the platform name.
-        const real = await seed('linked/target.txt', 'original\n');
+        // so the guard is "could we create it", not the platform name. Where the link
+        // cannot be created there is nothing to prove, so the fixture is asserted
+        // untouched and the case ends.
+        //
+        // CURRENT contract (T20): a symlink alias is no longer a rejected duplicate.
+        // realpath() collapses `linked/target.txt` and `linked-alias/target.txt` onto
+        // one identity (./identity.ts), so both entries are ONE file, applied in array
+        // order, written once.
+        const real = await seed('linked/target.txt', 'alpha\nbeta\n');
         const alias = join(workdir, 'linked-alias');
 
         try {
             await symlink(join(workdir, 'linked'), alias, 'dir');
         } catch {
-            await expect(readTextFile(real, 'utf8')).resolves.toBe('original\n');
+            await expect(readTextFile(real, 'utf8')).resolves.toBe('alpha\nbeta\n');
             return;
         }
 
@@ -224,14 +243,24 @@ describe('edit', () => {
 
         await expect(
             edit([
-                { path: real, oldString: 'original', newString: 'one' },
-                { path: throughLink, oldString: 'original', newString: 'two' }
+                { path: real, oldString: 'alpha', newString: 'one' },
+                // 'one\nbeta' exists only in the text the FIRST entry produced, so
+                // matching it through the alias proves the two spellings are one file
+                // with a defined order rather than two independent writes.
+                { path: throughLink, oldString: 'one\nbeta', newString: 'two' }
             ])
-        ).rejects.toThrow(
-            `edit received the same target path twice (${throughLink}); make one edit per file per call.`
-        );
+        ).resolves.toEqual([
+            // One identity, so one final byte count carried by both entries; each entry
+            // still names the path it asked for (identity is for comparing, never for
+            // reporting).
+            { path: real, replacements: 1, bytes: Buffer.byteLength('two\n', 'utf8') },
+            { path: throughLink, replacements: 1, bytes: Buffer.byteLength('two\n', 'utf8') }
+        ]);
 
-        await expect(readTextFile(real, 'utf8')).resolves.toBe('original\n');
+        // Written exactly once, through the first-appearance spelling; reading through
+        // the alias shows the same bytes, so no second file appeared beside it.
+        await expect(readTextFile(real, 'utf8')).resolves.toBe('two\n');
+        await expect(readTextFile(throughLink, 'utf8')).resolves.toBe('two\n');
     });
 
     it('rejects an empty oldString, a no-op edit, and a non-boolean replaceAll', async () => {

@@ -84,12 +84,24 @@ export const agentProfile = (name: string): AgentProfile => {
 export const isAgentProfileName = (name: string): name is AgentProfileName =>
     Object.prototype.hasOwnProperty.call(AGENT_PROFILES, name);
 
-// Build the system messages for an agent: the identity instruction first, then one
-// composed guidelines block. A single helper means a guideline added to a profile
-// reaches the runtime automatically — the definitions ARE the prompt, not
-// documentation that can drift from it.
+// Build THE system prompt for an agent: one string holding the identity sentence
+// and, below it, one composed guidelines block. A single helper means a guideline
+// added to a profile reaches the runtime automatically — the definitions ARE the
+// prompt, not documentation that can drift from it.
 //
-// Empty guidelines produce only the instruction, so a minimal profile is valid.
+// WHY ONE STRING AND NOT `[instruction, guidelines]`
+// --------------------------------------------------
+// `agent({ instruction })` seeds one `system` message per array entry
+// (../core/agent.ts `seed`), so the previous two-entry return value put TWO system
+// messages at the head of every transcript, and the transport forwards them
+// verbatim (../transport/openai.ts `wireMessage` → `{ role: 'system' }`). Several
+// OpenAI-compatible gateways accept exactly one system turn — or silently keep only
+// the first/last one — so on those models the guidelines were dropped or rejected
+// and the role ran on its identity sentence alone. The two sections are therefore
+// joined HERE, at the single place that composes them, so every model receives the
+// same complete prompt as one system message.
+//
+// Empty guidelines produce the instruction alone, so a minimal profile is valid.
 //
 // T3 EDITABLE CONFIGURATION — `instructionOverride` is the harness-level
 // per-agent instruction the operator saved (`HarnessPreset.agentInstructions`,
@@ -98,12 +110,17 @@ export const isAgentProfileName = (name: string): name is AgentProfileName =>
 // retune an agent's role without letting a stored document silently drop the
 // shared behavioural rules. An absent or blank override is "no override", which
 // keeps the trusted text byte-identical — the shipped profiles remain the default.
-export const agentInstruction = (profile: AgentProfile, instructionOverride?: string): string[] => {
+export const agentInstruction = (profile: AgentProfile, instructionOverride?: string): string => {
     const custom = instructionOverride === undefined ? '' : instructionOverride.trim();
     const instruction = custom.length > 0 ? custom : profile.instruction.trim();
+
+    // A blank bullet would render as a stray "- " inside the joined prompt, so an
+    // empty guideline never survives into the block.
     const guidelines = profile.guidelines.map((guideline) => guideline.trim()).filter((line) => line.length > 0);
 
-    if (guidelines.length === 0) return [instruction];
+    if (guidelines.length === 0) return instruction;
 
-    return [instruction, ['Guidelines:', ...guidelines.map((line) => `- ${line}`)].join('\n')];
+    // Blank line between the sections: the model sees ONE message, so the paragraph
+    // break is what separates "who you are" from "rules you follow".
+    return `${instruction}\n\nGuidelines:\n${guidelines.map((line) => `- ${line}`).join('\n')}`;
 };

@@ -991,7 +991,10 @@ summary::-webkit-details-marker {
 
 .harness-title-row {
     display: flex;
-    align-items: baseline;
+    /* The row holds two bordered controls (the session cycler and its `+`) beside the
+       title, so the items centre instead of sharing a text baseline — the alignment the
+       phone layout already used, now applied at every width. */
+    align-items: center;
     gap: 10px;
     min-width: 0;
 }
@@ -1114,20 +1117,21 @@ summary::-webkit-details-marker {
     font-size: 12px;
 }
 
-/* Session pills (T3/R1) ------------------------------------------------- */
-/* The saved-conversation directory moved out of the right rail and into one compact
-   strip under the Instruct title. `main.ts` `createSessionPillBar` builds it, and the
-   SAME strip is inserted at the top of the harness details dialog on a phone, where CSS
-   hides the header copy (see `.session-pills-bar-head` in the phone block).
+/* Session pills (T3/R1, dashboard-only since T9) ------------------------ */
+/* The saved-conversation directory now lives in EXACTLY one place: the Sessions section of
+   the dialog the harness title opens (`main.ts` `createSessionPillBar`, called from
+   `harnessDetailsBody`). The header keeps only the compact cycler and its `+`, at every
+   width — so there is no `.session-pills-bar-head` copy and no breakpoint rule hiding one.
    Contract:
-     .session-pills-bar[.session-pills-bar-head|.session-pills-bar-dialog]
+     .session-pills-bar.session-pills-bar-dialog
        .session-pills                role="list" (role="presentation" when empty)
          .session-pill[data-session-id][data-status][data-active][data-archived]
            .session-pill-select      opens the conversation
              .session-pill-id        the FIRST EIGHT CHARACTERS only
            .session-pill-delete      one click = one DELETE
-       .new-session                  kept: the historical selector and busy state
-       .refresh-sessions
+       .new-session                  kept: the historical selector and busy state (a `+`)
+   T9 removed the manual Refresh control; the automatic directory re-read
+   (`refreshSessions()` in main.ts) is untouched.
    The strip wraps instead of scrolling: horizontal overflow here would push the composer
    and the transcript wider than the chat column. */
 
@@ -1136,7 +1140,8 @@ summary::-webkit-details-marker {
     flex-wrap: wrap;
     align-items: center;
     gap: 6px;
-    /* Directly under the title row; the note line below it stays visually separate. */
+    /* The dashboard sets its own spacing (`.harness-details .session-pills-bar` below);
+       this base margin only keeps the strip off whatever neighbour it follows. */
     margin: 2px 0 0;
     min-width: 0;
     max-width: 100%;
@@ -1289,35 +1294,58 @@ summary::-webkit-details-marker {
     font-size: 11.5px;
 }
 
-/* T7: the phone session CYCLER next to the Instruct title (main.ts `sessionCycle`). -----
-   Under 861px the header strip is `display:none` (see the phone block) and the directory
-   moves into the Instruct dialog, so nothing on screen answers "which conversation am I
-   looking at?". This pill does, in one compact control, and pressing it steps to the next
-   session of the same projection. Delete deliberately does NOT live here: the user asked
-   for it only in the full dashboard behind the title button.
-
-   The BASE state is hidden, so desktop and tablet keep the strip they already have and the
-   pill is a phone-only addition (the assumption stated in the task). The phone block below
-   opts in; nothing else may make it visible.
+/* T7/T9: the session controls inside the Instruct title row (main.ts `sessionCycle` and
+   `sessionNew`). ONE compact header at EVERY width: the pill names the conversation on
+   screen and steps to the next one of the same directory, and the `+` beside it starts a
+   fresh conversation without going through the dashboard. The directory itself (pills +
+   delete + its own `+`) is the Sessions section of the dialog the title button opens, so
+   nothing here is breakpoint-shaped any more and Delete deliberately does NOT live in the
+   header.
 
    Box model (jsdom cannot lay this out, so the arithmetic is written down):
-   - the row is `display: flex; gap: 10px` and `.main-title` is the SHRINKING item
-     (`flex: 0 1 auto; min-width: 0`), so this control is `flex: 0 0 auto` — it never
-     squeezes the title's ellipsis, and the title can never push it off the row;
-   - `max-width: 42vw` is the ceiling: the phone header's own padding is 14px per side, the
-     brand row above is separate, and the title keeps the rest. Eight monospace characters
-     at 11px plus the glyph and 18px of padding measure ~90px, far under that cap, so the
-     cap only matters if a narrower device clips the id — and `.session-cycle-id` owns the
-     ellipsis for exactly that case;
-   - it is `hidden` (the attribute) whenever no conversation is open, and the global
-     `[hidden] { display: none !important }` rule above out-ranks the phone `inline-flex`,
-     so no per-state visibility rule is needed here. */
+   - the row is `display: flex; align-items: center; gap: 10px` and `.main-title` is the
+     SHRINKING item (`flex: 0 1 auto; min-width: 0`), so both controls are `flex: 0 0 auto`
+     — they never squeeze the title's ellipsis, and the title can never push them off the
+     row;
+   - `max-width: 42vw` on the cycler is the ceiling that matters on a 375px phone: eight
+     monospace characters at 11px plus the glyph and 18px of padding measure ~90px, far
+     under the cap, so it only bites on a very narrow device — and `.session-cycle-id` owns
+     the ellipsis for exactly that case;
+   - the cycler is `hidden` (the attribute) whenever no conversation is open, and the global
+     `[hidden] { display: none !important }` rule above out-ranks this `inline-flex`, so no
+     per-state visibility rule is needed here. */
+
+/* Shared geometry: one box, one radius, one mono voice, so the pair reads as a single
+   control group rather than two unrelated header widgets. Only the FILL differs — the
+   cycler is accent-tinted because it names the conversation in view (the vocabulary the
+   strip's active pill carries), while the `+` stays a neutral framed action. */
+.session-cycle,
+.session-new {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    flex: 0 0 auto;
+    padding: 3px 9px;
+    border: 1px solid var(--accent);
+    border-radius: var(--radius-sm);
+    background: var(--accent-soft);
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11px;
+    line-height: 1.4;
+    white-space: nowrap;
+    cursor: pointer;
+}
+
 .session-cycle {
-    display: none;
+    max-width: 42vw;
 }
 
 /* The id is the only visible text (eight characters, like the strip); the full uuid, the
-   harness and the status live in the tooltip main.ts writes. */
+   harness and the status live in the tooltip main.ts writes. These two BASE rules come
+   before the state rules below so the plain selectors stay the first match for anything
+   reading this stylesheet as text (session-cycle.test.ts). */
 .session-cycle-id {
     min-width: 0;
     overflow: hidden;
@@ -1332,8 +1360,59 @@ summary::-webkit-details-marker {
     font-size: 12px;
 }
 
-/* R2 (T3): the phone dialog's Sessions block. The strip above the header copy is hidden
-   there, so the dialog owns the directory and needs its own caption. */
+/* Accent-tinted by default because it names the conversation in view; hover only confirms
+   the press. */
+.session-cycle:hover:not(:disabled) {
+    background: var(--accent);
+    color: var(--bg);
+}
+
+.session-cycle:hover:not(:disabled) .session-cycle-glyph {
+    color: var(--bg);
+}
+
+.session-cycle:focus-visible,
+.session-new:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* The create action: the strip's neutral frame (`--border-strong` on `--bg-elevated`) so it
+   never reads as the "current session" highlight, plus a `min-width` for a stable, pressable
+   box around a single glyph. NO font/padding/border/radius/height override in this rule: the
+   `+` inherits the shared box exactly, so its intrinsic height matches the cycler's pixel for
+   pixel and the pair reads as one control group. The note lives above the selector so the
+   stylesheet-read contracts (session-cycle.test.ts) can anchor on the first declaration. */
+.session-new {
+    min-width: 26px;
+    border-color: var(--border-strong);
+    background: var(--bg-elevated);
+}
+
+.session-new:hover:not(:disabled) {
+    border-color: var(--accent);
+    color: var(--accent);
+}
+
+/* Both controls lock for states the painter knows about: switching is refused while a run
+   is in flight (`paintSessionCycle` reads `submitting || running`) and creating is refused
+   while a submit/create is in flight, before boot, or for an archived harness
+   (`paintSessionActions`). A locked control reads locked: quiet frame, no pointer, no tint. */
+.session-cycle:disabled,
+.session-new:disabled {
+    border-color: var(--border);
+    background: transparent;
+    color: var(--muted);
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+.session-cycle:disabled .session-cycle-glyph {
+    color: var(--muted);
+}
+
+/* R3 (T9): the Sessions block of the harness details dialog. The directory is here at
+   every width (the header no longer carries a strip), so the caption always has a job. */
 .harness-details-section {
     margin: 0 0 6px;
     color: var(--muted);
@@ -6205,74 +6284,11 @@ summary::-webkit-details-marker {
         padding: 8px 14px;
     }
 
-    /* R1 (T3): one title line on a phone, and the always-visible desktop note stays hidden
-       here — the full details live in the title's dialog (R2). The session strip moves
-       into that SAME dialog (main.ts `openHarnessDetails` builds a `.session-pills-bar`
-       with the `session-pills-bar-dialog` variant when `isPhoneLayout()` is true), so the
-       header copy is hidden rather than removed: the DOM, the paint pass and the selected
-       pill stay identical in both layouts. */
-    .harness-title-row {
-        align-items: center;
-    }
-
-    .session-pills-bar-head {
-        display: none;
-    }
-
-    /* T7: the pill the desktop layout hides now takes over — this is the row the user
-       pointed at ("a pill next to the instruct button here"). The strip above stays hidden
-       and the dialog keeps the full dashboard, so this control only answers WHICH session is
-       on screen and steps to the next one.
-       Geometry: `flex: 0 0 auto` + `max-width: 42vw` (see the base rule) keep it a fixed,
-       small item beside a title that is free to ellipsize; the pill can push the title,
-       never the other way round, and it can never wrap onto a second line. */
-    .session-cycle {
-        display: inline-flex;
-        align-items: center;
-        gap: 4px;
-        flex: 0 0 auto;
-        max-width: 42vw;
-        padding: 3px 9px;
-        border: 1px solid var(--accent);
-        border-radius: var(--radius-sm);
-        background: var(--accent-soft);
-        color: var(--text);
-        font-family: var(--mono);
-        font-size: 11px;
-        white-space: nowrap;
-        cursor: pointer;
-    }
-
-    /* Accent-tinted by default because it names the conversation in view: that IS the
-       highlight the strip's active pill carries on desktop. Hover only confirms the press. */
-    .session-cycle:hover:not(:disabled) {
-        background: var(--accent);
-        color: var(--bg);
-    }
-
-    .session-cycle:hover:not(:disabled) .session-cycle-glyph {
-        color: var(--bg);
-    }
-
-    .session-cycle:focus-visible {
-        outline: 2px solid var(--accent);
-        outline-offset: 2px;
-    }
-
-    /* Switching is locked while a run is in flight (main.ts mirrors the strip's guard), and
-       a locked control reads locked: quiet frame, no pointer, no tint. */
-    .session-cycle:disabled {
-        border-color: var(--border);
-        background: transparent;
-        color: var(--muted);
-        cursor: not-allowed;
-        opacity: 0.6;
-    }
-
-    .session-cycle:disabled .session-cycle-glyph {
-        color: var(--muted);
-    }
-
+    /* T9: the title row's session controls (`.session-cycle`, `.session-new`) and the
+       dialog's Sessions dashboard are the SAME at every width, so this block carries no
+       session rules at all — the compact geometry lives with the base rules above, and the
+       header strip this block used to hide is gone. Only the always-visible desktop note
+       steps aside here, because the title's dialog repeats its text. */
     .harness-head .harness-note {
         display: none;
     }

@@ -597,11 +597,16 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     // instruction editor are disabled with the real reason on each of them, `[+]`
     // cannot add, and the action cannot promote. R7: there is no lock notice and no
     // in-row "New session" link. T3/R1: a saved session prints NO header note at all —
-    // the strip under the title is what says which conversation is open, and it keeps its
-    // own independent New session action, which stays usable.
+    // since T9 the CYCLER beside the title is what names the conversation on screen, and
+    // the dashboard behind the title keeps its own New session action, which stays usable.
     expect(document.querySelector('.harness-note')?.textContent).toBe('');
     expect(document.querySelector<HTMLElement>('.harness-note')?.hidden).toBe(true);
-    expect(document.querySelector('.session-pill-select')?.getAttribute('data-active')).toBe('true');
+    byClass('.harness-title-button', 'button').click();
+    expect(
+        document.querySelector('.session-pills-bar-dialog .session-pill-select')?.getAttribute('data-active')
+    ).toBe('true');
+    byClass('.dialog-close', 'button').click();
+    await flush();
     openDeck();
     const frozenReason =
         'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.';
@@ -619,9 +624,10 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     expect(applyAction().disabled).toBe(true);
     expect(document.querySelector('.agent-lock')).toBeNull();
     expect(document.querySelector('.agent-row-wrap .link-button')).toBeNull();
-    const stripNewSession = byClass('.new-session', 'button');
-    expect(stripNewSession.textContent).toBe('+ New');
-    expect(stripNewSession.disabled).toBe(false);
+    const headerNewSession = byClass('.harness-title-row .new-session', 'button');
+    // R4 (T9): the create control is the compact `+` beside the cycler, not `+ New`.
+    expect(headerNewSession.textContent).toBe('+');
+    expect(headerNewSession.disabled).toBe(false);
 
     // Effective live values (not the live descriptor's map, which only has instruct)
     // with the MODEL control enabled (R2). One select per configuration, reached

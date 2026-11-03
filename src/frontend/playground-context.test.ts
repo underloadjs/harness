@@ -200,16 +200,43 @@ const call = (): void => {
     button.click();
 };
 
+// T9: the directory dashboard opens from the harness title button, and that button is
+// DISABLED while the tools view owns the head. Leaving the playground (close the runner,
+// press the Tools toggle) is what makes the reader's directory reachable again, so this is
+// how a test answers "is this conversation listed?" after a tool call.
+const backToChat = async (): Promise<void> => {
+    document.querySelector<HTMLButtonElement>('.dialog-close')?.click();
+    await flush();
+
+    if (toolsToggle().getAttribute('aria-pressed') === 'true') toolsToggle().click();
+    await flush();
+};
+
 const responseBox = (): HTMLElement => {
     const found = document.querySelector<HTMLElement>('.tool-output .card-body');
     if (found === null) throw new Error('missing response box');
     return found;
 };
 
-// T3/R1: the directory is a pill strip, so "is this conversation listed?" is answered by
-// the pill wrappers (id on the wrapper, and on both controls inside it).
-const sessionPills = (): string[] =>
-    [...document.querySelectorAll<HTMLElement>('.session-pill')].map((node) => node.dataset.sessionId ?? '');
+// T3/R1 + T9: the directory is the Sessions dashboard of the dialog behind the harness
+// title, so "is this conversation listed?" is answered by opening that layer, reading the
+// pill wrappers (id on the wrapper, and on both controls inside it), and putting the layer
+// away again.
+const sessionPills = (): string[] => {
+    const before = document.querySelector('.session-pills-bar-dialog') !== null;
+    if (!before) {
+        const trigger = document.querySelector<HTMLButtonElement>('.harness-title-button');
+        if (trigger === null) throw new Error('missing harness title button');
+        trigger.click();
+    }
+
+    const ids = [...document.querySelectorAll<HTMLElement>('.session-pill')].map(
+        (node) => node.dataset.sessionId ?? ''
+    );
+
+    if (!before) document.querySelector<HTMLButtonElement>('.dialog-close')?.click();
+    return ids;
+};
 
 const posts = (calls: Call[], url: string, method?: string): Call[] =>
     calls.filter((call) => call.url === url && (method === undefined || call.method === method));
@@ -263,12 +290,11 @@ it('runs a session-bound call in its own session and never adopts it into the ch
     // conversation was never opened or refreshed.
     expect(byPrefix(calls, '/api/sessions/chat-1')).toEqual([]);
 
-    // The temporary session is not a conversation: no row in the rail (the directory
-    // answer literally contains it), and it is not the session this browser remembers.
-    const refresh = document.querySelector<HTMLButtonElement>('.refresh-sessions');
-    if (refresh === null) throw new Error('missing sessions refresh');
-    refresh.click();
-    await flush();
+    // The temporary session is not a conversation: no row in the directory (the server's
+    // list answer literally contains it), and it is not the session this browser remembers.
+    // T9 removed the manual Refresh control, so the proof is the dashboard itself once the
+    // tools view has handed the head back to the harness.
+    await backToChat();
     expect(sessionPills()).toEqual([CHAT]);
     expect(localStorage.getItem('underload-harness-app:session')).toBeNull();
 
@@ -368,6 +394,8 @@ it('deletes the temporary session when the playground closes, and starts a fresh
     expect(
         byPrefix(calls, '/api/tools/').map((entry) => (entry.body as { sessionId?: string }).sessionId)
     ).toEqual(['temp-1', 'temp-2']);
+    // T9: the reader's directory is only reachable from the chat view.
+    await backToChat();
     expect(sessionPills()).toEqual([CHAT]);
 });
 
@@ -417,7 +445,9 @@ it('discards a session whose create lands after the playground was closed', asyn
         }
     });
 
-    // The reader's conversation survived the whole race.
+    // The reader's conversation survived the whole race. T9: read it through the directory
+    // dashboard, which needs the chat view back (the helper is a no-op if that already holds).
+    await backToChat();
     expect(sessionPills()).toEqual([CHAT]);
 });
 

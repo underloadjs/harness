@@ -2341,9 +2341,11 @@ R18 splits declarations: the five core file tools, the harness-owned
 changes the agents, not the tools.
 
 Agent identities live in **`src/agents/`** as trusted `AgentProfile` values:
-`instruction` plus a `guidelines` list. The runtime seeds both — an identity system
-message and one composed `Guidelines:` block — so the definition a UI renders and
-the prompt a model receives are the same text. A client can select an agent id; it
+`instruction` plus a `guidelines` list. `agentInstruction()` joins them into ONE
+system prompt (identity line, blank line, `Guidelines:` bullets) because several
+OpenAI-compatible gateways accept a single system turn — seeding two `system`
+messages used to drop the guidelines on those models — so the definition a UI renders
+and the prompt a model receives are the same text. A client can select an agent id; it
 can never supply instruction text.
 
 Guidelines carry **policy, not an inventory**. Every request already declares its

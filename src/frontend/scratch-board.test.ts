@@ -358,8 +358,10 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
     expect(ringActivity()).toBeUndefined();
 
     // Opening s2 replaces the board with that conversation's panels (no leakage
-    // of s1's panel), and the two secondary hosts light up.
-    byClass('.session-pill-select[data-session-id="s2"]', 'button').click();
+    // of s1's panel), and the two secondary hosts light up. T9: the pills live in the
+    // dashboard behind the harness title, which the press then dismisses.
+    byClass('.harness-title-button', 'button').click();
+    byClass('.session-pills-bar-dialog .session-pill-select[data-session-id="s2"]', 'button').click();
     await flush();
     await flush();
 
@@ -376,8 +378,9 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
     expect([...kv.querySelectorAll('dt')].map((node) => node.textContent)).toEqual(['open', 'done']);
     expect([...kv.querySelectorAll('dd')].map((node) => node.textContent)).toEqual(['2', '5']);
 
-    // New session clears every host; the board explains its empty state.
-    byClass('.new-session', 'button').click();
+    // New session clears every host; the board explains its empty state. T9: the header `+`
+    // is the no-dashboard path.
+    byClass('.harness-title-row .new-session', 'button').click();
     await flush();
 
     expect(panelIds('scratch')).toEqual([]);
@@ -389,7 +392,8 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
     );
 
     // Reopening s1 restores exactly its recorded panel.
-    byClass('.session-pill-select[data-session-id="s1"]', 'button').click();
+    byClass('.harness-title-button', 'button').click();
+    byClass('.session-pills-bar-dialog .session-pill-select[data-session-id="s1"]', 'button').click();
     await flush();
     await flush();
 

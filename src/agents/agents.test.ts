@@ -2,7 +2,7 @@
 //
 // These tests pin the catalogue the server advertises as AgentDescriptor and the
 // composition rule that makes guidelines affect the runtime prompt: the profile IS
-// the source of the system messages, so adding a guideline cannot silently become
+// the source of the system prompt, so adding a guideline cannot silently become
 // documentation that never reaches a model.
 //
 // T3 roster: the five real roles (instruct, research, workspace, reviewer,
@@ -11,6 +11,16 @@
 //
 // The later blocks pin what the model-visible text may contain: the policy a tool
 // declaration cannot express, never a copy of the declaration list itself.
+//
+// WHY `agentInstruction` RETURNS ONE STRING (regression pin)
+// ----------------------------------------------------------
+// It used to return `[instruction, guidelines]`, and `agent({ instruction })` seeds
+// one `system` message per array entry (src/core/agent.ts `seed`). Several
+// OpenAI-compatible gateways accept only ONE system turn — or keep only the first or
+// last one — so those models silently ran on the identity sentence alone and lost the
+// guidelines. The composition is therefore joined at the single place that builds it
+// (src/agents/index.ts), which is what the `agentInstruction` block below pins: one
+// string, one `Guidelines:` section, a blank line as the identity/rules split.
 
 import { describe, expect, it } from 'vitest';
 import {
@@ -39,6 +49,37 @@ import { BUILTIN_TOOL_DESCRIPTORS } from '../core/tool-manifest';
 // The exact error text a client sees for a bad id: the message lists the known set
 // in picker order, so this is also a roster pin.
 const KNOWN = 'instruct, research, workspace, reviewer, planner, summarizer, demo, flaky';
+
+// The exact identity sentence of each real role. `agentInstruction` puts this first,
+// above the guideline block, so a reworded role is a deliberate edit, not drift.
+const IDENTITY = {
+    instruct: 'You are the Instruct agent. Follow the brief exactly, answer directly, and do only what was asked.',
+    research: 'You are the Research agent. Investigate before you answer, and keep what you found separate from what you inferred.',
+    workspace: 'You are the Coder agent. Read, edit, and verify files in the server workspace, and keep every change as small as the task allows.',
+    reviewer: 'You are the Reviewer agent. Find real defects in the work you are given, and report only what you can point to.',
+    planner: 'You are the Planner agent. Plan before you build, route each step to the narrowest configured specialist, and verify the result yourself.'
+};
+
+// Measured length of the ONE composed system prompt, per profile, in registry order.
+// Exact equality (not a range): growth has to be intentional, so adding a bullet to a
+// shared guideline line is a visible diff here. 1500 characters is room for a policy
+// bullet, not for a tool manual — the ceiling below is the budget that keeps it true.
+const PROMPT_LENGTHS = [
+    { name: 'instruct', length: 1367 },
+    { name: 'research', length: 1391 },
+    { name: 'workspace', length: 1351 },
+    { name: 'reviewer', length: 1372 },
+    { name: 'planner', length: 1434 },
+    { name: 'summarizer', length: 141 },
+    { name: 'demo', length: 294 },
+    { name: 'flaky', length: 344 }
+];
+
+// The shared guideline block a profile composes, exactly as `agentInstruction` renders
+// it: a `Guidelines:` header plus one `- ` bullet per entry, in array order. The
+// parameter is `readonly` because `AgentProfile.guidelines` is a readonly tuple.
+const guidelinesBlock = (guidelines: readonly string[]) =>
+    `Guidelines:\n${guidelines.map((line) => `- ${line}`).join('\n')}`;
 
 describe('agent profiles', () => {
     it('lists the trusted agents with the real roles first', () => {
@@ -129,7 +170,7 @@ describe('agent profiles', () => {
 // hundreds of characters restating which tools exist and how the discovery selector
 // works. That contract now lives ONCE, in toolRequest's own metadata, and the profiles
 // carry only the policy a schema cannot say. These tests pin the boundary — and keep the
-// stale claim the rewrite removed from ever coming back.
+// stale claims the rewrite removed from ever coming back.
 describe('profile guidance stays policy, not a tool inventory', () => {
     const REAL_ROLES = [instruct, research, workspace, reviewer, planner];
 
@@ -148,7 +189,9 @@ describe('profile guidance stays policy, not a tool inventory', () => {
 
     it('never re-lists declared tools or re-states the discovery selector', () => {
         for (const profile of REAL_ROLES) {
-            const prompt = agentInstruction(profile).join('\n');
+            // The prompt is already ONE string, so no join: this is verbatim what the
+            // model reads as its single system message.
+            const prompt = agentInstruction(profile);
 
             // No "X is always available" inventory line: the declaration says it.
             expect(prompt).not.toMatch(/always available/i);
@@ -172,36 +215,111 @@ describe('profile guidance stays policy, not a tool inventory', () => {
         expect(description).toContain('newest request takes precedence');
     });
 
-    it('keeps each real profile inside a bounded system prompt', () => {
-        // The whole point of the shared lines: growth has to be deliberate. 1500
-        // characters is room for a policy bullet, not for a tool manual.
+    // The rewritten web line is only correct while it matches src/core/tool-manifest.ts:
+    // `fetch` is `visibility: 'core'` (declared, no key needed), `search` is core but
+    // only ACTIVATED by a configured key, `download` is searchable. The old text called
+    // fetch searchable, which sent the model hunting for a tool already in front of it.
+    it('states the web trio the way the manifest actually declares it', () => {
+        for (const profile of [instruct, research]) {
+            const prompt = agentInstruction(profile);
+
+            expect(prompt).toContain('search is declared only when the host configured a web-search key');
+            expect(prompt).toContain('fetch is declared without a key');
+            expect(prompt).toContain('download is searchable under "web" or "url"');
+        }
+
+        // The removed bug must stay removed, in every profile's prompt.
+        for (const profile of agentProfiles()) {
+            expect(agentInstruction(profile)).not.toMatch(/fetch is searchable/i);
+        }
+    });
+
+    it('keeps each profile at its measured prompt size, inside the budget', () => {
+        // Exact observed length per profile, so growth is a deliberate diff...
+        expect(
+            agentProfiles().map((profile) => ({
+                name: profile.name,
+                length: agentInstruction(profile).length
+            }))
+        ).toEqual(PROMPT_LENGTHS);
+
+        // ...and the five real roles stay well under the 1500-character ceiling.
         for (const profile of REAL_ROLES) {
-            expect(agentInstruction(profile).join('\n').length).toBeLessThan(1500);
+            expect(agentInstruction(profile).length).toBeLessThan(1500);
         }
     });
 });
 
 describe('agentInstruction', () => {
-    it('composes the instruction and one guideline block', () => {
-        expect(agentInstruction(summarizer)).toEqual([
+    // One string, not a pair: two entries meant two `system` messages, and gateways
+    // that accept one system turn dropped the guidelines. See the header comment.
+    it('composes the identity sentence and one guideline block into a single string', () => {
+        const prompt = agentInstruction(summarizer);
+
+        expect(typeof prompt).toBe('string');
+        expect(prompt).toBe(
+            'You compress technical notes into at most two sentences.\n\n' +
+            'Guidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
+        );
+
+        // Structure, asserted exactly: two paragraphs split by a blank line, and inside
+        // the second one the header plus the two bullets.
+        expect(prompt.split('\n\n')).toEqual([
             'You compress technical notes into at most two sentences.',
             'Guidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
         ]);
     });
 
     it('seeds every guideline from the Instruct profile, in order', () => {
-        const [instruction, guidelines = ''] = agentInstruction(instruct);
+        const prompt = agentInstruction(instruct);
 
-        expect(instruction).toBe(
-            'You are the Instruct agent. Answer the request directly and keep the answer focused.'
-        );
-        expect(guidelines.split('\n')).toEqual([
-            'Guidelines:',
-            ...instruct.guidelines.map((line) => `- ${line}`)
+        // The blank line is the ONLY thing separating "who you are" from "rules you
+        // follow", because both travel inside one system message.
+        expect(prompt.split('\n\n')).toEqual([
+            IDENTITY.instruct,
+            guidelinesBlock(instruct.guidelines)
+        ]);
+    });
+
+    it('gives every profile exactly one Guidelines section with one bullet per guideline', () => {
+        for (const profile of agentProfiles()) {
+            const prompt = agentInstruction(profile);
+            const lines = prompt.split('\n');
+
+            // One header, no second block appended by a second composition path.
+            expect(prompt.split('\n\n').length).toBe(2);
+            expect(lines.filter((line) => line === 'Guidelines:')).toEqual(['Guidelines:']);
+
+            // One bullet per guideline entry, in declared order, with nothing extra.
+            expect(lines.filter((line) => line.startsWith('- '))).toEqual(
+                profile.guidelines.map((line) => `- ${line}`)
+            );
+
+            // No stray blank bullet ("- ") and no doubled blank line: the single blank
+            // line is the identity/rules split and nothing else.
+            expect(prompt).not.toContain('- \n');
+            expect(prompt).not.toContain('\n\n\n');
+            expect(prompt.endsWith('\n')).toBe(false);
+        }
+    });
+
+    it('opens every real profile with its exact identity sentence', () => {
+        expect(
+            [instruct, research, workspace, reviewer, planner].map(
+                (profile) => agentInstruction(profile).split('\n\n')[0]
+            )
+        ).toEqual([
+            IDENTITY.instruct,
+            IDENTITY.research,
+            IDENTITY.workspace,
+            IDENTITY.reviewer,
+            IDENTITY.planner
         ]);
     });
 
     it('returns only the instruction when a profile has no guidelines', () => {
+        // No block, so no header and no blank line: a minimal profile stays valid and
+        // the prompt is the trimmed identity sentence alone.
         expect(
             agentInstruction({
                 name: 'bare',
@@ -210,25 +328,31 @@ describe('agentInstruction', () => {
                 instruction: ' You are bare. ',
                 guidelines: []
             })
-        ).toEqual(['You are bare.']);
+        ).toBe('You are bare.');
     });
 
     // T3 editable configuration. The override is the harness-level text a saved
     // configuration carries; it replaces ONLY the identity sentence so the shared
     // policy lines can never be dropped by an edit.
     it('replaces the identity sentence with a harness override', () => {
-        expect(agentInstruction(summarizer, 'Condense to one line.')).toEqual([
-            'Condense to one line.',
+        expect(agentInstruction(summarizer, 'Condense to one line.')).toBe(
+            'Condense to one line.\n\n' +
             'Guidelines:\n- Keep names, numbers, and conclusions.\n- Drop preamble and repetition.'
-        ]);
+        );
+
+        // Same rule for a role with the full shared policy: the override swaps the
+        // first paragraph and the whole guideline block survives untouched.
+        expect(agentInstruction(instruct, 'Lead with the answer.')).toBe(
+            `Lead with the answer.\n\n${guidelinesBlock(instruct.guidelines)}`
+        );
     });
 
     it('keeps the trusted instruction when the override is absent or blank', () => {
         // Absent (undefined) and a whitespace-only value are the same thing: no
         // override. The registry never stores a blank one, so a saved harness cannot
         // reach the runtime with an empty prompt by this path.
-        expect(agentInstruction(summarizer, undefined)).toEqual(agentInstruction(summarizer));
-        expect(agentInstruction(summarizer, '   \n ')).toEqual(agentInstruction(summarizer));
+        expect(agentInstruction(summarizer, undefined)).toBe(agentInstruction(summarizer));
+        expect(agentInstruction(summarizer, '   \n ')).toBe(agentInstruction(summarizer));
     });
 
     it('applies an override to a guideline-free profile without adding a block', () => {
@@ -243,6 +367,6 @@ describe('agentInstruction', () => {
                 },
                 '  You are edited.  '
             )
-        ).toEqual(['You are edited.']);
+        ).toBe('You are edited.');
     });
 });

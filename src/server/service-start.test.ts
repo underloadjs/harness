@@ -365,7 +365,10 @@ describeService('service endpoint discovery and canonical API', () => {
         expect(session.harness).toBe('demo');
         expect(session.status).toBe('idle');
         expect(session.turns).toEqual([]);
-        expect(session.messages.map((message) => message.role)).toEqual(['system', 'system']);
+        // ONE system message: the demo profile's identity sentence and guidelines are
+        // joined into a single prompt by `agentInstruction()` (../agents/index.ts),
+        // so the scripted fixture seeds one system turn instead of two.
+        expect(session.messages.map((message) => message.role)).toEqual(['system']);
 
         const listed = await json<{ sessions: SessionSnapshot[] }>(
             await fetch(`${base}/v1/harness/sessions`)
