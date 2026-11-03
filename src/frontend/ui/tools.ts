@@ -419,6 +419,12 @@ const COPY_RESULT_LABEL = 'Copy result';
 // fixed (not `think · 1,234 chars`) for the same reason the two above are.
 const COPY_THINK_LABEL = 'Copy thinking';
 
+// The class the tool panes carry, i.e. the soft-wrapped flavour of the viewer. It is
+// the default of `createCodeBlock`'s last parameter and stays the only class
+// `styles.css` `.tool-code` rules key off (tool-code-viewer.test.ts pins the exact
+// `code-block tool-code` className of a pane).
+export const TOOL_CODE_CLASS = 'tool-code';
+
 // `openFile` is supplied only for the tool dialog's argument/result blocks. The
 // transform runs on a detached highlighter host first (never inside `pre`/`code`,
 // which `file-links.ts` deliberately treats as literal), then the SAME highlight
@@ -430,13 +436,21 @@ const COPY_THINK_LABEL = 'Copy thinking';
 // `.code-block` keeps `overflow: auto / white-space: pre` for Markdown fences
 // (layout-containment.test.ts pins that), and only `.tool-code` gets soft wrap plus
 // the line-number gutter.
-const createCodeBlock = (
+//
+// `viewerClass` selects a DIFFERENT scoping class over the same line machinery, which
+// is how the file-preview dialog reuses this builder without inheriting the tool
+// pane's soft wrap: it passes `preview-code`, and `ui/dialog.css` gives that class the
+// no-wrap, sticky-gutter editor layout. The row/break/highlight contract (and
+// therefore `code.textContent`) is identical for every flavour, which is exactly why
+// this is one builder rather than two.
+export const createCodeBlock = (
     code: string,
     language: string | undefined,
-    openFile?: (path: string) => void
+    openFile?: (path: string) => void,
+    viewerClass: string = TOOL_CODE_CLASS
 ): HTMLElement => {
     const pre = document.createElement('pre');
-    pre.className = 'code-block tool-code';
+    pre.className = `code-block ${viewerClass}`;
 
     const block = document.createElement('code');
     block.className = language === undefined ? 'hljs' : `hljs language-${language}`;

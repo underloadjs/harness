@@ -636,7 +636,7 @@ it('hides the token and time totals a provider never reported instead of printin
         .toEqual(['1 thread', '10ms']);
 });
 
-it('keeps an open dialog totals in step with a directory read, on the same node', async () => {
+it("keeps an open dialog's totals in step with a directory read, on the same node", async () => {
     let listed = [
         snapshot({
             harnessDefinition: descriptor(),

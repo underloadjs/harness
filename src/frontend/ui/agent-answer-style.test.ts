@@ -128,7 +128,7 @@ it('styles the collapse toggle as the copy control\u2019s twin, pinned to the ri
         'width: 24px',
         'height: 24px',
         'border: 1px solid var(--border)',
-        'border-radius: 6px',
+        'border-radius: var(--radius-sm)',
         'background: transparent',
         'color: var(--muted)',
         'cursor: pointer'

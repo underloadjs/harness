@@ -30,6 +30,17 @@
     --warn: #fbbf24;
 
     --radius: 10px;
+
+    /* Control radius: buttons, chips, pills that act as controls.
+       Surfaces use --radius (10px); true circles keep 999px.
+       Scheme: `--radius` = surfaces (`.tile`, `.panel`, `.card`, `.conversation`,
+       `.code-block`), `--radius-sm` = every pressable/frame-as-control box (`.button`,
+       `.tool`, session pills, chips, tabs, presets, inputs), `999px` = round badges
+       (`.tool-duration`, `.status`) and circular icon buttons (`.composer-action`).
+       The 6px value is the `.tool` chip the user pointed at, so it is the one number
+       every control rounds to instead of the previous 4/5/6/7/8/999 mix. */
+    --radius-sm: 6px;
+
     --mono: ui-monospace, SFMono-Regular, 'Cascadia Code', Menlo, Consolas, monospace;
     --sans: 'Segoe UI', system-ui, -apple-system, sans-serif;
 
@@ -169,7 +180,7 @@ summary::-webkit-details-marker {
     height: 30px;
     padding: 0;
     border: 1px solid var(--border-strong);
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--muted);
     font-size: 14px;
@@ -432,7 +443,7 @@ summary::-webkit-details-marker {
 .rail-title-toggle:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
 }
 
 .rail-title-toggle:disabled {
@@ -537,7 +548,7 @@ summary::-webkit-details-marker {
     min-width: 26px;
     padding: 0 7px;
     border: 1px solid rgba(248, 113, 113, 0.35);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--danger);
     font-family: var(--mono);
@@ -660,7 +671,7 @@ summary::-webkit-details-marker {
     gap: 4px;
     padding: 2px 4px 2px 8px;
     border: 1px solid var(--border-strong);
-    border-radius: 999px;
+    border-radius: var(--radius-sm);
     background: var(--bg-elevated);
     font-family: var(--mono);
     font-size: 11px;
@@ -669,7 +680,7 @@ summary::-webkit-details-marker {
 .chip-remove {
     padding: 0 4px;
     border: 0;
-    border-radius: 999px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--muted);
     cursor: pointer;
@@ -729,7 +740,7 @@ summary::-webkit-details-marker {
     width: 100%;
     padding: 7px 9px;
     border: 1px solid var(--border-strong);
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     background: var(--bg-input);
     color: var(--text);
     font-family: var(--mono);
@@ -840,7 +851,7 @@ summary::-webkit-details-marker {
     gap: 1px;
     padding: 8px 10px;
     border: 1px solid transparent;
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     background: var(--bg-elevated);
     color: inherit;
     text-align: left;
@@ -955,7 +966,7 @@ summary::-webkit-details-marker {
 .tool-session {
     padding: 7px 9px;
     border: 1px solid var(--border-strong);
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     background: var(--bg-input);
     color: var(--text);
     font-family: var(--mono);
@@ -1068,8 +1079,9 @@ summary::-webkit-details-marker {
    missing provider tally never shows up as a fabricated zero — and the whole row is
    omitted when the harness has no sessions. The `' | '` between figures is generated
    here, not text, so each span stays a clean, copy-pastable value (the house pattern:
-   styles.css:2333). Wraps instead of scrolling: a 340px phone dialog has to be able to
-   break the four figures onto two lines without widening the dialog. */
+   styles.css, `.tile-elapsed + .tile-tokens::before`). Wraps instead of scrolling: a
+   340px phone dialog has to be able to break the four figures onto two lines without
+   widening the dialog. */
 .harness-details-stats {
     display: flex;
     flex-wrap: wrap;
@@ -1143,7 +1155,10 @@ summary::-webkit-details-marker {
 
 /* The wrapper is a `<span>`, NOT a button: the open and delete controls are siblings
    inside it (nested buttons are invalid) and this element exists only to carry the state
-   attributes painted below. */
+   attributes painted below.
+   Radius follows `--radius-sm` (the control token, same frame as the `.tool` chip) rather
+   than a 999px capsule, so the session strip matches every other control in the app; the
+   name "pill" is kept because it is the DOM/test vocabulary for the composite shell. */
 .session-pill {
     display: inline-flex;
     align-items: stretch;
@@ -1151,7 +1166,7 @@ summary::-webkit-details-marker {
     min-width: 0;
     max-width: 100%;
     border: 1px solid var(--border);
-    border-radius: 999px;
+    border-radius: var(--radius-sm);
     background: var(--bg-elevated);
 }
 
@@ -1161,6 +1176,10 @@ summary::-webkit-details-marker {
     min-width: 0;
     padding: 2px 8px;
     border: 0;
+    /* The shell clips (`overflow: hidden`), so each segment rounds ONLY the corners it
+       owns: without this, the segment's inset focus ring (`outline-offset: -2px`) keeps
+       square corners that the shell's control-radius clip shaves into a diagonal cut. */
+    border-radius: var(--radius-sm) 0 0 var(--radius-sm);
     background: transparent;
     color: inherit;
     cursor: pointer;
@@ -1236,6 +1255,10 @@ summary::-webkit-details-marker {
     padding: 0;
     border: 0;
     border-left: 1px solid var(--border);
+    /* Right-hand half of the shell: rounds only its own trailing corners so the hover fill
+       and the inset danger focus ring follow the pill's control radius instead of being cut
+       by the shell's clip. */
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
     background: transparent;
     color: var(--danger);
     font-family: var(--mono);
@@ -1371,7 +1394,7 @@ summary::-webkit-details-marker {
     max-width: 180px;
     padding: 0 10px;
     border: 1px solid transparent;
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     background: transparent;
     /* `--muted` is the palette's real secondary text token (there is no
        `--text-muted` variable in :root). */
@@ -1432,7 +1455,7 @@ summary::-webkit-details-marker {
     min-width: 0;
     padding: 5px 8px;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     background: var(--bg-elevated);
     color: var(--muted);
     font-family: var(--mono);
@@ -1756,7 +1779,7 @@ summary::-webkit-details-marker {
     min-width: 0;
     padding: 1px 3px;
     border: 1px solid var(--border);
-    border-radius: 5px;
+    border-radius: var(--radius-sm);
     background: var(--bg-input);
     color: var(--text);
     font-family: var(--mono);
@@ -1813,7 +1836,7 @@ summary::-webkit-details-marker {
     gap: 4px;
     padding: 6px 8px;
     border: 1px solid transparent;
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     background: var(--bg-elevated);
 }
 
@@ -2890,7 +2913,7 @@ summary::-webkit-details-marker {
 .thread-delete {
     padding: 4px 10px;
     border: 1px solid var(--border-strong);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--bg-elevated);
     color: var(--text);
     font: 500 11.5px/1.4 var(--sans);
@@ -2976,7 +2999,7 @@ summary::-webkit-details-marker {
 .thread-delete-confirm-cancel {
     padding: 4px 10px;
     border: 1px solid var(--border-strong);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--bg-elevated);
     color: var(--text);
     font: 500 11.5px/1.4 var(--sans);
@@ -3099,7 +3122,7 @@ summary::-webkit-details-marker {
     height: 18px;
     padding: 0;
     border: 1px solid transparent;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--muted);
     cursor: pointer;
@@ -3206,7 +3229,7 @@ summary::-webkit-details-marker {
 :is(.thread-transcript-edit, .thread-transcript-save, .thread-transcript-cancel) {
     padding: 5px 12px;
     border: 1px solid var(--border-strong);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--bg-elevated);
     color: var(--text);
     font: 500 11.5px/1.4 var(--sans);
@@ -3269,7 +3292,7 @@ summary::-webkit-details-marker {
     padding: 8px 10px;
     border: 1px solid var(--danger);
     border-left-width: 3px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: rgba(248, 113, 113, 0.1);
     color: var(--danger);
     font: 11.5px/1.5 var(--mono);
@@ -3311,7 +3334,7 @@ summary::-webkit-details-marker {
     gap: 6px;
     padding: 5px 12px;
     border: 1px solid var(--border-strong);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--bg-elevated);
     color: var(--text);
     font: 500 11.5px/1.4 var(--sans);
@@ -3688,7 +3711,7 @@ summary::-webkit-details-marker {
     height: 24px;
     padding: 0;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--muted);
     cursor: pointer;
@@ -3748,7 +3771,7 @@ summary::-webkit-details-marker {
     height: 24px;
     padding: 0;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--muted);
     cursor: pointer;
@@ -3952,7 +3975,7 @@ summary::-webkit-details-marker {
     flex: 0 1 auto;
     max-width: 100%;
     border: 1px solid var(--border);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--bg-input);
 }
 
@@ -4205,7 +4228,7 @@ summary::-webkit-details-marker {
     height: 18px;
     padding: 0;
     border: 1px solid transparent;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--muted);
     cursor: pointer;
@@ -4268,7 +4291,7 @@ summary::-webkit-details-marker {
 .tool-preset {
     padding: 3px 8px;
     border: 1px solid var(--border-strong);
-    border-radius: 999px;
+    border-radius: var(--radius-sm);
     background: var(--bg-elevated);
     color: var(--muted);
     font-family: var(--mono);
@@ -5002,7 +5025,7 @@ summary::-webkit-details-marker {
     max-width: 100%;
     padding: 4px 4px 4px 6px;
     border: 1px solid var(--border-strong);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--bg-input);
     color: var(--text);
     font-family: var(--mono);
@@ -5019,7 +5042,7 @@ summary::-webkit-details-marker {
     width: 28px;
     height: 28px;
     flex: 0 0 auto;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     object-fit: cover;
 }
 
@@ -5056,7 +5079,7 @@ summary::-webkit-details-marker {
     height: 18px;
     padding: 0;
     border: 0;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: var(--muted);
     font-size: 13px;
@@ -5163,7 +5186,7 @@ summary::-webkit-details-marker {
 .image-link:focus-visible {
     outline: 2px solid var(--accent);
     outline-offset: 2px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
 }
 
 /* --- previews (attachment + file), hosted by ui/dialog.css ----------------- */
@@ -5256,7 +5279,7 @@ summary::-webkit-details-marker {
 .preview-download {
     padding: 6px 12px;
     border: 1px solid var(--border-strong);
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     background: var(--bg-input);
     color: var(--text);
     font-family: var(--sans);
@@ -5403,7 +5426,7 @@ summary::-webkit-details-marker {
     max-width: 100%;
     margin: 0 1px;
     padding: 0 4px;
-    border-radius: 4px;
+    border-radius: var(--radius-sm);
     font-family: var(--mono);
     font-size: 11px;
     font-weight: 600;
@@ -5455,7 +5478,7 @@ summary::-webkit-details-marker {
     height: 14px;
     padding: 0;
     border: 0;
-    border-radius: 3px;
+    border-radius: var(--radius-sm);
     background: transparent;
     color: inherit;
     font-family: var(--sans);
@@ -5510,7 +5533,7 @@ summary::-webkit-details-marker {
     align-items: baseline;
     gap: 8px;
     padding: 6px 8px;
-    border-radius: 6px;
+    border-radius: var(--radius-sm);
     color: var(--text);
     font-size: 12px;
     cursor: pointer;
@@ -5642,7 +5665,7 @@ summary::-webkit-details-marker {
 .button {
     padding: 9px 15px;
     border: 1px solid var(--border-strong);
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     background: var(--bg-elevated);
     color: var(--text);
     font: inherit;
@@ -6211,7 +6234,7 @@ summary::-webkit-details-marker {
         max-width: 42vw;
         padding: 3px 9px;
         border: 1px solid var(--accent);
-        border-radius: 999px;
+        border-radius: var(--radius-sm);
         background: var(--accent-soft);
         color: var(--text);
         font-family: var(--mono);
@@ -6368,7 +6391,7 @@ summary::-webkit-details-marker {
     gap: 8px;
     padding: 6px 8px;
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     background: var(--bg-elevated);
     cursor: pointer;
 }
@@ -6433,7 +6456,7 @@ summary::-webkit-details-marker {
     margin-top: 2px;
     padding: 6px 8px;
     border: 1px solid var(--border-strong);
-    border-radius: 8px;
+    border-radius: var(--radius-sm);
     background: var(--bg);
     color: var(--text);
     font: inherit;

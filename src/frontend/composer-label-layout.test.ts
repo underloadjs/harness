@@ -315,7 +315,7 @@ it('makes the left agent button seamless and keeps the right control row compact
     expect(button).toContain('background: transparent');
     // Geometry (and therefore hover/focus rings and the compact code swap) is kept.
     expect(button).toContain('height: 32px');
-    expect(button).toContain('border-radius: 8px');
+    expect(button).toContain('border-radius: var(--radius-sm)');
     expect(button).toContain('max-width: 180px');
 
     // R15: the right row's padding no longer exceeds the text's own 32px line box,

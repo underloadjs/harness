@@ -194,7 +194,10 @@ import { applyActivity, activityOfTurns, paintActivity } from './ui/activity';
 import { highlightCode, looksLikeJson, prettyJson } from './ui/markdown';
 import { applyPanels, createPanelHost, mediaOfTurns } from './ui/panels';
 import type { PanelMedia } from './ui/panels';
-import type { FilePreviewReader, FilePreviewResult } from './ui/file-preview';
+import type { FilePreviewReader, FilePreviewResult, FilePreviewResolver } from './ui/file-preview';
+// The preview dialog owns the basename-resolution RULES (exact-name filter,
+// shallowest-first order); the shell below only supplies the `glob` round-trip.
+import { filePreviewGlobPattern } from './ui/file-preview';
 import { createTurnBoard, labelSeedsOf } from './ui/turns';
 import type { AnswerActionInput, TurnHandle } from './ui/turns';
 // Harness totals for the details dialog (threads / input / time / cache across EVERY
@@ -253,6 +256,40 @@ const readFileForPreview: FilePreviewReader = async ({ path, startLine, maxLines
     // The dialog reads this structurally (`files[]`); the cast only carries the
     // tool's documented result shape across the generic endpoint boundary.
     return response.result as FilePreviewResult;
+};
+
+// R11+: a transcript reference is usually a BARE BASENAME (`descriptors.ts`), and
+// the `read` tool resolves a path against the SERVER working directory with no
+// fuzzy search — so such a click failed with `no such file or directory (ENOENT)`
+// even though the file existed somewhere in the tree. This adapter is the missing
+// lookup: it asks the SAME `glob` tool the `@` picker already uses (main.ts
+// `lookupComposerPopup`), rooted at `'.'`, which is the working directory `read`
+// resolves against (src/server/runtime.ts — there is deliberately no
+// workspace-root endpoint).
+//
+// Pattern: `**/<name>` from `filePreviewGlobPattern`. `**/` can consume ZERO
+// directories (src/tools/files/glob.ts `globToRegExp`), so a file sitting at the
+// workspace root is found too — verified by ui/file-preview-glob.test.ts against
+// the real tool, which is why no `["<name>"]` fallback pattern is needed.
+//
+// The answer stays RAW here on purpose: exact (case-sensitive) basename filtering,
+// unsafe-path rejection, dedupe and the shallowest-first order all live in
+// ui/file-preview.ts `filePreviewCandidatesOf`, so the dialog and a test narrow the
+// same way and a substring hit (`old-descriptors.ts`) can never be opened instead
+// of the named file. A rejected `glob` call THROWS, which the dialog treats as
+// "the search said nothing" and falls back to reading the path as typed.
+const resolveFileForPreview: FilePreviewResolver = async (name) => {
+    const response = await callTool('glob', {
+        patterns: filePreviewGlobPattern(name),
+        paths: ['.'],
+        maxResults: 100
+    });
+
+    if (!response.ok) throw new Error(response.error.message);
+
+    // `glob` answers `{ files, truncated }`; `filePathsOf` narrows that structurally
+    // (an error body or an older server yields no rows, never a throw).
+    return filePathsOf(response.result);
 };
 
 // ---------------------------------------------------------------------------
@@ -481,6 +518,9 @@ const createView = (
         // R11: file links in the transcript get the bounded read adapter. Omitted
         // in a standalone/embedded page, where the dialog reports it is unwired.
         readFile: readFileForPreview,
+        // R11+: the same links often name a file by BARE BASENAME; this turns that
+        // name into the real workspace path (or a pick-list) instead of an ENOENT.
+        resolveFile: resolveFileForPreview,
         ...(answer === undefined ? {} : { answerAction: answer }),
         ...(refreshTranscript === undefined
             ? {}
@@ -2272,7 +2312,8 @@ const createSessionPillBar = (variant: 'head' | 'dialog'): SessionPillBar => {
 //
 // The `' | '` between figures is CSS decoration (`.harness-details-stat + ...`), not a
 // text node, so each span stays a clean, copy-pastable value — the same discipline as
-// the turn header's measurement line (styles.css:2333).
+// the turn header's measurement line (`.tile-elapsed + .tile-tokens::before` in
+// styles.css).
 //
 // Cross-references:
 //   - src/frontend/ui/usage-summary.ts — the derivation (threads/unknown rules)

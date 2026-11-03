@@ -69,7 +69,7 @@ it('places the single agent button inside the composer field frame', () => {
     const button = blockOf('.agent-control-button {');
     expect(button).toContain('display: inline-flex');
     expect(button).toContain('height: 32px');
-    expect(button).toContain('border-radius: 8px');
+    expect(button).toContain('border-radius: var(--radius-sm)');
     expect(button).toContain('max-width: 180px');
 
     // The compact control carries the activity state on the button, while the full
@@ -125,7 +125,10 @@ it('imports the agent dialog stylesheet and keeps the single-writer action botto
     expect(blockOf(".agent-dialog-tab[aria-selected='true'] {", agentDialogRules)).toContain(
         'border-color: var(--accent)'
     );
-    expect(blockOf('.agent-dialog-add {', agentDialogRules)).toContain('border-radius: 999px');
+    // The `[+]` rounds with the shared control token, like every other pressable box.
+    expect(blockOf('.agent-dialog-add {', agentDialogRules)).toContain(
+        'border-radius: var(--radius-sm)'
+    );
 
     // The instruction is a real editor (multi-line, resizable), not a read-only block.
     const editor = blockOf('.agent-dialog-instruction {', agentDialogRules);
@@ -161,4 +164,35 @@ it('imports the agent dialog stylesheet and keeps the single-writer action botto
     expect(blockOf(".agent-dialog-agent[data-activity='active'] {", agentDialogRules)).toContain(
         'border-color: var(--accent)'
     );
+});
+
+it('rounds every control with one shared token and keeps surfaces and circles on their own', () => {
+    // The per-rule `border-radius: var(--radius-sm)` assertions above are only meaningful
+    // if the token VALUES are pinned at the definition: a silent retune of the token would
+    // otherwise keep every one of them green. `--radius-sm` is 6px because that is the
+    // `.tool` chip frame the rest of the controls are aligned to; `--radius` stays 10px for
+    // surfaces, and 999px stays reserved for round badges + circular icon buttons.
+    const root = blockOf(':root {');
+    expect(root).toContain('--radius: 10px;');
+    expect(root).toContain('--radius-sm: 6px;');
+
+    // Control rules in the app sheet carry no radius literal any more (one source of truth).
+    for (const selector of ['\n.tool {', '\n.button {', '\n.session-pill {']) {
+        expect(blockOf(selector)).toContain('border-radius: var(--radius-sm)');
+    }
+
+    // The shapes deliberately OUTSIDE the token stay outside it, so a future sweep cannot
+    // flatten the duration/status badges or re-square the panels.
+    expect(blockOf(':is(.tool-duration, .think-count) {')).toContain('border-radius: 999px');
+    expect(blockOf('\n.status {')).toContain('border-radius: 999px');
+    expect(blockOf('\n.tile {')).toContain('border-radius: var(--radius)');
+    expect(blockOf('\n.conversation {')).toContain('border-radius: var(--radius)');
+
+    // The dialog sheet resolves the same token because styles.css @imports it (asserted
+    // above); neither the old 999px capsules nor the one-off 7px radius survive in it.
+    expect(blockOf('.agent-dialog-tab {', agentDialogRules)).toContain(
+        'border-radius: var(--radius-sm)'
+    );
+    expect(agentDialogRules).not.toContain('border-radius: 999px');
+    expect(agentDialogRules).not.toContain('border-radius: 7px');
 });

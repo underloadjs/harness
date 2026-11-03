@@ -719,7 +719,10 @@ describe('the phone cycler stylesheet (T7)', () => {
             // The strip's ACTIVE-pill vocabulary (accent frame + soft fill), so this control
             // reads as "the conversation in view" rather than as one more header button.
             'border: 1px solid var(--accent)',
-            'border-radius: 999px',
+            // Same control radius as every other button/chip (`--radius-sm`), so the phone
+            // cycle control matches the session strip it replaces instead of reading as a
+            // third capsule shape in the header.
+            'border-radius: var(--radius-sm)',
             'background: var(--accent-soft)',
             'color: var(--text)',
             'font-family: var(--mono)',

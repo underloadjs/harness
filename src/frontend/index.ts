@@ -45,7 +45,7 @@ export * from './ui/time';
 export * from './ui/tokens';
 export * from './ui/tools';
 export * from './ui/turns';
-// Aggregate token/time/thread totals for the harness details dialog. Pure data: no
-// element is created at import time, so the barrel's import-safety contract
-// (./index.test.ts) still holds.
-export * from './ui/usage-summary';
+// NOT exported: `./ui/usage-summary`, `./ui/threads`, `./ui/composer` and the other
+// shell-only modules. `src/structure.test.ts` pins this exact list, and the helper the
+// dialog needs is imported directly by `main.ts` — the same route every other `ui/`
+// module the shell uses takes.

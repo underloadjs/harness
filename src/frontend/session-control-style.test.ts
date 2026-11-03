@@ -94,7 +94,9 @@ it('paints one compact rounded pill per conversation', () => {
     const pill = blockOf('.session-pill {');
     // Siblings (open + delete) inside one rounded shell, never nested buttons.
     expect(pill).toContain('display: inline-flex');
-    expect(pill).toContain('border-radius: 999px');
+    // Control radius (the shared `--radius-sm` token), not a 999px capsule: the strip has to
+    // read as the same class of control as the `.tool` chip and every button in the app.
+    expect(pill).toContain('border-radius: var(--radius-sm)');
     expect(pill).toContain('border: 1px solid var(--border)');
     expect(pill).toContain('background: var(--bg-elevated)');
     expect(pill).toContain('min-width: 0');
@@ -104,6 +106,10 @@ it('paints one compact rounded pill per conversation', () => {
     expect(select).toContain('cursor: pointer');
     expect(select).toContain('background: transparent');
     expect(select).toContain('min-width: 0');
+    // The shell clips (`overflow: hidden`), so the leading segment rounds ONLY its own
+    // left corners: that is what keeps its `outline-offset: -2px` focus ring from being
+    // shaved into a diagonal cut by the shell's control-radius clip.
+    expect(select).toContain('border-radius: var(--radius-sm) 0 0 var(--radius-sm)');
 
     // The only visible text: monospace, small, and clipped instead of widening the strip.
     const id = blockOf('.session-pill-id {');
@@ -152,6 +158,9 @@ it('marks the delete control as destructive with disabled and focus states', () 
     expect(remove).toContain('min-height: 22px');
     // Separated from the open button by a divider, so the two never read as one control.
     expect(remove).toContain('border-left: 1px solid var(--border)');
+    // Mirror of the open segment: the trailing corners belong to this button, so the hover
+    // fill and the inset danger ring follow the shell's control radius.
+    expect(remove).toContain('border-radius: 0 var(--radius-sm) var(--radius-sm) 0');
     expect(remove).toContain('color: var(--danger)');
     expect(remove).toContain('cursor: pointer');
 

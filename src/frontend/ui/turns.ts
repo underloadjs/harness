@@ -156,7 +156,7 @@ import type {
 import { applyAttachmentChips } from './attachments';
 import { enhanceFileLinks } from './file-links';
 import { openFilePreview } from './file-preview';
-import type { FilePreviewReader } from './file-preview';
+import type { FilePreviewReader, FilePreviewResolver } from './file-preview';
 import { openAttachmentDialog, enhanceImages, openImageDialog } from './preview';
 // C5 transcript editing: the PUT answer's transcript document. TYPE-ONLY, so this
 // never pulls the fetch client into the UI graph at runtime.
@@ -456,6 +456,11 @@ export type TurnBoardOptions = {
     // layer owns no network code. Omitted in standalone use: clicking a file link
     // still opens the dialog, which reports that reading is not wired.
     readFile?: FilePreviewReader;
+    // R11+: resolves a BARE BASENAME transcript reference (`descriptors.ts`) into the
+    // real workspace path(s) before the read above. Injected by main.ts from the
+    // `glob` tool; omitted in standalone use, where the bare name is read as typed
+    // and the server's own ENOENT is what the dialog shows. See ui/file-preview.ts.
+    resolveFile?: FilePreviewResolver;
     // Focus is DERIVED from expansion (exactly one tile is expanded at a time), so
     // the board reports every change here. The shell repaints the thread strip and
     // the composer's routing line from it; nothing is sent to the server until a
@@ -2559,9 +2564,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
         // Open a file link in the R11 preview dialog. Only a user activation calls
         // this, so no path is fetched automatically; `options.readFile` supplies
-        // the bounded request (main.ts -> callTool('read', ...)).
+        // the bounded request (main.ts -> callTool('read', ...)) and
+        // `options.resolveFile` the basename lookup (main.ts -> callTool('glob', ...))
+        // for a reference that names a file without its directory.
         const openTranscriptFile = (path: string): void => {
-            openFilePreview(path, options.readFile === undefined ? {} : { read: options.readFile });
+            openFilePreview(path, {
+                ...(options.readFile === undefined ? {} : { read: options.readFile }),
+                ...(options.resolveFile === undefined ? {} : { resolve: options.resolveFile })
+            });
         };
 
         // A recorded attachment opens the shared preview modal. The dialog captures

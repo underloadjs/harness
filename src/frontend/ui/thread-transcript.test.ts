@@ -1125,7 +1125,7 @@ describe('responsive thread action bar', () => {
             block.replace(/\r\n/g, '\n')
         );
         expect(deleteRules).toEqual([
-            '.thread-delete {\n    padding: 4px 10px;\n    border: 1px solid var(--border-strong);\n    border-radius: 6px;\n    background: var(--bg-elevated);\n    color: var(--text);\n    font: 500 11.5px/1.4 var(--sans);\n    cursor: pointer;\n}',
+            '.thread-delete {\n    padding: 4px 10px;\n    border: 1px solid var(--border-strong);\n    border-radius: var(--radius-sm);\n    background: var(--bg-elevated);\n    color: var(--text);\n    font: 500 11.5px/1.4 var(--sans);\n    cursor: pointer;\n}',
             '.thread-delete {\n    border-color: rgba(248, 113, 113, 0.45);\n    color: var(--danger);\n}'
         ]);
 
