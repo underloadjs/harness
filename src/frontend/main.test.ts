@@ -3318,6 +3318,18 @@ it('rebuilds an open Instruct dialog when the width crosses the phone breakpoint
     expect(dialog.querySelector('.session-pills-bar-dialog')).toBeNull();
     expect(document.querySelectorAll('.session-pills-bar')).toHaveLength(1);
 
+    // The aggregate totals are NOT phone-only — they are built outside the breakpoint
+    // branch — and they sit between the description and the template metadata line.
+    expect([...details.children].map((node) => node.className)).toEqual([
+        'harness-details-description',
+        'harness-details-stats',
+        'harness-details-meta',
+        'harness-details-note'
+    ]);
+    // Two conversations, neither with a turn: the thread count is the only derivable
+    // figure, and the token/time figures are absent because nothing was reported.
+    expect(details.querySelector('.harness-details-stats')?.textContent).toBe('0 threads');
+
     // Resize to a phone width. The SAME layer stays open — same node, still modal — and
     // its body is rebuilt for the new layout.
     media.setMatches(true);
@@ -3335,6 +3347,14 @@ it('rebuilds an open Instruct dialog when the width crosses the phone breakpoint
     expect([...details.children].map((node) => node.className).slice(0, 2)).toEqual([
         'harness-details-section',
         'session-pills-bar session-pills-bar-dialog'
+    ]);
+    // The rebuild carries the totals as well, in the same slot between the description
+    // and the metadata line — one row per body, never a second one left behind.
+    expect([...details.children].map((node) => node.className).slice(2)).toEqual([
+        'harness-details-description',
+        'harness-details-stats',
+        'harness-details-meta',
+        'harness-details-note'
     ]);
     const dialogBar = byClass('.session-pills-bar-dialog', 'div');
     expect([...dialogBar.querySelectorAll<HTMLElement>('.session-pill')].map((node) => node.dataset.sessionId)).toEqual(

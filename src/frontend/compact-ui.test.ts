@@ -323,6 +323,10 @@ it('opens harness details from the clickable title and keeps tools headings iner
     expect(dialog.querySelector('.harness-details-note')?.textContent).toBe(
         'Edits apply to new sessions'
     );
+    // The aggregate totals are OMITTED here: this boot has no conversations at all, and
+    // a row of zeros would read as a measurement (session-pills.test.ts pins the row
+    // itself, including its exact figures).
+    expect(dialog.querySelector('.harness-details-stats')).toBeNull();
     expect(document.activeElement).toBe(dialog);
 
     // Closing restores focus to the title button.
