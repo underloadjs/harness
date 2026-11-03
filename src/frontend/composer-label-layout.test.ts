@@ -19,6 +19,7 @@ import type { HarnessDescriptor, SessionSnapshot } from '../server/protocol';
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const SESSION_KEY = 'underload-harness-app:session';
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
@@ -82,7 +83,7 @@ const mount = async (session: SessionSnapshot): Promise<void> => {
     localStorage.setItem(SESSION_KEY, 's1');
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
             const url = String(input);
             if (url === '/api') {
                 return json({
@@ -110,7 +111,7 @@ const mount = async (session: SessionSnapshot): Promise<void> => {
             }
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');

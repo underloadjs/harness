@@ -27,6 +27,7 @@ import type {
     SessionTurn
 } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const SESSION_KEY = 'underload-harness-app:session';
 // Realistic epoch stamps: the UI formats real server milliseconds, and a tiny
@@ -182,7 +183,7 @@ const stubFetch = (
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
@@ -192,7 +193,7 @@ const stubFetch = (
             if (response === undefined) throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
 
             return response;
-        })
+        }))
     );
 
     return calls;
@@ -610,6 +611,33 @@ it('boots the three-column shell, streams a turn and resolves server timings', a
     expect(tile.querySelector('.tile-index')).toBeNull();
     expect(tile.querySelector('.tile-status-text')?.textContent).toBe('done');
     expect(tile.querySelector('.turn-prompt')?.textContent).toBe('say hi\n');
+    console.warn(
+        '[boot probe]',
+        'tiles:',
+        document.querySelectorAll('.tile').length,
+        'turn-tiles:',
+        document.querySelectorAll('.turn-tile').length,
+        'turn-row:',
+        document.querySelectorAll('.turn-row').length,
+        'tile children classes:',
+        [...(tile.children ?? [])].map((n) => n.className).join(' | '),
+        'descendant classes:',
+        [...tile.querySelectorAll('*')].map((n) => n.className).filter(Boolean).slice(0, 30).join(' | '),
+        'connected:',
+        tile.isConnected,
+        'ancestors:',
+        (() => {
+            const chain: string[] = [];
+            let node: HTMLElement | null = tile;
+            while (node !== null && chain.length < 8) {
+                chain.push(node.tagName + '.' + String(node.className).replace(/\s+/g, '.'));
+                node = node.parentElement;
+            }
+            return chain.join(' < ');
+        })(),
+        'flow html:',
+        document.querySelector('.tile-flow')?.outerHTML.slice(0, 260).replace(/\s+/g, ' ')
+    );
     expect(tile.querySelector('.agent-text')?.innerHTML).toBe('<h1>Hi</h1>\n<p>a <strong>b</strong></p>\n');
     // R5: the block footer no longer prints the model / stop reason line — those
     // figures are header facts (`.tile-top`, asserted below). The footer is the
@@ -1805,7 +1833,7 @@ it('stops every task in the originating session while a run is in flight', async
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
             if (url === '/api') return json(bootstrap({ presets: [descriptor(), other] }));
@@ -1838,7 +1866,7 @@ it('stops every task in the originating session while a run is in flight', async
             if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [transcript] });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -2557,7 +2585,7 @@ it('hydrates a queued session on reload and stops the whole queue explicitly', a
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
             if (url === '/api') return json(bootstrap({ sessions: [queued] }));
@@ -2576,7 +2604,7 @@ it('hydrates a queued session on reload and stops the whole queue explicitly', a
             if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [queued] });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -2937,7 +2965,7 @@ it('deletes the running current session, stops watching and creates no replaceme
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             calls.push({
                 url,
@@ -2970,7 +2998,7 @@ it('deletes the running current session, stops watching and creates no replaceme
             }
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     await import('./main');

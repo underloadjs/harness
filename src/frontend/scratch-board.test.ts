@@ -1,9 +1,6 @@
 // R21 shell acceptance: editable harnesses everywhere, no right-rail tool list,
 // and the declarative scratch board (plus two secondary hosts).
 //
-// What this file pins, end to end through `main.ts` with a stubbed server:
-//   - R21.1: a preset the wire marks `editable:false` still renders an editable
-//     agent row, never a read-only badge, and a PATCH is sent when it is edited;
 //   - R21.2: the right rail is [scratch board, sessions] and holds NO tool list /
 //     core-tools dropdown — those live only on the Tools tab;
 //   - R21.3: recorded panels are derived from snapshot turns (reload/poll), live
@@ -15,6 +12,7 @@
 
 import type { HarnessDescriptor, SessionSnapshot, SessionTurn } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const SESSION_KEY = 'underload-harness-app:session';
 const T = 1_700_000_000_000;
@@ -92,7 +90,7 @@ const stubFetch = (
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
@@ -102,7 +100,7 @@ const stubFetch = (
             if (response === undefined) throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
 
             return response;
-        })
+        }))
     );
 
     return calls;
@@ -366,7 +364,13 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
     await flush();
 
     expect(panelIds('scratch')).toEqual(['s2-note']);
-    expect(panelText('scratch')).toEqual([]);
+    // T5 R1/R2: the compact surface sends a bounded SUMMARY per panel, so the card carries
+    // the server's own preview line (never the recorded blocks) plus the block SHAPES, and
+    // says what it left out. `panelText` reads `.panel-text`, i.e. exactly the preview line.
+    expect(panelText('scratch')).toEqual(['open 2 · done 5']);
+    expect(byClass('.panel[data-panel-id="s2-note"]', 'article').dataset.panelState).toBe('summary');
+    expect(host('scratch').querySelector('.panel-note')?.textContent).toContain('compact view');
+    expect(host('scratch').querySelector('.panel-expand')).not.toBeNull();
     expect(host('center').hidden).toBe(false);
     expect(panelText('center')).toEqual(['live summary']);
     expect(host('left').hidden).toBe(false);
@@ -374,6 +378,22 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
     // s1's panel is gone from every host: no cross-session residue.
     expect([...panelText('scratch'), ...panelText('center'), ...panelText('left')]).not.toContain('ready');
 
+    // T5 R2: before expansion the card names the block shapes only — the recorded values are
+    // NOT in the browser (that is the payload class the compact wire removes). The detail route
+    // is the one place they arrive, and only on the reader's click.
+    const summaryKv = byClass('.panel[data-panel-id="s2-note"] .panel-kv', 'dl');
+    expect([...summaryKv.querySelectorAll('dt')].map((node) => node.textContent)).toEqual(['keyValue']);
+    expect([...summaryKv.querySelectorAll('dd')].map((node) => node.textContent)).toEqual(['2 items']);
+
+    const details = calls.filter((call) => call.url.includes('/turns/') && call.url.includes('/steps/'));
+    expect(details).toHaveLength(0);
+
+    byClass('.panel[data-panel-id="s2-note"] .panel-expand', 'button').click();
+    await flush();
+    await flush();
+
+    expect(calls.filter((call) => call.url.includes('/turns/') && call.url.includes('/steps/'))).toHaveLength(1);
+    expect(byClass('.panel[data-panel-id="s2-note"]', 'article').dataset.panelState).toBe('full');
     const kv = byClass('.panel[data-panel-id="s2-note"] .panel-kv', 'dl');
     expect([...kv.querySelectorAll('dt')].map((node) => node.textContent)).toEqual(['open', 'done']);
     expect([...kv.querySelectorAll('dd')].map((node) => node.textContent)).toEqual(['2', '5']);

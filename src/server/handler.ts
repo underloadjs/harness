@@ -13,7 +13,7 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { HarnessRegistry, ToolCatalogue } from './harnesses';
-import type { SessionStreamItem } from './protocol';
+import type { SessionStreamItem, SessionViewStreamItem } from './protocol';
 import type { HarnessIndex } from './protocol';
 import { SessionStore } from './sessions';
 import {
@@ -115,7 +115,7 @@ const readJson = <T>(request: IncomingMessage, limitBytes = MAX_API_BODY_BYTES):
 // Write one SSE frame and honour backpressure. The harness awaits progress, so a
 // slow client naturally paces the run instead of buffering the transcript.
 const createSseWriter = (response: ServerResponse): HarnessApiEmit => {
-    return async (item: SessionStreamItem): Promise<void> => {
+    return async (item: SessionStreamItem | SessionViewStreamItem): Promise<void> => {
         if (response.writableEnded || response.destroyed) return;
 
         if (response.write(`data: ${JSON.stringify(item)}\n\n`)) return;

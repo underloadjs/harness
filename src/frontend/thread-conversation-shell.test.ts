@@ -15,6 +15,7 @@
 
 import type { HarnessDescriptor, HarnessEvent, SessionSnapshot, SessionTurn } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const T = 1_700_000_000_000;
 const SESSION_KEY = 'underload-harness-app:session';
@@ -131,7 +132,7 @@ const stubServer = (
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method ?? 'GET';
 
@@ -171,7 +172,7 @@ const stubServer = (
             // The shell may probe thread routes only on explicit actions.
             void stream;
             throw new Error(`unexpected request: ${method} ${url}`);
-        })
+        }))
     );
 
     return stub;

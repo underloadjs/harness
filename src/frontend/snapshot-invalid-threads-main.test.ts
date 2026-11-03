@@ -30,6 +30,7 @@
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import type { HarnessDescriptor, SessionSnapshot } from '../server/protocol';
 import { THREAD_TRANSCRIPT_SAVE_NOTE } from './ui/thread-transcript';
+import { viewAwareFetch } from './view-test-support';
 
 const descriptor = (): HarnessDescriptor =>
     ({
@@ -159,7 +160,7 @@ it('carries invalidThreads from the wire into the board and the editor, verbatim
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             if (url === '/api') return json(bootstrap(snapshot));
@@ -167,7 +168,7 @@ it('carries invalidThreads from the wire into the board and the editor, verbatim
             if (url === '/api/sessions/s1' && method === undefined) return json({ session: snapshot });
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -216,7 +217,7 @@ it('keeps the roster through the snapshot a save returns so the break stays visi
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             if (url === '/api') return json(bootstrap(snapshot));
@@ -236,7 +237,7 @@ it('keeps the roster through the snapshot a save returns so the break stays visi
             }
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     await import('./main');

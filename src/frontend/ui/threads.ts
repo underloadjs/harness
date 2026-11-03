@@ -87,7 +87,20 @@ export type SessionThreadEntry = {
     // has NO SessionTurn of its own (its work is recorded inside its parent's turn),
     // so this is the only way the UI can render that conversation (S2). Kept as an
     // opaque array: the board renders role/content defensively.
+    // T5 R1: on the DISPLAY wire the roster is `SessionView.threadViews` (protocol.ts:408) and
+    // carries NO messages — the transcript is the biggest payload class on the raw surface — so
+    // `messages` is absent there and the three compact fields below replace it. A raw snapshot
+    // document (the explicit export read) still carries the transcript entries themselves.
     messages?: readonly unknown[];
+    // How many transcript entries the conversation holds, never their content
+    // (`SessionThreadView.messageCount`).
+    messageCount?: number;
+    // True when a transcript read would return anything (`SessionThreadView.hasTranscript`): the
+    // honest signal for "offer the transcript control" without pulling the transcript.
+    hasTranscript?: boolean;
+    // Bounded last-message preview (`SessionThreadView.preview`), so a roster-only child shows
+    // something before its transcript is read.
+    preview?: string;
     // C5: this thread's stored transcript value cannot be read as
     // `HarnessMessage[]`. The record is the raw `SessionSnapshot.invalidThreads`
     // entry (error + the unreadable value verbatim), joined onto the roster so the
@@ -183,7 +196,12 @@ const idList = (value: unknown): string[] | undefined => {
 export const sessionThreadsOf = (session: unknown): SessionThreadEntry[] => {
     if (!isObjectLike(session)) return [];
 
-    const value = session.threads;
+    // T5 R1: the display wire publishes the COMPACT roster (`SessionView.threadViews`,
+    // protocol.ts:396-428) and omits `threads`, whose `messages` arrays are the payload class the
+    // view contract removes. The raw roster is still read when present (a raw snapshot document
+    // from an explicit export, an older server), so one adapter serves both surfaces.
+    const compact = Array.isArray(session.threadViews);
+    const value = compact ? session.threadViews : session.threads;
     if (!Array.isArray(value)) return [];
 
     const threads: SessionThreadEntry[] = [];
@@ -231,7 +249,15 @@ export const sessionThreadsOf = (session: unknown): SessionThreadEntry[] => {
                 ? {}
                 : { originInvocationId: nonEmptyString(entry.originInvocationId) as string }),
             ...(invocationIds === undefined ? {} : { invocationIds }),
-            ...(Array.isArray(entry.messages) ? { messages: [...entry.messages] } : {})
+            ...(Array.isArray(entry.messages) ? { messages: [...entry.messages] } : {}),
+            // The compact roster's transcript signal (protocol.ts:422-427). Read structurally:
+            // a roster that sends neither keeps the pre-T5 behaviour (`messages` decides), and a
+            // malformed count is dropped rather than rendered as a fake transcript.
+            ...(typeof entry.messageCount === 'number' && Number.isFinite(entry.messageCount)
+                ? { messageCount: entry.messageCount }
+                : {}),
+            ...(typeof entry.hasTranscript === 'boolean' ? { hasTranscript: entry.hasTranscript } : {}),
+            ...(nonEmptyString(entry.preview) === undefined ? {} : { preview: nonEmptyString(entry.preview) as string })
         });
     }
 

@@ -18,6 +18,7 @@
 
 import type { AgentDescriptor, HarnessDescriptor, SessionSnapshot } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 const SESSION_KEY = 'underload-harness-app:session';
@@ -139,7 +140,7 @@ it('removes the entry-agent transcript button and its raw session.messages dialo
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
             const url = String(input);
             if (url === '/api') {
                 return json({
@@ -155,7 +156,7 @@ it('removes the entry-agent transcript button and its raw session.messages dialo
             if (url === '/api/sessions/s1') return json({ session });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -177,7 +178,7 @@ it('removes the entry-agent transcript button and its raw session.messages dialo
 it('opens the shared agent dialog from the single composer button', async () => {
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
             const url = String(input);
             if (url === '/api') {
                 return json({
@@ -192,7 +193,7 @@ it('opens the shared agent dialog from the single composer button', async () => 
             if (url === '/api/models') return json({ models: ['m1'] });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -275,7 +276,7 @@ it('selects a different primary agent from the dialog and PATCHes the complete t
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
             if (url === '/api') {
@@ -298,7 +299,7 @@ it('selects a different primary agent from the dialog and PATCHes the complete t
             }
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -363,7 +364,7 @@ it('changes a model from the dialog and keeps the open dialog in sync without dr
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
             if (url === '/api') {
@@ -386,7 +387,7 @@ it('changes a model from the dialog and keeps the open dialog in sync without dr
             }
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -444,7 +445,7 @@ it('changes a model from the dialog and keeps the open dialog in sync without dr
 it('shows every agent instruction and guideline inside the dialog', async () => {
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
             const url = String(input);
             if (url === '/api') {
                 return json({
@@ -459,7 +460,7 @@ it('shows every agent instruction and guideline inside the dialog', async () => 
             if (url === '/api/models') return json({ models: ['m1'] });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -508,7 +509,7 @@ it('keeps a saved session’s team and instructions locked while models stay rea
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
             const url = String(input);
             if (url === '/api') {
                 return json({
@@ -524,7 +525,7 @@ it('keeps a saved session’s team and instructions locked while models stay rea
             if (url === '/api/sessions/s1') return json({ session });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -588,7 +589,7 @@ it('discards every draft on close, overlay and Escape without a single request',
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
             if (url === '/api') {
@@ -611,7 +612,7 @@ it('discards every draft on close, overlay and Escape without a single request',
             }
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -676,7 +677,7 @@ it('keeps the open dialog and the focused control across a live snapshot rebuild
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
             const url = String(input);
             if (url === '/api') {
                 return json({
@@ -698,7 +699,7 @@ it('keeps the open dialog and the focused control across a live snapshot rebuild
             }
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');

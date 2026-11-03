@@ -51,6 +51,7 @@ import type {
     SessionSnapshot,
     SessionStreamItem,
     SessionTurn,
+    SessionViewSummary,
     SubmitTaskResult,
     // C4 transcript documents, aliased below as the client-facing `...Payload` names.
     ThreadTranscriptResponse,
@@ -77,7 +78,12 @@ export type HarnessBootstrap = {
     presets: HarnessDescriptor[];
     tools: ToolDescriptor[];
     defaults: HarnessIndex['defaults'];
-    sessions: SessionSnapshot[];
+    // The conversation rows the catalogue answer embeds. On the display wire a server
+    // sends `SessionViewSummary[]` (no events, no display trees); an older one sends
+    // raw `SessionSnapshot[]`. The field is OPTIONAL and is only ever a FALLBACK: the
+    // shell's default directory source is `GET /views` (./view-api.ts `listViews`), and
+    // nothing on this path needs the events either shape may carry.
+    sessions?: (SessionSnapshot | SessionViewSummary)[];
     agents?: AgentDescriptor[];
 };
 
@@ -262,6 +268,15 @@ export const apiRootCandidates = (): readonly string[] => staticCandidates ?? []
 
 const url = (path: string): string => `${API_ROOT}${path}`;
 
+// Shared with ./view-api.ts so the display surface builds its URLs from the SAME
+// (possibly probed/moved) root as the raw surface. A live-binding getter rather
+// than a value: `ensureApiRoot` moves the root after module load on a static host.
+export const apiUrl = (path: string): string => url(path);
+
+// Shared error decoding (a stream response cannot go through `request`). Deferred
+// through a wrapper because `readError` is declared below this line.
+export const readStreamError = (response: Response): Promise<string> => readError(response);
+
 // One bounded `GET <root>/health` per candidate. A dead loopback port refuses
 // instantly, but a dead LAN address can hang on an unanswered SYN, so the probe is
 // capped — otherwise a Pages page waits for a TCP timeout before reaching the next
@@ -340,7 +355,11 @@ const readError = async (response: Response): Promise<string> => {
 // harness is already gone") is the caller's desired end state rather than an error.
 // Everything else keeps flattening a non-2xx answer into one Error with the server's
 // own message (`readError`), so a real failure stays actionable.
-const request = async <T>(
+// Exported for the display-surface client (./view-api.ts), which speaks the SAME
+// transport (root resolution, trust rules, error shaping) against `/views` routes.
+// Keeping one `request` is what makes "every browser request goes through one
+// place" verifiable rather than aspirational.
+export const request = async <T>(
     path: string,
     init?: RequestInit,
     accept?: readonly number[]
@@ -477,11 +496,11 @@ export const loadBootstrap = async (): Promise<HarnessBootstrap> => {
         // and its message would mask the useful error if the server is down.
     }
 
-    const [index, tools, sessions] = await Promise.all([listHarnesses(), listTools(), listSessions()]);
-
-    // The harness index carries the agent library on the new server. Read it
-    // defensively: an older index has no `agents`, and the UI then derives a
-    // minimal library from the descriptors (main.ts) instead of failing boot.
+    // T5 R1: the standalone fallback fetches the CATALOGUE only. The conversation
+    // directory is the display wire's job (`GET /views`, ./view-api.ts `listViews`),
+    // which the shell reads right after boot — so a standalone mount no longer pays
+    // for `GET /sessions`, the route whose payload grows with every recorded event.
+    const [index, tools] = await Promise.all([listHarnesses(), listTools()]);
     const agents = index.agents;
 
     return {
@@ -491,7 +510,7 @@ export const loadBootstrap = async (): Promise<HarnessBootstrap> => {
         presets: index.harnesses,
         tools: tools.tools,
         defaults: index.defaults,
-        sessions,
+        sessions: [],
         ...(Array.isArray(agents) ? { agents } : {})
     };
 };
@@ -817,15 +836,16 @@ export const callTool = (
     });
 
 // Read a `text/event-stream` body and hand every `data:` payload to the caller.
-// The server sends one JSON `SessionStreamItem` per frame, so a frame never
-// contains a literal newline.
+// The server sends one JSON frame per `data:` line, so a frame never contains a
+// literal newline.
 //
-// Shared by both stream routes on purpose: POST /messages (legacy, one task and a
-// terminal frame) and GET /events (the queue observer). Parsing must be identical
-// or the two paths would disagree about the same server.
-const readEventStream = async (
+// Generic over the frame type on purpose: the raw observer parses
+// `SessionStreamItem` and the display observer (./view-api.ts) parses
+// `SessionViewStreamItem` with the SAME parser, so the two surfaces cannot drift
+// in how they split frames.
+export const readEventStream = async <T>(
     body: ReadableStream<Uint8Array>,
-    onItem: (item: SessionStreamItem) => void
+    onItem: (item: T) => void
 ): Promise<void> => {
     const reader = body.getReader();
     const decoder = new TextDecoder();
@@ -840,9 +860,9 @@ const readEventStream = async (
 
         if (data.length === 0) return;
 
-        let item: SessionStreamItem;
+        let item: T;
         try {
-            item = JSON.parse(data) as SessionStreamItem;
+            item = JSON.parse(data) as T;
         } catch {
             return;
         }
@@ -902,7 +922,7 @@ export const submitMessage = async (
     }
 
     let snapshot: SessionSnapshot | undefined;
-    await readEventStream(response.body, (item) => {
+    await readEventStream<SessionStreamItem>(response.body, (item) => {
         if (item.type === 'snapshot' || item.type === 'failed') snapshot = item.session;
         onItem(item);
     });
@@ -952,5 +972,5 @@ export const observeSession = async (
         throw new Error('The harness server returned an empty event stream.');
     }
 
-    await readEventStream(response.body, onItem);
+    await readEventStream<SessionStreamItem>(response.body, onItem);
 };

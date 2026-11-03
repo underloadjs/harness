@@ -21,6 +21,7 @@ import type {
     SessionThread,
     SessionTurn
 } from '../server/protocol';
+import { viewAwareFetch } from './view-test-support';
 
 const T = 1_700_000_000_000;
 const SESSION_KEY = 'underload-harness-app:session';
@@ -189,7 +190,7 @@ it('saves through PUT and applies the returned session through the snapshot path
     localStorage.setItem(SESSION_KEY, 's1');
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             if (url === '/api') return json(bootstrap(before));
@@ -210,7 +211,7 @@ it('saves through PUT and applies the returned session through the snapshot path
             if (url === '/api/sessions/s1' && method === undefined) return json({ session: before });
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -257,7 +258,7 @@ it('keeps the editor and marks the board when the saved transcript is unreadable
     localStorage.setItem(SESSION_KEY, 's1');
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             if (url === '/api') return json(bootstrap(before));
@@ -279,7 +280,7 @@ it('keeps the editor and marks the board when the saved transcript is unreadable
             if (url === '/api/sessions/s1' && method === undefined) return json({ session: before });
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     await import('./main');

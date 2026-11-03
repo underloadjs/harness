@@ -15,6 +15,7 @@
 
 import type { HarnessDescriptor, SessionSnapshot } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 const SESSION_KEY = 'underload-harness-app:session';
@@ -162,7 +163,7 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
             if (url === '/api') return json(bootstrap({ presets: [current] }));
@@ -188,7 +189,7 @@ it('edits per-agent models, preserving the map and dropping removed keys', async
             }
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -338,14 +339,14 @@ it('names the server fallback when the stored settings model is blank', async ()
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
             const url = String(input);
 
             if (url === '/api') return json(bootstrap({ presets: [descriptor()] }));
             if (url === '/api/models') return json({ models: ['m1', 'm2'] });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -365,7 +366,7 @@ it('shows a model-change error and keeps the last server-confirmed selection', a
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
             if (url === '/api') return json(bootstrap({ presets: [current] }));
@@ -376,7 +377,7 @@ it('shows a model-change error and keeps the last server-confirmed selection', a
             }
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -420,7 +421,7 @@ it('shows the saving state and diagnostic while a model PATCH is in flight', asy
     const patchStarted = new Promise<void>((resolveStarted) => {
         vi.stubGlobal(
             'fetch',
-            vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+            vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
                 const url = String(input);
 
                 if (url === '/api') return json(bootstrap({ presets: [descriptor()] }));
@@ -437,7 +438,7 @@ it('shows the saving state and diagnostic while a model PATCH is in flight', asy
                 }
 
                 throw new Error(`unexpected request: ${url}`);
-            })
+            }))
         );
     });
 
@@ -498,7 +499,7 @@ it('clears the accessible status diagnostic when the state resets', async () => 
     // cannot be re-read.
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
             if (url === '/api') return json(bootstrap({ presets: [descriptor()] }));
@@ -509,7 +510,7 @@ it('clears the accessible status diagnostic when the state resets', async () => 
             }
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -570,7 +571,7 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             calls.push({
@@ -586,7 +587,7 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
             if (url === '/api/sessions/s9') return json({ session: saved });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -718,7 +719,7 @@ it('changes a RUNNING session’s model without cancelling the stream', async ()
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             calls.push({
@@ -733,7 +734,7 @@ it('changes a RUNNING session’s model without cancelling the stream', async ()
             if (url === '/api/sessions/s7') return json({ session: running });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -810,7 +811,7 @@ it('shows a session model-change error and keeps the last confirmed value', asyn
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             calls.push(`${init?.method ?? 'GET'} ${url}`);
 
@@ -822,7 +823,7 @@ it('shows a session model-change error and keeps the last confirmed value', asyn
             if (url === '/api/sessions/s9') return json({ session: saved });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');

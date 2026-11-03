@@ -18,6 +18,7 @@
 import type { HarnessDescriptor, SessionSnapshot, SessionTurn } from '../server/protocol';
 import type { HarnessAttachment } from '../types';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const SESSION_KEY = 'underload-harness-app:session';
 const T = 1_700_000_000_000;
@@ -105,7 +106,7 @@ const stubServer = (restored?: SessionSnapshot, taskError?: string): Call[] => {
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
@@ -152,7 +153,7 @@ const stubServer = (restored?: SessionSnapshot, taskError?: string): Call[] => {
             }
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     return calls;
@@ -167,7 +168,7 @@ const gatedServer = (): { calls: Call[]; release: (response: Response) => void }
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
@@ -214,7 +215,7 @@ const gatedServer = (): { calls: Call[]; release: (response: Response) => void }
             if (url === '/api/sessions' && method === undefined) return json({ sessions: [] });
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     return {

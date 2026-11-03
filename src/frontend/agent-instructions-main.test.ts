@@ -21,6 +21,7 @@
 
 import type { HarnessDescriptor, SessionSnapshot } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 const SESSION_KEY = 'underload-harness-app:session';
@@ -154,7 +155,7 @@ const stubHarnessWrites = (initial: HarnessDescriptor) => {
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
             if (url === '/api') return json(bootstrap({ presets: [current] }));
@@ -169,7 +170,7 @@ const stubHarnessWrites = (initial: HarnessDescriptor) => {
             }
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     return { patches, updated: () => current };
@@ -408,7 +409,7 @@ it('refuses an instruction delta on a saved conversation instead of reporting it
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             calls.push({
@@ -422,7 +423,7 @@ it('refuses an instruction delta on a saved conversation instead of reporting it
             if (url === '/api/sessions/s9') return json({ session: saved });
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     await import('./main');

@@ -26,6 +26,7 @@
 // Run: npx vitest run --config src/frontend/vitest.config.ts session-pills.test.ts
 
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { withViewRoutes } from './view-test-support';
 import type { HarnessDescriptor, SessionSnapshot, SessionTurn } from '../server/protocol';
 
 const SESSION_KEY = 'underload-harness-app:session';
@@ -107,6 +108,11 @@ const stubFetch = (
     handler: (url: string, method: string | undefined, body: unknown) => Response | undefined
 ): Call[] => {
     const calls: Call[] = [];
+    // T5: the shell speaks the DISPLAY surface by default, so every `/views` route is
+    // answered from the raw fixtures this test already declares
+    // (./view-test-support.ts `withViewRoutes` rewrites the request and compiles the
+    // answer). The recorded `calls` still show the URL the browser actually asked for.
+    const answer = withViewRoutes(handler as (url: string, method?: string, body?: unknown) => Response | undefined);
 
     vi.stubGlobal(
         'fetch',
@@ -116,7 +122,7 @@ const stubFetch = (
             const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
             calls.push({ url, method, body });
 
-            const response = handler(url, method, body);
+            const response = await answer(url, method, body);
             if (response === undefined) throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
 
             return response;
@@ -354,7 +360,10 @@ it('opens a session from its pill, marking it active, and keeps the harness sele
 
     // The pointer and the projection both moved to s2, through one GET of the record.
     expect(localStorage.getItem(SESSION_KEY)).toBe('s2');
-    expect(calls.filter((call) => call.url === '/api/sessions/s2')).toHaveLength(1);
+    // T5: the record read now goes through the display surface (`/views/:id`), which carries
+    // the compiled rows for the tile; the raw `/sessions/:id` read is only for the explicit
+    // "export raw" action.
+    expect(calls.filter((call) => call.url === '/api/views/s2')).toHaveLength(1);
     expect(pillIds(dashboard())).toEqual(['s1', 's2']);
     expect(
         dashboard().querySelector('.session-pill[data-session-id="s1"]')?.dataset.active
@@ -407,7 +416,7 @@ it('deletes a session from its pill with one click', async () => {
     await flush();
 
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
-        { url: '/api/sessions/s2', method: 'DELETE', body: undefined }
+        { url: '/api/views/s2', method: 'DELETE', body: undefined }
     ]);
     // A DELETE leaves the layer open (only opening a conversation dismisses it), so this is
     // the same strip the click landed on.
@@ -483,6 +492,12 @@ it('re-reads the directory automatically when a submit is rejected, with no refr
 
     expect(pillIds(dashboard())).toEqual(['s1']);
 
+
+    // T5 R1: boot reads the compact directory index (`GET /views`); count what it did before
+    // the submit so the re-read below is attributable to the rejected run alone.
+    const directoryReads = (): number =>
+        calls.filter((call) => call.url === '/api/views' && call.method === undefined).length;
+    const readByBoot = directoryReads();
     // The server gained a conversation while the page was open.
     listed = [first, snapshot({ id: 's9', turns: [doneTurn('from another tab')] })];
 
@@ -491,9 +506,11 @@ it('re-reads the directory automatically when a submit is rejected, with no refr
     await flush();
     await flush();
 
-    // Boot never lists on its own (the catalogue carries the sessions), so the ONE list read
-    // here is the automatic re-read the rejected run triggered.
-    expect(calls.filter((call) => call.url === '/api/sessions' && call.method === undefined)).toHaveLength(1);
+    // T5 R1: boot reads the compact directory index once (`GET /views`), so the reads after
+    // boot are the baseline. The ONE additional index read here is the automatic re-read the
+    // rejected run triggered, and it answers with compact rows (`{views}`), never raw
+    // snapshots. Nothing on this path waits for a manual refresh.
+    expect(directoryReads()).toBe(readByBoot + 1);
     expect(pillIds(dashboard())).toEqual(['s1', 's9']);
     // Nothing manual is left to press, and the create control is live again once the failed
     // run released its lock.
@@ -910,7 +927,7 @@ it('opens a session from a dialog pill and closes the dialog, and deletes from t
     await flush();
 
     expect(calls.filter((call) => call.method === 'DELETE')).toEqual([
-        { url: '/api/sessions/s3', method: 'DELETE', body: undefined }
+        { url: '/api/views/s3', method: 'DELETE', body: undefined }
     ]);
     // T9 leaves exactly one strip in the page, so the reopen returns the SAME live node the
     // delete repainted — no header copy to fall out of step.

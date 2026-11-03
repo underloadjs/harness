@@ -39,6 +39,7 @@ import type {
 } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 import { API_ROOT } from './api';
+import { viewAwareFetch } from './view-test-support';
 
 const SETTINGS_KEY = 'underload-harness-app:settings';
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
@@ -166,7 +167,7 @@ const stub = (extra?: (url: string, method: string, body: unknown) => Response |
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method ?? 'GET';
             const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
@@ -179,7 +180,7 @@ const stub = (extra?: (url: string, method: string, body: unknown) => Response |
             if (url === '/api/models' && method === 'POST') return json({ models: ['m1', 'm2'] });
 
             throw new Error(`unexpected request: ${method} ${url}`);
-        })
+        }))
     );
 
     return calls;

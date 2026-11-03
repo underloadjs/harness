@@ -11,6 +11,7 @@
 // (a fully-enqueued stream would be consumed before the first assertion).
 
 import type { HarnessDescriptor, HarnessEvent, SessionSnapshot, SessionTurn } from '../server/protocol';
+import { viewAwareFetch } from './view-test-support';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
 
 const SESSION_KEY = 'underload-harness-app:session';
@@ -168,7 +169,7 @@ it('lights on start, keeps a delegated sibling lit, and clears on done/terminal'
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
             if (url === '/api') return json(bootstrap());
@@ -187,7 +188,7 @@ it('lights on start, keeps a delegated sibling lit, and clears on done/terminal'
             if (url === '/api/sessions/s1/events') return stream.response;
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -263,7 +264,7 @@ it('clears every ring as soon as Stop is pressed', async () => {
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
             if (url === '/api') return json(bootstrap());
@@ -286,7 +287,7 @@ it('clears every ring as soon as Stop is pressed', async () => {
             if (url === '/api/sessions' && init?.method === undefined) return json({ sessions: [] });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -353,7 +354,7 @@ it('derives rings from a still-running polled turn and never from completed hist
     let gets = 0;
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
             const url = String(input);
 
             if (url === '/api') return json(bootstrap({ sessions: [live] }));
@@ -364,7 +365,7 @@ it('derives rings from a still-running polled turn and never from completed hist
             }
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');

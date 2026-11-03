@@ -365,13 +365,18 @@ describe('loadBootstrap', () => {
             presets: [descriptor],
             tools: [],
             defaults,
-            sessions: [session]
+            // T5 R1: the fallback composes the CATALOGUE only. The conversation directory is a
+            // separate, compact read (`GET /views`, ./view-api.ts `listViews`), so this path never
+            // embeds raw `{sessions}` snapshots — the shape that carried every recorded event.
+            sessions: []
         });
+        // Three reads, and NO `GET /api/sessions`: the raw session index is not part of the
+        // default bootstrap path any more (the route stays declared in the stub above, so a
+        // regression that re-added the read would show up as an extra entry here).
         expect(calls).toEqual([
             { url: '/api', method: undefined },
             { url: '/api/harnesses', method: undefined },
-            { url: '/api/tools', method: undefined },
-            { url: '/api/sessions', method: undefined }
+            { url: '/api/tools', method: undefined }
         ]);
     });
 

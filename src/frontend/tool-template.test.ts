@@ -31,6 +31,7 @@
 
 import type { ToolDescriptor } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const json = (value: unknown, status = 200): Response =>
     new Response(JSON.stringify(value), { status, headers: { 'Content-Type': 'application/json' } });
@@ -226,7 +227,7 @@ beforeEach(() => {
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             calls.push({ url, method: init?.method });
 
@@ -244,7 +245,7 @@ beforeEach(() => {
             if (url === '/api/models') return json({ models: ['m1'] });
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 });
 
@@ -375,6 +376,10 @@ it('leaves the arguments editable and executes nothing on selection', async () =
     ]);
 
     // No tool call was made: only the boot document and the model catalogue.
-    expect(calls.map((call) => call.url)).toEqual(['/api', '/api/models']);
+    // T5 R1: the catalogue embeds no conversations here, so boot also reads the compact
+    // directory index (`GET /views`). The double answers that route from this test's raw
+    // `/sessions` route, which is the URL its stub recorded — and no tool call was made,
+    // which is what this assertion exists to pin.
+    expect(calls.map((call) => call.url)).toEqual(['/api', '/api/models', '/api/sessions']);
     expect(calls.some((call) => call.url.startsWith('/api/tools/'))).toBe(false);
 });

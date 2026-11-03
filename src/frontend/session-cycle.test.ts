@@ -41,6 +41,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { HarnessDescriptor, SessionSnapshot, SessionTurn } from '../server/protocol';
+import { viewAwareFetch } from './view-test-support';
 
 const SESSION_KEY = 'underload-harness-app:session';
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
@@ -130,7 +131,7 @@ const stubFetch = (
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
@@ -140,7 +141,7 @@ const stubFetch = (
             if (response === undefined) throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
 
             return response;
-        })
+        }))
     );
 
     return calls;

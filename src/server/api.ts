@@ -97,12 +97,21 @@ import type {
     ModelListRequest,
     SessionSnapshot,
     SessionStreamItem,
+    SessionStepDetailResponse,
+    SessionTurn,
+    SessionTurnRawResponse,
+    SessionView,
+    SessionViewIndex,
+    SessionViewResponse,
+    SessionViewStreamItem,
     SubmitMessageRequest,
     SubmitTaskRequest,
+    SubmitTaskViewResult,
     ToolCallRequest,
     ToolCallResult,
     ToolDescriptor,
     ToolIndex,
+    TurnSummary,
     UpdateHarnessRequest,
     UpdateSessionRequest,
     UpdateThreadTranscriptRequest
@@ -112,7 +121,7 @@ import { HarnessRegistryError } from './harnesses/registry';
 import { MAX_SUBMIT_BODY_BYTES } from '../shared/attachments';
 import { parseAgentReferenceLabels } from '../shared/agent-results';
 import { SessionError, SessionStore, validateAttachmentsForSubmit } from './sessions';
-import type { SessionWatch } from './sessions';
+import type { SessionViewWatch, SessionWatch } from './sessions';
 
 const MAX_BODY_BYTES = 1_000_000;
 
@@ -236,7 +245,11 @@ export type HarnessApiRequest = {
 
 // Push a stream item to the client. The dispatcher awaits every call, so a slow
 // client paces the harness run instead of buffering the whole transcript.
-export type HarnessApiEmit = (item: SessionStreamItem) => void | Promise<void>;
+// R3: the display stream (`GET /views/:id/events`) rides the SAME writer, so the
+// emitted frame is either a raw stream item or a display frame. Both adapters
+// serialize with `JSON.stringify`, so nothing else about the transport changes and
+// the raw contract keeps its exact shape.
+export type HarnessApiEmit = (item: SessionStreamItem | SessionViewStreamItem) => void | Promise<void>;
 
 // A stream that has already passed validation (status line may be sent).
 // `signal` aborts when the client disconnects. What that means is per route:
@@ -475,6 +488,36 @@ const relativeSegments = (pathname: string, mount: string): string[] | undefined
 
 // Maximum bytes for one request body, per route (T3).
 //
+// A row for a turn the view no longer lists. This happens only when a thread was
+// deleted between the submit and the view read, and it keeps the 202 envelope
+// addressable (a client can still key its tile by id) without inventing display
+// content that never existed.
+const summaryOf = (turn: SessionTurn): TurnSummary => {
+    const state =
+        turn.status === 'running'
+            ? 'streaming'
+            : turn.status === 'done' || turn.status === 'error' || turn.status === 'cancelled'
+              ? turn.status
+              : 'queued';
+
+    return {
+        id: turn.id,
+        index: turn.index,
+        prompt: turn.prompt,
+        status: turn.status,
+        state,
+        ...(turn.threadId === undefined ? {} : { threadId: turn.threadId }),
+        ...(turn.threadLabel === undefined ? {} : { threadLabel: turn.threadLabel }),
+        ...(turn.startedAt === undefined ? {} : { startedAt: turn.startedAt }),
+        updatedAt: turn.updatedAt,
+        ...(turn.usage === undefined ? {} : { usage: { ...turn.usage } }),
+        sectionCount: 0,
+        stepCount: 0,
+        activeAgents: [],
+        blocks: []
+    };
+};
+
 // The two submit routes carry raw base64 media inside JSON, so they alone get the
 // shared MAX_SUBMIT_BODY_BYTES (16 MiB) bound. Everything else keeps the legacy
 // 1 MB cap: an unrelated route must not become a larger allocation surface just
@@ -492,8 +535,11 @@ export const bodyLimitFor = (method: string, pathname: string, mount: string): n
     if (
         segments !== undefined &&
         segments.length === 3 &&
-        segments[0] === 'sessions' &&
-        (segments[2] === 'tasks' || segments[2] === 'messages')
+        (segments[0] === 'sessions' || segments[0] === 'views') &&
+        // R3: the compact submit route carries the SAME base64 attachments as the raw
+        // one (it is the same store dispatch), so it must get the same 16 MiB bound —
+        // an attachment submit through /views would otherwise 413 at the 1 MB cap.
+        (segments[2] === 'tasks' || (segments[0] === 'sessions' && segments[2] === 'messages'))
     ) {
         return MAX_SUBMIT_BODY_BYTES;
     }
@@ -957,6 +1003,140 @@ export const createHarnessApi = ({
                 }
             }
         };
+    };
+
+    // R3: the display observer. Deliberately a parallel implementation rather than a
+    // generic one: the raw stream's contract (frame order, backlog rule, "disconnect
+    // unsubscribes and never cancels") is load-bearing and pinned by api.test.ts, and
+    // folding both surfaces into one polymorphic helper would have to touch it. Same
+    // trade-off the CLI documents for its duplicated validators (./cli/render.ts:18).
+    const watchViewRoute = (id: string): HarnessApiResult => {
+        // 404 before a status line, exactly like GET /views/:id.
+        store.getView(id);
+
+        return {
+            kind: 'stream',
+            start: async (emit, signal) => {
+                let finish!: () => void;
+                const finished = new Promise<void>((resolve) => {
+                    finish = resolve;
+                });
+
+                let ready = false;
+                let ended = false;
+                let abandoned = false;
+                let pendingWrites = 0;
+                const buffered: SessionViewStreamItem[] = [];
+
+                let tail: Promise<void> = Promise.resolve();
+
+                const append = (item: SessionViewStreamItem): void => {
+                    if (ended) return;
+
+                    pendingWrites += 1;
+
+                    if (pendingWrites > MAX_WATCH_BACKLOG) {
+                        abandoned = true;
+                        ended = true;
+                        finish();
+
+                        return;
+                    }
+
+                    const written = tail.then(() => emit(item));
+
+                    tail = written.then(
+                        () => {
+                            pendingWrites -= 1;
+                        },
+                        () => {
+                            pendingWrites -= 1;
+                            ended = true;
+                            finish();
+                        }
+                    );
+                };
+
+                let watched: SessionViewWatch | undefined;
+
+                try {
+                    // The view is captured atomically with registration, so a client
+                    // that connects mid-run starts from a complete compiled state.
+                    watched = store.watchView(
+                        id,
+                        (item) => {
+                            if (!ready) {
+                                buffered.push(item);
+                                return;
+                            }
+
+                            append(item);
+                        },
+                        () => {
+                            ended = true;
+                            finish();
+                        }
+                    );
+                } catch {
+                    // Removed between dispatch and stream open: nothing to watch.
+                    return;
+                }
+
+                if (watched === undefined) return;
+
+                const onAbort = (): void => {
+                    // Unsubscribe only; the pump owns execution (R4).
+                    ended = true;
+                    finish();
+                };
+
+                signal.addEventListener('abort', onAbort, { once: true });
+                if (signal.aborted) finish();
+
+                append({ type: 'view', view: watched.view });
+                ready = true;
+
+                for (const item of buffered.splice(0)) append(item);
+
+                try {
+                    await finished;
+                    if (!abandoned) await tail;
+                } finally {
+                    ready = false;
+                    ended = true;
+                    signal.removeEventListener('abort', onAbort);
+                    watched.unsubscribe();
+                }
+            }
+        };
+    };
+
+    // R3: the compact submit envelope. Same dispatch as POST /sessions/:id/tasks (ONE
+    // execution path), but the answer is the COMPILED view + row, so a browser never
+    // receives a raw snapshot from the mutation that starts its own run.
+    const viewSubmit = async (id: string, body: SubmitTaskRequest): Promise<HarnessApiResult> => {
+        if (typeof body.input !== 'string') throw new HttpError(400, 'A task must be a string.');
+
+        const submitted = await store.dispatch(id, body.input, body.attachments, body.references, body.threadId);
+        const view = store.getView(id);
+        const row = view.turns.find((candidate) => candidate.id === submitted.turn.id);
+
+        const result: SubmitTaskViewResult = {
+            view,
+            // The row for the turn this submit produced — or the OWNING turn's row when
+            // the input was steered (same meaning as `SubmitTaskResult.turn`).
+            turn: row ?? summaryOf(submitted.turn),
+            ...(submitted.steered === true
+                ? {
+                      steered: true as const,
+                      ...(submitted.steeredThreadId === undefined
+                          ? {}
+                          : { steeredThreadId: submitted.steeredThreadId })
+                  }
+                : {})
+        };
+
+        return { kind: 'json', status: 202, body: result };
     };
 
     return async (request): Promise<HarnessApiResult> => {
@@ -1515,6 +1695,276 @@ export const createHarnessApi = ({
                     store.answerAction(first, segments[3], body.choice);
 
                     const payload: AnswerActionResult = { ok: true };
+                    return { kind: 'json', status: 200, body: payload };
+                }
+            }
+
+            // -------------------------------------------------------------------
+            // R1/R3/R4: the COMPACT display surface (`/views`), route by route in
+            // ./protocol.ts.
+            //
+            // Why a second prefix instead of a mode flag on `/sessions`: the raw
+            // contract is load-bearing for the CLI (./cli/index.ts folds HarnessEvents
+            // in process), for api.test.ts's pinned snapshots, and for embedders. One
+            // route returning two shapes would make "no raw steps in the browser's
+            // default traffic" unenforceable; with this split a test asserts it by
+            // route.
+            //
+            // Every mutation below REUSES the underlying operation (there is no second
+            // execution path); only the envelope differs, and it always answers with
+            // the compiled view so the UI never needs a raw snapshot.
+            // -------------------------------------------------------------------
+            if (head === 'views') {
+                if (segments.length === 1) {
+                    // GET /views — the rail document: headers + rows, no node trees.
+                    if (method === 'GET') {
+                        const index: SessionViewIndex = { views: store.listViews() };
+
+                        return { kind: 'json', status: 200, body: index };
+                    }
+
+                    // POST /views — the compact alternative of POST /sessions: the same
+                    // store.create (same frozen definition, same durability rules), a
+                    // compiled answer.
+                    if (method === 'POST') {
+                        const body = requireObjectBody<CreateSessionRequest>(
+                            await readBody<CreateSessionRequest>()
+                        );
+
+                        if (typeof body.harness !== 'string' || body.harness.length === 0) {
+                            throw new HttpError(400, 'A session requires a harness name.');
+                        }
+
+                        const created = store.create(body.harness, body.settings);
+                        const response: SessionViewResponse = { view: store.getView(created.id) };
+
+                        return { kind: 'json', status: 201, body: response };
+                    }
+
+                    throw new HttpError(405, `Use GET or POST for ${mount}/views.`);
+                }
+
+                if (segments.length === 2) {
+                    // GET /views/:id — full compiled state (rows + node trees).
+                    if (method === 'GET') {
+                        const response: SessionViewResponse = { view: store.getView(first) };
+
+                        return { kind: 'json', status: 200, body: response };
+                    }
+
+                    // PATCH /views/:id — the same one live mutation as PATCH
+                    // /sessions/:id (per-agent models), answered compactly.
+                    if (method === 'PATCH') {
+                        const body = requireObjectBody<UpdateSessionRequest>(
+                            await readBody<UpdateSessionRequest>()
+                        );
+
+                        requireKnownFields(body, SESSION_PATCH_FIELDS);
+
+                        if (body.agentModels === undefined) {
+                            throw new HttpError(
+                                400,
+                                `A patch must change at least one of: ${SESSION_PATCH_FIELDS.join(', ')}.`
+                            );
+                        }
+
+                        store.setAgentModels(first, body.agentModels);
+
+                        return {
+                            kind: 'json',
+                            status: 200,
+                            body: { view: store.getView(first) } satisfies SessionViewResponse
+                        };
+                    }
+
+                    // DELETE /views/:id — identical to DELETE /sessions/:id (its payload
+                    // was already free of raw state; the journal goes with the session).
+                    if (method === 'DELETE') {
+                        if (!store.remove(first)) throw new HttpError(404, `Unknown session "${first}".`);
+
+                        return { kind: 'json', status: 200, body: { deleted: true } };
+                    }
+
+                    throw new HttpError(405, `Use GET, PATCH or DELETE for ${mount}/views/:id.`);
+                }
+
+                if (segments.length === 3) {
+                    // POST /views/:id/tasks — the same 202 submit as the raw route.
+                    if (second === 'tasks') {
+                        if (method !== 'POST') throw new HttpError(405, 'Use POST to submit a task.');
+
+                        const body = requireObjectBody<SubmitTaskRequest>(
+                            await readBody<SubmitTaskRequest>()
+                        );
+
+                        return await viewSubmit(first, body);
+                    }
+
+                    // GET /views/:id/events — the display stream: one `view`, then
+                    // `ops` frames, then a final self-sufficient `view`. A disconnect
+                    // unsubscribes and never cancels (the pump owns execution).
+                    if (second === 'events') {
+                        if (method !== 'GET') {
+                            throw new HttpError(405, `Use GET for ${mount}/views/:id/events.`);
+                        }
+
+                        return watchViewRoute(first);
+                    }
+
+                    // POST /views/:id/reset — same store.reset (which also truncates the
+                    // journal, so a reset can never replay stale steps).
+                    if (second === 'reset') {
+                        if (method !== 'POST') throw new HttpError(405, 'Use POST to reset a session.');
+
+                        store.reset(first);
+
+                        return {
+                            kind: 'json',
+                            status: 200,
+                            body: { view: store.getView(first) } satisfies SessionViewResponse
+                        };
+                    }
+
+                    // POST /views/:id/cancel — the raw payload was already compact
+                    // (`{ cancelled }`); mirrored so a client stays on one prefix.
+                    if (second === 'cancel') {
+                        if (method !== 'POST') throw new HttpError(405, 'Use POST to cancel a run.');
+
+                        const body = requireObjectBody<CancelSessionRequest>(
+                            await readBody<CancelSessionRequest>()
+                        );
+
+                        requireKnownFields(body, SESSION_CANCEL_FIELDS);
+
+                        if (body.all !== undefined && typeof body.all !== 'boolean') {
+                            throw new HttpError(400, '`all` must be a boolean when present.');
+                        }
+
+                        store.get(first);
+
+                        return {
+                            kind: 'json',
+                            status: 200,
+                            body: { cancelled: store.cancel(first, { all: body.all === true }) }
+                        };
+                    }
+                }
+
+                // GET /views/:id/turns/:turnId/steps/:stepId — the LAZY detail lookup:
+                // the exact recorded opening event plus the exact recorded result of the
+                // SAME call, so one click retrieves a tool's request AND response
+                // together (R2). Served from the durable turn record, so it answers
+                // identically before and after a restart.
+                if (segments.length === 6 && second === 'turns' && segments[4] === 'steps') {
+                    if (method !== 'GET') {
+                        throw new HttpError(405, `Use GET for ${mount}/views/:id/turns/:turnId/steps/:stepId.`);
+                    }
+
+                    const response: SessionStepDetailResponse = {
+                        detail: store.stepDetail(first, segments[3], segments[5])
+                    };
+
+                    return { kind: 'json', status: 200, body: response };
+                }
+
+                // GET /views/:id/turns/:turnId/raw — the verbatim recorded turn, for the
+                // transcript copy/export surface. Together with the step route this is
+                // ALL the raw traffic a browser ever generates, and only on a click.
+                if (segments.length === 5 && second === 'turns' && segments[4] === 'raw') {
+                    if (method !== 'GET') {
+                        throw new HttpError(405, `Use GET for ${mount}/views/:id/turns/:turnId/raw.`);
+                    }
+
+                    const response: SessionTurnRawResponse = { turn: store.rawTurn(first, segments[3]) };
+
+                    return { kind: 'json', status: 200, body: response };
+                }
+
+                // DELETE /views/:id/threads/:threadId — same store.deleteThread; the
+                // post-delete roster arrives as the compact `threadViews`.
+                if (segments.length === 4 && second === 'threads') {
+                    if (method !== 'DELETE') {
+                        throw new HttpError(405, `Use DELETE for ${mount}/views/:id/threads/:threadId.`);
+                    }
+
+                    store.deleteThread(first, segments[3]);
+
+                    return {
+                        kind: 'json',
+                        status: 200,
+                        body: { deleted: true, view: store.getView(first) }
+                    };
+                }
+
+                // POST /views/:id/threads/:threadId/cancel
+                if (segments.length === 5 && second === 'threads' && segments[4] === 'cancel') {
+                    if (method !== 'POST') {
+                        throw new HttpError(405, `Use POST for ${mount}/views/:id/threads/:threadId/cancel.`);
+                    }
+
+                    const stopped = store.cancelThread(first, segments[3]);
+
+                    return {
+                        kind: 'json',
+                        status: 200,
+                        body: { cancelled: stopped.cancelled, view: store.getView(first) }
+                    };
+                }
+
+                // GET/PUT /views/:id/threads/:threadId/transcript (C4). A transcript IS
+                // raw model context by definition, and it travels only when the operator
+                // opens the editor — the lazy counterpart of the omitted roster. Same
+                // store methods, so validation and the "an unreadable transcript is a
+                // 200" rule stay identical to the raw routes.
+                if (segments.length === 5 && second === 'threads' && segments[4] === 'transcript') {
+                    const threadId = segments[3];
+
+                    if (method === 'GET') {
+                        return { kind: 'json', status: 200, body: store.threadTranscript(first, threadId) };
+                    }
+
+                    if (method === 'PUT') {
+                        const body = requireObjectBody<UpdateThreadTranscriptRequest>(
+                            await readBody<UpdateThreadTranscriptRequest>()
+                        );
+
+                        // An absent `messages` property is the only malformed case
+                        // (the raw route documents why a broken VALUE is a success).
+                        if (!Object.prototype.hasOwnProperty.call(body, 'messages')) {
+                            throw new HttpError(400, 'A transcript update requires a `messages` value.');
+                        }
+
+                        const updated = store.updateThreadTranscript(first, threadId, body.messages);
+
+                        return {
+                            kind: 'json',
+                            status: 200,
+                            body: { transcript: updated.transcript, view: store.getView(first) }
+                        };
+                    }
+
+                    throw new HttpError(405, `Use GET or PUT for ${mount}/views/:id/threads/:threadId/transcript.`);
+                }
+
+                // POST /views/:id/actions/:requestId/answer (N4) — the answer payload was
+                // already compact; mirrored so the UI never mixes prefixes.
+                if (segments.length === 5 && second === 'actions' && segments[4] === 'answer') {
+                    if (method !== 'POST') {
+                        throw new HttpError(405, `Use POST for ${mount}/views/:id/actions/:requestId/answer.`);
+                    }
+
+                    const body = requireObjectBody<AnswerActionRequest>(await readBody<AnswerActionRequest>());
+
+                    requireKnownFields(body, ANSWER_ACTION_FIELDS);
+
+                    if (body.choice === undefined) {
+                        throw new HttpError(400, 'An action answer requires a `choice`.');
+                    }
+
+                    store.answerAction(first, segments[3], body.choice);
+
+                    const payload: AnswerActionResult = { ok: true };
+
                     return { kind: 'json', status: 200, body: payload };
                 }
             }

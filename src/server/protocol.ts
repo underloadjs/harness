@@ -19,6 +19,11 @@ import type {
 } from '../harness';
 import type { RunnerSettings } from './harnesses/types';
 import type { AgentResultReference } from '../shared/agent-results';
+// The display contract is imported (not just re-exported) because the view
+// envelopes below embed its shapes. `import type` only: this file stays free of any
+// runtime dependency, and `../shared/turn-display.ts` never imports this file back,
+// so the dependency direction is one-way with no cycle at any level.
+import type { TurnDisplay, TurnDisplayOp, TurnStepDetail, TurnSummary } from '../shared/turn-display';
 
 export type {
     HarnessActionAnswer,
@@ -43,6 +48,49 @@ export type {
 } from '../harness';
 export type { RunnerSettings } from './harnesses/types';
 export type { AgentResultReference, AgentResultBlock, AgentResultStatus } from '../shared/agent-results';
+
+// The server-compiled DISPLAY contract (R1/R3). Types only, on purpose: the bounds
+// constants (`DISPLAY_PREVIEW_CHARS`, ...) stay importable from
+// `../shared/turn-display` directly — re-exporting VALUES here would give this file
+// a runtime dependency, and a browser loads it type-only (see the header comment).
+//
+// Why the turn-level shapes live in `shared/` while the SESSION-level envelopes
+// live below: `shared/turn-display.ts` must not import this file (one-way rule), so
+// anything that names `SessionThread`/`HarnessDescriptor`/`SessionSteerRecord` is
+// declared here instead.
+export type {
+    DisplayActionOption,
+    DisplayActionSummary,
+    DisplayAttachmentSummary,
+    DisplayBlockSummary,
+    DisplayMediaSummary,
+    DisplayNode,
+    DisplayNodePatch,
+    DisplayNoticeNode,
+    DisplayNoticeTone,
+    DisplayPanelBlockSummary,
+    DisplayPanelSummary,
+    DisplayProjectContext,
+    DisplayRole,
+    DisplayStep,
+    DisplayStepDetailRef,
+    DisplaySteerSummary,
+    DisplayTextNode,
+    DisplayReasoningNode,
+    DisplayedTurn,
+    DisplayTurnInput,
+    SectionDisplayState,
+    StepDisplayState,
+    TurnDisplay,
+    TurnDisplayOp,
+    TurnDisplayState,
+    TurnProjector,
+    TurnRecordStatus,
+    TurnSection,
+    TurnSectionPatch,
+    TurnStepDetail,
+    TurnSummary
+} from '../shared/turn-display';
 
 export type SessionStatus = 'idle' | 'running' | 'error';
 
@@ -345,6 +393,40 @@ export type SessionThread = {
     messages: HarnessMessage[];
 };
 
+// A conversation as the COMPACT surface sees it (R1). The field set is exactly
+// `SessionThread` minus `messages`, plus a bounded transcript signal: the roster's
+// `messages` are the committed harness transcript (every tool result verbatim, up to
+// 64 KiB each), which is the payload class the view wire removes. A client that needs
+// the transcript text reads
+// `GET {mount}/views/:id/threads/:threadId/transcript` (the same `ThreadTranscriptResponse`
+// the editor already uses), and `hasTranscript`/`messageCount` say whether it is worth
+// asking. Identity fields keep their `SessionThread` names and meanings verbatim, so a
+// renderer maps them without translation.
+//
+// T4 addition (additive, reported): `SessionView.threads` stays as declared for raw
+// consumers, but the `/views` responses populate `threadViews` and OMIT `threads`.
+export type SessionThreadView = {
+    id: string;
+    agent: string;
+    origin: 'agent' | 'host';
+    status: 'idle' | 'running' | 'stopped';
+    sequence: number;
+    ownerThreadId?: string;
+    label?: string;
+    invocationId?: string;
+    originTurnId?: string;
+    originInvocationId?: string;
+    invocationIds?: string[];
+    references?: AgentResultReference[];
+    connectedThreadIds?: string[];
+    // How many transcript entries the conversation holds (never their content).
+    messageCount: number;
+    // Bounded last-message preview, so a roster-only child still shows something.
+    preview?: string;
+    // True when a transcript read would return anything.
+    hasTranscript: boolean;
+};
+
 // C4: one conversation whose stored transcript this build could NOT read.
 //
 // A transcript is fully user-editable JSON, so it can be broken by hand. One
@@ -503,6 +585,129 @@ export type SessionStreamItem =
     | { type: 'event'; turnId: string; event: HarnessEvent; at?: number; usage?: HarnessUsage }
     | { type: 'snapshot'; session: SessionSnapshot }
     | { type: 'failed'; error: HarnessErrorInfo; session: SessionSnapshot };
+
+// ---------------------------------------------------------------------------
+// The display wire (R1/R3/R4) — a SECOND surface, never a mutation of the raw one
+// ---------------------------------------------------------------------------
+//
+// Everything above (`SessionSnapshot.turns[].events`, `SessionStreamItem`) is the
+// RAW contract and stays byte-identical: the CLI folds `HarnessEvent`s in process
+// (src/server/cli/index.ts:426 -> cli/render.ts), `api.test.ts`/`sessions.test.ts`
+// assert those shapes, and an embedder may depend on them. The types below are the
+// browser's surface, reached only under `/views`, so "the default traffic contains
+// no raw steps" is enforceable by route rather than by discipline.
+//
+// Routes (mount-relative, identical on the standalone `/api` mount and the service
+// `/v1/harness` mount — both adapters call the same dispatcher, src/server/api.ts:962):
+//
+//   GET  views                                                        -> SessionViewIndex
+//   GET  views/:sessionId                                             -> { view: SessionView }
+//   GET  views/:sessionId/events         SSE `data: <SessionViewStreamItem>\n\n`
+//   POST views/:sessionId/tasks          202                          -> SubmitTaskViewResult
+//   GET  views/:sessionId/turns/:turnId/steps/:stepId                -> { detail: TurnStepDetail }
+//   GET  views/:sessionId/turns/:turnId/raw                          -> { turn: SessionTurn }
+//
+// The last two are the ONLY places a raw event reaches a browser, and only on an
+// explicit user action (open a tool's details / copy a transcript). `:stepId` is the
+// opening event's index (see `DisplayStepDetailRef`), so the request resolves the
+// recorded request AND its recorded response together. The `/raw` route exists for
+// the transcript copy/export surface, which quotes whole recorded turns
+// (src/frontend/ui/thread-transcript.ts:296); nothing in the normal render path uses it.
+
+// The complete compiled state of one conversation: the same session header a
+// snapshot reports, plus compact rows and their display trees, and NO event list
+// anywhere. `threads`/`invalidThreads` are reused verbatim because they already
+// carry no events (see `SessionThread`, line 362).
+export type SessionView = {
+    id: string;
+    harness: string;
+    status: SessionStatus;
+    // Same rule as `SessionSnapshot.queueDepth` (line 432): omitted when empty.
+    queueDepth?: number;
+    model: string;
+    agentModels?: Record<string, string>;
+    createdAt: number;
+    updatedAt: number;
+    lastError?: string;
+    threads?: SessionThread[];
+    // T4 (additive): the compact roster the `/views` responses actually send. The raw
+    // `threads` roster above is left for a consumer that explicitly wants the
+    // transcript-bearing roster; `/views` omits it (see `SessionThreadView`).
+    threadViews?: SessionThreadView[];
+    invalidThreads?: SessionInvalidThread[];
+    // Counters only (see `SessionSnapshot.labelSeeds`/`labelHighWater`, lines
+    // 466-476). A client never mints a label from these any more — the server owns
+    // `TurnSummary.blocks` — but they stay so the raw and display surfaces agree.
+    labelSeeds?: Record<string, Record<string, number>>;
+    labelHighWater?: Record<string, number>;
+    harnessDefinition?: HarnessDescriptor;
+    discoveredTools?: string[];
+    // Compact rows, in recorded order (the raw `turns` list is absent by contract).
+    turns: TurnSummary[];
+    // Display trees keyed by turn id. Present ONLY for turns named in `turns`; a
+    // turn with no live work still has an entry (its sections are the transcript).
+    displays: Record<string, TurnDisplay>;
+};
+
+// One session WITHOUT the node trees: the rail/list document. This is the shape
+// that makes `GET views` cheap for a session list, which today ships every session's
+// every event (`SessionStore.list()`, src/server/sessions.ts:2324).
+export type SessionViewSummary = Omit<SessionView, 'displays'>;
+
+// Body of GET /api/views.
+export type SessionViewIndex = {
+    views: SessionViewSummary[];
+};
+
+// Body of GET /api/views/:id.
+export type SessionViewResponse = {
+    view: SessionView;
+};
+
+// Body of GET /api/views/:id/turns/:turnId/steps/:stepId.
+export type SessionStepDetailResponse = {
+    detail: TurnStepDetail;
+};
+
+// Body of GET /api/views/:id/turns/:turnId/raw — the verbatim recorded turn
+// (`copyTurn`, src/server/sessions.ts:705), events and eventTimes included.
+export type SessionTurnRawResponse = {
+    turn: SessionTurn;
+};
+
+// One item of GET /api/views/:id/events.
+//
+// Ordering contract, mirroring `SessionStreamItem` above so a client keeps one
+// mental model:
+//   - the stream OPENS with one `view` (the atomic state at registration, exactly
+//     like `SessionStore.watch()`, src/server/sessions.ts:3965);
+//   - `ops` frames follow, at most one per recorded harness event, each naming its
+//     turn. A frame is applied by node/step id, never by arrival position;
+//   - the stream CLOSES with one `view` once the queue drains, and that frame is
+//     self-sufficient: it reconciles any op this connection missed (the same
+//     recovery role the terminal `snapshot` plays on the raw stream);
+//   - `failed` is the error terminal and still carries the full `view`.
+//
+// A `turn` upsert rides inside `ops` as `{ op: 'turn' }` (queued -> running ->
+// terminal transitions), so a client has exactly one place to patch a row.
+export type SessionViewStreamItem =
+    | { type: 'view'; view: SessionView }
+    | { type: 'ops'; turnId: string; at: number; ops: TurnDisplayOp[] }
+    | { type: 'failed'; error: HarnessErrorInfo; view: SessionView };
+
+// Response of POST /api/views/:id/tasks — the browser submit. Same semantics as
+// `SubmitTaskResult` (line 771) with the raw session/turn replaced by their display
+// counterparts, so a submit repaints the board without ever pulling events.
+//
+// `steered`/`steeredThreadId` keep their exact meaning from `SubmitTaskResult`:
+// present only when the input folded into a running conversation, and `turn` is then
+// the OWNING turn's summary.
+export type SubmitTaskViewResult = {
+    view: SessionView;
+    turn: TurnSummary;
+    steered?: true;
+    steeredThreadId?: string;
+};
 
 export type CreateSessionRequest = {
     harness: string;

@@ -95,7 +95,7 @@
 //   - styles: src/frontend/styles.css (`.tool`, `.tool-*`, `.file-link`) and ui/dialog.css
 
 import { callTool } from '../api';
-import type { HarnessToolOutcome } from '../../types';
+import type { HarnessToolOutcome, ToolMediaDescriptor, ToolUiPanel } from '../../types';
 import { createTextCopyButton, openDialog, type DialogHandle } from './dialog';
 import { enhanceFileLinks } from './file-links';
 import { openFilePreview, type FilePreviewReader, type FilePreviewResult } from './file-preview';
@@ -116,6 +116,48 @@ export type ToolTiming = {
     startedAt?: number;
 };
 
+// The exact pair of one step, already unwrapped from the wire's `TurnStepDetail`
+// (see ./view-detail.ts `stepDetailPayloadOf`). Deliberately a FLAT presentation
+// shape: the card must never receive a `HarnessEvent` and unwrap it itself, because
+// that would move transcript compilation back into the widget.
+export type ToolDetailPayload = {
+    // The verbatim `tool_call.arguments` JSON string the model sent.
+    arguments?: string;
+    // The verbatim `tool_result.content`. Absent when the call never settled.
+    result?: string;
+    // Authoritative classification of a settled call.
+    outcome?: HarnessToolOutcome;
+    // Server-measured span (never a local guess).
+    durationMs?: number;
+    // False when the record holds no settled event for this step (still running, or
+    // a call abandoned by a cancel). The dialog then says so instead of inventing a
+    // result.
+    settled?: boolean;
+    // Every panel the result contributed, FULL cells and rows (detail-only data).
+    panels?: ToolUiPanel[];
+    // Every media descriptor the result contributed.
+    media?: ToolMediaDescriptor[];
+    // The raw events, for the dialog's "copy the recorded event" affordance.
+    opening?: unknown;
+    resultEvent?: unknown;
+};
+
+// Where one card's lazy detail stands (see `ToolCallCard.detailState`).
+export type ToolDetailState = 'none' | 'compact' | 'loading' | 'full' | 'error';
+
+// Lazy detail (R2). A card built from the COMPACT wire carries bounded previews, so
+// the exact request/response is fetched the first time the reader expands it — and
+// only then, and only once per card.
+export type ToolDetailSource = {
+    // One request per card. The caller owns transport (./view-api.ts
+    // `getStepDetail`) and the unwrap (./view-detail.ts), so this widget stays free
+    // of both the route and the event shapes.
+    load: () => Promise<ToolDetailPayload>;
+    // True when the texts this card was built from are server previews, i.e. the
+    // detail strictly carries more (`DisplayStepDetailRef.truncated`).
+    truncated?: boolean;
+};
+
 // Optional collaborators for `createToolCallCard`. The transcript consumer
 // (turns.ts) passes nothing and gets the browser adapter below; tests inject a
 // deterministic stub so no request is issued.
@@ -124,6 +166,9 @@ export type ToolCallCardOptions = {
     // argument/result code block is activated. Same contract as the transcript
     // reader in ui/turns.ts (`FilePreviewReader`).
     readFile?: FilePreviewReader;
+    // R2 lazy detail. Absent = the card already holds the full payloads (the raw
+    // event fold, the manual tool runner, and every pre-views embedding).
+    detail?: ToolDetailSource;
 };
 
 // Browser adapter for the only file request this module can make. It mirrors
@@ -152,6 +197,14 @@ export type ToolCallCard = {
     // Final duration in ms, once known. Undefined for a legacy record with no
     // timing data — never NaN.
     durationMs: () => number | undefined;
+    // R2 lazy detail state.
+    //   - 'none'    the card was built with the full payloads (no fetch exists);
+    //   - 'compact' the card holds server PREVIEWs and nothing has been requested;
+    //   - 'loading' the one request is in flight (the dialog says so, per pane);
+    //   - 'full'    the exact recorded pair is on screen;
+    //   - 'error'   the request failed; the dialog offers Retry.
+    // Exposed for tests and for a caller that must not re-request what is loaded.
+    detailState: () => ToolDetailState;
     // Attach the matching `tool_result`. Idempotent: a duplicate result for the
     // same call is ignored instead of overwriting the first answer. `outcome` is
     // the structured classification from the runtime (R1): a cancelled call shows
@@ -567,17 +620,30 @@ export const createToolCallCard = (
     // placeholder.
     let resultText = 'Waiting for the harness to run this call…';
 
+    // R2: the arguments the panes (and the Copy button) currently show. It starts as
+    // what the caller had — the verbatim `arguments` on the raw path, a bounded
+    // `argsPreview` on the compact path — and becomes the verbatim recorded string
+    // once the detail arrives. Copy therefore always names what is on screen.
+    let argumentsText = rawArguments;
+
+    // The detail state machine (see `ToolCallCard.detailState`).
+    const detail = options.detail;
+    let detailStatus: ToolDetailState = detail === undefined ? 'none' : 'compact';
+    // A retry after a failure supersedes the previous attempt's answer; the ticket
+    // is what makes a late resolution of the older request paint nothing.
+    let detailTicket = 0;
+
     // The detail body is built ONCE and lives inside the closed `<details>` while no
     // dialog is open (a closed details renders only its summary, so this is not an
     // in-flow detail area). Opening MOVES this exact node into the dialog; closing
     // moves it back. No cloning means no duplicate ids and no stale handlers, and
-    // `resolve`/`abandon` always mutate the same live nodes.
+    // `resolve`/`abandon`/the detail loader always mutate the same live nodes.
     const body = document.createElement('div');
     body.className = 'tool-body';
 
     // R3/R4: each pane is `heading (label + its own copy icon)` over a framed,
     // line-numbered code view. The copy provider hands over the pane's ORIGINAL
-    // payload verbatim — `rawArguments` exactly as the model sent it, and the whole
+    // payload verbatim — `argumentsText` exactly as the model sent it, and the whole
     // result content — so the clipboard is independent of the pretty-printed,
     // soft-wrapped, numbered view on screen and is never truncated.
     const argsSection = document.createElement('section');
@@ -585,15 +651,41 @@ export const createToolCallCard = (
     const argsLabel = document.createElement('div');
     argsLabel.className = 'tool-label';
     argsLabel.textContent = 'arguments';
-    const argsCode = createCodeBlock(
-        prettyJson(rawArguments),
-        looksLikeJson(rawArguments) ? 'json' : undefined,
+    let argsCode = createCodeBlock(
+        prettyJson(argumentsText),
+        looksLikeJson(argumentsText) ? 'json' : undefined,
         openFile
     );
-    argsSection.append(
-        createPaneHeading(argsLabel, COPY_ARGUMENTS_LABEL, () => rawArguments),
-        argsCode
-    );
+    const argsHeading = createPaneHeading(argsLabel, COPY_ARGUMENTS_LABEL, () => argumentsText);
+    argsSection.append(argsHeading, argsCode);
+
+    // Replace the arguments code block IN PLACE (heading node untouched, same parent,
+    // same position). The lazy detail repaints this pane exactly once, and the DOM
+    // shape stays `section.tool-section > (.tool-label + code block)` for styles.css
+    // and for every existing selector.
+    const renderArguments = (value: string): void => {
+        const next = createCodeBlock(
+            prettyJson(value),
+            looksLikeJson(value) ? 'json' : undefined,
+            openFile
+        );
+
+        argsSection.replaceChild(next, argsCode);
+        argsCode = next;
+    };
+
+    // A neutral in-pane note (loading / failure). `data-detail` lets the styling and
+    // the tests name the state without scraping text out of the DOM.
+    const renderArgumentsNote = (text: string, state: 'loading' | 'error'): HTMLElement => {
+        const note = document.createElement('p');
+        note.className = 'tool-pending';
+        note.dataset.detail = state;
+        note.textContent = text;
+
+        argsSection.replaceChildren(argsLabel, note);
+
+        return note;
+    };
 
     const resultSection = document.createElement('section');
     resultSection.className = 'tool-section';
@@ -617,6 +709,77 @@ export const createToolCallCard = (
     let current: ToolState = 'running';
     let settled = false;
 
+    // Label text for the result pane's heading. One source, so a compact preview, a
+    // live settle and the loaded detail can never name the same outcome differently.
+    const resultLabelFor = (outcome: HarnessToolOutcome): string =>
+        outcome === 'completed'
+            ? 'result'
+            : outcome === 'cancelled'
+              ? 'result · cancelled'
+              : 'result · error';
+
+    // Paint the result pane. `resolve` (an answer arrives), `abandon` (the call will
+    // never answer) and the lazy detail all go through here, which is what keeps an
+    // ALREADY-OPEN dialog truthful: the body node is inside `.dialog-body` at that
+    // moment, so replacing these children IS the update (no `update({content})`).
+    // A `note` replaces the code view with plain text (a pending/interrupted call
+    // has no payload to number).
+    const paintResult = (text: string, outcome: HarnessToolOutcome, note?: string): void => {
+        resultText = text;
+        resultLabel.textContent = resultLabelFor(outcome);
+        resultHolder.replaceChildren();
+
+        if (note !== undefined) {
+            const line = document.createElement('p');
+            line.className = 'tool-pending';
+            line.textContent = note;
+            resultHolder.append(line);
+
+            return;
+        }
+
+        // R12: the result only renders in the modal, which scrolls, so the whole
+        // available payload/error is shown — no display truncation. An empty answer
+        // still gets an explicit placeholder rather than an empty code block.
+        resultHolder.append(
+            createCodeBlock(prettyJson(text), looksLikeJson(text) ? 'json' : undefined, openFile)
+        );
+    };
+
+    // The collapsed chip's one-line summary, recomputed from the state the card is
+    // actually in (R5: the chip is the scannable surface, so its text must never
+    // claim more than this card holds).
+    //
+    //   - running            the arguments preview alone (no outcome to report);
+    //   - ok, full payloads  `args · <n> chars` — the recorded content's size;
+    //   - ok, compact wire   `args · preview · open for the full result`, because a
+    //     bounded `DisplayStep.preview` length is NOT the payload's size, and after a
+    //     successful detail fetch this line becomes the honest `chars` figure;
+    //   - cancelled / error  the outcome word, never a character count the call
+    //     does not have.
+    const syncPeek = (): void => {
+        const args = previewArguments(argumentsText);
+
+        if (current === 'ok') {
+            const size =
+                detailStatus === 'full' || detailStatus === 'none'
+                    ? `${resultText.length.toLocaleString()} chars`
+                    : 'preview · open for the full result';
+
+            peek.textContent = `${args} · ${size}`;
+
+            return;
+        }
+
+        if (current === 'running') {
+            peek.textContent = args;
+
+            return;
+        }
+
+        peek.textContent = `${args} · ${current === 'cancelled' ? 'cancelled' : 'failed'}`;
+    };
+
     // The open dialog handle, if any. Cleared in `onClose` so a close via Escape,
     // backdrop or the close button is indistinguishable from `handle.close()`.
     let dialog: DialogHandle | undefined;
@@ -630,6 +793,11 @@ export const createToolCallCard = (
     // return-focus target: it exists for the whole life of the card, so focus can
     // never fall back to the composer (ui/dialog.ts has no shell fallback).
     const openDetails = (): void => {
+        // R2: the expansion IS the request. A compact card fires its one detail load
+        // here (and only here), so nothing about a tool call's payload is downloaded
+        // while the board renders.
+        void loadDetail();
+
         if (dialog !== undefined && dialog.isOpen) {
             dialog.element.focus({ preventScroll: true });
             return;
@@ -688,6 +856,126 @@ export const createToolCallCard = (
     element.addEventListener('toggle', () => {
         if (element.open) element.open = false;
     });
+
+    // --- R2 lazy detail ----------------------------------------------------
+    //
+    // A compact card carries bounded SERVER previews, so the exact recorded pair is
+    // fetched on the FIRST expansion and never again. The rules below are the
+    // contract this exists for, and each one is pinned by ui/tools.test.ts:
+    //   - NO request before an expansion (a board with hundreds of settled calls must
+    //     cost nothing until the reader clicks one);
+    //   - exactly ONE request per card afterwards — a reopen is free, and a second
+    //     click on the same chip never re-hits the route;
+    //   - a failure is shown IN the pane with a Retry that re-arms the same loader
+    //     (a dropped detail must never look like "the tool returned nothing");
+    //   - the answer repaints the SAME panes of the SAME body node, so a dialog that
+    //     is open while the request lands updates without re-opening;
+    //   - `destroy` invalidates an in-flight answer, so a cleared board cannot be
+    //     resurrected by a late response.
+    //
+    // Panels and media from the detail (`payload.panels`) are deliberately NOT drawn
+    // here: the scratch board owns panel rendering (ui/panels.ts) and expands the
+    // FULL panel documents through this same route, so painting them twice would put
+    // two copies of one tool's cards on screen.
+
+    // Paint the exact pair over the previews. `result` is absent for a call that has
+    // no recorded answer (still running, or abandoned); the running placeholder and
+    // the interruption note are already honest, so only the arguments pane moves.
+    const applyDetail = (payload: ToolDetailPayload): void => {
+        // An absent `arguments` means the opening event carried none; the recorded
+        // empty string then wins over a preview (the dialog shows what the model sent).
+        if (typeof payload.arguments === 'string') {
+            argumentsText = payload.arguments;
+            renderArguments(argumentsText);
+        }
+
+        if (payload.result !== undefined) {
+            // The event is the authority for the outcome wording (R1: `outcome`
+            // first, `isError` only as its projection) — the same precedence the
+            // compact row was painted with, so the two can only agree.
+            paintResult(
+                payload.result.length > 0 ? payload.result : '(empty result)',
+                payload.outcome ?? (current === 'error' ? 'failed' : current === 'cancelled' ? 'cancelled' : 'completed')
+            );
+        }
+
+        // Prefer the recorded measurement: the server knows the call's own span,
+        // while this browser's wall clock includes whatever it waited behind other
+        // work. An unknown span stays hidden (never `0.0s`).
+        if (
+            payload.durationMs !== undefined &&
+            Number.isFinite(payload.durationMs) &&
+            payload.durationMs >= 0
+        ) {
+            measured = payload.durationMs;
+            paintDuration();
+            summary.setAttribute(
+                'aria-label',
+                summaryLabel(name, current, formatToolDuration(measured))
+            );
+        }
+
+        syncPeek();
+        if (dialog !== undefined && dialog.isOpen) dialog.update({ title: dialogTitle() });
+    };
+
+    const renderDetailLoading = (): void => {
+        renderArgumentsNote('loading the recorded request…', 'loading');
+
+        const line = document.createElement('p');
+        line.className = 'tool-pending';
+        line.dataset.detail = 'loading';
+        line.textContent = 'loading the recorded response…';
+        resultHolder.replaceChildren(line);
+    };
+
+    const renderDetailError = (message: string): void => {
+        const line = document.createElement('p');
+        line.className = 'tool-pending';
+        // `data-detail` is the styling/test hook for the failed state; the text is
+        // the human explanation, and the control is a real button so keyboard and
+        // the dialog's focus trap both reach it.
+        line.dataset.detail = 'error';
+        line.textContent = `the recorded request and response could not be loaded · ${message}`;
+
+        const retry = document.createElement('button');
+        retry.type = 'button';
+        retry.className = 'button small tool-retry';
+        retry.textContent = 'Retry';
+        retry.addEventListener('click', () => {
+            void loadDetail();
+        });
+        line.append(retry);
+
+        resultHolder.replaceChildren(line);
+        // The arguments pane keeps its preview: a readable summary beats an empty
+        // pane while the request is failing, and the Copy icon still hands over the
+        // exact preview text the reader sees.
+    };
+
+    const loadDetail = async (): Promise<void> => {
+        if (detail === undefined) return;
+        if (detailStatus === 'loading' || detailStatus === 'full') return;
+
+        const ticket = ++detailTicket;
+        detailStatus = 'loading';
+        renderDetailLoading();
+
+        try {
+            const payload = await detail.load();
+            // Superseded by a retry, or the card was destroyed while this was in
+            // flight: the loser paints nothing.
+            if (ticket !== detailTicket) return;
+
+            detailStatus = 'full';
+            applyDetail(payload);
+        } catch (error) {
+            if (ticket !== detailTicket) return;
+
+            detailStatus = 'error';
+            renderDetailError(error instanceof Error ? error.message : String(error));
+        }
+    };
 
     // Live label. Only starts when the caller supplied a start stamp; a recorded
     // replay without `eventTimes` passes none, so no duration is invented.
@@ -753,38 +1041,18 @@ export const createToolCallCard = (
         // The visible badge above is frozen at this same span, so the accessible
         // name repeats it (unknown span -> no span in the label).
         summary.setAttribute('aria-label', summaryLabel(name, current, formatToolDuration(measured)));
-        resultLabel.textContent =
-            outcome === 'completed'
-                ? 'result'
-                : outcome === 'cancelled'
-                  ? 'result · cancelled'
-                  : 'result · error';
 
         // R12: the result only renders in the modal, which scrolls, so the whole
         // available payload/error is shown — no display truncation. An empty answer
-        // still gets an explicit placeholder rather than an empty code block.
-        const text = content.length > 0 ? content : '(empty result)';
-        resultText = text;
-
-        // Mutating the shared body is what makes an ALREADY-OPEN dialog update while
-        // the call finishes: the node is inside `.dialog-body` at this moment.
-        resultHolder.replaceChildren();
-
-        // JSON results (most schema-shaped tools) get pretty-printed; anything
-        // else is shown as-is with short-block language detection.
-        resultHolder.append(
-            createCodeBlock(prettyJson(text), looksLikeJson(text) ? 'json' : undefined, openFile)
-        );
+        // still gets an explicit placeholder rather than an empty code block. On the
+        // COMPACT wire this text is the server's bounded preview, and the lazy
+        // loader replaces it with the recorded content on the first expansion.
+        paintResult(content.length > 0 ? content : '(empty result)', outcome);
 
         // Recompute the summary so the compact card still answers "did it work and
         // what did it touch?" without opening the dialog. A cancelled call says so
         // instead of reporting a character count it does not have.
-        peek.textContent =
-            outcome === 'completed'
-                ? `${previewArguments(rawArguments)} · ${text.length.toLocaleString()} chars`
-                : `${previewArguments(rawArguments)} · ${
-                      outcome === 'cancelled' ? 'cancelled' : 'failed'
-                  }`;
+        syncPeek();
 
         // A modal opened while the call was running now shows the settled state in
         // its title. The body was updated in place above, so no `update({content})`
@@ -812,20 +1080,14 @@ export const createToolCallCard = (
         // The collapsed chip hides the state word, so the accessible label carries
         // it plus the frozen span (same rule as resolve).
         summary.setAttribute('aria-label', summaryLabel(name, current, formatToolDuration(measured)));
-        resultLabel.textContent = 'result · cancelled';
 
         // Replace the "Waiting for the harness to run this call…" placeholder: a
         // card on a settled tile must not claim the harness may still run it.
-        const note = document.createElement('p');
-        note.className = 'tool-pending';
-        note.textContent = reason;
-        resultHolder.replaceChildren(note);
-        resultText = reason;
-
-        peek.textContent = `${previewArguments(rawArguments)} · cancelled`;
+        paintResult(reason, 'cancelled', reason);
 
         // Same live-update rule as `resolve`: an open dialog switches to the
         // cancelled title while the body already shows the interruption reason.
+        syncPeek();
         if (dialog !== undefined && dialog.isOpen) dialog.update({ title: dialogTitle() });
     };
 
@@ -835,6 +1097,7 @@ export const createToolCallCard = (
         ...(timing.callId === undefined ? {} : { callId: timing.callId }),
         state: () => current,
         durationMs: () => measured,
+        detailState: () => detailStatus,
         resolve,
         abandon,
         destroy: () => {
@@ -842,6 +1105,9 @@ export const createToolCallCard = (
             // dialog left behind by a cleared turn would be an orphaned modal with a
             // stale focus trap; `onClose` also restores the body into the card.
             stopTicker();
+            // A detail request that is still in flight belongs to a card that is
+            // going away: moving the ticket makes its answer (good or bad) a no-op.
+            detailTicket += 1;
             if (dialog !== undefined && dialog.isOpen) dialog.close();
         }
     };
@@ -918,6 +1184,18 @@ export const formatThinkShare = (
     return percent < 10 ? `${percent.toFixed(1)}%` : `${Math.round(percent)}%`;
 };
 
+// Same pill rules as `formatThinkShare`, applied to a share the SERVER already
+// computed (`DisplayReasoningNode.share`, src/shared/turn-display.ts:355). The
+// display wire owns the token arithmetic, so the browser formats a percentage it is
+// handed instead of re-deriving one from a character estimate — and uses the exact
+// wording rules above so a live chip and a reloaded one read identically.
+export const formatServerThinkShare = (percent: number | undefined): string => {
+    if (percent === undefined || !Number.isFinite(percent) || percent <= 0) return '';
+    if (percent < 0.1) return '<0.1%';
+
+    return percent < 10 ? `${percent.toFixed(1)}%` : `${Math.round(percent)}%`;
+};
+
 export type ReasoningCard = {
     // The chip itself, appended into the agent's `.tool-group` row by turns.ts.
     element: HTMLDetailsElement;
@@ -934,6 +1212,11 @@ export type ReasoningCard = {
     // Repaint against the block's freshest context figure (the denominator above). Safe to
     // call repeatedly; an unchanged figure repaints identically.
     setContext: (tokens: number | undefined) => void;
+    // Display-wire path: paint the share the SERVER computed for this round
+    // (`DisplayReasoningNode.share`). It wins over the local character estimate,
+    // because the server owns the token arithmetic and its figure is the one the
+    // block's header tally prints. `undefined` restores the local estimate.
+    setShare: (percent: number | undefined) => void;
     // The text currently held (the dialog's Copy button reads it at CLICK time, so it is
     // always the whole round, never a streaming prefix of it).
     text: () => string;
@@ -985,6 +1268,16 @@ export const createReasoningCard = (): ReasoningCard => {
     // `createToolCallCard`.
     let current = '';
     let contextTokens: number | undefined;
+    // R1 display wire: a share the server computed. When present it is the figure —
+    // the local character estimate is the raw-path fallback, never a override.
+    let serverShare: number | undefined;
+
+    // The one share this card reports: the server's figure when it sent one,
+    // otherwise the local estimate against the block's context.
+    const shareOf = (): string =>
+        serverShare === undefined
+            ? formatThinkShare(current.length, contextTokens)
+            : formatServerThinkShare(serverShare);
 
     const section = document.createElement('section');
     section.className = 'tool-section';
@@ -1008,7 +1301,7 @@ export const createReasoningCard = (): ReasoningCard => {
         if (current.length === 0) return THINK_LABEL;
 
         const chars = `${thinkCount(current.length)} chars`;
-        const share = formatThinkShare(current.length, contextTokens);
+        const share = shareOf();
 
         return share.length === 0
             ? `${THINK_LABEL} · ${chars}`
@@ -1018,7 +1311,7 @@ export const createReasoningCard = (): ReasoningCard => {
     // ONE paint path for every derived surface, so the pill, the accessible name, the
     // hover title and an open dialog's title cannot disagree about the same round.
     const paint = (): void => {
-        const share = formatThinkShare(current.length, contextTokens);
+        const share = shareOf();
 
         // An empty round or an unknown context hides the pill; the chip then keeps its
         // intrinsic `think` width instead of claiming a measurement it does not have.
@@ -1107,9 +1400,18 @@ export const createReasoningCard = (): ReasoningCard => {
             contextTokens = finite;
             paint();
         },
+        setShare: (percent: number | undefined): void => {
+            // A non-finite or non-positive figure is "not reported", never `0%`.
+            const finite =
+                percent !== undefined && Number.isFinite(percent) && percent > 0 ? percent : undefined;
+            if (finite === serverShare) return;
+
+            serverShare = finite;
+            paint();
+        },
         text: () => current,
         context: () => contextTokens,
-        share: () => formatThinkShare(current.length, contextTokens),
+        share: () => shareOf(),
         destroy: () => {
             if (dialog !== undefined && dialog.isOpen) dialog.close();
         }

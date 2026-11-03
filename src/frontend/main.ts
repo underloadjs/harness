@@ -94,9 +94,52 @@ import type {
     RunnerSettings,
     SessionSnapshot,
     SessionStreamItem,
+    SessionThread,
     SessionTurn,
+    SessionView,
+    SessionViewStreamItem,
+    SessionViewSummary,
     ToolDescriptor
 } from '../server/protocol';
+import type { HarnessUsage } from '../types';
+import type { TurnDisplayOp, TurnSummary, TurnStepDetail } from '../shared/turn-display';
+// The display wire (T5) is the shell's DEFAULT surface: every fetch, every stream
+// and every submit below speaks `/views`, so no round trip on this path can carry a
+// recorded event. The raw client (./api.ts) stays imported for the catalogue routes
+// (`/harnesses`, `/tools`, `/models`) and for the explicit export read, which is the
+// ONLY place `HarnessEvent`s reach this browser.
+import {
+    answerViewAction,
+    cancelView,
+    cancelViewThread,
+    createView as createViewSession,
+    deleteView,
+    deleteViewOnUnload,
+    deleteViewThread,
+    getRawSession,
+    getStepDetail,
+    getView,
+    listViews,
+    observeView,
+    resetView,
+    submitViewTask,
+    updateThreadTranscript as updateViewThreadTranscript,
+    updateView
+} from './view-api';
+import {
+    activeAgentsOf,
+    createViewStateStore,
+    displayOf as viewDisplayOf,
+    isPendingView,
+    panelEntriesOf,
+    stepIndex,
+    summariesOf,
+    transcriptTurnIdsOf,
+    type ViewStateStore
+} from './view-state';
+// The unwrap of ONE lazy step detail (explicit clicks only): the panel expansion and
+// the tool chip's detail loader are its only callers.
+import { stepDetailPayloadOf } from './view-detail';
 import type { HarnessActionChoice, HarnessAttachment } from '../types';
 import { validateAttachments } from '../shared/attachments';
 import {
@@ -196,8 +239,8 @@ import {
 import type { AgentBlockDescriptor, MentionTrigger } from './ui/references';
 import { applyActivity, activityOfTurns, paintActivity } from './ui/activity';
 import { highlightCode, looksLikeJson, prettyJson } from './ui/markdown';
-import { applyPanels, createPanelHost, mediaOfTurns } from './ui/panels';
-import type { PanelMedia } from './ui/panels';
+import { applyPanels, createPanelHost, mediaOfTurns, panelKeyOf, mediaOfSummaries } from './ui/panels';
+import type { PanelMedia, PanelSummarySource } from './ui/panels';
 import type { FilePreviewReader, FilePreviewResult, FilePreviewResolver } from './ui/file-preview';
 // The preview dialog owns the basename-resolution RULES (exact-name filter,
 // shallowest-first order); the shell below only supplies the `glob` round-trip.
@@ -429,9 +472,14 @@ type View = {
     // presented as several independent threads. (The former strip also rendered
     // these rows; it is gone, and this is the only consumer.)
     setThreads: (threads: readonly SessionThreadEntry[]) => void;
-    // R7: the tombstone-filtered raw snapshot the JSON transcript copies. Called
-    // after every applied snapshot; `undefined` on session teardown.
+    // R7: the tombstone-filtered raw snapshot the JSON transcript copies. Reached by
+    // an EXPLICIT export read only (T5 R3); `undefined` until the reader opens a
+    // transcript, and on session teardown.
     setSessionSnapshot: (snapshot: SessionSnapshot | undefined) => void;
+    // T5 R1: the COMPILED document the shell applied. Roster joins, delete
+    // protection and the transcript fallback read their rows from here, so none of
+    // the default surfaces needs an event list.
+    setSessionView: (view: SessionView | undefined) => void;
     clear: () => void;
     notice: (text: string, tone?: 'info' | 'error') => void;
     // Session-scoped outcome line (a failed/cancelled run's detail), rendered in
@@ -468,6 +516,18 @@ type View = {
     ) => TurnHandle[];
     // Find, or adopt, the tile for one server turn (a `turn` upsert frame).
     upsert: (turn: SessionTurn, model?: string) => TurnHandle;
+    // --- display-wire path (T5: R1/R2/R3) --------------------------------
+    //
+    // The same list/focus rules, fed by the COMPILED document instead of recorded
+    // turns. These are the DEFAULT surfaces; `hydrate`/`reconcile`/`upsert` above
+    // remain the raw compatibility path for an embedding that folds events.
+    hydrateView: (view: SessionView, model?: string, keep?: string) => TurnHandle[];
+    reconcileView: (view: SessionView, model?: string, keep?: string) => TurnHandle[];
+    // Bind/adopt the compact row a submit answer names (a steered submit merges into
+    // the tile that already owns that conversation).
+    upsertSummary: (summary: TurnSummary, view?: SessionView) => TurnHandle;
+    // Route one ops frame by turn id. False when this view holds no such tile.
+    applyOps: (turnId: string, ops: readonly TurnDisplayOp[], view?: SessionView) => boolean;
     // Look up a tile by the server turn id carried on a stream `event` frame.
     turn: (id: string) => TurnHandle | undefined;
     // Every real block in this conversation (root+nested), oldest→newest. The
@@ -496,7 +556,16 @@ const createView = (
         sessionId: string,
         threadId: string,
         messages: unknown
-    ) => Promise<ThreadTranscriptPayload>
+    ) => Promise<ThreadTranscriptPayload>,
+    // T5 R2: the ONE transport a tool chip may use, and only when the reader expands
+    // it. The shell owns the route (./view-api.ts `getStepDetail`); the UI layer keeps
+    // its "no network code in the renderer" rule (`readFile`/`resolveFile` work the
+    // same way).
+    loadDetail?: (input: {
+        turnId: string;
+        stepId: string;
+        sessionId?: string;
+    }) => Promise<TurnStepDetail>
 ): View => {
     const pane = el('div', 'pane');
     const logWrap = el('div', 'log-wrap');
@@ -531,6 +600,7 @@ const createView = (
             : { refreshSessionSnapshot: refreshTranscript }),
         ...(removeThread === undefined ? {} : { deleteThread: removeThread }),
         ...(saveTranscript === undefined ? {} : { saveThreadTranscript: saveTranscript }),
+        ...(loadDetail === undefined ? {} : { loadStepDetail: loadDetail }),
         // Focus follows the single expanded tile. Only the composer's routing line
         // has to repaint from here now that the thread strip is gone, so the
         // steering target stays visible in the same tick the reader
@@ -606,6 +676,43 @@ const createView = (
             // The board owns the JSON transcript and delete protection; the shell
             // only supplies the tombstone-filtered authority (see applySnapshot).
             board.setSessionSnapshot(snapshot);
+        },
+        setSessionView: (view) => {
+            // T5 R1: the compiled document is the authority for everything the default
+            // path draws and protects. The raw transcript source stays untouched until
+            // an explicit export read replaces it.
+            board.setSessionView(view);
+        },
+        hydrateView: (view, model, keep) => {
+            const follow = pinned();
+            const handles = board.hydrateView(view, {
+                ...(model === undefined ? {} : { model }),
+                ...(keep === undefined ? {} : { keep })
+            });
+            stick(follow);
+
+            return handles;
+        },
+        reconcileView: (view, model, keep) => {
+            const follow = pinned();
+            const handles = board.reconcileView(view, {
+                ...(model === undefined ? {} : { model }),
+                ...(keep === undefined ? {} : { keep })
+            });
+            // A task submitted while the reader is at the bottom should pull the view
+            // down to the active row; a reader scrolled up keeps their place.
+            stick(follow);
+
+            return handles;
+        },
+        upsertSummary: (summary, view) => board.upsertView(summary, view),
+        applyOps: (turnId, ops, view) => {
+            const applied = board.applyViewOps(turnId, ops, view);
+            // An ops frame changes the transcript without changing the document
+            // pointer, so the same follow-the-bottom rule applies.
+            if (applied) stick(pinned());
+
+            return applied;
         },
         clear: () => {
             board.clear();
@@ -3536,7 +3643,7 @@ const selectComposerPopup = (index = composerPopupState?.index): boolean => {
 // gone and `purgeStaleReferences`/the submit boundary filter drop it, so it must not
 // inflate this count.
 const unfinishedReferenceCount = (
-    records: ReadonlyMap<string, SessionTurn> | undefined,
+    records: ReadonlyMap<string, { status: string }> | undefined,
     references: readonly { turnId: string }[]
 ): number => {
     if (records === undefined) return 0;
@@ -4070,19 +4177,34 @@ type Instance = {
     // two harness views must not share who is busy.
     activity: Set<string>;
     // Tool-contributed panels for THIS instance/session (R21.3), keyed by
-    // tool+panel id. Recomputed from the server's turns on every applySnapshot
-    // (reload, poll, session open, enqueue answer) and upserted live from
-    // `tool_result.ui` and from manual tool results. Never shared across
+    // tool+panel id. Recomputed from the server's COMPILED state on every applied
+    // view (reload, poll, session open, enqueue answer) and upserted live from the
+    // `step:set`/`pending:set` ops the display wire sends — plus from manual tool
+    // results, which are already full panel documents. Never shared across
     // instances: switching harness can neither show nor leak another chat's board.
     panels: Map<string, PanelMedia>;
+    // Panel cards the READER expanded (T5 R2). A full panel document arrives only
+    // from an explicit click on a summary card's action, and is cached here so a
+    // later snapshot re-derivation (which recomputes `panels` from the compact rows)
+    // restores the expansion instead of silently collapsing it back to a summary.
+    panelDetails: Map<string, PanelMedia>;
+    // Panel keys with a detail request in flight, so one press issues exactly one
+    // request and a double click cannot stack two answers.
+    panelRequests: Set<string>;
     // Work the server has not finished for this instance's session (R4): a
     // running task, a retained queued task, or a non-zero queueDepth. Drives the
     // composer's stop state (R10) and the topbar pill. The composer is NOT gated
     // by it: submitting another task is how a queue is built.
     pending: boolean;
-    // The latest authoritative turn records for this session, keyed by id. Kept so
-    // activity can be recomputed from running records without a full snapshot.
-    records: Map<string, SessionTurn>;
+    // The latest authoritative COMPACT rows for this session, keyed by id (T5 R1:
+    // a `TurnSummary`, never a recorded turn). Kept so pending state, activity and
+    // reference validation answer without a document walk.
+    records: Map<string, TurnSummary>;
+    // The compiled document store for this instance (T5 R1/R3). It owns the
+    // `SessionView` the shell renders and applies the ops frames to it, so state
+    // and DOM are updated by ONE addressed mutation per frame — and the only place
+    // a raw event can enter this browser is the explicit export read below.
+    store: ViewStateStore;
     // The session's PERSISTENT runtime threads (`SessionSnapshot.threads`, additive),
     // in creation order. Empty for a legacy server and for a session that has only
     // its implicit conversations; every pre-thread behaviour is unchanged then. The
@@ -4102,11 +4224,17 @@ type Instance = {
     // Per-turn records are guarded separately by their own `updatedAt`. The tag is
     // required because pointing the instance at another session resets the clock.
     snapshotMark?: { sessionId: string; at: number };
-    // R7: the last tombstone-filtered authoritative snapshot (raw threads + raw
-    // turns + session fields). Not used for rendering (the board owns that); it is
-    // the source the JSON transcript copies and the baseline delete protection
-    // reads. Cleared whenever the instance points at a different/no session.
+    // R7: the last tombstone-filtered RAW document this page read, and a read happens
+    // ONLY on an explicit transcript/export action (T5 R3). Not used for rendering
+    // (the board owns that, from the compiled view below); it is the source the JSON
+    // transcript quotes and the lossless baseline delete protection can fall back to.
+    // Cleared whenever the instance points at a different/no session.
     snapshot?: SessionSnapshot;
+    // The compiled document this instance currently renders (T5 R1). A convenience
+    // mirror of `store.view()` — the store remains the mutation point, so an ops
+    // frame and a drain frame reconcile the SAME object. Named `compiled` (not
+    // `view`) because `Instance.view` is the DOM view wrapper.
+    compiled?: SessionView;
 };
 
 const instances = new Map<string, Instance>();
@@ -4114,7 +4242,44 @@ let current: Instance | undefined;
 let selectedName: string | undefined;
 let presetDescriptors: readonly HarnessDescriptor[] = [];
 let agentLibrary: readonly AgentDescriptor[] = [];
-let sessions: SessionSnapshot[] = [];
+// A row of the session directory, read-only by shape.
+//
+// The display wire's `SessionViewSummary` is what the rail ACTUALLY holds (T5 R1),
+// and `SessionSnapshot` satisfies the same fields — every helper below reads header
+// figures, thread ids and turn STATUS/USAGE only, never `events` or `displays`. One
+// structural type therefore serves both surfaces, which is also the proof that the
+// rail needs no recorded events at all.
+type DirectoryTurn = {
+    id: string;
+    status: string;
+    updatedAt: number;
+    index?: number;
+    startedAt?: number;
+    threadId?: string;
+    threadLabel?: string;
+    usage?: HarnessUsage;
+};
+
+type SessionRecord = {
+    id: string;
+    harness: string;
+    status: string;
+    model: string;
+    createdAt: number;
+    updatedAt: number;
+    lastError?: string;
+    queueDepth?: number;
+    threads?: SessionThread[];
+    turns: DirectoryTurn[];
+    harnessDefinition?: HarnessDescriptor;
+    agentModels?: Record<string, string>;
+    discoveredTools?: string[];
+};
+
+// The session directory. `SessionViewSummary` is the compact counterpart of
+// `SessionSnapshot`: same header fields the rail, the pills and the harness totals
+// read, and NO event list anywhere (which is the payload this surface removes).
+let sessions: SessionRecord[] = [];
 let currentTool: ToolDescriptor | undefined;
 // The complete server catalogue (core entries included) for the global tools view —
 // the ONLY tool listing after R21.2. Boot replaces it from the bootstrap document.
@@ -4232,7 +4397,7 @@ const releasePlaygroundSession = (options?: { unload?: boolean }): void => {
 
     if (id === undefined) return;
 
-    const request$ = options?.unload === true ? deleteSessionOnUnload(id) : deleteSession(id);
+    const request$ = options?.unload === true ? deleteViewOnUnload(id) : deleteView(id);
 
     void request$.then(
         // Removed from the roster filter only once the server confirms the record is
@@ -4273,14 +4438,14 @@ const ensurePlaygroundSession = async (): Promise<string | undefined> => {
     try {
         // `settings` are the configured runtime defaults, exactly as a chat submit uses
         // them — the playground never inherits another conversation's frozen model.
-        const session = await createSession(harness, settings);
+        const session = await createViewSession(harness, settings);
 
         // Closed (or superseded) while this request was in flight: this record is not
         // the live playground's context, so it is removed immediately and the caller is
         // told the call did not run. Best-effort: nothing awaits it.
         if (generation !== playground.generation || !showingTools) {
             playgroundSessions.add(session.id);
-            void deleteSession(session.id).catch(() => undefined);
+            void deleteView(session.id).catch(() => undefined);
             return undefined;
         }
 
@@ -4328,7 +4493,7 @@ const runner = createToolRunner({
         // never applied to an Instance and never enters the sessions roster, so a
         // discovery inside the temporary context cannot repaint or adopt anything in the
         // conversation the reader is looking at.
-        const session = await getSession(sessionId);
+        const session = await getView(sessionId);
         if (playground.sessionId !== sessionId) return;
 
         playground.discovered = Array.isArray(session.discoveredTools)
@@ -4360,7 +4525,7 @@ const answerActionFor = async (harnessName: string, input: AnswerActionInput): P
         throw new Error('This question belongs to another session.');
     }
 
-    await answerAction(instance.sessionId, input.requestId, input.choice);
+    await answerViewAction(instance.sessionId, input.requestId, input.choice);
 };
 
 const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
@@ -4379,17 +4544,33 @@ const ensureInstance = (descriptor: HarnessDescriptor): Instance => {
             (input) => answerActionFor(descriptor.name, input),
             refreshTranscriptSnapshot,
             deleteThreadForSession,
-            saveThreadTranscriptFor
+            saveThreadTranscriptFor,
+            // R2 lazy detail. The board calls this ONLY from a chip the reader
+            // expanded, and `boundSession` inside the tile already names the session
+            // the card was rendered from; the instance id is the fallback for an
+            // embedding that has no per-card binding.
+            (input) =>
+                getStepDetail(
+                    input.sessionId ?? instance.sessionId ?? '',
+                    input.turnId,
+                    input.stepId
+                )
         ),
         activity: new Set<string>(),
         panels: new Map<string, PanelMedia>(),
+        panelDetails: new Map<string, PanelMedia>(),
+        panelRequests: new Set<string>(),
         pending: false,
-        records: new Map<string, SessionTurn>(),
+        records: new Map<string, TurnSummary>(),
+        // One store per instance: two harness views must not share a document, and a
+        // session switch resets it rather than patching another conversation's tree.
+        store: createViewStateStore(),
         threads: [],
         threadTombstones: new Set<string>(),
         turnTombstones: new Set<string>()
     };
     instances.set(descriptor.name, instance);
+
     return instance;
 };
 
@@ -5401,7 +5582,7 @@ const patchSessionModels = async (
     setStatus('saving', 'saving agent models');
 
     try {
-        const session = await updateSession(id, { agentModels: { ...models } });
+        const session = await updateView(id, { agentModels: { ...models } });
 
         // The reader may have started a New session or opened another row while the
         // PATCH was in flight. Applying then would re-point THIS card at a session
@@ -5795,7 +5976,7 @@ const buildTools = (entries: readonly ToolDescriptor[]): void => {
 // Session directory (server-owned, filtered by harness)
 // ---------------------------------------------------------------------------
 
-const upsertSession = (session: SessionSnapshot): void => {
+const upsertSession = (session: SessionRecord): void => {
     // R8: a deleted conversation is never re-entered into the directory cache by a
     // late answer (see `deletedSessions` and `forgetDeletedSession`).
     if (deletedSessions.has(session.id)) return;
@@ -5819,7 +6000,7 @@ const shortId = (id: string): string => (id.length <= 8 ? id : id.slice(0, 8));
 // legacy alias to its canonical name but returns an unknown name unchanged, so "archived"
 // is exactly the case where that canonical name has no descriptor: the record is intact, the
 // definition is gone.
-const archivedHarnessOf = (session: SessionSnapshot): string | undefined => {
+const archivedHarnessOf = (session: SessionRecord): string | undefined => {
     const canonical = canonicalHarnessName(session.harness, presetDescriptors);
 
     return descriptorFor(canonical) === undefined ? canonical : undefined;
@@ -5828,7 +6009,7 @@ const archivedHarnessOf = (session: SessionSnapshot): string | undefined => {
 // Sessions whose harness no longer exists, newest last (the directory order). They are
 // listed in their own group in the sessions rail, because the rail is otherwise scoped to
 // the SELECTED harness and the deleted harness has no row to be selected any more.
-const archivedSessions = (): SessionSnapshot[] =>
+const archivedSessions = (): SessionRecord[] =>
     sessions.filter(
         (session) =>
             !deletedSessions.has(session.id) &&
@@ -5848,7 +6029,7 @@ const archivedSessions = (): SessionSnapshot[] =>
 // R6: the one extra match is an ARCHIVED harness that is currently open. A deleted
 // harness has no registry entry to resolve through, so its still-readable conversations
 // are matched by the harness name the record itself carries.
-const visibleSessions = (): SessionSnapshot[] => {
+const visibleSessions = (): SessionRecord[] => {
     if (selectedName === undefined) return [];
 
     return sessions.filter(
@@ -5873,7 +6054,7 @@ const visibleSessions = (): SessionSnapshot[] => {
 // listed, flagged `archived`, exactly as reachable as before. A session already in the
 // first list is skipped, so an archived harness that is CURRENTLY selected is never
 // listed twice.
-type SessionDirectoryEntry = { session: SessionSnapshot; archived: boolean };
+type SessionDirectoryEntry = { session: SessionRecord; archived: boolean };
 
 const sessionDirectory = (): SessionDirectoryEntry[] => {
     const entries: SessionDirectoryEntry[] = visibleSessions().map((session) => ({
@@ -5976,12 +6157,9 @@ const forgetDeletedSession = (id: string): void => {
         instance.sessionModel = undefined;
         instance.discovered = undefined;
         instance.pending = false;
-        instance.records.clear();
-        // The watermark and raw JSON authority belonged to the deleted conversation.
-        instance.snapshotMark = undefined;
-        instance.snapshot = undefined;
-        instance.panels.clear();
-        instance.view.setSessionSnapshot(undefined);
+        // The watermark, the compiled document and the raw JSON authority all belonged
+        // to the deleted conversation; the view store's addressed tree did too.
+        releaseSessionState(instance);
         instance.view.clear();
         // The conversation (and its outcome detail) is gone; nothing is left to
         // report.
@@ -6023,7 +6201,7 @@ const deleteSessionRow = async (id: string): Promise<void> => {
     let alreadyGone = false;
 
     try {
-        await deleteSession(id);
+        await deleteView(id);
         removed = true;
     } catch (error) {
         // A 404 means the server holds no such session (deleted from another
@@ -6073,7 +6251,7 @@ const deleteSessionRow = async (id: string): Promise<void> => {
 // status live in the `title` tooltip, so a dozen conversations still fit one wrapped row
 // under the title.
 const renderSessionPill = (
-    session: SessionSnapshot,
+    session: SessionRecord,
     activeId: string | undefined,
     archived: boolean
 ): HTMLElement => {
@@ -6162,11 +6340,15 @@ const paintSessionCycle = (): void => {
         return;
     }
 
-    // The record behind the pointer. Normally the directory entry itself; `instance.snapshot`
-    // is the fallback for a conversation opened from a record the list read has not returned
-    // yet, so the tooltip still describes what is on screen.
+    // The record behind the pointer. Normally the directory entry itself; the applied
+    // COMPILED document is the fallback for a conversation opened from a record the
+    // list read has not returned yet, so the tooltip still describes what is on
+    // screen. The raw export document (present only after an explicit transcript read)
+    // is the last resort.
     const record =
-        sessions.find((session) => session.id === activeId) ?? instance.snapshot;
+        sessions.find((session) => session.id === activeId) ??
+        (instance.compiled as SessionRecord | undefined) ??
+        (instance.snapshot as SessionRecord | undefined);
     const harness = record?.harness ?? (instance.frozen ?? instance.descriptor).title;
     const status = record?.status ?? 'unknown';
     const short = shortId(activeId);
@@ -6284,7 +6466,10 @@ const paintSessionActions = (): void => {
 // gone, never the behaviour behind it.
 const refreshSessions = async (): Promise<void> => {
     try {
-        const listed = await listSessions();
+        // T5 R1: the directory is the COMPACT index — one row per conversation and no
+        // display trees at all (`SessionViewSummary`), which is the payload the raw
+        // `GET /sessions` list used to carry for every session.
+        const listed = await listViews();
         // R7: a temporary playground session that exists right now is filtered out of
         // the directory too, so the sessions strip never grows a conversation the reader
         // did not start (the id returns after cleanup, on the next refresh).
@@ -6301,12 +6486,12 @@ const refreshSessions = async (): Promise<void> => {
 // `queueDepth` (new server), or any running/queued turn record (authoritative even
 // when an older server omits queueDepth). Drives the composer's stop action and the
 // topbar pill.
-const queueDepthOf = (session: SessionSnapshot): number => {
+const queueDepthOf = (session: SessionRecord): number => {
     const depth = (session as { queueDepth?: unknown }).queueDepth;
     return typeof depth === 'number' && Number.isFinite(depth) && depth > 0 ? depth : 0;
 };
 
-const pendingOf = (session: SessionSnapshot): boolean => {
+const pendingOf = (session: SessionRecord): boolean => {
     if (queueDepthOf(session) > 0) return true;
     if (session.status === 'running') return true;
 
@@ -6335,7 +6520,7 @@ const pendingOf = (session: SessionSnapshot): boolean => {
 //
 // `updatedAt` is absent from legacy fixtures: then nothing is recorded and the
 // caller never treats a snapshot as stale (graceful, no regression).
-const markSnapshot = (instance: Instance, session: SessionSnapshot): void => {
+const markSnapshot = (instance: Instance, session: SessionRecord): void => {
     const stamp = session.updatedAt;
 
     if (typeof stamp !== 'number' || !Number.isFinite(stamp)) return;
@@ -6402,7 +6587,13 @@ const liveTurnIds = (instance: Instance): ReadonlySet<string> =>
 const threadTombstoned = (instance: Instance, threadId: string | undefined): boolean =>
     threadId !== undefined && instance.threadTombstones.has(threadId);
 
-const turnTombstoned = (instance: Instance, turn: SessionTurn): boolean =>
+// A row is tombstoned when its turn id was deleted, or when the conversation it ran
+// in was. `TurnSummary` (display wire) and `SessionTurn` (raw) both carry `id` and
+// `threadId`, so one guard covers both surfaces.
+const turnTombstoned = (
+    instance: Instance,
+    turn: { id: string; threadId?: string }
+): boolean =>
     instance.turnTombstones.has(turn.id) || threadTombstoned(instance, turnThreadIdOf(turn));
 
 // Tombstone a removed thread AND everything it owns: descendant threads (by the
@@ -6427,7 +6618,81 @@ const tombstoneThread = (
     }
 };
 
-const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
+// Draw one COMPILED view into its harness view (T5 R1 — the default path).
+//
+// The rows (`view.turns`, a `TurnSummary` per exchange) and the display trees
+// (`view.displays`, keyed by turn id) are the whole transcript: no function reached
+// from here reads `SessionTurn.events`, so a reload, a poll and a drain frame all
+// reconcile the SAME addressed state the server published.
+//
+// R4: this RECONCILES the list (same id → patch in place) rather than rebuilding it,
+// so a reconnect/poll neither duplicates streamed text (a node's content is painted
+// FROM the node) nor collapses the reader's expanded turn. It also refreshes what the
+// composer needs to know — whether work is pending, which decides stop vs submit
+// (R10) — and the activity rings (only a still-running row/section lights an agent).
+//
+// Record where a document sits in its session's monotonic timeline. EVERY answer that
+// carries an authoritative view announces itself here — the stream/poll/202 hydration
+// path (applyView) and the model PATCH, which applies its answer directly without a
+// reconcile. Without the PATCH's mark a delayed 202 body would look newer than the
+// last *streamed* frame and revert the edit it predates.
+//
+// `updatedAt` is absent from legacy fixtures: then nothing is recorded and the caller
+// never treats a document as stale (graceful, no regression).
+// ---------------------------------------------------------------------------
+// Scratch board from COMPILED state (T5 R1/R2)
+// ---------------------------------------------------------------------------
+
+// Recompute one instance's panel map from its compiled display trees, then re-apply
+// whatever the reader already expanded.
+//
+// The compact wire sends `DisplayPanelSummary` cards (identity, slot, title, block
+// SHAPES, one preview line) — never a full `ToolUiPanel`. A card that carries an
+// expand action is therefore known to be a summary, and the full document only ever
+// comes from the step-detail route the reader triggered. `panelDetails` is what keeps
+// that expansion across a later document that ships the summary again.
+const derivePanels = (instance: Instance): void => {
+    const summaries = mediaOfSummaries(panelEntriesOf(instance.compiled), (entry) =>
+        openPanelDetail(instance, entry)
+    );
+
+    instance.panels = new Map([...summaries, ...instance.panelDetails]);
+};
+
+// One click, one request: fetch the step this panel came from and upsert its FULL
+// panels over the summary (same scoped key, same sanitizing/bounds as any other
+// panel source). A failure is silent-but-recoverable: the summary card stays and its
+// action remains clickable, because losing a panel card would be a worse answer than
+// telling the reader nothing loaded.
+const openPanelDetail = (instance: Instance, entry: PanelSummarySource): void => {
+    const sessionId = instance.sessionId;
+    if (sessionId === undefined) return;
+
+    const key = panelKeyOf(entry.tool, { id: entry.panel.id });
+    if (instance.panelRequests.has(key)) return;
+
+    instance.panelRequests.add(key);
+
+    void getStepDetail(sessionId, entry.turnId, entry.stepId)
+        .then((detail) => {
+            const payload = stepDetailPayloadOf(detail);
+
+            // `applyPanels` is the documented upsert (an empty `blocks` array removes
+            // the key), so a result that no longer carries this panel retracts it and
+            // the compact card returns on the next derivation.
+            if (payload.panels !== undefined)
+                applyPanels(instance.panelDetails, entry.tool, payload.panels);
+
+            derivePanels(instance);
+            if (current === instance) paintPanels();
+        })
+        .catch(() => undefined)
+        .finally(() => {
+            instance.panelRequests.delete(key);
+        });
+};
+
+const applyView = (instance: Instance, session: SessionView): void => {
     // R8: a snapshot for a session this page deleted must never re-point the card
     // at it. The tombstone covers the observer/poll/resync/openSession/enqueue
     // continuations that were already in flight when the DELETE succeeded.
@@ -6525,7 +6790,7 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     // MONOTONIC per id: a stale snapshot may not replace a record this instance
     // already holds in a newer revision, otherwise `pending`/activity would flicker
     // back to a state the observer has already moved past.
-    const records = new Map<string, SessionTurn>();
+    const records = new Map<string, TurnSummary>();
     for (const turn of incomingTurns) {
         const known = instance.records.get(turn.id);
         const knownAt = known === undefined ? undefined : known.updatedAt;
@@ -6541,23 +6806,16 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     }
     instance.records = records;
 
-    // R7 authority for the JSON transcript/delete protection. Built from the RAW
-    // snapshot (not the normalized roster) so exact `SessionThread`/`SessionTurn`
-    // fields survive, and from the MONOTONIC records map so a newer turn revision
-    // already adopted from a stream is not regressed. Tombstone-filtered exactly
-    // like the render path: a late answer can never make a deleted thread
-    // inspectable again.
-    const rawIncomingThreads = Array.isArray(session.threads)
-        ? session.threads.filter((entry) => !instance.threadTombstones.has(entry.id))
-        : undefined;
-    instance.snapshot = {
-        ...session,
-        turns: [...records.values()],
-        ...(rawIncomingThreads === undefined ? {} : { threads: rawIncomingThreads })
-    };
+    // R1/R3 authority: the compiled document this instance renders, kept in the
+    // per-instance store so an ops frame and this document mutate ONE state object.
+    // The RAW record (`instance.snapshot`) is deliberately NOT written here — it
+    // exists only after an explicit transcript/export read, which is the one surface
+    // that quotes recorded events.
+    instance.store.setView(session);
+    instance.compiled = session;
 
-    // Pending: a live (running/queued) RECORD or the session-level flags of this
-    // authoritative snapshot. No stale snapshot can reach here to leave Stop enabled
+    // Pending: a live (running/queued) ROW or the session-level flags of this
+    // authoritative document. No stale answer can reach here to leave Stop enabled
     // after the queue drained.
     const liveRecord = [...records.values()].some((turn) => {
         const status = turn.status as string;
@@ -6565,35 +6823,42 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     });
     instance.pending = liveRecord || queueDepthOf(session) > 0 || session.status === 'running';
 
-    // Activity from a hydrated/polled record: ONLY a still-running turn can make
-    // an agent busy. Replaying a settled turn (done/error/cancelled) lights
-    // nothing, so opening history never animates old work. A queued task is not
-    // working yet, so it lights nothing either.
+    // Activity from a hydrated/polled document: ONLY a still-running turn can make an
+    // agent busy. Replaying a settled turn (done/error/cancelled) lights nothing, so
+    // opening history never animates old work. A queued task is not working yet, so it
+    // lights nothing either. `TurnSummary.activeAgents` is the server's own figure —
+    // the replacement for walking every event (ui/activity.ts:129).
     instance.activity.clear();
     if (instance.pending) {
-        for (const name of activityOfTurns([...records.values()])) instance.activity.add(name);
+        for (const name of activeAgentsOf(session)) instance.activity.add(name);
     }
 
-    // R21.3: the tool panels are DERIVED from the server's recorded turns on every
-    // snapshot - reload, poll, session open, enqueue answer, terminal frame. A completed
-    // turn's panels are valid scratch state (they describe work that happened), but
-    // they never light an agent ring: activity above only reads a RUNNING turn.
-    // Recomputation also means no cross-session leakage: the board is replaced with
-    // exactly what this conversation recorded.
-    instance.panels = mediaOfTurns(incomingTurns);
+    // R21.3 + T5 R1: the tool panels are DERIVED from the compiled display trees on
+    // every document — reload, poll, session open, enqueue answer, drain frame. A
+    // completed turn's panels are valid scratch state (they describe work that
+    // happened), but they never light an agent ring: activity above only reads a
+    // RUNNING row. Recomputation also means no cross-session leakage: the board is
+    // replaced with exactly what this conversation published. Whatever the reader had
+    // expanded (a full panel document) is re-applied by `derivePanels`, so an
+    // expansion survives a frame that only carries the bounded summary.
+    derivePanels(instance);
 
-    // `labelSeeds` keeps every surviving turn's block labels identical across a
-    // deletion: a replayed turn seeds its allocator from the counters the server
-    // recorded at ITS start instead of from the (now shorter) surviving list. Read
-    // structurally so a server without the field falls back to the old numbering.
-    // Tombstone-filtered turns and roster: a late 202 body or an in-flight answer
-    // captured before a DELETE can never resurrect the deleted thread or its turns.
-    instance.view.reconcile(incomingTurns, session.model, undefined, labelSeedsOf(session));
+    // The compact rows and their display trees ARE the transcript. Tombstone-filtered
+    // turns and roster: a late 202 body or an in-flight answer captured before a DELETE
+    // can never resurrect the deleted thread or its turns.
+    //
+    // No `labelSeeds` on this path: the projector sends each block's label, so a
+    // deletion cannot renumber a surviving block by construction — the guarantee the
+    // raw fold implements with seeds.
+    instance.view.reconcileView(session, session.model);
 
-    // Persistent thread roster (R5/R7). Only an authoritative snapshot updates it
+    // Persistent thread roster (R5/R7). Only an authoritative document updates it
     // (the stale guard above returns first).
     instance.threads = incomingThreads;
     instance.view.setThreads(instance.threads);
+    instance.view.setSessionView(session);
+    // The transcript dialog repaints from the newest authority the board holds: the
+    // raw document after an explicit export read, the compiled rows otherwise.
     instance.view.setSessionSnapshot(instance.snapshot);
 
     // A LEARNED deletion must drop the focus, exactly like the in-app delete used to
@@ -6649,12 +6914,17 @@ const applySnapshot = (instance: Instance, session: SessionSnapshot): void => {
     setBusy(instance.pending);
 };
 
-// R7 explicit-open freshness. The board asks for ONE read when the reader opens a
-// transcript; every streamed event is deliberately ignored. The answer is applied
-// through the normal tombstone-guarded snapshot path (so roster/turns/tiles stay
-// coherent) and then returned as the authority the dialog copies. A session switch
-// or an already-deleted session makes the read stale: return undefined and let the
-// board keep its last applied snapshot instead of retargeting another conversation.
+// R7 explicit-open freshness, on the display wire (T5 R3). The board asks for ONE read
+// when the reader opens a transcript; every streamed frame is deliberately ignored for
+// this purpose. The answer is the RAW document the dialog quotes — the ONLY place a
+// recorded event enters this browser, and it is reached by an explicit user action.
+//
+// Bounded on purpose: the request names the turn ids the transcript document needs
+// (./view-state.ts `transcriptTurnIdsOf` derives them from COMPILED rows and section
+// invocations), and the read refreshes the COMPILED document first so the roster, the
+// rows and the tiles stay coherent while the raw bytes are being collected. A session
+// switch or an already-deleted session makes the read stale: return undefined and let
+// the board keep its last applied authority instead of retargeting another conversation.
 const refreshTranscriptSnapshot = async (
     sessionId: string
 ): Promise<SessionSnapshot | undefined> => {
@@ -6666,13 +6936,32 @@ const refreshTranscriptSnapshot = async (
     if (instance === undefined) return undefined;
 
     try {
-        const session = await getSession(sessionId);
+        const view = await getView(sessionId);
         if (deletedSessions.has(sessionId) || instance.sessionId !== sessionId) return undefined;
 
-        applySnapshot(instance, session);
-        return instance.snapshot;
+        // Compiled first: the export's turn selection is derived from what the server
+        // says exists NOW, so a turn another tab deleted is not fetched (and a newly
+        // added one is not missed).
+        applyView(instance, view);
+
+        // T5 R1: the roster comes from the compact view (`threadViews`, no transcripts), which is
+        // also what `applyView` installs — the raw `threads` roster is only present on an explicit
+        // export read, and `sessionThreadsOf` prefers whichever this document carries.
+        const roster = sessionThreadsOf(view);
+        const ids = new Set<string>();
+        for (const entry of instance.threads) {
+            for (const id of transcriptTurnIdsOf(view, entry.id, roster)) ids.add(id);
+        }
+
+        const session = await getRawSession(sessionId, [...ids]);
+        if (deletedSessions.has(sessionId) || instance.sessionId !== sessionId) return undefined;
+
+        instance.snapshot = session;
+        instance.view.setSessionSnapshot(session);
+
+        return session;
     } catch {
-        // A failed freshness read never invalidates the snapshot already on screen.
+        // A failed freshness read never invalidates what is already on screen.
         return undefined;
     }
 };
@@ -6693,26 +6982,60 @@ const reconcileDeletedThread = (
     instance: Instance,
     sessionId: string,
     threadId: string,
-    session: SessionSnapshot
+    session: SessionView
 ): void => {
     if (instance.sessionId !== sessionId) return;
 
     tombstoneThread(instance, threadId, instance.threads);
-    applySnapshot(instance, session);
+    applyView(instance, session);
 
-    // The answer is authoritative even if `applySnapshot` rejected it as older
-    // than a newer streamed frame. Filtering through the tombstones is safe in both
-    // cases, and repainting the board closes the deleted surfaces immediately.
+    // The answer is authoritative even if `applyView` rejected it as older than a
+    // newer streamed frame. Filtering through the tombstones is safe in both cases,
+    // and repainting the board closes the deleted surfaces immediately.
     instance.records = new Map(
         [...instance.records].filter(([, turn]) => !turnTombstoned(instance, turn))
     );
-    // Tool panels are derived state, exactly like `applySnapshot`: recompute them
-    // from the surviving records so a deleted thread's `tool_result.ui` cards do
-    // not survive a stale DELETE answer that the watermark guard rejected.
-    instance.panels = mediaOfTurns([...instance.records.values()]);
-    instance.view.reconcile([...instance.records.values()], instance.sessionModel);
+
+    // The compiled authority loses the deleted rows/threads FIRST, so everything derived from it
+    // (panels, the reconciled board, the transcript fallback) sees only the survivors. Both roster
+    // spellings are filtered: the display wire's compact `threadViews` (protocol.ts:408) and the
+    // raw `threads` roster an export read may still carry.
+    if (instance.compiled !== undefined) {
+        const compactThreads = Array.isArray(instance.compiled.threadViews)
+            ? {
+                  threadViews: instance.compiled.threadViews.filter(
+                      (entry) => !instance.threadTombstones.has(entry.id)
+                  )
+              }
+            : {};
+        const rawThreads = Array.isArray(instance.compiled.threads)
+            ? {
+                  threads: instance.compiled.threads.filter(
+                      (entry) => !instance.threadTombstones.has(entry.id)
+                  )
+              }
+            : {};
+
+        instance.compiled = {
+            ...instance.compiled,
+            turns: summariesOf(instance.compiled).filter((turn) => !turnTombstoned(instance, turn)),
+            ...compactThreads,
+            ...rawThreads
+        };
+        instance.store.setView(instance.compiled);
+    }
+
+    // Tool panels are derived state, exactly like `applyView`: recompute them from
+    // the surviving compiled rows so a deleted thread's panel cards do not survive a
+    // stale DELETE answer that the watermark guard rejected.
+    derivePanels(instance);
+    instance.view.reconcileView(instance.compiled ?? session, instance.sessionModel);
     instance.threads = instance.threads.filter((entry) => !instance.threadTombstones.has(entry.id));
     instance.view.setThreads(instance.threads);
+
+    if (instance.compiled !== undefined) instance.view.setSessionView(instance.compiled);
+
+    // The raw export document (when one was read) loses them the same way.
     if (instance.snapshot !== undefined) {
         const rawThreads = Array.isArray(instance.snapshot.threads)
             ? instance.snapshot.threads.filter((entry) => !instance.threadTombstones.has(entry.id))
@@ -6730,7 +7053,7 @@ const reconcileDeletedThread = (
         instance.view.clearFocus();
     }
 
-    // Same app-facing effect as the normal snapshot path: the selected view paints
+    // Same app-facing effect as the normal document path: the selected view paints
     // the current instance's derived panels (or hides empty hosts).
     if (current === instance) paintPanels();
 };
@@ -6745,17 +7068,22 @@ const deleteThreadForSession = async (
     if (instance === undefined) throw new Error('Unknown session');
 
     try {
-        const result = await deleteSessionThread(sessionId, threadId);
-        reconcileDeletedThread(instance, sessionId, threadId, result.session);
-        return result;
+        // T5: the mirrored route answers with a VIEW, so a destructive delete
+        // reconciles without one snapshot of every recorded event. `session` keeps the
+        // field the board's transport contract names, and it carries the view.
+        const result = await deleteViewThread(sessionId, threadId);
+        reconcileDeletedThread(instance, sessionId, threadId, result.view);
+
+        return { deleted: true, session: result.view as unknown as SessionSnapshot };
     } catch (error) {
         if (!messageOf(error).includes('Unknown thread')) throw error;
 
         // Already gone: the caller's intended end state holds. Re-read so the
         // roster/turns/focus reconcile to whatever the server holds now.
-        const session = await getSession(sessionId);
-        reconcileDeletedThread(instance, sessionId, threadId, session);
-        return { deleted: true, session };
+        const view = await getView(sessionId);
+        reconcileDeletedThread(instance, sessionId, threadId, view);
+
+        return { deleted: true, session: view as unknown as SessionSnapshot };
     }
 };
 
@@ -6768,11 +7096,11 @@ const deleteThreadForSession = async (
 //   2. send the editor's parsed value VERBATIM. A structurally invalid transcript is a
 //      200 carrying `transcript.invalid`, not a failure: the write landed, and the
 //      dialog keeps the text with a banner;
-//   3. apply `result.session` through `applySnapshot`, which owns the stale-watermark
-//      guard, the deletion tombstones, the roster/turn reconcile, the focus clear and
-//      the panel repaint. That path also calls `view.setSessionSnapshot`, which
-//      refreshes the open dialog from the same authority — an invalid transcript is
-//      never closed by it (ui/thread-transcript.ts).
+//   3. apply `result.view` through `applyView`, which owns the stale-watermark guard,
+//      the deletion tombstones, the roster/row reconcile, the focus clear and the
+//      panel repaint. That path also calls `view.setSessionView`, which refreshes the
+//      open dialog from the same authority — an invalid transcript is never closed by
+//      it (ui/thread-transcript.ts).
 // A 409 (running thread) / 404 (unknown thread) / 400 (missing `messages`) throws with
 // the server's own message via `api.ts#request`; the editor shows it and keeps the text.
 const saveThreadTranscriptFor = async (
@@ -6785,12 +7113,12 @@ const saveThreadTranscriptFor = async (
     );
     if (instance === undefined) throw new Error('Unknown session');
 
-    const result = await updateThreadTranscript(sessionId, threadId, messages);
+    const result = await updateViewThreadTranscript(sessionId, threadId, messages);
 
-    // The snapshot is applied even when the watermark rejects it as older than a
+    // The document is applied even when the watermark rejects it as older than a
     // streamed frame: nothing else about the session changes, and the returned
     // `transcript` remains the newest authority for the editable value.
-    applySnapshot(instance, result.session);
+    applyView(instance, result.view);
 
     return result.transcript;
 };
@@ -6829,13 +7157,14 @@ const refreshPending = (instance: Instance): void => {
     });
 };
 
-// Activity rings come from running records only. A queued task is not working
-// yet, so it lights nothing (R4: queued is neutral).
+// Activity rings come from running state only. A queued task is not working yet, so
+// it lights nothing (R4: queued is neutral). On the display wire the figure comes from
+// the compiled document — `TurnSummary.activeAgents` plus any section still working —
+// so no event is walked (T5 R1/R3, and the replacement for `activityOfTurns`).
 const refreshActivity = (instance: Instance): void => {
     instance.activity.clear();
 
-    const active = [...instance.records.values()].filter((turn) => turn.status === 'running');
-    for (const name of activityOfTurns(active)) instance.activity.add(name);
+    for (const name of activeAgentsOf(instance.compiled)) instance.activity.add(name);
 
     if (current === instance) paintAgentRings(instance.activity);
 };
@@ -6857,96 +7186,96 @@ const stopWatching = (): void => {
     watch = undefined;
 };
 
-// One item from the observer. Items for a session/observer this view no longer
-// owns are dropped: a late frame must not paint into a conversation the reader
-// left.
-const onStreamItem = (
+// One frame from the DISPLAY observer (T5 R1/R3). Items for a session/observer this
+// view no longer owns are dropped: a late frame must not paint into a conversation the
+// reader left.
+//
+// The frame vocabulary is `view` / `ops` / `failed` (protocol.ts:640). An `ops` frame
+// is applied to the store by NODE/STEP ID and routed to the tile that owns the turn —
+// no event matching, no routing by name, no compilation. A `view` frame is
+// self-sufficient, so it reconciles anything this connection missed; that is the
+// recovery contract the raw stream implemented with a terminal `snapshot`, kept
+// identical here so a reconnect never duplicates text.
+const onViewItem = (
     instance: Instance,
     sessionId: string,
-    item: SessionStreamItem,
+    item: SessionViewStreamItem,
     controller: AbortController
 ): void => {
     if (instance.sessionId !== sessionId) return;
     if (watch === undefined || watch.controller !== controller) return;
 
-    if (item.type === 'turn') {
-        // S3: a DELETED thread (or a turn removed with it) must never come back. An
-        // upsert can be in flight while the DELETE answer lands, so the tombstone —
-        // not arrival order — decides. The tile is not adopted and no focus moves.
-        if (turnTombstoned(instance, item.turn)) return;
-
-        // UPSERT the record and the tile. A queued turn is retained behind the
-        // active one; a running turn starts the clock/ring; a terminal one settles.
-        instance.records.set(item.turn.id, item.turn);
-        instance.view.upsert(item.turn, instance.sessionModel);
-        refreshPending(instance);
-        refreshActivity(instance);
-
-        if (current === instance) {
-            // The topbar pill is app-scoped. The last retained task settling is a
-            // session outcome: the tile says `done`/`error`/`cancelled`, so the
-            // global header is left untouched (R1).
-            setBusy(instance.pending);
-        }
-        return;
-    }
-
-    if (item.type === 'event') {
-        // A late event for a deleted turn is dropped for the same reason as a late
-        // upsert (S3): it would repaint a conversation the server already removed.
+    if (item.type === 'ops') {
+        // S3: a turn removed by a delete this client performed must never come back.
+        // The tombstone — not arrival order — decides.
         if (instance.turnTombstones.has(item.turnId)) return;
 
-        // Route by explicit turn id. The `turn` upsert precedes its events, so a
-        // missing tile means this frame is for a turn this view does not hold
-        // (another tab, a stale frame): the terminal snapshot reconciles it.
-        const target = instance.view.turn(item.turnId);
-        if (target === undefined) return;
+        // TEMP PROBE (T5): client-side routing of one ops frame.
+        console.warn(
+            '[route ops]',
+            item.turnId,
+            JSON.stringify((item.ops ?? []).map((op) => op.op)),
+            'displays:',
+            JSON.stringify(Object.keys(instance.store.view()?.displays ?? {}))
+        );
 
-        target.apply(item.event, frameAtOf(item));
+        // 1. state first: the store applies every addressed mutation to the one
+        //    document this instance renders.
+        instance.store.applyItem(item);
+        const view = instance.store.view();
+        if (view === undefined) return;
+        instance.compiled = view;
 
-        // Token tally, straight from the server: the frame carries the turn's
-        // running sum, and the tile prints it verbatim. Frames without a tally
-        // leave the last figure alone.
-        const tally = frameUsageOf(item);
-        if (tally !== undefined) target.setUsage(tally);
+        // 2. the row upsert that rode inside the frame (`{ op: 'turn' }`) refreshes
+        //    the record cache and the derived chrome. A frame that only patches nodes
+        //    changes none of that, so this stays cheap.
+        const summaryOp = (item.ops ?? []).find((op) => op.op === 'turn');
+        if (summaryOp !== undefined && summaryOp.op === 'turn') {
+            if (!turnTombstoned(instance, summaryOp.summary))
+                instance.records.set(summaryOp.summary.id, summaryOp.summary);
 
-        // Per-agent ring. `start` activates the agent; a `done`/`error` for one
-        // agent removes only that agent (a delegated sibling keeps spinning).
-        applyActivity(instance.activity, item.event);
-        if (current === instance) {
-            // R12 (T5): keep the composer control AND the open dialog's team rows
-            // truthful without a rebuild — event frames can arrive many times per
-            // second, so repainting the ring is both cheaper and non-disruptive
-            // (focus, the caret and open details all stay put).
-            paintAgentRings(instance.activity);
+            refreshPending(instance);
         }
 
-        // R21.3 LIVE panels: a tool result may carry `ui`. Upsert it into THIS
-        // instance's board immediately, scoped by the tool name.
-        if (item.event.type === 'tool_result') {
-            const changed = applyPanels(instance.panels, item.event.name, item.event.ui);
-            if (changed > 0 && current === instance) paintPanels();
+        // 3. DOM: route the ops to the tile by explicit turn id. A missing tile means
+        //    this frame belongs to a turn this view does not hold (another tab, or the
+        //    row has not arrived yet): the closing `view` frame reconciles it, so
+        //    guessing here would be a client-side projection.
+        const applied = instance.view.applyOps(item.turnId, item.ops ?? [], view);
+
+        if (applied) {
+            // Panels: the compact trees changed, so the scratch board follows — the
+            // same derivation the document path uses, never an event scan.
+            derivePanels(instance);
+            refreshActivity(instance);
+
+            if (current === instance) {
+                paintAgentRings(instance.activity);
+                paintPanels();
+                setBusy(instance.pending);
+            }
         }
+
         return;
     }
 
-    // Terminal/drain frames (snapshot | failed) carry the complete session, turns
-    // included. Apply it reconciles everything the frames may have missed — and its
-    // `lastError` populates the pane's session note. The pill is NOT touched: a
-    // failed run is session-scoped (R1); its detail is in the transcript (R2).
-    applySnapshot(instance, item.session);
+    // `view` (the open frame and every drain frame) and `failed` (the error terminal)
+    // both carry a complete document. Applying it reconciles everything the frames may
+    // have missed — and `lastError` populates the pane's session note. The pill is NOT
+    // touched: a failed run is session-scoped (R1); its detail is in the transcript (R2).
+    applyView(instance, item.view);
 };
 
 // Re-read the session after an observer ends, then reopen it only if work is
-// still pending. A drained queue already delivered its final snapshot.
+// still pending. A drained queue already delivered its final document.
 const resyncSession = async (instance: Instance, sessionId: string): Promise<void> => {
     if (instance.sessionId !== sessionId) return;
 
     try {
-        const session = await getSession(sessionId);
+        const view = await getView(sessionId);
         if (instance.sessionId !== sessionId) return;
 
-        applySnapshot(instance, session);
+        applyView(instance, view);
 
         if (instance.pending && watch === undefined) {
             window.setTimeout(() => {
@@ -6956,8 +7285,8 @@ const resyncSession = async (instance: Instance, sessionId: string): Promise<voi
             }, RECONNECT_DELAY_MS);
         }
     } catch {
-        // The snapshot read failed too: fall back to bounded polling, which
-        // reports its own trouble. The task is unaffected either way.
+        // The re-read failed too: fall back to bounded polling, which reports its own
+        // trouble. The task is unaffected either way.
         pollSession(instance, sessionId);
     }
 };
@@ -6989,9 +7318,9 @@ const startWatching = (instance: Instance, sessionId: string): void => {
     const controller = new AbortController();
     watch = { instance, sessionId, controller };
 
-    void observeSession(
+    void observeView(
         sessionId,
-        (item) => onStreamItem(instance, sessionId, item, controller),
+        (item) => onViewItem(instance, sessionId, item, controller),
         controller.signal
     )
         .then(() => {
@@ -7012,9 +7341,9 @@ const startWatching = (instance: Instance, sessionId: string): void => {
         });
 };
 
-// Bounded GET /sessions/:id polling — the fallback when observation fails (or a
-// page reloaded mid-run and cannot attach). It never POSTs a task, so it can never
-// start a second run.
+// Bounded `GET /views/:id` polling — the fallback when observation fails (or a page
+// reloaded mid-run and cannot attach). It never POSTS a task, so it can never start a
+// second run, and each poll costs the compact document: no recorded events.
 const pollSession = (instance: Instance, id: string): void => {
     stopPolling();
     stopWatching();
@@ -7029,9 +7358,9 @@ const pollSession = (instance: Instance, id: string): void => {
 
         attempts += 1;
 
-        let session: SessionSnapshot;
+        let session: SessionView;
         try {
-            session = await getSession(id);
+            session = await getView(id);
         } catch (error) {
             if (token !== pollToken) return;
 
@@ -7049,10 +7378,10 @@ const pollSession = (instance: Instance, id: string): void => {
         if (token !== pollToken) return;
 
         upsertSession(session);
-        // Pending is derived from the snapshot (queue included), not from the old
+        // Pending is derived from the document (queue included), not from the old
         // "status === running" test: a session that is only holding queued tasks
         // still needs to be followed.
-        applySnapshot(instance, session);
+        applyView(instance, session);
 
         if (!pendingOf(session)) {
             stopPolling();
@@ -7079,15 +7408,36 @@ const pollSession = (instance: Instance, id: string): void => {
     }, POLL_INTERVAL_MS);
 };
 
+// Point an instance at no conversation (or at a brand-new one). Every per-session
+// authority is dropped TOGETHER, so a stale document, tombstone-fed record map, panel
+// board or store tree can never describe the conversation this card just left. The
+// view store resets because its sections and nodes are addressed by ids minted inside
+// ONE session (turn-display.ts:50), and `panelDetails` because a full panel the reader
+// expanded belongs to a step of the previous conversation.
+const releaseSessionState = (instance: Instance): void => {
+    instance.snapshot = undefined;
+    instance.snapshotMark = undefined;
+    instance.compiled = undefined;
+    instance.records = new Map<string, TurnSummary>();
+    instance.threads = [];
+    instance.panelDetails.clear();
+    instance.panelRequests.clear();
+    instance.panels.clear();
+    instance.store.reset();
+    instance.view.setSessionSnapshot(undefined);
+    instance.view.setSessionView(undefined);
+};
+
 // Select and render an existing session. Everything drawn here comes from the
-// server's snapshot; nothing is reconstructed from browser memory.
+// server's COMPILED document; nothing is reconstructed from browser memory, and no
+// recorded event is fetched (T5 R1/R3).
 const openSession = async (id: string): Promise<void> => {
     stopWatching();
     stopPolling();
 
-    let session: SessionSnapshot;
+    let session: SessionView;
     try {
-        session = await getSession(id);
+        session = await getView(id);
     } catch (error) {
         // A remembered id from a previous server process is not an error state
         // the user must fix: forget it and show what the server does have. A
@@ -7137,32 +7487,25 @@ const openSession = async (id: string): Promise<void> => {
     for (const instance of instances.values()) {
         if (instance !== target && instance.sessionId === id) {
             instance.sessionId = undefined;
-            instance.snapshot = undefined;
-            instance.snapshotMark = undefined;
-            instance.threads = [];
+            releaseSessionState(instance);
             instance.view.bindSession(undefined);
             instance.view.setThreads([]);
-            instance.view.setSessionSnapshot(undefined);
         }
     }
 
     // N1: everything the instance holds about the conversation being LEFT is stale
     // once a DIFFERENT session is opened. Thread ids are minted per session, so the
-    // previous session's roster/records must not be the baseline for `applySnapshot`
+    // previous session's roster/records must not be the baseline for `applyView`
     // deletion learning — otherwise an id the new session will mint later (e.g.
     // `thread-2`) is tombstoned on arrival and the new thread can never appear.
     //
     // Tombstones are session-scoped by construction: they live on the instance and
     // are cleared exactly here (and in `ensureSession`/`newSession`), while
-    // `applySnapshot` refuses a snapshot for any other session id.
+    // `applyView` refuses a document for any other session id.
     if (target.sessionId !== undefined && target.sessionId !== id) {
         target.threadTombstones.clear();
         target.turnTombstones.clear();
-        target.records = new Map<string, SessionTurn>();
-        target.threads = [];
-        target.snapshotMark = undefined;
-        target.snapshot = undefined;
-        target.view.setSessionSnapshot(undefined);
+        releaseSessionState(target);
     }
 
     target.sessionId = id;
@@ -7175,7 +7518,7 @@ const openSession = async (id: string): Promise<void> => {
     // has no entry to look up. The instance key is the record's own harness name, so the
     // conversation is scoped to itself and no harness row appears in the rail.
     selectHarness(descriptor.name, descriptor);
-    applySnapshot(target, session);
+    applyView(target, session);
     rememberSession(id);
 
     if (pendingOf(session)) {
@@ -7187,7 +7530,7 @@ const openSession = async (id: string): Promise<void> => {
     }
 
     // A saved error session's detail is already in the pane note via
-    // `applySnapshot`; the topbar pill stays app-scoped (R1).
+    // `applyView`; the topbar pill stays app-scoped (R1).
 };
 
 // Explicit new conversation: forget the pointer and drop the local projection.
@@ -7223,16 +7566,13 @@ const newSession = (): void => {
     // A new conversation has no pending work and no server records; the queue
     // belongs to the previous session and keeps running there.
     instance.pending = false;
-    instance.records.clear();
-    // The watermark and raw authority belonged to the previous conversation; a new
-    // session's snapshots start a fresh clock/source.
-    instance.snapshotMark = undefined;
-    instance.snapshot = undefined;
-    instance.view.setSessionSnapshot(undefined);
+    // The watermark, the compiled document and the raw authority belonged to the
+    // previous conversation; a new session's documents start a fresh clock/source, and
+    // the view store's addressed tree starts empty because its ids are per session.
+    releaseSessionState(instance);
     // A new conversation has no tool output yet: clearing the instance state and
     // repainting is what drops the previous session's board and any manual panels
     // that lived only in the browser (R21.3).
-    instance.panels.clear();
     clearActivity();
     // The conversation (and its thread roster) is gone: clearing the board also
     // drops the focus, and the emptied roster leaves the composer with "New thread"
@@ -7405,9 +7745,9 @@ const ensureSession = async (instance: Instance): Promise<string> => {
     // server captures `agentModels` at creation (see setAgentModel).
     creatingSessions += 1;
 
-    let session: SessionSnapshot;
+    let session: SessionView;
     try {
-        session = await createSession(instance.descriptor.name, settings);
+        session = await createViewSession(instance.descriptor.name, settings);
     } finally {
         creatingSessions -= 1;
     }
@@ -7419,35 +7759,35 @@ const ensureSession = async (instance: Instance): Promise<string> => {
     instance.view.bindSession(session.id);
     instance.frozen = frozenDefinitionOf(session);
     // The creation answer carries this session's effective model map, which is also
-    // the map a later PATCH /sessions/:id replaces (R2).
+    // the map a later PATCH /views/:id replaces (R2).
     instance.sessionModels = agentModelsOf(session);
     instance.sessionModel = typeof session.model === 'string' ? session.model : undefined;
     instance.discovered = Array.isArray(session.discoveredTools)
         ? [...session.discoveredTools]
         : undefined;
     // A fresh session has no turns and no pending work; clear any stale queue state
-    // from the conversation this card used to point at. Tombstones are per-session,
-    // so the new conversation starts with none (S3).
+    // from the conversation this card used to point at — including the compiled
+    // document, the view store's addressed tree and any expanded panel, all of which
+    // belong to the conversation being left. Tombstones are per-session, so the new
+    // conversation starts with none (S3).
     instance.threadTombstones.clear();
     instance.turnTombstones.clear();
-    instance.records = new Map(session.turns.map((turn) => [turn.id, turn]));
+    releaseSessionState(instance);
     instance.pending = pendingOf(session);
     // A brand-new session has no persistent threads yet; handing the empty roster to
     // the board clears any focus left over from the conversation this card used to
     // point at.
     instance.threads = sessionThreadsOf(session);
     instance.view.setThreads(instance.threads);
-    // Creation answer is the initial raw JSON authority for this new session.
-    instance.snapshot = {
-        ...session,
-        turns: session.turns,
-        ...(Array.isArray(session.threads) ? { threads: session.threads } : {})
-    };
-    instance.view.setSessionSnapshot(instance.snapshot);
+    // The creation answer IS the initial compiled authority: a `SessionView`, so the
+    // first paint of a new conversation costs a header, not an event log (T5 R1).
+    instance.store.setView(session);
+    instance.compiled = session;
+    instance.view.setSessionView(session);
     // A freshly created session starts with an empty turn list, so recomputing from
     // it both empties the board and guarantees nothing from a previously viewed
     // session survives a New session.
-    instance.panels = mediaOfTurns(session.turns);
+    derivePanels(instance);
     rememberSession(session.id);
     upsertSession(session);
     renderSessions();
@@ -7579,36 +7919,37 @@ const run = async (): Promise<void> => {
         // exactly one session (creatingSessions + the instance id).
         sessionId = await ensureSession(instance);
 
-        // 202: the server retained the task and answered with its record. The
-        // request is over here — execution and streaming happen on GET /events.
-        // `references` carries the exact block bindings picked via # (omitted when
-        // the prompt has none, so a plain typed `#LABEL` keeps the old body shape).
-        const { session, turn: record } = await enqueueTask(
+        // 202 on the DISPLAY wire: the server retained the task and answered with the
+        // compact row plus the whole compiled document — no recorded event anywhere,
+        // which is the payload this route exists to remove (T5 R1). The request is
+        // over here; execution and streaming are observed on GET /views/:id/events.
+        // `references` carries the exact block bindings picked via # (omitted when the
+        // prompt has none, so a plain typed `#LABEL` keeps the old body shape).
+        const { view: session, turn: record } = await submitViewTask(
             sessionId,
             prompt,
             validated,
             references.length === 0 ? undefined : references,
             // Absent for a new thread: the server decides the new thread's id and
-            // reports it on the record (and in the roster of the snapshot below).
+            // reports it on the row (and in the roster of the document below).
             target.threadId
         );
 
-        // Steering answers with the OWNING turn (same id, `steered: true`) instead
-        // of a new record: the optimistic steering row must not survive as an unbound
-        // queued ghost, so it is discarded and the record is merged into the tile
-        // that already represents that conversation. Every other path binds this tile
-        // as usual, and `merge` applies only events the tile has not seen yet (a
-        // retried answer can never duplicate a streamed prefix).
+        // Steering answers with the OWNING row (same id, `steered: true`) instead of a
+        // new one: the optimistic steering row must not survive as an unbound queued
+        // ghost, so it is discarded and the row binds to the tile that already
+        // represents that conversation. Every other path binds this tile as usual, and
+        // binding a compiled row can never duplicate streamed text — a node's content
+        // is painted from the node, not from a replayed delta.
         //
         // The id check is kept alongside the marker: it also collapses the (rare)
         // case of a server that folds the submit without reporting `steered`.
         const owner = instance.view.turn(record.id);
-        if (owner !== undefined && owner !== turn) {
+        if (owner !== undefined && owner !== turn && record.id !== turn.id()) {
             instance.view.discard(turn);
-            owner.merge(record, session.model);
-        } else {
-            turn.merge(record, session.model);
         }
+
+        instance.view.upsertSummary(record, session);
 
         // Keep the steering target visible on the conversation that received the
         // message: continuing/steering must not silently move focus elsewhere.
@@ -7618,10 +7959,10 @@ const run = async (): Promise<void> => {
         renderSessions();
 
         if (instance.sessionId === sessionId) {
-            // The POST answer is a full snapshot and already includes the new
-            // turn: reconcile from it (the optimistic tile matches by id) and
-            // start observing the queue. `applySnapshot` sets pending + the pill.
-            applySnapshot(instance, session);
+            // The POST answer is a complete compiled document and already includes the
+            // new row: reconcile from it (the optimistic tile matches by id) and start
+            // observing the queue. `applyView` sets pending + the pill.
+            applyView(instance, session);
             startWatching(instance, sessionId);
             if (current === instance) rememberSession(sessionId);
         }
@@ -7645,18 +7986,14 @@ const run = async (): Promise<void> => {
             // to a conversation the server no longer holds.
             instance.sessionId = undefined;
             instance.frozen = undefined;
-            instance.records.clear();
             instance.snapshotMark = undefined;
             instance.pending = false;
-            instance.snapshot = undefined;
-            instance.threads = [];
             // Bind teardown expires answer cards AND closes the tracked transcript;
-            // clearing the roster/snapshot also stops the board's standalone
-            // fallback from reopening that transcript from stale tile records.
+            // releasing the compiled document, the store tree and the roster also stops
+            // the board's fallback from reopening a transcript from stale state.
+            releaseSessionState(instance);
             instance.view.bindSession(undefined);
             instance.view.setThreads([]);
-            instance.view.setSessionSnapshot(undefined);
-            instance.panels.clear();
             // The conversation is gone from the server; any outcome detail from it
             // would describe a session this card no longer points at.
             instance.view.setNotice(undefined);
@@ -7908,7 +8245,7 @@ const stopRun = (): void => {
     instance.activity.clear();
     if (current === instance) paintAgentRings(instance.activity);
 
-    void cancelSession(sessionId, true)
+    void cancelView(sessionId, true)
         .catch(() => false)
         .finally(() => {
             if (instance.sessionId !== sessionId) return;
@@ -8144,7 +8481,13 @@ const boot = async (): Promise<void> => {
         buildHarnesses();
         buildTools(data.tools);
 
-        sessions = data.sessions;
+        // T5 R1: the conversation directory is the COMPACT surface. The bootstrap document already
+        // embeds one row per conversation (the server's own catalogue read), which is the cheapest
+        // source and never leaves boot waiting behind a second request; the index route is read
+        // only when the catalogue carried none. Neither path issues a raw `GET /sessions`, and
+        // directory rows need no events (see `SessionRecord`).
+        const embedded = Array.isArray(data.sessions) ? (data.sessions as unknown as SessionRecord[]) : [];
+        sessions = embedded.length > 0 ? embedded : await listViews().catch(() => []);
         renderSessions();
 
         // Catalogue-dependent actions become usable only now.

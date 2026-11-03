@@ -44,6 +44,7 @@
 //   - src/frontend/styles.css — `.panel-host`, `.panel`, `.panel-table`
 
 import type { SessionTurn, ToolUiBlock, ToolUiPanel } from '../../server/protocol';
+import type { DisplayPanelSummary } from '../../shared/turn-display';
 
 // ---------------------------------------------------------------------------
 // Wire contract
@@ -244,6 +245,12 @@ export type PanelMedia = {
     key: string;
     slot: PanelSlot;
     panel: ToolUiPanel & { slot: PanelSlot };
+    // Display-wire expansion (T5 R1/R2): a compact summary card carries the action
+    // that replaces itself with the FULL panel document (one step-detail request,
+    // owned by the shell). A full panel — a manual tool result, or a summary already
+    // expanded — has no action, because there is nothing left to load; a card never
+    // claims a payload it does not show.
+    detail?: { open: () => void; label?: string };
 };
 
 export const panelKeyOf = (toolName: string, panel: Pick<ToolUiPanel, 'id'>): string =>
@@ -312,6 +319,115 @@ export const mediaOfTurns = (turns: readonly SessionTurn[]): Map<string, PanelMe
 };
 
 // ---------------------------------------------------------------------------
+// Display-wire summaries (T5: R1/R3)
+// ---------------------------------------------------------------------------
+//
+// The compact view never ships a `ToolUiPanel`: the server ships a bounded
+// `DisplayPanelSummary` (identity, slot, title, block SHAPES, one preview line,
+// and the `truncated`/`totalPanels` figures that say what it left out —
+// src/shared/turn-display.ts:179). Those summaries become ordinary panel data
+// here, so one host, one renderer and one upsert rule serve both surfaces, and
+// the reader can always tell a summary from a payload because the card says so.
+//
+// Expansion is the shell's job: the card carries a `detail.open` action, and the
+// shell answers it with the step-detail route (./view-api.ts `getStepDetail`),
+// whose FULL panels then upsert over the summary under the SAME key.
+//
+// `PanelSummarySource` is structural on purpose: ./view-state.ts produces these
+// entries (`panelEntriesOf`), and this module stays free of that import so the
+// two can be tested — and reasoned about — independently.
+
+export type PanelSummarySource = {
+    turnId: string;
+    sectionId: string;
+    stepId: string;
+    /** The contributing tool: the upsert scope, exactly as in `applyPanels`. */
+    tool: string;
+    panel: DisplayPanelSummary;
+};
+
+// One block summary -> a human-readable shape line. Counts only, never content:
+// the content is what the expand action fetches.
+const blockShapeOf = (block: DisplayPanelSummary['blocks'][number]): string => {
+    if (block.type === 'text') return `${block.length.toLocaleString()} characters`;
+    if (block.type === 'table') return `${block.rows} rows · ${block.columns} columns`;
+
+    return `${block.items} items`;
+};
+
+// A summary -> the panel data this host draws. Returns undefined for a panel that
+// names an unmounted slot (the same rule that drops unknown slots on the raw
+// surface: a tool cannot invent a location).
+export const panelOfSummary = (
+    summary: DisplayPanelSummary
+): (ToolUiPanel & { slot: PanelSlot; note?: string }) | undefined => {
+    const slot = resolveSlot(summary.slot);
+    if (slot === undefined) return undefined;
+
+    const id = asText(summary.id, PANEL_LIMITS.idLength);
+    if (id.length === 0) return undefined;
+
+    const blocks: ToolUiBlock[] = [];
+
+    // The bounded first line is the only readable content the compact wire ships —
+    // and it is enough to recognise the card without a request (turn-display.ts:116).
+    if (summary.preview !== undefined && summary.preview.length > 0)
+        blocks.push({ type: 'text', text: asText(summary.preview, PANEL_LIMITS.textLength) });
+
+    // Block shapes, as a key/value list: a reader sees WHAT the panel holds (a
+    // 12-row table, 30 fields) without the browser holding any of it.
+    const items = summary.blocks
+        .slice(0, PANEL_LIMITS.keyValueItems)
+        .map((block) => ({ label: block.type, value: blockShapeOf(block) }));
+    if (items.length > 0) blocks.push({ type: 'keyValue', items });
+
+    // The honest footer: this is a summary, what it trimmed, and how many panels the
+    // result actually carries. `truncated` is the server's flag, so the card never
+    // guesses whether more exists. It is a NOTE, not a panel block: the card's block list
+    // stays exactly the panel's own content (a tool's `ui` blocks on the raw surface), and
+    // the disclosure is chrome the renderer draws once, below them.
+    const notes: string[] = [];
+    if (summary.truncated) notes.push('content trimmed');
+    else notes.push('preview only');
+    if (summary.totalPanels > 1) notes.push(`${summary.totalPanels} panels in this result`);
+
+    return {
+        id,
+        slot,
+        title: asText(summary.title, PANEL_LIMITS.titleLength),
+        blocks,
+        note: `compact view · ${notes.join(' · ')}`
+    };
+};
+
+// Summary entries -> the panel map, upserted under the same scoped key the raw
+// aggregation uses, so a full panel that arrives later (or a manual tool result)
+// replaces its summary rather than sitting beside it.
+export const mediaOfSummaries = (
+    entries: readonly PanelSummarySource[],
+    open?: (entry: PanelSummarySource) => void
+): Map<string, PanelMedia> => {
+    const media = new Map<string, PanelMedia>();
+
+    for (const entry of entries) {
+        const panel = panelOfSummary(entry.panel);
+        if (panel === undefined) continue;
+
+        const key = panelKeyOf(entry.tool, panel);
+        media.set(key, {
+            key,
+            slot: panel.slot,
+            panel,
+            ...(open === undefined
+                ? {}
+                : { detail: { open: () => open(entry), label: 'Open the full panel' } })
+        });
+    }
+
+    return media;
+};
+
+// ---------------------------------------------------------------------------
 // Rendering
 // ---------------------------------------------------------------------------
 
@@ -373,6 +489,10 @@ const renderPanel = (slot: PanelSlot, media: PanelMedia): HTMLElement => {
     const card = el('article', 'panel');
     card.dataset.panelId = media.panel.id;
     card.dataset.panelSlot = slot;
+    // Display-wire state (T5): is this card the bounded SUMMARY the compact view
+    // sends, or a FULL panel document (a manual tool result, or a summary the reader
+    // expanded)? Styling and tests read this instead of counting blocks.
+    card.dataset.panelState = media.detail === undefined ? 'full' : 'summary';
     // Attribution for styling/diagnostics. A hand-built media entry may have a key
     // without the separator; then the whole key is the best name available.
     const separator = media.key.indexOf('\u001f');
@@ -385,6 +505,30 @@ const renderPanel = (slot: PanelSlot, media: PanelMedia): HTMLElement => {
     const body = el('div', 'panel-blocks');
     for (const block of media.panel.blocks) body.append(renderBlock(block));
     card.append(body);
+
+    // Display-wire disclosure (T5): a summary card says what it left out, as a NOTE below the
+    // panel's own blocks. `PanelMedia.panel` is a `ToolUiPanel` on the raw surface and a summary
+    // projection here, so the note rides as an optional field rather than a fake block.
+    const note = (media.panel as { note?: string }).note;
+    if (note !== undefined && note.length > 0) {
+        const footer = el('p', 'panel-note', note);
+        footer.title = 'This card is the compact view. Use Open the full panel for the recorded content.';
+        card.append(footer);
+    }
+
+    // R1/R2: a summary card says what it left out and how to get it. The control is
+    // a real button (keyboard, and the shell's focus restoration), and the request
+    // belongs to the shell — this module owns no transport, exactly like the file
+    // preview reader it shares the host rail with.
+    if (media.detail !== undefined) {
+        const actions = el('div', 'panel-actions');
+        const button = el('button', 'button small panel-expand');
+        button.type = 'button';
+        button.textContent = media.detail.label ?? 'Open the full panel';
+        button.addEventListener('click', () => media.detail?.open());
+        actions.append(button);
+        card.append(actions);
+    }
 
     return card;
 };

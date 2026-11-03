@@ -143,7 +143,8 @@ import type {
     SessionSteerRecord,
     SessionThread,
     SessionTurn,
-    SessionTurnStatus
+    SessionTurnStatus,
+    SessionView
 } from '../../server/protocol';
 import type {
     HarnessActionAnswer,
@@ -153,6 +154,25 @@ import type {
     HarnessBranchSummary,
     HarnessToolOutcome
 } from '../../types';
+// The compiled display contract (T5 R1/R2/R3): the row, the tree, and the ops that
+// mutate both. TYPE-only for the tree shapes, plus the two DOM-free helpers the
+// renderer needs — nothing here pulls in a server-side fold.
+import type {
+    DisplayAttachmentSummary,
+    DisplayNode,
+    DisplayNoticeNode,
+    DisplayReasoningNode,
+    DisplayStep,
+    DisplayTextNode,
+    SectionDisplayState,
+    TurnDisplay,
+    TurnDisplayOp,
+    TurnSection,
+    TurnStepDetail,
+    TurnSummary
+} from '../../shared/turn-display';
+import { displayOf as displayOfView, sectionsOf, summariesOf } from '../view-state';
+import { stepDetailPayloadOf } from '../view-detail';
 import { applyAttachmentChips } from './attachments';
 import { enhanceFileLinks } from './file-links';
 import { openFilePreview } from './file-preview';
@@ -388,6 +408,23 @@ export type TurnHandle = {
     // `key`. False when this tile is not the target, so the board can try another
     // turn or the roster-only panel. Never renders a child steer on the parent.
     tryRenderSteer: (steer: SessionSteerRecord, sourceTurnId: string, key: string) => boolean;
+    // --- display-wire path (T5: R1/R2/R3) --------------------------------
+    //
+    // Paint/patch this tile from COMPILED server state. `setSummary` prints the
+    // compact row (status, timing, tally, attachment chips, block list, steers);
+    // `renderDisplay` rebuilds the flow from the server's node tree; `applyOps`
+    // mutates the existing DOM by node/step id. None of the three reads a
+    // `HarnessEvent`, and `applyOps` never renumbers or re-pairs anything.
+    setSummary: (summary: TurnSummary) => void;
+    renderDisplay: (display: TurnDisplay) => void;
+    // Reconcile the existing DOM with a whole compiled tree, keeping the surfaces
+    // that are already painted (see `syncCompiledDisplay`).
+    syncDisplay: (display: TurnDisplay) => void;
+    applyOps: (ops: readonly TurnDisplayOp[], display?: TurnDisplay) => void;
+    // True once this tile is driven by the display wire, i.e. the raw event fold is
+    // not in play for it (the default browser path always sets this; a compatibility
+    // embedding that still folds never does).
+    compiled: () => boolean;
     // Stop every timer the tile owns (elapsed tick, tool timers, pending text
     // frame). Called when the board clears or the page is hidden.
     destroy: () => void;
@@ -489,6 +526,17 @@ export type TurnBoardOptions = {
         threadId: string,
         messages: unknown
     ) => Promise<ThreadTranscriptPayload>;
+    // R2 lazy detail transport. The board calls this AT MOST ONCE PER STEP, from the
+    // reader's first expansion of that tool chip — never while it renders, and never
+    // for a chip nobody opens. The shell owns the route (./view-api.ts
+    // `getStepDetail`); the UI layer owns no network code, exactly like `readFile`.
+    // Omitted in a standalone embedding: the chip then keeps its bounded previews and
+    // issues no request, instead of pretending it has the full payload.
+    loadStepDetail?: (input: {
+        turnId: string;
+        stepId: string;
+        sessionId?: string;
+    }) => Promise<TurnStepDetail>;
 };
 
 export type TurnBoard = {
@@ -539,6 +587,10 @@ export type TurnBoard = {
     // and by delete protection; `setThreads` alone remains enough for every
     // pre-R7 label/focus behaviour.
     setSessionSnapshot: (snapshot: SessionSnapshot | undefined) => void;
+    // The COMPILED document the shell last applied (T5 R1). Roster joins, delete
+    // protection and the transcript fallback read their rows from here; the raw
+    // snapshot above stays undefined until an explicit export read.
+    setSessionView: (view: SessionView | undefined) => void;
     // Drop one tile without applying anything: used by the submit path when a
     // server answer describes a turn this browser already has (steering returns the
     // OWNING turn), so the optimistic steering row must not linger unbound.
@@ -562,6 +614,20 @@ export type TurnBoard = {
     // without duplicating them, adopt new turns, drop removed ones, and keep the
     // reader's expanded tile. This is the snapshot path for a live queue.
     reconcile: (turns: readonly SessionTurn[], options?: HydrateOptions) => TurnHandle[];
+    // --- display-wire board path (T5: R1/R2/R3) -------------------------
+    //
+    // The same list/focus rules as `hydrate`/`reconcile`, fed by the COMPILED
+    // document instead of recorded turns: rows come from `TurnSummary`, flows from
+    // `TurnDisplay.displays`, and `labelSeeds` is not needed because the server
+    // already owns the block labels.
+    hydrateView: (view: SessionView, options?: HydrateOptions) => TurnHandle[];
+    reconcileView: (view: SessionView, options?: HydrateOptions) => TurnHandle[];
+    // Bind/adopt the row a submit answer names (steered submits merge into the tile
+    // that already represents the owning conversation).
+    upsertView: (summary: TurnSummary, view?: SessionView) => TurnHandle;
+    // Route one ops frame by EXPLICIT turn id. False when no tile holds that turn,
+    // in which case the caller must not guess: the terminal `view` frame reconciles.
+    applyViewOps: (turnId: string, ops: readonly TurnDisplayOp[], view?: SessionView) => boolean;
     // Every real block across the visible turns, oldest→newest then root/nested.
     // The # popup uses this order together with ui/references.ts
     // `latestReferenceBlock` (latest matching label wins; labels are unique across
@@ -689,6 +755,16 @@ type BlockMeta = {
     stop: () => void;
     // One request's usage, from that block's own `usage` events.
     noteUsage: (usage: HarnessUsage | undefined) => void;
+    // Display-wire path (T5 R1): the server pre-computes the two figures this line
+    // prints (`TurnSummary.latestInput` / `cachedInput`, and the same pair per
+    // section), so the compact view sets them directly instead of accumulating
+    // `usage` events. Absent figures leave the current value alone — an unknown
+    // number stays hidden, never zero-filled.
+    setFigures: (figures: {
+        latestInput?: number;
+        cachedInput?: number;
+        usage?: HarnessUsage;
+    }) => void;
     // Authoritative cumulative tally (the root tile's `SessionTurn.usage`).
     setTally: (usage: HarnessUsage | undefined) => void;
     // The context size this block reports RIGHT NOW (`latestInput`, falling back to the
@@ -886,6 +962,26 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
         paintTokens();
     };
 
+    const setFigures = (figures: { latestInput?: number; cachedInput?: number; usage?: HarnessUsage }): void => {
+        // Server-authoritative cumulative tally first: the tile prints this figure,
+        // so a compact row and a live stream show the identical total.
+        if (figures.usage !== undefined) tally = usageOf(figures.usage) ?? tally;
+
+        const latest = finiteOf(figures.latestInput);
+        if (latest !== undefined) latestInput = latest;
+
+        // `cachedInput` is the turn-wide cached figure the projector already summed;
+        // it replaces the per-event accumulation rather than adding to it, so a
+        // reload cannot double-count what a live stream counted once per event.
+        const cached = finiteOf(figures.cachedInput);
+        if (cached !== undefined) {
+            eventCachedReported = true;
+            eventCached = Math.max(cached, 0);
+        }
+
+        paintTokens();
+    };
+
     return {
         elapsed,
         tokens,
@@ -897,6 +993,7 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
         paint,
         stop,
         noteUsage,
+        setFigures,
         context: () => contextInput(),
         setTally(usage?: HarnessUsage): void {
             tally = usage;
@@ -1272,10 +1369,16 @@ export const threadSubtreeIdsOf = (
 // last applied snapshot so a stale frame cannot enable a destructive request.
 export type ThreadDeleteProtection = 'default' | 'active';
 
+// The row shape delete protection needs: the conversation a turn ran in, and its
+// status. `SessionTurn` (raw) and `TurnSummary` (display wire) BOTH satisfy it,
+// which is the point — the same destructive-action guard must run identically on
+// either surface, without either one being re-projected into the other.
+export type ThreadProtectionRow = { status: string; threadId?: string };
+
 export const threadDeleteProtectionOf = (
     entry: SessionThreadEntry,
     threads: readonly SessionThreadEntry[],
-    turns: readonly SessionTurn[]
+    turns: readonly ThreadProtectionRow[]
 ): ThreadDeleteProtection | undefined => {
     if (entry.origin === 'agent') return 'default';
 
@@ -1331,7 +1434,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // The raw snapshot last applied by the shell. It is the R7 JSON source; the
     // normalized roster above intentionally drops fields (references, raw
     // messages) that a lossless transcript must keep.
+    // The raw document last read for THIS board, and it exists only after an
+    // EXPLICIT transcript/export read (T5 R3): the default path never pulls recorded
+    // events, so `sessionSnapshot` is undefined for a board that has only ever shown
+    // the compact view. It remains the lossless source the JSON document quotes.
     let sessionSnapshot: SessionSnapshot | undefined;
+    // The compiled document the shell last applied (T5 R1). Roster joins, delete
+    // protection and the transcript fallback read the ROWS from here, so none of them
+    // needs an event list — and a session that has never been opened raw still knows
+    // exactly what the server says exists.
+    let sessionView: SessionView | undefined;
     // The session this board is bound to (N3 answer routing + transcript/delete
     // provenance). Declared here because the transcript fallback and the delete
     // transport both consult it.
@@ -1358,7 +1470,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const deletionKey = (sessionId: string, threadId: string): string =>
         `${sessionId}\u0000${threadId}`;
 
-    const currentSessionId = (): string | undefined => sessionSnapshot?.id ?? boundSession;
+    const currentSessionId = (): string | undefined =>
+        sessionSnapshot?.id ?? sessionView?.id ?? boundSession;
 
     const isDeleting = (threadId: string): boolean => {
         const sessionId = currentSessionId();
@@ -1417,13 +1530,33 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
 
     const transcriptSnapshotNow = (): SessionSnapshot | undefined => {
         if (sessionSnapshot !== undefined) return sessionSnapshot;
+
+        const invalidRecords = invalidRecordsOf(roster);
+
+        // Display-wire authority (T5 R1/R3): the shell applied a compiled view but no
+        // raw document has been read yet (the reader has not opened a transcript in
+        // this page's life). The rows are the honest source then — identity, status,
+        // usage, timing, steers and references all survive, and the exported document
+        // simply has no recorded events, which its own limitations line discloses.
+        if (sessionView !== undefined) {
+            // The roster of a compiled view is `threadViews` (identity + transcript SIGNAL, no
+            // messages), so the composite carries the roster rows the transcript surface needs to
+            // find the conversation at all; the recorded transcript itself arrives from the
+            // freshness read the dialog fires right after opening (`refreshSessionSnapshot`).
+            return {
+                ...sessionView,
+                messages: [],
+                threads: roster.map(rawThreadOf),
+                turns: summariesOf(sessionView) as unknown as SessionTurn[],
+                ...(invalidRecords.length === 0 ? {} : { invalidThreads: invalidRecords })
+            } as unknown as SessionSnapshot;
+        }
+
         if (roster.length === 0) return undefined;
 
         const sourceTurns = turns
             .map((turn) => turn.source())
             .filter((turn): turn is SessionTurn => turn !== undefined);
-
-        const invalidRecords = invalidRecordsOf(roster);
 
         return {
             id: boundSession ?? '',
@@ -1439,13 +1572,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         } as SessionSnapshot;
     };
 
-    // The raw turns this board currently knows, for delete protection when no full
-    // snapshot was wired.
-    const transcriptTurnsNow = (): readonly SessionTurn[] =>
+    // The rows this board currently knows, for delete protection. Preference order
+    // is "most authoritative AND most recent": a raw read wins, the applied view comes
+    // next, and the tiles' own merged records are the last resort (an embedder that
+    // only calls `setThreads`).
+    const transcriptTurnsNow = (): readonly ThreadProtectionRow[] =>
         sessionSnapshot?.turns ??
+        (sessionView === undefined ? undefined : summariesOf(sessionView)) ??
         turns
             .map((turn) => turn.source())
-            .filter((turn): turn is SessionTurn => turn !== undefined);
+            .filter((turn): turn is SessionTurn => turn !== undefined) ??
+        [];
 
     // Delete protection is recomputed from the freshest roster/turns the board
     // holds. A missing entry is not deletable through this surface.
@@ -2211,6 +2348,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     'p',
                     'thread-focus-invalid-note',
                     `transcript unreadable: ${invalidRecord.error}. Use Transcript to edit the raw JSON.`
+                )
+            );
+        } else if (messages.length === 0 && entry.hasTranscript === true) {
+            // T5 R1: the COMPACT roster reports a transcript without sending it (the transcript is
+            // the payload class the display wire removes, protocol.ts:396-427), so the panel names
+            // what exists and where to read it instead of claiming the conversation is empty.
+            transcript.append(
+                el(
+                    'p',
+                    'thread-focus-lazy',
+                    `${entry.messageCount ?? 'Some'} message${entry.messageCount === 1 ? '' : 's'} — use Transcript to read them.`
                 )
             );
         } else if (messages.length === 0) {
@@ -3214,7 +3362,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         };
 
         const persistentIdOf = (entry: ThreadEntry): string | undefined => {
-            const claim = rosterClaimOf(entry.key);
+            // A card's join key is its RUNTIME invocation identity when the board knows one
+            // (`explicitId`: the raw path's `thread.id`, the compiled path's `section.invocationId`
+            // / `section.threadId`), and its board key otherwise. The roster publishes exactly
+            // those ids (`invocationId` / `originInvocationId` / the historical `invocationIds`),
+            // so this is the documented join — not an inference from task text. The compiled
+            // section id (`${turnId}:${ordinal}`) is deliberately NOT a roster key, so keying the
+            // claim on it alone would never resolve a child card created before the roster landed.
+            const claim = rosterClaimOf(entry.explicitId ?? entry.key);
             if (claim !== undefined) {
                 // Remember the join while the roster still names it: this card's key
                 // never changes, the roster's invocation fields do.
@@ -3276,6 +3431,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         };
 
         const paintPersistentMarkers = (): void => {
+            // T5-DEBUG (remove before commit)
+            console.warn('[markers]', [...threads.values()].map((entry) => ({ key: entry.key, row: entry.row !== undefined, explicit: entry.explicitId, persistent: persistentIdOf(entry) })), [...learnedThreads], roster.map((row) => ({ id: row.id, invocationId: row.invocationId, invocationIds: row.invocationIds })));
             for (const entry of threads.values()) {
                 // The ROOT invocation has no row (its surface is the tile body), so
                 // it has nothing to mark; its label is painted separately.
@@ -4974,6 +5131,1094 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             syncRootAgentVisibility();
         };
 
+        // --- display-wire (compiled) rendering (T5: R1/R2/R3) -------------
+        //
+        // The DEFAULT browser path. A tile painted here never reads a
+        // `HarnessEvent`: the row comes from `TurnSummary` and the flow comes from
+        // `TurnDisplay`, both authored by the server's projector
+        // (src/server/turn-projector.ts), and every later frame is an op ADDRESSED by
+        // id (src/shared/turn-display.ts:499). That is what makes a reload, a live
+        // stream and a reconnected observer render the same DOM from the same ids,
+        // with no compilation, no call-by-name pairing and no event list on the wire.
+        //
+        // Identity maps (the only lookup keys this path uses):
+        //   - `compiledSections`: server section id -> the invocation entry that owns
+        //     that section's DOM (the root maps to the tile's own ROOT_KEY entry);
+        //   - `compiledHandles`: `${sectionId}\0${nodeId}` -> the painted handle, so
+        //     `node:append`/`node:set`/`node:remove`/`step:set` reach the exact
+        //     surface without searching.
+        type CompiledHandle =
+            | { kind: 'text'; sectionId: string; entry: ThreadEntry; node: HTMLElement }
+            | { kind: 'reasoning'; sectionId: string; entry: ThreadEntry; card: ReasoningCard }
+            | {
+                  kind: 'step';
+                  sectionId: string;
+                  entry: ThreadEntry;
+                  card: ToolCallCard;
+                  step: DisplayStep;
+              }
+            | {
+                  kind: 'action';
+                  sectionId: string;
+                  entry: ThreadEntry;
+                  card: ActionRequestCard;
+                  step: DisplayStep;
+              }
+            | { kind: 'notice'; sectionId: string; entry: ThreadEntry; node: HTMLElement };
+
+        const compiledSections = new Map<string, ThreadEntry>();
+        const compiledHandles = new Map<string, CompiledHandle>();
+        // The compact row this tile was last painted from: blocks (the `#` popup),
+        // steers (routing), attachments (chips) and usage all come from it, so no
+        // invocation walk is needed to answer those questions.
+        let compiledSummary: TurnSummary | undefined;
+        // True once anything was painted from the display wire. The raw event fold
+        // and this renderer never share a tile: a view-driven tile has no events.
+        let compiledMode = false;
+
+        const compiledKeyOf = (sectionId: string, nodeId: string): string =>
+            `${sectionId}\u0000${nodeId}`;
+
+        // `SectionDisplayState` -> the row vocabulary. `open` (started, nothing
+        // committed yet) reads as running, exactly as the fold painted a `start`
+        // frame; the terminal three pass through. No inference — the server decided.
+        const sectionThreadState = (value: SectionDisplayState): ThreadState =>
+            value === 'done'
+                ? 'done'
+                : value === 'error'
+                  ? 'error'
+                  : value === 'cancelled'
+                    ? 'cancelled'
+                    : 'streaming';
+
+        // `StepDisplayState` -> the tool card's outcome vocabulary. `DisplayStep.outcome`
+        // is authoritative when present (turn-display.ts:326); the state is the
+        // fallback, never a re-derivation from an `isError` boolean.
+        const stepOutcomeOf = (step: DisplayStep): HarnessToolOutcome =>
+            step.outcome ??
+            (step.state === 'ok' ? 'completed' : step.state === 'cancelled' ? 'cancelled' : 'failed');
+
+        // The entry that owns one server section, creating it on first sight.
+        const compiledEntryOf = (section: TurnSection): ThreadEntry => {
+            const known = compiledSections.get(section.id);
+            if (known !== undefined) return known;
+
+            compiledMode = true;
+
+            // The ROOT flow is the turn's own primary section; every other section is a nested
+            // invocation with its own row. `parentSectionId` cannot decide this alone: a direct
+            // child of the root omits it by contract (`HarnessThread.parentId` is "omitted for a
+            // direct child of the root", types/index.ts:1664), so the server's `role` is the
+            // authority for "is this the turn's own flow" (turn-display.ts:161,199).
+            const root = section.role === 'primary';
+            let entry: ThreadEntry;
+
+            if (root) {
+                // The root section IS the tile body: `rootSection` mints the
+                // `.tile-flow` surface and registers it under ROOT_KEY, so the tile
+                // remains the single owner of this conversation's DOM (every
+                // expansion/focus/copy behaviour already keys off that entry).
+                rootSection(section.agent);
+                const rootEntry = threads.get(ROOT_KEY);
+                // `rootSection` always registers ROOT_KEY; `inlineEntry` is the honest
+                // fallback rather than an assertion, so a broken invariant degrades to
+                // a flat block instead of throwing inside a render pass.
+                entry = rootEntry ?? inlineEntry(section.agent);
+
+                // The root header's agent code comes from the server's label, so the
+                // conversation-scoped allocator is not consulted at all here.
+                if (section.agentLabel.length > 0) {
+                    tileAgent.textContent = section.agentLabel;
+                    tileAgent.hidden = false;
+                    syncRootAgentVisibility();
+                }
+            } else {
+                entry = createThread({
+                    // The server's section id is the card's identity: stable across a
+                    // restart (turn-display.ts:50) and opaque by contract, so nothing
+                    // here parses it.
+                    key: section.id,
+                    agent: section.agent,
+                    // T5 R1: `TurnSection` carries no delegated-task text, so the row shows the
+                    // COMPACT roster's bounded transcript preview
+                    // (`SessionThreadView.preview`, protocol.ts:424), joined on the invocation /
+                    // persistent-thread identity — the same key the card itself is addressed by
+                    // (`explicitId` below), never the section id, which the roster does not know.
+                    // With neither available the row keeps its neutral 'delegated task' preview
+                    // instead of re-deriving a prompt from a bounded `argsPreview` string.
+                    input: rosterClaimOf(section.invocationId ?? section.threadId ?? section.id)?.preview,
+                    callId: undefined,
+                    // A direct child of the turn's own flow has no `parentSectionId` (see above),
+                    // and its parent surface is the tile body — registered under ROOT_KEY.
+                    parentKey: section.parentSectionId ?? ROOT_KEY,
+                    explicitId: section.invocationId ?? section.threadId,
+                    started: section.state !== 'open',
+                    state: sectionThreadState(section.state),
+                    branchId: section.branchId
+                });
+            }
+
+            compiledSections.set(section.id, entry);
+            paintCompiledSection(entry, section);
+
+            return entry;
+        };
+
+        // Paint a section's server-authored identity: label, nesting, role, thread
+        // join, model, clock and token figures. Everything ARRIVES; the local label
+        // allocator and the roster invocation join are the raw path's fallbacks and
+        // are deliberately not consulted first.
+        const paintCompiledSection = (entry: ThreadEntry, section: TurnSection): void => {
+            if (entry.key !== ROOT_KEY && section.agentLabel.length > 0)
+                paintEntryLabel(entry, section.agentLabel);
+
+            // The persistent conversation this invocation belongs to. The server
+            // names it, so the join is data rather than a roster/`invocationIds`
+            // inference; the board-level map still holds it, because child focus,
+            // the badge and delete protection all read that one source.
+            if (section.threadId !== undefined && section.threadId.length > 0)
+                learnedThreads.set(entry.key, section.threadId);
+
+            // The server names the persistent conversation on the section when it can resolve one.
+            // When it does not (a delegated child whose identity only the roster holds), the join
+            // falls back to the raw path's rule: claim the roster row by the section's RUNTIME
+            // identity — `rosterClaimOf` matches `invocationId` / `originInvocationId` /
+            // `invocationIds`, and the section id is never one of those, so a claim here is proof,
+            // never a guess.
+            if (section.threadId === undefined || section.threadId.length === 0) {
+                const claimed = rosterClaimOf(section.invocationId ?? section.threadId ?? section.id);
+                if (claimed !== undefined) learnedThreads.set(entry.key, claimed.id);
+            }
+
+            if (entry.key !== ROOT_KEY && section.threadId !== undefined && section.threadId.length > 0)
+                entry.explicitId = section.invocationId ?? section.threadId;
+
+            if (section.model !== undefined && section.model.length > 0)
+                entry.section.root.dataset.model = section.model;
+
+            // R3: only the structural role attribute; there is no visible badge.
+            entry.section.root.dataset.role = section.role;
+
+            const meta = entry.meta;
+            if (meta !== undefined) {
+                const hasStart = section.startedAt !== undefined;
+                const hasEnd = section.endedAt !== undefined;
+                if (hasStart || hasEnd)
+                    meta.settle({
+                        ...(hasStart ? { startedAt: section.startedAt } : {}),
+                        ...(hasEnd ? { endedAt: section.endedAt } : {})
+                    });
+
+                meta.setFigures({
+                    ...(section.latestInput === undefined ? {} : { latestInput: section.latestInput }),
+                    ...(section.cachedInput === undefined ? {} : { cachedInput: section.cachedInput })
+                });
+            }
+
+            setThreadState(entry, sectionThreadState(section.state));
+            // A terminal section is closed by the server, so its row gets the same
+            // terminal treatment (outcome wording) the fold gave a `done`/`error`.
+            if (isTerminalThread(entry.state)) completeThread(entry, entry.state);
+
+            updateMeta();
+        };
+
+        // One notice line. The tone selects the existing surface so a retry, a wake
+        // and an error keep the DOM vocabulary the styles and the tests already pin;
+        // the quieter tones share one new `.agent-notice` line.
+        const paintCompiledNotice = (
+            entry: ThreadEntry,
+            node: DisplayNoticeNode
+        ): CompiledHandle => {
+            const section = entry.section;
+
+            // A notice is readable prose between chips, so it breaks the chip run —
+            // the same rule the retry/error paths already apply.
+            closeText(section);
+            closeToolGroup(section);
+
+            const line = el('div', 'agent-notice');
+            line.dataset.tone = node.tone;
+            line.append(el('span', 'agent-notice-label', node.tone));
+            line.append(el('span', 'agent-notice-text', node.text));
+            if (node.at !== undefined) line.dataset.at = String(node.at);
+            section.flow.append(line);
+
+            const handle: CompiledHandle = {
+                kind: 'notice',
+                sectionId: entry.key,
+                entry,
+                node: line
+            };
+            compiledHandles.set(compiledKeyOf(entry.key, node.id), handle);
+
+            return handle;
+        };
+
+        // One tool call / owner question, from the compact row's step.
+        //
+        // R2: the card is built from PREVIEWs (`argsPreview`, `preview`) and gets a
+        // lazy detail source, so the exact recorded request+response is fetched by
+        // the card on the reader's first expansion — never while the board renders.
+        const paintCompiledStep = (entry: ThreadEntry, step: DisplayStep): CompiledHandle => {
+            // An owner question reuses the interactive card, built from the bounded
+            // `DisplayActionSummary` the server sends inline (answering must not cost
+            // a round trip).
+            if (step.kind === 'action') return paintCompiledAction(entry, step);
+
+            const section = entry.section;
+            const startedAt = step.startedAt;
+
+            // The loader is wired per step, and the card calls it at most once, on
+            // expand. An unwired board (a standalone embed, a test) keeps the
+            // previews and simply performs no request.
+            const loader = options.loadStepDetail;
+            const detail =
+                loader === undefined || step.turnId.length === 0
+                    ? undefined
+                    : {
+                          truncated: step.detail.truncated || step.detail.hasResult,
+                          load: async () => {
+                              const fetched = await loader({
+                                  ...(boundSession === undefined ? {} : { sessionId: boundSession }),
+                                  turnId: step.turnId,
+                                  stepId: step.id
+                              });
+
+                              return stepDetailPayloadOf(fetched);
+                          }
+                      };
+
+            const card = createToolCallCard(
+                step.name,
+                // The bounded preview stands in for the raw arguments until the
+                // detail arrives; `previewArguments` keeps it one line.
+                step.argsPreview ?? '',
+                {
+                    ...(step.callId === undefined ? {} : { callId: step.callId }),
+                    ...(startedAt === undefined ? {} : { startedAt })
+                },
+                {
+                    ...(options.readFile === undefined ? {} : { readFile: options.readFile }),
+                    ...(detail === undefined ? {} : { detail })
+                }
+            );
+
+            // The card is attempt-owned exactly like a folded call, so a server
+            // `attempt:discard` that names this node removes this chip and nothing
+            // else (the raw path's per-chip ownership, reused verbatim).
+            section.tools.push(card);
+            toolGroupOf(section).append(card.element);
+            trackNode(section, card.element);
+            if (section.pending !== undefined) section.flow.append(section.pending);
+            toolCount += 1;
+
+            // A settled step freezes the card with the server's figures; a running
+            // one stays live and keeps ticking from `startedAt`.
+            if (step.state === 'running') {
+                // `pending` on the step is that agent's authoritative snapshot
+                // (absence = "this frame says nothing", an empty array = drained).
+                if (Array.isArray(step.pending)) paintPending(section, step.pending);
+            } else {
+                const outcome = stepOutcomeOf(step);
+
+                if (step.state === 'cancelled')
+                    card.abandon(
+                        'Cancelled before the call returned.'
+                    );
+                else
+                // The span is the SERVER's figure in both of its shapes: the measured
+                // `durationMs` when the recorded result carried one, otherwise the span between
+                // the step's own `startedAt` and `endedAt` (the projector stamps both from the
+                // recorded `eventTimes`). This is the raw path's rule verbatim
+                // (`durationMs ?? elapsedBetween(startedAt, finishedAt)`, turns.ts:5024-5028);
+                // passing `undefined` here would leave the card ticking from `startedAt` to NOW,
+                // which prints an absurd elapsed time for a recorded call.
+                card.resolve(step.preview ?? '', outcome, step.durationMs ?? elapsedBetween(step.startedAt, step.endedAt));
+
+                // The call settled, so it is no longer part of the pending snapshot —
+                // the same scoped prune the raw path performs on a `tool_result`.
+                if (step.callId !== undefined) noteSettled(section, step.callId);
+                if (Array.isArray(step.pending)) paintPending(section, step.pending);
+            }
+
+            const handle: CompiledHandle = {
+                kind: 'step',
+                sectionId: entry.key,
+                entry,
+                card,
+                step
+            };
+            compiledHandles.set(compiledKeyOf(entry.key, step.id), handle);
+
+            return handle;
+        };
+
+        // An owner question from the compact wire. The card's request is rebuilt from
+        // the bounded summary — the question stays answerable without a detail fetch.
+        const paintCompiledAction = (entry: ThreadEntry, step: DisplayStep): CompiledHandle => {
+            const action = step.action;
+            const requestId = action?.requestId ?? step.callId ?? step.id;
+
+            const request: HarnessActionRequest = {
+                requestId,
+                question: action?.question ?? step.name,
+                recommended: action?.recommended ?? '',
+                options: (action?.options ?? []).map((option) => ({
+                    id: option.id,
+                    label: option.label,
+                    ...(option.description === undefined ? {} : { description: option.description })
+                })),
+                allowCustom: true
+            };
+
+            closeText(entry.section);
+            closeToolGroup(entry.section);
+
+            const card = mountActionCard(entry, request);
+
+            // The recorded answer, when there is one, is authoritative: the card
+            // shows it instead of an open question (the same `action_answer` effect).
+            if (action?.answered !== undefined)
+                applyActionAnswer({
+                    requestId,
+                    choice: action.answered.choice,
+                    source: action.answered.source
+                });
+
+            // The server knows an id is dead (a restored/expired request,
+            // sessions.ts:679); the card must not guess that from elapsed time.
+            if (action?.expired === true && card.state() !== 'answered')
+                card.setExpired('This question can no longer be answered.');
+
+            const handle: CompiledHandle = {
+                kind: 'action',
+                sectionId: entry.key,
+                entry,
+                card,
+                step
+            };
+            compiledHandles.set(compiledKeyOf(entry.key, step.id), handle);
+
+            return handle;
+        };
+
+        // One prose/reasoning node. Both reuse the fold's incremental writers, so
+        // Markdown scheduling, attempt ownership and the chip-row layout are the
+        // same code the live path already proved — only the bytes' origin differs.
+        const paintCompiledText = (entry: ThreadEntry, node: DisplayTextNode): CompiledHandle | undefined => {
+            const section = entry.section;
+
+            closeToolGroup(section);
+            appendText(section, node.text);
+
+            const block = section.text;
+            if (block === undefined) return undefined;
+
+            const handle: CompiledHandle = {
+                kind: 'text',
+                sectionId: entry.key,
+                entry,
+                node: block.node
+            };
+            compiledHandles.set(compiledKeyOf(entry.key, node.id), handle);
+
+            // A committed node is a closed window: the next node must stream into a
+            // block of its own (the raw path closes at `attempt_commit`/`done`).
+            if (node.committed) {
+                flushText(section);
+                closeText(section);
+                promoteAnswer(section, node.text);
+            }
+
+            return handle;
+        };
+
+        const paintCompiledReasoning = (
+            entry: ThreadEntry,
+            node: DisplayReasoningNode
+        ): CompiledHandle | undefined => {
+            const section = entry.section;
+
+            appendReasoning(section, node.text);
+
+            const chip = section.reasoning;
+            if (chip === undefined) return undefined;
+
+            // The server owns the token arithmetic, so the chip prints the share it
+            // was handed; the local character estimate stays the fallback for a
+            // frame that reports no share.
+            chip.card.setContext((entry.meta ?? blockMeta).context());
+            chip.card.setShare(node.share);
+
+            const handle: CompiledHandle = {
+                kind: 'reasoning',
+                sectionId: entry.key,
+                entry,
+                card: chip.card
+            };
+            compiledHandles.set(compiledKeyOf(entry.key, node.id), handle);
+
+            return handle;
+        };
+
+        const paintCompiledNode = (entry: ThreadEntry, node: DisplayNode): void => {
+            const key = compiledKeyOf(entry.key, node.id);
+            if (compiledHandles.has(key)) return;
+
+            if (node.kind === 'text') void paintCompiledText(entry, node);
+            else if (node.kind === 'reasoning') void paintCompiledReasoning(entry, node);
+            else if (node.kind === 'notice') paintCompiledNotice(entry, node);
+            else paintCompiledStep(entry, node);
+        };
+
+        // Destroy + detach one handle. A card owns timers and possibly a dialog, so
+        // `destroy` runs before the node leaves the DOM (the same ownership rule the
+        // raw path's `discardAttempt` documents).
+        const dropCompiledHandle = (key: string): void => {
+            const handle = compiledHandles.get(key);
+            if (handle === undefined) return;
+
+            compiledHandles.delete(key);
+
+            if (handle.kind === 'step') {
+                handle.entry.section.tools = handle.entry.section.tools.filter(
+                    (card) => card !== handle.card
+                );
+                toolCount = Math.max(0, toolCount - 1);
+                handle.card.destroy();
+                handle.card.element.remove();
+
+                return;
+            }
+
+            if (handle.kind === 'reasoning') {
+                handle.entry.section.thinking = handle.entry.section.thinking.filter(
+                    (card) => card !== handle.card
+                );
+                handle.card.destroy();
+                handle.card.element.remove();
+
+                return;
+            }
+
+            if (handle.kind === 'action') {
+                handle.card.destroy();
+                handle.card.element.remove();
+
+                return;
+            }
+
+            handle.node.remove();
+        };
+
+        // Every compiled handle key of one section, so a section rebuild can drop
+        // exactly its own surfaces (a steer node or a pending line this path does not
+        // own stays put).
+        const compiledSectionKeys = (sectionId: string): string[] =>
+            [...compiledHandles.keys()].filter((key) => key.startsWith(`${sectionId}\u0000`));
+
+        // Repaint one section's flow from its compiled node array. Used for a full
+        // hydration and for the rare `node:insert` with an explicit `index` (an
+        // out-of-order recovery), where appending would put the node in the wrong
+        // place; rebuilding is cheaper than tracking DOM positions here.
+        const renderCompiledSection = (entry: ThreadEntry, section: TurnSection): void => {
+            for (const key of compiledSectionKeys(entry.key)) dropCompiledHandle(key);
+
+            // The writers must not survive into a rebuilt flow: `section.text` would
+            // otherwise append into a detached block.
+            closeText(entry.section);
+            entry.section.text = undefined;
+            entry.section.reasoning = undefined;
+            entry.section.toolGroup = undefined;
+            entry.section.flow.replaceChildren();
+            entry.section.pendingCalls.clear();
+            entry.section.pending = undefined;
+
+            for (const node of section.nodes) paintCompiledNode(entry, node);
+
+            // TEMP PROBE (T5): did the compiled paint actually reach the surface?
+            console.warn(
+                '[paint]',
+                'mode',
+                compiledMode,
+                'entry',
+                entry.key,
+                'section',
+                section.id,
+                section.role,
+                'nodes',
+                section.nodes.length,
+                'kinds',
+                section.nodes.map((n) => n.kind).join(','),
+                'flow children',
+                entry.section.flow.children.length
+            );
+
+            updateMeta();
+        };
+
+        // Full paint of one turn from the compiled tree (hydration, a drain frame,
+        // or a superseding view). Rebuilds from a clean slate: this is the path that
+        // says "the document IS the state", so anything left over from a previous
+        // projection (including sections the document no longer names) is dropped.
+        const renderCompiledDisplay = (display: TurnDisplay): void => {
+            resetCompiled();
+            compiledMode = true;
+            // TEMP PROBE (T5): which whole-tree path ran, and with what.
+            console.warn('[full paint]', display.turnId, sectionsOf(display).length);
+
+            // Sections in the server's allocation order: root first, then nested.
+            // `paintCompiledSection` re-applies identity, so an already-created entry
+            // (an optimistic tile's root) is refreshed rather than duplicated.
+            for (const section of sectionsOf(display)) {
+                const entry = compiledEntryOf(section);
+                renderCompiledSection(entry, section);
+            }
+
+            // The persistent-conversation join (the row's `data-persistent-thread`, its title and
+            // the child header's conversation name) is painted from the roster claim or the join
+            // this pass just recorded, so it runs after the sections exist — the raw path paints it
+            // from its event handlers, the compiled path has no event handlers.
+            paintPersistentMarkers();
+
+            updateMeta();
+        };
+
+        // Reconcile this tile's DOM with a full compiled tree WITHOUT rebuilding the
+        // surfaces that already exist.
+        //
+        // This is what an authoritative `view` frame (a drain, a poll, a 202 answer)
+        // does to a live tile: a node id that is already painted keeps its DOM, so an
+        // open tool dialog, an already-loaded detail and the reader's scroll survive;
+        // the content advances to the server's text; and ids the tree no longer names
+        // are detached. Text can never duplicate, because a node's content is painted
+        // FROM the node (the raw path needs prefix matching for that guarantee).
+        const syncCompiledDisplay = (display: TurnDisplay): void => {
+            compiledMode = true;
+
+            for (const section of sectionsOf(display)) {
+                const entry = compiledEntryOf(section);
+                paintCompiledSection(entry, section);
+
+                // TEMP PROBE (T5): the incremental whole-tree path's per-section work.
+                console.warn(
+                    '[sync paint]',
+                    display.turnId,
+                    'sections',
+                    sectionsOf(display).length,
+                    'section',
+                    section.id,
+                    section.role,
+                    'nodes',
+                    section.nodes.length,
+                    'flow children',
+                    entry.section.flow.children.length,
+                    'flow',
+                    entry.section.flow.tagName + '.' + String(entry.section.flow.className),
+                    'flow parent',
+                    entry.section.flow.parentElement?.className ?? '(detached)',
+                    'connected',
+                    entry.section.flow.isConnected,
+                    'card connected',
+                    card.isConnected,
+                    'card flow',
+                    card.querySelector('.tile-flow')?.children.length ?? -1
+                );
+
+                const painted = new Set<string>();
+
+                for (const node of section.nodes) {
+                    painted.add(node.id);
+
+                    const handle = compiledHandles.get(compiledKeyOf(entry.key, node.id));
+                    if (handle === undefined) {
+                        paintCompiledNode(entry, node);
+                        continue;
+                    }
+
+                    syncCompiledNode(handle, node);
+                }
+
+                // Ids this tree no longer names are gone from the record.
+                for (const key of compiledSectionKeys(entry.key)) {
+                    const nodeId = key.split('\u0000')[1] ?? '';
+                    if (painted.has(nodeId)) continue;
+
+                    dropCompiledHandle(key);
+                }
+            }
+
+            // A whole section the document dropped (a deleted invocation) takes its
+            // row with it; the view is the authority for what exists.
+            for (const [sectionId, entry] of [...compiledSections]) {
+                if (sectionsOf(display).some((candidate) => candidate.id === sectionId)) continue;
+
+                for (const key of compiledSectionKeys(sectionId)) dropCompiledHandle(key);
+                compiledSections.delete(sectionId);
+                entry.disposeActionBar();
+                entry.row?.remove();
+                threads.delete(sectionId);
+            }
+
+            // Same rule as `renderCompiledDisplay`: the persistent-conversation join (row
+            // `data-persistent-thread`, the row title, the child header's conversation name) is
+            // derived from the roster claim recorded while painting sections, so it is refreshed
+            // once the sections exist instead of from an event handler.
+            paintPersistentMarkers();
+
+            updateMeta();
+        };
+
+        // Advance one already-painted surface to the server's current content.
+        const syncCompiledNode = (handle: CompiledHandle, node: DisplayNode): void => {
+            const key = compiledKeyOf(handle.sectionId, node.id);
+
+            if (handle.kind === 'text' && node.kind === 'text') {
+                const section = handle.entry.section;
+                const block = section.text;
+
+                if (block !== undefined && block.node === handle.node) {
+                    // Still the live writer: adopt the cumulative text and render it
+                    // once, so a delta stream and a whole-tree refresh land identically.
+                    if (block.buffer !== node.text) {
+                        block.buffer = node.text;
+                        renderText(block);
+                    }
+                } else {
+                    // A closed (committed) block: repaint its element from the node,
+                    // reusing the fold's renderer so Markdown, file links and images
+                    // are treated exactly as they were while the node streamed.
+                    renderText({
+                        node: handle.node,
+                        buffer: node.text,
+                        handle: undefined,
+                        viaFrame: false
+                    });
+                }
+
+                if (node.committed) {
+                    flushText(section);
+                    closeText(section);
+                    // A committed node IS this block's completed answer, so it becomes
+                    // the footer Copy target (the same promotion `commitAttempt` does).
+                    if (node.text.length > 0) promoteAnswer(section, node.text);
+                }
+
+                return;
+            }
+
+            if (handle.kind === 'reasoning' && node.kind === 'reasoning') {
+                handle.card.setText(node.text);
+                handle.card.setShare(node.share);
+
+                return;
+            }
+
+            if (handle.kind === 'notice' && node.kind === 'notice') {
+                handle.node.dataset.tone = node.tone;
+                const label = handle.node.querySelector('.agent-notice-label');
+                const text = handle.node.querySelector('.agent-notice-text');
+                if (label !== null) label.textContent = node.tone;
+                if (text !== null) text.textContent = node.text;
+
+                return;
+            }
+
+            if (
+                (handle.kind === 'step' || handle.kind === 'action') &&
+                (node.kind === 'tool' || node.kind === 'action')
+            ) {
+                // A step is resent WHOLE by contract (no field merging), so an exact
+                // comparison is the cheap, unambiguous equality test here — the same
+                // JSON comparison the raw fold uses for prefix matching.
+                if (JSON.stringify(handle.step) === JSON.stringify(node)) return;
+
+                dropCompiledHandle(key);
+                paintCompiledStep(handle.entry, node);
+
+                return;
+            }
+
+            // A node whose kind changed on the same id (the contract forbids it; a
+            // malformed frame must still render something truthful): repaint it.
+            dropCompiledHandle(key);
+            paintCompiledNode(handle.entry, node);
+        };
+
+        // Handles are registered under the ENTRY's key — its board identity, which is `ROOT_KEY`
+        // for the turn's own flow and the server's section id for every nested invocation
+        // (`compiledEntryOf`). An ops frame always names the WIRE section id, so a lookup must
+        // resolve the entry first: keying by `op.sectionId` misses every root-flow node, and a
+        // missed handle means a settled `step:set` appends a second chip beside the running one
+        // instead of replacing it.
+        const compiledEntryKeyOf = (sectionId: string): string | undefined =>
+            compiledSections.get(sectionId)?.key;
+
+        const compiledHandleOf = (
+            sectionId: string,
+            nodeId: string
+        ): CompiledHandle | undefined => {
+            const key = compiledEntryKeyOf(sectionId);
+
+            return key === undefined ? undefined : compiledHandles.get(compiledKeyOf(key, nodeId));
+        };
+
+        const dropCompiledHandleOf = (sectionId: string, nodeId: string): void => {
+            const key = compiledEntryKeyOf(sectionId);
+            if (key === undefined) return;
+            dropCompiledHandle(compiledKeyOf(key, nodeId));
+        };
+
+        // Apply one ops frame to THIS tile's DOM.
+        //
+        // `display` is the store's post-state tree for this turn (main.ts applies the
+        // ops to the document first, then routes them here). It is consulted only for
+        // an indexed insert, where the position must come from the server's order.
+        const applyCompiledOps = (
+            ops: readonly TurnDisplayOp[],
+            display?: TurnDisplay
+        ): void => {
+            for (const op of ops) {
+                switch (op.op) {
+                    case 'turn':
+                        // The row itself: status/timing/usage/chips/blocks.
+                        setCompiledSummary(op.summary);
+                        break;
+
+                    case 'section:open': {
+                        compiledMode = true;
+                        const entry = compiledEntryOf(op.section);
+                        paintCompiledSection(entry, op.section);
+                        break;
+                    }
+
+                    case 'section:set': {
+                        const entry = compiledSections.get(op.sectionId);
+                        if (entry === undefined) break;
+
+                        const section = sectionsOf(display).find(
+                            (candidate) => candidate.id === op.sectionId
+                        );
+                        if (section !== undefined) paintCompiledSection(entry, section);
+
+                        // A patch that only moves the state still has to reach the row.
+                        if (op.patch.state !== undefined) {
+                            setThreadState(entry, sectionThreadState(op.patch.state));
+                            if (isTerminalThread(entry.state)) completeThread(entry, entry.state);
+                        }
+
+                        break;
+                    }
+
+                    case 'node:insert': {
+                        const entry = compiledSections.get(op.sectionId);
+                        if (entry === undefined) break;
+
+                        compiledMode = true;
+
+                        if (op.index !== undefined && display !== undefined) {
+                            // Out-of-order recovery: rebuild this section in the
+                            // server's order instead of guessing a DOM position.
+                            const section = sectionsOf(display).find(
+                                (candidate) => candidate.id === op.sectionId
+                            );
+                            if (section !== undefined) {
+                                renderCompiledSection(entry, section);
+                                break;
+                            }
+                        }
+
+                        paintCompiledNode(entry, op.node);
+                        updateMeta();
+                        break;
+                    }
+
+                    case 'node:append': {
+                        const handle = compiledHandleOf(op.sectionId, op.nodeId);
+                        if (handle === undefined) break;
+
+                        if (handle.kind === 'text') {
+                            // The writer accumulates and schedules ONE Markdown parse
+                            // per frame (`schedule` above), which is what keeps a
+                            // streamed answer cheap to render.
+                            const section = handle.entry.section;
+                            const block = section.text;
+
+                            if (block !== undefined) {
+                                block.buffer += op.delta;
+                                schedule(block, () => renderText(block));
+                                // A status line stays after new prose.
+                                if (section.pending !== undefined) section.flow.append(section.pending);
+                            } else {
+                                // The writer is closed (the node was committed and its
+                                // block finalized). A delta that still arrives opens a
+                                // block of its own rather than being dropped.
+                                appendText(section, op.delta);
+                            }
+                        } else if (handle.kind === 'reasoning') {
+                            handle.card.setText(`${handle.card.text()}${op.delta}`);
+                        }
+
+                        break;
+                    }
+
+                    case 'node:set': {
+                        const handle = compiledHandleOf(op.sectionId, op.nodeId);
+                        if (handle === undefined) break;
+
+                        if (handle.kind === 'reasoning' && op.patch.share !== undefined)
+                            handle.card.setShare(op.patch.share);
+
+                        // `committed` is a styling/lifecycle marker: the server sends
+                        // explicit removes for a discard, so a commit only closes the
+                        // writer here (and promotes the answer for the Copy action).
+                        if (handle.kind === 'text' && op.patch.committed === true) {
+                            const section = handle.entry.section;
+                            const text = section.text?.buffer;
+
+                            flushText(section);
+                            closeText(section);
+                            if (text !== undefined && text.length > 0) promoteAnswer(section, text);
+                        }
+
+                        break;
+                    }
+
+                    case 'node:remove':
+                        dropCompiledHandleOf(op.sectionId, op.nodeId);
+                        updateMeta();
+                        break;
+
+                    case 'step:set': {
+                        const entry = compiledSections.get(op.sectionId);
+                        if (entry === undefined) break;
+
+                        const key = compiledKeyOf(entry.key, op.step.id);
+                        const handle = compiledHandles.get(key);
+
+                        // A step is small enough to resend whole (turn-display.ts:509),
+                        // so replacing the chip is the honest, merge-free update.
+                        if (handle !== undefined) dropCompiledHandle(key);
+                        paintCompiledStep(entry, op.step);
+                        updateMeta();
+                        break;
+                    }
+
+                    case 'pending:set': {
+                        const entry = compiledSections.get(op.sectionId);
+                        if (entry === undefined) break;
+
+                        // Absent means the snapshot is gone (nothing is running); an
+                        // empty array means the same thing visibly.
+                        paintPending(entry.section, op.pending ?? []);
+                        break;
+                    }
+
+                    case 'usage': {
+                        if (op.sectionId === 'turn') {
+                            blockMeta.setFigures({
+                                ...(op.latestInput === undefined ? {} : { latestInput: op.latestInput }),
+                                ...(op.cachedInput === undefined ? {} : { cachedInput: op.cachedInput }),
+                                ...(op.usage === undefined ? {} : { usage: op.usage })
+                            });
+                            syncThinkingShares();
+                            break;
+                        }
+
+                        const entry = compiledSections.get(op.sectionId);
+                        if (entry === undefined) break;
+
+                        entry.meta?.setFigures({
+                            ...(op.latestInput === undefined ? {} : { latestInput: op.latestInput }),
+                            ...(op.cachedInput === undefined ? {} : { cachedInput: op.cachedInput })
+                        });
+                        syncThinkingShares();
+                        break;
+                    }
+
+                    case 'attempt:commit': {
+                        const entry = compiledSections.get(op.sectionId);
+                        if (entry === undefined) break;
+
+                        commitAttempt(entry.section);
+                        break;
+                    }
+
+                    case 'attempt:discard': {
+                        const entry = compiledSections.get(op.sectionId);
+                        if (entry === undefined) break;
+
+                        for (const nodeId of op.nodeIds)
+                            dropCompiledHandle(compiledKeyOf(entry.key, nodeId));
+
+                        // The prose writer belongs to a discarded attempt: close it so
+                        // the next attempt's first node starts a fresh block.
+                        closeText(entry.section);
+                        entry.section.text = undefined;
+                        updateMeta();
+                        break;
+                    }
+                }
+            }
+
+            // One pass per frame, after the ops it names: a `section:open` records the roster join
+            // (or adopts the conversation id the server put on the section), and the row's
+            // persistent-thread identity, title and header label are derived from that. The raw
+            // path paints them from its event handlers; this path has none.
+            paintPersistentMarkers();
+        };
+
+        // The compact row -> the tile header. Status, timing, the token tally, the
+        // thread badge, the attachment chips and the copy target all come from the
+        // server's figures; `state` is printed verbatim because the projector already
+        // applied the `running -> streaming` mapping the fold used to do.
+        const setCompiledSummary = (summary: TurnSummary): void => {
+            compiledMode = true;
+            compiledSummary = summary;
+
+            if (serverId === undefined || serverId !== summary.id) {
+                serverId = summary.id;
+                card.dataset.turnId = summary.id;
+            }
+
+            // Identity: the persistent conversation and its display label.
+            setThreadId(summary.threadId, summary.threadLabel);
+
+            // Timing: a running row counts up from `startedAt`, a terminal one
+            // freezes at `updatedAt` (never at "now", so a poll and a live view
+            // agree) — the exact rule `merge` implements for a raw record.
+            const terminal =
+                summary.status !== 'running' && (summary.status as string) !== 'queued';
+            blockMeta.settle({
+                ...(summary.startedAt === undefined ? {} : { startedAt: summary.startedAt }),
+                ...(terminal && summary.updatedAt !== undefined ? { endedAt: summary.updatedAt } : {})
+            });
+
+            blockMeta.setFigures({
+                ...(summary.latestInput === undefined ? {} : { latestInput: summary.latestInput }),
+                ...(summary.cachedInput === undefined ? {} : { cachedInput: summary.cachedInput }),
+                ...(summary.usage === undefined ? {} : { usage: summary.usage })
+            });
+
+            // R1: the state comes from the wire, and `setState` performs the whole
+            // terminal cleanup (abandon unsettled cards, expire questions, clear the
+            // pending lines) that the fold used to reach through events.
+            setState(summary.state, summary.detail);
+
+            setCompiledAttachments(summary.attachments);
+            renderCompiledSteers(summary);
+
+            syncRootAgentVisibility();
+            syncTranscriptAction();
+            updateMeta();
+        };
+
+        // Attachment chips from the compact wire. A small image arrives inlined and
+        // renders as a thumbnail; everything else is identity + size, and a chip whose
+        // bytes were not inlined still shows what the file was.
+        const setCompiledAttachments = (
+            attachments: readonly DisplayAttachmentSummary[] | undefined
+        ): void => {
+            const records: HarnessAttachment[] = (attachments ?? []).map((entry) => ({
+                id: entry.id,
+                marker: entry.marker,
+                name: entry.name,
+                kind: entry.kind,
+                mime: entry.mime,
+                // Canonical base64 when the projector inlined it; an empty string is
+                // the honest "the bytes are on the server, not here" marker.
+                data: entry.data ?? '',
+                size: entry.size
+            }));
+
+            setAttachments(records);
+        };
+
+        // Steered submits, routed by the section the SERVER names. `sectionId` is the
+        // destination, so the raw path's "find the invocation whose thread matches"
+        // walk is not needed on this path (it stays for the compatibility fold).
+        const renderCompiledSteers = (summary: TurnSummary): void => {
+            const steers = summary.steers ?? [];
+            steerRecords = steers.map((steer) => ({
+                at: steer.at,
+                prompt: steer.prompt,
+                ...(steer.threadId === undefined ? {} : { threadId: steer.threadId }),
+                ...(steer.references === undefined ? {} : { references: steer.references })
+            }));
+
+            steers.forEach((steer, index) => {
+                const key = steerKeyOf(summary.id, index);
+                const section =
+                    steer.sectionId === undefined
+                        ? undefined
+                        : compiledSections.get(steer.sectionId)?.section;
+
+                if (section === undefined) {
+                    // No section (yet): the root flow, or a child owned by an EARLIER
+                    // turn, which the board-level pass routes from the audit.
+                    if (steer.sectionId === undefined) {
+                        if (flowHasSteer(flow, key)) return;
+                        closeText(entry0Section());
+                        closeToolGroup(entry0Section());
+                        flow.append(createSteerNode(steer, key));
+                    }
+
+                    return;
+                }
+
+                if (flowHasSteer(section.flow, key)) return;
+                closeText(section);
+                closeToolGroup(section);
+                section.flow.append(createSteerNode(steer, key));
+            });
+        };
+
+        // The root section for a root-level steer. `threads.get(ROOT_KEY)` exists
+        // once anything has been painted; `rootSection` is the documented way to
+        // create it, so an empty compiled turn still has its flow.
+        const entry0Section = (): AgentSection =>
+            threads.get(ROOT_KEY)?.section ?? rootSection(primaryAgent ?? UNNAMED_AGENT_PLACEHOLDER);
+
+        // Drop everything this path painted. Cards own timers and dialogs, so each is
+        // destroyed before its node leaves the document.
+        const resetCompiled = (): void => {
+            for (const key of [...compiledHandles.keys()]) dropCompiledHandle(key);
+
+            compiledSections.clear();
+            compiledHandles.clear();
+
+            for (const entry of threads.values()) entry.disposeActionBar();
+
+            threads.clear();
+            pendingTools.length = 0;
+            settledCalls.clear();
+            flow.replaceChildren();
+            threadHost.replaceChildren();
+            primaryAgent = undefined;
+            toolCount = 0;
+            blockMeta.clearUsage();
+            tileAgent.textContent = '';
+            tileAgent.hidden = true;
+            syncRootAgentVisibility();
+        };
+
+        // The `#` popup source for this tile: the server's block projection, with
+        // the bounded preview as the descriptor's `content`. Full block text is
+        // detail-only, and the popup only ever needs the label and the snippet.
+        const compiledBlocks = (): AgentBlockDescriptor[] => {
+            if (compiledSummary === undefined || serverId === undefined) return [];
+
+            return (compiledSummary.blocks ?? []).map((block) => ({
+                turnId: block.turnId,
+                ...(block.threadId === undefined ? {} : { threadId: block.threadId }),
+                label: block.label,
+                agent: block.agent,
+                status: block.status,
+                ...(block.preview === undefined ? {} : { content: block.preview })
+            }));
+        };
+
         // --- events -------------------------------------------------------
         // `at` is the server clock for this event. A live frame arrives with one
         // on the new server; local date is only the fallback. `origin` keeps the
@@ -5546,6 +6791,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             value === 'streaming' ? 'running' : value === 'waiting' ? 'queued' : value;
 
         const blocks = (): AgentBlockDescriptor[] => {
+            // Display-wire path: the SERVER's block projection is the popup source,
+            // so no invocation walk and no full block text is needed (R1/R3).
+            if (compiledSummary !== undefined) return compiledBlocks();
+
             // An optimistic tile has no server turn id yet. It cannot be referenced
             // (the wire binding would be undefined), so it contributes nothing.
             if (serverId === undefined) return [];
@@ -5636,6 +6885,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             blocks,
             steerAudit: () => steerRecords,
             tryRenderSteer,
+            setSummary: (summary: TurnSummary) => setCompiledSummary(summary),
+            renderDisplay: (display: TurnDisplay) => renderCompiledDisplay(display),
+            syncDisplay: (display: TurnDisplay) => syncCompiledDisplay(display),
+            applyOps: (ops: readonly TurnDisplayOp[], display?: TurnDisplay) =>
+                applyCompiledOps(ops, display),
+            compiled: () => compiledMode,
             destroy
         };
 
@@ -5959,6 +7214,219 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         return handles;
     };
 
+    // ------------------------------------------------------------------
+    // The display-wire board API (T5: R1/R2/R3)
+    // ------------------------------------------------------------------
+    //
+    // Same list model, same focus/expansion rules, different source: a row comes
+    // from `TurnSummary` and a flow from `TurnDisplay`. No function below touches
+    // `SessionTurn.events`, and none of them needs `labelSeeds` (the server mints
+    // the block labels, so a deletion can never renumber a surviving block here —
+    // the guarantee the raw path implements with seeds arrives for free).
+    //
+    // `HydrateOptions` is accepted unchanged so the shell has ONE options shape:
+    // `model` still labels a settled tile, `keep` still preserves which turn is
+    // expanded, `labelSeeds` is simply not needed.
+
+    // A turn whose tree the view has not sent yet (a queued row, or a partial view).
+    // Empty is the honest answer: the row exists, the flow has nothing to paint.
+    const emptyDisplay = (turnId: string): TurnDisplay => ({ turnId, sections: [] });
+
+    // Build one tile from the compact row + its tree.
+    const adoptView = (
+        summary: TurnSummary,
+        display: TurnDisplay | undefined
+    ): TurnHandle => {
+        const handle = create(summary.prompt, [], summary.threadId);
+        handle.setSummary(summary);
+        handle.renderDisplay(display ?? emptyDisplay(summary.id));
+
+        return handle;
+    };
+
+    // Reconcile the board with an authoritative VIEW document (R4 queue + a drain
+    // frame). Tiles are matched by the server's stable id and patched in place, so
+    // the expanded tile, its DOM, any loaded tool detail and the reader's scroll all
+    // survive — and because a node's content is painted from the node itself (never
+    // from a delta stream), a reconnect cannot duplicate streamed text by
+    // construction. `reconcile` needs prefix matching for that; this path does not.
+    const reconcileView = (
+        view: SessionView,
+        options: HydrateOptions = {}
+    ): TurnHandle[] => {
+        const keepHandle = expandedTurn;
+        const keepFocus = focusedThreadId;
+        const keepId = options.keep ?? keepHandle?.id();
+        const hadTurns = turns.length > 0;
+        const seen = new Set<string>();
+        const ordered: TurnHandle[] = [];
+
+        for (const summary of summariesOf(view)) {
+            // A duplicate id in one document is the same reconnect artefact the raw
+            // path guards: the first row wins, and a repeat never adds a second one.
+            if (seen.has(summary.id)) continue;
+            seen.add(summary.id);
+
+            const display = displayOfView(view, summary.id);
+
+            const existing = find(summary.id);
+            if (existing !== undefined) {
+                existing.setSummary(summary);
+                existing.syncDisplay(display ?? emptyDisplay(summary.id));
+                ordered.push(existing);
+                continue;
+            }
+
+            // The row for a task this browser submitted but has not been answered
+            // for yet: bind the tile the reader is already looking at.
+            const claimed = claim(summary.prompt);
+            if (claimed !== undefined) {
+                claimed.setSummary(summary);
+                claimed.syncDisplay(display ?? emptyDisplay(summary.id));
+                ordered.push(claimed);
+                continue;
+            }
+
+            ordered.push(adoptView(summary, display));
+        }
+
+        const next = [...ordered];
+
+        // An optimistic tile survives while it is genuinely pending (the enqueue is
+        // still in flight). A terminal unbound row is a failed submit and retires,
+        // exactly as in `reconcile`.
+        for (const turn of [...turns]) {
+            if (turn.id() !== undefined) continue;
+
+            const state = turn.state();
+            if (state === 'queued' || state === 'waiting') next.push(turn);
+        }
+
+        // Server authority: every bound tile this pass did not place is gone.
+        for (const turn of [...turns]) {
+            if (next.includes(turn)) continue;
+
+            turn.destroy();
+            turn.element.parentElement?.remove();
+        }
+
+        turns.length = 0;
+        turns.push(...next);
+
+        placeAllTurns();
+        renderCrossSteers();
+
+        // Focus preservation (S1) — the identical policy `reconcile` documents: a
+        // background adoption never steals the reader's focus, and a session switch
+        // opens the incoming conversation exactly once.
+        if (keepHandle !== undefined && next.includes(keepHandle)) {
+            const boundFocus = keepHandle.threadId();
+            if (boundFocus !== undefined && boundFocus !== focusedThreadId) {
+                focusedThreadId = boundFocus;
+                notifyFocus();
+            }
+            if (boundFocus !== undefined) keepHandle.clearThreadFocus();
+        } else if (keepFocus !== undefined) {
+            if (!focusThread(keepFocus)) {
+                dropFocusState();
+                notifyFocus();
+                if (!explicitUnfocus && pendingFirstFocus) {
+                    const newest = next[next.length - 1];
+                    if (newest !== undefined) expand(newest);
+                }
+            }
+        } else if (!explicitUnfocus && (!hadTurns || pendingFirstFocus)) {
+            const newest = next[next.length - 1];
+            if (newest !== undefined) expand(newest);
+        }
+        pendingFirstFocus = false;
+
+        return next;
+    };
+
+    // Replace the whole board with one view document (a reload, a session open, a
+    // session switch). Expansion is carried across by turn id.
+    const hydrateView = (
+        view: SessionView,
+        options: HydrateOptions = {}
+    ): TurnHandle[] => {
+        const keepId = options.keep ?? expandedTurn?.id();
+
+        clear();
+
+        const handles = summariesOf(view).map((summary) =>
+            adoptView(summary, displayOfView(view, summary.id))
+        );
+
+        placeAllTurns();
+        renderCrossSteers();
+
+        const kept = keepId === undefined ? undefined : handles.find((handle) => handle.id() === keepId);
+        const target = kept ?? handles[handles.length - 1];
+        if (target !== undefined) {
+            expand(target);
+        } else {
+            notifyFocus();
+        }
+
+        return handles;
+    };
+
+    // Bind/adopt the row a `POST /views/:id/tasks` answer names, so a submit that
+    // was STEERED into a running conversation merges into the tile that already
+    // represents it instead of growing an unbound ghost row.
+    const upsertView = (
+        summary: TurnSummary,
+        view: SessionView | undefined
+    ): TurnHandle => {
+        const display = view === undefined ? undefined : displayOfView(view, summary.id);
+        const existing = find(summary.id);
+        if (existing !== undefined) {
+            existing.setSummary(summary);
+            if (display !== undefined) existing.syncDisplay(display);
+
+            return existing;
+        }
+
+        const claimed = claim(summary.prompt);
+        if (claimed !== undefined) {
+            claimed.setSummary(summary);
+            if (display !== undefined) claimed.syncDisplay(display);
+
+            return claimed;
+        }
+
+        return adoptView(summary, display);
+    };
+
+    // Route one ops frame to its tile by EXPLICIT turn id. False means this board
+    // holds no tile for that turn (another tab's turn, or a frame that arrived before
+    // the row it belongs to): the caller leaves it alone, because the terminal `view`
+    // frame is self-sufficient and reconciles whatever a connection missed.
+    const applyViewOps = (
+        turnId: string,
+        ops: readonly TurnDisplayOp[],
+        view?: SessionView
+    ): boolean => {
+        let handle = find(turnId);
+
+        // A `{ op: 'turn' }` upsert IS the row's own record — "a client has exactly one place to
+        // patch a row" (protocol.ts:691) — so the frame that opens a turn CREATES the tile, which
+        // is what the raw surface's leading `turn` frame did (protocol.ts:563: "`turn` opens every
+        // run, before the first harness event"). A frame whose ops name a turn this board has no
+        // row for, with no upsert, still proves nothing about ordering and stays unapplied.
+        if (handle === undefined) {
+            const opened = ops.find((op) => op.op === 'turn');
+            if (opened === undefined || opened.op !== 'turn') return false;
+            handle = upsertView(opened.summary, view);
+        }
+
+        const display = view === undefined ? undefined : displayOfView(view, turnId);
+        handle.applyOps(ops, display);
+
+        return true;
+    };
+
     // Stop every timer the board owns without discarding its DOM. Used by the
     // view teardown and on `pagehide`; a reload re-reads server state anyway.
     const destroy = (): void => {
@@ -6082,14 +7550,38 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // Kept separate from `setThreads` so every pre-R7 embedding keeps working with
     // the roster-only fallback and the exact raw shape lives in ONE place.
     const setSessionSnapshot = (snapshot: SessionSnapshot | undefined): void => {
+        const hadRaw = sessionSnapshot !== undefined;
         sessionSnapshot = snapshot;
-
         if (snapshot === undefined) {
-            // Session teardown: no snapshot, no transcript surface.
-            closeThreadTranscript(transcriptScope);
+            // Raw authority REMOVED (a session teardown): the transcript surface goes with it.
+            // Installing `undefined` when nothing was installed is not a teardown — under the
+            // display wire the shell re-applies documents while `instance.snapshot` is still
+            // absent (the transcript's own freshness read begins with exactly such an apply), and
+            // an open dialog at that moment reads the compiled fallback, which survives.
+            if (hadRaw) closeThreadTranscript(transcriptScope);
         } else {
             notifyTranscriptRefresh(refreshOpenThreadTranscript(snapshot, transcriptScope));
         }
+        refreshActionBars();
+    };
+
+    // Install the COMPILED authority (T5 R1/R3). The default path calls this on every
+    // applied view document; the raw document above stays undefined until the reader
+    // explicitly opens a transcript, because a JSON export is the one surface that
+    // quotes recorded events. An open transcript dialog refreshes from the newest
+    // source, so a drain frame keeps it current without ever pulling events.
+    const setSessionView = (view: SessionView | undefined): void => {
+        sessionView = view;
+
+        // The transcript document needs events; only a raw read can serve it, so the
+        // dialog is refreshed from whichever authority exists (raw first, compiled
+        // rows otherwise — see `transcriptSnapshotNow`).
+        if (view === undefined) closeThreadTranscript(transcriptScope);
+        // A compiled document never repaints an open transcript: its rows carry no recorded
+        // events, so it can only DOWNGRADE the lossless document the reader is looking at. The
+        // surfaces that CAN improve it own their own refresh — the raw freshness read the dialog
+        // fires on open (`refreshSessionSnapshot`) and the PUT answer of a save.
+
         refreshActionBars();
     };
 
@@ -6107,12 +7599,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         focusThread,
         setThreads,
         setSessionSnapshot,
+        setSessionView,
         discard,
         find,
         claim,
         adopt,
         hydrate,
         reconcile,
+        hydrateView,
+        reconcileView,
+        upsertView,
+        applyViewOps,
         blocks,
         destroy
     };

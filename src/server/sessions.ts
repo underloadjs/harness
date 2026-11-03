@@ -171,6 +171,7 @@ import {
     composeAgentResultPrompt,
     findAgentResultBlock,
     findLatestAgentResultBlock,
+    listAgentResultBlocks,
     MAX_AGENT_REFERENCES,
     parseAgentReferenceLabels,
     readAgentResultReferenceList
@@ -210,10 +211,22 @@ import type {
     SessionStatus,
     SessionStreamItem,
     SessionThread,
+    SessionThreadView,
     SessionTurn,
+    SessionView,
+    SessionViewStreamItem,
+    SessionViewSummary,
     ThreadTranscriptResponse,
+    TurnStepDetail,
     UpdateThreadTranscriptResult
 } from './protocol';
+// R1/R3/R4: the compiled display surface. The fold is SERVER-only (the browser
+// imports the types from ../shared/turn-display.ts and never this runtime), and the
+// journal is the per-step durable log the compiled memory is rebuilt from.
+import type { DisplayProjectContext, TurnDisplay, TurnDisplayOp, TurnProjector } from '../shared/turn-display';
+import { createTurnProjector, refoldTurn } from './turn-projector';
+import { HarnessJournal } from './journal';
+import type { JournalEventRecord, JournalProblem } from './journal';
 
 const MAX_INPUT_LENGTH = 200_000;
 
@@ -294,6 +307,24 @@ type SessionWatcher = {
     emit: Emit;
     close: () => void;
 };
+
+// R3: the compact display stream. A view watcher's frames are `SessionViewStreamItem`
+// (turn ops / rows / views) and NEVER a raw event, so the browser's default traffic
+// carries no step payloads.
+type EmitView = (item: SessionViewStreamItem) => void | Promise<void>;
+
+type ViewWatcher = {
+    emit: EmitView;
+    close: () => void;
+};
+
+// R4: how often a RUNNING session may rewrite the whole `state.json`. Every event is
+// appended to the journal regardless; the checkpoint exists so a crash between two
+// intervals loses at most this many milliseconds of PROGRESS deltas (a tool call,
+// commit, start, done or cancellation always checkpoints through the existing
+// strict/best-effort calls). 2s is bounded work per turn and far below the old
+// per-non-delta-event full-document serialization.
+const VIEW_CHECKPOINT_INTERVAL_MS = 2_000;
 
 // One host thread's execution lane (R1-R6). Every thread-capable submit runs in a
 // lane (F1); it owns:
@@ -481,6 +512,31 @@ type Session = {
     // process dies has not reached its boundary; that residual is documented and
     // the interrupted turn is never replayed.
     core: HarnessSnapshot;
+    // -----------------------------------------------------------------------
+    // R1/R3/R4: the compiled DISPLAY surface, maintained AS the run goes.
+    //
+    // One projector per turn, holding that turn's display tree and row. The recorder
+    // folds each stored event through it exactly once (see `executeTurn`), so
+    // `getView`/`listViews` read a CACHE instead of re-walking events, and the raw
+    // `get()`/`list()` copy of every event is not paid just to build a compact
+    // response. A terminal turn is rebuilt from the journal/checkpoint at restore,
+    // never lazily per request.
+    projections: Map<string, TurnProjector>;
+    // `GET /views/:id/events` subscribers. Mirrors `watchers`; a view watcher never
+    // sees a raw frame, and a raw watcher never sees a display frame.
+    viewWatchers: Set<ViewWatcher>;
+    // The per-step durable log for this session (undefined for an in-memory store).
+    journal: HarnessJournal | undefined;
+    // Journal problems worth telling an operator about: write failures and READ
+    // corruption. Surfaced through `journalErrors`, never swallowed silently. A
+    // crash-truncated tail is included but flagged as tolerated by the reader.
+    journalProblems: string[];
+    // Memo for the per-turn result-block projection (labels are the store's). Keyed
+    // by turn id; invalidated by the turn's own status/updatedAt/event-count stamp.
+    blockCache: Map<string, { stamp: string; blocks: AgentResultBlock[] }>;
+    // Last full-document checkpoint for THIS session, so a long run writes the
+    // document at a bounded interval instead of once per step (R4).
+    checkpointAt: number;
 };
 
 // What start.ts/runtime.ts hand the store (R3b). `persistence` owns the file,
@@ -541,6 +597,14 @@ export type EnqueuedTask = {
 // registration, plus the detach function.
 export type SessionWatch = {
     snapshot: SessionSnapshot;
+    unsubscribe: () => void;
+};
+
+// What watchView() hands GET /views/:id/events: the compiled view captured
+// atomically with registration, plus the detach function. Same contract as
+// `SessionWatch`, compact instead of raw.
+export type SessionViewWatch = {
+    view: SessionView;
     unsubscribe: () => void;
 };
 
@@ -777,6 +841,56 @@ const copyDescriptor = (descriptor: HarnessDescriptor): HarnessDescriptor =>
 
 const copyTurns = (turns: readonly SessionTurn[]): SessionTurn[] => turns.map(copyTurn);
 
+// A timestamp is usable only when it is a real epoch-ms number. 0 is the projector's
+// documented "no timestamp" sentinel (../server/turn-projector.ts
+// DISPLAY_NO_TIMESTAMP), and a record without `eventTimes` must never paint a
+// duration — the same honesty rule turns.ts:4778 applies to a recorded replay.
+const finiteAt = (value: unknown): value is number =>
+    typeof value === 'number' && Number.isFinite(value) && value > 0;
+
+// Terminal turn statuses (./protocol.ts SessionTurnStatus). Kept local so the store,
+// the frame mirror and the projector agree on one definition.
+const isTerminalTurnStatus = (status: SessionTurn['status']): boolean =>
+    status === 'done' || status === 'error' || status === 'cancelled';
+
+// Roster WITHOUT the transcript. `SessionThread.messages` is the committed harness
+// transcript — every assistant text and every tool result verbatim (a tool result is
+// capped only at 64 KiB, ../core/result-budget.ts:42) — so shipping it in every view
+// frame is precisely the payload class R1 removes. Identity plus a bounded preview is
+// what a strip, a badge and a focus resolution need; the transcript itself is one
+// lazy route away (GET /views/:id/threads/:threadId/transcript), which is exactly the
+// moment the UI has opened a transcript surface.
+const threadViewsOf = (threads: readonly SessionThread[]): SessionThreadView[] =>
+    threads.map((thread): SessionThreadView => {
+        const last = thread.messages[thread.messages.length - 1];
+        const raw = (last as { content?: unknown } | undefined)?.content;
+
+        return {
+            id: thread.id,
+            agent: thread.agent,
+            origin: thread.origin,
+            status: thread.status,
+            sequence: thread.sequence,
+            ...(thread.ownerThreadId === undefined ? {} : { ownerThreadId: thread.ownerThreadId }),
+            ...(thread.label === undefined ? {} : { label: thread.label }),
+            ...(thread.invocationId === undefined ? {} : { invocationId: thread.invocationId }),
+            ...(thread.originTurnId === undefined ? {} : { originTurnId: thread.originTurnId }),
+            ...(thread.originInvocationId === undefined ? {} : { originInvocationId: thread.originInvocationId }),
+            ...(thread.invocationIds === undefined ? {} : { invocationIds: [...thread.invocationIds] }),
+            ...(thread.references === undefined || thread.references.length === 0
+                ? {}
+                : { references: thread.references.map((reference) => ({ ...reference })) }),
+            ...(thread.connectedThreadIds === undefined || thread.connectedThreadIds.length === 0
+                ? {}
+                : { connectedThreadIds: [...thread.connectedThreadIds] }),
+            messageCount: thread.messages.length,
+            ...(typeof raw === 'string' && raw.length > 0
+                ? { preview: raw.length > 240 ? `${raw.slice(0, 239).trimEnd()}\u2026` : raw }
+                : {}),
+            hasTranscript: thread.messages.length > 0
+        };
+    });
+
 // Trim + bound a task input. Shared by the legacy run() and the queue enqueue()
 // so the two submit surfaces cannot disagree about what a valid task is. Throws
 // BEFORE any mutation, which is what makes a rejected submit safe to retry.
@@ -906,6 +1020,9 @@ export class SessionStore {
     // Last background save failure. Exposed so a caller/test can observe a write
     // error that must not change a run's outcome (the core observer swallows it).
     private lastPersistenceError: string | undefined;
+    // R4: aggregate journal diagnostics — write failures and READ corruption for any
+    // session, kept after a session is removed (see the `journalErrors` getter).
+    private readonly journalFailures: string[] = [];
     // True while the constructor replays a document: the restored harness emits
     // `restore` state changes, and writing the file back mid-load would be a
     // pointless (and possibly partial) round trip.
@@ -980,6 +1097,16 @@ export class SessionStore {
     // for the turn-transition path, which must not fail a completed run.
     get persistenceError(): string | undefined {
         return this.lastPersistenceError;
+    }
+
+    // R4: every event-journal problem this store observed, in first-seen order —
+    // append/rewrite/open failures AND read-side corruption (a truncated tail is
+    // included and labelled as tolerated). The journal is best-effort for a RUNNING
+    // turn (a full disk must not change its outcome), which is exactly why the
+    // failures have to be collectible rather than swallowed: the runtime host and the
+    // tests read this.
+    get journalErrors(): readonly string[] {
+        return this.journalFailures;
     }
 
     // Sessions this load dropped, document order, each as the exact diagnostic
@@ -1062,6 +1189,15 @@ export class SessionStore {
             pendingActions: new Map(),
             completedActions: [],
             disposed: false,
+            // R1/R3/R4: compiled display state, its observers, and the durable log.
+            // A fresh session has no turns, so every map starts empty; the journal is
+            // attached lazily (an in-memory store never creates one).
+            projections: new Map(),
+            viewWatchers: new Set(),
+            journal: undefined,
+            journalProblems: [],
+            blockCache: new Map(),
+            checkpointAt: Date.now(),
             // An empty session is a valid commit point: snapshot() succeeds here.
             core: harness.snapshot()
         };
@@ -1912,6 +2048,16 @@ export class SessionStore {
                 // 409 instead of a misleading 404.
                 completedActions: expiredActionIds(turns),
                 disposed: false,
+                // R1/R3/R4: the compiled state is rebuilt from the durable records
+                // right after registration (`restoreProjections`), so a restart starts
+                // with warm compact state and no request-time folding. The journal is
+                // attached lazily by that merge.
+                projections: new Map(),
+                viewWatchers: new Set(),
+                journal: undefined,
+                journalProblems: [],
+                blockCache: new Map(),
+                checkpointAt: restoredAt,
                 // Replaced with a fresh snapshot after restore succeeds.
                 core: record.core
             };
@@ -1999,6 +2145,12 @@ export class SessionStore {
             // records the model map above) as this session's committed state.
             session.core = harness.snapshot();
             this.sessions.set(session.id, session);
+
+            // R4: merge the durable per-step log into the checkpointed turns and fold
+            // the compiled display state ONCE here (not per request). A legacy
+            // document without a journal directory keeps its checkpoint events exactly
+            // as written, so an old database restores unchanged.
+            this.restoreProjections(session);
         } catch (error) {
             // R6/R7: the caller decides. `restoreSession` itself stays strict — a
             // direct restore failure is a real error with the file path and the
@@ -2323,6 +2475,646 @@ export class SessionStore {
 
     list(): SessionSnapshot[] {
         return [...this.sessions.values()].map((session) => this.snapshot(session));
+    }
+
+    // -----------------------------------------------------------------------
+    // The compiled display surface (R1/R3/R4)
+    //
+    // Everything below reads the PER-TURN projection cache, never the raw event
+    // copy: a compact response must not cost a raw `get()`/`list()`. The cache is
+    // updated by the recorder as events are stored, and rebuilt from the durable
+    // journal at restore, so no request ever folds anything.
+    // -----------------------------------------------------------------------
+
+    // What the fold needs that is NOT inside one turn record: the entry agent (for
+    // `role`), the invocation→conversation label join (R8/T14), the answer-route
+    // expiry set (N4), and the store's own block projection (labels are the store's,
+    // so the fold must not re-mint them).
+    private displayContext(session: Session): DisplayProjectContext {
+        const threadLabels = new Map<string, string>();
+
+        // R8/T14: ADOPT persisted conversation labels before anything mints one.
+        // `invocationThreadLabels` allocates for a thread whose name is not recorded,
+        // and a restored document adopts its surviving names on the first roster read
+        // (see `ensureThreadLabels` → `adoptPersistedLabels`). Building the fold
+        // context without that adoption would consume the ordinal a restored `RR3`
+        // still owns and hand the survivor `RR4`.
+        this.ensureThreadLabels(session);
+
+        for (const [invocationId, label] of Object.entries(this.invocationThreadLabels(session))) {
+            threadLabels.set(invocationId, label);
+        }
+
+        return {
+            primary: session.definition.primary,
+            threadLabels,
+            expiredRequestIds: new Set(session.completedActions),
+            // The callback is handed the LIVE turn record the projector holds, so the
+            // cast is exact (see `DisplayTurnInput`, ../shared/turn-display.ts).
+            blocksOf: (turn) => this.blocksFor(session, turn as unknown as SessionTurn)
+        };
+    }
+
+    // One turn's result blocks, memoized by the inputs the projection reads. Without
+    // this, a rail refresh would re-walk every event of every turn — the exact cost
+    // the compact surface exists to remove.
+    private blocksFor(session: Session, turn: SessionTurn): readonly AgentResultBlock[] {
+        const stamp = `${turn.status}:${turn.updatedAt}:${turn.events.length}`;
+        const cached = session.blockCache.get(turn.id);
+
+        if (cached !== undefined && cached.stamp === stamp) return cached.blocks;
+
+        const blocks = listAgentResultBlocks(this.projectionTurns(session, [turn]));
+        session.blockCache.set(turn.id, { stamp, blocks });
+
+        return blocks;
+    }
+
+    // The live projector for one turn, folded on first use so a queued turn (no
+    // events yet) and a restored turn (a full history) both have a row immediately.
+    private projectorFor(session: Session, turn: SessionTurn): TurnProjector {
+        const existing = session.projections.get(turn.id);
+        if (existing !== undefined) return existing;
+
+        const projector = createTurnProjector(turn, this.displayContext(session));
+
+        for (let index = 0; index < turn.events.length; index += 1) {
+            projector.apply(turn.events[index], turn.eventTimes?.[index] ?? 0, index);
+        }
+
+        if (isTerminalTurnStatus(turn.status)) {
+            projector.settle(turn.status, turn.updatedAt);
+        }
+
+        session.projections.set(turn.id, projector);
+
+        return projector;
+    }
+
+    // Compiled artifacts must die with their turn (reset, thread deletion, session
+    // removal) or a stale tree could outlive the record it was folded from.
+    private forgetProjections(session: Session, turnIds: Iterable<string>): void {
+        for (const id of turnIds) {
+            session.projections.delete(id);
+            session.blockCache.delete(id);
+        }
+    }
+
+    // Full compiled state of one session: header + rows + node trees.
+    private viewOf(session: Session): SessionView {
+        const turns: SessionView['turns'] = [];
+        const displays: Record<string, TurnDisplay> = {};
+
+        for (const turn of session.turns) {
+            const projector = this.projectorFor(session, turn);
+
+            turns.push(projector.summary());
+            displays[turn.id] = projector.display();
+        }
+
+        const pending = this.pendingCount(session);
+        const threads = this.threadRoster(session);
+
+        return {
+            id: session.id,
+            harness: session.preset.name,
+            status: session.status,
+            ...(pending === 0 ? {} : { queueDepth: pending }),
+            model: session.harness.agent.model(),
+            agentModels: Object.fromEntries(
+                Object.entries(session.harness.agents).map(([name, brain]) => [name, brain.model()])
+            ),
+            createdAt: session.createdAt,
+            updatedAt: session.updatedAt,
+            ...(session.lastError !== undefined ? { lastError: session.lastError } : {}),
+            // ROSTER, NOT TRANSCRIPT: the view ships the compact thread identity and
+            // deliberately OMITS the raw `threads` roster (whose `messages` are the
+            // committed transcript, i.e. every tool result verbatim — the payload
+            // class this change removes). `SessionThreadView` carries identity + a
+            // bounded preview; the transcript itself is one lazy route away
+            // (GET /views/:id/threads/:threadId/transcript), which is exactly when the
+            // UI has shown a transcript dialog.
+            ...(threads.length === 0 ? {} : { threadViews: threadViewsOf(threads) }),
+            ...(session.invalidThreads.size === 0
+                ? {}
+                : {
+                      invalidThreads: [...session.invalidThreads]
+                          .sort(([left], [right]) => left.localeCompare(right))
+                          .map(([id, entry]): SessionInvalidThread => ({
+                              id,
+                              ...(entry.label === undefined ? {} : { label: entry.label }),
+                              ...(entry.agent === undefined ? {} : { agent: entry.agent }),
+                              error: entry.error,
+                              messages: copyInvalidMessages(entry.messages)
+                          }))
+                  }),
+            ...(session.labelSeeds.size === 0
+                ? {}
+                : {
+                      labelSeeds: Object.fromEntries(
+                          [...session.labelSeeds].map(([turnId, seed]) => [turnId, { ...seed }])
+                      )
+                  }),
+            ...(session.labelHighWater.size === 0
+                ? {}
+                : { labelHighWater: Object.fromEntries([...session.labelHighWater]) }),
+            harnessDefinition: copyDescriptor(session.definition),
+            discoveredTools: [...session.harness.discoveredTools],
+            turns,
+            displays
+        };
+    }
+
+    // The rail document: header + rows, NO trees. This is what makes `listViews()`
+    // cheap where `list()` copies every event of every session.
+    private viewSummaryOf(session: Session): SessionViewSummary {
+        const turns: SessionViewSummary['turns'] = [];
+
+        for (const turn of session.turns) turns.push(this.projectorFor(session, turn).summary());
+
+        const pending = this.pendingCount(session);
+        const threads = this.threadRoster(session);
+
+        return {
+            id: session.id,
+            harness: session.preset.name,
+            status: session.status,
+            ...(pending === 0 ? {} : { queueDepth: pending }),
+            model: session.harness.agent.model(),
+            agentModels: Object.fromEntries(
+                Object.entries(session.harness.agents).map(([name, brain]) => [name, brain.model()])
+            ),
+            createdAt: session.createdAt,
+            updatedAt: session.updatedAt,
+            ...(session.lastError !== undefined ? { lastError: session.lastError } : {}),
+            ...(threads.length === 0 ? {} : { threadViews: threadViewsOf(threads) }),
+            ...(session.labelHighWater.size === 0
+                ? {}
+                : { labelHighWater: Object.fromEntries([...session.labelHighWater]) }),
+            harnessDefinition: copyDescriptor(session.definition),
+            discoveredTools: [...session.harness.discoveredTools],
+            turns
+        };
+    }
+
+    getView(id: string): SessionView {
+        return this.viewOf(this.require(id));
+    }
+
+    listViews(): SessionViewSummary[] {
+        return [...this.sessions.values()].map((session) => this.viewSummaryOf(session));
+    }
+
+    // The lazy detail lookup: the EXACT recorded opening event and, when one was
+    // recorded, the matching settled event. Served from the durable turn record
+    // (`turn.events`), so the bytes are verbatim before and after a restart, and the
+    // pairing comes from the projection that made them addressable — a `callId`
+    // reused by a nested invocation of the same turn resolves to its own pair.
+    stepDetail(id: string, turnId: string, stepId: string): TurnStepDetail {
+        const session = this.require(id);
+        const turn = session.turns.find((candidate) => candidate.id === turnId);
+
+        if (turn === undefined) throw new SessionError(404, `Unknown turn "${turnId}" in session "${id}".`);
+        if (typeof stepId !== 'string' || !/^\d+$/.test(stepId)) {
+            throw new SessionError(400, 'A step id must be the recorded event index of the step.');
+        }
+
+        const index = Number(stepId);
+
+        if (!Number.isInteger(index) || index < 0 || index >= turn.events.length) {
+            throw new SessionError(404, `Unknown step "${stepId}" in turn "${turnId}".`);
+        }
+
+        // The step's own record supplies the section (identity scoping) and the
+        // settled event's index; the events themselves come from the raw record.
+        const display = this.projectorFor(session, turn).display();
+        let sectionId: string | undefined;
+        let resultStepId: string | undefined;
+        let callId: string | undefined;
+
+        for (const section of display.sections) {
+            for (const node of section.nodes) {
+                if (node.kind !== 'tool' && node.kind !== 'action') continue;
+                if (node.id !== stepId) continue;
+
+                sectionId = section.id;
+                resultStepId = node.detail.resultStepId;
+                callId = node.callId;
+                break;
+            }
+            if (sectionId !== undefined) break;
+        }
+
+        if (sectionId === undefined) throw new SessionError(404, `Unknown step "${stepId}" in turn "${turnId}".`);
+
+        const event = turn.events[index];
+        const times = turn.eventTimes;
+
+        const detail: TurnStepDetail = {
+            sessionId: session.id,
+            turnId,
+            stepId,
+            sectionId,
+            ...(typeof callId === 'string' && callId.length > 0 ? { callId } : {}),
+            opening: {
+                index,
+                ...(finiteAt(times?.[index]) ? { at: times[index] } : {}),
+                event: copyEvent(event)
+            }
+        };
+
+        const resultIndex = resultStepId === undefined ? undefined : Number(resultStepId);
+
+        if (
+            resultIndex !== undefined &&
+            Number.isInteger(resultIndex) &&
+            resultIndex >= 0 &&
+            resultIndex < turn.events.length &&
+            resultIndex !== index
+        ) {
+            detail.result = {
+                index: resultIndex,
+                ...(finiteAt(times?.[resultIndex]) ? { at: times[resultIndex] } : {}),
+                event: copyEvent(turn.events[resultIndex])
+            };
+        }
+
+        return detail;
+    }
+
+    // The whole recorded turn, verbatim — the transcript copy/export surface, which
+    // quotes raw events by design. Never part of the normal render path.
+    rawTurn(id: string, turnId: string): SessionTurn {
+        const session = this.require(id);
+        const turn = session.turns.find((candidate) => candidate.id === turnId);
+
+        if (turn === undefined) throw new SessionError(404, `Unknown turn "${turnId}" in session "${id}".`);
+
+        return copyTurn(turn);
+    }
+
+    // Register a display observer. Same contract as `watch()`: the initial frame is
+    // captured atomically with registration, `unsubscribe` detaches only, and never
+    // cancels a task (the pump owns execution).
+    watchView(id: string, emit: EmitView, close: () => void = () => {}): SessionViewWatch {
+        const session = this.require(id);
+        const watcher: ViewWatcher = { emit, close };
+
+        session.viewWatchers.add(watcher);
+
+        return {
+            view: this.viewOf(session),
+            unsubscribe: () => {
+                session.viewWatchers.delete(watcher);
+            }
+        };
+    }
+
+    // Fan a display frame out. Same isolation rule as `publish`: every watcher gets
+    // its OWN deep copy, a throwing or slow watcher is dropped, and nothing here can
+    // cancel a turn or block the pump.
+    private publishView(session: Session, item: SessionViewStreamItem): void {
+        if (session.disposed || session.viewWatchers.size === 0) return;
+
+        for (const watcher of [...session.viewWatchers]) {
+            let frame: SessionViewStreamItem;
+
+            try {
+                frame = JSON.parse(JSON.stringify(item)) as SessionViewStreamItem;
+            } catch {
+                continue;
+            }
+
+            try {
+                const result: unknown = watcher.emit(frame);
+
+                if (result instanceof Promise) {
+                    void result.catch(() => {
+                        session.viewWatchers.delete(watcher);
+                    });
+                }
+            } catch {
+                session.viewWatchers.delete(watcher);
+            }
+        }
+    }
+
+    // The recorder's ops path: one `ops` frame per recorded event group.
+    private publishViewOps(session: Session, turnId: string, at: number, ops: TurnDisplayOp[]): void {
+        if (ops.length === 0) return;
+
+        this.publishView(session, { type: 'ops', turnId, at, ops });
+    }
+
+    // Mirror a RAW frame to the display surface. The raw stream is untouched (CLI,
+    // embedders, existing tests); this is the only place a view frame is derived,
+    // which is what keeps every lifecycle transition (queued/running/terminal,
+    // command turns, cancel, thread and transcript mutations) covered for free.
+    private mirrorView(session: Session, item: SessionStreamItem): void {
+        if (session.disposed) return;
+
+        // An observer count only gates the FAN-OUT and the expensive full-view build:
+        // the projection state itself must settle on every transition, or a later
+        // `getView` (a poll, a reload, a second tab) would serve a turn that already
+        // ended with rows still "streaming".
+        const watching = session.viewWatchers.size > 0;
+
+        if (item.type === 'turn') {
+            // The frame carries a COPY; the projection cache is keyed by the live
+            // record (the projector reads status/updatedAt/usage off it).
+            const live = session.turns.find((turn) => turn.id === item.turn.id);
+
+            if (live === undefined) return;
+
+            const projector = this.projectorFor(session, live);
+            const ops: TurnDisplayOp[] = [];
+
+            // A terminal turn must settle its rows the same way the live run's
+            // terminal frame did; `settle` is idempotent, so a repeat emits nothing
+            // beyond the row itself.
+            if (isTerminalTurnStatus(item.turn.status)) {
+                ops.push(...projector.settle(item.turn.status, item.turn.updatedAt));
+            } else {
+                ops.push({ op: 'turn', turnId: item.turn.id, summary: projector.summary() });
+            }
+
+            if (watching) this.publishViewOps(session, item.turn.id, item.turn.updatedAt, ops);
+
+            return;
+        }
+
+        // A terminal/drain frame needs the whole compiled view, which is a full deep
+        // copy: build it only for an observer that is actually waiting for it.
+        if (!watching) return;
+
+        if (item.type === 'snapshot') {
+            this.publishView(session, { type: 'view', view: this.viewOf(session) });
+            return;
+        }
+
+        if (item.type === 'failed') {
+            this.publishView(session, { type: 'failed', error: item.error, view: this.viewOf(session) });
+        }
+
+        // `item.type === 'event'` needs no mirror: the recorder produced that event's
+        // display ops already, and re-deriving them here would double-apply.
+    }
+
+    // -----------------------------------------------------------------------
+    // Durable per-step journal (R4)
+    // -----------------------------------------------------------------------
+
+    // The journal exists only when the host runs with a database root; an in-memory
+    // store keeps its previous (memory-only) behaviour exactly.
+    private attachJournal(session: Session): HarnessJournal | undefined {
+        if (this.persistence === undefined) return undefined;
+        if (session.journal !== undefined) return session.journal;
+
+        const journal = new HarnessJournal(this.persistence.directory, session.id);
+
+        journal.open();
+        session.journal = journal;
+
+        const error = journal.error;
+
+        if (error !== undefined) this.noteJournalError(session, `could not open the event journal: ${error}`);
+
+        return journal;
+    }
+
+    private journalAppend(
+        session: Session,
+        turnId: string,
+        index: number,
+        at: number,
+        event: HarnessEvent
+    ): void {
+        // A removed/disposed session must not resurrect its own log: an in-flight run
+        // can still record after `remove()` deleted the session (the same rule that
+        // suppresses its publishes).
+        if (session.disposed) return;
+
+        const journal = session.journal ?? this.attachJournal(session);
+
+        if (journal === undefined) return;
+
+        journal.append({ turnId, index, at, event });
+
+        const error = journal.error;
+
+        if (error !== undefined) this.noteJournalError(session, `could not append to the event journal: ${error}`);
+    }
+
+    private noteJournalError(session: Session, message: string): void {
+        // Report each distinct failure once, so a persistently broken disk cannot
+        // flood the reporter with one line per token.
+        if (session.journalProblems.includes(message)) return;
+
+        session.journalProblems.push(message);
+
+        const report = `Session ${session.id}: ${message}`;
+
+        if (!this.journalFailures.includes(report)) this.journalFailures.push(report);
+
+        if (this.onPersistenceError === undefined) return;
+
+        try {
+            this.onPersistenceError(new Error(report));
+        } catch {
+            // The reporter is observational; it must never change a run.
+        }
+    }
+
+    // READ-side problems are reported through the restore channel (they are about
+    // what was saved, not about a write that failed now).
+    private surfaceJournalProblems(session: Session, problems: readonly JournalProblem[]): void {
+        for (const problem of problems) {
+            const label = problem.tail
+                ? `tolerated truncated tail on line ${problem.line}: ${problem.reason}`
+                : `journal corruption at line ${problem.line} (${problem.kind}): ${problem.reason}`;
+
+            this.noteJournalError(session, label);
+        }
+    }
+
+    // Checkpoint with a bounded interval. Every event is journal-appended
+    // unconditionally, so the interval only decides how often the FULL document is
+    // rewritten; the strict (`persistOrThrow`) and terminal saves are unchanged and
+    // still land at every structural transition.
+    private checkpoint(session: Session, force = false): void {
+        if (this.persistence === undefined) return;
+
+        const now = Date.now();
+
+        if (!force && now - session.checkpointAt < VIEW_CHECKPOINT_INTERVAL_MS) return;
+
+        session.checkpointAt = now;
+        this.persistBestEffort();
+    }
+
+    // Merge the durable log with the loaded checkpoint (see the rules on the method
+    // body), then fold the compiled state so the process starts with a warm cache.
+    private restoreProjections(session: Session): void {
+        this.mergeJournal(session);
+        this.foldProjections(session);
+    }
+
+    private foldProjections(session: Session): void {
+        const context = this.displayContext(session);
+
+        session.projections.clear();
+        session.blockCache.clear();
+
+        for (const turn of session.turns) {
+            session.projections.set(turn.id, refoldTurn(turn, context));
+        }
+    }
+
+    private mergeJournal(session: Session): void {
+        const journal = this.attachJournal(session);
+
+        if (journal === undefined) return;
+
+        const read = journal.read();
+
+        // No journal directory: a database written before R4. Its checkpoint turns
+        // already carry every event, so legacy restore is byte-for-byte unchanged.
+        if (read.missing) return;
+
+        this.surfaceJournalProblems(session, read.problems);
+
+        const logged = new Map<string, JournalEventRecord[]>();
+
+        for (const record of read.events) {
+            const bucket = logged.get(record.turnId);
+
+            if (bucket === undefined) logged.set(record.turnId, [record]);
+            else bucket.push(record);
+        }
+
+        for (const turn of session.turns) {
+            const records = logged.get(turn.id);
+
+            if (records === undefined) continue;
+
+            logged.delete(turn.id);
+
+            // Start from the CHECKPOINT: a turn keeps every record it had, even if
+            // the journal never saw it (a truncated or compacted log must never lose
+            // a step the document still holds).
+            const merged = new Map<number, { event: HarnessEvent; at: number | undefined }>();
+
+            for (let index = 0; index < turn.events.length; index += 1) {
+                merged.set(index, { event: turn.events[index], at: turn.eventTimes?.[index] });
+            }
+
+            for (const record of records) {
+                const existing = merged.get(record.index);
+
+                if (existing === undefined) {
+                    merged.set(record.index, { event: record.event, at: record.at });
+                    continue;
+                }
+
+                // A journal line is written BEFORE the document is rewritten, so on a
+                // conflict the journal is the newer byte. Compare cheaply first.
+                if (existing.at === record.at && existing.event === record.event) continue;
+                if (JSON.stringify(existing.event) === JSON.stringify(record.event) && existing.at === record.at) continue;
+
+                merged.set(record.index, { event: record.event, at: record.at });
+            }
+
+            const indexes = [...merged.keys()].sort((left, right) => left - right);
+            const events: HarnessEvent[] = [];
+            const times: number[] = [];
+            let timed = false;
+
+            for (const index of indexes) {
+                const entry = merged.get(index) as { event: HarnessEvent; at: number | undefined };
+
+                events.push(entry.event);
+                times.push(finiteAt(entry.at) ? (entry.at as number) : 0);
+                if (finiteAt(entry.at)) timed = true;
+            }
+
+            turn.events = events;
+            turn.eventTimes = timed ? times : undefined;
+        }
+
+        // A turn the document never saw: its prompt was lost with the write that
+        // failed, but its STEPS survived in the log. Recover it as an interrupted
+        // turn rather than dropping the work — and say so.
+        for (const [turnId, records] of logged) {
+            const first = records[0];
+            const last = records[records.length - 1];
+            const events: HarnessEvent[] = [];
+            const times: number[] = [];
+            let timed = false;
+
+            for (const record of records) {
+                events.push(record.event);
+                times.push(record.at);
+                if (finiteAt(record.at)) timed = true;
+            }
+
+            const recovered: SessionTurn = {
+                id: turnId,
+                index: session.turnSequence++,
+                // The prompt lived only on the turn record, and the record never
+                // reached a document. Empty is the honest answer, not a guess.
+                prompt: '',
+                status: 'error',
+                ...(finiteAt(first.at) ? { startedAt: first.at } : {}),
+                updatedAt: finiteAt(last.at) ? last.at : first.at,
+                events,
+                ...(timed ? { eventTimes: times } : {})
+            };
+
+            session.turns.push(recovered);
+            session.projections.delete(turnId);
+            this.noteJournalError(
+                session,
+                `recovered turn ${turnId} from the event journal: its record was never checkpointed, so its prompt is unknown`
+            );
+        }
+
+        if (logged.size > 0) {
+            session.status = 'error';
+            session.lastError = session.lastError ?? INTERRUPTED_MESSAGE;
+        }
+    }
+
+    // Replace the log with exactly what the live records hold (compaction after a
+    // deletion or a reset). Without this, a deleted turn's events could be replayed
+    // onto a restart as ghost steps.
+    private compactJournal(session: Session, turnIds?: Iterable<string>): void {
+        const journal = session.journal;
+
+        if (journal === undefined) return;
+
+        const wanted = turnIds === undefined ? undefined : new Set(turnIds);
+        const records: JournalEventRecord[] = [];
+
+        for (const turn of session.turns) {
+            if (wanted !== undefined && !wanted.has(turn.id)) continue;
+
+            for (let index = 0; index < turn.events.length; index += 1) {
+                records.push({
+                    type: 'event',
+                    v: 1,
+                    turnId: turn.id,
+                    index,
+                    at: turn.eventTimes?.[index] ?? turn.updatedAt,
+                    event: turn.events[index]
+                });
+            }
+        }
+
+        journal.rewrite(records);
+
+        const error = journal.error;
+
+        if (error !== undefined) this.noteJournalError(session, `could not rewrite the event journal: ${error}`);
     }
 
     // PATCH /sessions/:id — retarget the model of one or more agents in THIS live
@@ -3485,6 +4277,12 @@ export class SessionStore {
         // shared by the frame and the parallel `eventTimes` entry, so a live view and
         // a reload agree exactly.
         const record = (event: HarnessEvent): void => {
+            // Same addressing/fold order as the model-run recorder above: the journal
+            // and the compiled state describe a COMMAND turn exactly as they describe a
+            // model turn, so a slash command's steps survive a restart and render from
+            // the compact surface (R4).
+            const index = turn.events.length;
+            const projector = this.projectorFor(session, turn);
             const stored = copyEvent(event);
             const at = Date.now();
 
@@ -3492,10 +4290,16 @@ export class SessionStore {
             turn.eventTimes?.push(at);
             turn.updatedAt = at;
 
-            // Background durability for a non-delta event (every event here is one).
-            // A failed write is recorded, never thrown: the command's outcome must not
-            // depend on the disk, and the terminal save below is the strict one.
-            this.persistBestEffort();
+            this.journalAppend(session, turn.id, index, at, stored);
+
+            const ops = projector.apply(stored, at, index);
+
+            // Background durability for a non-delta event (every event here is one),
+            // bounded by the same interval so a command never pays one document rewrite
+            // per step. A failed write is recorded, never thrown: the command's outcome
+            // must not depend on the disk, and the terminal save below is the strict one.
+            this.checkpoint(session);
+            this.publishViewOps(session, turn.id, at, ops);
 
             this.publish(session, {
                 type: 'event',
@@ -4054,6 +4858,13 @@ export class SessionStore {
                 session.watchers.delete(watcher);
             }
         }
+
+        // R3: the compact surface is derived here, so EVERY lifecycle transition that
+        // already publishes a raw frame (queued/running/terminal upserts, command
+        // turns, cancel, thread and transcript mutations, drain snapshots) automatically
+        // produces its display equivalent. Event frames are the one exception: the
+        // recorder emitted that event's display ops already.
+        this.mirrorView(session, item);
     }
 
     // Start a NEW block with a fresh conversation. Only agent histories are
@@ -4219,10 +5030,28 @@ export class SessionStore {
                 // that opened the stream disappeared (a reload, a cancel by disconnect).
                 // `at` is the one server timestamp shared by the frame and the parallel
                 // `eventTimes` entry, so a client and a reload agree exactly.
+                //
+                // The event's POSITION is captured before the push: it is the address a
+                // display step carries (`DisplayStep.id == String(index)`), which is what
+                // lets the lazy detail route resolve one step's request AND response
+                // bytes before and after a restart (R2/R4).
+                const index = turn.events.length;
+                // Fold through THIS turn's projector BEFORE the record grows, so a
+                // lazily-created projector folds exactly the prior events — the identical
+                // call sequence a restore's cold fold performs (live ≡ replay, the one
+                // rule ./turn-projector.ts is built on).
+                const projector = this.projectorFor(session, turn);
                 const record = copyEvent(event);
                 const at = Date.now();
                 turn.events.push(record);
                 turn.eventTimes?.push(at);
+
+                // R4: every step is durable, including text/reasoning deltas (which the
+                // old checkpoint policy left unwritten until the terminal save) and a
+                // command turn's synthesized pair. Best-effort by POLICY — a full disk
+                // must not change a run's outcome — and never silent: the failure is
+                // retained on the session and reported through `journalErrors`.
+                this.journalAppend(session, turn.id, index, at, record);
 
                 // F6: remember which persistent conversation each invocation ran in.
                 // The START frame of a root host run or a delegated child names the
@@ -4240,19 +5069,26 @@ export class SessionStore {
                 // Token tally, accumulated here so every client reads the SERVER's
                 // figure. Only the per-request `usage` event counts: the harness also
                 // repeats the final request's usage on `done`, and adding that too
-                // would double the last step.
+                // would double the last step. Folded BEFORE the display fold, because the
+                // turn-level token figures come off this tally.
                 if (record.type === 'usage') turn.usage = addUsage(turn.usage, record.usage);
 
                 turn.updatedAt = at;
 
-                // Durable background transitions. A full document is rewritten per
-                // non-delta event (message commit, tool call/result, usage, start,
-                // done); per-token text/reasoning deltas are coalesced and land with
-                // the terminal save. A failure is recorded, never thrown: the run's
-                // outcome must not depend on the disk.
-                if (record.type !== 'text' && record.type !== 'reasoning') {
-                    this.persistBestEffort();
-                }
+                // The compiled display fold: one event in, bounded display ops out. This
+                // is the cache every `/views` read serves, so nothing recomputes it.
+                const ops = projector.apply(record, at, index);
+
+                // Durable transitions: the journal above carries every step, so the full
+                // document is rewritten on a bounded interval rather than once per step
+                // (R4). The strict turn-start save and the terminal save below are
+                // unchanged, so no structural transition ever relies on the interval.
+                this.checkpoint(session);
+
+                // Display frames go out even to a run that was just cancelled: a second
+                // tab's board must not lose rows the server still recorded. The RAW
+                // stream keeps its historical "stop sending when aborted" rule.
+                this.publishViewOps(session, turn.id, at, ops);
 
                 // A cancelled run keeps recording but stops sending: the stream is gone
                 // or the client asked to stop. No progress event is buffered.
@@ -5271,6 +6107,14 @@ export class SessionStore {
         // Purge the owning turns and every link that pointed at them.
         session.turns = survivors;
 
+        // R1/R4: the compiled trees of the deleted turns go with them, and the durable
+        // per-step log is compacted to the SURVIVING turns. The compaction is what
+        // makes a deletion final across a restart: the restore merge would otherwise
+        // find journal records for turns the document no longer lists and recover them
+        // as orphan steps.
+        this.forgetProjections(session, removedIds);
+        this.compactJournal(session, survivors.map((turn) => turn.id));
+
         // R8: forget the doomed conversations' names (their high-water stays).
         for (const id of doomed) session.threadLabels.delete(id);
         for (const turn of survivors) {
@@ -5381,6 +6225,13 @@ export class SessionStore {
         // so an old card cannot claim a 409 for a session that no longer knows it.
         session.pendingActions.clear();
         session.completedActions = [];
+        // R1/R4: the compiled state and the durable per-step log start over with the
+        // conversation. A truncate is required, not optional: without it a restart
+        // would replay the OLD turns' events onto the new record as ghost steps, and
+        // without the cache clear a stale tree could be served until the next event.
+        session.projections.clear();
+        session.blockCache.clear();
+        session.journal?.truncate();
         session.status = 'idle';
         session.cancelled = false;
         session.lastError = undefined;
@@ -5420,7 +6271,13 @@ export class SessionStore {
             throw error;
         }
 
+        // The per-step log is part of this session's durable footprint: a deleted
+        // session must not leave events behind that a restart could replay as ghost
+        // turns. Captured BEFORE `disposeSession` (which closes and clears the handle).
+        const journal = session.journal;
+
         this.disposeSession(session);
+        journal?.remove();
         return true;
     }
 
@@ -5515,6 +6372,28 @@ export class SessionStore {
                 // The stream is already gone; nothing to close.
             }
         }
+
+        // R3: display observers end exactly like raw ones — the stream closes, and no
+        // later frame is published for a disposed session.
+        const viewWatchers = [...session.viewWatchers];
+        session.viewWatchers.clear();
+
+        for (const watcher of viewWatchers) {
+            try {
+                watcher.close();
+            } catch {
+                // Same rule: the stream is already gone.
+            }
+        }
+
+        // R4: flush and release the append handle. The LOG ITSELF stays on disk — a
+        // store shutdown must never discard durable steps — and only an explicit
+        // session removal deletes it (see `remove`).
+        const journal = session.journal;
+        journal?.close();
+        session.journal = undefined;
+        session.projections.clear();
+        session.blockCache.clear();
 
         // Wake a pump parked on the gate (it will see `disposed` and exit) and any
         // waitForIdle()/reference waiter.

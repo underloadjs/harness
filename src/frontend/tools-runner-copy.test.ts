@@ -11,6 +11,7 @@
 
 import type { HarnessDescriptor, SessionSnapshot, ToolDescriptor } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const flush = async (): Promise<void> => {
     await new Promise((resolve) => setTimeout(resolve, 30));
@@ -75,7 +76,7 @@ const boot = async (): Promise<Call[]> => {
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
             calls.push({ url, method: init?.method, body });
@@ -97,7 +98,7 @@ const boot = async (): Promise<Call[]> => {
             if (url === '/api/sessions' && init?.method === 'POST') return json({ session: snapshot() }, 201);
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -233,7 +234,11 @@ it('pressing a preset fills the editable box without calling the server', async 
     ).toEqual(['false', 'true', 'false']);
 
     // A preset is a fill, not a call: nothing but boot traffic happened.
-    expect(calls.map((call) => call.url)).toEqual(['/api', '/api/models']);
+    // T5 R1: the catalogue embeds no conversations here, so boot also reads the compact
+    // directory index (`GET /views`). The double answers that route from this test's raw
+    // `/sessions` route, which is the URL its stub recorded — and no tool call was made,
+    // which is what this assertion exists to pin.
+    expect(calls.map((call) => call.url)).toEqual(['/api', '/api/models', '/api/sessions']);
 });
 
 it('keeps an invalid draft untouched and reports it as a structured response', async () => {

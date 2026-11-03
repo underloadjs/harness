@@ -21,6 +21,7 @@
 
 import type { HarnessDescriptor, SessionSnapshot, ToolDescriptor } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const flush = async (): Promise<void> => {
     await new Promise((resolve) => setTimeout(resolve, 30));
@@ -428,7 +429,7 @@ const boot = async (subagents: readonly string[] = ['research', 'workspace']): P
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const body = init?.body === undefined || init.body === null ? undefined : JSON.parse(String(init.body));
             calls.push({ url, method: init?.method, body });
@@ -451,7 +452,7 @@ const boot = async (subagents: readonly string[] = ['research', 'workspace']): P
             }
 
             throw new Error(`unexpected request: ${init?.method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     await import('./main');

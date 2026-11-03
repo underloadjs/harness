@@ -38,9 +38,24 @@
 //   - src/frontend/ui/tokens.ts    — `formatTokens`, the display formatter
 //   - src/server/protocol.ts       — SessionSnapshot / SessionTurn / SessionThread
 
-import type { SessionSnapshot } from '../../server/protocol';
+import type { HarnessUsage } from '../../types';
 import { usageOf } from '../contract';
 import { elapsedBetween } from './time';
+
+// A session as the totals helper needs it. Both directory shapes satisfy it — the
+// display wire's `SessionViewSummary` and the raw `SessionSnapshot` — because the
+// totals read header fields, thread ids and turn STATUS/USAGE only, never `events`
+// (T5 R1: the harness totals must be computable from the compact document).
+export type UsageSession = {
+    threads?: readonly { id: string }[];
+    turns: readonly {
+        status: string;
+        updatedAt: number;
+        startedAt?: number;
+        threadId?: string;
+        usage?: HarnessUsage;
+    }[];
+};
 
 export type SessionUsageSummary = {
     // Total conversations (threads) across every session. Always derivable, so it
@@ -71,7 +86,7 @@ const threadIdOf = (value: unknown): string | undefined =>
 
 // Union the ids THIS session owns (host roster + the conversations its turns ran in)
 // and return how many distinct ones there are.
-const countSessionThreads = (session: SessionSnapshot): number => {
+const countSessionThreads = (session: UsageSession): number => {
     const ids = new Set<string>();
 
     // `threads` is omitted entirely when a session owns no host thread, hence `?? []`.
@@ -101,7 +116,7 @@ const isTerminal = (status: string): boolean => !IN_FLIGHT.includes(status);
 // Fold one turn into the running totals. Kept separate from the session walk so the
 // per-figure "reported or not" rules stay in one place.
 const accumulateTurn = (
-    turn: SessionSnapshot['turns'][number],
+    turn: UsageSession['turns'][number],
     totals: { input?: number; cached?: number; durationMs?: number }
 ): void => {
     // Validate through the wire helper: a partially malformed tally is treated as
@@ -124,7 +139,7 @@ const accumulateTurn = (
 
 // Sum the aggregate figures for the sessions of ONE harness. Insertion order is
 // stable, so the caller's rendering is deterministic.
-export const summarizeSessionUsage = (entries: readonly SessionSnapshot[]): SessionUsageSummary => {
+export const summarizeSessionUsage = (entries: readonly UsageSession[]): SessionUsageSummary => {
     const totals: { input?: number; cached?: number; durationMs?: number } = {};
     let threads = 0;
 

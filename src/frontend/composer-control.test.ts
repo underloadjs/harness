@@ -29,6 +29,7 @@
 
 import type { HarnessDescriptor, SessionSnapshot, SessionTurn } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const T = 1_700_000_000_000;
 const SESSION_KEY = 'underload-harness-app:session';
@@ -107,7 +108,7 @@ const stubServer = (taskError?: string, restored?: SessionSnapshot): Server => {
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
 
@@ -161,7 +162,7 @@ const stubServer = (taskError?: string, restored?: SessionSnapshot): Server => {
             }
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     return server;

@@ -21,6 +21,7 @@ import type {
     SessionThread,
     SessionTurn
 } from '../server/protocol';
+import { viewAwareFetch } from './view-test-support';
 
 const T = 1_700_000_000_000;
 const SESSION_KEY = 'underload-harness-app:session';
@@ -141,7 +142,7 @@ const stubFetch = (
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             calls.push({ url, method });
@@ -149,7 +150,7 @@ const stubFetch = (
             const response = handler(url, method);
             if (response === undefined) throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
             return response;
-        })
+        }))
     );
 
     return calls;

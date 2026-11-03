@@ -273,7 +273,14 @@ export const instructionsForMembers = (
 // A session may freeze the definition it started with (`harnessDefinition`). The
 // frontend renders that descriptor, never the live one, so an edited harness
 // cannot rewrite a conversation that is already on screen.
-export const frozenDefinitionOf = (session: SessionSnapshot): HarnessDescriptor | undefined => {
+//
+// Declared over the FIELD, not over `SessionSnapshot`: the raw snapshot and the
+// display wire's `SessionView` both carry the frozen definition (protocol.ts:472 and
+// :605), and this read must work identically on either surface — which is exactly
+// what makes the compact view a drop-in for the shell's chrome.
+export const frozenDefinitionOf = (session: {
+    harnessDefinition?: HarnessDescriptor;
+}): HarnessDescriptor | undefined => {
     const frozen = session.harnessDefinition;
     if (frozen === null || typeof frozen !== 'object') return undefined;
 

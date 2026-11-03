@@ -33,6 +33,7 @@
 
 import type { HarnessDescriptor, SessionSnapshot, ToolDescriptor } from '../server/protocol';
 import { afterEach, beforeEach, expect, it, vi } from 'vitest';
+import { viewAwareFetch } from './view-test-support';
 
 const defaults = { baseURL: 'http://provider/v1', model: 'm1', hasApiKey: false };
 
@@ -154,7 +155,7 @@ it('lists core tools in the global tools view, calls with the captured session a
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             const method = init?.method;
             const body = init?.body === undefined ? undefined : JSON.parse(String(init.body));
@@ -191,7 +192,7 @@ it('lists core tools in the global tools view, calls with the captured session a
             }
 
             throw new Error(`unexpected request: ${method ?? 'GET'} ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -346,13 +347,13 @@ it('lists core tools in the global tools view, calls with the captured session a
 it('opens the tool runner in the shared dialog and restores the list on close', async () => {
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
             const url = String(input);
             if (url === '/api') return json(bootstrap());
             if (url === '/api/models') return json({ models: ['m1'] });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -442,7 +443,7 @@ it('opens the tool runner in the shared dialog and restores the list on close', 
 it('shows a server request failure for a core call instead of pretending it ran', async () => {
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
 
             if (url === '/api') return json(bootstrap());
@@ -456,7 +457,7 @@ it('shows a server request failure for a core call instead of pretending it ran'
             }
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -504,7 +505,7 @@ const agentDelegateTool = coreTool('delegate', {
 it('fills the delegation presets from the playground harness, not a hard-coded agent', async () => {
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL) => {
             const url = String(input);
             if (url === '/api') {
                 return json(
@@ -522,7 +523,7 @@ it('fills the delegation presets from the playground harness, not a hard-coded a
             if (url === '/api/models') return json({ models: ['m1'] });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
@@ -558,7 +559,7 @@ it('reports delegation as unavailable when the playground harness has no subagen
 
     vi.stubGlobal(
         'fetch',
-        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        vi.fn(viewAwareFetch(async (input: RequestInfo | URL, init?: RequestInit) => {
             const url = String(input);
             calls.push({ url, method: init?.method, body: undefined });
 
@@ -566,7 +567,7 @@ it('reports delegation as unavailable when the playground harness has no subagen
             if (url === '/api/models') return json({ models: ['m1'] });
 
             throw new Error(`unexpected request: ${url}`);
-        })
+        }))
     );
 
     await import('./main');
