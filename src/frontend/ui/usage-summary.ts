@@ -130,7 +130,7 @@ export const summarizeSessionUsage = (entries: readonly SessionSnapshot[]): Sess
 
     for (const session of entries) {
         threads += countSessionThreads(session);
-        for (const turn of session.turns) accumulateTurn(session, turn, totals);
+        for (const turn of session.turns) accumulateTurn(turn, totals);
     }
 
     // Optional keys are OMITTED when unknown rather than set to `undefined`, so a

@@ -2396,10 +2396,14 @@ const harnessDetailsBody = (display: HarnessDescriptor): HTMLElement => {
     }
 
     // OUTSIDE the phone branch on purpose: the totals are desktop content too. Omitted
-    // entirely when the harness has no conversations (no sessions, nothing to total).
-    if (sessionDirectory().length > 0) {
-        dialogStats = harnessDetailsStats();
-        body.append(dialogStats);
+    // ENTIRELY when the harness has no conversations — nothing to total, and a row of
+    // zeros would read as reported numbers.
+    const summary = harnessDialogSummary();
+    if (summary.sessions > 0) {
+        const stats = el('p', 'harness-details-stats');
+        stats.replaceChildren(...harnessStatFigures(summary));
+        dialogStats = stats;
+        body.append(stats);
     }
 
     body.append(el('p', 'harness-details-meta', harnessMeta(display)));
