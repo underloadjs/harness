@@ -1,20 +1,26 @@
-// Agent answer-footer CSS contract (R5).
+// Agent answer-footer CSS contract (R5/T7).
 //
 // jsdom cannot lay out the transcript, so this reads the stylesheet source and pins
-// the rules the answer action and the collapse toggle rely on:
+// the rules the answer action and the Collapse chevron rely on:
 //   - the block footer is an action row, not a metadata line (the old `.agent-meta`
 //     model/stop/token text is gone with its rules); the COPY control reads first
-//     (`justify-content: flex-start`) and the Collapse/Expand toggle owns the right
-//     edge through `margin-left: auto` on itself, so the row is stable whether or not
-//     an answer has completed;
+//     (`justify-content: flex-start`) and the Collapse chevron owns the right edge
+//     through `margin-left: auto` on itself, so the row is stable whether or not an
+//     answer has completed;
 //   - a footer with NO control at all (a flat legacy section) collapses instead of
 //     adding a dead strip under the block;
 //   - the Copy control is a compact icon button with a focus ring, and its
 //     success/error reinforcement is written LOCALLY (scoped through the footer) so
 //     it cannot be outranked by ui/dialog.css depending on bundle order;
-//   - the toggle is the SAME 24px icon button (same border/colour/hover/focus ring),
-//     its chevron is a CSS rotation of one down-pointing glyph, and the rotation is
-//     dropped under `prefers-reduced-motion`.
+//   - the chevron is the SAME 24px icon button (same border/colour/hover/focus ring),
+//     it is a CSS rotation of one down-pointing glyph, and the rotation is dropped under
+//     `prefers-reduced-motion`;
+//   - T7: it is the ONLY chevron. The header chevron of the previous pass is gone, the
+//     collapsed header keeps its original padding, and the control's visibility comes
+//     from the body-hiding rules (`.tile:not(.is-expanded) .tile-body`,
+//     `.thread-row:not(.is-expanded) .thread-body`) rather than a chevron-specific rule
+//     — which is what keeps it rendered for a T12b sibling exchange whose body an open
+//     conversation shows.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/agent-answer-style.test.ts
 
@@ -31,8 +37,8 @@ if (stylesheet === undefined) throw new Error('styles.css not found');
 
 const css = readFileSync(stylesheet, 'utf8');
 
-// A whole `@media` block, braces balanced: the reduced-motion contract is about the
-// RULE LIST (both chevrons share one entry), so it cannot be read with `blockOf`.
+// A whole `@media` block, braces balanced: the reduced-motion contract is about the RULE
+// LIST (which selectors it covers), so it cannot be read with `blockOf`.
 const mediaBlockOf = (condition: string): string => {
     const start = css.indexOf(`@media ${condition} {`);
     if (start < 0) throw new Error(`missing @media ${condition}`);
@@ -158,94 +164,39 @@ it('styles the collapse toggle as the copy control\u2019s twin, pinned to the ri
         'outline: 2px solid var(--accent)'
     );
 
-    // Motion preference: the flip is decoration, the state is the ARIA value and the
-    // word in the accessible name, so it is dropped — for BOTH chevrons, which share the
-    // one rule inside the reduced-motion block.
+    // Motion preference: the flip is decoration, the state is the ARIA value and the word
+    // in the accessible name, so it is dropped — and T7 leaves exactly ONE chevron in the
+    // reduced-motion rule list.
     const reduced = mediaBlockOf('(prefers-reduced-motion: reduce)');
     expect(reduced).toContain('.agent-answer-actions .answer-collapse svg');
-    expect(reduced).toContain('> .header-collapse svg');
-    expect(blockOfInside(reduced, '> .header-collapse svg {')).toContain('transition: none');
+    expect(blockOfInside(reduced, '.agent-answer-actions .answer-collapse svg {')).toContain(
+        'transition: none'
+    );
+    expect(reduced).not.toContain('header-collapse');
 });
 
-it('gives a collapsed block its own chevron, and shows only one of the pair', () => {
-    const header = blockOf(':is(.tile, .thread-tile) > .header-collapse {');
-    // Same 24px icon button as the footer control: the two states of one affordance must
-    // not look like two different widgets.
-    const footer = blockOf('.agent-answer-actions .answer-collapse {');
-    for (const declaration of [
-        'display: none', // the base state; the collapsed rule below flips it
-        'width: 24px',
-        'height: 24px',
-        'padding: 0',
-        'border: 1px solid var(--border)',
-        'border-radius: 6px',
-        'background: transparent',
-        'color: var(--muted)',
-        'cursor: pointer'
-    ]) {
-        expect(header).toContain(declaration);
-        expect(footer).toContain(declaration.replace('display: none', 'display: inline-flex'));
-    }
+it('leaves the collapsed header row alone: one chevron, in the footer only', () => {
+    // T7 (user feedback): the whole collapsed row is already the expander, so the header
+    // chevron of the previous pass is gone — no rule may resurrect it.
+    expect(css).not.toContain('header-collapse');
 
-    // Anchored to the BLOCK (both `.tile` and `.thread-tile` are already
-    // `position: relative`), on the header's own inline-padding edge, and centred on the
-    // one row a collapsed block has — jsdom cannot compute it, so the geometry is pinned.
-    expect(header).toContain('position: absolute');
-    expect(header).toContain('top: 50%');
-    expect(header).toContain('transform: translateY(-50%)');
-    expect(header).toContain('right: 10px');
-    // The selector is scoped through the block surface, never bare.
-    expect(css).not.toContain('\n.header-collapse {');
-
-    // ONLY the header chevron while collapsed ...
-    expect(
-        blockOf(':is(.tile, .thread-tile):not(.is-expanded) > .header-collapse {')
-    ).toContain('display: inline-flex');
-    // ... and only the footer chevron while expanded.
-    expect(
-        blockOf(
-            ':is(.tile:not(.is-expanded) > .tile-body, .thread-tile:not(.is-expanded) > .thread-body) .answer-collapse {'
-        )
-    ).toContain('display: none');
-
-    // The collapsed header reserves the chevron's footprint so the flush-right
-    // measurement line can never sit under it: 10px padding + 24px button + 10px gap.
-    const reserved = blockOf(
-        ':is(.tile:not(.is-expanded), .thread-tile:not(.is-expanded)) > :is(.tile-select, .thread-select) {'
-    );
-    expect(reserved).toContain('padding-right: 44px');
+    // The header keeps its ORIGINAL padding: the reservation that defended an absolutely
+    // positioned chevron is removed, so the flush-right measurement line returns to the
+    // inline-padding edge like every other header.
+    expect(css).not.toContain('padding-right: 44px');
     expect(blockOf('.thread-select {')).toContain('padding: 6px 10px');
     expect(blockOf('.tile:not(.is-expanded) .tile-select {')).toContain('padding: 6px 10px');
-    expect(44).toBe(10 + 24 + 10);
 
-    // Same glyph, rotation and affordances as the footer control.
-    const glyph = blockOf(':is(.tile, .thread-tile) > .header-collapse svg {');
-    expect(glyph).toContain('width: 14px');
-    expect(glyph).toContain('fill: none');
-    expect(glyph).toContain('stroke: currentColor');
-    expect(glyph).toContain('transition: transform 120ms ease');
-    expect(
-        blockOf(":is(.tile, .thread-tile) > .header-collapse[aria-expanded='true'] svg {")
-    ).toContain('transform: rotate(180deg)');
-    expect(blockOf(':is(.tile, .thread-tile) > .header-collapse:hover {')).toBe(
-        blockOf('.agent-answer-actions .answer-collapse:hover {')
-    );
-    expect(blockOf(':is(.tile, .thread-tile) > .header-collapse:focus-visible {')).toContain(
-        'outline: 2px solid var(--accent)'
-    );
-
-    // T12b exception: an open CONVERSATION already shows every exchange's body, so there
-    // the footer chevron renders and the header one stands down (and gives its reserved
-    // padding back to the measurement line).
-    expect(
-        blockOf('.conversation.is-expanded > .turn-row > .tile > .header-collapse {')
-    ).toContain('display: none');
-    expect(
-        blockOf('.conversation.is-expanded > .turn-row > .tile > .tile-body .answer-collapse {')
-    ).toContain('display: inline-flex');
-    expect(blockOf('.conversation.is-expanded > .turn-row > .tile > .tile-select {')).toContain(
-        'padding-right: 10px'
-    );
+    // The footer-only contract depends on these two rules, which hide the body that holds
+    // the chevron (and therefore take it out of the layout, the tab order and the
+    // accessibility tree). They must not be paired with a chevron-specific hide rule: the
+    // button needs no second rule of its own, and T12b's open-conversation case (a body
+    // shown without `.is-expanded`) must keep its Collapse control.
+    expect(blockOf('.tile:not(.is-expanded) .tile-body {')).toContain('display: none');
+    expect(blockOf('.thread-row:not(.is-expanded) .thread-body {')).toContain('display: none');
+    expect(blockOf('.conversation.is-expanded .tile-body {')).toContain('display: flex');
+    expect(css).not.toContain('.answer-collapse { display: none');
+    expect(css).not.toContain('.turn-row > .tile > .header-collapse');
 });
 
 it('gives the collapse toggle no copy-only feedback states', () => {

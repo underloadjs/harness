@@ -201,6 +201,63 @@ it('hides the label and its notch padding when a session has nothing to distingu
     expect(agent.closest('.composer-controls')).toBeNull();
 });
 
+// --- Issue B: the notch label's TEXT starts on the caret ---------------------
+
+it('measures the notched label onto the input text column', async () => {
+    await mount(
+        snapshot({
+            threads: [
+                { id: 'thread-1', agent: 'instruct', origin: 'host', status: 'idle', sequence: 1, label: 'One' }
+            ]
+        })
+    );
+
+    const label = byClass('.composer-target', 'p');
+    const input = byClass('.composer-input', 'div');
+
+    // The mount-time paint runs with no layout available (`offsetLeft` 0), so the label
+    // lands on the stylesheet's floor. Asserting it first is what makes the measured
+    // value below provably a MEASUREMENT and not just the fallback repeated.
+    expect(label.style.left).toBe('10px');
+
+    // jsdom has no layout engine: `offsetLeft` is a prototype getter that always reads
+    // 0, and the stylesheet is not applied, so BOTH inputs of the measurement are
+    // pinned on the element. 80px is the desktop geometry — 1px frame border + 2px field
+    // padding + the agent button's box — and the padding is pinned inline so the
+    // expected number cannot depend on which stylesheet the host happens to load.
+    Object.defineProperty(input, 'offsetLeft', { value: 80, configurable: true });
+    input.style.paddingLeft = '8px';
+
+    // The 860px media query swaps the pill from the full agent name to its short code
+    // with NO DOM change, so a resize is the only signal the label has to re-measure.
+    // Driving the listener pins the wiring and the arithmetic in one step.
+    window.dispatchEvent(new Event('resize'));
+
+    // offsetLeft (80, already relative to `.composer-field`, the label's own containing
+    // block) + the input's text inset (8) - the label's own `padding: 0 5px` (5), which
+    // is what puts the label's TEXT — not its background box — on the caret.
+    expect(label.style.left).toBe('83px');
+});
+
+it('clears the measured left when the label is hidden', async () => {
+    await mount(snapshot());
+
+    const label = byClass('.composer-target', 'p');
+    const input = byClass('.composer-input', 'div');
+
+    // A measurement left over from a LABELED state must not survive into the hidden
+    // one: `[hidden]` is `display: none`, so `offsetLeft` reads 0 while hidden and the
+    // next painted label would otherwise start from a stale x instead of the fallback.
+    Object.defineProperty(input, 'offsetLeft', { value: 80, configurable: true });
+    input.style.paddingLeft = '8px';
+    label.style.left = '83px';
+
+    window.dispatchEvent(new Event('resize'));
+
+    expect(label.hidden).toBe(true);
+    expect(label.style.left).toBe('');
+});
+
 // --- stylesheet contract ----------------------------------------------------
 
 const stylesheet = ['src/frontend/styles.css', 'src/styles.css']

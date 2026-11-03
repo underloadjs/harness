@@ -22,6 +22,7 @@
 //   tools/runtime/threadFork.tool.ts       THREAD_FORK_NAME / THREAD_FORK_METADATA
 //   tools/runtime/threadSend.tool.ts       THREAD_SEND_NAME / THREAD_SEND_METADATA
 //   tools/runtime/threadList.tool.ts       THREAD_LIST_NAME / THREAD_LIST_METADATA
+//   tools/runtime/threadRead.tool.ts       THREAD_READ_NAME / THREAD_READ_METADATA
 //
 // This module is a DATA PROJECTION of the generated manifest plus the one
 // set-projection function. Why keep it at all: the server
@@ -48,10 +49,10 @@
 // Core vs conditional. The ALWAYS-DECLARED set is coreToolMetadata(), in the
 // harness's historical registration order (taken from each descriptor's
 // `registration.order`). actionRequest/threadFork/toolCancel/threadSend/
-// threadList/delegate are capability-by-configuration: they are exported
-// individually (and listed by the server catalogue) but deliberately omitted from
-// coreToolMetadata() because a session without the capability must not declare
-// them.
+// threadList/threadRead/delegate are capability-by-configuration: they are
+// exported individually (and listed by the server catalogue) but deliberately
+// omitted from coreToolMetadata() because a session without the capability must
+// not declare them.
 //
 // Cross-references:
 //   - ./tool-metadata.ts   — ToolMetadata / CoreToolMetadata / ToolRegistration
@@ -145,6 +146,7 @@ export const TOOL_CANCEL_NAME = descriptorOf('toolCancel').name;
 export const ACTION_REQUEST_NAME = descriptorOf('actionRequest').name;
 export const THREAD_FORK_NAME = descriptorOf('threadFork').name;
 export const THREAD_SEND_NAME = descriptorOf('threadSend').name;
+export const THREAD_READ_NAME = descriptorOf('threadRead').name;
 export const THREAD_LIST_NAME = descriptorOf('threadList').name;
 
 // ---------------------------------------------------------------------------
@@ -173,6 +175,7 @@ export const TOOL_CANCEL_METADATA = coreMetadataOf(TOOL_CANCEL_NAME);
 export const ACTION_REQUEST_METADATA = coreMetadataOf(ACTION_REQUEST_NAME);
 export const THREAD_FORK_METADATA = coreMetadataOf(THREAD_FORK_NAME);
 export const THREAD_SEND_METADATA = coreMetadataOf(THREAD_SEND_NAME);
+export const THREAD_READ_METADATA = coreMetadataOf(THREAD_READ_NAME);
 export const THREAD_LIST_METADATA = coreMetadataOf(THREAD_LIST_NAME);
 
 // ---------------------------------------------------------------------------

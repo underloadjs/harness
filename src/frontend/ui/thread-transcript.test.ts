@@ -11,6 +11,16 @@
 //   - dialog body and Copy action are the SAME pretty JSON string, resolved at CLICK
 //     time from the rendered surface (T1/R3), including through the insecure-origin
 //     execCommand fallback the LAN deployment depends on;
+//   - T1 layout contract: the JSON `<pre>` is the dialog's only vertical scroller (the
+//     body is opened in the shell's `dialog-body--fill` mode), so the identity line and
+//     the "Edit transcript" row are SIBLINGS around it and never scroll away; and the
+//     copy icon lives at the right end of the identity line ("… · JSON snapshot"),
+//     not in the modal header. T3 adds what that scroller owes the keyboard: the `<pre>`
+//     is focusable (`tabindex="0"`) with the shell's `:focus-visible` ring, and the two
+//     disclosure rows keep a non-shrinking, self-capped height so a short viewport
+//     neither collapses them nor clips the action row. T4 finishes the original request:
+//     the read-mode row ends its line, so "Edit transcript" sits on the right edge under
+//     the copy icon (scoped `justify-content: flex-end`, edit mode unchanged).
 //   - refresh updates an open dialog from a newer snapshot, ignores a stale
 //     session and CLOSES when the thread vanished;
 //   - T26 action-bar anatomy (the controls SWAPPED homes): ONE bar per surface — an
@@ -523,13 +533,87 @@ describe('lossless JSON document', () => {
         expect(pre?.textContent).toBe(serializeThreadTranscript(transcript as NonNullable<typeof transcript>));
         expect(pre?.getAttribute('aria-label')).toBe('JSON transcript of thread RR2');
 
-        const copy = document.querySelector<HTMLButtonElement>('.dialog .dialog-copy');
-        if (copy === null) throw new Error('missing dialog copy button');
+        const copy = document.querySelector<HTMLButtonElement>('.dialog .thread-transcript-meta-copy');
+        if (copy === null) throw new Error('missing transcript meta copy button');
         copy.click();
         await flush();
 
         expect(writeText).toHaveBeenCalledTimes(1);
         expect(writeText).toHaveBeenCalledWith(pre?.textContent);
+        // The shared control's feedback: the hidden live word announces the outcome and
+        // the button keeps its stable accessible name (ui/dialog.ts, pinned in
+        // ui/dialog-copy.test.ts for the header variant).
+        expect(copy.querySelector('.dialog-copy-feedback')?.textContent).toBe('Copied');
+        expect(copy.getAttribute('aria-label')).toBe('Copy the transcript JSON');
+    });
+
+    // T1: the copy icon moved OUT of the modal header and onto the identity line, right
+    // after the "… · JSON snapshot" text. This pins the anatomy the layout depends on:
+    // the header has no copy control, the meta row is text-then-icon, and the visible
+    // label is unchanged.
+    it('puts the copy icon on the meta row instead of the dialog header (T1)', () => {
+        const handle = openThreadTranscript(transcriptSnapshot, 'thread-child', {}, { generatedAt: 456 });
+        if (handle === undefined) throw new Error('transcript did not open');
+
+        expect(handle.element.querySelectorAll('.dialog-copy')).toHaveLength(0);
+        // The header is exactly the title and the dismiss control, like every dialog
+        // without the shell's opt-in `copy` source (ui/dialog.test.ts pins the default).
+        const head = handle.element.querySelector<HTMLElement>('.dialog-head');
+        if (head === null) throw new Error('missing dialog head');
+        expect([...head.children].map((node) => node.className)).toEqual(['dialog-title', 'dialog-close']);
+
+        const meta = handle.element.querySelector<HTMLElement>('.thread-transcript-meta');
+        if (meta === null) throw new Error('missing transcript meta row');
+        expect([...meta.children].map((node) => node.className)).toEqual([
+            'thread-transcript-meta-text',
+            'text-copy thread-transcript-meta-copy'
+        ]);
+        // The exact visible label, and the icon is the LAST child of the row: immediately
+        // after the "… JSON snapshot" text, at its right edge.
+        expect(meta.querySelector<HTMLElement>('.thread-transcript-meta-text')?.textContent).toBe(
+            'RR2 · Helper · idle · 2 turns · JSON snapshot'
+        );
+        expect(meta.querySelector('.thread-transcript-meta-copy')?.lastElementChild?.className).toBe(
+            'dialog-copy-feedback'
+        );
+    });
+
+    // T1: the scrolling contract as DOM structure (jsdom has no layout, so the CSS side is
+    // pinned by the stylesheet test below). The document and the "Edit transcript" row are
+    // SIBLINGS under one host: the action row is not inside the scrollable <pre>, so a
+    // filling body plus `flex: 0 0 auto` on the row keeps it visible at the panel's cap.
+    it('keeps the action row outside the scrolling document, after it', () => {
+        const handle = openThreadTranscript(transcriptSnapshot, 'thread-child', {}, { generatedAt: 456 });
+        if (handle === undefined) throw new Error('transcript did not open');
+
+        // The body is opted into the shell's fill mode: it no longer scrolls (styles.css /
+        // dialog.css keep the scrollbar inside the JSON area).
+        const body = handle.element.querySelector<HTMLElement>('.dialog-body');
+        if (body === null) throw new Error('missing dialog body');
+        expect(body.className).toBe('dialog-body dialog-body--fill');
+
+        const host = handle.element.querySelector<HTMLElement>('.thread-transcript');
+        if (host === null) throw new Error('missing transcript host');
+        expect([...host.children].map((node) => node.className)).toEqual([
+            'thread-transcript-meta',
+            'thread-transcript-json',
+            'thread-transcript-actions thread-transcript-read-actions'
+        ]);
+        expect(body.children).toHaveLength(1);
+        expect(body.firstElementChild).toBe(host);
+
+        // The document is the only element that scrolls; the rows around it are not.
+        expect(handle.element.querySelectorAll('.thread-transcript-json')).toHaveLength(1);
+        const actions = host.querySelector<HTMLElement>('.thread-transcript-read-actions');
+        if (actions === null) throw new Error('missing read-mode action row');
+        // `previousElementSibling` (not `...ElementChild`): the sibling relation is what
+        // "immediately after the document" means, and it is the property this repo's
+        // jsdom supports (see ui/turns-attachments.test.ts).
+        expect(actions.previousElementSibling).toBe(host.querySelector('.thread-transcript-json'));
+        expect(actions.parentElement).toBe(host);
+        expect(actions.querySelector<HTMLButtonElement>('.thread-transcript-edit')?.textContent).toBe(
+            'Edit transcript'
+        );
     });
 
     // T1/R3: the plain-HTTP LAN host (src/frontend/deployment.ts, vite.config.ts) has
@@ -552,8 +636,8 @@ describe('lossless JSON document', () => {
         const pre = handle.element.querySelector<HTMLElement>('.thread-transcript-json');
         if (pre === null) throw new Error('missing transcript surface');
 
-        const copy = document.querySelector<HTMLButtonElement>('.dialog .dialog-copy');
-        if (copy === null) throw new Error('missing dialog copy button');
+        const copy = document.querySelector<HTMLButtonElement>('.dialog .thread-transcript-meta-copy');
+        if (copy === null) throw new Error('missing transcript meta copy button');
         copy.click();
         await flush();
 
@@ -655,6 +739,231 @@ describe('lossless JSON document', () => {
     });
 });
 
+// --- T1: the scrolling + copy-icon layout, pinned in the stylesheet sources ----------
+//
+// jsdom computes no layout, so the "only the JSON area scrolls" and "the icon sits at
+// the right end of the meta row" claims are pinned the way every other layout test in
+// this package does: by reading the CSS the browser will actually apply
+// (layout-containment.test.ts, tool-chip-style.test.ts, dialog.test.ts).
+describe('transcript dialog layout contract', () => {
+    const sourceOf = (candidates: string[]): string => {
+        const path = candidates
+            .map((candidate) => resolve(process.cwd(), candidate))
+            .find((candidate) => {
+                try {
+                    readFileSync(candidate);
+                    return true;
+                } catch {
+                    return false;
+                }
+            });
+        if (path === undefined) throw new Error(`${candidates[0]} not found`);
+        return readFileSync(path, 'utf8');
+    };
+
+    const styles = sourceOf(['src/frontend/styles.css', 'src/styles.css']);
+    const shell = sourceOf(['src/frontend/ui/dialog.css', 'ui/dialog.css']);
+
+    // Rule body by brace matching, anchored to a selector that STARTS a line so a
+    // descendant selector ending in the same class cannot be sliced instead (the
+    // `.thread-transcript-actions` group below is exactly that case). Comments are
+    // stripped first: they NAME the selectors under test, and an assertion about a
+    // "gone" declaration must run against declarations only.
+    const blockOf = (css: string, selector: string): string => {
+        const rules = css.replace(/\/\*[\s\S]*?\*\//g, '');
+        const start = rules.indexOf(`\n${selector}`);
+        if (start < 0) throw new Error(`missing selector ${selector}`);
+
+        const open = rules.indexOf('{', start);
+        if (open < 0) throw new Error(`missing body for ${selector}`);
+
+        let depth = 0;
+        for (let index = open; index < rules.length; index += 1) {
+            if (rules[index] === '{') depth += 1;
+            if (rules[index] === '}') {
+                depth -= 1;
+                if (depth === 0) return rules.slice(open + 1, index);
+            }
+        }
+
+        throw new Error(`unbalanced block for ${selector}`);
+    };
+
+    it('hands the vertical scroll to the JSON area and never to the dialog body', () => {
+        // The shell half: fill mode turns the body into a NON-scrolling stretched column,
+        // and it is a separate rule so the default body (every other dialog) keeps its
+        // historical `overflow: auto` scroll container.
+        const fill = blockOf(shell, '.dialog-body--fill {');
+        expect(fill).toContain('overflow: hidden');
+        expect(blockOf(shell, '.dialog-body {')).toContain('overflow: auto');
+
+        // The chain: the host fills the body and may shrink below its content height...
+        const host = blockOf(styles, '.dialog-body--fill > .thread-transcript {');
+        expect(host).toContain('flex: 1 1 auto');
+        expect(host).toContain('min-height: 0');
+
+        // ...the document takes what is left and scrolls its own overflow, which puts the
+        // scrollbar at the right edge of the JSON box instead of the panel's far edge.
+        const pre = blockOf(styles, '.dialog-body--fill > .thread-transcript > .thread-transcript-json {');
+        expect(pre).toContain('flex: 1 1 auto');
+        expect(pre).toContain('min-height: 0');
+        expect(pre).toContain('max-height: none');
+        const base = blockOf(styles, '.thread-transcript-json {');
+        expect(base).toContain('overflow: auto');
+        expect(base).toContain('overscroll-behavior: contain');
+
+        // ...and the rows around it are intrinsic, so a long document shrinks the <pre>,
+        // never the identity line or the Edit control.
+        expect(blockOf(styles, '.dialog-body--fill > .thread-transcript > .thread-transcript-actions {')).toContain(
+            'flex: 0 0 auto'
+        );
+        expect(blockOf(styles, '.thread-transcript-meta {')).toContain('flex: 0 0 auto');
+
+        // T3: the row gaps are the first thing that gives way, because at innerHeight 266
+        // the four 14px gaps were part of what pushed a capped panel past its own body.
+        expect(host).toContain('gap: clamp(6px, 1.6vh, 14px)');
+
+        // T3: the disclosure rows are disclosure, not filler. With a shrinking basis,
+        // headless Chrome measured the scope note at ~0.94px (innerHeight 306) and the
+        // banner at ~18.5px (266) — a content box of about nothing. Both rows are now
+        // intrinsic and cap their OWN height instead, then scroll, so a long provider
+        // message can neither collapse into a sliver nor push the clipped action row out.
+        const disclosure = blockOf(
+            styles,
+            '.dialog-body--fill > .thread-transcript > :is(.thread-transcript-note, .thread-transcript-error) {'
+        );
+        expect(disclosure).toContain('flex: 0 0 auto');
+        expect(disclosure).toContain('max-height: clamp(34px, 20vh, 132px)');
+        expect(disclosure).toContain('overflow: auto');
+        expect(disclosure).not.toContain('flex: 0 1 auto');
+
+        // T3: and one short-panel tier, because at innerHeight 168 the FIXED chrome
+        // (head + body inset + four gaps + meta + action row) already measured 155px
+        // against a 134px capped panel: only compaction that does not touch the banner,
+        // the note, the field or the buttons can keep the action row inside the body.
+        const shortTier = blockOf(styles, '@media (max-height: 560px) {');
+        expect(shortTier).toContain('.dialog-body--fill {');
+        expect(shortTier).toContain('padding: 8px 12px;');
+        expect(shortTier).toContain('.dialog-body--fill > .thread-transcript {');
+        expect(shortTier).toContain('gap: 6px;');
+        expect(shortTier).toContain('max-height: clamp(30px, 11vh, 72px);');
+
+        // Edit mode keeps the same contract: the textarea fills the space the identity
+        // line, the banner, the note and the action row leave, and scrolls its own text
+        // (the standalone 60vh cap is what used to push the row below the fold).
+        const editor = blockOf(
+            styles,
+            '.dialog-body--fill > .thread-transcript-editing > .thread-transcript-editor {'
+        );
+        expect(editor).toContain('flex: 1 1 auto');
+        expect(editor).toContain('min-height: 0');
+        expect(editor).toContain('max-height: none');
+        expect(editor).toContain('overflow: auto');
+    });
+
+    // T3: the document became the dialog's ONLY vertical scroller, so it has to be
+    // keyboard-reachable (arrows / PageUp / PageDown scroll an `overflow: auto` box only
+    // once that box can take focus) and the keyboard focus has to be painted with the
+    // ring the rest of the shell already uses.
+    it('makes the sole scroller focusable with the shell focus ring', () => {
+        const handle = openThreadTranscript(transcriptSnapshot, 'thread-child', {}, { generatedAt: 456 });
+        if (handle === undefined) throw new Error('transcript did not open');
+
+        const pre = handle.element.querySelector<HTMLElement>('.thread-transcript-json');
+        if (pre === null) throw new Error('missing transcript surface');
+        expect(pre.getAttribute('tabindex')).toBe('0');
+        // It joins the modal's Tab cycle: ui/dialog.ts drops only `tabIndex < 0` from the
+        // focusable set, so `-1` would have stranded the keyboard outside the document.
+        expect(pre.tabIndex).toBe(0);
+
+        // The ring is the shell's existing token pair, and it is `:focus-visible` only so
+        // selecting text with the mouse does not paint a ring nobody asked for.
+        const ring = blockOf(styles, '.thread-transcript-json:focus-visible {');
+        expect(ring).toContain('outline: 2px solid var(--accent)');
+        expect(ring).toContain('outline-offset: 2px');
+
+        // Edit mode is untouched: the field was already the tabbable surface, and it has
+        // its own focus styling in the standalone rule.
+        actionButton(handle.element, '.thread-transcript-edit').click();
+        expect(handle.element.querySelector('.thread-transcript-editor')?.getAttribute('tabindex')).toBeNull();
+    });
+
+    // T4: the user asked for the "Edit transcript" action ON THE RIGHT SIDE of the modal.
+    // jsdom computes no layout, so the pin is the declaration the browser will apply plus
+    // the row's own anatomy: the read row ends its line, the shared row and the EDIT row
+    // keep the arrangement they were designed with, and the row still carries one real,
+    // enabled control inside the non-scrolling part of the fill chain.
+    it('flushes the read-mode action row right and leaves the edit row alone', () => {
+        const read = blockOf(styles, '.thread-transcript-read-actions {');
+        expect(read).toContain('justify-content: flex-end');
+
+        // Scoped on purpose: the shared row has no two-ended alignment of its own, so the
+        // edit row (Save, Cancel, then Copy pushed right by its OWN margin) is untouched by
+        // this rule.
+        expect(blockOf(styles, '.thread-transcript-actions {')).not.toContain('justify-content');
+        expect(blockOf(styles, '.thread-transcript-copy {')).toContain('margin-left: auto');
+
+        // Vertical sizing is unchanged: the row stays intrinsic in the fill chain, so
+        // right-aligning it cannot make it the thing that shrinks or scrolls away.
+        expect(blockOf(styles, '.dialog-body--fill > .thread-transcript > .thread-transcript-actions {')).toContain(
+            'flex: 0 0 auto'
+        );
+
+        const handle = openThreadTranscript(transcriptSnapshot, 'thread-child', {}, { generatedAt: 456 });
+        if (handle === undefined) throw new Error('transcript did not open');
+
+        const actions = handle.element.querySelector<HTMLElement>('.thread-transcript-read-actions');
+        if (actions === null) throw new Error('missing read-mode action row');
+        expect(actions.className).toBe('thread-transcript-actions thread-transcript-read-actions');
+        expect([...actions.children].map((node) => node.className)).toEqual(['thread-transcript-edit']);
+        const edit = actions.querySelector<HTMLButtonElement>('.thread-transcript-edit');
+        if (edit === null) throw new Error('missing Edit transcript control');
+        expect(edit.textContent).toBe('Edit transcript');
+        expect(edit.disabled).toBe(false);
+
+        // Entering the editor swaps in the OTHER row class, so `flex-end` cannot leak onto
+        // the Save/Cancel/Copy arrangement.
+        edit.click();
+        expect(handle.element.querySelector('.thread-transcript-read-actions')).toBeNull();
+        const editRow = handle.element.querySelector<HTMLElement>('.thread-transcript-edit-actions');
+        if (editRow === null) throw new Error('missing edit-mode action row');
+        expect([...editRow.children].map((node) => node.className)).toEqual([
+            'thread-transcript-save',
+            'thread-transcript-cancel',
+            'text-copy thread-transcript-copy'
+        ]);
+    });
+
+    it('lays the meta row out as text-then-icon with the icon flush right', () => {
+        const meta = blockOf(styles, '.thread-transcript-meta {');
+        expect(meta).toContain('display: flex');
+        expect(meta).toContain('align-items: center');
+        expect(meta).toContain('justify-content: space-between');
+        expect(meta).toContain('gap: 10px');
+
+        // The label shrinks and wraps rather than pushing the icon out of the panel.
+        expect(blockOf(styles, '.thread-transcript-meta-text {')).toContain('min-width: 0');
+
+        // The icon is an intrinsic square at the row's right edge, sized for an 11px mono
+        // caption line (the shared `.dialog-copy-icon` glyph is restated here, exactly as
+        // the tool pane's caption copy does).
+        const copy = blockOf(styles, '.thread-transcript-meta-copy {');
+        expect(copy).toContain('flex: 0 0 auto');
+        expect(copy).toContain('width: 18px');
+        expect(copy).toContain('height: 18px');
+        expect(blockOf(styles, '.thread-transcript-meta-copy .dialog-copy-icon {')).toContain('width: 12px');
+
+        // The state reinforcement (tick / exclamation colours) is painted from
+        // `data-state` by the shared control, so the announcement is never colour-only.
+        expect(blockOf(styles, ".thread-transcript-meta-copy[data-state='success'] {")).toContain(
+            'color: var(--ok)'
+        );
+        expect(blockOf(styles, ".thread-transcript-meta-copy[data-state='error'] {")).toContain(
+            'color: var(--danger)'
+        );
+    });
+});
+
 // --- board helpers ---------------------------------------------------------
 
 const mount = (options: Parameters<typeof createTurnBoard>[0] = {}): TurnBoard => {
@@ -681,9 +990,12 @@ const actionButton = (root: ParentNode, selector: string): HTMLButtonElement => 
     return button;
 };
 
+// T1: the transcript's copy control lives on the meta row (`.thread-transcript-meta-copy`),
+// not in the shared modal header. One helper so every copy assertion presses the icon the
+// reader actually sees.
 const copyDialog = async (): Promise<void> => {
-    const button = document.querySelector<HTMLButtonElement>('.dialog .dialog-copy');
-    if (button === null) throw new Error('missing dialog copy button');
+    const button = document.querySelector<HTMLButtonElement>('.dialog .thread-transcript-meta-copy');
+    if (button === null) throw new Error('missing transcript meta copy button');
     button.click();
     await flush();
 };
@@ -1016,15 +1328,12 @@ describe('responsive thread action bar', () => {
         expect(board.focusThread('thread-child')).toBe(true);
         expect(childBar?.hidden).toBe(false);
         // T26: header → bar → body, and the bar is Delete, Transcript, confirmation — the
-        // identical anatomy of the main tile. T6 adds ONE sibling: the card's collapsed-
-        // state Collapse/Expand chevron, created with its agent section and inserted
-        // immediately after `.thread-select` (a SIBLING of the header button, never nested
-        // in it). It is `display: none` in exactly this state — the expanded card renders
-        // the footer chevron instead — and the bar still sits between the header and the
-        // body, which is what this anatomy assertion is about.
+        // identical anatomy of the main tile. T7 removed the card's header chevron again:
+        // the collapsed row is itself the expander, so the card owns ONE control per slot
+        // and the Collapse chevron lives in the section's footer, inside `.thread-body`
+        // (rendered only in exactly this expanded state).
         expect([...(tile?.children ?? [])].map((node) => node.className)).toEqual([
             'thread-select',
-            'header-collapse',
             'thread-transcript-action',
             'thread-body'
         ]);

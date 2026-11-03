@@ -117,6 +117,7 @@ const ALL_PACKAGE_NAMES = [
     'search',
     'fetch',
     'threadSend',
+    'threadRead',
     'threadList'
 ];
 
@@ -147,12 +148,12 @@ describe('live Node descriptor catalogue (T24)', () => {
         expect(BUILTIN_TOOL_DESCRIPTORS.map((descriptor) => descriptor.name)).not.toContain(
             'syntax'
         );
-        // The generated manifest ships 29 package rows (the 28 historical
-        // entries plus the `download` preset, order 235); the filter above
-        // removes `syntax`, so 28 is the stale table this simulation really
-        // contains. Kept exact on purpose: a row count that silently moves is
-        // how a new `.tool.ts` stops being covered by this file.
-        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(28);
+        // The generated manifest ships 30 package rows (the 29 historical entries
+        // plus the `threadRead` runtime entry, order 265); the filter above removes
+        // `syntax`, so 29 is the stale table this simulation really contains. Kept
+        // exact on purpose: a row count that silently moves is how a new `.tool.ts`
+        // stops being covered by this file.
+        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(29);
 
         // The live scan still reports the whole package tree, in scan order. The
         // generated table is one row shorter: it lost `syntax` to the filter above.

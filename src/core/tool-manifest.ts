@@ -1660,6 +1660,94 @@ export const BUILTIN_TOOL_DESCRIPTORS: readonly BuiltinToolDescriptor[] = [
     alwaysDeclared: false
 },
 {
+    name: "threadRead",
+    metadata: {
+        name: "threadRead",
+        description: "Read the committed transcript of one thread in this session: your own conversation, another agent's default conversation (agent:<name>), or a host thread you were given by threadList. Omit every argument to read the whole thread from the start. \"thread\" names the conversation and defaults to the thread you are running in; an unknown or deleted id is an error. \"message\" instead reads ONE raw message by 0-based transcript index and bypasses the filters and list pagination (out of range is an error). \"regex\" keeps only the messages that match: it is tested against each message's content, plus assistant reasoning, plus every tool call's name and arguments, case-sensitively unless you pass \"flags\" such as \"i\"; the \"/pattern/flags\" spelling is accepted and its flags win over \"flags\". \"role\" narrows to one role - system messages ARE included unless you filter them out. Pagination applies to the filtered list: \"offset\"/\"limit\" (default 20, maximum 100) page over \"matched\" (the filtered count), so pass nextOffset back as offset while hasMore is true; one message's text pages with \"contentOffset\"/\"contentLimit\" (default 4000, maximum 32000) using contentHasMore and nextContentOffset. The text a page returns is capped at 32768 UTF-8 bytes (contentBudget): when that cap cuts anything, truncated is true and hasMore/nextOffset/nextContentOffset say exactly how to continue. Attachments are reported as descriptors only (id, kind, name, mime, size) - never base64 bytes. Set \"includeReasoning\" to also return assistant reasoning, flagged when truncated. Tool calls are always listed with their id and name, and their arguments are paged like text.",
+        tags: [
+            "thread",
+            "threads",
+            "read",
+            "transcript",
+            "history",
+            "messages",
+            "conversation",
+            "regex"
+        ],
+        parameters: {
+            type: "object",
+            properties: {
+                thread: {
+                    type: "string",
+                    minLength: 1,
+                    description: "Thread id to read, as reported by threadList (a host thread, agent:<name>, or a delegated child). Defaults to the thread you are running in."
+                },
+                message: {
+                    type: "integer",
+                    minimum: 0,
+                    description: "Read only this one message, by 0-based index in the raw transcript. Bypasses regex/role filtering and list pagination; contentOffset/contentLimit still page its text."
+                },
+                regex: {
+                    type: "string",
+                    minLength: 1,
+                    description: "Keep only messages matching this JavaScript regular expression. Tested against each message content, assistant reasoning, and tool-call name/arguments. \"/pattern/flags\" is accepted."
+                },
+                flags: {
+                    type: "string",
+                    description: "Regex flags for a bare \"regex\" (for example \"i\" or \"m\"). Ignored when \"regex\" is written as /pattern/flags. A malformed pattern is an error."
+                },
+                role: {
+                    type: "string",
+                    enum: [
+                        "system",
+                        "user",
+                        "assistant",
+                        "tool"
+                    ],
+                    description: "Keep only messages with this role. Omit it to include every role, system messages included."
+                },
+                offset: {
+                    type: "integer",
+                    minimum: 0,
+                    description: "0-based position into the filtered message list. Defaults to 0; use nextOffset from the previous page."
+                },
+                limit: {
+                    type: "integer",
+                    minimum: 1,
+                    maximum: 100,
+                    description: "How many messages to return, 1-100. Defaults to 20."
+                },
+                contentOffset: {
+                    type: "integer",
+                    minimum: 0,
+                    description: "0-based character offset into each returned message content. Defaults to 0; use nextContentOffset to continue a long message."
+                },
+                contentLimit: {
+                    type: "integer",
+                    minimum: 1,
+                    maximum: 32000,
+                    description: "Maximum characters of text returned per message (content, each tool-call arguments string, and reasoning). Defaults to 4000."
+                },
+                includeReasoning: {
+                    type: "boolean",
+                    description: "Also return assistant reasoning for the returned messages. Defaults to false."
+                }
+            },
+            additionalProperties: false
+        },
+        visibility: "core"
+    },
+    sourcePath: "tools/runtime/threadRead.tool.ts",
+    label: "tools/runtime/threadRead.tool.ts",
+    origin: "package",
+    group: "runtime",
+    activation: "threads",
+    order: 265,
+    sessionBound: true,
+    listed: false,
+    alwaysDeclared: false
+},
+{
     name: "threadList",
     metadata: {
         name: "threadList",
@@ -1755,6 +1843,8 @@ export const loadDiscoveredTool = (label: string): Promise<unknown> => {
             return import("../tools/runtime/fetch.tool.ts");
         case "tools/runtime/threadSend.tool.ts":
             return import("../tools/runtime/threadSend.tool.ts");
+        case "tools/runtime/threadRead.tool.ts":
+            return import("../tools/runtime/threadRead.tool.ts");
         case "tools/runtime/threadList.tool.ts":
             return import("../tools/runtime/threadList.tool.ts");
         default:

@@ -33,6 +33,13 @@
     --mono: ui-monospace, SFMono-Regular, 'Cascadia Code', Menlo, Consolas, monospace;
     --sans: 'Segoe UI', system-ui, -apple-system, sans-serif;
 
+    /* Scratch FAB size — the ONE number behind the phone `.scratch-fab` box. It is a
+       layout token rather than a button detail because the transcript's bottom padding
+       is derived from it (`.log-wrap` uses `calc(var(--scratch-fab-size) * 3)`), so the
+       gap under the last thread scales with the button that floats in that gap instead
+       of drifting from it as two hand-tuned magic numbers. */
+    --scratch-fab-size: 32px;
+
     /* Agent identity (R3). Every agent-owned block (`.tile`, `.thread-tile`,
        `.agent`) is painted from ui/agent-color.ts, which overrides these two on the
        element. The values here are the UNKNOWN-AGENT fallback — identical to
@@ -1053,6 +1060,34 @@ summary::-webkit-details-marker {
     line-height: 1.5;
 }
 
+/* Aggregate totals for the selected harness across ALL of its sessions (threads /
+   input / time / cache). Same muted-mono voice as the metadata line below it, and the
+   same tabular figures as the turn header's tally, so the dialog reads as one block of
+   measurements. `main.ts` `harnessStatFigures` emits one `.harness-details-stat` per
+   REPORTED figure — an unreported token/time figure produces no node at all, so a
+   missing provider tally never shows up as a fabricated zero — and the whole row is
+   omitted when the harness has no sessions. The `' | '` between figures is generated
+   here, not text, so each span stays a clean, copy-pastable value (the house pattern:
+   styles.css:2333). Wraps instead of scrolling: a 340px phone dialog has to be able to
+   break the four figures onto two lines without widening the dialog. */
+.harness-details-stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 0;
+    margin: 0 0 8px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    font-variant-numeric: tabular-nums;
+}
+
+.harness-details-stat + .harness-details-stat::before {
+    content: ' | ';
+    /* Decorative only (the figures are the content), and it must not break a line
+       between the separator and the value that follows it. */
+    white-space: pre;
+}
+
 .harness-details-meta {
     margin: 0;
     color: var(--muted);
@@ -1229,6 +1264,49 @@ summary::-webkit-details-marker {
     margin: 0;
     color: var(--muted);
     font-size: 11.5px;
+}
+
+/* T7: the phone session CYCLER next to the Instruct title (main.ts `sessionCycle`). -----
+   Under 861px the header strip is `display:none` (see the phone block) and the directory
+   moves into the Instruct dialog, so nothing on screen answers "which conversation am I
+   looking at?". This pill does, in one compact control, and pressing it steps to the next
+   session of the same projection. Delete deliberately does NOT live here: the user asked
+   for it only in the full dashboard behind the title button.
+
+   The BASE state is hidden, so desktop and tablet keep the strip they already have and the
+   pill is a phone-only addition (the assumption stated in the task). The phone block below
+   opts in; nothing else may make it visible.
+
+   Box model (jsdom cannot lay this out, so the arithmetic is written down):
+   - the row is `display: flex; gap: 10px` and `.main-title` is the SHRINKING item
+     (`flex: 0 1 auto; min-width: 0`), so this control is `flex: 0 0 auto` — it never
+     squeezes the title's ellipsis, and the title can never push it off the row;
+   - `max-width: 42vw` is the ceiling: the phone header's own padding is 14px per side, the
+     brand row above is separate, and the title keeps the rest. Eight monospace characters
+     at 11px plus the glyph and 18px of padding measure ~90px, far under that cap, so the
+     cap only matters if a narrower device clips the id — and `.session-cycle-id` owns the
+     ellipsis for exactly that case;
+   - it is `hidden` (the attribute) whenever no conversation is open, and the global
+     `[hidden] { display: none !important }` rule above out-ranks the phone `inline-flex`,
+     so no per-state visibility rule is needed here. */
+.session-cycle {
+    display: none;
+}
+
+/* The id is the only visible text (eight characters, like the strip); the full uuid, the
+   harness and the status live in the tooltip main.ts writes. */
+.session-cycle-id {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* The rotation mark says "pressing this steps forward" without adding a word to the
+   button's accessible name (main.ts marks it `aria-hidden`). */
+.session-cycle-glyph {
+    color: var(--muted);
+    font-size: 12px;
 }
 
 /* R2 (T3): the phone dialog's Sessions block. The strip above the header copy is hidden
@@ -1879,7 +1957,11 @@ summary::-webkit-details-marker {
     min-width: 0;
     max-width: 100%;
     min-height: 0;
-    padding: 18px 20px;
+    /* Bottom padding is THREE times the scratch FAB (`--scratch-fab-size` = 96px today)
+       so the last thread clears the floating button and still reads as breathing room at
+       the foot of the page. The scroll box keeps `scrollTop = scrollHeight` semantics
+       (main.ts), so the extra padding simply extends the scrollable content. */
+    padding: 18px 20px calc(var(--scratch-fab-size) * 3);
     overflow: auto;
 }
 
@@ -2123,16 +2205,28 @@ summary::-webkit-details-marker {
     border-top: 1px solid var(--border);
 }
 
+/* Issue D: `visibility: hidden`, NOT `display: none`. The conversation label is an
+   identity, not a per-message measurement, so it shows once on the first exchange (the
+   card header) — but it still has to OCCUPY its flex slot, or `.tile-identity`
+   collapses to zero width while `.tile-select`'s column gap still applies and every
+   follow-up prompt starts ~one badge width left of the header row's prompt. All rows of
+   one conversation paint the SAME badge text (ui/turns.ts `paintThreadBadge`), so the
+   reserved width is identical and the two text columns line up exactly.
+   No phantom column from `.tile-agent`: it carries the `hidden` attribute whenever the
+   badge repeats it (ui/turns.ts `syncRootAgentVisibility`), and the UA `display: none`
+   for `[hidden]` is untouched by a visibility-only rule, so an attribute-hidden node
+   stays zero-width in BOTH rows. A row whose identity is the agent code instead (a
+   legacy/unthreaded turn) gets that node's width in both rows too, by the same logic. */
 .conversation .turn-row.is-continuation:not([data-child-thread]) :is(.tile-thread, .tile-agent) {
-    /* The conversation label is an identity, not a per-message measurement: show
-       it once, on the first exchange (the card header). */
-    display: none;
+    visibility: hidden;
 }
 
 /* A resumed CHILD conversation appends its next turn inside the child's own nested
-   card (ui/turns.ts `placeTurn`), so the card header is the identity there too. */
+   card (ui/turns.ts `placeTurn`), so the card header is the identity there too.
+   Issue D: same reserved-slot treatment — the nested rows keep the column their own
+   card header occupies, so they align with each other instead of shifting left. */
 .thread-flow > .turn-row :is(.tile-thread, .tile-agent) {
-    display: none;
+    visibility: hidden;
 }
 
 .conversation .turn-row[data-child-thread] {
@@ -2949,15 +3043,28 @@ summary::-webkit-details-marker {
     flex: 0 0 auto;
 }
 
-/* Full-thread transcript dialog content (R4). The dialog shell owns scrolling and
-   the Copy control; these rules only lay out the role-tagged messages. */
+/* Full-thread transcript dialog content (R4). The dialog shell owns the panel and the
+   action controls; these rules only lay out the role-tagged messages. T1 changes WHO
+   scrolls: the dialog body opts into `.dialog-body--fill` (ui/dialog.ts
+   `DIALOG_BODY_FILL_CLASS`), so the JSON <pre> is the single vertical scroller and the
+   identity line and the action row never leave the screen. */
 .thread-transcript {
     display: flex;
     flex-direction: column;
     gap: 14px;
 }
 
+/* T1: the identity line is a two-ended row — the document it names on the left, the
+   copy icon on the right. The icon moved out of the dialog header, so the control sits
+   next to the text whose wording it depends on ("… · JSON snapshot") and the header
+   keeps only the title and the dismiss control. The line is `flex: 0 0 auto` in the
+   fill chain below: it must never be the thing that shrinks. */
 .thread-transcript-meta {
+    display: flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
     margin: 0;
     color: var(--muted);
     font-family: var(--mono);
@@ -2965,12 +3072,74 @@ summary::-webkit-details-marker {
     line-height: 1.4;
 }
 
+/* The label is its OWN node (never the row's textContent) so the copy button can sit
+   beside it, and a repaint of the identity line (ui/thread-transcript.ts
+   `paintEditorChrome`) can rewrite the text without removing the button. It shrinks and
+   wraps instead of pushing the icon past the panel's edge. */
+.thread-transcript-meta-text {
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+/* T1: the copy icon on that line is the SHARED copy control (ui/dialog.ts
+   `createTextCopyButton`), which is the only implementation carrying the focus-trap-aware
+   `execCommand` fallback the plain-HTTP LAN deployment needs — a hand-rolled icon would
+   report success and change nothing. It is sized like the caption-line copy in a tool
+   pane (an 18px borderless icon, not the boxed 28px header action), because it shares an
+   11px mono line with the identity text. The shared `.dialog-copy-icon` /
+   `.dialog-copy-feedback` children come from the shell; only the metric and the palette
+   differ here, and `data-state` (tick / exclamation) is painted by the same painter. */
+.thread-transcript-meta-copy {
+    position: relative;
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 4px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+}
+
+.thread-transcript-meta-copy .dialog-copy-icon {
+    width: 12px;
+    height: 12px;
+}
+
+.thread-transcript-meta-copy:hover {
+    border-color: var(--border-strong);
+    background: var(--accent-soft);
+    color: var(--text);
+}
+
+.thread-transcript-meta-copy:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.thread-transcript-meta-copy[data-state='success'] {
+    color: var(--ok);
+}
+
+.thread-transcript-meta-copy[data-state='error'] {
+    color: var(--danger);
+}
+
 /* R7: the lossless pretty JSON document. `pre-wrap` keeps the payload readable
-   on a phone without changing the copied text; the dialog body owns scrolling. */
+   on a phone without changing the copied text. T1: this is the dialog's ONLY vertical
+   scroller — the fill chain below gives it the panel's remaining height and it scrolls
+   its own overflow, so the scrollbar sits at the right edge of the text area rather
+   than at the far-right edge of the panel, and `overscroll-behavior` stops a flick at
+   either end of the document chaining into the page behind the modal. */
 .thread-transcript-json {
     margin: 0;
     padding: 12px 14px;
     overflow: auto;
+    overscroll-behavior: contain;
     border: 1px solid var(--border);
     border-radius: 8px;
     background: var(--bg-deep);
@@ -2979,6 +3148,19 @@ summary::-webkit-details-marker {
     tab-size: 2;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+}
+
+/* T3: the document is now the ONLY vertical scroller in this dialog, so it must be
+   reachable by keyboard — ui/thread-transcript.ts gives the <pre> `tabindex="0"` and the
+   browser scrolls a focused `overflow: auto` box with the arrows, PageUp/PageDown and
+   Space. The ring is the shell's existing focus pair (`--accent`, 2px, 2px offset — the
+   same declaration `.thread-transcript-meta-copy:focus-visible` above and
+   `:is(.thread-transcript-edit, …):focus-visible` below use), so no new colour enters
+   the dialog. `:focus-visible` only: a mouse click that lands inside the text to select
+   it must not paint a ring the reader did not ask for. */
+.thread-transcript-json:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
 }
 
 .thread-transcript-empty {
@@ -2992,7 +3174,9 @@ summary::-webkit-details-marker {
    toolbars above); this row is a plain flex line, NOT the `.thread-transcript-action`
    toolbar — that one is hidden by expansion state and owns Delete's confirmation row.
    `margin-left: auto` on the last action keeps Copy (a secondary affordance) at the
-   trailing edge while Save/Cancel stay where the reader looks first. */
+   trailing edge while Save/Cancel stay where the reader looks first. The read row has no
+   trailing-affordance problem to solve - it carries exactly one control and T4 puts it
+   flush right with its own `justify-content` (below). */
 .thread-transcript-actions {
     display: flex;
     flex-wrap: wrap;
@@ -3002,6 +3186,19 @@ summary::-webkit-details-marker {
 
 .thread-transcript-copy {
     margin-left: auto;
+}
+
+/* T4: the read-mode row holds ONE control - "Edit transcript" - and the user asked for
+   it on the right side, under the copy icon that already closes the identity line. It is
+   scoped to `.thread-transcript-read-actions` rather than `margin-left: auto` on
+   `.thread-transcript-edit`, because the shared button group is also the selector the
+   edit row's Save/Cancel vocabulary is built from: pushing the button itself would put
+   the trailing-edge rule on a class that edit mode never renders, and a two-ended row is
+   the honest description of "one control, flush right". `flex-end` keeps the row's own
+   `flex-wrap` behaviour (a wrapped second line still reads from the right edge) and does
+   not touch the edit row, whose Save/Cancel stay where the reader looks first. */
+.thread-transcript-read-actions {
+    justify-content: flex-end;
 }
 
 /* C5: one button vocabulary with the thread toolbars, so an action inside the dialog
@@ -3149,6 +3346,106 @@ summary::-webkit-details-marker {
 .thread-transcript-actions .thread-transcript-copy[data-state='error'] {
     border-color: rgba(248, 113, 113, 0.65);
     color: var(--danger);
+}
+
+/* T1: the fill chain inside a transcript dialog. The shell body opts into
+   `.dialog-body--fill` (ui/dialog.ts `DIALOG_BODY_FILL_CLASS`, ui/dialog.css), which
+   stops the body from scrolling; these rules hand the whole remaining height to ONE
+   scrolling surface per mode, so the header, the identity line and the action row are
+   never scrolled out of view and there is no scrollbar at the panel's far-right edge.
+
+     .dialog-body--fill (stretched, overflow:hidden)
+       .thread-transcript (fills the body, gaps collapse on a short panel)
+         .thread-transcript-meta            intrinsic, never shrinks
+         .thread-transcript-json            fills + scrolls      <- read mode
+         .thread-transcript-error / -note   intrinsic floor + bounded own scroll
+         .thread-transcript-editor          fills + scrolls      <- edit mode
+         .thread-transcript-actions         intrinsic, never shrinks
+
+   `min-height: 0` is what lets a level shrink below its content height instead of
+   pushing a body that can no longer scroll past the 80% viewport cap (the same
+   requirement `.dialog-body > .tool-body` documents for the tool dialog). The
+   difference here is that NOTHING in this chain may overflow: the action row is the
+   control the reader came for, so the text surfaces take the loss — the fill surfaces
+   by scrolling, the disclosure rows by capping their own height (below). Scoping the
+   whole chain to `.dialog-body--fill > .thread-transcript` keeps the standalone builders
+   (the same content adopted outside a filling body) and every other dialog on their
+   historical layout. */
+.dialog-body--fill > .thread-transcript {
+    flex: 1 1 auto;
+    min-height: 0;
+    /* T3: measured at innerHeight 266 the four 14px row gaps plus the banner and the
+       scope note pushed the capped panel past its own body, so spacing — not the rows —
+       gives way first. Same shape as `.dialog-overlay`'s viewport-scaled padding: a 6px
+       floor keeps the rows separated and the 14px default returns from ~900px up. */
+    gap: clamp(6px, 1.6vh, 14px);
+}
+
+/* Read mode: the pretty JSON document is the payload, so it takes the height the panel
+   is not using for the identity line and the Edit control. `max-height: none` drops any
+   cap that would leave the fill unused; `overflow: auto` (above) is what scrolls it. */
+.dialog-body--fill > .thread-transcript > .thread-transcript-json {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
+}
+
+/* Edit mode: the textarea fills what the identity line, the failure banner, the scope
+   note and the Save/Cancel/Copy row leave over. A textarea already scrolls its own
+   text, so the standalone 60vh cap is removed here — with the cap in place the panel
+   was still taller than the body and the action row fell below the fold, which is the
+   layout this change exists to fix. `min-height: 0` (rather than the standalone 240px
+   floor) is what keeps the row and the banner on screen in a very short viewport: the
+   field squashes and scrolls instead of clipping a control. */
+.dialog-body--fill > .thread-transcript-editing > .thread-transcript-editor {
+    flex: 1 1 auto;
+    min-height: 0;
+    max-height: none;
+    overflow: auto;
+}
+
+/* The identity line and the action row stay intrinsic (`flex: 0 0 auto`): one is what
+   the reader reads, the other is what they press. */
+.dialog-body--fill > .thread-transcript > .thread-transcript-actions {
+    flex: 0 0 auto;
+}
+
+/* T3: the two disclosure rows are DISCLOSURE, not filler, so they never shrink. The
+   previous `flex: 0 1 auto` measured down to ~0.94px for the scope note at innerHeight
+   306 and ~18.5px for a two-line banner at 266 (a content box of about nothing), which
+   reads as a broken dialog. `flex: 0 0 auto` keeps each row its full content height,
+   and the bounded `max-height` is what stops a long provider message from taking that
+   height away from the field and the action row instead: the row then scrolls its own
+   text, exactly like the document and the field already do. The clamp is
+   viewport-scaled so the cap binds where it has to (~20vh of the viewport is ~25% of the
+   80dvh panel), with a 34px readable floor and a 132px ceiling on a tall panel. */
+.dialog-body--fill > .thread-transcript > :is(.thread-transcript-note, .thread-transcript-error) {
+    flex: 0 0 auto;
+    max-height: clamp(34px, 20vh, 132px);
+    overflow: auto;
+}
+
+/* T3: one short-panel tier. Measured headless at 1280x266 (innerHeight 168) the fixed
+   chrome alone - head 49px, body padding 36px, four 14px gaps, meta row 18px, action row
+   28px - was 155px against a 134px capped panel, so NO allocation of the rows could fit
+   and the body's `overflow: hidden` clipped the action row. Below 560px of viewport
+   height, everything that is not the banner, the scope note, the field and the buttons
+   gives way: the fill body's inset and the row gaps compact and the disclosure rows cap
+   tighter (30px floor, ~11vh) while still scrolling their own text. Everything stays
+   scoped to `.dialog-body--fill`, which the transcript is the only caller of, so no other
+   dialog and no other viewport loses its padding. */
+@media (max-height: 560px) {
+    .dialog-body--fill {
+        padding: 8px 12px;
+    }
+
+    .dialog-body--fill > .thread-transcript {
+        gap: 6px;
+    }
+
+    .dialog-body--fill > .thread-transcript > :is(.thread-transcript-note, .thread-transcript-error) {
+        max-height: clamp(30px, 11vh, 72px);
+    }
 }
 
 /* C5: an unreadable transcript on the surfaces that represent the conversation. The
@@ -3433,12 +3730,14 @@ summary::-webkit-details-marker {
     color: var(--danger);
 }
 
-/* R5: the block's Collapse/Expand toggle, the LAST control in the row. Built by
-   ui/turns.ts (`attachSectionCollapse`): a real <button> with an aria-hidden chevron
-   and no visible word, so it is the copy control's twin in size, border, colour and
-   focus ring — two buttons that sit side by side must not look like two different
-   widgets. Scoped through `.agent-answer-actions` for the same reason as the copy
-   rules: the shared specificity keeps the footer look independent of bundle order. */
+/* R5/T7: the block's Collapse chevron, the LAST control in the row (the copy button is
+   PREPENDED in front of it). Built by ui/turns.ts (`createCollapseButton`): a real <button>
+   with an aria-hidden chevron and no visible word, so it is the copy control's twin in size,
+   border, colour and focus ring — two buttons that sit side by side must not look like two
+   different widgets. T7 made it single-purpose (the collapsed header row is the expander),
+   which is also why it has no state styles: nothing about this button ever changes. Scoped
+   through `.agent-answer-actions` for the same reason as the copy rules: the shared
+   specificity keeps the footer look independent of bundle order. */
 .agent-answer-actions .answer-collapse {
     position: relative;
     display: inline-flex;
@@ -3453,15 +3752,16 @@ summary::-webkit-details-marker {
     background: transparent;
     color: var(--muted);
     cursor: pointer;
-    /* R5: the toggle owns the RIGHT edge. The row is `justify-content: flex-start`
-       (the copy button sits flush left against the answer it copies), so this is what
-       pins the toggle to the opposite end WHETHER OR NOT a copy button exists. */
+    /* R5: the chevron owns the RIGHT edge. The row is `justify-content: flex-start` (the copy
+       button sits flush left against the answer it copies), so this is what pins the chevron
+       to the opposite end WHETHER OR NOT a copy button exists. */
     margin-left: auto;
 }
 
-/* ONE down-pointing chevron in the DOM: the expanded state is a 180° rotation, so the
-   glyph never swaps and the flip is a pure transform. The glyph stays sized from the
-   button so it can never stretch the row. */
+/* ONE down-pointing chevron in the DOM: the button is always `aria-expanded="true"` (it is
+   reachable only while the surface is open), so the glyph is permanently rotated 180° to point
+   UP — "close what I am looking at". The DOM never swaps paths, and the glyph stays sized from
+   the button so it can never stretch the row. */
 .agent-answer-actions .answer-collapse svg {
     display: block;
     width: 14px;
@@ -3489,122 +3789,30 @@ summary::-webkit-details-marker {
     outline-offset: 2px;
 }
 
-/* No success/error tints here: the toggle has no transient state — its whole job is
-   the state already in `aria-expanded` and in its own accessible name, and its click
-   moves the surface rather than reporting a result. */
+/* No success/error tints here: the chevron has no transient state — its click MOVES the
+   surface rather than reporting a result, and the state it acts on is already carried by
+   `aria-expanded` plus the word in its own accessible name. */
 
-/* R5/T6: THE SECOND CHEVRON — the same control, in the collapsed header row. --------
-   The footer chevron above lives INSIDE `.tile-body`/`.thread-body`, and a collapsed
-   block sets `display: none` on exactly that element. So while the block was closed the
-   chevron could not be seen, focused or clicked, and the control could only ever
-   COLLAPSE a block — never expand one. ui/turns.ts therefore creates a second, identical
-   button per collapsible block, immediately after the header button (`.thread-select` /
-   `.tile-select`) as its SIBLING inside `.thread-tile` / `.tile`: the header is already a
-   <button>, and interactive content may not nest inside a button. Both buttons are
-   painted from the same state owner (`setThreadExpanded` / the board's expand path), so
-   they always carry the same `aria-expanded`, name, tooltip and `aria-controls`.
+/* R5/T7: ONE chevron per collapsible block — footer-only, and collapse-only. -----------
+   T7 removed the earlier header chevron: a collapsed row IS the expander (clicking
+   `.thread-select` / `.tile-select` opens the block), so a second chevron in that row was
+   a duplicate affordance at "this level". What stays serves the case the header cannot:
+   closing a long block from the BOTTOM, when the reader is already at the end of it and
+   would otherwise have to scroll all the way up.
 
-   Only ONE of the pair is ever rendered, and the rules below make that explicit in BOTH
-   directions: `display: none` also removes the hidden one from the accessibility tree and
-   the tab order, so a screen reader hears exactly one Collapse/Expand control per block.
+   No visibility rule is written for it here, on purpose. The button lives inside
+   `.tile-body` / `.thread-body`, and the rules that hide those elements for a collapsed
+   block (`.tile:not(.is-expanded) .tile-body`, `.thread-row:not(.is-expanded) .thread-body`)
+   already take it out of the layout, the tab order and the accessibility tree. Adding a
+   second, parallel hiding rule could only disagree with the body it depends on. That is
+   also why ui/turns.ts gives the button a CONSTANT `aria-expanded="true"` and a constant
+   `Collapse …` name, and why nothing repaints it: the only moment a reader can see or
+   press it is while the surface is open, so the label is always true — and after a
+   projection rebuild the replay simply mints the same button again.
 
-   Box model (jsdom cannot lay this out, so the arithmetic is written down):
-   - both block surfaces are already `position: relative` (the shared busy ring), so the
-     chevron anchors to the BLOCK rather than escaping to the viewport;
-   - while a block is collapsed its body is `display: none` and its action bar is
-     `hidden`, so the block's box IS the header row → `top: 50%` + `translateY(-50%)`
-     centres the chevron on that one row at any content height;
-   - `right: 10px` puts it exactly on the header's own inline padding edge
-     (`.tile-select`/`.thread-select`: `padding: 6px 10px`), so it aligns with the text
-     column instead of floating in the border;
-   - the flush-right measurement line (`.tile-top`, `.thread-top`: `margin-left: auto`)
-     would otherwise slide under it, so the collapsed header reserves its footprint:
-     10px padding + 24px button + 10px gap = `padding-right: 44px`. The gap matches the
-     row's own 10px flex gap, and the figures themselves are `flex: 0 0 auto`, so they
-     stop short of the chevron rather than overlapping it. */
-:is(.tile, .thread-tile) > .header-collapse {
-    position: absolute;
-    top: 50%;
-    right: 10px;
-    transform: translateY(-50%);
-    /* Expanded: the FOOTER chevron is the rendered one (see the pair below). */
-    display: none;
-    align-items: center;
-    justify-content: center;
-    width: 24px;
-    height: 24px;
-    padding: 0;
-    border: 1px solid var(--border);
-    border-radius: 6px;
-    background: transparent;
-    color: var(--muted);
-    cursor: pointer;
-}
-
-/* Collapsed: this is the block's only chevron. */
-:is(.tile, .thread-tile):not(.is-expanded) > .header-collapse {
-    display: inline-flex;
-}
-
-/* The chevron glyph is the footer control's twin: ONE down-pointing path, rotated while
-   the surface is open, sized from the button so it can never stretch the row. */
-:is(.tile, .thread-tile) > .header-collapse svg {
-    display: block;
-    width: 14px;
-    height: 14px;
-    fill: none;
-    stroke: currentColor;
-    stroke-width: 1.7;
-    stroke-linecap: round;
-    stroke-linejoin: round;
-    transition: transform 120ms ease;
-}
-
-:is(.tile, .thread-tile) > .header-collapse[aria-expanded='true'] svg {
-    transform: rotate(180deg);
-}
-
-:is(.tile, .thread-tile) > .header-collapse:hover {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-    color: var(--text);
-}
-
-:is(.tile, .thread-tile) > .header-collapse:focus-visible {
-    outline: 2px solid var(--accent);
-    outline-offset: 2px;
-}
-
-/* The reservation described above, and only while the chevron is rendered. */
-:is(.tile:not(.is-expanded), .thread-tile:not(.is-expanded)) > :is(.tile-select, .thread-select) {
-    padding-right: 44px;
-}
-
-/* The FOOTER chevron is rendered only while its own block is open. The body-hiding rules
-   already take it out of the tree, and this says the same thing directly (the child
-   combinator keeps it on the block that owns the body: descendants of an open block are
-   selected by their OWN surface's state, never by an ancestor's). */
-:is(.tile:not(.is-expanded) > .tile-body, .thread-tile:not(.is-expanded) > .thread-body) .answer-collapse {
-    display: none;
-}
-
-/* T12b exception: expanding a CONVERSATION opens EVERY exchange in it
-   (`.conversation.is-expanded .tile-body { display: flex }`), so those sibling tiles show
-   their bodies without carrying `.is-expanded` themselves. Their FOOTER chevron is the
-   reachable one in that state, so the header chevron stands down — and the padding it
-   reserved is given back to the measurement line, which returns to the flush-right
-   position every other header uses. */
-.conversation.is-expanded > .turn-row > .tile > .header-collapse {
-    display: none;
-}
-
-.conversation.is-expanded > .turn-row > .tile > .tile-body .answer-collapse {
-    display: inline-flex;
-}
-
-.conversation.is-expanded > .turn-row > .tile > .tile-select {
-    padding-right: 10px;
-}
+   T12b: a sibling exchange inside an OPEN conversation shows its body without carrying
+   `.is-expanded` itself. Its chevron renders there too, correctly: clicking it closes the
+   conversation, which is exactly the visible effect the control promises. */
 
 .agent-error {
     display: flex;
@@ -5696,9 +5904,14 @@ summary::-webkit-details-marker {
     }
 }
 
-/* Phone: one column; both rails start COLLAPSED (R1) and the topbar toggles open
-   exactly one at a time over a dismissable backdrop. The rails stay in the DOM, so
-   their content and state are never rebuilt or lost when a rail is closed. */
+/* Phone: one column, and ONE sidebar slot. Both rails start COLLAPSED (R1) and exactly one
+   is ever open (main.ts keeps the single `openRail` value in `shell[data-rail-open]`), over a
+   dismissable backdrop. T8 (user feedback: "Make scratch pad opens on the left. If there is
+   harness list open, it will close that and open scratch pad. That is, there is only one
+   sidebar, viewing whichever item is selected"): BOTH drawers now use the same left-hand,
+   off-canvas geometry — same inset, width, edge divider, shadow and slide — so opening one
+   visibly replaces the other in the same place instead of jumping across the screen. The
+   rails stay in the DOM either way, so their content and state are never rebuilt. */
 @media (max-width: 860px) {
     .shell {
         grid-template-columns: minmax(0, 1fr);
@@ -5711,9 +5924,17 @@ summary::-webkit-details-marker {
        `--composer-height` (written by main.ts `syncComposerHeight` from the composer's
        measured height) so the button clears the field as the draft grows; `76px` is the
        stylesheet fallback for the first frame and for a host with no layout at all.
-       z-index 1 keeps it UNDER the backdrop (2) and the drawer (3): while the drawer is
-       open, a press on the button lands on the backdrop and dismisses the drawer, which
-       is the behaviour of every other outside press. */
+
+       T8: `z-index: 4` puts it ABOVE the backdrop (2) and the drawer (3). It is the only
+       way onto the scratch board, so it must stay pressable while the harness drawer is
+       open — a press then SWITCHES drawers (close left, open right) instead of being
+       swallowed by the backdrop, which is what the single-sidebar rule asks for. Pressing
+       it again while the scratch drawer is open still collapses it (main.ts). The button
+       sits bottom-right and the drawer now occupies the left edge, so the only overlap is
+       the drawer's own bottom-right corner on the narrowest phones: the panel ends at
+       `min(86vw, 320px)` and the button starts at `100vw - 14px - var(--scratch-fab-size)`,
+       so at 32px they meet only below ~328px of viewport width, and the board scrolls under
+       it either way. */
     .scratch-fab {
         display: inline-flex;
         align-items: center;
@@ -5721,9 +5942,14 @@ summary::-webkit-details-marker {
         position: fixed;
         right: 14px;
         bottom: calc(var(--composer-height, 76px) + 12px);
-        z-index: 1;
-        width: 44px;
-        height: 44px;
+        z-index: 4;
+        /* Sized from the shared `--scratch-fab-size` token (32px, down from 44px): the
+           button was reading oversized against the phone chrome, and one token is what
+           keeps `.log-wrap`'s bottom gap (`calc(var(--scratch-fab-size) * 3)`) honest.
+           The glyph follows the box proportionally (17px -> 14px) so the icon stays
+           legible without filling the smaller circle. */
+        width: var(--scratch-fab-size);
+        height: var(--scratch-fab-size);
         padding: 0;
         border: 1px solid var(--border-strong);
         border-radius: 999px;
@@ -5731,7 +5957,7 @@ summary::-webkit-details-marker {
         color: var(--text);
         box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
         font-family: var(--mono);
-        font-size: 17px;
+        font-size: 14px;
         cursor: pointer;
     }
 
@@ -5779,7 +6005,10 @@ summary::-webkit-details-marker {
     /* R2: the harness listing is a dashboard-style SIDEBAR on phones: an
        off-canvas, full-height panel over the chat, not a strip that pushes the
        conversation down. It stays a direct grid child in the DOM, but `fixed`
-       removes it from grid flow while open. */
+       removes it from grid flow while open. T8: this is now the geometry of BOTH
+       drawers — the scratch board below uses the same inset, width, divider edge,
+       shadow and slide — because the phone has ONE sidebar slot and switching must
+       not jump the panel across the screen. */
     .shell[data-rail-open='left'] .rail-left {
         display: flex;
         position: fixed;
@@ -5787,32 +6016,49 @@ summary::-webkit-details-marker {
         z-index: 3;
         width: min(86vw, 320px);
         max-height: none;
+        /* T8: written in the same order and with the same values as the scratch drawer below,
+           so the two rules are byte-identical (rail-toggle.test.ts pins that). A drawer that
+           sits on the left edge carries its divider on the RIGHT and nothing on the top or
+           left, whatever the in-flow layouts above the breakpoints paint on these elements. */
+        border-top: 0;
+        border-left: 0;
         border-right: 1px solid var(--border);
         border-bottom: 0;
         box-shadow: 16px 0 48px rgba(0, 0, 0, 0.55);
         animation: rail-slide-in 160ms ease-out;
     }
 
-    /* R3 (T3): the scratch board opens as a SIDEBAR on the right, mirroring the harness
-       drawer on the left, instead of the old in-flow strip that stole a grid row from the
-       conversation. `fixed` removes it from grid flow (the rails stay direct grid children
-       in the DOM, so their state is never rebuilt), and it slides in from the right edge
-       to match the direction it comes from. */
+    /* T8 (user feedback, verbatim): "Make scratch pad opens on the left. If there is harness
+       list open, it will close that and open scratch pad. That is, there is only one sidebar,
+       viewing which ever item is selected." The scratch board therefore takes the harness
+       drawer's slot EXACTLY: the same left-hand `inset`, the same width, the same right-edge
+       divider, the same shadow and the same `rail-slide-in` keyframe. `fixed` still removes it
+       from grid flow (the rails stay direct grid children in the DOM, so their content and
+       state are never rebuilt), and the single `data-rail-open` value main.ts writes says
+       which of the two is in it.
+       What this removes: the right-edge placement (`inset: 0 0 0 auto`), the mirrored
+       `rail-slide-in-right` keyframe, and the tablet strip's dividers (`border-left: 0` and
+       `border-top` from the 861-1180px block) — those belong to the layout UNDER the chat and
+       must not follow the board into a drawer. */
     .shell[data-rail-open='right'] .rail-right {
         display: flex;
         position: fixed;
-        inset: 0 0 0 auto;
+        inset: 0 auto 0 0;
         z-index: 3;
         width: min(86vw, 320px);
         max-height: none;
-        border-left: 1px solid var(--border);
-        box-shadow: -16px 0 48px rgba(0, 0, 0, 0.55);
-        animation: rail-slide-in-right 160ms ease-out;
+        border-top: 0;
+        border-left: 0;
+        border-right: 1px solid var(--border);
+        border-bottom: 0;
+        box-shadow: 16px 0 48px rgba(0, 0, 0, 0.55);
+        animation: rail-slide-in 160ms ease-out;
     }
 
     /* The backdrop dims the chat behind either drawer and is the pointer dismiss
-       (Escape is the keyboard one, main.ts). It sits below both drawers (3) and above
-       the floating scratch button (1). */
+       (Escape is the keyboard one, main.ts). It sits below both drawers (3) and BELOW the
+       floating scratch button (4, T8): the button is the only way onto the scratch board, so
+       it stays pressable with the harness drawer open and switches drawers in one press. */
     .shell[data-rail-open] .rail-backdrop {
         display: block;
         position: fixed;
@@ -5821,19 +6067,12 @@ summary::-webkit-details-marker {
         background: rgba(0, 0, 0, 0.45);
     }
 
+    /* One slide for both drawers (T8): they share the left edge, so both enter from it. The
+       mirrored `rail-slide-in-right` this replaces is deleted, not left behind to style a
+       surface that no longer slides from the right. */
     @keyframes rail-slide-in {
         from {
             transform: translateX(-100%);
-        }
-
-        to {
-            transform: translateX(0);
-        }
-    }
-
-    @keyframes rail-slide-in-right {
-        from {
-            transform: translateX(100%);
         }
 
         to {
@@ -5876,9 +6115,11 @@ summary::-webkit-details-marker {
     }
 
     /* The list stays one full-width column on a phone: only the spacing and the
-       reading surface shrink. */
+       reading surface shrink. The bottom leg stays `--scratch-fab-size * 3` (not the
+       14px side inset) so the gap under the last thread still clears the floating
+       scratch button, which lives in exactly that corner. */
     .log-wrap {
-        padding: 14px;
+        padding: 14px 14px calc(var(--scratch-fab-size) * 3);
     }
 
     .turns {
@@ -5907,8 +6148,9 @@ summary::-webkit-details-marker {
         min-width: 0;
     }
 
-    /* Compact topbar on a phone: brand + tools icon + pill on one line. The rails are
-       opened by the brand (left) and the floating `.scratch-fab` (right, T3/R3), so the
+    /* Compact topbar on a phone: brand + tools icon + pill on one line. The two drawers are
+       opened by the brand (the harness listing) and the floating `.scratch-fab` (the scratch
+       board, T3/R3) — T8: both into the SAME left-hand sidebar slot, one at a time — so the
        bar spends no room on a rail control. */
     .topbar {
         gap: 8px;
@@ -5954,6 +6196,60 @@ summary::-webkit-details-marker {
         display: none;
     }
 
+    /* T7: the pill the desktop layout hides now takes over — this is the row the user
+       pointed at ("a pill next to the instruct button here"). The strip above stays hidden
+       and the dialog keeps the full dashboard, so this control only answers WHICH session is
+       on screen and steps to the next one.
+       Geometry: `flex: 0 0 auto` + `max-width: 42vw` (see the base rule) keep it a fixed,
+       small item beside a title that is free to ellipsize; the pill can push the title,
+       never the other way round, and it can never wrap onto a second line. */
+    .session-cycle {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        flex: 0 0 auto;
+        max-width: 42vw;
+        padding: 3px 9px;
+        border: 1px solid var(--accent);
+        border-radius: 999px;
+        background: var(--accent-soft);
+        color: var(--text);
+        font-family: var(--mono);
+        font-size: 11px;
+        white-space: nowrap;
+        cursor: pointer;
+    }
+
+    /* Accent-tinted by default because it names the conversation in view: that IS the
+       highlight the strip's active pill carries on desktop. Hover only confirms the press. */
+    .session-cycle:hover:not(:disabled) {
+        background: var(--accent);
+        color: var(--bg);
+    }
+
+    .session-cycle:hover:not(:disabled) .session-cycle-glyph {
+        color: var(--bg);
+    }
+
+    .session-cycle:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
+    }
+
+    /* Switching is locked while a run is in flight (main.ts mirrors the strip's guard), and
+       a locked control reads locked: quiet frame, no pointer, no tint. */
+    .session-cycle:disabled {
+        border-color: var(--border);
+        background: transparent;
+        color: var(--muted);
+        cursor: not-allowed;
+        opacity: 0.6;
+    }
+
+    .session-cycle:disabled .session-cycle-glyph {
+        color: var(--muted);
+    }
+
     .harness-head .harness-note {
         display: none;
     }
@@ -5980,10 +6276,9 @@ summary::-webkit-details-marker {
     }
 
     /* R5: the chevron flip is decoration — the state is the ARIA value and the word in
-       the accessible name — so an instant swap loses nothing. T6: BOTH chevrons (the
-       footer control and its collapsed-header twin) animate the same transform. */
-    .agent-answer-actions .answer-collapse svg,
-    :is(.tile, .thread-tile) > .header-collapse svg {
+       the accessible name — so an instant swap loses nothing. T7: ONE chevron per block
+       (the footer control), because the collapsed row is itself the expander. */
+    .agent-answer-actions .answer-collapse svg {
         transition: none;
     }
 }
@@ -6325,6 +6620,12 @@ summary::-webkit-details-marker {
 .composer-target {
     position: absolute;
     top: 0;
+    /* Fallback only. main.ts `paintComposerTarget` writes an inline `left` measured from
+       the input's own text column (frame border + agent button + the input's padding),
+       because the caret's x depends on the agent pill's width — the full name on
+       desktop, the short code under the 860px breakpoint. This static value is what a
+       host without layout (jsdom) or a composer that is `display: none` at paint time
+       falls back to, and it is the floor the inline measurement never goes below. */
     left: 10px;
     z-index: 1;
     max-width: calc(100% - 20px);

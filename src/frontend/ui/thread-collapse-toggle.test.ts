@@ -1,34 +1,30 @@
-// R5/T6: the Collapse/Expand chevrons of an agent block.
+// R5/T7: the ONE Collapse chevron of an agent block — footer-only, collapse-only.
 //
-// Every block with a collapsible surface — a nested invocation card (`.thread-body`) and
-// the root conversation (`.tile-body`) — owns TWO identical buttons, because one slot
-// cannot serve both states: the footer control (`.answer-collapse`) sits where the Copy
-// button used to be alone, INSIDE the body that a collapsed block hides with
-// `display: none`, so it could only ever collapse; the header control
-// (`.header-collapse`) sits immediately after the block's header button — a SIBLING of
-// `.thread-select`/`.tile-select` inside `.thread-tile`/`.tile`, never nested in it,
-// because the header is already a <button> — and renders only while the block is closed.
-// styles.css shows exactly one of the pair per state, so one is never in the accessibility
-// tree while the other is.
+// T7 (user feedback: "the whole row is a toggle … [the chevron] is only needed when it is
+// fully expanded and I'm at the bottom of the page, allowing me to collapse without having
+// to scroll all the way up") removed the header chevron an earlier pass added. What is
+// left is exactly one button per collapsible block — a nested invocation card
+// (`.thread-body`) and the root conversation (`.tile-body`) — appended into that block's
+// `.agent-answer-actions` footer row, after the Copy button:
+//   - expanding belongs to the ROW: `.thread-select` / `.tile-select` is a real button
+//     spanning the collapsed header, so a second chevron in that row was a duplicate
+//     affordance ("unnecessary at this level");
+//   - the chevron's whole row lives inside the body, which styles.css hides with
+//     `display: none` while the block is closed. That single fact is what makes its
+//     constants honest: a reader can only ever see or press it while the surface is OPEN,
+//     so `aria-expanded="true"` and the name `Collapse thread` / `Collapse conversation`
+//     are always true, and NOTHING repaints them — no `isExpanded()` probe, no sync pass,
+//     no `TurnHandle.syncCollapseAction`;
+//   - it never routes through `focusThread`, so collapsing a nested card in place leaves
+//     board focus and the composer target where they were; the root chevron performs the
+//     board's own `collapse()`, the same deliberate unfocus the header performs.
 //
-// What this file pins:
-//   - ONE pair per nested thread and per root conversation, and NEITHER for a flat legacy
-//     section (whose footer row therefore stays empty until an answer completes);
-//   - both buttons always carry the same `aria-expanded`, state-aware `aria-label`/`title`,
-//     `data-expanded` and `aria-controls`, read from the OWNER of the state (the entry for
-//     a child card, the board for the root conversation) — at creation, on a click, on an
-//     implicit board-driven open, and after a projection rebuild replaced the buttons
-//     (including: no stale duplicate left in the tile header);
-//   - the click is an in-place expand/collapse: it never routes through `focusThread`, so
-//     board focus and the composer target do not move, and the header chevron does not
-//     fire the header button beside it;
-//   - both are icon-only, focusable <button type="button"> controls that stay enabled while
-//     streaming;
-//   - the copy button stays FIRST in the footer row (left) and the footer chevron LAST.
-//
-// jsdom cannot lay the transcript out, so the CSS facts this contract depends on (which
-// chevron is rendered per state, and the header padding that keeps the measurement line
-// clear of the chevron) are asserted against the stylesheet SOURCE, like
+// What this file pins: one chevron per block and zero header chevrons; the constant ARIA
+// contract; the copy-before-chevron order; collapse-only clicks (nested and root) with the
+// focus guarantees; header expansion unchanged; a projection rebuild minting a fresh button
+// with the same contract and no leftovers; no chevron at all for a flat legacy section;
+// and the icon-only / keyboard / never-disabled shape. The CSS facts this depends on are
+// asserted against the stylesheet SOURCE (jsdom computes no layout), like
 // ui/agent-answer-style.test.ts does.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/thread-collapse-toggle.test.ts
@@ -111,9 +107,9 @@ const mount = () => {
     return { board, focused };
 };
 
-// A child invocation joined to a PERSISTENT conversation through the roster. Only a
-// joined entry routes a HEADER CLICK into `focusThread`, which is what makes it the right
-// surface for proving that NEITHER chevron does.
+// A child invocation joined to a PERSISTENT conversation through the roster. Only a joined
+// entry routes a HEADER CLICK into `focusThread`, which is what makes it the right surface
+// for proving the chevron does not.
 const rosterWithChild = (): SessionThreadEntry[] => [
     threadEntry({ id: 'thread-root', sequence: 1, label: 'Writer', agent: 'writer' }),
     threadEntry({
@@ -140,39 +136,33 @@ const threadRows = (turn: TurnHandle): HTMLElement[] => [
     ...((turn.element.parentElement as HTMLElement).querySelectorAll<HTMLElement>('.thread-row') ?? [])
 ];
 
-// The two slots, for each owner. Scoped to the OWNING surface (`:scope >`), so a nested
-// card's controls are never counted as the parent's.
-const rootFooter = (turn: TurnHandle): HTMLButtonElement | null =>
+// The chevron, for each owner. Scoped to the OWNING surface (`:scope >`), so a nested
+// card's control is never counted as the parent's.
+const rootChevron = (turn: TurnHandle): HTMLButtonElement | null =>
     turn.element.querySelector<HTMLButtonElement>('.tile-flow .agent-answer-actions .answer-collapse');
 
-const rootHeader = (turn: TurnHandle): HTMLButtonElement | null =>
-    turn.element.querySelector<HTMLButtonElement>(':scope > .header-collapse');
-
-const rowFooter = (row: HTMLElement): HTMLButtonElement | null =>
+const rowChevron = (row: HTMLElement): HTMLButtonElement | null =>
     row.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-body .answer-collapse');
 
-const rowHeader = (row: HTMLElement): HTMLButtonElement | null =>
-    row.querySelector<HTMLButtonElement>(':scope > .thread-tile > .header-collapse');
+const childChevron = (turn: TurnHandle): HTMLButtonElement | null => rowChevron(threadRows(turn)[0]);
 
-const childFooter = (turn: TurnHandle): HTMLButtonElement | null => rowFooter(threadRows(turn)[0]);
-const childHeader = (turn: TurnHandle): HTMLButtonElement | null => rowHeader(threadRows(turn)[0]);
-
-// The footer's control order, as class names: the exact R5 contract.
+// The footer's control order, as class names: the exact R5 contract (copy left, chevron
+// right) that T7 must not disturb.
 const footerOrder = (actions: Element | null): string[] =>
     [...((actions as HTMLElement | null)?.children ?? [])].map((node) => node.className);
 
-// Every state-bearing attribute of one chevron, so a pair can be compared as a whole.
+// Every state-bearing attribute of the chevron. There is no `data-expanded` any more: the
+// button carries a CONSTANT `aria-expanded`, so nothing has to keep a mirror in sync.
 const chevronState = (button: HTMLButtonElement | null) => ({
     expanded: button?.getAttribute('aria-expanded'),
     label: button?.getAttribute('aria-label'),
     title: button?.title,
-    data: button?.dataset.expanded,
     controls: button?.getAttribute('aria-controls'),
     type: button?.type
 });
 
-describe('block collapse chevrons (R5/T6)', () => {
-    it('gives the root conversation and each nested thread exactly one pair', () => {
+describe('block footer collapse chevron (R5/T7)', () => {
+    it('gives each collapsible block exactly one chevron, and no header chevron at all', () => {
         const { board } = mount();
         const turn = board.begin('delegate');
 
@@ -184,26 +174,28 @@ describe('block collapse chevrons (R5/T6)', () => {
 
         const row = threadRows(turn)[0];
         const tile = row.querySelector<HTMLElement>(':scope > .thread-tile') as HTMLElement;
-        // ONE of each, per block, each in its own slot.
-        expect(turn.element.querySelectorAll('.tile-flow .answer-collapse')).toHaveLength(1);
-        expect(turn.element.querySelectorAll(':scope > .header-collapse')).toHaveLength(1);
-        expect(tile.querySelectorAll(':scope > .thread-body .answer-collapse')).toHaveLength(1);
-        expect(tile.querySelectorAll(':scope > .header-collapse')).toHaveLength(1);
-        // Four distinct buttons: the child never borrows the root's controls.
-        expect(new Set([rootFooter(turn), rootHeader(turn), childFooter(turn), childHeader(turn)]).size).toBe(4);
+        // ONE per block, each inside that block's own footer row.
+        expect(turn.element.querySelectorAll('.answer-collapse')).toHaveLength(1);
+        expect(tile.querySelectorAll('.answer-collapse')).toHaveLength(1);
+        // Two distinct buttons: the child never borrows the root's control.
+        expect(new Set([rootChevron(turn), childChevron(turn)]).size).toBe(2);
 
-        // T6: the header chevron is the header BUTTON's next sibling — inside the block
-        // surface, and never nested inside the button (interactive content cannot nest).
-        const rootSelect = turn.element.querySelector<HTMLElement>(':scope > .tile-select');
-        expect(rootSelect?.nextElementSibling?.className).toBe('header-collapse');
-        expect(rootSelect?.contains(turn.element.querySelector('.header-collapse') as Node)).toBe(false);
-
-        const threadSelect = tile.querySelector<HTMLElement>(':scope > .thread-select');
-        expect(threadSelect?.nextElementSibling?.className).toBe('header-collapse');
-        expect(threadSelect?.contains(tile.querySelector('.header-collapse') as Node)).toBe(false);
+        // T7: NO header chevron anywhere — the collapsed row is the expander, so the
+        // header surfaces are exactly what they were before the toggle existed.
+        expect(board.element.querySelectorAll('.header-collapse')).toHaveLength(0);
+        expect([...turn.element.children].map((node) => node.className)).toEqual([
+            'tile-select',
+            'tile-transcript-action',
+            'tile-body'
+        ]);
+        expect([...tile.children].map((node) => node.className)).toEqual([
+            'thread-select',
+            'thread-transcript-action',
+            'thread-body'
+        ]);
     });
 
-    it('paints both chevrons from the surface they control', () => {
+    it('carries a constant Collapse contract, honest because only the body renders it', () => {
         const { board } = mount();
         const turn = board.begin('delegate');
 
@@ -213,49 +205,41 @@ describe('block collapse chevrons (R5/T6)', () => {
             withThread({ type: 'start', agent: 'helper', model: 'h1' }, { id: 't1', callId: 'd1', input: 'child task' })
         );
 
-        // `begin` expands the tile, and the root section is created AFTER that — so both
-        // buttons must already read the live board state at creation, not a constant.
-        const rootBodyId = turn.element.querySelector<HTMLElement>('.tile-body')?.id;
-        expect(rootFooter(turn)).not.toBeNull();
-        expect(chevronState(rootFooter(turn))).toEqual({
+        const row = threadRows(turn)[0];
+        // The root block is OPEN (`begin` expanded the tile): the label matches the state.
+        expect(chevronState(rootChevron(turn))).toEqual({
             expanded: 'true',
             label: 'Collapse conversation',
             title: 'Collapse conversation',
-            data: 'true',
-            controls: rootBodyId,
+            controls: turn.element.querySelector<HTMLElement>('.tile-body')?.id,
             type: 'button'
         });
-        // Identical truth in the collapsed slot: CSS decides which one is rendered, the
-        // ARIA never waits for it.
-        expect(chevronState(rootHeader(turn))).toEqual(chevronState(rootFooter(turn)));
-
-        // A nested card starts collapsed: both of its buttons offer the OTHER verb.
-        const childBodyId = threadRows(turn)[0].querySelector<HTMLElement>('.thread-body')?.id;
-        expect(chevronState(childFooter(turn))).toEqual({
-            expanded: 'false',
-            label: 'Expand thread',
-            title: 'Expand thread',
-            data: 'false',
-            controls: childBodyId,
+        // The child card is CLOSED, and its chevron still says `Collapse thread`. That is
+        // not a lie: the whole row is inside `.thread-body`, which the stylesheet hides for
+        // a collapsed card, so the button is unrendered, untabbable and out of the
+        // accessibility tree in that state — the only moment it is reachable is when the
+        // surface is open. These are the rules that make that guarantee.
+        expect(chevronState(rowChevron(row))).toEqual({
+            expanded: 'true',
+            label: 'Collapse thread',
+            title: 'Collapse thread',
+            controls: row.querySelector<HTMLElement>('.thread-body')?.id,
             type: 'button'
         });
-        expect(chevronState(childHeader(turn))).toEqual(chevronState(childFooter(turn)));
-        // The relation points at a REAL body, and both buttons name the same one.
-        expect(rootBodyId).toBeTruthy();
-        expect(childBodyId).toBeTruthy();
-        expect(rootBodyId).not.toBe(childBodyId);
-        // ... which is also the body the block's HEADER BUTTON controls: the pair and the
-        // header describe one surface, three ways.
-        expect(rootHeader(turn)?.getAttribute('aria-controls')).toBe(
-            turn.element.querySelector('.tile-select')?.getAttribute('aria-controls')
+        expect(css).toContain('.thread-row:not(.is-expanded) .thread-body');
+        expect(css).toContain('.tile:not(.is-expanded) .tile-body');
+        // Both name a REAL body, and the two bodies differ.
+        expect(rootChevron(turn)?.getAttribute('aria-controls')).toBeTruthy();
+        expect(rowChevron(row)?.getAttribute('aria-controls')).toBeTruthy();
+        expect(rootChevron(turn)?.getAttribute('aria-controls')).not.toBe(
+            rowChevron(row)?.getAttribute('aria-controls')
         );
-        const childRow = threadRows(turn)[0];
-        expect(rowHeader(childRow)?.getAttribute('aria-controls')).toBe(
-            childRow.querySelector('.thread-select')?.getAttribute('aria-controls')
-        );
+        // The constant ARIA replaced the mirrored attribute entirely.
+        expect(rootChevron(turn)?.hasAttribute('data-expanded')).toBe(false);
+        expect(rowChevron(row)?.hasAttribute('data-expanded')).toBe(false);
     });
 
-    it('leaves a flat legacy section without either chevron', () => {
+    it('leaves a flat legacy section without a chevron', () => {
         const { board } = mount();
         const turn = board.begin('legacy ctx.run');
 
@@ -272,16 +256,14 @@ describe('block collapse chevrons (R5/T6)', () => {
 
         const flat = agents[1].querySelector<HTMLElement>('.agent-answer-actions');
         expect(flat?.querySelector('.answer-collapse')).toBeNull();
-        expect(agents[1].querySelector('.header-collapse')).toBeNull();
         // The completed answer is the ONLY control it can ever hold, so the row is a
         // single child and the `:empty` rule still describes the pre-answer state.
         expect(footerOrder(flat ?? null)).toEqual(['text-copy answer-copy']);
-        // The root block (the primary section) DOES own a surface, so it keeps its pair.
+        // The root block (the primary section) DOES own a surface, so it keeps its chevron.
         expect(agents[0].querySelector('.answer-collapse')).not.toBeNull();
-        expect(turn.element.querySelectorAll(':scope > .header-collapse')).toHaveLength(1);
     });
 
-    it('keeps the copy button before the footer chevron, and the chevron alone before an answer', () => {
+    it('keeps the copy button before the chevron, and the chevron alone before an answer', () => {
         const { board } = mount();
         const turn = board.begin('delegate');
 
@@ -292,7 +274,7 @@ describe('block collapse chevrons (R5/T6)', () => {
         );
 
         const row = threadRows(turn)[0];
-        row.querySelector<HTMLButtonElement>('.thread-select')?.click();
+        row.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-select')?.click();
 
         const actions = row.querySelector<HTMLElement>('.agent-answer-actions');
         // No completed answer yet: the chevron is the whole row, pinned right by CSS.
@@ -304,12 +286,11 @@ describe('block collapse chevrons (R5/T6)', () => {
         // R5: copy FIRST (left), chevron LAST (right).
         expect(footerOrder(actions ?? null)).toEqual(['text-copy answer-copy', 'answer-collapse']);
         expect(actions?.firstElementChild?.classList.contains('answer-copy')).toBe(true);
-        expect(actions?.lastElementChild?.classList.contains('answer-collapse')).toBe(true);
-        // The header chevron is NOT part of that row (different slot, different state).
-        expect(actions?.querySelector('.header-collapse')).toBeNull();
+        expect(actions?.lastElementChild?.className).toBe('answer-collapse');
+        expect(css).toContain('margin-left: auto');
     });
 
-    it('collapses an expanded thread with the footer chevron and re-opens it with the header one', () => {
+    it('collapses an expanded thread in place, and never re-opens it', () => {
         const { board } = mount();
         const turn = board.begin('delegate');
 
@@ -321,79 +302,71 @@ describe('block collapse chevrons (R5/T6)', () => {
 
         const row = threadRows(turn)[0];
         const tile = row.querySelector<HTMLElement>(':scope > .thread-tile') as HTMLElement;
-        const footer = rowFooter(row);
-        const header = rowHeader(row);
+        const chevron = rowChevron(row);
+        // The HEADER expands (unchanged behaviour: the whole row is the toggle).
         row.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-select')?.click();
         expect(row.classList.contains('is-expanded')).toBe(true);
-        expect(chevronState(footer)?.expanded).toBe('true');
-        expect(chevronState(header)?.expanded).toBe('true');
+        expect(tile.classList.contains('is-expanded')).toBe(true);
+        expect(row.querySelector('.thread-select')?.getAttribute('aria-expanded')).toBe('true');
 
-        // The click closes THIS card only: the parent tile keeps its own state.
-        footer?.click();
+        // The CHEVRON closes it, and nothing else: the parent tile keeps its own state.
+        chevron?.click();
         expect(row.classList.contains('is-expanded')).toBe(false);
         expect(tile.classList.contains('is-expanded')).toBe(false);
-        for (const state of [chevronState(footer), chevronState(header)]) {
-            expect(state).toEqual({
-                expanded: 'false',
-                label: 'Expand thread',
-                title: 'Expand thread',
-                data: 'false',
-                controls: row.querySelector<HTMLElement>('.thread-body')?.id,
-                type: 'button'
-            });
-        }
-        // The header's own ARIA moves with it — one state, three surfaces.
         expect(row.querySelector('.thread-select')?.getAttribute('aria-expanded')).toBe('false');
         expect(turn.element.classList.contains('is-expanded')).toBe(true);
         expect(board.expanded()).toBe(turn);
+        // The label and ARIA are constants, so they are simply still what they were.
+        expect(chevronState(chevron)).toEqual({
+            expanded: 'true',
+            label: 'Collapse thread',
+            title: 'Collapse thread',
+            controls: row.querySelector<HTMLElement>('.thread-body')?.id,
+            type: 'button'
+        });
 
-        // T6: this is the state the footer control could never serve — the body that
-        // holds it (and therefore the button itself) is hidden by
-        // `.thread-row:not(.is-expanded) .thread-body { display: none }`. The header
-        // chevron is the one a collapsed card renders.
-        expect(css).toContain('.thread-row:not(.is-expanded) .thread-body');
-        header?.click();
+        // T7: the chevron is collapse-ONLY. jsdom still dispatches a click on a
+        // `display: none` node, so this proves the handler itself never toggles: a second
+        // press cannot re-open the card the reader just closed.
+        chevron?.click();
+        expect(row.classList.contains('is-expanded')).toBe(false);
+
+        // And the header row re-opens it.
+        row.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-select')?.click();
         expect(row.classList.contains('is-expanded')).toBe(true);
-        expect(tile.classList.contains('is-expanded')).toBe(true);
-        expect(chevronState(header)?.label).toBe('Collapse thread');
-        expect(chevronState(footer)?.label).toBe('Collapse thread');
-        expect(row.querySelector('.thread-select')?.getAttribute('aria-expanded')).toBe('true');
-        // Re-opening a child card never touches the board's expanded turn.
-        expect(board.expanded()).toBe(turn);
     });
 
-    it('collapses and re-expands the root conversation through the board', () => {
-        const { board } = mount();
+    it('collapses the root conversation through the board, and never re-opens it', () => {
+        const { board, focused } = mount();
         const turn = board.begin('ask');
 
         turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
-        const footer = rootFooter(turn);
-        const header = rootHeader(turn);
+        const chevron = rootChevron(turn);
         expect(board.expanded()).toBe(turn);
+        expect(board.focusedThread()).toBeUndefined();
+        const reports = focused.length;
 
-        // The footer chevron collapses (a deliberate unfocus, exactly like the header).
-        footer?.click();
+        chevron?.click();
+        // The same transition the tile header performs: the conversation closes AND a
+        // collapse is a deliberate unfocus (T12). That board-level focus change is the
+        // ROOT's own semantics, not the chevron inventing any routing of its own.
         expect(turn.element.classList.contains('is-expanded')).toBe(false);
         expect(turn.element.querySelector('.tile-select')?.getAttribute('aria-expanded')).toBe('false');
-        for (const state of [chevronState(footer), chevronState(header)]) {
-            expect(state?.expanded).toBe('false');
-            expect(state?.label).toBe('Expand conversation');
-            expect(state?.title).toBe('Expand conversation');
-            expect(state?.data).toBe('false');
-        }
         expect(board.expanded()).toBeUndefined();
+        expect(focused.length).toBeGreaterThan(reports);
+        expect(focused[focused.length - 1]).toBeUndefined();
+        expect(chevronState(chevron)?.label).toBe('Collapse conversation');
 
-        // T6: and the HEADER chevron re-opens it — the state a collapsed tile renders
-        // (`.tile:not(.is-expanded) .tile-body { display: none }`).
-        header?.click();
+        // Collapse-only, idempotent: a second press cannot re-open the conversation …
+        chevron?.click();
+        expect(turn.element.classList.contains('is-expanded')).toBe(false);
+        // … and the header row does.
+        turn.element.querySelector<HTMLButtonElement>(':scope > .tile-select')?.click();
         expect(turn.element.classList.contains('is-expanded')).toBe(true);
-        expect(turn.element.querySelector('.tile-select')?.getAttribute('aria-expanded')).toBe('true');
-        expect(chevronState(header)?.label).toBe('Collapse conversation');
-        expect(chevronState(footer)?.label).toBe('Collapse conversation');
         expect(board.expanded()).toBe(turn);
     });
 
-    it('never moves board focus or the composer target, from either chevron', () => {
+    it('never moves board focus or the composer target when a persistent child collapses', () => {
         const { board, focused } = mount();
         board.setThreads(rosterWithChild());
         board.hydrate([
@@ -410,30 +383,50 @@ describe('block collapse chevrons (R5/T6)', () => {
         if (row === undefined) throw new Error(`no rows; html=${board.element.innerHTML.length}`);
         expect(row.dataset.persistentThread).toBe('thread-child');
         expect(board.focusedThread()).toBe('thread-root');
-        const reports = focused.length;
 
-        // T6: opening a PERSISTENT child from its header CHEVRON expands the card without
-        // focusing the conversation — the header BUTTON next to it does exactly the
-        // opposite (S2), and that routing is deliberately not inherited.
-        rowHeader(row)?.click();
-        expect(row.classList.contains('is-expanded')).toBe(true);
-        expect(board.focusedThread()).toBe('thread-root');
-        expect(focused).toHaveLength(reports);
-
-        // The HEADER click still routes focus (unchanged behaviour).
+        // Opening a PERSISTENT child from its header focuses that conversation (S2).
         row.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-select')?.click();
         expect(board.focusedThread()).toBe('thread-child');
-        expect(focused.length).toBeGreaterThan(reports);
-        const afterFocus = focused.length;
+        expect(row.classList.contains('is-expanded')).toBe(true);
+        const reports = focused.length;
 
-        // And the FOOTER chevron closes the card without re-targeting the composer.
-        rowFooter(row)?.click();
+        // The footer chevron closes the card IN PLACE: the composer still targets
+        // `thread-child`, and no focus change is reported at all.
+        rowChevron(row)?.click();
         expect(row.classList.contains('is-expanded')).toBe(false);
         expect(board.focusedThread()).toBe('thread-child');
-        expect(focused).toHaveLength(afterFocus);
+        expect(focused).toHaveLength(reports);
     });
 
-    it('keeps both chevrons truthful after a projection rebuild', () => {
+    it('follows a board-driven implicit open, with the same constant contract', () => {
+        const { board } = mount();
+        board.setThreads(rosterWithChild());
+        board.hydrate([
+            serverTurn({
+                id: 'turn-1',
+                index: 0,
+                threadId: 'thread-root',
+                status: 'running',
+                events: childEvents()
+            })
+        ]);
+
+        const row = threadRows(board.turns()[0])[0];
+        const chevron = rowChevron(row);
+        // Focusing the CHILD conversation opens its card without a click on this surface
+        // (`openEnclosingCards` / `focusChildThread` drive the model). The chevron needed
+        // no repaint to become truthful: the body it sits in is what shows it.
+        expect(board.focusThread('thread-child')).toBe(true);
+        expect(row.classList.contains('is-expanded')).toBe(true);
+        expect(chevronState(chevron)?.label).toBe('Collapse thread');
+
+        // And it closes that implicitly-opened card like any other.
+        chevron?.click();
+        expect(row.classList.contains('is-expanded')).toBe(false);
+        expect(chevronState(chevron)?.label).toBe('Collapse thread');
+    });
+
+    it('mints a fresh chevron with the same contract after a projection rebuild', () => {
         const { board } = mount();
         const turn = board.begin('rebuild');
 
@@ -445,10 +438,13 @@ describe('block collapse chevrons (R5/T6)', () => {
 
         const before = threadRows(turn)[0];
         before.querySelector<HTMLButtonElement>(':scope > .thread-tile > .thread-select')?.click();
-        expect(chevronState(rowHeader(before))?.expanded).toBe('true');
+        const stale = rowChevron(before);
+        expect(stale).not.toBeNull();
 
-        // A DISAGREEING prefix forces `resetProjection`: the row, the root section and all
-        // FOUR chevrons below are NEW elements.
+        // A DISAGREEING prefix forces `resetProjection`: the row, the root section and
+        // both chevrons below are NEW elements. Nothing may be left over from the
+        // discarded projection (a header chevron once was; now every chevron is inside the
+        // flow / body that gets replaced).
         turn.merge({
             ...serverTurn({
                 status: 'running',
@@ -467,63 +463,27 @@ describe('block collapse chevrons (R5/T6)', () => {
         const after = threadRows(turn)[0];
         expect(after).not.toBe(before);
         expect(after.classList.contains('is-expanded')).toBe(true);
-        // The rebuilt child: exactly ONE header chevron (the discarded row went with its
-        // own), and both buttons read the restored state.
-        const childTile = after.querySelector<HTMLElement>(':scope > .thread-tile') as HTMLElement;
-        expect(childTile.querySelectorAll(':scope > .header-collapse')).toHaveLength(1);
-        expect(chevronState(rowHeader(after))).toEqual({
+        const fresh = rowChevron(after);
+        expect(fresh).not.toBe(stale);
+        expect(after.querySelectorAll('.answer-collapse')).toHaveLength(1);
+        expect(chevronState(fresh)).toEqual({
             expanded: 'true',
             label: 'Collapse thread',
             title: 'Collapse thread',
-            data: 'true',
             controls: after.querySelector<HTMLElement>('.thread-body')?.id,
             type: 'button'
         });
-        expect(chevronState(rowFooter(after))).toEqual(chevronState(rowHeader(after)));
-        expect(rowHeader(after)).not.toBe(rowHeader(before));
 
-        // Same for the root conversation, whose section was re-created too. The header
-        // chevron lives OUTSIDE `.tile-flow`, so the rebuild must not leave the discarded
-        // one in the header row: that would be two chevrons, the older one frozen.
+        // The root conversation, whose section was re-created too: one chevron, still
+        // open, still collapse-only.
+        expect(turn.element.querySelectorAll('.answer-collapse')).toHaveLength(1);
+        expect(board.element.querySelectorAll('.header-collapse')).toHaveLength(0);
         expect(turn.element.classList.contains('is-expanded')).toBe(true);
-        expect(turn.element.querySelectorAll(':scope > .header-collapse')).toHaveLength(1);
-        expect(chevronState(rootHeader(turn))).toEqual({
-            expanded: 'true',
-            label: 'Collapse conversation',
-            title: 'Collapse conversation',
-            data: 'true',
-            controls: turn.element.querySelector<HTMLElement>('.tile-body')?.id,
-            type: 'button'
-        });
-        expect(chevronState(rootFooter(turn))).toEqual(chevronState(rootHeader(turn)));
-    });
-
-    it('follows an implicit open from the board, not only a click', () => {
-        const { board } = mount();
-        board.setThreads(rosterWithChild());
-        board.hydrate([
-            serverTurn({
-                id: 'turn-1',
-                index: 0,
-                threadId: 'thread-root',
-                status: 'running',
-                events: childEvents()
-            })
-        ]);
-
-        const row = threadRows(board.turns()[0])[0];
-        expect(chevronState(rowFooter(row))?.expanded).toBe('false');
-        expect(chevronState(rootHeader(board.turns()[0]))?.expanded).toBe('true');
-
-        // Focusing the CHILD conversation opens its card without ANY click on this surface
-        // (`openEnclosingCards` / `focusChildThread` drive the model), and it closes the
-        // parent tile in the same move. All four buttons must follow.
-        expect(board.focusThread('thread-child')).toBe(true);
-        expect(row.classList.contains('is-expanded')).toBe(true);
-        expect(chevronState(rowFooter(row))?.label).toBe('Collapse thread');
-        expect(chevronState(rowHeader(row))?.label).toBe('Collapse thread');
-        expect(chevronState(rootFooter(board.turns()[0]))?.expanded).toBe('false');
-        expect(chevronState(rootHeader(board.turns()[0]))?.label).toBe('Expand conversation');
+        expect(chevronState(rootChevron(turn))?.label).toBe('Collapse conversation');
+        fresh?.click();
+        expect(after.classList.contains('is-expanded')).toBe(false);
+        rootChevron(turn)?.click();
+        expect(turn.element.classList.contains('is-expanded')).toBe(false);
     });
 
     it('is an icon-only, keyboard-reachable control that stays enabled while streaming', () => {
@@ -532,50 +492,45 @@ describe('block collapse chevrons (R5/T6)', () => {
 
         turn.apply({ type: 'start', agent: 'writer', model: 'm1' });
         turn.apply({ type: 'text', agent: 'writer', delta: 'still streaming' });
+        turn.apply(delegateCall('helper', 'child task', 'd1'));
+        turn.apply(
+            withThread({ type: 'start', agent: 'helper', model: 'h1' }, { id: 't1', callId: 'd1', input: 'child task' })
+        );
         turn.flush();
         expect(turn.state()).toBe('streaming');
 
-        for (const button of [rootFooter(turn), rootHeader(turn)]) {
-            expect(button).not.toBeNull();
+        // The shape contract applies to BOTH owners: the root conversation's chevron and
+        // the nested card's. A running block is exactly when a reader most wants to close
+        // the transcript they are looking at, so neither may be disabled.
+        const chevrons = [rootChevron(turn), rowChevron(threadRows(turn)[0])];
+        expect(chevrons.every((button) => button !== null)).toBe(true);
+
+        for (const button of chevrons) {
             // Icon-only, exactly like the copy button: no visible word of its own.
             expect(button?.textContent).toBe('');
             const icon = button?.querySelector('svg');
             expect(icon?.getAttribute('aria-hidden')).toBe('true');
             expect(icon?.getAttribute('viewBox')).toBe('0 0 24 24');
+            // ONE down-pointing path, rotated to face UP by CSS (the button is always
+            // `aria-expanded="true"`), sized from the 24px box (styles.css).
             expect(icon?.querySelector('path')?.getAttribute('d')).toBe('M6 9l6 6 6-6');
-            // ONE glyph child, so the accessible name is the label and nothing else — and
-            // no nested interactive content anywhere inside it.
             expect(button?.children).toHaveLength(1);
+            // No nested interactive content anywhere inside it.
             expect(button?.querySelector('button, a, input, select')).toBeNull();
 
-            // A real <button> (Enter/Space are native), in the tab order, never disabled —
-            // a reader collapses or re-opens a running conversation without waiting.
+            // A real <button> (Enter/Space are native), in the tab order, never disabled — a
+            // reader closes a running block without waiting for it to settle.
             expect(button?.type).toBe('button');
             expect(button?.disabled).toBe(false);
             expect(button?.hasAttribute('tabindex')).toBe(false);
             expect(button?.hasAttribute('aria-disabled')).toBe(false);
             expect(button?.getAttribute('role')).toBeNull();
         }
-    });
 
-    it('renders exactly one chevron per state, and reserves the header row for it', () => {
-        // jsdom cannot compute the cascade, so the pair's exclusivity is pinned from the
-        // stylesheet source: the header control is hidden by default and shown ONLY while
-        // the block is collapsed, and the footer control is hidden while it is collapsed.
-        expect(css).toContain(':is(.tile, .thread-tile) > .header-collapse {');
-        expect(css).toContain(':is(.tile, .thread-tile):not(.is-expanded) > .header-collapse {');
-        expect(css).toContain(
-            ':is(.tile:not(.is-expanded) > .tile-body, .thread-tile:not(.is-expanded) > .thread-body) .answer-collapse {'
+        // The 24px footprint the contract relies on is a stylesheet fact jsdom cannot
+        // compute, so it is pinned against the source like ui/agent-answer-style.test.ts.
+        expect(css).toMatch(
+            /\.agent-answer-actions \.answer-collapse \{[^}]*width: 24px;[^}]*height: 24px;/s
         );
-        // The collapsed header reserves 10px padding + the 24px button + a 10px gap, so
-        // the flush-right measurement line (`.tile-top`/`.thread-top`) is never under it.
-        expect(css).toContain(
-            ':is(.tile:not(.is-expanded), .thread-tile:not(.is-expanded)) > :is(.tile-select, .thread-select) {'
-        );
-        expect(css).toContain('padding-right: 44px');
-        // T12b: an open CONVERSATION already renders every exchange's body, so there the
-        // footer chevron renders and the header one gives its slot back.
-        expect(css).toContain('.conversation.is-expanded > .turn-row > .tile > .header-collapse {');
-        expect(css).toContain('.conversation.is-expanded > .turn-row > .tile > .tile-body .answer-collapse {');
     });
 });

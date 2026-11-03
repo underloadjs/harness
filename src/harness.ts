@@ -7760,7 +7760,15 @@ export { createProfileTool, createChapterTool, createLocationTool } from './core
 // R4 cross-thread chat descriptor. The tool is registered CONDITIONALLY (once a
 // session owns an independent thread), so a server catalogue can quote the same
 // name/description/schema the runtime uses without advertising it up front.
-export { THREAD_LIST_METADATA, THREAD_LIST_NAME, THREAD_SEND_METADATA, THREAD_SEND_NAME } from './core';
+// `threadRead` (transcript reading) joins the same trio for the same reason.
+export {
+    THREAD_LIST_METADATA,
+    THREAD_LIST_NAME,
+    THREAD_READ_METADATA,
+    THREAD_READ_NAME,
+    THREAD_SEND_METADATA,
+    THREAD_SEND_NAME
+} from './core';
 export { MAX_THREAD_LABEL_CHARS, MAX_THREAD_RECORDS, defaultThreadIdOf } from './core';
 // Tool-panel bounds and the normalizer are public too: a client or a host-side
 // tool author can quote the same caps the server enforces (see core/tool-ui.ts).

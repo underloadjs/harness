@@ -84,6 +84,7 @@ describe('tools folder consolidation (R7)', () => {
             'task.tool.ts',
             'threadFork.tool.ts',
             'threadList.tool.ts',
+            'threadRead.tool.ts',
             'threadSend.tool.ts',
             'toolCancel.tool.ts',
             'toolCreate.tool.ts',
@@ -128,6 +129,7 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'search',
             'fetch',
             'threadSend',
+            'threadRead',
             'threadList'
         ]);
     });
@@ -235,6 +237,16 @@ describe('discoverToolMetadata (R8/R9)', () => {
             answerExtraction: undefined,
             sessionBound: true
         });
+        // The transcript reader joins the same conditional trio: registered on the
+        // first thread, not at startup, with no control marker.
+        expect(policy('threadRead')).toEqual({
+            activation: 'threads',
+            pendingOnly: undefined,
+            control: undefined,
+            primaryOnly: undefined,
+            answerExtraction: undefined,
+            sessionBound: true
+        });
         expect(policy('read')).toEqual({
             activation: 'always',
             pendingOnly: undefined,
@@ -265,6 +277,7 @@ describe('discoverToolMetadata (R8/R9)', () => {
             'search',
             'fetch',
             'threadSend',
+            'threadRead',
             'threadList'
         ]);
     });
@@ -448,9 +461,10 @@ describe('generated manifest parity (R9)', () => {
     });
 
     it('describes every package entry, and no folder entry', () => {
-        // 29 generated rows: the 28 historical package entries plus the
-        // `download` preset (order 235) added by R3/R4.
-        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(29);
+        // 30 generated rows: the 29 package entries before this change (including
+        // the `download` preset, order 235) plus the `threadRead` runtime entry
+        // (order 265) that reads a thread transcript.
+        expect(BUILTIN_TOOL_DESCRIPTORS).toHaveLength(30);
 
         for (const descriptor of BUILTIN_TOOL_DESCRIPTORS) {
             expect(descriptor.origin).toBe('package');

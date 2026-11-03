@@ -28,10 +28,22 @@
 // `session.lastError` is nested under `session` because it is a session-scoped
 // field (it may describe a failure that did not run in this thread at all).
 //
-// The dialog body is a `<pre>` containing `JSON.stringify(document, null, 2)`. The
-// dialog's Copy source is a CLICK-TIME provider over the live panel (T1/R3), so there
-// is no second serialization path and what the reader inspects is exactly what lands
-// on the clipboard — before and after a refresh alike, and in either mode.
+// The dialog body is a `<pre>` containing `JSON.stringify(document, null, 2)`. T1: that
+// `<pre>` is also the dialog's ONLY vertical scroller — the shared modal is opened in
+// fill mode (`DIALOG_BODY_FILL_CLASS`), so the header, the identity line and the "Edit
+// transcript" row stay on screen while a long document scrolls inside the text area, and
+// the scrollbar sits at the right edge of the JSON box. T3: being the only scroller also
+// makes it a keyboard target — the `<pre>` carries `tabindex="0"` so arrow / PageUp /
+// PageDown / Space scroll it after Tab lands there (a `:focus-visible` ring in styles.css
+// marks it), and the disclosure rows around the editor keep a non-shrinking height so a
+// short viewport never collapses them or clips the action row.
+//
+// The Copy source is a CLICK-TIME provider over the rendered surface (T1/R3), so there
+// is no second serialization path and what the reader inspects is exactly what lands on
+// the clipboard — before and after a refresh alike, and in either mode. T1 moved the
+// control itself from the dialog header onto the identity line (`.thread-transcript-meta`
+// row, right-aligned next to the "… · JSON snapshot" text), because the icon copies THAT
+// document; the shared header control stays available to every other dialog.
 //
 // EDITABLE (C5): the transcript is the user's own JSON, so the dialog also offers an
 // edit mode. "Edit transcript" swaps the document for a `<textarea
@@ -76,14 +88,16 @@
 //     openTranscriptOf, action bars)
 //   - shell source + delete API: src/frontend/main.ts
 //   - shared modal / Copy: src/frontend/ui/dialog.ts
-//   - styles: src/frontend/styles.css (`.thread-transcript-json`,
+//   - styles: src/frontend/styles.css (`.thread-transcript-meta`,
+//     `.thread-transcript-meta-copy`, `.thread-transcript-json`,
 //     `.thread-transcript-editor`, `.thread-transcript-error`,
-//     `.thread-transcript-note`, `.thread-transcript-actions`)
+//     `.thread-transcript-note`, `.thread-transcript-actions`, and the
+//     `.dialog-body--fill` chain that makes the document the only scroller)
 //
 // The module is intentionally INTERNAL: it is not re-exported from
 // src/frontend/index.ts. The board is its only production caller.
 
-import { createTextCopyButton, openDialog } from './dialog';
+import { DIALOG_BODY_FILL_CLASS, createTextCopyButton, openDialog } from './dialog';
 import type { DialogHandle } from './dialog';
 import type {
     HarnessEvent,
@@ -513,8 +527,61 @@ const actionButton = (className: string, label: string): HTMLButtonElement => {
     return button;
 };
 
+// --- the meta row (identity text + the copy icon) -----------------------------
+
+// T1: the copy control moved out of the shared modal's header and onto the line that
+// NAMES the document, right-aligned immediately after the "… · JSON snapshot" text. The
+// class is shared with styles.css (the row's flex anatomy and the icon's metrics live
+// there); the label never changes, so the outcome is announced by the button's own
+// hidden live child (ui/dialog.ts), not by a rename.
+const META_TEXT_CLASS = 'thread-transcript-meta-text';
+const META_COPY_CLASS = 'thread-transcript-meta-copy';
+const META_COPY_LABEL = 'Copy the transcript JSON';
+
+// The text the read surface copies: exactly what the `<pre>` shows. An absent or empty
+// DOCUMENT throws, which the shared control reports as a FAILED copy rather than an
+// empty success; an empty EDITOR is a legitimate state (the reader is mid-repair) and
+// copies as such. Both rules are the ones the header control used (T1/R3).
+const documentCopyText = (surface: HTMLElement): string => {
+    const text = surface.textContent;
+    if (typeof text !== 'string' || text.length === 0) {
+        throw new Error('thread transcript surface holds no text');
+    }
+    return text;
+};
+
+// One meta line for both modes. `copy` is a provider, resolved at CLICK time, so the
+// icon always writes what is on screen now: the rendered document, or the CURRENT
+// textarea value including unsaved edits. It is passed the node this very surface built
+// (never a captured snapshot of an earlier mode), which is the equivalent of the
+// panel-wide query the header button needed — the button is rebuilt together with its
+// own surface on every mode switch, so it cannot go stale.
+//
+// The identity text is a CHILD span, not the row's own textContent, for two reasons:
+// `paintEditorChrome` rewrites the line on a refresh and must not delete the button
+// beside it, and the button's hidden live child must not become part of the label a
+// screen reader reads out as this line.
+const metaRow = (text: string, copy: () => string): HTMLParagraphElement => {
+    const label = el('span', META_TEXT_CLASS, text);
+    const icon = createTextCopyButton({
+        label: META_COPY_LABEL,
+        text: copy,
+        className: META_COPY_CLASS
+    });
+    // Text first, icon second: `justify-content: space-between` puts the icon at the
+    // row's right edge, immediately after the label, without any order property.
+    const row = el('p', 'thread-transcript-meta');
+    row.append(label, icon);
+    return row;
+};
+
 // The read-only document + the affordance that leaves it. Never built from innerHTML:
 // the payload carries model/tool text and must stay data, not markup.
+//
+// DOM order is the layout contract (T1): meta row, then the `<pre>` that owns the
+// scroll, then the action row — styles.css `.dialog-body--fill > .thread-transcript` is
+// the flex chain that keeps the first and the last row on screen while the middle one
+// scrolls.
 const readContent = (input: {
     name: string;
     meta: string;
@@ -522,14 +589,20 @@ const readContent = (input: {
     onEdit?: () => void;
 }): HTMLElement => {
     const host = el('div', 'thread-transcript');
-    const meta = el('p', 'thread-transcript-meta', input.meta);
 
     const json = el('pre', 'thread-transcript-json');
     json.textContent = input.json;
     // Screen readers get the same disclosure that is copied; the <pre> is the
     // accessible reading surface for the document.
     json.setAttribute('aria-label', `JSON transcript of thread ${input.name}`);
-    host.append(meta, json);
+    // T3: this box is now the dialog's ONLY vertical scroll container (T1 moved the body
+    // out of the scroll chain), so it has to be reachable from the keyboard: a focused
+    // `overflow: auto` element takes the arrow / PageUp / PageDown / Space scroll keys,
+    // which an unfocusable box cannot. Tab order lands on it right after the meta-row
+    // copy icon and before the Edit control. `:focus-visible` in styles.css paints the
+    // ring only for keyboard focus, and the aria-label above is what the box announces.
+    json.tabIndex = 0;
+    host.append(metaRow(input.meta, () => documentCopyText(json)), json);
 
     if (input.onEdit !== undefined) {
         const edit = actionButton('thread-transcript-edit', 'Edit transcript');
@@ -587,7 +660,6 @@ const editorContent = (state: TranscriptState): HTMLElement => {
     const authority = state.editor;
 
     const host = el('div', 'thread-transcript thread-transcript-editing');
-    const meta = el('p', 'thread-transcript-meta', editorMeta(authority));
 
     const error = el('p', 'thread-transcript-error');
     error.setAttribute('role', 'status');
@@ -615,6 +687,14 @@ const editorContent = (state: TranscriptState): HTMLElement => {
             paintEditorChrome(state);
         }
     });
+
+    // Built AFTER the field so the meta row's copy icon can point at it: the provider is
+    // resolved at click time, so the icon writes the CURRENT text, unsaved edits
+    // included, exactly like the read surface writes its rendered document. In edit mode
+    // the row below also carries a labelled Copy button (kept because the row is where a
+    // keyboard reader looks for the dialog's actions); the icon is the same control with
+    // the same source, never a second clipboard path.
+    const meta = metaRow(editorMeta(authority), () => editor.value);
 
     const save = actionButton('thread-transcript-save', 'Save');
     save.addEventListener('click', () => {
@@ -703,7 +783,9 @@ const paintEditorChrome = (state: TranscriptState): void => {
 
     const panel = state.handle.element;
 
-    const meta = panel.querySelector<HTMLElement>('.thread-transcript-meta');
+    // The identity TEXT is its own node inside the meta row (T1), so repainting the line
+    // cannot remove the copy icon that now shares it.
+    const meta = panel.querySelector<HTMLElement>('.thread-transcript-meta-text');
     if (meta !== null) meta.textContent = editorMeta(state.editor);
 
     const error = panel.querySelector<HTMLElement>('.thread-transcript-error');
@@ -718,33 +800,11 @@ const paintEditorChrome = (state: TranscriptState): void => {
     if (save !== null) paintSaveButton(state, save);
 };
 
-// T1/R3: the dialog's Copy SOURCE, resolved at CLICK time from the live panel. It
-// always writes what the reader is looking at: the read-only document, or the
-// editor's CURRENT text including unsaved edits. Querying the panel (instead of
-// capturing one node) is what keeps the provider correct across a mode switch, where
-// the content node is replaced but the header button is not.
-//
-// A missing/empty DOCUMENT surface throws, which the dialog reports as a failed copy
-// rather than an empty success; an empty EDITOR is a legitimate state (the reader is
-// mid-repair) and copies as such.
-const transcriptCopySource = (state: TranscriptState): (() => string) => () => {
-    const panel = state.handle.element;
-
-    const editor = panel.querySelector<HTMLTextAreaElement>('.thread-transcript-editor');
-    if (editor !== null) return editor.value;
-
-    const surface = panel.querySelector<HTMLElement>('.thread-transcript-json');
-    if (surface === null) {
-        throw new Error('thread transcript content has no .thread-transcript-json surface');
-    }
-
-    const text = surface.textContent;
-    if (typeof text !== 'string' || text.length === 0) {
-        throw new Error('thread transcript surface holds no text');
-    }
-
-    return text;
-};
+// T1/R3: the copy providers live with the surfaces they read (`readContent` copies the
+// rendered document, `editorContent` copies the field), because the icon that triggers
+// them now lives inside the same content node and is replaced with it. The rule they
+// share is unchanged: whatever is on screen at CLICK time is what lands on the
+// clipboard, before and after a refresh alike, in either mode.
 
 // The single open transcript this UI owns. `scope` is the board identity from
 // ui/turns.ts; `sessionId` guards a stale refresh that resolves after a session
@@ -982,7 +1042,15 @@ export const openThreadTranscript = (
     state.handle = openDialog({
         title: dialogTitle(editor),
         content,
-        copy: transcriptCopySource(state),
+        // T1: the document owns the vertical scroll, so the header, the identity line
+        // and this surface's own action row never scroll away (`dialog-body--fill` turns
+        // the shell body into a stretched, non-scrolling flex column — see styles.css and
+        // ui/dialog.css).
+        bodyClassName: DIALOG_BODY_FILL_CLASS,
+        // T1: no `copy` here on purpose. The shared header control would sit far from the
+        // JSON it copies and put the icon back in the corner of the panel, so the
+        // transcript passes its own click-time provider to the meta-row button instead
+        // (`readContent` / `editorContent`); `dialog-copy` stays for the other dialogs.
         onClose: () => {
             if (activeTranscript === state) activeTranscript = undefined;
         }

@@ -31,8 +31,9 @@
 //                  shared modal. There is no tab strip (R3);
 //   - right rail — the tool-contributed SCRATCH BOARD (primary panel host), and nothing
 //                  else since T3/R1 moved the session directory into the header. On a
-//                  phone it opens as a right-side drawer from the floating
-//                  `.scratch-fab` (T3/R3).
+//                  phone it opens from the floating `.scratch-fab` (T3/R3), and since T8
+//                  it opens in the SAME left-hand sidebar slot as the harness drawer: the
+//                  phone has one sidebar, showing whichever trigger was pressed last.
 //
 // R21.2 removed the right rail's core-tools dropdown and tool catalogue. They
 // duplicated the tools view, which is now the single place to review and call
@@ -196,6 +197,14 @@ import type { PanelMedia } from './ui/panels';
 import type { FilePreviewReader, FilePreviewResult } from './ui/file-preview';
 import { createTurnBoard, labelSeedsOf } from './ui/turns';
 import type { AnswerActionInput, TurnHandle } from './ui/turns';
+// Harness totals for the details dialog (threads / input / time / cache across EVERY
+// session of the selected harness). The pure helper lives in `ui/` so it is testable
+// without booting the shell, and the two formatters are the SAME ones the turn header
+// already prints token counts and elapsed time with — one vocabulary of numbers.
+import { summarizeSessionUsage } from './ui/usage-summary';
+import type { SessionUsageSummary } from './ui/usage-summary';
+import { formatDuration } from './ui/time';
+import { formatTokens } from './ui/tokens';
 // Persistent agent threads (R2/R5/R6/R7): roster reading and the routing decision for
 // the next submit. See ui/threads.ts for the server contract; every read there is
 // additive (legacy snapshots simply produce an empty roster).
@@ -1698,6 +1707,11 @@ const railIcon = (glyph: string): HTMLSpanElement => {
 // painted by `setRailOpen` so the disclosure state is real for assistive tech. CSS
 // hides the button entirely above 860px (`.scratch-fab { display: none; }`), where the
 // rail is permanently visible and the control would be a no-op.
+//
+// T8: the rail keeps the id `rail-right` (and `aria-controls` points at it) because the
+// name describes the CONTENT — the scratch board — not the edge it opens from. On a phone
+// that drawer now slides in from the left, in the harness drawer's slot, and the button is
+// stacked above the backdrop so it can switch drawers with one press.
 const scratchFab = el('button', 'scratch-fab');
 scratchFab.type = 'button';
 scratchFab.id = 'scratch-fab';
@@ -2089,6 +2103,66 @@ const headName = el('span', 'harness-id', '');
 const headNote = el('p', 'harness-note', '');
 headNote.id = 'harness-note';
 
+// T7 (user feedback, phone): "Lower screen … needed to highlight which session is being
+// viewed, but I want a pill next to the instruct button … clicking it will rotate through
+// the session available. There is no need for delete button in this mode."
+//
+// Under 861px the header strip is `display:none` (`.session-pills-bar-head`, styles.css)
+// and the directory moves INSIDE the Instruct dialog, so a phone reader sees no answer to
+// "which conversation am I looking at?". This pill answers it in ~70px and steps to the
+// next conversation on press; deleting stays in the dialog's full dashboard.
+//
+// It is a SIBLING of the `h1` itself (`.main-title`), inserted between the title and the
+// `.harness-id` line, so it sits immediately to the RIGHT of `.harness-title-button` in the
+// row — and it is never nested inside that button: the title already opens the details
+// dialog, and interactive content may not live inside a <button>, or one press could mean
+// two different things.
+const sessionCycle = el('button', 'session-cycle');
+sessionCycle.type = 'button';
+// `paintSessionCycle()` owns this: with no conversation open the pill has nothing to name.
+// (styles.css `[hidden] { display: none !important }` makes it authoritative over the
+// phone block's `display: inline-flex`, so no extra visibility rule is needed here.)
+sessionCycle.hidden = true;
+// The only VISIBLE text is the eight-character prefix (the same rule the strip follows);
+// the full uuid stays in the tooltip.
+const sessionCycleId = el('span', 'session-cycle-id', '');
+// The rotation glyph is the wordless "this cycles" cue. Decoration, so it stays out of the
+// accessible name the button carries.
+const sessionCycleGlyph = el('span', 'session-cycle-glyph', '\u21c4');
+sessionCycleGlyph.setAttribute('aria-hidden', 'true');
+sessionCycle.append(sessionCycleId, sessionCycleGlyph);
+
+// Cycling walks the SAME projection the strip paints (`sessionDirectory`), so "next" is
+// always the next conversation the reader would find in the dashboard.
+//   - last entry → wraps to the first;
+//   - an active id that is not in the list (`index` -1 — the conversation was deleted in
+//     another tab and the directory re-read, or nothing is open at all) → starts at the
+//     FIRST entry rather than wrapping past the end;
+//   - an empty list → no-op, because there is nothing to open.
+//
+// There is deliberately no separate "nothing is open" branch: in that state
+// `paintSessionCycle` has already written `hidden`, and the stylesheet's global
+// `[hidden] { display: none !important }` rule takes the control out of the layout, the tab
+// order and the pointer, so this handler only ever runs on a pill the reader can see. (jsdom
+// still dispatches a click on a hidden node, which is why session-cycle.test.ts pins what
+// such a press does: the first conversation, never a stale pointer.)
+//
+// `openSession` is a module-level `const` declared far below; the arrow defers the read to
+// click time (the same temporal-dead-zone discipline `createSessionPillBar` uses for
+// `newSession`). No delete affordance and no delete handler live here.
+sessionCycle.addEventListener('click', () => {
+    const list = sessionDirectory().map((entry) => entry.session);
+    if (list.length === 0) return;
+
+    const index = list.findIndex((session) => session.id === current?.sessionId);
+    const next = list[(index + 1) % list.length] ?? list[0];
+    if (next === undefined) return;
+
+    // Switching is a view change (R4), never a cancellation, and it repaints through
+    // `renderSessions()` → `paintSessionCycle()`.
+    void openSession(next.id);
+});
+
 // R2: one painter for the title trigger's state. The chat head names a harness, so
 // the button advertises (and opens) the details dialog. The tools view names the
 // catalogue or a tool instead, so the button is disabled, drops `aria-haspopup` and
@@ -2188,6 +2262,106 @@ const createSessionPillBar = (variant: 'head' | 'dialog'): SessionPillBar => {
     return bar;
 };
 
+// Aggregate totals for the selected harness, across EVERY session the dialog lists.
+//
+// The row is built from `sessionDirectory()` — the exact list the session chips come
+// from (main.ts:5713) — so a figure can never disagree with the strip above it. Four
+// totals (thread count, total input tokens, total completed time, total cached input),
+// never per-thread values. A figure the data does not report produces NO span (see
+// ui/usage-summary.ts), because "not reported" is a different fact from zero.
+//
+// The `' | '` between figures is CSS decoration (`.harness-details-stat + ...`), not a
+// text node, so each span stays a clean, copy-pastable value — the same discipline as
+// the turn header's measurement line (styles.css:2333).
+//
+// Cross-references:
+//   - src/frontend/ui/usage-summary.ts — the derivation (threads/unknown rules)
+//   - src/frontend/ui/tokens.ts        — formatTokens, the grouped token figures
+//   - src/frontend/ui/time.ts          — formatDuration, the elapsed figure
+const harnessStatFigures = (summary: SessionUsageSummary): HTMLElement[] => {
+    // One labelled figure. Every value here is a TOTAL over the whole session set, and
+    // `input`/`cache` are not self-explanatory, so the scope and the unit ride on the
+    // node as a tooltip rather than as visible clutter.
+    const figure = (text: string, title: string): HTMLElement => {
+        const span = el('span', 'harness-details-stat', text);
+        span.title = title;
+        return span;
+    };
+
+    // A thread count is always derivable from the roster and the turn ids, so it is the
+    // one figure that never disappears: `0 threads` is a real answer, not a gap.
+    const figures: HTMLElement[] = [
+        figure(
+            `${summary.threads} thread${summary.threads === 1 ? '' : 's'}`,
+            'Threads across all sessions of this harness'
+        )
+    ];
+
+    if (summary.input !== undefined) {
+        figures.push(
+            figure(`${formatTokens(summary.input)} input`, 'Prompt tokens across all sessions of this harness')
+        );
+    }
+
+    if (summary.durationMs !== undefined) {
+        // `1m30s` already carries its own unit, so the label is the tooltip only. The
+        // empty-string guard covers the formatter's own "nothing honest to show" case.
+        const time = formatDuration(summary.durationMs);
+        if (time.length > 0) {
+            figures.push(figure(time, 'Summed completed run time across all sessions of this harness'));
+        }
+    }
+
+    if (summary.cached !== undefined) {
+        figures.push(
+            figure(
+                `${formatTokens(summary.cached)} cache`,
+                'Input tokens served from the provider prefix cache'
+            )
+        );
+    }
+
+    return figures;
+};
+
+// The totals for the conversation set the dialog is describing, from the one directory
+// projection (`sessionDirectory()`), so the pills and the figures are the same set.
+const harnessDialogSummary = (): SessionUsageSummary =>
+    summarizeSessionUsage(sessionDirectory().map((entry) => entry.session));
+
+// The live `<p>` inside an OPEN dialog, kept so a repaint can touch ONLY these figures.
+// `renderSessions()` is the single painter every snapshot already flows through
+// (`applySnapshot`/`upsertSession`), and replacing the children of one `<p>` cannot move
+// focus or scroll — unlike `refreshHarnessDialog`, which rebuilds the whole body and
+// would reset the reader's place on every streamed usage event.
+let dialogStats: HTMLElement | undefined;
+
+const paintHarnessDialogStats = (): void => {
+    const row = dialogStats;
+    if (row === undefined) return;
+
+    // Closing takes the adopted body (and this row) out of the document, so the painter
+    // drops the dead node instead of painting into it.
+    if (!row.isConnected) {
+        dialogStats = undefined;
+        return;
+    }
+
+    const summary = harnessDialogSummary();
+
+    // Every conversation was deleted while the dialog stayed open: the row goes quiet
+    // (the global `[hidden]` rule, styles.css:75) rather than printing an empty shell.
+    // The node stays, so a session that arrives later still repopulates it.
+    if (summary.sessions === 0) {
+        row.hidden = true;
+        row.replaceChildren();
+        return;
+    }
+
+    row.hidden = false;
+    row.replaceChildren(...harnessStatFigures(summary));
+};
+
 // The dialog's body, built from the CURRENT breakpoint. R2 (T3): on a phone the header
 // strip is `display:none`, so the dialog carries the directory instead — it goes FIRST,
 // because choosing a conversation is the action a phone reader came for — and it is the
@@ -2206,6 +2380,10 @@ const harnessDetailsBody = (display: HarnessDescriptor): HTMLElement => {
         dialogSessionBar = undefined;
     }
 
+    // The stats row is rebuilt together with the body, so the live reference goes with
+    // the old node; `paintHarnessDialogStats` re-arms on the way out.
+    dialogStats = undefined;
+
     const body = el('div', 'harness-details');
 
     if (isPhoneLayout()) {
@@ -2216,6 +2394,14 @@ const harnessDetailsBody = (display: HarnessDescriptor): HTMLElement => {
     if (display.description.length > 0) {
         body.append(el('p', 'harness-details-description', display.description));
     }
+
+    // OUTSIDE the phone branch on purpose: the totals are desktop content too. Omitted
+    // entirely when the harness has no conversations (no sessions, nothing to total).
+    if (sessionDirectory().length > 0) {
+        dialogStats = harnessDetailsStats();
+        body.append(dialogStats);
+    }
+
     body.append(el('p', 'harness-details-meta', harnessMeta(display)));
     // The header's own note is hidden on a phone (styles.css), so the dialog repeats
     // it here: the "edits apply to new sessions" context. A locked saved session has no
@@ -2296,7 +2482,10 @@ headTitleButton.addEventListener('click', () => {
 // R1 (T3): the header's only children are the title line and the note; the rail
 // disclosure is gone from this row (`.scratch-fab` owns it now), and the session
 // directory sits between them as a pill strip.
-titleRow.append(headTitle, headName);
+//
+// T7: the title row is `title`, the phone session cycler, then the id/group line. The
+// cycler is `display: none` above the phone breakpoint, so desktop's row is unchanged.
+titleRow.append(headTitle, sessionCycle, headName);
 const headSessionBar = createSessionPillBar('head');
 mainHead.append(titleRow, headSessionBar.element, headNote);
 
@@ -3352,6 +3541,32 @@ const paintComposerTarget = (): void => {
     composerField.dataset.target = showTarget ? 'true' : 'false';
     if (showTarget) input.setAttribute('aria-describedby', 'composer-target');
     else input.removeAttribute('aria-describedby');
+
+    // Issue B: the notch label's TEXT has to start at the same x as the caret inside
+    // the field (the "blue dot"), not at a fixed 10px. A static `left` cannot track
+    // it, because the text column's origin is content-dependent: the agent button is
+    // the frame's first child (R16) and its width is the agent NAME on desktop and the
+    // short code (`IT`) under the 860px media query, so the caret moves when the agent
+    // changes or the viewport crosses the breakpoint.
+    //   - `input.offsetLeft` is measured against `.composer-field`, which is ALSO the
+    //     label's containing block (`position: relative`), so `left` and `offsetLeft`
+    //     share one origin and need no extra arithmetic;
+    //   - `+ textInset` crosses the input's own left padding to reach the glyph column
+    //     (read from the live computed style so a stylesheet change cannot drift; the
+    //     `|| 8` fallback is what jsdom/no-layout hosts get);
+    //   - `- 5` cancels the label's own `padding: 0 5px`, which is what puts the text
+    //     — not the label's background box — on the caret;
+    //   - the 10px floor is the stylesheet's fallback and keeps the label off the
+    //     frame's rounded corner when the pill is missing (tools view, no agent).
+    // Hidden clears the inline value so the label can never carry a stale measurement
+    // into the next painted state (`[hidden]` is `display: none`, so the write would
+    // otherwise be the only thing recomputed late).
+    if (showTarget) {
+        const textInset = Number.parseFloat(getComputedStyle(input).paddingLeft) || 8;
+        composerTarget.style.left = `${Math.max(10, input.offsetLeft + textInset - 5)}px`;
+    } else {
+        composerTarget.style.left = '';
+    }
 };
 
 const paintComposer = (): void => {
@@ -3490,6 +3705,12 @@ window.addEventListener('resize', () => {
     // R3 (T3): explicit, not merely via `autoGrow`, so the scratch button's anchor is
     // refreshed even in a host where the composer has no editable content to grow.
     syncComposerHeight();
+    // Issue B: the notched label is aligned to the caret by MEASUREMENT (see
+    // `paintComposerTarget`), and the agent pill's width — the input's offset — changes
+    // purely in CSS at the 860px breakpoint (full name -> short code). A resize is the
+    // only signal for that swap, so the label has to be re-measured here or it drifts
+    // off the text column the moment the pill shrinks.
+    paintComposerTarget();
 });
 
 
@@ -3542,9 +3763,12 @@ railBackdrop.setAttribute('aria-hidden', 'true');
 
 // R3 (T3): the scratch FAB is mounted in the shell but is NOT a grid item — CSS makes it
 // `position: fixed`, so it takes no track and cannot disturb the three-column layout.
-// It is appended BEFORE the backdrop on purpose: the backdrop (z-index 2) covers the
-// button (z-index 1) while a rail is open, so a tap on the button dismisses the drawer
-// like any other outside press instead of toggling it under an invisible overlay.
+// T8 changed the stacking decision: the button is painted ABOVE the backdrop (2) and both
+// drawers (3) with `z-index: 4`, because it is the only way onto the scratch board and the
+// reader must be able to press it while the harness drawer is open — one press then SWITCHES
+// drawers in the single sidebar slot instead of the press being swallowed as an outside
+// dismiss. DOM order still puts it before the backdrop; the layering is CSS's, and the
+// backdrop keeps its own click handler for every other outside press.
 shell.append(leftRail, center, rightRail, scratchFab, railBackdrop);
 app.append(topbar, shell);
 
@@ -3636,6 +3860,15 @@ const syncBrandTrigger = (): void => {
 // so the collapsed default has no lingering data state to style. `trigger` is the
 // control that opened the rail, so closing always restores focus there even when the
 // reader switches from one rail to the other.
+//
+// T8 — the single sidebar, in code: `openRail` is ONE value and `shell[data-rail-open]` is
+// ONE attribute, so "open the other one" is a reassignment, not a second state to keep in
+// step. Every call repaints BOTH disclosures (the FAB through the line below, the brand and
+// the drawer heading through `syncBrandTrigger`), which is what makes a direct switch
+// (harness drawer open → press the scratch button) leave no stale `aria-expanded="true"` on
+// the control that just lost the slot, and `railReturnFocus` is OVERWRITTEN on every open —
+// the trigger of the rail that is now showing is the dismiss target, never the hidden
+// element that opened the previous one.
 const setRailOpen = (side: 'left' | 'right' | undefined, trigger?: HTMLElement): void => {
     openRail = side;
 
@@ -3667,8 +3900,18 @@ const setRailOpen = (side: 'left' | 'right' | undefined, trigger?: HTMLElement):
         // The harness drawer is modal-ish: move focus to its own dismiss control (R4:
         // the heading toggle, which is what the removed `×` used to be) so Escape/Tab
         // and the dismissal affordance are immediately reachable.
-        if (side === 'left') harnessTitleToggle.focus({ preventScroll: true });
-        return;
+        if (side === 'left') {
+            harnessTitleToggle.focus({ preventScroll: true });
+            return;
+        }
+
+        // T8: the scratch drawer has NO in-drawer toggle — its dismiss control IS the FAB —
+        // so focus goes to the trigger on open. This matters most when the reader switches
+        // from the harness drawer: the heading that held focus sits inside a rail CSS has just
+        // hidden, and a browser moves focus to <body> when the focused element stops being
+        // rendered. Pinning the FAB keeps Escape, Tab and the second press that closes the
+        // drawer reachable, and matches where a pointer press already placed the focus.
+        scratchFab.focus({ preventScroll: true });
     }
 
     // Closed: hand focus back to the trigger when it is still in the page. A
@@ -3683,10 +3926,14 @@ const setRailOpen = (side: 'left' | 'right' | undefined, trigger?: HTMLElement):
 // the familiar collapsed disclosure state.
 syncBrandTrigger();
 
-// R3 (T3): the floating scratch button is a real toggle for the RIGHT rail — pressing
-// it again collapses the drawer, and opening it closes the left one (the two rails stay
-// exclusive on a phone). The stored trigger is the button itself, so Escape, the
-// backdrop or a programmatic close hands focus back to it.
+// R3 (T3): the floating scratch button is a real toggle for the RIGHT rail — pressing it
+// again collapses the drawer. T8: opening it also closes the harness drawer IN ONE PRESS,
+// because the phone has one sidebar slot (`setRailOpen` holds a single `openRail`), and the
+// button is stacked ABOVE the backdrop (styles.css `z-index: 4`) precisely so this press
+// reaches it while the harness drawer is open. The switch reads `openRail === 'right'`
+// first, so from `'left'` it lands on `'right'` rather than closing anything, and the
+// stored trigger is the button itself — so Escape, the backdrop or a programmatic close
+// hand focus back to the control that is still on screen.
 scratchFab.addEventListener('click', () => {
     setRailOpen(openRail === 'right' ? undefined : 'right', scratchFab);
 });
@@ -4573,6 +4820,14 @@ const renderHarnessChrome = (): void => {
     // Keep the open dialog truthful after a promotion/model PATCH/frame without
     // closing it (unchanged state is a no-op inside refreshAgentDialog).
     refreshAgentDialog(view, instance);
+
+    // Issue B: this is the ONLY place the agent button is rebuilt, so it is the one
+    // funnel through which the pill's width changes (harness switch, agent promotion,
+    // a team edit, an activity/snapshot frame). The label's inline `left` is derived
+    // from that width, so the alignment has to be recomputed here — nothing else in
+    // this path repaints the composer, and a stale `left` would leave the notch label
+    // sitting over the previous agent's text column.
+    paintComposerTarget();
 };
 
 // One derived description of the agent UI for the selected instance. Both the
@@ -5563,6 +5818,34 @@ const visibleSessions = (): SessionSnapshot[] => {
     );
 };
 
+// T7: THE one session directory projection, shared by every surface that lists the
+// reader's conversations. `renderSessions()` paints it as pills and the phone cycler
+// (`paintSessionCycle`) walks it to answer "which session is next?", so the strip, the
+// dialog copy and the pill can never disagree about membership or order.
+//
+// Selected harness first. Then (R6) the conversations of a harness the reader deleted:
+// the server never cascades, and with no rail group to hold them any more they stay
+// listed, flagged `archived`, exactly as reachable as before. A session already in the
+// first list is skipped, so an archived harness that is CURRENTLY selected is never
+// listed twice.
+type SessionDirectoryEntry = { session: SessionSnapshot; archived: boolean };
+
+const sessionDirectory = (): SessionDirectoryEntry[] => {
+    const entries: SessionDirectoryEntry[] = visibleSessions().map((session) => ({
+        session,
+        archived: archivedHarnessOf(session) !== undefined
+    }));
+
+    const seen = new Set(entries.map((entry) => entry.session.id));
+    for (const session of archivedSessions()) {
+        if (session.harness === selectedName || seen.has(session.id)) continue;
+        seen.add(session.id);
+        entries.push({ session, archived: true });
+    }
+
+    return entries;
+};
+
 // ---------------------------------------------------------------------------
 // Deleting a session (R8, T1/R1)
 // ---------------------------------------------------------------------------
@@ -5762,7 +6045,16 @@ const renderSessionPill = (
     select.type = 'button';
     select.dataset.sessionId = session.id;
     select.dataset.status = session.status;
-    if (session.id === activeId) select.dataset.active = 'true';
+    if (session.id === activeId) {
+        select.dataset.active = 'true';
+        // T7: the highlight is only a border/background tint, and the strip is the one place
+        // that states which conversation is on screen, so the relation is announced as well.
+        // `aria-current` is ARIA for "this is the current item of a set"; it is written under
+        // the SAME condition as `data-active`, from the SAME painter, so what a reader sees
+        // and what a screen reader hears can never disagree — in the header strip or in the
+        // dialog copy on a phone, both of which are rebuilt from `activeId` on every paint.
+        select.setAttribute('aria-current', 'true');
+    }
     // Switching conversations is refused while a run is in flight (the same lock the old
     // row carried, and the reason the rail's New session is disabled too).
     select.disabled = running;
@@ -5794,11 +6086,84 @@ const renderSessionPill = (
     return pill;
 };
 
+// T7: paint the phone-only cycling pill next to the Instruct title (the node and the click
+// route are built in the head above). It is driven from `renderSessions()`, which every
+// mutation path already calls (open, delete, new, refresh, a snapshot frame), so the pill
+// follows the directory the instant it changes — and from `paintControls()`, which owns the
+// busy lock the same way it owns the strip's.
+//
+// Three facts, all read from the SAME state the strip paints from:
+//   - WHICH conversation: `current.sessionId`. No session open → the pill is `hidden`,
+//     because naming nothing and cycling to "the next" of nothing would be a lie.
+//   - WHAT it shows: `shortId(id)` — eight characters, like the strip. The full uuid, the
+//     harness and the status are tooltip facts only, so the row stays one line wide.
+//   - WHAT a press does: the next entry of `sessionDirectory()`, the strip's own projection.
+// The guard is the strip's own "can I switch" rule (`submitting || running`, see
+// `paintControls`), because pressing this pill calls the very same `openSession`.
+const paintSessionCycle = (): void => {
+    const instance = current;
+    const activeId = instance?.sessionId;
+
+    if (activeId === undefined || instance === undefined) {
+        sessionCycle.hidden = true;
+        sessionCycle.disabled = false;
+        sessionCycleId.textContent = '';
+        delete sessionCycle.dataset.sessionId;
+        delete sessionCycle.dataset.status;
+        sessionCycle.removeAttribute('aria-label');
+        sessionCycle.removeAttribute('title');
+        return;
+    }
+
+    // The record behind the pointer. Normally the directory entry itself; `instance.snapshot`
+    // is the fallback for a conversation opened from a record the list read has not returned
+    // yet, so the tooltip still describes what is on screen.
+    const record =
+        sessions.find((session) => session.id === activeId) ?? instance.snapshot;
+    const harness = record?.harness ?? (instance.frozen ?? instance.descriptor).title;
+    const status = record?.status ?? 'unknown';
+    const short = shortId(activeId);
+    // Same lock as a strip pill: switching mid-run would drop the reader out of a
+    // conversation whose queue is still moving.
+    const blocked = submitting || running;
+
+    sessionCycle.hidden = false;
+    sessionCycle.disabled = blocked;
+    sessionCycle.dataset.sessionId = activeId;
+    sessionCycle.dataset.status = status;
+    sessionCycleId.textContent = short;
+    // The visible text is eight hex characters, so the NAME says what the pill points at and
+    // what pressing it does — the same reasoning as the strip's `Open session …` labels.
+    sessionCycle.setAttribute(
+        'aria-label',
+        `Current session ${short}. Switch to the next session.`
+    );
+    // The tooltip carries what the compact pill has no room for: the harness, the server
+    // status, the FULL uuid, and the action (or the reason the action is locked).
+    sessionCycle.title =
+        `${harness} · ${status} · ${activeId} · ` +
+        (blocked ? 'wait for the run to finish before switching' : 'click to switch');
+};
+
 // The single painter for the directory. `renderSessions()` is still the only entry point
 // (every mutation path already calls it), and it repaints EVERY live strip — the header
 // one and, on a phone, the one inside the open Instruct dialog — from one projection, so
 // the two copies can never disagree.
 const renderSessions = (): void => {
+    // T7: the pill beside the title is not a strip, so it is painted BEFORE the early
+    // return below — with no live bar at all (a closed dialog, a phone that never opens
+    // one) it still has to name the conversation on screen.
+    paintSessionCycle();
+
+    // The dialog's aggregate figures ride the SAME projection as the pills, so they are
+    // repainted here: a streamed usage tally lands in `sessions` through
+    // `applySnapshot`/`upsertSession`, which both route through this painter. Kept
+    // narrowly scoped on purpose — only the spans inside `.harness-details-stats` are
+    // replaced, so an open dialog keeps its scroll position, its focus trap and its
+    // pill strip (a full `refreshHarnessDialog` rebuild on every frame would flicker
+    // the whole body and reset the reader).
+    paintHarnessDialogStats();
+
     // A closed dialog adopts its body into the overlay and removes the layer wholesale,
     // so its strip is disconnected here. Dropping it keeps the loop off dead nodes.
     for (const bar of [...sessionBars]) {
@@ -5810,23 +6175,8 @@ const renderSessions = (): void => {
     if (bars.length === 0) return;
 
     const activeId = current?.sessionId;
-
-    // Selected harness first. Then (R6) the conversations of a harness the reader deleted:
-    // the server never cascades, and with no rail group to hold them any more they stay in
-    // the strip, flagged `data-archived`, exactly as reachable as before. A session already
-    // in the first list is skipped, so an archived harness that is CURRENTLY selected is
-    // never pill'd twice.
-    const entries: { session: SessionSnapshot; archived: boolean }[] = visibleSessions().map((session) => ({
-        session,
-        archived: archivedHarnessOf(session) !== undefined
-    }));
-
-    const seen = new Set(entries.map((entry) => entry.session.id));
-    for (const session of archivedSessions()) {
-        if (session.harness === selectedName || seen.has(session.id)) continue;
-        seen.add(session.id);
-        entries.push({ session, archived: true });
-    }
+    // T7: extracted into `sessionDirectory()` so the phone cycler walks exactly this list.
+    const entries = sessionDirectory();
 
     for (const bar of bars) {
         if (entries.length === 0) {
@@ -6942,6 +7292,12 @@ const paintControls = (): void => {
             button.disabled = deletionsBlocked || (id !== undefined && removingSessions.has(id));
         }
     }
+
+    // T7: the phone cycler opens a conversation through the very same `openSession` a strip
+    // pill uses, so it carries the very same lock. Repainting it HERE (not only from
+    // `renderSessions`) is what keeps it honest when a run starts or ends without the
+    // directory changing — the same reason the strip's buttons are re-walked above.
+    paintSessionCycle();
 
     // The compact agent control follows the pending lock for TEAM edits; models
     // remain live (R2) and are handled in renderHarnessChrome/renderAgentControl.

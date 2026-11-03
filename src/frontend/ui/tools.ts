@@ -629,9 +629,12 @@ export const createToolCallCard = (
             // tool name + state + arguments + result together is exactly what made
             // "copy the result" require pasting-and-cutting, so the tool dialog drops
             // the centered header action entirely and each pane heading carries its
-            // own icon (see `createPaneHeading`). Every OTHER dialog (transcript,
-            // file preview, the manual tool runner) still passes `copy` and keeps its
-            // header button.
+            // own icon (see `createPaneHeading`). That is now the normal case rather
+            // than the exception: the transcript carries its own click-time icon on the
+            // meta row (ui/thread-transcript.ts, T1) and the manual tool runner, the
+            // chips and the attachment/image previews carry their own per-pane control
+            // or none at all. `ui/file-preview.ts` is the only remaining caller of the
+            // shared header button (it passes `copy: null` once the payload is binary).
             returnFocus: summary,
             onClose: () => {
                 if (dialog === handle) dialog = undefined;

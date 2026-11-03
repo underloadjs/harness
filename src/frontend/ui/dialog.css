@@ -188,8 +188,9 @@
     opacity: 0;
 }
 
-/* The only scroll container: `min-height: 0` is what lets flex actually shrink it,
- * and `overscroll-behavior` stops chained scroll behind the modal.
+/* The scroll container for every dialog that does not opt into fill mode below:
+ * `min-height: 0` is what lets flex actually shrink it, and `overscroll-behavior` stops
+ * chained scroll behind the modal.
  *
  * The body is also a flex column so content-aware children (the tool detail body
  * in styles.css) can grow into the panel's remaining height and shrink/scroll
@@ -204,6 +205,22 @@
     overflow: auto;
     overscroll-behavior: contain;
     overflow-wrap: anywhere;
+}
+
+/* Fill mode (T1), opted into with `openDialog({ bodyClassName: 'dialog-body--fill' })`:
+ * the body stops being the scroll container and becomes a stretched flex column whose
+ * child owns the vertical scroll. `overflow: hidden` is the whole point — a body that
+ * still scrolls puts a second scrollbar at the panel's far-right edge and lets the
+ * header/action rows scroll out of view, which is exactly the transcript layout this
+ * exists for.
+ *
+ * The contract moves to the child: the fill chain must declare `min-height: 0` all the
+ * way down (see styles.css `.dialog-body--fill > .thread-transcript…`), or an
+ * un-shrinkable flex item would overflow a body that can no longer scroll and be
+ * clipped silently. Nothing here changes the default body, so every other dialog keeps
+ * its single scroll container. */
+.dialog-body--fill {
+    overflow: hidden;
 }
 
 /* Content is caller-built DOM (image / pre / code / text). These rules only make

@@ -18,7 +18,13 @@
 //      silent return) and the roster/focus panel/card state the unreadable transcript;
 //   7. an unrelated snapshot frame NEVER replaces the textarea: the same node and the
 //      reader's unsaved text survive a refresh, and an invalid state never closes it;
-//   8. Copy in the editor writes the CURRENT textarea value, unsaved edits included.
+//   8. Copy in the editor writes the CURRENT textarea value, unsaved edits included —
+//      both the labelled row button and the meta-row icon (T1, which moved the copy
+//      control out of the dialog header);
+//   9. T1 layout: the dialog body is opened in the shell's `dialog-body--fill` mode, so
+//      the scrolling surface is the `<pre>` (read) or the `<textarea>` (edit) while the
+//      identity row and the Save/Cancel/Copy row stay siblings around it; the modal
+//      header carries no copy control at all.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/thread-transcript-edit.test.ts
 
@@ -701,6 +707,84 @@ describe('editor survival and copy', () => {
 
         expect(writeText).toHaveBeenCalledTimes(1);
         expect(writeText).toHaveBeenCalledWith('["unsaved"]');
+    });
+
+    // T1: the header's copy icon moved onto the meta row, so the icon that stays on screen
+    // while the field scrolls has to follow the SAME rule as the labelled button: the
+    // CURRENT textarea value, unsaved edits included, plus the shared live feedback.
+    it('copies the current editor text from the meta-row icon and announces it', async () => {
+        const writeText = vi.fn(async () => undefined);
+        setClipboard(writeText);
+
+        const handle = openThreadTranscript(childSnapshot, 'thread-child', scope);
+        if (handle === undefined) throw new Error('transcript did not open');
+
+        button(handle.element, '.thread-transcript-edit').click();
+        typeInto(editorOf(handle.element), '["unsaved", 2]');
+
+        const copy = button(handle.element, '.thread-transcript-meta-copy');
+        expect(copy.getAttribute('aria-label')).toBe('Copy the transcript JSON');
+        copy.click();
+        await flush();
+
+        expect(writeText).toHaveBeenCalledTimes(1);
+        expect(writeText).toHaveBeenCalledWith('["unsaved", 2]');
+        expect(copy.querySelector('.dialog-copy-feedback')?.textContent).toBe('Copied');
+        expect(copy.dataset.state).toBe('success');
+    });
+
+    // T1 layout: the editor keeps the same scrolling contract as the document — the body
+    // still fills without scrolling (the textarea owns it), the header has no copy control,
+    // and the Save/Cancel/Copy row is a sibling AFTER the field instead of content that
+    // scrolls out of view.
+    it('keeps the fill layout and the meta icon across the read/edit swap', async () => {
+        const writeText = vi.fn(async () => undefined);
+        setClipboard(writeText);
+
+        const handle = openThreadTranscript(childSnapshot, 'thread-child', scope);
+        if (handle === undefined) throw new Error('transcript did not open');
+
+        const readBody = handle.element.querySelector<HTMLElement>('.dialog-body');
+        if (readBody === null) throw new Error('missing dialog body');
+        expect(readBody.className).toBe('dialog-body dialog-body--fill');
+        expect(handle.element.querySelectorAll('.dialog-copy')).toHaveLength(0);
+
+        button(handle.element, '.thread-transcript-edit').click();
+
+        // Same body, same class, same scroll owner: `update()` only replaced the content.
+        expect(handle.element.querySelector('.dialog-body')).toBe(readBody);
+        expect(readBody.className).toBe('dialog-body dialog-body--fill');
+        expect(handle.element.querySelectorAll('.dialog-copy')).toHaveLength(0);
+
+        const host = handle.element.querySelector<HTMLElement>('.thread-transcript');
+        if (host === null) throw new Error('missing transcript host');
+        expect([...host.children].map((node) => node.className)).toEqual([
+            'thread-transcript-meta',
+            'thread-transcript-error',
+            'thread-transcript-note',
+            'thread-transcript-editor',
+            'thread-transcript-actions thread-transcript-edit-actions'
+        ]);
+
+        // The identity line and the field are separate nodes, so the repaint a refresh
+        // performs (identity text only) cannot take the icon out of the row.
+        const meta = host.querySelector<HTMLElement>('.thread-transcript-meta');
+        if (meta === null) throw new Error('missing transcript meta row');
+        expect([...meta.children].map((node) => node.className)).toEqual([
+            'thread-transcript-meta-text',
+            'text-copy thread-transcript-meta-copy'
+        ]);
+        expect(meta.textContent).toBe('RR2 · Helper · idle · editing JSON');
+
+        // And the icon still copies the field it now sits above.
+        typeInto(editorOf(handle.element), '["after repaint"]');
+        handle.element
+            .querySelector<HTMLButtonElement>('.thread-transcript-meta-copy')
+            ?.click();
+        await flush();
+
+        expect(writeText).toHaveBeenCalledTimes(1);
+        expect(writeText).toHaveBeenCalledWith('["after repaint"]');
     });
 
     it('closes only this board\'s transcript and drops the tracking', () => {

@@ -352,12 +352,6 @@ export type TurnHandle = {
     // Re-evaluate the R7/R8 transcript/delete action bar: visible while THIS tile
     // is the expanded surface and the roster names its thread.
     syncTranscriptAction: () => void;
-    // R5: repaint the root conversation's footer Collapse/Expand toggle. The control
-    // lives in the tile's agent section, but its state is BOARD state (the one
-    // expanded conversation), so only the board can tell the button the truth —
-    // exactly the split `syncTranscriptAction` uses. A no-op before the root section
-    // exists, and for a projection with no collapsible surface.
-    syncCollapseAction: () => void;
     // Does a nested invocation of THIS turn belong to `threadId`? (S2 tie-break for
     // the board's focus resolution.)
     knowsThread: (threadId: string) => boolean;
@@ -913,66 +907,48 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
     };
 };
 
-// R5: the COLLAPSIBLE SURFACE a block's footer toggle drives.
+// R5/T7: the COLLAPSIBLE SURFACE a block's footer chevron controls.
 //
-// A section is only given a toggle when the caller can name a real expand/collapse
-// surface: a nested invocation card (`is-expanded` on the `.thread-row`, which is what
-// shows or hides `.thread-body`) or the root conversation (the board's `expandedTurn`
-// plus `is-expanded` on the `.tile`, which is what shows or hides `.tile-body`). A
-// flat legacy section has neither, so it gets no control and its footer stays empty.
+// T7 (user feedback): the collapsed row IS the expander — clicking `.thread-select` /
+// `.tile-select` opens the block — so a chevron in the collapsed header was a second
+// control for one affordance ("the whole row is a toggle"). Exactly one chevron remains,
+// in the footer action row beside the Copy button: its job is the case the header cannot
+// serve, closing a LONG block from the bottom when the reader is already at the end of it
+// ("collapse without having to scroll all the way up").
 //
-// Both predicates read the RENDERED state rather than a parallel flag: the class is
-// the only thing the CSS keys on, so the announced state can never disagree with what
-// the reader sees, and it is safe to paint during creation (before the entry object or
-// the turn handle exists).
+// That makes the control SINGLE-PURPOSE, and that is what removes all the state machinery:
+// the button lives inside the body, and a collapsed block hides that whole body with
+// `display: none` (`.tile:not(.is-expanded) .tile-body`, `.thread-row:not(.is-expanded)
+// .thread-body`, styles.css), which takes the button out of the layout, the tab order and
+// the accessibility tree with it. A reader can therefore only ever SEE and PRESS it while
+// the surface is open, so it always means "collapse this block": its name, tooltip and
+// `aria-expanded` are constants. No `isExpanded()` probe, no repaint, no per-change sync —
+// the CSS visibility rule is the state, and a projection rebuild just mints the same
+// button again.
 //
-// The descriptor is deliberately READ/TOGGLE rather than a stored flag: the owner of
-// the state (the entry, or the board) stays the single authority, and the button just
-// mirrors it. `sync()` re-reads `isExpanded()` at paint time, so `aria-expanded` can
-// never disagree with what the reader actually sees — including after a projection
-// rebuild recreates the button from scratch.
+// A section is only given the button when the caller can name a real surface: a nested
+// invocation card (`.thread-body`) or the root conversation (`.tile-body`). A flat legacy
+// section has neither, so it gets no control and its footer row stays empty (and is then
+// `display: none` through `:empty`).
+//
+// `collapse` must move ONLY the surface: it must not move board focus or retarget the
+// composer. That is what separates it from clicking a nested header, which focuses a
+// persistent conversation (`focusThread`).
 type SectionCollapse = {
     // 'thread' or 'conversation' — the noun in the accessible name and tooltip.
     label: string;
-    // The id of the element this button controls, when a REAL one exists. `aria-
-    // controls` is only written when it is set, so it never points at nothing.
+    // The id of the element this button hides, when a REAL one exists. `aria-controls` is
+    // only written when it is set, so it never points at nothing.
     controls?: string;
-    // T6: the block's HEADER BUTTON (`.thread-select` / `.tile-select`). The
-    // collapsed-state chevron is inserted immediately AFTER it, as its sibling inside
-    // `.thread-tile` / `.tile` — never inside it, because the header is already a
-    // <button> and interactive content cannot nest. Omitting it leaves the block with
-    // the footer chevron only (which is why a flat legacy section, which has no header
-    // surface at all, gets no descriptor in the first place).
-    header?: HTMLElement;
-    // Current expansion state, read at paint time.
-    isExpanded: () => boolean;
-    // Toggle the surface IN PLACE. It must not move board focus or retarget the
-    // composer: that is what separates these controls from clicking the header, which
-    // focuses a persistent conversation (`focusThread`).
-    toggle: () => void;
-};
-
-// T6: THE TWO CHEVRONS of one collapsible block, and the single painter that keeps
-// them identical. Both buttons exist at all times and both carry the same ARIA truth;
-// styles.css shows exactly ONE of them (`display: none` on the other, in both
-// directions), so only one is in the accessibility tree and the tab order:
-//   - `footer` (`.answer-collapse`) sits in the block's `.agent-answer-actions` row,
-//     where the Copy button used to be alone — visible while the block is EXPANDED;
-//   - `header` (`.header-collapse`) sits in the collapsed header row — visible while
-//     the block is COLLAPSED, which is the state the footer chevron cannot serve: its
-//     whole row lives inside a body the stylesheet hides with `display: none`.
-// `sync` is called by whoever CHANGES the state (the entry's `setThreadExpanded`, the
-// board's expand/collapse paths) and once at creation to paint the initial state.
-type SectionCollapseControl = {
-    footer: HTMLButtonElement;
-    header: HTMLButtonElement | undefined;
-    sync: () => void;
+    // Close the surface in place (see the focus rule above).
+    collapse: () => void;
 };
 
 const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
 
-// The chevron is ONE down-pointing path; CSS rotates it 180° while
-// `aria-expanded="true"`, so the DOM never has to swap glyphs and the animation is a
+// The chevron is ONE down-pointing path; CSS rotates it 180° while `aria-expanded="true"`
+// — the value the button carries CONSTANTLY (see `SectionCollapse`) — so the glyph points
+// UP for the one action it offers, the DOM never has to swap paths, and the animation is a
 // pure transform. Same data-only SVG construction as `createCopyIcon` (ui/dialog.ts):
 // this module never parses HTML, and `aria-hidden` keeps the glyph out of the
 // accessible name the button carries.
@@ -990,72 +966,33 @@ const createCollapseIcon = (): SVGSVGElement => {
     return icon;
 };
 
-// Build ONE chevron button: the glyph, the click route and the painter that mirrors
-// the surface. `className` says WHICH slot it fills (`.answer-collapse` in the block's
-// footer, `.header-collapse` in its header row); styles.css shows exactly one of the
-// two per state, so both can carry the identical name and ARIA without a screen reader
-// hearing the control twice.
-//
-// Each is a real <button> (Enter/Space work natively) and icon-only (no visible word),
-// so the pair reads as one affordance; the state lives in `aria-expanded`, in
-// `data-expanded` and IN THE NAME — unlike the copy button, whose job is one invariant
-// action and whose name therefore never changes.
-const createChevronButton = (
-    collapse: SectionCollapse,
-    className: string
-): { button: HTMLButtonElement; paint: () => void } => {
-    const button = el('button', className);
+// Build the block's ONE chevron: a real <button> (Enter/Space work natively), icon-only,
+// appended to the block's action row. There is deliberately NO painter here — see the
+// `SectionCollapse` comment: the button is only renderable while the surface is open, so
+// "collapse" is always the truth and nothing has to be repainted when the state changes.
+// The constant name is also what makes it behave like the Copy button beside it (a fixed
+// accessible name), which is what lets the pair read as one affordance instead of two.
+const createCollapseButton = (collapse: SectionCollapse): HTMLButtonElement => {
+    const button = el('button', 'answer-collapse');
     button.type = 'button';
-    // Only a real controlled body gets the relation, and BOTH chevrons name it: they
-    // show and hide the very same element.
+    // Only a real controlled body gets the relation.
     if (collapse.controls !== undefined) button.setAttribute('aria-controls', collapse.controls);
+    // Open by construction whenever this button is reachable, and the stylesheet keys the
+    // glyph's 180° rotation on exactly this value: up = "close what I am looking at".
+    button.setAttribute('aria-expanded', 'true');
+    // The name is the action, and the tooltip matches it so hover never promises the
+    // other verb (the header row owns expanding; this button never does).
+    const name = `Collapse ${collapse.label}`;
+    button.setAttribute('aria-label', name);
+    button.title = name;
     button.append(createCollapseIcon());
 
-    // Re-reads the surface, so the announced state can never disagree with what is
-    // visible. The tooltip matches the name: hover must not promise the other verb.
-    const paint = (): void => {
-        const expanded = collapse.isExpanded();
-        const name = `${expanded ? 'Collapse' : 'Expand'} ${collapse.label}`;
-        button.setAttribute('aria-expanded', String(expanded));
-        button.dataset.expanded = String(expanded);
-        button.setAttribute('aria-label', name);
-        button.title = name;
-    };
+    // No `stopPropagation`: the button lives in the block FOOTER, never inside
+    // `.thread-select`/`.tile-select`, so the header's own click handler cannot fire with
+    // it — and the header stays the only way back open.
+    button.addEventListener('click', () => collapse.collapse());
 
-    // No `stopPropagation`: neither chevron is nested in the other, and the header one
-    // is a SIBLING of `.thread-select`/`.tile-select`, so the header's own click handler
-    // cannot fire with it.
-    button.addEventListener('click', () => collapse.toggle());
-
-    return { button, paint };
-};
-
-// Create and place both chevrons of one collapsible block. The footer control is
-// APPENDED to the block's action row (never prepended) while `paintAnswerAction`
-// PREPENDS the copy button, so DOM order there is always copy → toggle. Both are
-// painted BEFORE they join the document, so no frame shows an unnamed control.
-const attachSectionCollapse = (host: HTMLElement, collapse: SectionCollapse): SectionCollapseControl => {
-    const footer = createChevronButton(collapse, 'answer-collapse');
-    footer.paint();
-    host.append(footer.button);
-
-    // T6: the collapsed-state twin. The host is the block's HEADER BUTTON, so the
-    // chevron is inserted directly after it — a sibling inside `.thread-tile`/`.tile`,
-    // which is the positioning context the CSS uses (both are `position: relative`).
-    const headerHost = collapse.header;
-    const header =
-        headerHost === undefined ? undefined : createChevronButton(collapse, 'header-collapse');
-    if (headerHost !== undefined && header !== undefined) {
-        header.paint();
-        headerHost.after(header.button);
-    }
-
-    const sync = (): void => {
-        footer.paint();
-        header?.paint();
-    };
-
-    return { footer: footer.button, header: header?.button, sync };
+    return button;
 };
 
 type AgentSection = {
@@ -1067,8 +1004,9 @@ type AgentSection = {
     // for the root, `.thread-top` for a nested invocation), so the bottom line was
     // a duplicate. It holds the Copy action for this block's final answer (FIRST, so
     // it reads left) and, for a block with a collapsible surface, that surface's
-    // Collapse/Expand toggle (LAST, pinned right). A block with no surface stays empty
-    // until an answer completes, and is then `display: none` (styles.css `:empty`).
+    // Collapse chevron (LAST, pinned right — the bottom-of-a-long-block way to close
+    // it without scrolling back up to the header row). A block with no surface stays
+    // empty until an answer completes, and is then `display: none` (styles.css `:empty`).
     actions: HTMLElement;
     text: TextBlock | undefined;
     // The LAST closed prose block's cumulative buffer. `closeText` clears `text`
@@ -1090,13 +1028,12 @@ type AgentSection = {
     // life of the block (its payload is read at click time, so it never goes stale
     // and never needs re-creating when the answer advances).
     answerAction: HTMLButtonElement | undefined;
-    // R5/T6: the block's Collapse/Expand CHEVRONS, created with the block when the
-    // caller passed a `SectionCollapse` (a nested invocation card or the root
-    // conversation): `footer` in this row, `header` in the block's collapsed header.
-    // `sync()` repaints `aria-expanded`/`aria-label`/`title`/`data-expanded` on BOTH
-    // from the OWNER of the state, so it is called at creation and on every expansion
-    // change. Undefined for a flat legacy section, which has nothing to expand.
-    collapse: SectionCollapseControl | undefined;
+    // R5/T7: the block's Collapse chevron, created with the block when the caller passed a
+    // `SectionCollapse` (a nested invocation card or the root conversation). Nothing ever
+    // repaints it (a constant label is always true — see `SectionCollapse`), so this is
+    // only the reference to the node that was appended into `actions`. Undefined for a
+    // flat legacy section, which has no surface to collapse.
+    collapse: HTMLButtonElement | undefined;
     // The CURRENT reasoning round: its INLINE think chip plus the cumulative text streamed
     // so far. One writer per model request — `commitAttempt`/`discardAttempt` drop this
     // pointer so the next request mints its own chip (T8: two requests' thinking must never
@@ -2194,11 +2131,6 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             ?.setAttribute('aria-expanded', 'false');
         // R4: the action belongs to the expanded surface only.
         expandedTurn.syncTranscriptAction();
-        // R5: the root footer toggle announces this conversation's expansion. It is
-        // synced here (after `is-expanded` was removed above) so a tile that loses the
-        // expanded slot — to another tile, a child focus or a roster panel — repaints
-        // to `Expand conversation` instead of keeping a stale `Collapse`.
-        expandedTurn.syncCollapseAction();
         // The whole CONVERSATION was open (all its exchanges), not just this tile.
         hostOfTurn(expandedTurn)?.classList.remove('is-expanded');
         expandedTurn = undefined;
@@ -2418,11 +2350,6 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // thread transcript. The previous expansion hid its action in
         // `detachTileExpansion`.
         turn.syncTranscriptAction();
-        // R5: and its footer Collapse/Expand toggle flips to `Collapse conversation`
-        // with the same transition. This also covers a root section created AFTER the
-        // tile was expanded (a live tile starts empty; only its sections know the
-        // state), because the toggle's `isExpanded` reads the live board state.
-        turn.syncCollapseAction();
         // R3: a continuation routed into a nested child card lives inside that card's
         // body, so the card has to be open for the expanded exchange to be visible.
         openEnclosingCards(turn);
@@ -2726,16 +2653,6 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // R7/R8: repaint the shared toolbar. Visibility is board expansion state,
         // so `expand`/`detachTileExpansion` and every roster/snapshot update call it.
         const syncTranscriptAction = actionBar.sync;
-
-        // R5: repaint THIS tile's root footer Collapse/Expand toggle. The control is
-        // owned by the agent section, but the state it announces is the BOARD's single
-        // expanded conversation, so the board drives this on every expansion change
-        // (`expand`, `detachTileExpansion` and therefore `dropFocusState`/`collapse`).
-        // A no-op while no root section exists (a tile with no events yet) or for a
-        // projection with no collapsible surface.
-        const syncCollapseAction = (): void => {
-            threads.get(ROOT_KEY)?.section.collapse?.sync();
-        };
 
         const paintThreadBadge = (): void => {
             if (runtimeThreadId === undefined) {
@@ -3126,11 +3043,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // never the raw agent id (R2/R3). The id is still mirrored on `data-agent`
         // by `paintAgentColor` for colour/routing.
         //
-        // R5: `collapse` names the surface this block's footer toggle expands and
-        // collapses. It is OPTIONAL: a flat legacy section has no collapsible surface,
-        // so it gets no toggle. The toggle is appended HERE — at creation, before any
-        // answer can complete — which is what lets the Copy button that arrives later
-        // be PREPENDED in front of it (copy left, toggle right) in every order.
+        // R5/T7: `collapse` names the surface this block's footer chevron closes. It is
+        // OPTIONAL: a flat legacy section has no collapsible surface, so it gets no
+        // chevron. The button is appended HERE — at creation, before any answer can
+        // complete — which is what lets the Copy button that arrives later be PREPENDED in
+        // front of it (copy left, chevron right) in every order.
         const createSection = (
             container: HTMLElement,
             agentName: string,
@@ -3150,10 +3067,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             head.append(el('span', 'agent-name', label));
 
             const sectionFlow = el('div', 'agent-flow');
-            // R5: the footer row. A block WITH a collapsible surface owns its
-            // Collapse/Expand toggle from the moment it exists; a block without one
-            // (a flat legacy section) stays EMPTY until it completes an answer, so it
-            // paints no orphan control (`display: none` on `:empty`, styles.css).
+            // R5/T7: the footer row. A block WITH a collapsible surface owns its Collapse
+            // chevron from the moment it exists (it sits last, after the Copy button); a
+            // block without one (a flat legacy section) stays EMPTY until it completes an
+            // answer, so it paints no orphan control (`display: none` on `:empty`,
+            // styles.css). The chevron needs no state of its own: while this block is
+            // closed the whole row is inside a `display: none` body, so it is unrendered,
+            // untabbable and out of the accessibility tree.
             const sectionActions = el('div', 'agent-answer-actions');
 
             root.append(head, sectionFlow, sectionActions);
@@ -3177,12 +3097,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 attempt: undefined
             };
 
-            // R5: the toggle is created and appended HERE, before anything can stream,
+            // R5/T7: the chevron is created and appended HERE, before anything can stream,
             // so it is permanently the LAST control in the row: `paintAnswerAction`
-            // PREPENDS the copy button, and a later answer can never slip in front of
-            // the toggle or displace it. `sync()` paints the state the surface is
-            // already in (a restored projection re-opens this block right after).
-            if (collapse !== undefined) section.collapse = attachSectionCollapse(sectionActions, collapse);
+            // PREPENDS the copy button, and a later answer can never slip in front of the
+            // chevron or displace it. Its attributes are constants (see `SectionCollapse`),
+            // so there is nothing to paint afterwards — a projection rebuild simply runs
+            // this again.
+            if (collapse !== undefined) {
+                const button = createCollapseButton(collapse);
+                sectionActions.append(button);
+                section.collapse = button;
+            }
 
             return section;
         };
@@ -3207,12 +3132,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             entry.tile?.classList.toggle('is-expanded', expanded);
             entry.select?.setAttribute('aria-expanded', String(expanded));
             syncThreadTranscriptAction(entry);
-            // R5: this is the ONLY transition of a nested card's expansion (a header
-            // click, the footer toggle, and the board's implicit open/close all route
-            // through here), so the footer toggle repaints with it — which is what keeps
-            // `aria-expanded` correct after a rebuild restore or an `openEnclosingCards`
-            // reveal, not just after a click.
-            entry.section.collapse?.sync();
+            // T7: nothing else to repaint. This is the ONLY transition of a nested card's
+            // expansion (a header click, the footer chevron, and the board's implicit
+            // open/close all route through here), and the card's own `is-expanded` class is
+            // what shows or hides `.thread-body` — the row that holds the footer chevron.
+            // Closing the card therefore removes that chevron from the layout, the tab
+            // order and the accessibility tree by itself, which is why its label can be a
+            // constant `Collapse thread`.
 
             // Remember the reader's choice by canonical key so a projection rebuild
             // can restore it (the entry objects are recreated, the keys are stable).
@@ -3757,31 +3683,21 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 kindTag,
                 started: options.started,
                 state: options.state,
-                // R5/T6: the two Collapse/Expand chevrons for THIS card — the footer
-                // one in the block's action row, the header one inserted after
-                // `.thread-select` so a COLLAPSED card is still reachable (the footer
-                // row lives inside `.thread-body`, which styles.css hides while the card
-                // is closed).
+                // R5/T7: the footer Collapse chevron for THIS card. It is the only one:
+                // the collapsed row above IS the expander (`.thread-select`, whose own
+                // click handler is below), and this button is the way to close the card
+                // from the bottom of a long transcript without scrolling back up.
                 //
-                // The descriptor READS the row's own class rather than `entry.expanded`,
-                // because the section is part of `entry`'s literal: `entry` is still in
-                // its temporal dead zone while `createSection` paints the buttons. `is-
-                // expanded` on `threadRow` is exactly what styles.css uses to show or
-                // hide `.thread-body` (and it is mirrored onto `.thread-tile`, which is
-                // what the chevrons are positioned against), so the announced state can
-                // never disagree with what the reader sees — and `setThreadExpanded`
-                // keeps it in lockstep with `entry.expanded`. `toggle` reads `entry` only
-                // at CLICK time, when the literal has long been assigned. It performs the
-                // card's own expand/collapse and deliberately does NOT route through
-                // `focusThread` the way the header button does for a PERSISTENT child
-                // (see the click handler below): pressing a chevron moves this card's
-                // body, it never re-targets the composer.
+                // `collapse` reads `entry` only at CLICK time — `entry` is still in its
+                // temporal dead zone while this literal is being evaluated, which is
+                // harmless now that nothing is read at creation. It performs the card's own
+                // collapse and deliberately does NOT route through `focusThread` the way the
+                // header button does for a PERSISTENT child (see that handler): pressing the
+                // chevron moves this card's body, it never re-targets the composer.
                 section: createSection(threadFlow, options.agent, 'subagent', label, {
                     label: 'thread',
                     controls: bodyId,
-                    header: select,
-                    isExpanded: () => threadRow.classList.contains('is-expanded'),
-                    toggle: () => setThreadExpanded(entry, !entry.expanded)
+                    collapse: () => setThreadExpanded(entry, false)
                 }),
                 row: threadRow,
                 tile,
@@ -3868,30 +3784,23 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const conversationLabel = rootConversationLabel();
             reserveConversationLabel(conversationLabel);
             const label = conversationLabel ?? nextLabel(agentName);
-            // R5/T6: the root block's content IS `.tile-body`, so its chevrons drive the
-            // BOARD's single expanded conversation — the footer one in the action row
-            // while the tile is open, the header one after `.tile-select` while it is
-            // closed (a collapsed tile hides `.tile-body`, so the footer row is not
-            // renderable there).
+            // R5/T7: the root block's content IS `.tile-body`, so its footer chevron
+            // closes the BOARD's single expanded conversation. There is exactly one
+            // chevron for this block now: the collapsed tile's whole row (`.tile-select`)
+            // is the expander, and a collapsed tile hides `.tile-body` anyway, so this
+            // button only ever exists in the open state — where its job is letting the
+            // reader close the conversation from the end of a long transcript.
             //
-            // `isExpanded` reuses the exact pair the tile's own action bar keys on
-            // (`expandedTurn?.element === card` plus the `is-expanded` class, see the
-            // `visible` predicate above), i.e. the state AS RENDERED, and it avoids
-            // reading `turn` — which does not exist yet when a projection paints this
-            // section. `toggle` performs the same two board transitions as the tile
-            // header (`select`'s click handler): collapse the expanded conversation,
-            // otherwise expand this one. The chevrons add no focus routing of their own,
-            // so an in-place collapse of a nested card never moves the composer target.
+            // `collapse` calls the board's own `collapse()`, the same transition the tile
+            // header performs on the expanded conversation (a deliberate unfocus). That is
+            // also the correct effect for the one other state the body is visible in — a
+            // sibling exchange inside an open CONVERSATION (T12b, styles.css
+            // `.conversation.is-expanded .tile-body`): closing the conversation is what
+            // actually hides what the reader is looking at.
             const section = createSection(flow, agentName, 'primary', label, {
                 label: 'conversation',
                 controls: `${id}-body`,
-                header: select,
-                isExpanded: () =>
-                    expandedTurn?.element === card && card.classList.contains('is-expanded'),
-                toggle: () => {
-                    if (expandedTurn?.element === card) collapse();
-                    else expand(turn);
-                }
+                collapse: () => collapse()
             });
             // R1/F3: the compact root header shows the same code as a child header.
             // The section's own `.agent-head` is hidden by CSS for the primary part
@@ -4224,9 +4133,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     className: 'answer-copy'
                 });
                 // R5: PREPENDED, so the copy control is always the FIRST child of the
-                // row (left) and the collapse toggle — created with the block — stays the
+                // row (left) and the Collapse chevron — created with the block — stays the
                 // last (right, pinned by `margin-left: auto`). Appending here would put
-                // the copy button after the toggle and reverse the agreed order.
+                // the copy button after the chevron and reverse the agreed order.
                 section.actions.prepend(button);
                 section.answerAction = button;
                 return;
@@ -5024,13 +4933,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             actionCards.clear();
             actionAnswers.clear();
             flow.replaceChildren();
-            // R5/T6: a block's collapsed-state chevron is created WITH its section but
-            // lives in the BLOCK surface (a sibling of `.tile-select` inside the tile),
-            // so clearing `.tile-flow` alone would leave the discarded one in the header
-            // and the replay would add a second — two chevrons in one row, the older one
-            // never repainted again. Nested rows do not need this: their chevron is inside
-            // `.thread-tile`, which is inside the row being replaced below.
-            for (const stale of card.querySelectorAll(':scope > .header-collapse')) stale.remove();
+            // T7: nothing outside `.tile-flow` belongs to a section any more — the block's
+            // single Collapse chevron lives in the section's own footer row, inside this
+            // flow — so clearing the flow discards it completely and the replay mints a
+            // fresh one with the same constant attributes.
             // Invocation rows live OUTSIDE the tile flow, so clearing the flow alone
             // would leave orphan entries after a superseding record arrives.
             threadHost.replaceChildren();
@@ -5706,7 +5612,6 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             threadId: () => runtimeThreadId,
             refreshThreadRoster,
             syncTranscriptAction,
-            syncCollapseAction,
             knowsThread,
             focusChildThread,
             clearThreadFocus,

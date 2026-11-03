@@ -45,3 +45,7 @@ export * from './ui/time';
 export * from './ui/tokens';
 export * from './ui/tools';
 export * from './ui/turns';
+// Aggregate token/time/thread totals for the harness details dialog. Pure data: no
+// element is created at import time, so the barrel's import-safety contract
+// (./index.test.ts) still holds.
+export * from './ui/usage-summary';

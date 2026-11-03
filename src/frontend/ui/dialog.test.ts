@@ -11,7 +11,7 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import { createDialogHost, openDialog } from './dialog';
+import { createDialogHost, DIALOG_BODY_FILL_CLASS, openDialog } from './dialog';
 import type { DialogHost } from './dialog';
 
 // Exact glyph rendered by the close button (see CLOSE_GLYPH in dialog.ts).
@@ -126,6 +126,46 @@ describe('open: structure and accessible wiring', () => {
 
         expect(handle.element.querySelector('img')).toBeNull();
         expect(query<HTMLElement>(handle.element, '.dialog-body').textContent).toBe(payload);
+    });
+
+    // T1: the transcript dialog opens its body in "fill" mode so the JSON area, not the
+    // panel, owns the vertical scroll. The opt-in is one appended class — every dialog
+    // that says nothing keeps the historical single scroll container, byte for byte.
+    it('appends the body layout class only when the caller opts in', () => {
+        // The exported token IS the selector in dialog.css, so a rename that misses the
+        // stylesheet is caught here rather than by a missing scrollbar.
+        expect(DIALOG_BODY_FILL_CLASS).toBe('dialog-body--fill');
+
+        const plain = host.open({ title: 'Plain', content: paragraph('Prose preview') });
+        expect(query<HTMLElement>(plain.element, '.dialog-body').className).toBe('dialog-body');
+
+        const filled = host.open({
+            title: 'Fill',
+            content: paragraph('Document'),
+            bodyClassName: DIALOG_BODY_FILL_CLASS
+        });
+        expect(query<HTMLElement>(filled.element, '.dialog-body').className).toBe(
+            'dialog-body dialog-body--fill'
+        );
+
+        // `update()` replaces the CONTENT only: a read -> edit swap inside one dialog must
+        // not move the scroll owner out from under a live scrollbar.
+        filled.update({ content: paragraph('Editor') });
+        expect(query<HTMLElement>(filled.element, '.dialog-body').className).toBe(
+            'dialog-body dialog-body--fill'
+        );
+        expect(query<HTMLElement>(filled.element, '.dialog-body').textContent).toBe('Editor');
+
+        // A value that is not a single bare class token is ignored: the attribute can only
+        // ever carry shell classes, so a caller cannot inject a selector list.
+        for (const bodyClassName of ['', '   ', 'a b', '.dialog-body-x', 'x{overflow:visible}']) {
+            const junk = host.open({ title: 'Junk', content: paragraph('text'), bodyClassName });
+            expect(query<HTMLElement>(junk.element, '.dialog-body').className).toBe('dialog-body');
+            junk.close();
+        }
+
+        plain.close();
+        filled.close();
     });
 });
 
@@ -557,6 +597,15 @@ describe('dialog.css contract', () => {
         expect(body).toContain('min-height: 0');
         expect(body).toContain('overflow: auto');
         expect(body).toContain('overscroll-behavior: contain');
+    });
+
+    // T1: the opt-in fill mode (used by the transcript dialog) is ONE extra rule — the
+    // body stops scrolling so a child surface can own the vertical scroll. The base rule
+    // above keeps `overflow: auto`, which is what every other dialog still depends on.
+    it('keeps the body scroll except in the opt-in fill mode', () => {
+        const fill = blockOf('.dialog-body--fill {');
+        expect(fill).toContain('overflow: hidden');
+        expect(fill).not.toContain('overflow: auto');
     });
 
     it('stays content-sized and centred instead of stretching on phones', () => {

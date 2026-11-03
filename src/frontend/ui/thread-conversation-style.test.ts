@@ -69,7 +69,23 @@ it('keeps a distinct child thread card framed inside the owner', () => {
 
     // A resumed child appends into its own card: the card header names the identity,
     // so the exchange must not repeat it.
-    expect(blockOf('.thread-flow > .turn-row :is(.tile-thread, .tile-agent) {')).toContain('display: none');
+    // Issue D: `visibility: hidden`, not `display: none` — the badge keeps occupying
+    // its column so a follow-up row's prompt lines up with the row that shows it.
+    expect(blockOf('.thread-flow > .turn-row :is(.tile-thread, .tile-agent) {')).toContain('visibility: hidden');
+    expect(blockOf('.thread-flow > .turn-row :is(.tile-thread, .tile-agent) {')).not.toContain('display: none');
+});
+
+it('keeps the hidden conversation badge in the text column so rows align (Issue D)', () => {
+    // The rule that hides the repeated badge on a continuation row is the whole
+    // alignment contract: `display: none` collapses `.tile-identity` to zero width
+    // while `.tile-select`'s column gap still applies, so the follow-up prompt starts
+    // ~one badge (~31px) left of the header row's prompt. Reserving the slot aligns
+    // the two text columns without printing the label twice.
+    const continuation = blockOf(
+        '.conversation .turn-row.is-continuation:not([data-child-thread]) :is(.tile-thread, .tile-agent) {'
+    );
+    expect(continuation).toContain('visibility: hidden');
+    expect(continuation).not.toContain('display: none');
 });
 
 it('places the thread identity left of the header measurements (R1)', () => {

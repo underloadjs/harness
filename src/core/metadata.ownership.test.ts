@@ -62,6 +62,7 @@ import * as toolCancelEntry from '../tools/runtime/toolCancel.tool';
 import * as actionRequestEntry from '../tools/runtime/actionRequest.tool';
 import * as threadForkEntry from '../tools/runtime/threadFork.tool';
 import * as threadSendEntry from '../tools/runtime/threadSend.tool';
+import * as threadReadEntry from '../tools/runtime/threadRead.tool';
 import * as threadListEntry from '../tools/runtime/threadList.tool';
 
 const sourceOf = (relativePath: string): string =>
@@ -190,6 +191,13 @@ const runtimeEntries: RuntimeEntry[] = [
         metadata: threadSendEntry.THREAD_SEND_METADATA,
         moduleMetadata: threadSendEntry.metadata,
         aggregated: coreMetadata.THREAD_SEND_METADATA
+    },
+    {
+        wireName: 'threadRead',
+        sourcePath: '../tools/runtime/threadRead.tool.ts',
+        metadata: threadReadEntry.THREAD_READ_METADATA,
+        moduleMetadata: threadReadEntry.metadata,
+        aggregated: coreMetadata.THREAD_READ_METADATA
     },
     {
         wireName: 'threadList',

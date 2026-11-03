@@ -8,13 +8,18 @@
 //
 // CONTRACT
 // --------
-//   openDialog({ title, content, copy?, returnFocus?, onClose? })
+//   openDialog({ title, content, copy?, bodyClassName?, returnFocus?, onClose? })
 //       -> { element, isOpen, close(), update({ title?, content?, copy? }) }
 //
 // `copy` is the opt-in data-inspection action (R5): a string or a click-time
 // provider. The dialog owns the icon button, the clipboard path (async API plus the
 // insecure-origin fallback) and the success/failure announcement, so tool/transcript/
 // file dialogs do not duplicate handlers.
+//
+// `bodyClassName` is the opt-in layout hook for `.dialog-body` (T1: the transcript
+// passes `dialog-body--fill` so the JSON area owns the scroll). It never replaces the
+// base class, and `update()` does not touch it, so a mode switch inside one dialog
+// keeps the layout the caller asked for at open time.
 //
 // `createTextCopyButton({ label, text, className })` exports that SAME copy control
 // for callers that need it outside a dialog header (a section heading inside adopted
@@ -107,6 +112,17 @@ export type DialogOptions = {
     // Pure confirmation/input dialogs and binary previews omit this: a Copy button
     // must copy meaningful text, not configuration controls or an image payload.
     copy?: DialogCopySource;
+    // Opt-in layout class for `.dialog-body`, appended AFTER the base class. A content
+    // surface that scrolls itself (the transcript document) passes `dialog-body--fill`,
+    // which turns the body into a stretched, NON-scrolling flex column so the caller's
+    // inner element becomes the only vertical scroller and the dialog's header, meta
+    // line and action row never scroll away. Omitted => the historical single
+    // scroll-container body, exactly as every other dialog renders it today.
+    //
+    // Not part of `DialogUpdate`: the scroll owner is decided when the dialog is built,
+    // and a later `update({ content })` swapping the surface (read -> edit) must not be
+    // able to change the panel's scrolling underneath a live scrollbar.
+    bodyClassName?: string;
     // Explicit focus destination on close. `undefined` = restore the element that
     // was focused when the dialog opened. `null` = restore nothing.
     returnFocus?: HTMLElement | null;
@@ -163,6 +179,17 @@ const TITLE_CLASS = 'dialog-title';
 const COPY_CLASS = 'dialog-copy';
 const CLOSE_CLASS = 'dialog-close';
 const BODY_CLASS = 'dialog-body';
+
+// The one `.dialog-body` layout variant the shell ships (T1). Exported because the
+// stylesheet rule lives in `./dialog.css` and the caller only opts in; like
+// `TEXT_COPY_CLASS` below, the class string exists in exactly one place so a renamed
+// selector cannot silently unstyle a dialog.
+export const DIALOG_BODY_FILL_CLASS = 'dialog-body--fill';
+
+// `bodyClassName` is a bare class token: anything else (an empty string, a selector, a
+// list with stray spaces) is ignored so the body can only ever carry shell classes.
+const bodyClassOf = (extra: string | undefined): string =>
+    typeof extra === 'string' && /^[\w-]+$/.test(extra) ? `${BODY_CLASS} ${extra}` : BODY_CLASS;
 
 // Close glyph is escaped so the source file stays ASCII-safe (the repo has had
 // encoding issues) and the test can assert the exact character.
@@ -717,7 +744,8 @@ export const TEXT_COPY_CLASS = 'text-copy';
 //
 // Synchronous and DOM-only: it opens nothing, needs no dialog, and never throws when
 // the clipboard is unavailable — the button reports the failure in place.
-// `createToolCallCard`'s argument/result headings and the answer footer use it.
+// `createToolCallCard`'s argument/result headings, the answer footer and the transcript
+// dialog's meta line (ui/thread-transcript.ts) use it.
 export const createTextCopyButton = (options: TextCopyButtonOptions): HTMLButtonElement => {
     const { label, text, className } = options;
     // Titles are derived from the label so the hover explains which pane is copied;
@@ -840,7 +868,9 @@ export const createDialogHost = (parent?: HTMLElement): DialogHost => {
             closeButton.textContent = CLOSE_GLYPH;
 
             const body = document.createElement('div');
-            body.className = BODY_CLASS;
+            // `bodyClassName` is appended after the base class (see `bodyClassOf`), so a
+            // dialog that does not opt in keeps `class="dialog-body"` byte for byte.
+            body.className = bodyClassOf(options.bodyClassName);
             // `content` is adopted as-is. No innerHTML path exists in this module.
             body.append(content);
 

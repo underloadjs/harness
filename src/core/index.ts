@@ -222,10 +222,12 @@ export {
     THREAD_FORK_NAME,
     TOOL_CANCEL_METADATA,
     TOOL_CANCEL_NAME,
-    // R4 cross-thread chat + roster (conditional core tools, registered by the
-    // harness once the session owns an independent thread).
+    // R4 cross-thread chat + roster + transcript reader (conditional core tools,
+    // registered by the harness once the session owns an independent thread).
     THREAD_LIST_METADATA,
     THREAD_LIST_NAME,
+    THREAD_READ_METADATA,
+    THREAD_READ_NAME,
     THREAD_SEND_METADATA,
     THREAD_SEND_NAME,
     TOOL_REQUEST_METADATA,

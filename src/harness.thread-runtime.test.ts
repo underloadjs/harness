@@ -1123,12 +1123,14 @@ describe('cross-thread chat and delegation links (R4)', () => {
         const result = await writer.sendThreadInput(alpha.id, 'talk to beta');
         expect(result.content).toBe('alpha sent');
         // R9-R11: the demoted runtime rows are searchable, so the declared set is
-        // the bootstrap pair plus the two thread controls this harness just
-        // registered.
+        // the bootstrap pair plus the three thread controls this harness just
+        // registered (roster first, then the transcript reader, then the sender —
+        // descending `order` inside the 'threads' activation group).
         expect(seen[0]!.tools?.map((tool) => tool.name)).toEqual([
             'toolRequest',
             'task',
             'threadList',
+            'threadRead',
             'threadSend'
         ]);
 

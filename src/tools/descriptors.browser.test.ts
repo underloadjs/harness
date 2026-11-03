@@ -58,9 +58,10 @@ describe('browser catalogue fallback (T24)', () => {
         // Field for field: no live row may sneak in, and no generated row may be
         // rewritten by the projection.
         expect(TOOL_DESCRIPTORS).toEqual([...BUILTIN_TOOL_DESCRIPTORS]);
-        // 29 rows: the browser bundle carries the same generated inventory as the
-        // Node build, including the new `download` preset.
-        expect(TOOL_DESCRIPTORS).toHaveLength(29);
+        // 30 rows: the browser bundle carries the same generated inventory as the
+        // Node build, including the new `download` preset and the `threadRead`
+        // runtime entry.
+        expect(TOOL_DESCRIPTORS).toHaveLength(30);
     });
 
     it('derives the preset and runtime groups from the generated data', () => {

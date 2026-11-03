@@ -506,7 +506,7 @@ Harness tools are named for what the model calls them. Two shapes coexist on pur
 | `location*` | `locationManage` (session locations/places) |
 | `agent*` | `agentManage` (list agents + result previews), `agentResult` (read one completed result) |
 | `action*` | `actionRequest` (conditional owner question; `interaction` configured) |
-| `thread*` | `threadFork` (conditional private history fork; forks enabled), `threadSend`, `threadList` |
+| `thread*` | `threadFork` (conditional private history fork; forks enabled), `threadSend`, `threadList`, `threadRead` (paged transcript read: whole thread, one message, regex/role filters, per-message content paging) |
 | `file*` | `fileList` (the renamed half is bare: `write`, `glob`, `grep`; the read/edit pair is `read`/`edit`) |
 | (verbs) | `read`, `write`, `edit`, `glob`, `grep`, `shell`, `search`, `fetch`, `delegate` |
 | `text*` | `textCount`, `textSummarize` |

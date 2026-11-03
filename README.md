@@ -161,14 +161,17 @@ Threads may only be OWNED by an independent host thread: `ownerThreadId` must
 name a `createThread` record, never an implicit `agent:<name>` conversation
 (its owner link could not be persisted/restored). Delegation children from host
 threads satisfy this automatically.
-- **Cross-thread chat & discovery** — once the session owns a host thread, two
+- **Cross-thread chat & discovery** — once the session owns a host thread, three
   conditional core tools are registered: `threadList` returns this session's live
   conversations (id, agent, origin, status, owner/label) with the caller's own
-  `currentThreadId`, and `threadSend` posts into one of them. Ids are therefore
-  observed, never invented by a model or injected by the server; deleted threads
-  are absent, and only this session is visible. The runtime records the REAL
-  sender (agent + thread from the calling run, not a tool argument). An idle
-  target receives the message immediately; a running target receives it at its
+  `currentThreadId`, `threadRead` reads one of them back (the whole transcript, one
+  message by index, or a regex/role-filtered page with per-message content paging;
+  attachments come back as descriptors, never base64 bytes; omitting `thread` reads
+  the calling run's own conversation), and `threadSend` posts into one of them. Ids
+  are therefore observed, never invented by a model or injected by the server;
+  deleted threads are absent, and only this session is visible. The runtime records
+  the REAL sender (agent + thread from the calling run, not a tool argument). An
+  idle target receives the message immediately; a running target receives it at its
   next boundary.
 
 Threads persist through snapshot v1 as an optional `threads`/`threadSequence`
