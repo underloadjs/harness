@@ -177,6 +177,30 @@ it('keeps the empty hint short and the dialog heading present', () => {
     expect(heading).toContain('text-transform: uppercase');
 });
 
+it('paints the dialog totals row as one compact line of tabular figures', () => {
+    // The aggregate line (`6 threads | 51,935 input | 1m32s | 9,472 cache`) is the same
+    // muted-mono voice as `.harness-details-meta` under it, so the two read as one block
+    // of metadata — and it WRAPS, because a 340px phone dialog cannot scroll sideways.
+    const stats = blockOf('.harness-details-stats {');
+    expect(stats).toContain('display: flex');
+    expect(stats).toContain('flex-wrap: wrap');
+    expect(stats).toContain('gap: 4px 0');
+    expect(stats).toContain('margin: 0 0 8px');
+    expect(stats).toContain('color: var(--muted)');
+    expect(stats).toContain('font-family: var(--mono)');
+    expect(stats).toContain('font-size: 11.5px');
+    expect(stats).toContain('font-variant-numeric: tabular-nums');
+
+    // The `' | '` is generated between adjacent figures only, so there is no leading
+    // separator and each `<span>` stays a clean, copy-pastable value.
+    expect(blockOf('.harness-details-stat + .harness-details-stat::before {')).toContain(
+        "content: ' | '"
+    );
+    // Nothing else styles a figure that `main.ts` `harnessStatFigures` does not produce:
+    // the row owns all of its own typography, and there is no per-figure rule.
+    expect(rules).not.toContain('.harness-details-stat:hover');
+});
+
 it('keeps no rail surface or confirmation row now that the directory is a strip', () => {
     // The panel, its question and both of its buttons were removed from the behaviour
     // layer (T1/R1). A surviving rule here would mean the stylesheet still styles a
