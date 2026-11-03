@@ -1674,3 +1674,192 @@ describe('review corrections (H1/M1/M2/L2 + steering preservation)', () => {
         expect(requests).toBe(4);
     });
 });
+
+// ---------------------------------------------------------------------------
+// C4: `setThreadMessages` — the wholesale transcript REPLACEMENT primitive the
+// server's transcript editor (GET/PUT .../threads/:id/transcript) is built on.
+//
+// Pinned here (implementation: setThreadMessages in src/harness.ts):
+//   - validation uses the SAME reader snapshot()/restore() enforce, so a write
+//     this harness accepts can never produce a snapshot its own restore refuses;
+//   - a refused write mutates NOTHING (validate before mutate);
+//   - replacement is IN PLACE, so a caller holding `agent.messages` (the run loop,
+//     the server roster) keeps seeing the current transcript;
+//   - live work is refused; a STOPPED conversation is writable — that is exactly
+//     the repair path a broken transcript needs;
+//   - the submitted array is copied (detached), and persistence is notified with
+//     the existing `agent_message` reason while NO progress event is emitted.
+// ---------------------------------------------------------------------------
+describe('thread transcript replacement (C4 setThreadMessages)', () => {
+    it('replaces a host transcript wholesale and reports it to persistence only', () => {
+        const changes: { type: string; reason?: string; agent?: string }[] = [];
+        const progress: unknown[] = [];
+
+        const writer = harness({
+            agents: { writer: brain(scripted([answer('unused')])) },
+            presets: false,
+            report: {
+                // Contextually typed by HarnessConfiguration, so the event shapes
+                // stay the compiler's business, not this file's.
+                progress: (event) => {
+                    progress.push(event);
+                },
+                stateChange: (event) => {
+                    changes.push(event);
+                }
+            }
+        });
+
+        const thread = writer.createThread('writer', { label: 'Editor' });
+        // A thread of an instruction-less agent starts empty: every expectation
+        // below is therefore about THIS write, not about a seed.
+        expect(writer.threadMessages(thread.id)).toEqual([]);
+
+        // `createThread` notified the roster first (`reason: 'thread'`). The
+        // recording window below starts at the write under test, so its assertion
+        // is about exactly one operation.
+        expect(changes).toEqual([{ type: 'state_change', reason: 'thread' }]);
+        changes.length = 0;
+        progress.length = 0;
+
+        writer.setThreadMessages(thread.id, [
+            { role: 'system', content: 'seed' },
+            { role: 'user', content: 'rewritten' }
+        ]);
+
+        expect(writer.threadMessages(thread.id)).toEqual([
+            { role: 'system', content: 'seed' },
+            { role: 'user', content: 'rewritten' }
+        ]);
+
+        // The snapshot sees it, so the next save of this harness IS the new truth.
+        expect(writer.snapshot().threads).toEqual([
+            {
+                id: 'thread-1',
+                agent: 'writer',
+                status: 'idle',
+                sequence: 2,
+                label: 'Editor',
+                messages: [
+                    { role: 'system', content: 'seed' },
+                    { role: 'user', content: 'rewritten' }
+                ]
+            }
+        ]);
+
+        // Persistence is notified once, with the EXISTING reason and the owning
+        // agent. The write is a host edit, not model output, so nothing streamed.
+        expect(changes).toEqual([{ type: 'state_change', reason: 'agent_message', agent: 'writer' }]);
+        expect(progress).toEqual([]);
+
+        // Round-trip: a snapshot of this harness restores the replaced transcript.
+        const restored = harness({
+            agents: { writer: brain(scripted([answer('unused')])) },
+            presets: false
+        });
+        restored.restore(writer.snapshot());
+        expect(restored.threadMessages('thread-1')).toEqual([
+            { role: 'system', content: 'seed' },
+            { role: 'user', content: 'rewritten' }
+        ]);
+    });
+
+    it('replaces the live array in place, so an existing reference keeps working', () => {
+        const entry = brain(scripted([answer('unused')]));
+        const writer = quiet(entry);
+
+        // `agent.messages` is the LIVE array the run loop appends to (restore()
+        // mutates it the same way). The primitive must not swap the reference.
+        const live = writer.agents.writer.messages;
+        expect(live).toEqual([]);
+
+        writer.setThreadMessages('agent:writer', [{ role: 'user', content: 'kept' }]);
+
+        expect(writer.agents.writer.messages).toBe(live);
+        expect(writer.agents.writer.messages).toEqual([{ role: 'user', content: 'kept' }]);
+        // The default conversation and the registry transcript are one and the
+        // same thing, which is why an in-place write matters here.
+        expect(writer.threadMessages('agent:writer')).toEqual([{ role: 'user', content: 'kept' }]);
+    });
+
+    it('detaches the submitted value, validates it, and mutates nothing on refusal', () => {
+        const writer = quiet(brain(scripted([answer('unused')])));
+        const thread = writer.createThread('writer');
+
+        // An unknown id is the same honest error every thread operation throws.
+        expect(() => writer.setThreadMessages('thread-99', [{ role: 'user', content: 'x' }])).toThrow(
+            'Thread "thread-99" is not available in this harness; it was never created, or it was deleted.'
+        );
+
+        // Bad role / non-array / missing field: the shared reader's own wording,
+        // labelled with the thread it belongs to.
+        expect(() => writer.setThreadMessages(thread.id, [{ role: 'bogus', content: 'x' } as never])).toThrow(
+            'thread "thread-1" messages[0].role must be one of: system, user, assistant, tool.'
+        );
+        expect(() => writer.setThreadMessages(thread.id, { not: 'an array' } as never)).toThrow(
+            'thread "thread-1" messages must be an array.'
+        );
+        expect(() => writer.setThreadMessages(thread.id, [{ role: 'user' } as never])).toThrow(
+            'thread "thread-1" messages[0] is missing the field "content".'
+        );
+
+        // A refused write left the conversation exactly as it was.
+        expect(writer.threadMessages(thread.id)).toEqual([]);
+
+        // The accepted write is COPIED: mutating the caller's array afterwards
+        // cannot rewrite the stored transcript (restore's detachment rule).
+        const submitted = [{ role: 'user' as const, content: 'one' }];
+        writer.setThreadMessages(thread.id, submitted);
+        submitted[0].content = 'mutated';
+        submitted.push({ role: 'user', content: 'appended' });
+
+        expect(writer.threadMessages(thread.id)).toEqual([{ role: 'user', content: 'one' }]);
+
+        // An empty transcript is legal (the editor's "clear" action).
+        writer.setThreadMessages(thread.id, []);
+        expect(writer.threadMessages(thread.id)).toEqual([]);
+        expect(writer.snapshot().threads?.[0]?.messages).toEqual([]);
+    });
+
+    it('refuses a running conversation and accepts a stopped or settled one', async () => {
+        const slow = gatedAnswer('late');
+        const writer = quiet(brain(slow.stream));
+        const thread = writer.createThread('writer');
+
+        const pending = writer.sendThreadInput(thread.id, 'start');
+        const running = probe(pending);
+        await flush();
+
+        expect(writer.thread(thread.id)?.status).toBe('running');
+        expect(() => writer.setThreadMessages(thread.id, [{ role: 'user', content: 'too late' }])).toThrow(
+            'Thread "thread-1" is running; stop it before replacing its transcript.'
+        );
+        // The refusal left the run's own transcript alone.
+        expect(writer.threadMessages(thread.id)).toEqual([{ role: 'user', content: 'start' }]);
+
+        slow.ready.open();
+        expect(running.status).toBe('pending');
+        const answerMessage = await pending;
+        expect(answerMessage.content).toBe('late');
+
+        // Settled: the same write now lands and replaces EVERYTHING, including the
+        // transcript the run just committed.
+        expect(writer.threadMessages(thread.id)).toEqual([
+            { role: 'user', content: 'start' },
+            { role: 'assistant', content: 'late' }
+        ]);
+
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: 'after the run' }]);
+        expect(writer.threadMessages(thread.id)).toEqual([{ role: 'user', content: 'after the run' }]);
+
+        // A STOPPED conversation stays editable — repairing a broken transcript on
+        // a stopped thread is the recovery path the visualiser needs.
+        writer.stopThread(thread.id);
+        expect(writer.thread(thread.id)?.status).toBe('stopped');
+
+        writer.setThreadMessages(thread.id, [{ role: 'user', content: 'repaired while stopped' }]);
+        expect(writer.threadMessages(thread.id)).toEqual([
+            { role: 'user', content: 'repaired while stopped' }
+        ]);
+    });
+});

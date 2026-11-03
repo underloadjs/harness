@@ -104,7 +104,8 @@ import type {
     ToolDescriptor,
     ToolIndex,
     UpdateHarnessRequest,
-    UpdateSessionRequest
+    UpdateSessionRequest,
+    UpdateThreadTranscriptRequest
 } from './protocol';
 import { mergeSettings, SettingsError } from './config';
 import { HarnessRegistryError } from './harnesses/registry';
@@ -1255,11 +1256,15 @@ export const createHarnessApi = ({
                 }
 
                 if (segments.length === 3) {
-                    // POST /sessions/:id/tasks — the server-queued submit (R4).
+                    // POST /sessions/:id/tasks — the server-queued submit (R4), and
+                    // the ONE surface that understands a slash COMMAND.
                     //
-                    // 202 `{ session, turn }`: the turn exists immediately with
-                    // status 'queued' and a stable id/index, and the server pump
-                    // runs it even if this client (or any browser) disconnects.
+                    // 202 `{ session, turn }`: for model work the turn exists
+                    // immediately with status 'queued' and a stable id/index, and the
+                    // server pump runs it even if this client (or any browser)
+                    // disconnects. For a leading-"/" input the turn is already
+                    // TERMINAL (a command runs here, server-side, without a model
+                    // request), and the same envelope shape carries its result.
                     // Validation/trimming/cap live in the store (400/413/429) so
                     // this route and the legacy /messages route cannot disagree.
                     if (second === 'tasks') {
@@ -1273,16 +1278,23 @@ export const createHarnessApi = ({
                         }
 
                         // Attachments are a trailing store argument (T3); the store
-                        // validates them (400/413/415) before the queued turn exists.
+                        // validates them (400/413/415) before the queued turn exists —
+                        // for a COMMAND they are a 400 (a command takes no media).
                         // References are the next trailing argument (R2): the store
-                        // validates/binds them (400) before any mutation.
-                        const submitted = store.enqueue(
+                        // validates/binds them (400) before any mutation, and refuses
+                        // them for a command for the same reason.
+                        //
+                        // `dispatch` is ASYNC because a command turn is executed and
+                        // fully recorded before it returns; a plain task still resolves
+                        // with the accepted (queued) state without waiting for the pump.
+                        const submitted = await store.dispatch(
                             first,
                             body.input,
                             body.attachments,
                             body.references,
                             // R1-R6: an explicit thread steers/continues that
-                            // conversation; absent opens a new standalone thread.
+                            // conversation; absent opens a new standalone thread. A
+                            // COMMAND ignores it (session scope, never a lane).
                             body.threadId
                         );
 
@@ -1320,6 +1332,11 @@ export const createHarnessApi = ({
                     if (second === 'messages') {
                         if (method !== 'POST') throw new HttpError(405, 'Use POST to submit a task.');
 
+                        // NOTE: a leading-"/" line is NOT a command here. The legacy
+                        // response-owned route keeps sending it to the model (its
+                        // run/stream contract predates the command registry, and its
+                        // SSE envelope has no terminal-turn frame for a local
+                        // result). Slash commands are supported on /tasks only.
                         const body = requireObjectBody<SubmitMessageRequest>(
                             await readBody<SubmitMessageRequest>()
                         );
@@ -1418,6 +1435,51 @@ export const createHarnessApi = ({
                         kind: 'json',
                         status: 200,
                         body: store.cancelThread(first, segments[3])
+                    };
+                }
+
+                // GET / PUT /sessions/:id/threads/:threadId/transcript (C4). The
+                // transcript is FULLY user-editable JSON: GET returns the live
+                // transcript plus the pretty JSON to edit (and the reason + raw
+                // value when the stored value cannot be read), and PUT ACCEPTS a
+                // structurally broken value with 200 — the broken text is persisted
+                // and the live transcript becomes a valid placeholder, so the user
+                // can always see and repair it. 404 unknown session/thread, 409
+                // running thread, 400 malformed body/absent `messages`.
+                if (segments.length === 5 && second === 'threads' && segments[4] === 'transcript') {
+                    const threadId = segments[3];
+
+                    if (method === 'GET') {
+                        return {
+                            kind: 'json',
+                            status: 200,
+                            body: { transcript: store.threadTranscript(first, threadId) }
+                        };
+                    }
+
+                    if (method !== 'PUT') {
+                        throw new HttpError(
+                            405,
+                            `Use GET or PUT for ${mount}/sessions/:id/threads/:threadId/transcript.`
+                        );
+                    }
+
+                    const body = requireObjectBody<UpdateThreadTranscriptRequest>(
+                        await readBody<UpdateThreadTranscriptRequest>()
+                    );
+
+                    // `messages` must be PRESENT. A service whose JSON body failed to
+                    // parse answers `{}` (see ./service.ts), so an absent property is
+                    // indistinguishable from a swallowed parse error; refusing it keeps
+                    // a malformed request from silently EMPTYING a transcript.
+                    if (body.messages === undefined) {
+                        throw new HttpError(400, 'A transcript update requires a `messages` value.');
+                    }
+
+                    return {
+                        kind: 'json',
+                        status: 200,
+                        body: store.updateThreadTranscript(first, threadId, body.messages)
                     };
                 }
 

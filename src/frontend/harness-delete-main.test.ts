@@ -298,15 +298,16 @@ it('deletes the selected harness after the second press and reselects another on
     // R6: a harness delete never removes conversations. Only the harness route was hit.
     expect(calls.filter((call) => call.method === 'DELETE' && call.url.startsWith('/api/sessions/'))).toEqual([]);
 
-    // The surviving harness still lists its own session in the main list, and the deleted
-    // harness's conversation is reachable in the archived group (R6) rather than gone.
+    // The surviving harness still lists its own session, and the deleted harness's
+    // conversation stays reachable in the SAME strip (T3/R1) — as a `data-archived` pill
+    // instead of a rail group with its own heading.
     expect(
-        [...document.querySelectorAll('.session-list:not(.session-archived-list) .session-row')].map(
+        [...document.querySelectorAll<HTMLElement>('.session-pill[data-archived=false]')].map(
             (node) => node.dataset.sessionId
         )
     ).toEqual(['chat-b']);
     expect(
-        [...document.querySelectorAll('.session-archived-list .session-row')].map(
+        [...document.querySelectorAll<HTMLElement>('.session-pill[data-archived=true]')].map(
             (node) => node.dataset.sessionId
         )
     ).toEqual(['chat-a']);
@@ -447,7 +448,14 @@ it('replaces the chat column with guidance when the last harness is deleted outs
     );
     expect(document.querySelectorAll('.harness-row')).toHaveLength(0);
     expect(pressedHarnesses()).toEqual([]);
-    expect(document.querySelector('.sessions-scope')?.textContent).toBe('Select a harness to see its sessions.');
+    // T3/R1: the strip carries no "select a harness" hint here, because the deleted
+    // harness's conversation is still listed (R6: losing the definition must not orphan
+    // the record). The rail's `.sessions-scope` sentence is gone with the rail.
+    expect(document.querySelector('.sessions-scope')).toBeNull();
+    expect(document.querySelector('.session-pills-empty')).toBeNull();
+    expect(
+        [...document.querySelectorAll<HTMLElement>('.session-pill')].map((node) => node.dataset.sessionId)
+    ).toEqual(['chat-a']);
     expect((document.querySelector('.composer') as HTMLFormElement | null)?.hidden).toBe(true);
     expect((document.querySelector('.agent-slot') as HTMLElement | null)?.hidden).toBe(true);
 });
@@ -517,34 +525,34 @@ const archivedRecord = (): SessionSnapshot =>
         turns: [turn('Plan the release')]
     });
 
-it('lists a deleted harness sessions in an archived group and reopens it from its frozen definition', async () => {
+it('keeps a deleted harness session reachable as an archived pill and reopens it from its frozen definition', async () => {
     const calls = stubServer({
         presets: [descriptor('alpha'), descriptor('beta')],
         sessions: [archivedRecord()]
     });
     await boot();
 
-    // Before the delete the conversation is an ordinary row of the selected harness.
-    expect(document.querySelector('.session-archived')?.hidden).toBe(true);
+    // Before the delete the conversation is an ordinary pill of the selected harness.
+    expect(document.querySelector('.session-archived')).toBeNull();
+    expect(document.querySelectorAll('.session-pill[data-archived=false][data-session-id="chat-a"]')).toHaveLength(1);
 
     await deleteHarnessRow('alpha');
 
-    // beta is now selected, and alpha's conversation is still reachable: it moved into the
-    // labelled archived group instead of disappearing with the harness row.
-    const archived = document.querySelector<HTMLElement>('.session-archived');
-    expect(archived?.hidden).toBe(false);
-    expect(archived?.querySelector('.session-archived-title')?.textContent).toBe('Archived harnesses');
-    expect(archived?.querySelector('.field-hint')?.textContent).toBe(
-        'Saved sessions of a harness you deleted. They still open exactly as they were; starting a new session needs a harness that exists.'
-    );
-
-    const row = archived?.querySelector<HTMLElement>('.session-row[data-session-id="chat-a"]');
-    expect(row).toBeDefined();
-    expect(row?.querySelector('.session-harness')?.textContent).toBe('alpha');
-    expect(row?.querySelector('.session-meta')?.textContent).toBe('idle · 1 turn · chat-a');
+    // beta is now selected, and alpha's conversation is still reachable (R6): it stays in
+    // the same strip, flagged `data-archived`. T3/R1 dropped the labelled rail group and
+    // its explanatory hint — the dashed/muted pill frame and the harness in the tooltip
+    // carry the same fact one line lower.
+    const pill = document.querySelector<HTMLElement>('.session-pill[data-session-id="chat-a"]');
+    expect(pill?.dataset.archived).toBe('true');
+    expect(pill?.dataset.status).toBe('idle');
+    const select = pill?.querySelector<HTMLElement>('.session-pill-select');
+    // Only the eight-character prefix is visible; the harness the record belongs to is in
+    // the tooltip, which is what replaces the old `.session-harness` line.
+    expect(select?.textContent).toBe('chat-a');
+    expect(select?.title).toBe('alpha · idle · chat-a');
 
     // Opening it is the normal path: one GET of the record, nothing else.
-    archived?.querySelector<HTMLButtonElement>('.session')?.click();
+    pill?.querySelector<HTMLButtonElement>('.session-pill-select')?.click();
     await flush();
     await flush();
 
@@ -555,21 +563,18 @@ it('lists a deleted harness sessions in an archived group and reopens it from it
     expect(document.querySelector('.harness-note')?.textContent).toBe(
         'Deleted harness · saved session kept and reopened from its frozen definition'
     );
-    expect(document.querySelector('.sessions-scope')?.textContent).toBe(
-        'Locked to alpha · this harness was deleted.'
-    );
 
-    // The conversation really reopened (its recorded prompt is on screen), and it is now
-    // the active row of the main list rather than duplicated in the group.
+    // The conversation really reopened (its recorded prompt is on screen). The pill is now
+    // the ACTIVE one and still appears exactly once — the archived pass must never
+    // duplicate a conversation the selected (deleted) harness already owns.
     expect(document.querySelector('.stage')?.textContent).toContain('Plan the release');
-    // The row moved: the archived group is empty/hidden, and the main list owns the active
-    // row (no duplicate of the same conversation in two places).
-    expect(archived?.querySelectorAll('.session-row')).toHaveLength(0);
-    expect(archived?.hidden).toBe(true);
-    const opened = document.querySelector<HTMLElement>(
-        '.session-list:not(.session-archived-list) .session-row[data-session-id="chat-a"]'
-    );
+    expect(document.querySelectorAll('.session-pill[data-session-id="chat-a"]')).toHaveLength(1);
+    // Every paint REBUILDS the pills, so the pre-open reference is detached: proof the
+    // strip was re-projected rather than appended to (the old rail could duplicate a row).
+    expect(pill?.parentElement).toBeNull();
+    const opened = document.querySelector<HTMLElement>('.session-pill[data-session-id="chat-a"]');
     expect(opened?.getAttribute('data-active')).toBe('true');
+    expect(opened?.getAttribute('data-archived')).toBe('true');
 
     // NO registry resurrection: the rail still shows only the surviving harness, nothing
     // was POSTed to /harnesses, and a new session cannot start on a harness that is gone.
@@ -589,14 +594,14 @@ it('reopens an archived conversation even when no harness is left at all', async
 
     await deleteHarnessRow('alpha');
 
-    // Empty roster: the rail says there are no harnesses, but the conversation is still
+    // Empty roster: there is no harness row to select, but the conversation is still
     // offered — losing the definition must not orphan the record.
     expect(document.querySelectorAll('.harness-row')).toHaveLength(0);
-    expect(document.querySelector('.session-archived')?.hidden).toBe(false);
+    expect(document.querySelectorAll('.session-pill[data-archived=true][data-session-id="chat-a"]')).toHaveLength(1);
 
     document
-        .querySelector('.session-archived')
-        ?.querySelector<HTMLButtonElement>('.session-row[data-session-id="chat-a"] .session')
+        .querySelector<HTMLElement>('.session-pill[data-session-id="chat-a"]')
+        ?.querySelector<HTMLButtonElement>('.session-pill-select')
         ?.click();
     await flush();
     await flush();
@@ -628,8 +633,8 @@ it('refuses an archived record with no frozen definition instead of inventing a 
     await deleteHarnessRow('alpha');
 
     document
-        .querySelector('.session-archived')
-        ?.querySelector<HTMLButtonElement>('.session-row[data-session-id="chat-l"] .session')
+        .querySelector<HTMLElement>('.session-pill[data-session-id="chat-l"]')
+        ?.querySelector<HTMLButtonElement>('.session-pill-select')
         ?.click();
     await flush();
     await flush();

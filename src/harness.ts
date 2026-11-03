@@ -331,7 +331,13 @@ import {
     pruneBranchRecords,
     reserveBranchSequence,
     validateActionChoice,
-    validateActionRequestParameters
+    validateActionRequestParameters,
+    // Slash-command registry primitives: the shared parser (a host rendering a
+    // composer needs the SAME grammar) and the built-in set that is registered
+    // below before any configured command. See core/command.ts.
+    createBuiltinCommands,
+    parseCommandLine,
+    validateCommandName
 } from './core';
 import type { AgentBranchMetadata } from './core';
 import type { DiscoveredTool } from './core';
@@ -356,6 +362,9 @@ import type {
     HarnessBranchStatus,
     HarnessBranchSummary,
     HarnessBranchTerminalStatus,
+    HarnessCommand,
+    HarnessCommandConfiguration,
+    HarnessCommandResult,
     HarnessConfiguration,
     HarnessDelegationResult,
     HarnessErrorInfo,
@@ -3773,6 +3782,56 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     const threadMessages = (threadId: string): HarnessMessage[] =>
         cloneMessages(threadStateOf(threadId).agent.messages);
 
+    // C4: wholesale transcript replacement (the server's transcript editor).
+    //
+    // WHY THE ORDER BELOW IS FIXED
+    // ---------------------------
+    //   1. resolve the thread first  → an unknown id is the same HarnessError
+    //      every other thread operation throws (`threadStateOf`);
+    //   2. refuse live work BEFORE validating → the caller gets the actionable
+    //      "stop it first" reason instead of a schema complaint about a value the
+    //      run is still writing;
+    //   3. validate with `readHarnessMessages`, the SAME reader `snapshot()` uses
+    //      for this transcript (see line ~6725). It returns a fully detached,
+    //      normalised copy and throws on a bad role/key/shape, so a rejected write
+    //      mutates nothing and a successful one can never emit a snapshot this
+    //      harness's own `restore()` would refuse;
+    //   4. only then replace.
+    //
+    // IN-PLACE replacement mirrors `restore()` (line ~7025): the transcript array
+    // is exposed as `agent.messages` by reference, so reassigning a new array
+    // would leave existing readers (the run loop, the server roster) staring at a
+    // stale value. Truncate + push keeps every reference valid.
+    //
+    // Edge case: `validated` may be an EMPTY array. That is a legal transcript
+    // here (a bare conversation with no system seed); restore() accepts it for a
+    // host thread, and the next run simply starts from the agent instructions.
+    const setThreadMessages = (threadId: string, messages: HarnessMessage[]): void => {
+        const target = threadStateOf(threadId);
+
+        // Same live-work predicate as `deleteThread` (line ~3680) and `reset()`
+        // (line ~7564): a record that still says 'running', OR any live run object
+        // attached to the thread. A run that has been stopped but is still
+        // unwinding keeps `state.run` set, and `status` may already read
+        // 'stopped'; replacing its transcript mid-unwind would be lost work.
+        if (target.record.status === 'running' || target.run !== undefined) {
+            throw new HarnessError(
+                `Thread "${threadId}" is running; stop it before replacing its transcript.`
+            );
+        }
+
+        const validated = readHarnessMessages(messages, `thread "${threadId}" messages`);
+
+        target.agent.messages.length = 0;
+        for (const message of validated) target.agent.messages.push(message);
+
+        // Shared-store persistence: the transcript IS harness state, so the
+        // session's state-change observer must capture it. `agent_message` + the
+        // owning agent's name is exactly what `postThreadMessage` reports for an
+        // idle append (line ~3460); no new reason is introduced.
+        notifyStateChange('agent_message', { agent: target.agent.name });
+    };
+
     // Every live run, so a scheduler wake can mark the right runs dirty. Runs are
     // removed in runAgent's finally.
     const runs = new Set<RunState>();
@@ -7060,6 +7119,166 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
     };
 
     // Apply plugins before returning so the handle is complete and consistent.
+    //
+    // -----------------------------------------------------------------------
+    // The slash-command registry
+    // -----------------------------------------------------------------------
+    //
+    // WHY THE HARNESS OWNS IT
+    // -----------------------
+    // A slash line is an OPERATOR action, not a prompt: `/task add "testing"` has
+    // to run in the process that owns the session (the server, the CLI, the UI
+    // composer's submit handler), never be forwarded to a model that cannot
+    // answer for it. A registry on the handle is what makes that possible for
+    // every front end at once: one name resolves to one implementation, tools and
+    // plugins contribute commands the way they contribute tools, and a host only
+    // has to call `executeCommand` and print the result.
+    //
+    // ORDERING — and why collisions are asymmetric
+    // --------------------------------------------
+    //   1. the built-ins (/help, /tools, /task, /websearch, /webfetch);
+    //   2. `configuration.commands` — colliding with a built-in, or repeating
+    //      inside the list, is a DECLARATIVE mistake: two configuration entries
+    //      cannot both mean one name, so it fails CONSTRUCTION (fail fast, before
+    //      a plugin runs or a first command is typed);
+    //   3. plugins, then runtime `registerCommand` — both are intentional LATER
+    //      registrations, so they REPLACE by name, mirroring `addTool`/
+    //      `registerTool`. Overriding a built-in is the supported way to change
+    //      one, which is why these two phases do not reject a collision.
+    //
+    // The registry is read at CALL time (`executeCommand` looks the name up in the
+    // live record, and the `commands` handle property copies it per read), so a
+    // replacement is visible to the next command and never to an in-flight one.
+    const commandRegistry: Record<string, HarnessCommand> = {};
+
+    // The ONE install path for a command. `replace` is false during the
+    // configuration phase, where a duplicate is a bug, and true for a plugin or a
+    // runtime registration, where replacing is the point. ALL validation happens
+    // before the first mutation, so a rejected candidate leaves the registry
+    // exactly as it was (the same atomicity rule the tool kernel follows).
+    const installCommand = (
+        candidate: HarnessCommandConfiguration,
+        source: string,
+        replace: boolean
+    ): HarnessCommand => {
+        if (candidate === null || typeof candidate !== 'object') {
+            throw new HarnessError(`A command registered by ${source} must be an object.`);
+        }
+
+        if (typeof candidate.name !== 'string' || candidate.name.trim().length === 0) {
+            throw new HarnessError(
+                `A command registered by ${source} requires a name (the "/task" style name an operator will type).`
+            );
+        }
+
+        // Normalizes case and an optional leading slash, then validates the
+        // canonical form against COMMAND_NAME_PATTERN.
+        const name = validateCommandName(candidate.name);
+
+        if (
+            typeof candidate.description !== 'string' ||
+            candidate.description.trim().length === 0
+        ) {
+            throw new HarnessError(`Command "/${name}" requires a description.`);
+        }
+
+        if (typeof candidate.execute !== 'function') {
+            throw new HarnessError(`Command "/${name}" requires an execute function.`);
+        }
+
+        if (candidate.usage !== undefined && typeof candidate.usage !== 'string') {
+            throw new HarnessError(`Command "/${name}" usage must be a string.`);
+        }
+
+        if (!replace && Object.prototype.hasOwnProperty.call(commandRegistry, name)) {
+            throw new HarnessError(
+                `Command "/${name}" is already registered. Built-in commands and "commands" entries share one namespace and must be unique; use a plugin or harness.registerCommand() to override "/${name}".`
+            );
+        }
+
+        // The published record is a NEW object: a caller mutating the definition it
+        // passed in cannot edit the installed command (or its /help line) after the
+        // fact, and `name` is guaranteed canonical.
+        const command: HarnessCommand = {
+            name,
+            description: candidate.description.trim(),
+            execute: candidate.execute,
+            ...(candidate.usage === undefined || candidate.usage.trim().length === 0
+                ? {}
+                : { usage: candidate.usage.trim() })
+        };
+
+        commandRegistry[name] = command;
+
+        return command;
+    };
+
+    // Built-ins first, so a configured name that shadows one is visible as a
+    // collision. Then the declarative list. Plugins apply below and may replace.
+    for (const command of createBuiltinCommands()) {
+        installCommand(command, 'the harness', false);
+    }
+
+    for (const command of configuration.commands ?? []) {
+        installCommand(command, 'the "commands" configuration', false);
+    }
+
+    // Host-facing runtime registration: validates, then REPLACES by name
+    // (mirroring `registerTool`, where "already registered" is never an error).
+    const registerCommand = (command: HarnessCommandConfiguration): HarnessCommand =>
+        installCommand(command, 'harness.registerCommand()', true);
+
+    // Execute one slash line. The model is NEVER called and NO progress event is
+    // emitted (a command is not a conversation turn), so a host can run `/task`
+    // while a run is in flight. A built-in that calls a tool still fires the
+    // existing `stateChange('tool_execute')`, which is what a persistence layer
+    // needs to see the mutation.
+    //
+    // Two failures are exceptions, not results, because they are host bugs rather
+    // than user input: a line that is not a command at all, and an unknown name.
+    // Everything the operator can get wrong (missing argument, unconfigured tool,
+    // a rejected tool call) comes back as `{ content, isError: true }` from the
+    // built-in itself.
+    const executeCommand = async (input: string): Promise<HarnessCommandResult> => {
+        const parsed = parseCommandLine(input);
+
+        if (parsed === undefined) {
+            throw new HarnessError('a command must start with "/"');
+        }
+
+        // Own-key read: a command named `constructor` or `toString` is legal, and
+        // a prototype lookup would answer "found" for a name nobody registered.
+        const command = Object.prototype.hasOwnProperty.call(commandRegistry, parsed.name)
+            ? commandRegistry[parsed.name]
+            : undefined;
+
+        if (command === undefined) {
+            throw new HarnessError(`unknown command: /${parsed.name}`);
+        }
+
+        const result = await command.execute({
+            // The LIVE handle, so a command can read the registries and call tools
+            // like any other host (never a clone or a snapshot).
+            harness: handle,
+            name: parsed.name,
+            args: parsed.args,
+            rest: parsed.rest,
+            input: parsed.input
+        });
+
+        // Normalized for the host: `content` is always a string (a hand-built
+        // command may return nothing), and the optional keys appear only when the
+        // command actually set them, so a host can spread the result safely.
+        const content = typeof result?.content === 'string' ? result.content : '';
+
+        return {
+            content,
+            ...(result?.isError === undefined ? {} : { isError: result.isError }),
+            ...(result?.data === undefined ? {} : { data: result.data })
+        };
+    };
+
+    // Apply plugins before returning so the handle is complete and consistent.
     const pluginNames = runPlugins(configuration.plugins ?? [], {
         agents,
         tools,
@@ -7093,7 +7312,13 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             const definition = defineTool({ ...toolConfiguration, name });
             registerAtStartup({ definition });
             return definition;
-        }
+        },
+        // Commands follow the SAME replace-by-name rule as addTool, and for the
+        // same reason: the plugin phase runs after the built-ins and
+        // `configuration.commands`, so contributing a name that already exists is
+        // how a plugin intentionally overrides one.
+        addCommand: (name, definition) =>
+            installCommand({ ...definition, name }, 'a plugin', true)
     });
 
     // Startup is complete: registrations from here on are runtime registrations
@@ -7292,10 +7517,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // every nested runAgent call: only the root prompt may carry media.
         runAgent(primary, input, options?.signal, undefined, undefined, undefined, options?.attachments);
 
-    // Every Harness field except `name` and `discoveredTools` is assigned here.
-    // Those two are defineProperty'd below: `name` is a built-in function property
-    // that cannot be assigned, and `discoveredTools` must be a getter so a caller
-    // can never mutate the enabled set. The `unknown`-mediated cast is therefore
+    // Every Harness field except `name`, `commands`, and `discoveredTools` is
+    // assigned here. Those three are defineProperty'd below: `name` is a built-in
+    // function property that cannot be assigned, and `commands`/`discoveredTools`
+    // must be GETTERS so a caller can never mutate the live registry or the
+    // enabled set through the handle. The `unknown`-mediated cast is therefore
     // describing exactly that: a complete handle assembled from two sources. Keep
     // this list in step with the Harness type — an omitted accessor typechecks as
     // `never` here and the cast would silently hide it.
@@ -7328,6 +7554,11 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // Server-facing manual execution (R8): the session-bound tool invocation
         // `POST /tools/:name` uses when a client supplies a sessionId.
         executeTool,
+        // Slash commands: the operator-facing registry (a frozen copy per read)
+        // plus the two operations a host needs — run one line, and contribute or
+        // replace one command at runtime.
+        executeCommand,
+        registerCommand,
         // N6 branch audit. Ephemeral: never snapshot/restore state. Every read is a
         // DETACHED copy, so a caller cannot mutate a live record (or its branch
         // transcript) through the handle. Retention is bounded by
@@ -7350,6 +7581,8 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
             return state === undefined ? undefined : threadRecordCopy(state.record);
         },
         threadMessages,
+        // C4: the transcript editor's write primitive (validate + replace in place).
+        setThreadMessages,
         createThread,
         sendThreadInput,
         steerThread,
@@ -7442,6 +7675,16 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         configurable: true
     });
 
+    // Read-only command view (`Harness.commands`). A getter that copies AND freezes
+    // the live registry on every read: `/help` and a host UI get the current set
+    // (a plugin or `registerCommand` replacement shows up in the next read), while
+    // a caller can never add, delete, or swap an entry through the handle.
+    Object.defineProperty(handle, 'commands', {
+        get: () => Object.freeze({ ...commandRegistry }),
+        enumerable: true,
+        configurable: true
+    });
+
     return handle;
 };
 
@@ -7523,6 +7766,20 @@ export { MAX_THREAD_LABEL_CHARS, MAX_THREAD_RECORDS, defaultThreadIdOf } from '.
 // tool author can quote the same caps the server enforces (see core/tool-ui.ts).
 export { TOOL_UI_LIMITS, normalizeToolUiPanels } from './core';
 export type { ToolUiExtraction } from './core';
+// Slash commands (operator-facing, harness-side). The parser is public so a host
+// (CLI, server route, UI composer) resolves a line with the SAME grammar the
+// registry uses instead of splitting it by hand, and the built-in factory is
+// public so a host can register the same set on its own harness-like object. The
+// command TYPES ride on `export type * from './types'` at the bottom.
+export {
+    COMMAND_NAME_PATTERN,
+    createBuiltinCommands,
+    formatCommandHelp,
+    normalizeCommandName,
+    parseCommandLine,
+    validateCommandName
+} from './core';
+export type { ParsedCommand } from './core';
 export { openAICompatible, listModels, ModelListError } from './transport';
 export type { ModelListConfiguration, ModelListErrorKind } from './transport';
 export {

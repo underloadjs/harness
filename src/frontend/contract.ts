@@ -11,10 +11,24 @@
 //   - `tool_result.callId`;
 //   - concurrent-tool fields (`toolResult.durationMs`, `pending`, `wakeup`);
 //   - interactive action requests/answers and fork/autoanswer branch events (N3);
+//   - the C4 invalid-transcript roster (`SessionSnapshot.invalidThreads`);
 //   - legacy harness aliases for the sessions filter.
 //
 // Every accessor has to be safe on an older payload: a missing field must degrade
 // to something truthful, never to NaN or to a fabricated duration.
+//
+// SNAPSHOT PASS-THROUGH (C6): this module reads FIELDS, it never rebuilds a snapshot.
+// There is deliberately no whitelist normalizer anywhere between `GET /sessions/:id`
+// (or a `SessionStreamItem`'s `session`) and `main.ts#applySnapshot`, which stores the
+// answer as `{ ...session, turns, threads }`. That is what makes an additive record
+// such as `invalidThreads` — including each entry's opaque `messages` value, which is
+// precisely NOT a `HarnessMessage[]` — survive a round trip into the UI untouched. The
+// defensive per-entry validation for that roster lives in `ui/threads.ts`
+// (`invalidThreadsOf`: an entry with no usable id is dropped, a valid one is kept
+// verbatim), because it is the roster projection that decides what the board renders.
+// Anything that starts rebuilding a snapshot field-by-field here or in main.ts must
+// carry `invalidThreads` explicitly; `src/frontend/snapshot-invalid-threads-main.test.ts`
+// and `src/frontend/ui/threads-invalid.test.ts` pin that contract.
 
 import type {
     AgentDescriptor,

@@ -198,6 +198,39 @@ summary::-webkit-details-marker {
     line-height: 1;
 }
 
+/* R4 (T4): the top-right status pill doubles as the trigger for the Endpoint & model
+   dialog. The pill ITSELF stays the `role="status"` live region (`<span class="status">`),
+   because a live region cannot also be a button; this bare wrapper button carries the
+   click, `aria-haspopup="dialog"` and the accessible name. It resets the UA button
+   chrome completely so the pill's border, radius and colour remain the only painted
+   surface — and it deliberately has NO `overflow: hidden`, which would clip the
+   pill's own ellipsis machinery and this button's focus ring. */
+.status-button {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    max-width: 100%;
+    padding: 0;
+    border: 0;
+    background: none;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+}
+
+.status-button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: 999px;
+}
+
+/* Hover reinforces the affordance with the pill's own border/colour, so the popup
+   reads as clickable without adding a second box around it. */
+.status-button:hover .status {
+    border-color: var(--accent);
+    color: var(--text);
+}
+
 /* The pill is the app's request-lifecycle indicator. Colour is never the only
    signal: the text states the phase, and a pulsing dot (motion, then also text)
    marks work in flight. The visible word is the CONCISE app vocabulary
@@ -299,36 +332,20 @@ summary::-webkit-details-marker {
     border-color: rgba(248, 113, 113, 0.45);
 }
 
-/* Rail toggles (R1) ------------------------------------------------------ */
+/* Scratch board FAB (T3/R3) --------------------------------------------- */
 
-/* Phone-only disclosure for the RIGHT rail. It lives on the harness title row
-   (main.ts `titleRow`), so on a phone it sits to the RIGHT of the harness title and
-   the left rail needs no control at all (the "Harness UI" brand opens the listing).
-   Every layout at or above 861px shows both rails permanently, so the control does
-   nothing there; hiding it keeps the title row unchanged on desktop/tablet. The
-   mobile block below reveals it. */
-.rail-toggles {
+/* The right rail's phone trigger is a FLOATING action button, not a header toggle: the
+   header row has nothing left to disclose now that the session directory lives under the
+   title (T3/R1). It is hidden at every wider width, where the rail is permanently visible
+   and the control would be a no-op; the phone block below reveals it, pinned above the
+   composer with `bottom: calc(var(--composer-height, 76px) + 12px)`. */
+.scratch-fab {
     display: none;
-    align-items: center;
-    gap: 6px;
-    flex: 0 0 auto;
-    margin-left: auto;
 }
 
-.rail-toggle {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    width: 30px;
-    height: 30px;
-    padding: 0;
-    font-family: var(--mono);
-    font-size: 14px;
-    line-height: 1;
-}
-
-/* R4: the phone rail toggles are icon-only, so the glyph carries the whole visual
-   footprint. It is decorative; the button's aria-label names the rail. */
+/* R4: the drawer glyph stays decorative — the button's `aria-label` names the rail and
+   `aria-expanded` carries the state. The glyph keeps its own class so the button's
+   `font-size` never has to fight an icon-specific rule. */
 .rail-toggle-icon {
     font-size: 14px;
     line-height: 1;
@@ -667,44 +684,24 @@ summary::-webkit-details-marker {
     gap: 6px;
 }
 
-/* Endpoint ------------------------------------------------------------- */
+/* Endpoint & model (R4 / T4) ------------------------------------------- */
 
-.endpoint {
-    margin-top: auto;
-    padding-top: 10px;
-    border-top: 1px solid var(--border);
-}
-
-.endpoint-summary {
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 0.1em;
-    cursor: pointer;
-    list-style: none;
-}
-
-.endpoint-summary::-webkit-details-marker {
-    display: none;
-}
-
-.endpoint-summary::before {
-    content: '▸';
-    display: inline-block;
-    margin-right: 6px;
-    transition: transform 120ms ease;
-}
-
-.endpoint[open] > .endpoint-summary::before {
-    transform: rotate(90deg);
+/* The settings have no rail home any more: `.endpoint-body` is the PERSISTENT field
+   group and the status-pill dialog adopts it into a fresh `.endpoint-dialog` wrapper on
+   every open. The wrapper owns the dialog's breathing room; `.endpoint-body` keeps its
+   own field spacing and drops the accordion `padding-top`, because the dialog title
+   replaced the `<summary>` that used to sit above it. */
+.endpoint-dialog {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: min(440px, 100%);
 }
 
 .endpoint-body {
     display: flex;
     flex-direction: column;
     gap: 9px;
-    padding-top: 10px;
 }
 
 .field {
@@ -1068,6 +1065,186 @@ summary::-webkit-details-marker {
     margin: 8px 0 0;
     color: var(--muted);
     font-size: 12px;
+}
+
+/* Session pills (T3/R1) ------------------------------------------------- */
+/* The saved-conversation directory moved out of the right rail and into one compact
+   strip under the Instruct title. `main.ts` `createSessionPillBar` builds it, and the
+   SAME strip is inserted at the top of the harness details dialog on a phone, where CSS
+   hides the header copy (see `.session-pills-bar-head` in the phone block).
+   Contract:
+     .session-pills-bar[.session-pills-bar-head|.session-pills-bar-dialog]
+       .session-pills                role="list" (role="presentation" when empty)
+         .session-pill[data-session-id][data-status][data-active][data-archived]
+           .session-pill-select      opens the conversation
+             .session-pill-id        the FIRST EIGHT CHARACTERS only
+           .session-pill-delete      one click = one DELETE
+       .new-session                  kept: the historical selector and busy state
+       .refresh-sessions
+   The strip wraps instead of scrolling: horizontal overflow here would push the composer
+   and the transcript wider than the chat column. */
+
+.session-pills-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    /* Directly under the title row; the note line below it stays visually separate. */
+    margin: 2px 0 0;
+    min-width: 0;
+    max-width: 100%;
+}
+
+.session-pills {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px;
+    /* A flex item inside the chat column: without `min-width: 0` a long run of pills
+       raises an intrinsic floor and widens the column (R6 containment rule). */
+    min-width: 0;
+    max-width: 100%;
+}
+
+/* The wrapper is a `<span>`, NOT a button: the open and delete controls are siblings
+   inside it (nested buttons are invalid) and this element exists only to carry the state
+   attributes painted below. */
+.session-pill {
+    display: inline-flex;
+    align-items: stretch;
+    overflow: hidden;
+    min-width: 0;
+    max-width: 100%;
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    background: var(--bg-elevated);
+}
+
+.session-pill-select {
+    display: inline-flex;
+    align-items: center;
+    min-width: 0;
+    padding: 2px 8px;
+    border: 0;
+    background: transparent;
+    color: inherit;
+    cursor: pointer;
+}
+
+/* The visible id is monospace so the eight characters read as an id and line up across
+   pills; it clips rather than widening the strip (the tooltip carries the full uuid). */
+.session-pill-id {
+    min-width: 0;
+    overflow: hidden;
+    color: var(--text);
+    font-family: var(--mono);
+    font-size: 11.5px;
+    letter-spacing: 0.02em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.session-pill-select:hover:not(:disabled) .session-pill-id {
+    color: var(--accent);
+}
+
+.session-pill-select:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+}
+
+.session-pill-select:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: -2px;
+}
+
+/* The conversation this card is pointed at. The strip is the only place that states it,
+   so the frame is explicit rather than a tint. */
+.session-pill[data-active='true'] {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+.session-pill[data-active='true'] .session-pill-id {
+    color: var(--accent);
+}
+
+/* A running/saving conversation is amber text, matching the status pill's vocabulary.
+   Colour never carries it alone: `data-status` and the tooltip state are the facts. */
+.session-pill[data-status='running'] .session-pill-id,
+.session-pill[data-status='saving'] .session-pill-id {
+    color: var(--warn);
+}
+
+/* R6: the harness of this conversation was deleted. The pill stays fully clickable
+   (open and delete are the same paths); the muted, dashed frame only says the record has
+   no harness row to belong to. */
+.session-pill[data-archived='true'] {
+    border-style: dashed;
+    border-color: var(--border-strong);
+    background: transparent;
+}
+
+.session-pill[data-archived='true'] .session-pill-id {
+    color: var(--muted);
+}
+
+/* The destructive half, separated by a divider so the two controls never read as one.
+   The hit area stays >=20x20 even though the glyph is small. */
+.session-pill-delete {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 22px;
+    min-height: 22px;
+    padding: 0;
+    border: 0;
+    border-left: 1px solid var(--border);
+    background: transparent;
+    color: var(--danger);
+    font-family: var(--mono);
+    font-size: 13px;
+    line-height: 1;
+    cursor: pointer;
+}
+
+.session-pill-delete:hover:not(:disabled) {
+    background: rgba(248, 113, 113, 0.12);
+}
+
+.session-pill-delete:focus-visible {
+    outline: 2px solid var(--danger);
+    outline-offset: -2px;
+}
+
+.session-pill-delete:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* No conversation to offer. Short on purpose: it sits under the title, where the old rail
+   sentence ("Locked to <harness>") had room to explain the scoping rule. */
+.session-pills-empty {
+    margin: 0;
+    color: var(--muted);
+    font-size: 11.5px;
+}
+
+/* R2 (T3): the phone dialog's Sessions block. The strip above the header copy is hidden
+   there, so the dialog owns the directory and needs its own caption. */
+.harness-details-section {
+    margin: 0 0 6px;
+    color: var(--muted);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+}
+
+.harness-details .session-pills-bar {
+    margin: 0 0 12px;
 }
 
 /* Agent row ------------------------------------------------------------ */
@@ -2810,6 +2987,187 @@ summary::-webkit-details-marker {
     font-size: 13px;
 }
 
+/* C5: the dialog's own control row. The shared modal has no actions API, so the
+   transcript buttons live in the adopted content (the same precedent as the thread
+   toolbars above); this row is a plain flex line, NOT the `.thread-transcript-action`
+   toolbar — that one is hidden by expansion state and owns Delete's confirmation row.
+   `margin-left: auto` on the last action keeps Copy (a secondary affordance) at the
+   trailing edge while Save/Cancel stay where the reader looks first. */
+.thread-transcript-actions {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+}
+
+.thread-transcript-copy {
+    margin-left: auto;
+}
+
+/* C5: one button vocabulary with the thread toolbars, so an action inside the dialog
+   reads exactly like the Delete/Transcript controls that opened it. */
+:is(.thread-transcript-edit, .thread-transcript-save, .thread-transcript-cancel) {
+    padding: 5px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--bg-elevated);
+    color: var(--text);
+    font: 500 11.5px/1.4 var(--sans);
+    cursor: pointer;
+}
+
+.thread-transcript-save {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+}
+
+:is(.thread-transcript-edit, .thread-transcript-save, .thread-transcript-cancel):hover:not(:disabled) {
+    border-color: var(--accent);
+}
+
+:is(.thread-transcript-edit, .thread-transcript-save, .thread-transcript-cancel):focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* Save is disabled for two honest reasons the dialog states in `title`: an unwired
+   host, and a PUT already in flight. */
+.thread-transcript-save:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
+}
+
+/* C5: the raw JSON the reader owns. A textarea (not a contenteditable) because the
+   value must be plain text: no rich-text paste can inject markup, `value` is the exact
+   document that gets parsed, and the browser gives selection/undo/ctrl-A for free.
+   It owns its own scroll (`max-height`) so the identity line and the error stay in
+   view while a long transcript is being repaired. */
+.thread-transcript-editor {
+    width: 100%;
+    min-height: 240px;
+    max-height: min(60vh, 640px);
+    padding: 12px 14px;
+    border: 1px solid var(--border-strong);
+    border-radius: 8px;
+    background: var(--bg-deep);
+    color: var(--text);
+    font: 11.5px/1.5 var(--mono);
+    tab-size: 2;
+    resize: vertical;
+}
+
+.thread-transcript-editor:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+/* C5: the inline failure line. Tone is DATA (`data-tone` in ui/thread-transcript.ts):
+   `local` is a document the browser refused, `request` is the server refusing the
+   write, and `server` (amber) is the harness unable to READ what is stored — a state
+   that survived a successful save rather than a failed one. All three are stated in the
+   SAME place so the message that needs acting on never moves between attempts. Hidden
+   (not removed) while empty so the live region keeps its announcement slot. */
+.thread-transcript-error {
+    margin: 0;
+    padding: 8px 10px;
+    border: 1px solid var(--danger);
+    border-left-width: 3px;
+    border-radius: 6px;
+    background: rgba(248, 113, 113, 0.1);
+    color: var(--danger);
+    font: 11.5px/1.5 var(--mono);
+    overflow-wrap: anywhere;
+    white-space: pre-wrap;
+}
+
+.thread-transcript-error[hidden] {
+    display: none;
+}
+
+.thread-transcript-error[data-tone='server'] {
+    border-color: var(--warn);
+    background: rgba(251, 191, 36, 0.1);
+    color: var(--warn);
+}
+
+/* C6: the one-line scope note above the editor ("Save replaces only these messages").
+   It is disclosure, not a status, so it stays quiet: muted mono at the meta line's size,
+   no border and no background, so the error line and the field keep the visual weight.
+   `margin: -6px 0 0` tucks it under the identity/error block the dialog already groups,
+   instead of adding another 14px gap from `.thread-transcript`'s column spacing. */
+.thread-transcript-note {
+    margin: -6px 0 0;
+    color: var(--muted);
+    font: 11px/1.45 var(--mono);
+    overflow-wrap: anywhere;
+}
+
+/* C5: the Copy control in the editor row is the SHARED text-copy button
+   (ui/dialog.ts `createTextCopyButton`): on the plain-HTTP LAN deployment there is no
+   `navigator.clipboard` at all, and only this control carries the focus-trap-aware
+   execCommand fallback, so a hand-rolled copy would silently "succeed" and change
+   nothing. Scoped through `.thread-transcript-actions` so it reads like its sibling
+   buttons and never depends on which stylesheet the bundle emits last. */
+.thread-transcript-actions .thread-transcript-copy {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 5px 12px;
+    border: 1px solid var(--border-strong);
+    border-radius: 6px;
+    background: var(--bg-elevated);
+    color: var(--text);
+    font: 500 11.5px/1.4 var(--sans);
+    cursor: pointer;
+}
+
+.thread-transcript-actions .thread-transcript-copy svg {
+    display: block;
+    width: 14px;
+    height: 14px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+}
+
+.thread-transcript-actions .thread-transcript-copy:hover {
+    border-color: var(--accent);
+}
+
+.thread-transcript-actions .thread-transcript-copy:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+.thread-transcript-actions .thread-transcript-copy[data-state='success'] {
+    border-color: rgba(52, 211, 153, 0.65);
+    color: var(--ok);
+}
+
+.thread-transcript-actions .thread-transcript-copy[data-state='error'] {
+    border-color: rgba(248, 113, 113, 0.65);
+    color: var(--danger);
+}
+
+/* C5: an unreadable transcript on the surfaces that represent the conversation. The
+   conversation stays focusable and steerable — only the DOCUMENT is unavailable — so
+   this is one short badge in the identity line plus the note above the message list,
+   never a hidden or dimmed card. */
+:is(.thread-focus-invalid, .thread-focus-invalid-note) {
+    color: var(--warn);
+    font: 500 10.5px/1.5 var(--mono);
+}
+
+.thread-focus-invalid-note {
+    margin: 0;
+}
+
+.conversation[data-invalid='true'] {
+    border-color: var(--warn);
+}
+
 .thread-transcript-message {
     display: flex;
     flex-direction: column;
@@ -2996,20 +3354,22 @@ summary::-webkit-details-marker {
    token figures it used to print are measurements, and the block HEADERS already
    carry theirs (`.tile-top`, `.thread-top`: `elapsed | tokens`, with the state word clipped
    to screen-reader-only and the line colour carrying the state). What the
-   end of an answer offers is one action: copy this block's final Markdown.
-   Right-aligned, so the control reads as an affordance of the answer above it and
-   the transcript's left column stays clean at every depth. */
+   end of an answer offers is a COPY action for this block's final Markdown, FIRST
+   (left) so it reads as an affordance of the answer above it, and the block's
+   Collapse/Expand toggle LAST. The toggle is pinned right with `margin-left: auto`
+   (below), so the row reads the same whether or not an answer has completed yet. */
 .agent-answer-actions {
     display: flex;
     align-items: center;
-    justify-content: flex-end;
+    justify-content: flex-start;
     gap: 6px;
     margin-top: 4px;
 }
 
-/* Nothing completed to copy yet — the answer is still streaming, the block only
-   issued calls, or its text was cut short by an error/cancel. The row collapses
-   entirely instead of leaving a dead strip under the block. */
+/* Nothing to show at all: a FLAT legacy section has no collapsible surface, so its
+   footer only ever gains the copy button, and until an answer completes the row is
+   empty — it must take NO vertical space instead of leaving a dead strip under the
+   block. A block WITH a surface always owns its toggle, so this never matches there. */
 .agent-answer-actions:empty {
     display: none;
 }
@@ -3071,6 +3431,179 @@ summary::-webkit-details-marker {
 .agent-answer-actions .answer-copy[data-state='error'] {
     border-color: rgba(248, 113, 113, 0.65);
     color: var(--danger);
+}
+
+/* R5: the block's Collapse/Expand toggle, the LAST control in the row. Built by
+   ui/turns.ts (`attachSectionCollapse`): a real <button> with an aria-hidden chevron
+   and no visible word, so it is the copy control's twin in size, border, colour and
+   focus ring — two buttons that sit side by side must not look like two different
+   widgets. Scoped through `.agent-answer-actions` for the same reason as the copy
+   rules: the shared specificity keeps the footer look independent of bundle order. */
+.agent-answer-actions .answer-collapse {
+    position: relative;
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+    /* R5: the toggle owns the RIGHT edge. The row is `justify-content: flex-start`
+       (the copy button sits flush left against the answer it copies), so this is what
+       pins the toggle to the opposite end WHETHER OR NOT a copy button exists. */
+    margin-left: auto;
+}
+
+/* ONE down-pointing chevron in the DOM: the expanded state is a 180° rotation, so the
+   glyph never swaps and the flip is a pure transform. The glyph stays sized from the
+   button so it can never stretch the row. */
+.agent-answer-actions .answer-collapse svg {
+    display: block;
+    width: 14px;
+    height: 14px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    transition: transform 120ms ease;
+}
+
+.agent-answer-actions .answer-collapse[aria-expanded='true'] svg {
+    transform: rotate(180deg);
+}
+
+.agent-answer-actions .answer-collapse:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
+}
+
+.agent-answer-actions .answer-collapse:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* No success/error tints here: the toggle has no transient state — its whole job is
+   the state already in `aria-expanded` and in its own accessible name, and its click
+   moves the surface rather than reporting a result. */
+
+/* R5/T6: THE SECOND CHEVRON — the same control, in the collapsed header row. --------
+   The footer chevron above lives INSIDE `.tile-body`/`.thread-body`, and a collapsed
+   block sets `display: none` on exactly that element. So while the block was closed the
+   chevron could not be seen, focused or clicked, and the control could only ever
+   COLLAPSE a block — never expand one. ui/turns.ts therefore creates a second, identical
+   button per collapsible block, immediately after the header button (`.thread-select` /
+   `.tile-select`) as its SIBLING inside `.thread-tile` / `.tile`: the header is already a
+   <button>, and interactive content may not nest inside a button. Both buttons are
+   painted from the same state owner (`setThreadExpanded` / the board's expand path), so
+   they always carry the same `aria-expanded`, name, tooltip and `aria-controls`.
+
+   Only ONE of the pair is ever rendered, and the rules below make that explicit in BOTH
+   directions: `display: none` also removes the hidden one from the accessibility tree and
+   the tab order, so a screen reader hears exactly one Collapse/Expand control per block.
+
+   Box model (jsdom cannot lay this out, so the arithmetic is written down):
+   - both block surfaces are already `position: relative` (the shared busy ring), so the
+     chevron anchors to the BLOCK rather than escaping to the viewport;
+   - while a block is collapsed its body is `display: none` and its action bar is
+     `hidden`, so the block's box IS the header row → `top: 50%` + `translateY(-50%)`
+     centres the chevron on that one row at any content height;
+   - `right: 10px` puts it exactly on the header's own inline padding edge
+     (`.tile-select`/`.thread-select`: `padding: 6px 10px`), so it aligns with the text
+     column instead of floating in the border;
+   - the flush-right measurement line (`.tile-top`, `.thread-top`: `margin-left: auto`)
+     would otherwise slide under it, so the collapsed header reserves its footprint:
+     10px padding + 24px button + 10px gap = `padding-right: 44px`. The gap matches the
+     row's own 10px flex gap, and the figures themselves are `flex: 0 0 auto`, so they
+     stop short of the chevron rather than overlapping it. */
+:is(.tile, .thread-tile) > .header-collapse {
+    position: absolute;
+    top: 50%;
+    right: 10px;
+    transform: translateY(-50%);
+    /* Expanded: the FOOTER chevron is the rendered one (see the pair below). */
+    display: none;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: transparent;
+    color: var(--muted);
+    cursor: pointer;
+}
+
+/* Collapsed: this is the block's only chevron. */
+:is(.tile, .thread-tile):not(.is-expanded) > .header-collapse {
+    display: inline-flex;
+}
+
+/* The chevron glyph is the footer control's twin: ONE down-pointing path, rotated while
+   the surface is open, sized from the button so it can never stretch the row. */
+:is(.tile, .thread-tile) > .header-collapse svg {
+    display: block;
+    width: 14px;
+    height: 14px;
+    fill: none;
+    stroke: currentColor;
+    stroke-width: 1.7;
+    stroke-linecap: round;
+    stroke-linejoin: round;
+    transition: transform 120ms ease;
+}
+
+:is(.tile, .thread-tile) > .header-collapse[aria-expanded='true'] svg {
+    transform: rotate(180deg);
+}
+
+:is(.tile, .thread-tile) > .header-collapse:hover {
+    border-color: var(--accent);
+    background: var(--accent-soft);
+    color: var(--text);
+}
+
+:is(.tile, .thread-tile) > .header-collapse:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+}
+
+/* The reservation described above, and only while the chevron is rendered. */
+:is(.tile:not(.is-expanded), .thread-tile:not(.is-expanded)) > :is(.tile-select, .thread-select) {
+    padding-right: 44px;
+}
+
+/* The FOOTER chevron is rendered only while its own block is open. The body-hiding rules
+   already take it out of the tree, and this says the same thing directly (the child
+   combinator keeps it on the block that owns the body: descendants of an open block are
+   selected by their OWN surface's state, never by an ancestor's). */
+:is(.tile:not(.is-expanded) > .tile-body, .thread-tile:not(.is-expanded) > .thread-body) .answer-collapse {
+    display: none;
+}
+
+/* T12b exception: expanding a CONVERSATION opens EVERY exchange in it
+   (`.conversation.is-expanded .tile-body { display: flex }`), so those sibling tiles show
+   their bodies without carrying `.is-expanded` themselves. Their FOOTER chevron is the
+   reachable one in that state, so the header chevron stands down — and the padding it
+   reserved is given back to the measurement line, which returns to the flush-right
+   position every other header uses. */
+.conversation.is-expanded > .turn-row > .tile > .header-collapse {
+    display: none;
+}
+
+.conversation.is-expanded > .turn-row > .tile > .tile-body .answer-collapse {
+    display: inline-flex;
+}
+
+.conversation.is-expanded > .turn-row > .tile > .tile-select {
+    padding-right: 10px;
 }
 
 .agent-error {
@@ -5131,229 +5664,9 @@ summary::-webkit-details-marker {
     color: var(--danger);
 }
 
-/* Session directory ----------------------------------------------------- */
-/* Server-owned conversations, filtered to the selected canonical harness. The
-   active row is the session this card is pointed at; the status text (not just
-   colour) says whether it is running. */
-
-.sessions {
-    display: flex;
-    flex-direction: column;
-    gap: 7px;
-}
-
-.sessions-scope {
-    margin: 0;
-    color: var(--muted);
-    font-size: 11px;
-}
-
-.sessions-actions {
-    display: grid;
-    grid-template-columns: 1fr 1fr;
-    gap: 6px;
-}
-
-.session-list {
-    display: flex;
-    flex-direction: column;
-    gap: 4px;
-    /* R6: the list is a flex/grid item in the rail at every breakpoint; letting it
-       shrink keeps the entries inside the 320px column. */
-    min-width: 0;
-    max-width: 100%;
-}
-
-.session-row {
-    /* R8/T1: one directory entry = the selection button + its delete control, and the
-       delete control is the whole action (no confirmation row). The contract with the
-       behaviour layer (main.ts) is structural, not visual:
-         .session-row[data-session-id][data-status][data-active]  ← wrapper
-           .session                                              ← select button
-           .session-delete                                       ← remove control (one
-              click = one DELETE)
-       The wrapper owns the surface and the active frame so the entry stays one
-       block while it hosts a sibling control. */
-    display: grid;
-    /* Column 1 shrinks (long harness names/prompts); the delete control keeps its
-       intrinsic width. `minmax(0, 1fr)` is the R6 guard inside the 320px rail. */
-    grid-template-columns: minmax(0, 1fr) auto;
-    align-items: stretch;
-    gap: 3px;
-    min-width: 0;
-    max-width: 100%;
-    padding: 2px;
-    border: 1px solid transparent;
-    border-radius: 8px;
-    background: var(--bg-elevated);
-}
-
-/* The wrapper is the active frame. `.session[data-active='true']` below stays for
-   the pre-wrapper DOM and for a caller that mirrors the attribute onto the button;
-   the `data-active` wrapper rule neutralises the button's own frame only when the
-   wrapper is the one painting it, so either placement reads as ONE active row. */
-.session-row[data-active='true'] {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-}
-
-.session {
-    display: flex;
-    flex-direction: column;
-    gap: 2px;
-    /* R6/R8: shrink inside the sidebar column instead of widening the rail. */
-    min-width: 0;
-    max-width: 100%;
-    padding: 7px 10px;
-    border: 1px solid transparent;
-    border-radius: 8px;
-    background: var(--bg-elevated);
-    color: inherit;
-    font: inherit;
-    text-align: left;
-    cursor: pointer;
-}
-
-.session:hover:not(:disabled) {
-    border-color: var(--border-strong);
-}
-
-.session[data-active='true'] {
-    border-color: var(--accent);
-    background: var(--accent-soft);
-}
-
-.session:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
-}
-
-/* Inside a row the SURFACE lives on the wrapper, so the button is transparent and
-   only adds a hover tint. That keeps one frame per entry even though the row also
-   hosts the delete control. Columns are explicit, so the markup order of the two
-   controls cannot swap them. */
-.session-row > .session {
-    grid-column: 1;
-    border-color: transparent;
-    background: transparent;
-}
-
-.session-row > .session-delete {
-    grid-column: 2;
-}
-
-.session-row > .session:hover:not(:disabled) {
-    border-color: transparent;
-    background: rgba(255, 255, 255, 0.04);
-}
-
-/* Only when the wrapper itself is active, so a caller that marks just the button
-   still gets a visible active frame (inset by the row padding). */
-.session-row[data-active='true'] > .session {
-    border-color: transparent;
-    background: transparent;
-}
-
-/* Compact delete control. The danger is stated at rest (red glyph and a faint red
-   frame), not only on hover; hover/focus intensify it so the control stays
-   unmistakably destructive without shouting in a 320px rail. */
-.session-delete {
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    flex: 0 0 auto;
-    min-width: 26px;
-    padding: 0 7px;
-    border: 1px solid rgba(248, 113, 113, 0.35);
-    border-radius: 6px;
-    background: transparent;
-    color: var(--danger);
-    font-family: var(--mono);
-    font-size: 12px;
-    line-height: 1;
-    cursor: pointer;
-}
-
-.session-delete:hover:not(:disabled) {
-    border-color: var(--danger);
-    background: rgba(248, 113, 113, 0.12);
-}
-
-.session-delete:focus-visible {
-    outline: 2px solid var(--danger);
-    outline-offset: 1px;
-}
-
-.session-delete:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-}
-
-/* T1/R1: the `.session-confirm*` rules are GONE with the inline confirmation panel —
-   one click on `.session-delete` deletes, so the rail has no second row to style. */
-
-/* R6: sessions of a harness that was DELETED. The server keeps the record (a harness
-   delete never cascades), so the rail keeps a separate, labelled group for them instead
-   of letting them vanish behind a harness row that no longer exists. The rows themselves
-   are ordinary `.session-row` entries — same open and delete paths — and this block only
-   separates and captions the group. */
-.session-archived {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-    margin-top: 10px;
-    padding-top: 10px;
-    border-top: 1px solid var(--border);
-}
-
-.session-archived[hidden] {
-    display: none;
-}
-
-.session-archived-list {
-    display: flex;
-    flex-direction: column;
-    gap: 6px;
-}
-
-/* R8: each line of the entry clips with an ellipsis rather than pushing the grid
-   column wider (a long harness name or id would otherwise break the rail width). */
-.session-harness {
-    min-width: 0;
-    overflow: hidden;
-    color: var(--accent);
-    font-family: var(--mono);
-    font-size: 11.5px;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-.session-meta {
-    min-width: 0;
-    overflow: hidden;
-    color: var(--muted);
-    font-family: var(--mono);
-    font-size: 10.5px;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-}
-
-/* A running entry states its status in text; colour only reinforces it. The
-   wrapper carries `data-status` per the R8 contract, so both placements are
-   honoured (the button form is the pre-wrapper DOM). */
-.session[data-status='running'] .session-meta,
-.session-row[data-status='running'] .session-meta {
-    color: var(--warn);
-}
-
-.session-prompt {
-    min-width: 0;
-    overflow: hidden;
-    color: var(--muted);
-    font-size: 11px;
-    white-space: nowrap;
-    text-overflow: ellipsis;
-}
+/* Session directory: MOVED (T3/R1). The saved-conversation list is no longer a rail
+   section, so its rules live with the harness head above (`.session-pills-bar`,
+   `.session-pill*`). The right rail below is the scratch board alone. */
 
 /* Responsive ----------------------------------------------------------- */
 
@@ -5366,9 +5679,11 @@ summary::-webkit-details-marker {
 
     .rail-right {
         grid-column: 1 / -1;
-        /* Two sections now: the scratch board and sessions (R21.2). */
+        /* One section since T3/R1: the scratch board (the session directory moved into
+           the harness head, T6: and the strip is a single track, so the board gets the
+           whole width instead of leaving the second column as dead space). */
         display: grid;
-        grid-template-columns: repeat(2, minmax(0, 1fr));
+        grid-template-columns: minmax(0, 1fr);
         gap: 14px;
         max-height: 40vh;
         border-left: 0;
@@ -5391,8 +5706,38 @@ summary::-webkit-details-marker {
         grid-template-rows: minmax(0, 1fr);
     }
 
-    .rail-toggles {
-        display: flex;
+    /* R3 (T3): the floating scratch button. `position: fixed` takes it out of the grid,
+       so it costs the chat no row and never moves the composer. `bottom` is driven by
+       `--composer-height` (written by main.ts `syncComposerHeight` from the composer's
+       measured height) so the button clears the field as the draft grows; `76px` is the
+       stylesheet fallback for the first frame and for a host with no layout at all.
+       z-index 1 keeps it UNDER the backdrop (2) and the drawer (3): while the drawer is
+       open, a press on the button lands on the backdrop and dismisses the drawer, which
+       is the behaviour of every other outside press. */
+    .scratch-fab {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        position: fixed;
+        right: 14px;
+        bottom: calc(var(--composer-height, 76px) + 12px);
+        z-index: 1;
+        width: 44px;
+        height: 44px;
+        padding: 0;
+        border: 1px solid var(--border-strong);
+        border-radius: 999px;
+        background: var(--bg-bar);
+        color: var(--text);
+        box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+        font-family: var(--mono);
+        font-size: 17px;
+        cursor: pointer;
+    }
+
+    .scratch-fab:focus-visible {
+        outline: 2px solid var(--accent);
+        outline-offset: 2px;
     }
 
     /* R2: "Harness UI" (the brand button) is the human-readable drawer trigger on
@@ -5448,24 +5793,26 @@ summary::-webkit-details-marker {
         animation: rail-slide-in 160ms ease-out;
     }
 
-    /* The right rail keeps its existing in-flow strip below the chat (R3): only
-       the harness listing moved into the overlay drawer. `.rail-right` is a grid
-       (its two sections) at <=1180px, so it is restored explicitly. */
-    .shell[data-rail-open='right'] {
-        grid-template-rows: minmax(0, 1fr) auto;
-    }
-
+    /* R3 (T3): the scratch board opens as a SIDEBAR on the right, mirroring the harness
+       drawer on the left, instead of the old in-flow strip that stole a grid row from the
+       conversation. `fixed` removes it from grid flow (the rails stay direct grid children
+       in the DOM, so their state is never rebuilt), and it slides in from the right edge
+       to match the direction it comes from. */
     .shell[data-rail-open='right'] .rail-right {
-        display: grid;
-        grid-template-columns: minmax(0, 1fr);
-        grid-row: 2;
-        position: relative;
+        display: flex;
+        position: fixed;
+        inset: 0 0 0 auto;
         z-index: 3;
+        width: min(86vw, 320px);
+        max-height: none;
+        border-left: 1px solid var(--border);
+        box-shadow: -16px 0 48px rgba(0, 0, 0, 0.55);
+        animation: rail-slide-in-right 160ms ease-out;
     }
 
-    /* The backdrop dims the chat behind the drawer and is the pointer dismiss
-       (Escape is the keyboard one, main.ts). It sits below the drawer and above
-       the right rail's in-flow strip. */
+    /* The backdrop dims the chat behind either drawer and is the pointer dismiss
+       (Escape is the keyboard one, main.ts). It sits below both drawers (3) and above
+       the floating scratch button (1). */
     .shell[data-rail-open] .rail-backdrop {
         display: block;
         position: fixed;
@@ -5474,13 +5821,19 @@ summary::-webkit-details-marker {
         background: rgba(0, 0, 0, 0.45);
     }
 
-    .rail-right {
-        max-height: 38vh;
-    }
-
     @keyframes rail-slide-in {
         from {
             transform: translateX(-100%);
+        }
+
+        to {
+            transform: translateX(0);
+        }
+    }
+
+    @keyframes rail-slide-in-right {
+        from {
+            transform: translateX(100%);
         }
 
         to {
@@ -5546,16 +5899,17 @@ summary::-webkit-details-marker {
         font-size: 11.5px;
     }
 
-    /* R3/R4: the topbar carries two icon rail toggles plus the icon-only Tools button,
-       so the pill must be able to shrink and ellipsize instead of pushing the icons
-       off the line. The width cap itself lives on `.topbar-right .status` (F1); a
-       percentage here would resolve against the shrink-to-fit cluster. */
+    /* R3/R4: the topbar carries the icon-only Tools button and the live status pill, so
+       the pill must be able to shrink and ellipsize instead of pushing the icon off the
+       line. The width cap itself lives on `.topbar-right .status` (F1); a percentage here
+       would resolve against the shrink-to-fit cluster. */
     .status {
         min-width: 0;
     }
 
-    /* Compact topbar on a phone: brand + tools icon + pill on one line (the rail
-       toggle moved to the harness title row — see `.harness-title-row` below). */
+    /* Compact topbar on a phone: brand + tools icon + pill on one line. The rails are
+       opened by the brand (left) and the floating `.scratch-fab` (right, T3/R3), so the
+       bar spends no room on a rail control. */
     .topbar {
         gap: 8px;
         padding: 8px 12px;
@@ -5586,13 +5940,18 @@ summary::-webkit-details-marker {
         padding: 8px 14px;
     }
 
-    /* R1: the scratch/sessions rail toggle sits on the harness title row, to the
-       right of the title (`.rail-toggles` carries `margin-left: auto`; its phone
-       `display: flex` lives with the other rail rules above). The title row is a
-       single line on a phone and the always-visible desktop note stays hidden here;
-       the full details live in the title's dialog (R2). */
+    /* R1 (T3): one title line on a phone, and the always-visible desktop note stays hidden
+       here — the full details live in the title's dialog (R2). The session strip moves
+       into that SAME dialog (main.ts `openHarnessDetails` builds a `.session-pills-bar`
+       with the `session-pills-bar-dialog` variant when `isPhoneLayout()` is true), so the
+       header copy is hidden rather than removed: the DOM, the paint pass and the selected
+       pill stay identical in both layouts. */
     .harness-title-row {
         align-items: center;
+    }
+
+    .session-pills-bar-head {
+        display: none;
     }
 
     .harness-head .harness-note {
@@ -5610,13 +5969,21 @@ summary::-webkit-details-marker {
     .thread-tile[data-state='waiting']::before,
     .thread-tile[data-state='streaming']::before,
     .agent-tile[data-activity='active']::before,
-    .shell[data-rail-open='left'] .rail-left {
+    .shell[data-rail-open='left'] .rail-left,
+    .shell[data-rail-open='right'] .rail-right {
         animation: none !important;
     }
 
     .tile,
-    .endpoint-summary::before,
     .harness-item {
+        transition: none;
+    }
+
+    /* R5: the chevron flip is decoration — the state is the ARIA value and the word in
+       the accessible name — so an instant swap loses nothing. T6: BOTH chevrons (the
+       footer control and its collapsed-header twin) animate the same transform. */
+    .agent-answer-actions .answer-collapse svg,
+    :is(.tile, .thread-tile) > .header-collapse svg {
         transition: none;
     }
 }

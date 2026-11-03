@@ -1,23 +1,32 @@
-// R7/R8 session-control CSS contract.
+// R7/R8 session-control CSS contract, restated for T3/R1.
 //
-// R8 adds permanent session deletion to the right-rail directory. The behaviour
-// layer owns the DOM; this file pins the CSS half of the agreed contract, and holds
-// no import of main.ts so it stays runnable while the behaviour is changing:
+// The server-owned directory used to be a stack of rail ROWS (`.session-row` + a full
+// meta block). T3/R1 moved it out of the right rail into a compact pill strip under the
+// Instruct header (`main.ts` `createSessionPillBar`), and the same strip is inserted at
+// the top of the harness details dialog on a phone. The behaviour layer owns the DOM;
+// this file pins the CSS half of the agreed contract, and holds no import of main.ts so
+// it stays runnable while the behaviour is changing:
 //
-//   .session-row[data-session-id][data-status][data-active]   ← one entry wrapper
-//     .session                                               ← select button
-//     .session-delete                                        ← remove control (one click)
+//   .session-pills-bar[.session-pills-bar-head|.session-pills-bar-dialog] ← the strip
+//     .session-pills                                                       ← role="list"
+//       .session-pill[data-session-id][data-status][data-active][data-archived]
+//         .session-pill-select                                             ← open
+//           .session-pill-id                                               ← 8 chars ONLY
+//         .session-pill-delete                                             ← one click
+//       .session-pills-empty                                               ← empty hint
+//     .new-session / .refresh-sessions                                     ← the actions
 //
 // Requirements pinned here:
-//   - the entry is COMPACT for a 320px rail: the button and the delete control share
-//     one grid row, and every text line clips instead of widening the rail;
-//   - T1/R1: the inline confirmation is gone, so NO `.session-confirm*` rule may
-//     survive (the panel cannot come back through the stylesheet alone);
-//   - the destructive action is visually unambiguous, with disabled and focus states
-//     for both controls;
-//   - the active-entry appearance is preserved for both placements of `data-active`
-//     (wrapper per the contract, button for the pre-wrapper DOM) without ever
-//     painting two frames;
+//   - the strip is a WRAPPING row (it lives under the title, where horizontal overflow
+//     would widen the chat column) and every level can shrink (`min-width: 0`);
+//   - the pill is compact and rounded-full, with the id in monospace;
+//   - the active, running and archived states are painted from the data attributes the
+//     behaviour layer writes — never from a class the DOM does not produce;
+//   - the destructive action is visually unambiguous, with disabled and focus states for
+//     both controls, and the delete hit area stays at least 20x20;
+//   - the rail DOM is GONE: no `.session-row`/`.session-list`/`.sessions-scope`/
+//     `.session-archived*` rule may survive to style a surface that no longer exists;
+//   - T1/R1 still holds: no `.session-confirm*` rule may exist;
 //   - R7 removed the saved-session lock notice, so its `.agent-lock` / `.link-button`
 //     rules must not exist any more.
 //
@@ -60,106 +69,136 @@ const blockOf = (selector: string): string => {
     throw new Error(`unbalanced block for ${selector}`);
 };
 
-it('lays one entry out as a compact shrinkable row', () => {
-    const row = blockOf('.session-row {');
+it('lays the directory out as one wrapping strip that can shrink', () => {
+    const bar = blockOf('.session-pills-bar {');
 
-    // Button in column 1 (shrinkable), delete control in column 2 (intrinsic): the
-    // delete control never wraps below the button, so the entry stays one row.
-    expect(row).toContain('display: grid');
-    expect(row).toContain('grid-template-columns: minmax(0, 1fr) auto');
-    expect(row).toContain('align-items: stretch');
-    expect(row).toContain('gap: 3px');
-    expect(row).toContain('padding: 2px');
-    // R6/R8: the wrapper can never be wider than the rail.
-    expect(row).toContain('min-width: 0');
-    expect(row).toContain('max-width: 100%');
+    // A row, but one that WRAPS: the strip sits under the title, where a single long line
+    // of conversations would push the composer and the transcript wider than the column.
+    expect(bar).toContain('display: flex');
+    expect(bar).toContain('flex-wrap: wrap');
+    expect(bar).toContain('align-items: center');
+    expect(bar).toContain('gap: 6px');
+    expect(bar).toContain('min-width: 0');
+    expect(bar).toContain('max-width: 100%');
 
-    // The select button keeps its compact padding and column of text.
-    const session = blockOf('.session {');
-    expect(session).toContain('flex-direction: column');
-    expect(session).toContain('padding: 7px 10px');
-    expect(session).toContain('min-width: 0');
-    expect(session).toContain('max-width: 100%');
-
-    // Every line of the entry clips: a long harness name or session id can never
-    // widen the rail or wrap the entry into extra rows.
-    for (const selector of ['.session-harness {', '.session-meta {', '.session-prompt {']) {
-        const line = blockOf(selector);
-        expect(line).toContain('overflow: hidden');
-        expect(line).toContain('text-overflow: ellipsis');
-        expect(line).toContain('white-space: nowrap');
-    }
+    // The list container wraps on its own axis too, and can shrink below its content:
+    // a flex item's default `min-width: auto` is what used to widen the rail.
+    const list = blockOf('.session-pills {');
+    expect(list).toContain('display: flex');
+    expect(list).toContain('flex-wrap: wrap');
+    expect(list).toContain('min-width: 0');
+    expect(list).toContain('max-width: 100%');
 });
 
-it('preserves the active entry in either attribute placement, once', () => {
-    // The pre-wrapper contract (button carries `data-active`) is unchanged.
-    expect(blockOf(".session[data-active='true'] {")).toContain('border-color: var(--accent)');
-    expect(blockOf(".session[data-active='true'] {")).toContain('background: var(--accent-soft)');
+it('paints one compact rounded pill per conversation', () => {
+    const pill = blockOf('.session-pill {');
+    // Siblings (open + delete) inside one rounded shell, never nested buttons.
+    expect(pill).toContain('display: inline-flex');
+    expect(pill).toContain('border-radius: 999px');
+    expect(pill).toContain('border: 1px solid var(--border)');
+    expect(pill).toContain('background: var(--bg-elevated)');
+    expect(pill).toContain('min-width: 0');
+    expect(pill).toContain('max-width: 100%');
 
-    // The R8 contract puts it on the wrapper, which owns the surface.
-    const activeRow = blockOf(".session-row[data-active='true'] {");
-    expect(activeRow).toContain('border-color: var(--accent)');
-    expect(activeRow).toContain('background: var(--accent-soft)');
+    const select = blockOf('.session-pill-select {');
+    expect(select).toContain('cursor: pointer');
+    expect(select).toContain('background: transparent');
+    expect(select).toContain('min-width: 0');
 
-    // Inside a row the surface lives on the wrapper: the button is transparent so
-    // the entry is one frame, and the neutralisation happens ONLY when the wrapper
-    // is the active one (so a button-only `data-active` still shows a frame).
-    expect(blockOf('.session-row > .session {')).toContain('grid-column: 1');
-    expect(blockOf('.session-row > .session {')).toContain('background: transparent');
-    // Columns are explicit, so the controls cannot swap if the markup order does.
-    expect(blockOf('.session-row > .session-delete {')).toContain('grid-column: 2');
-    expect(blockOf(".session-row[data-active='true'] > .session {")).toContain(
-        'background: transparent'
+    // The only visible text: monospace, small, and clipped instead of widening the strip.
+    const id = blockOf('.session-pill-id {');
+    expect(id).toContain('font-family: var(--mono)');
+    expect(id).toContain('font-size: 11.5px');
+    expect(id).toContain('overflow: hidden');
+    expect(id).toContain('text-overflow: ellipsis');
+    expect(id).toContain('white-space: nowrap');
+
+    // Both controls advertise focus, and a locked pill reads as locked.
+    expect(blockOf('.session-pill-select:focus-visible {')).toContain('outline: 2px solid var(--accent)');
+    expect(blockOf('.session-pill-select:disabled {')).toContain('cursor: not-allowed');
+});
+
+it('marks active, running and archived states from the data attributes', () => {
+    // `main.ts` writes `data-active` only on the conversation the card is pointed at.
+    const active = blockOf(".session-pill[data-active='true'] {");
+    expect(active).toContain('border-color: var(--accent)');
+    expect(active).toContain('background: var(--accent-soft)');
+
+    // `data-status` mirrors the server's status; a running/saving conversation is amber
+    // (the same vocabulary as the topbar pill) and never colour-only (the attribute and
+    // the tooltip carry the state).
+    const running = rules.slice(
+        rules.indexOf(".session-pill[data-status='running'] .session-pill-id,"),
+        rules.indexOf('}', rules.indexOf(".session-pill[data-status='running'] .session-pill-id,"))
     );
+    expect(running).toContain(".session-pill[data-status='saving'] .session-pill-id {");
+    expect(running).toContain('color: var(--warn)');
 
-    // Status colour follows the same two placements, so a running entry is amber
-    // whichever element carries `data-status`.
-    expect(blockOf(".session-row[data-status='running'] .session-meta {")).toContain(
-        'color: var(--warn)'
-    );
-    expect(blockOf(".session[data-status='running'] .session-meta,")).toContain(
-        'color: var(--warn)'
+    // R6: a conversation whose harness was deleted stays listed and stays clickable; the
+    // dashed, muted frame is the only difference.
+    const archived = blockOf(".session-pill[data-archived='true'] {");
+    expect(archived).toContain('border-style: dashed');
+    expect(archived).toContain('background: transparent');
+    expect(blockOf(".session-pill[data-archived='true'] .session-pill-id {")).toContain(
+        'color: var(--muted)'
     );
 });
 
 it('marks the delete control as destructive with disabled and focus states', () => {
-    // Anchored to its own first declaration: the row-placement rule
-    // `.session-row > .session-delete {` appears earlier in the file.
-    const remove = blockOf('.session-delete {\n    display: inline-flex;');
+    const remove = blockOf('.session-pill-delete {');
     expect(remove).toContain('display: inline-flex');
-    expect(remove).toContain('min-width: 26px');
-    expect(remove).toContain('border: 1px solid rgba(248, 113, 113, 0.35)');
+    // The hit area survives the compact pill: >= 20x20 on a touch screen.
+    expect(remove).toContain('width: 22px');
+    expect(remove).toContain('min-height: 22px');
+    // Separated from the open button by a divider, so the two never read as one control.
+    expect(remove).toContain('border-left: 1px solid var(--border)');
     expect(remove).toContain('color: var(--danger)');
     expect(remove).toContain('cursor: pointer');
 
     // Hover intensifies the danger instead of introducing it.
-    expect(blockOf('.session-delete:hover:not(:disabled) {')).toContain('border-color: var(--danger)');
+    expect(blockOf('.session-pill-delete:hover:not(:disabled) {')).toContain(
+        'background: rgba(248, 113, 113, 0.12)'
+    );
 
-    // Focus is explicit (the generic accent ring is not enough for a destructive
-    // control) and disabled is inert.
-    expect(blockOf('.session-delete:focus-visible {')).toContain('outline: 2px solid var(--danger)');
-    expect(blockOf('.session-delete:disabled {')).toContain('cursor: not-allowed');
-    expect(blockOf('.session-delete:disabled {')).toContain('opacity: 0.4');
+    // Focus is explicit (the generic accent ring is not enough for a destructive control)
+    // and disabled is inert.
+    expect(blockOf('.session-pill-delete:focus-visible {')).toContain('outline: 2px solid var(--danger)');
+    expect(blockOf('.session-pill-delete:disabled {')).toContain('cursor: not-allowed');
+    expect(blockOf('.session-pill-delete:disabled {')).toContain('opacity: 0.4');
 });
 
-it('keeps no confirmation surface now that one click deletes (T1/R1)', () => {
-    // The panel, its question and both of its buttons are removed from the behaviour
-    // layer (main.ts `renderSessions`). A surviving rule here would mean the stylesheet
-    // still styles a surface that no longer exists — or that one came back.
+it('keeps the empty hint short and the dialog heading present', () => {
+    const empty = blockOf('.session-pills-empty {');
+    expect(empty).toContain('color: var(--muted)');
+
+    // R2 (T3): the phone dialog carries the strip, and needs its own caption.
+    const heading = blockOf('.harness-details-section {');
+    expect(heading).toContain('font-family: var(--mono)');
+    expect(heading).toContain('text-transform: uppercase');
+});
+
+it('keeps no rail surface or confirmation row now that the directory is a strip', () => {
+    // The panel, its question and both of its buttons were removed from the behaviour
+    // layer (T1/R1). A surviving rule here would mean the stylesheet still styles a
+    // surface that no longer exists — or that one came back.
     expect(rules).not.toContain('.session-confirm');
 
-    // The rail row is therefore exactly the two controls, in explicit columns: nothing
-    // reserves a second row inside the entry.
-    expect(blockOf('.session-row > .session {')).toContain('grid-column: 1');
-    expect(blockOf('.session-row > .session-delete {')).toContain('grid-column: 2');
-});
+    // R1 (T3): the entire rail directory is gone, so nothing may still style it.
+    for (const dead of [
+        '.session-row',
+        '.session-list',
+        '.sessions-scope',
+        '.sessions-actions',
+        '.session-archived',
+        '.session-harness',
+        '.session-meta',
+        '.session-prompt',
+        '.session-delete'
+    ]) {
+        expect(rules).not.toContain(dead);
+    }
 
-it('leaves the list shrinkable and drops the removed lock notice rules', () => {
-    expect(blockOf('.session-list {')).toContain('min-width: 0');
-    expect(blockOf('.session-list {')).toContain('max-width: 100%');
-
-    // R7: the saved-session lock notice and its "New session" link are gone from the
-    // UI, so no rule may style (or resurrect) them.
+    // The lock notice rules R7 removed stay removed.
     expect(rules).not.toContain('.agent-lock');
     expect(rules).not.toContain('.link-button');
 });

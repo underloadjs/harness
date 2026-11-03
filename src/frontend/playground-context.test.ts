@@ -206,8 +206,10 @@ const responseBox = (): HTMLElement => {
     return found;
 };
 
-const sessionRows = (): string[] =>
-    [...document.querySelectorAll<HTMLElement>('.session-row')].map((node) => node.dataset.sessionId ?? '');
+// T3/R1: the directory is a pill strip, so "is this conversation listed?" is answered by
+// the pill wrappers (id on the wrapper, and on both controls inside it).
+const sessionPills = (): string[] =>
+    [...document.querySelectorAll<HTMLElement>('.session-pill')].map((node) => node.dataset.sessionId ?? '');
 
 const posts = (calls: Call[], url: string, method?: string): Call[] =>
     calls.filter((call) => call.url === url && (method === undefined || call.method === method));
@@ -234,7 +236,7 @@ it('runs a session-bound call in its own session and never adopts it into the ch
     await boot();
 
     // Boot selects the first harness, and the reader's conversation exists in the roster.
-    expect(sessionRows()).toEqual([CHAT]);
+    expect(sessionPills()).toEqual([CHAT]);
 
     await openTool('toolRequest');
     argsBox().value = '{"tags":["web"]}';
@@ -263,11 +265,11 @@ it('runs a session-bound call in its own session and never adopts it into the ch
 
     // The temporary session is not a conversation: no row in the rail (the directory
     // answer literally contains it), and it is not the session this browser remembers.
-    const refresh = document.querySelector<HTMLButtonElement>('.sessions-actions button:nth-of-type(2)');
+    const refresh = document.querySelector<HTMLButtonElement>('.refresh-sessions');
     if (refresh === null) throw new Error('missing sessions refresh');
     refresh.click();
     await flush();
-    expect(sessionRows()).toEqual([CHAT]);
+    expect(sessionPills()).toEqual([CHAT]);
     expect(localStorage.getItem('underload-harness-app:session')).toBeNull();
 
     // The scratch board stayed untouched: a playground call paints no panels anywhere.
@@ -366,7 +368,7 @@ it('deletes the temporary session when the playground closes, and starts a fresh
     expect(
         byPrefix(calls, '/api/tools/').map((entry) => (entry.body as { sessionId?: string }).sessionId)
     ).toEqual(['temp-1', 'temp-2']);
-    expect(sessionRows()).toEqual([CHAT]);
+    expect(sessionPills()).toEqual([CHAT]);
 });
 
 it('discards a session whose create lands after the playground was closed', async () => {
@@ -416,7 +418,7 @@ it('discards a session whose create lands after the playground was closed', asyn
     });
 
     // The reader's conversation survived the whole race.
-    expect(sessionRows()).toEqual([CHAT]);
+    expect(sessionPills()).toEqual([CHAT]);
 });
 
 it('calls a tool that needs no session directly, with no session traffic at all', async () => {

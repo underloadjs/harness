@@ -269,6 +269,76 @@ The legacy `source` form (the body of an async function) remains accepted by
 `toolCreate`/`createTool` for compatibility. New editable tools should use a
 module `sourcePath` or `moduleText`.
 
+### Tool-contributed commands
+
+A tool package does not have to stop at tools. The same plugin that calls
+`api.addTool` can call `api.addCommand`, so a tool and the operator command that
+drives it ship as one unit — and a host that owns the harness can declare the same
+command declaratively through `commands` with no plugin at all. A command is an
+**operator action, never a prompt**: `execute` receives the tokenized line
+(`{ harness, name, args, rest, input }`, grammar in `src/core/command.ts`) and returns
+`{ content, isError?, data? }`, and the model is never called. The command below calls
+the tool this same package registered, through the live registry.
+
+```ts
+import type { HarnessPluginApi } from '@underload/harness';
+
+// A tool package exports the plugin; the host passes it to harness().
+export const deployPlugin = {
+    name: 'deploy',
+    setup: (api: HarnessPluginApi) => {
+        api.addTool('deployStatus', {
+            description: 'Report deployment status for an environment.',
+            parameters: { type: 'object', properties: { env: { type: 'string' } } },
+            execute: async ({ parameters }) => status(parameters)
+        });
+
+        api.addCommand('deploy', {
+            description: 'Report deployment status.',
+            usage: '/deploy [env]',
+            execute: async ({ harness, args }) =>
+                ({ content: JSON.stringify(await harness.executeTool('deployStatus', { env: args[0] ?? 'dev' })) })
+        });
+    }
+};
+
+// Equivalent from the host, no plugin involved.
+const writer = harness({
+    agents: { /* … */ },
+    commands: [
+        {
+            name: 'deploy',
+            description: 'Report deployment status.',
+            usage: '/deploy [env]',
+            execute: async ({ harness, args }) =>
+                ({ content: JSON.stringify(await harness.executeTool('deployStatus', { env: args[0] ?? 'dev' })) })
+        }
+    ]
+});
+
+await writer.executeCommand('/deploy staging');   // no model request, no progress event
+```
+
+Names follow `COMMAND_NAME_PATTERN` (`/^[a-z][a-z0-9-]{0,31}$/`): one lowercase letter,
+then lowercase letters, digits, or `-`, at most 32 characters. An optional leading slash
+and any case are stripped first, so `addCommand('/Deploy', …)` registers `deploy`.
+`description` is required and `usage` is optional (shown by `/help`).
+
+**Collision policy is registration order, and it is asymmetric on purpose.** Built-ins
+(`/help`, `/tools`, `/task`, `/websearch`, `/webfetch`) install first, then
+`configuration.commands` — a name that collides inside that declarative phase throws at
+construction. A plugin's `addCommand` and a runtime `harness.registerCommand()` run
+later and therefore REPLACE by name, exactly like `addTool`: overriding `/task` is the
+supported way to change a built-in, and a tool package that contributes a NEW verb
+should pick a name nothing else uses, because it silently takes precedence over a
+configured entry of the same name. The registry is read at call time, so the
+replacement is live for the next command and never for one already in flight.
+
+Because commands are harness-side, the CLI and the server execute the contributed
+command with no per-front-end wiring: the terminal forwards every unrecognized `/name`
+to `harness.executeCommand`, and `POST /sessions/:id/tasks` records the result as a
+terminal turn (see `README.md`, “Slash commands”).
+
 ### Invoke through the live registry
 
 ```ts

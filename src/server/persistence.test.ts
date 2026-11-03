@@ -32,6 +32,7 @@ import {
     HarnessPersistence,
     HarnessPersistenceError,
     INTERRUPTED_TOOL_RESULT_TEXT,
+    readHarnessDatabase,
     repairInterruptedToolCalls
 } from './persistence';
 import { createHarnessRuntime } from './runtime';
@@ -1595,5 +1596,85 @@ describe('durable conversation labels (T14)', () => {
         expect(restored?.turns[0].threadLabel).toBeUndefined();
         // `toEqual` on the record proves the key is absent rather than empty.
         expect(restored?.turns[0]).not.toHaveProperty('threadLabel');
+    });
+});
+
+// C8-m8: `invalidThreads` is keyed by THREAD ID — opaque, host-minted text — and the
+// session reader used to build the map with ordinary bracket assignment on an object
+// literal. A document naming one thread `__proto__` therefore hit the PROTOTYPE
+// SETTER: `mapped['__proto__'] = value` re-points the object's prototype instead of
+// storing an entry, so that conversation's raw broken transcript vanished from the
+// loaded record even though the file still carried it (`Object.keys` never showed the
+// id, and the operator got a 404-stale "readable" conversation instead of the text
+// they have to fix). The reader now builds a NULL-PROTOTYPE map.
+describe('prototype-shaped invalid transcript keys (C8-m8)', () => {
+    // One persisted session, tampered with the way a foreign writer (or an older
+    // build) would leave the document: an `invalidThreads` map holding a `__proto__`
+    // key next to a normal thread id.
+    const documentWithProtoKey = (label: string): { root: string; sessionId: string } => {
+        const root = tempRoot(label);
+        const runtime = runtimeOf(root, [liveScriptedPreset('one')]);
+        const sessionId = runtime.store.create('one').id;
+
+        runtime.store.dispose();
+
+        // Parsed, NOT an object literal: `{ __proto__: value }` in a literal invokes
+        // the setter while writing the file, which would hide the very key under test.
+        const invalidThreads = JSON.parse(
+            '{ "__proto__": { "error": "thread \\"__proto__\\" messages must be an array.",' +
+                ' "messages": "broken", "agent": "one" },' +
+                ' "thread-9": { "error": "thread \\"thread-9\\" messages must be an array.",' +
+                ' "messages": "also broken", "agent": "one" } }'
+        ) as Record<string, unknown>;
+
+        const document = JSON.parse(fs.readFileSync(stateFile(root), 'utf8')) as Record<string, any>;
+        document.sessions[0].invalidThreads = invalidThreads;
+        fs.writeFileSync(stateFile(root), JSON.stringify(document, null, 2), 'utf8');
+
+        return { root, sessionId };
+    };
+
+    it('keeps a `__proto__` thread id as a stored entry through the reader', () => {
+        const { root, sessionId } = documentWithProtoKey('invalid-proto-key');
+
+        const database = readHarnessDatabase(JSON.parse(fs.readFileSync(stateFile(root), 'utf8')));
+        const record = database.sessions.find((entry) => entry.id === sessionId);
+        const invalid = record?.invalidThreads;
+
+        if (invalid === undefined) throw new Error('the reader dropped the invalidThreads map');
+
+        // Both ids are REAL entries, in document order — the `__proto__` one used to
+        // disappear into the prototype instead of being stored.
+        expect(Object.keys(invalid)).toEqual(['__proto__', 'thread-9']);
+        expect(Object.prototype.hasOwnProperty.call(invalid, '__proto__')).toBe(true);
+        expect(invalid['__proto__']).toEqual({
+            error: 'thread "__proto__" messages must be an array.',
+            messages: 'broken',
+            agent: 'one'
+        });
+        expect(invalid['thread-9']).toEqual({
+            error: 'thread "thread-9" messages must be an array.',
+            messages: 'also broken',
+            agent: 'one'
+        });
+
+        // Null prototype is what makes the assignment safe (and it stays an ordinary
+        // enumerable map for every consumer: Object.entries, JSON, the store merge).
+        expect(Object.getPrototypeOf(invalid)).toBeNull();
+        expect(Object.values(invalid)).toHaveLength(2);
+    });
+
+    it('loads the same document through the persistence owner', () => {
+        const { root, sessionId } = documentWithProtoKey('invalid-proto-load');
+
+        const loaded = new HarnessPersistence(root).load()?.sessions.find(
+            (entry) => entry.id === sessionId
+        );
+        const invalid = loaded?.invalidThreads;
+
+        if (invalid === undefined) throw new Error('load() dropped the invalidThreads map');
+
+        expect(Object.keys(invalid)).toEqual(['__proto__', 'thread-9']);
+        expect(invalid['__proto__'].messages).toBe('broken');
     });
 });

@@ -82,9 +82,15 @@ describe('createTurnBoard', () => {
         // R5: the block footer is no longer a metadata line — the model / stop reason
         // / token figures belong to the block HEADER. And this answer never COMPLETED
         // (no `done`, no `attempt_commit`), so the footer has no Copy action yet: a
-        // streaming partial is never presented as the final answer.
+        // streaming partial is never presented as the final answer. The ROOT block does
+        // own one control from birth: the Collapse/Expand toggle for the conversation
+        // (`.tile-body`), which is why the row is no longer childless.
         expect(turn.element.querySelectorAll('.agent-meta')).toHaveLength(0);
-        expect([...(turn.element.querySelector('.agent-answer-actions')?.children ?? [])]).toEqual([]);
+        expect(
+            [...(turn.element.querySelector('.agent-answer-actions')?.children ?? [])].map(
+                (node) => node.className
+            )
+        ).toEqual(['answer-collapse']);
         expect(turn.element.querySelector('.answer-copy')).toBeNull();
         expect(turn.element.querySelector('.tile-meta')?.textContent).toBe('1 agent');
     });
@@ -2099,7 +2105,15 @@ describe('final answer copy action (R5)', () => {
         // The streamed half-answer is on screen, but it is not FINAL: no action.
         expect(turn.element.querySelector('.agent-text')?.textContent).toBe('Partial\n');
         expect(copyButton(turn.element)).toBeNull();
-        expect(turn.element.querySelector('.agent-answer-actions')?.childElementCount).toBe(0);
+        // R5: the row is no longer childless for a block WITH a surface — the
+        // Collapse/Expand toggle is there from creation — but the copy control is
+        // still the only thing that appears on completion, so the child set is
+        // exactly the toggle.
+        expect(
+            [...(turn.element.querySelector('.agent-answer-actions')?.children ?? [])].map(
+                (node) => node.className
+            )
+        ).toEqual(['answer-collapse']);
 
         turn.apply(answerDone('# Partial'));
         const button = copyButton(turn.element);
@@ -2109,6 +2123,10 @@ describe('final answer copy action (R5)', () => {
         // accessible name never changes.
         expect(button?.dataset.state).toBe('success');
         expect(button?.getAttribute('aria-label')).toBe('Copy the final answer');
+        // R5: the completed copy control joins the row on the LEFT of the toggle, so
+        // the answer's affordance reads first and the block's own collapse stays last.
+        expect(button?.parentElement?.firstElementChild).toBe(button);
+        expect(button?.nextElementSibling?.className).toBe('answer-collapse');
     });
 
     it('copies the raw Markdown of the last completed answer after several tool rounds', async () => {

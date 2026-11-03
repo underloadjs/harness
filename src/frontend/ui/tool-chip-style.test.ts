@@ -237,16 +237,19 @@ it('flows each chip with its own measured span so the chip is content-width', ()
         expect(declarations).not.toContain('content:');
     }
 
-    // The only triangle the stylesheet paints any more belongs to the endpoint accordion,
-    // which genuinely IS an inline disclosure. One rule, one surface.
-    expect(ruleList.filter(([, d]) => d.includes("content: '▸'")).map(([s]) => s)).toEqual([
-        '.endpoint-summary::before'
-    ]);
+    // T4/R4: no triangle is painted ANYWHERE in the sheet. The endpoint accordion used to
+    // own the last one (`.endpoint-summary::before`), and it left with the rail
+    // disclosure — the settings open from the top-right status pill now, so the dialog
+    // TITLE is the label and there is nothing to arrow. Zero rules is the invariant that
+    // replaces "one rule, one surface".
+    expect(ruleList.filter(([, d]) => d.includes("content: '▸'")).map(([s]) => s)).toEqual([]);
+    expect(rules).not.toContain('.endpoint-summary');
+    expect(rules).not.toContain('.endpoint[open]');
 
     // THE inheritable half: the marker reset is written on the ELEMENT, so a chip added
     // tomorrow is arrow-free without declaring anything. `list-style: none` is the Gecko
     // marker, `::-webkit-details-marker` the Blink/WebKit one. Line-anchored so an
-    // indented `.endpoint-summary {` can never satisfy them by accident.
+    // indented `.tool-summary {` can never satisfy them by accident.
     expect(rules).toMatch(/^summary \{\s*list-style: none;\s*\}/m);
     expect(rules).toMatch(/^summary::-webkit-details-marker \{\s*display: none;\s*\}/m);
     // Base layer, not a component rule: both reset lines precede the topbar, and therefore
@@ -258,10 +261,11 @@ it('flows each chip with its own measured span so the chip is content-width', ()
     expect(summary).toContain('list-style: none');
 
     // The arrow's rotation and its motion opt-out left together: reduced motion no longer
-    // has a `.tool-summary` transition to freeze, and the accordion's still does.
+    // has a `.tool-summary` transition to freeze, and T4/R4 removed the endpoint
+    // accordion's one as well — no disclosure triangle survives in either layer.
     const reduced = mediaBlockOf('@media (prefers-reduced-motion: reduce) {');
     expect(reduced).not.toContain('tool-summary');
-    expect(reduced).toContain('.endpoint-summary::before');
+    expect(reduced).not.toContain('endpoint-summary');
 });
 
 it('fills the dialog height with the result pane instead of leaving a blank tail', () => {

@@ -127,6 +127,9 @@
 //     src/frontend/ui/file-preview.ts
 //   - lifecycle status (topbar pill): src/frontend/main.ts (`setLifecycle`)
 //   - elapsed formatting: src/frontend/ui/time.ts
+//   - editable transcript + unreadable roster (C5): src/frontend/ui/thread-transcript.ts,
+//     src/frontend/api.ts (`updateThreadTranscript`) and the `saveThreadTranscript`
+//     transport main.ts wires into this board
 //   - styles: src/frontend/styles.css (`.turns`, `.turn-row`, `.tile`, `.agent`)
 //   - queue/ack race (R2): src/server/sessions.ts `enqueue` publishes the queued
 //     `turn` upsert BEFORE the 202 body is returned, so an observer frame can
@@ -155,6 +158,9 @@ import { enhanceFileLinks } from './file-links';
 import { openFilePreview } from './file-preview';
 import type { FilePreviewReader } from './file-preview';
 import { openAttachmentDialog, enhanceImages, openImageDialog } from './preview';
+// C5 transcript editing: the PUT answer's transcript document. TYPE-ONLY, so this
+// never pulls the fetch client into the UI graph at runtime.
+import type { ThreadTranscriptPayload } from '../api';
 import {
     closeThreadTranscript,
     openThreadTranscript,
@@ -211,6 +217,7 @@ import type { ReasoningCard, ToolCallCard, ToolState } from './tools';
 // belongs to, while `AgentBlockDescriptor.threadId` names one invocation. The two
 // must never be joined — see ui/threads.ts for both contracts.
 import {
+    invalidThreadsOf,
     threadLabelOf,
     threadNameOf,
     threadTitleOf,
@@ -345,6 +352,12 @@ export type TurnHandle = {
     // Re-evaluate the R7/R8 transcript/delete action bar: visible while THIS tile
     // is the expanded surface and the roster names its thread.
     syncTranscriptAction: () => void;
+    // R5: repaint the root conversation's footer Collapse/Expand toggle. The control
+    // lives in the tile's agent section, but its state is BOARD state (the one
+    // expanded conversation), so only the board can tell the button the truth —
+    // exactly the split `syncTranscriptAction` uses. A no-op before the root section
+    // exists, and for a projection with no collapsible surface.
+    syncCollapseAction: () => void;
     // Does a nested invocation of THIS turn belong to `threadId`? (S2 tie-break for
     // the board's focus resolution.)
     knowsThread: (threadId: string) => boolean;
@@ -465,6 +478,18 @@ export type TurnBoardOptions = {
     // reconciliation. Omitted in an embedding that does not expose thread delete:
     // the control is rendered disabled rather than silently pretending to work.
     deleteThread?: (sessionId: string, threadId: string) => Promise<DeleteThreadResult>;
+    // C5 transcript editing transport. The dialog owns the editor (local JSON parse,
+    // the inline error area, the pending/disable rule and the invalid-transcript
+    // banner); the shell owns the PUT plus applying the returned `session` through its
+    // normal tombstone/watermark snapshot path, and resolves with the `transcript`
+    // answer the dialog repaints from. Omitted in an embedding that does not expose
+    // editing: the editor still opens (the raw JSON can be read and copied) and Save
+    // says it is unwired instead of pretending to work.
+    saveThreadTranscript?: (
+        sessionId: string,
+        threadId: string,
+        messages: unknown
+    ) => Promise<ThreadTranscriptPayload>;
 };
 
 export type TurnBoard = {
@@ -888,6 +913,151 @@ const createBlockMeta = (classes: { elapsed: string; tokens: string }): BlockMet
     };
 };
 
+// R5: the COLLAPSIBLE SURFACE a block's footer toggle drives.
+//
+// A section is only given a toggle when the caller can name a real expand/collapse
+// surface: a nested invocation card (`is-expanded` on the `.thread-row`, which is what
+// shows or hides `.thread-body`) or the root conversation (the board's `expandedTurn`
+// plus `is-expanded` on the `.tile`, which is what shows or hides `.tile-body`). A
+// flat legacy section has neither, so it gets no control and its footer stays empty.
+//
+// Both predicates read the RENDERED state rather than a parallel flag: the class is
+// the only thing the CSS keys on, so the announced state can never disagree with what
+// the reader sees, and it is safe to paint during creation (before the entry object or
+// the turn handle exists).
+//
+// The descriptor is deliberately READ/TOGGLE rather than a stored flag: the owner of
+// the state (the entry, or the board) stays the single authority, and the button just
+// mirrors it. `sync()` re-reads `isExpanded()` at paint time, so `aria-expanded` can
+// never disagree with what the reader actually sees — including after a projection
+// rebuild recreates the button from scratch.
+type SectionCollapse = {
+    // 'thread' or 'conversation' — the noun in the accessible name and tooltip.
+    label: string;
+    // The id of the element this button controls, when a REAL one exists. `aria-
+    // controls` is only written when it is set, so it never points at nothing.
+    controls?: string;
+    // T6: the block's HEADER BUTTON (`.thread-select` / `.tile-select`). The
+    // collapsed-state chevron is inserted immediately AFTER it, as its sibling inside
+    // `.thread-tile` / `.tile` — never inside it, because the header is already a
+    // <button> and interactive content cannot nest. Omitting it leaves the block with
+    // the footer chevron only (which is why a flat legacy section, which has no header
+    // surface at all, gets no descriptor in the first place).
+    header?: HTMLElement;
+    // Current expansion state, read at paint time.
+    isExpanded: () => boolean;
+    // Toggle the surface IN PLACE. It must not move board focus or retarget the
+    // composer: that is what separates these controls from clicking the header, which
+    // focuses a persistent conversation (`focusThread`).
+    toggle: () => void;
+};
+
+// T6: THE TWO CHEVRONS of one collapsible block, and the single painter that keeps
+// them identical. Both buttons exist at all times and both carry the same ARIA truth;
+// styles.css shows exactly ONE of them (`display: none` on the other, in both
+// directions), so only one is in the accessibility tree and the tab order:
+//   - `footer` (`.answer-collapse`) sits in the block's `.agent-answer-actions` row,
+//     where the Copy button used to be alone — visible while the block is EXPANDED;
+//   - `header` (`.header-collapse`) sits in the collapsed header row — visible while
+//     the block is COLLAPSED, which is the state the footer chevron cannot serve: its
+//     whole row lives inside a body the stylesheet hides with `display: none`.
+// `sync` is called by whoever CHANGES the state (the entry's `setThreadExpanded`, the
+// board's expand/collapse paths) and once at creation to paint the initial state.
+type SectionCollapseControl = {
+    footer: HTMLButtonElement;
+    header: HTMLButtonElement | undefined;
+    sync: () => void;
+};
+
+const SVG_NAMESPACE = 'http://www.w3.org/2000/svg';
+
+// The chevron is ONE down-pointing path; CSS rotates it 180° while
+// `aria-expanded="true"`, so the DOM never has to swap glyphs and the animation is a
+// pure transform. Same data-only SVG construction as `createCopyIcon` (ui/dialog.ts):
+// this module never parses HTML, and `aria-hidden` keeps the glyph out of the
+// accessible name the button carries.
+const createCollapseIcon = (): SVGSVGElement => {
+    const icon = document.createElementNS(SVG_NAMESPACE, 'svg');
+    icon.setAttribute('viewBox', '0 0 24 24');
+    icon.setAttribute('aria-hidden', 'true');
+    icon.setAttribute('focusable', 'false');
+
+    const path = document.createElementNS(SVG_NAMESPACE, 'path');
+    path.setAttribute('fill', 'none');
+    path.setAttribute('d', 'M6 9l6 6 6-6');
+    icon.append(path);
+
+    return icon;
+};
+
+// Build ONE chevron button: the glyph, the click route and the painter that mirrors
+// the surface. `className` says WHICH slot it fills (`.answer-collapse` in the block's
+// footer, `.header-collapse` in its header row); styles.css shows exactly one of the
+// two per state, so both can carry the identical name and ARIA without a screen reader
+// hearing the control twice.
+//
+// Each is a real <button> (Enter/Space work natively) and icon-only (no visible word),
+// so the pair reads as one affordance; the state lives in `aria-expanded`, in
+// `data-expanded` and IN THE NAME — unlike the copy button, whose job is one invariant
+// action and whose name therefore never changes.
+const createChevronButton = (
+    collapse: SectionCollapse,
+    className: string
+): { button: HTMLButtonElement; paint: () => void } => {
+    const button = el('button', className);
+    button.type = 'button';
+    // Only a real controlled body gets the relation, and BOTH chevrons name it: they
+    // show and hide the very same element.
+    if (collapse.controls !== undefined) button.setAttribute('aria-controls', collapse.controls);
+    button.append(createCollapseIcon());
+
+    // Re-reads the surface, so the announced state can never disagree with what is
+    // visible. The tooltip matches the name: hover must not promise the other verb.
+    const paint = (): void => {
+        const expanded = collapse.isExpanded();
+        const name = `${expanded ? 'Collapse' : 'Expand'} ${collapse.label}`;
+        button.setAttribute('aria-expanded', String(expanded));
+        button.dataset.expanded = String(expanded);
+        button.setAttribute('aria-label', name);
+        button.title = name;
+    };
+
+    // No `stopPropagation`: neither chevron is nested in the other, and the header one
+    // is a SIBLING of `.thread-select`/`.tile-select`, so the header's own click handler
+    // cannot fire with it.
+    button.addEventListener('click', () => collapse.toggle());
+
+    return { button, paint };
+};
+
+// Create and place both chevrons of one collapsible block. The footer control is
+// APPENDED to the block's action row (never prepended) while `paintAnswerAction`
+// PREPENDS the copy button, so DOM order there is always copy → toggle. Both are
+// painted BEFORE they join the document, so no frame shows an unnamed control.
+const attachSectionCollapse = (host: HTMLElement, collapse: SectionCollapse): SectionCollapseControl => {
+    const footer = createChevronButton(collapse, 'answer-collapse');
+    footer.paint();
+    host.append(footer.button);
+
+    // T6: the collapsed-state twin. The host is the block's HEADER BUTTON, so the
+    // chevron is inserted directly after it — a sibling inside `.thread-tile`/`.tile`,
+    // which is the positioning context the CSS uses (both are `position: relative`).
+    const headerHost = collapse.header;
+    const header =
+        headerHost === undefined ? undefined : createChevronButton(collapse, 'header-collapse');
+    if (headerHost !== undefined && header !== undefined) {
+        header.paint();
+        headerHost.after(header.button);
+    }
+
+    const sync = (): void => {
+        footer.paint();
+        header?.paint();
+    };
+
+    return { footer: footer.button, header: header?.button, sync };
+};
+
 type AgentSection = {
     root: HTMLElement;
     flow: HTMLElement;
@@ -895,9 +1065,10 @@ type AgentSection = {
     // metadata line. The model / stop reason / token figures this row used to print
     // are measurement facts, and the block HEADERS already carry them (`.tile-top`
     // for the root, `.thread-top` for a nested invocation), so the bottom line was
-    // a duplicate. It now holds the single Copy action for this block's final
-    // answer and is empty (hence `display: none`, styles.css) until an answer has
-    // actually completed.
+    // a duplicate. It holds the Copy action for this block's final answer (FIRST, so
+    // it reads left) and, for a block with a collapsible surface, that surface's
+    // Collapse/Expand toggle (LAST, pinned right). A block with no surface stays empty
+    // until an answer completes, and is then `display: none` (styles.css `:empty`).
     actions: HTMLElement;
     text: TextBlock | undefined;
     // The LAST closed prose block's cumulative buffer. `closeText` clears `text`
@@ -919,6 +1090,13 @@ type AgentSection = {
     // life of the block (its payload is read at click time, so it never goes stale
     // and never needs re-creating when the answer advances).
     answerAction: HTMLButtonElement | undefined;
+    // R5/T6: the block's Collapse/Expand CHEVRONS, created with the block when the
+    // caller passed a `SectionCollapse` (a nested invocation card or the root
+    // conversation): `footer` in this row, `header` in the block's collapsed header.
+    // `sync()` repaints `aria-expanded`/`aria-label`/`title`/`data-expanded` on BOTH
+    // from the OWNER of the state, so it is called at creation and on every expansion
+    // change. Undefined for a flat legacy section, which has nothing to expand.
+    collapse: SectionCollapseControl | undefined;
     // The CURRENT reasoning round: its INLINE think chip plus the cumulative text streamed
     // so far. One writer per model request — `commitAttempt`/`discardAttempt` drop this
     // pointer so the next request mints its own chip (T8: two requests' thinking must never
@@ -1285,6 +1463,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // embedder that only calls `setThreads` still gets a truthful roster/turn
     // fallback (turns are the last records the tiles merged, and the document's
     // limitations disclose that live frames are not folded in).
+    //
+    // C5: the fallback carries the invalid roster too, rebuilt from the normalized
+    // entries (`SessionThreadEntry.invalid`, joined by ui/threads.ts). A transcript the
+    // server cannot read must stay openable in the editor on EVERY source, or a
+    // roster-only host would hide the one surface that can repair it.
+    const invalidRecordsOf = (entries: readonly SessionThreadEntry[]) =>
+        entries
+            .map((entry) => entry.invalid)
+            .filter((record): record is NonNullable<typeof record> => record !== undefined);
+
     const transcriptSnapshotNow = (): SessionSnapshot | undefined => {
         if (sessionSnapshot !== undefined) return sessionSnapshot;
         if (roster.length === 0) return undefined;
@@ -1292,6 +1480,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const sourceTurns = turns
             .map((turn) => turn.source())
             .filter((turn): turn is SessionTurn => turn !== undefined);
+
+        const invalidRecords = invalidRecordsOf(roster);
 
         return {
             id: boundSession ?? '',
@@ -1302,8 +1492,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             updatedAt: 0,
             messages: [],
             threads: roster.map(rawThreadOf),
-            turns: sourceTurns
-        };
+            turns: sourceTurns,
+            ...(invalidRecords.length === 0 ? {} : { invalidThreads: invalidRecords })
+        } as SessionSnapshot;
     };
 
     // The raw turns this board currently knows, for delete protection when no full
@@ -1497,9 +1688,21 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             bar.hidden = false;
             const name = threadNameOf(entry);
             const transcriptBusy = isDeleting(threadId);
+            // C5: an unreadable transcript is offered through the SAME control, but
+            // the hover/accessible name says what it actually opens (an editor for the
+            // raw JSON) instead of promising a readable document.
+            const unreadable = entry.invalid !== undefined;
 
-            transcriptButton.setAttribute('aria-label', `Open the JSON transcript of ${name}`);
-            transcriptButton.title = `Open the complete JSON transcript of ${name}`;
+            transcriptButton.dataset.invalid = unreadable ? 'true' : 'false';
+            transcriptButton.setAttribute(
+                'aria-label',
+                unreadable
+                    ? `Open the unreadable transcript JSON of ${name} to repair it`
+                    : `Open the JSON transcript of ${name}`
+            );
+            transcriptButton.title = unreadable
+                ? `This thread's transcript cannot be read; edit its raw JSON to repair it`
+                : `Open the complete JSON transcript of ${name}`;
             transcriptButton.disabled = transcriptBusy;
 
             const protection = deleteProtectionFor(threadId);
@@ -1557,10 +1760,25 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // Open the JSON transcript for one persistent thread. The click is the only
     // trigger; the initial document comes from the latest applied snapshot and a
     // shell-provided single `getSession` refresh runs in the background.
+    //
+    // C5: an unreadable transcript is NOT a reason to silently return. The roster
+    // entry carries the joined invalid record (ui/threads.ts), so the click opens the
+    // editor with the raw stored value and the error banner — the state in which the
+    // reader can actually fix the JSON.
     const openTranscriptOf = (threadId: string | undefined): void => {
         const entry = transcriptEntryOf(threadId);
         const source = transcriptSnapshotNow();
-        if (threadId === undefined || entry === undefined || source === undefined) return;
+        if (threadId === undefined || source === undefined) return;
+
+        // A thread the roster does not describe offers nothing — UNLESS the applied
+        // snapshot names it in `invalidThreads`: an unreadable conversation the reader
+        // cannot open cannot be repaired either, so a partial roster must not hide it.
+        if (
+            entry === undefined &&
+            invalidThreadsOf(source).find((record) => record.id === threadId) === undefined
+        ) {
+            return;
+        }
 
         // The standalone fallback has no session id; bind the board's id so a later
         // async refresh with the real snapshot is accepted as the SAME session.
@@ -1568,10 +1786,23 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             source.id.length > 0 || boundSession === undefined
                 ? source
                 : { ...source, id: boundSession };
-        const handle = openThreadTranscript(snapshot, threadId, transcriptScope);
+        const sessionId = snapshot.id.length > 0 ? snapshot.id : boundSession;
+
+        // The save transport is bound to THIS session + thread before the dialog is
+        // built: the answer of a late PUT must never be applied to a conversation the
+        // reader moved on to, and the dialog itself holds no routing knowledge.
+        const transport = options.saveThreadTranscript;
+        const onSave =
+            transport === undefined || sessionId === undefined
+                ? undefined
+                : (messages: unknown): Promise<ThreadTranscriptPayload> =>
+                      transport(sessionId, threadId, messages);
+
+        const handle = openThreadTranscript(snapshot, threadId, transcriptScope, {
+            ...(onSave === undefined ? {} : { onSave })
+        });
         if (handle === undefined) return;
 
-        const sessionId = snapshot.id.length > 0 ? snapshot.id : boundSession;
         if (options.refreshSessionSnapshot === undefined || sessionId === undefined) return;
 
         void options
@@ -1694,6 +1925,26 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         return host instanceof HTMLElement && host.classList.contains('conversation') ? host : undefined;
     };
 
+    // C8-M1: WHICH conversation a tile's row belongs to is decided by the
+    // AUTHORITATIVE record whenever one is bound, never by the tile's draft
+    // binding. `turn.threadId()` is the runtime binding and `setThreadId` is
+    // deliberately ADDITIVE (a record that omits `threadId` keeps the draft value):
+    // the composer must keep steering/continuing the conversation the reader
+    // focused when the submit left the browser, even for a record that names no
+    // thread. Placement cannot inherit that draft. A server COMMAND turn is
+    // thread-less (src/server/sessions.ts `executeCommandTurn` records no
+    // `threadId`), so the live card sat INSIDE the focused conversation while the
+    // same record hydrated board-level, and once that conversation was deleted the
+    // orphaned card was the only thing keeping its container on the board.
+    const placementThreadIdOf = (turn: TurnHandle): string | undefined => {
+        const source = turn.source();
+
+        // Unbound optimistic tile: no record exists yet, so the draft thread the
+        // submit was addressed to IS the placement (a new conversation adopts its
+        // container from its first record — see `setThreadId`).
+        return source === undefined ? turn.threadId() : turnThreadIdOf(source);
+    };
+
     const hostThreadIdOf = (threadId: string): string => {
         const seen = new Set<string>([threadId]);
         let current = roster.find((candidate) => candidate.id === threadId)?.ownerThreadId;
@@ -1702,7 +1953,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             // Nest under the nearest OWNED ancestor that already has a conversation
             // container (or at least a turn). A link to a thread with no visible
             // surface falls through to this conversation remaining top-level.
-            if (conversationHosts.has(current) || turns.some((turn) => turn.threadId() === current)) {
+            // The surface test uses the SAME placement authority as `placeTurn`, so
+            // a thread-less card (a command turn) can never be mistaken for a turn
+            // of the ancestor it was submitted from.
+            if (
+                conversationHosts.has(current) ||
+                turns.some((candidate) => placementThreadIdOf(candidate) === current)
+            ) {
                 return current;
             }
 
@@ -1720,7 +1977,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         const row = turn.element.parentElement;
         if (row === null) return;
 
-        const threadId = turn.threadId();
+        // C8-M1: record-authoritative (see `placementThreadIdOf`), so a live command
+        // tile leaves the focused conversation the moment its record is merged and
+        // reads exactly like its hydrated twin.
+        const threadId = placementThreadIdOf(turn);
 
         // 1. A continuation of a CHILD conversation lands inside that child's own
         //    nested card (see `childExchangeHost`), so a resumed child keeps ONE card
@@ -1856,6 +2116,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     const placeAllTurns = (): void => {
         for (const turn of turns) placeTurn(turn);
         reorderBoard();
+        // C5: the projection can create or replace a conversation card, so the
+        // unreadable-transcript mark is re-applied from the roster in the same pass.
+        paintRosterInvalid();
     };
 
     const notifyFocus = (): void => options.onFocusChange?.(focusedThreadId);
@@ -1931,6 +2194,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             ?.setAttribute('aria-expanded', 'false');
         // R4: the action belongs to the expanded surface only.
         expandedTurn.syncTranscriptAction();
+        // R5: the root footer toggle announces this conversation's expansion. It is
+        // synced here (after `is-expanded` was removed above) so a tile that loses the
+        // expanded slot — to another tile, a child focus or a roster panel — repaints
+        // to `Expand conversation` instead of keeping a stale `Collapse`.
+        expandedTurn.syncCollapseAction();
         // The whole CONVERSATION was open (all its exchanges), not just this tile.
         hostOfTurn(expandedTurn)?.classList.remove('is-expanded');
         expandedTurn = undefined;
@@ -1964,6 +2232,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             el('span', 'thread-focus-name', name),
             el('span', 'thread-focus-status', entry.status)
         );
+        // C5: an unreadable transcript is stated ONCE, briefly, next to the identity —
+        // the conversation is still focusable, steerable and fixable from the bar below,
+        // and hiding the state would make the editor in the dialog look like a surprise.
+        if (entry.invalid !== undefined) {
+            panel.dataset.invalid = 'true';
+            head.append(el('span', 'thread-focus-invalid', 'transcript unreadable'));
+        }
         if (entry.ownerThreadId !== undefined) {
             const owner = roster.find((candidate) => candidate.id === entry.ownerThreadId);
             head.append(
@@ -1988,8 +2263,20 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         focusActionDispose = actionBar.dispose;
 
         const transcript = el('div', 'thread-focus-messages');
+        const invalidRecord = entry.invalid;
         const messages = Array.isArray(entry.messages) ? entry.messages : [];
-        if (messages.length === 0) {
+        if (invalidRecord !== undefined) {
+            // The stored value is not a transcript, so nothing here can be rendered as
+            // messages. Name the failure and point at the control that fixes it; the
+            // dialog (not the panel) is where the raw JSON is shown and edited.
+            transcript.append(
+                el(
+                    'p',
+                    'thread-focus-invalid-note',
+                    `transcript unreadable: ${invalidRecord.error}. Use Transcript to edit the raw JSON.`
+                )
+            );
+        } else if (messages.length === 0) {
             transcript.append(el('p', 'thread-focus-empty', 'No messages recorded in this thread yet.'));
         }
         for (const message of messages) {
@@ -2131,6 +2418,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // thread transcript. The previous expansion hid its action in
         // `detachTileExpansion`.
         turn.syncTranscriptAction();
+        // R5: and its footer Collapse/Expand toggle flips to `Collapse conversation`
+        // with the same transition. This also covers a root section created AFTER the
+        // tile was expanded (a live tile starts empty; only its sections know the
+        // state), because the toggle's `isExpanded` reads the live board state.
+        turn.syncCollapseAction();
         // R3: a continuation routed into a nested child card lives inside that card's
         // body, so the card has to be open for the expanded exchange to be visible.
         openEnclosingCards(turn);
@@ -2434,6 +2726,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // R7/R8: repaint the shared toolbar. Visibility is board expansion state,
         // so `expand`/`detachTileExpansion` and every roster/snapshot update call it.
         const syncTranscriptAction = actionBar.sync;
+
+        // R5: repaint THIS tile's root footer Collapse/Expand toggle. The control is
+        // owned by the agent section, but the state it announces is the BOARD's single
+        // expanded conversation, so the board drives this on every expansion change
+        // (`expand`, `detachTileExpansion` and therefore `dropFocusState`/`collapse`).
+        // A no-op while no root section exists (a tile with no events yet) or for a
+        // projection with no collapsible surface.
+        const syncCollapseAction = (): void => {
+            threads.get(ROOT_KEY)?.section.collapse?.sync();
+        };
 
         const paintThreadBadge = (): void => {
             if (runtimeThreadId === undefined) {
@@ -2823,11 +3125,18 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // once by the caller for THIS invocation: the section header shows the code,
         // never the raw agent id (R2/R3). The id is still mirrored on `data-agent`
         // by `paintAgentColor` for colour/routing.
+        //
+        // R5: `collapse` names the surface this block's footer toggle expands and
+        // collapses. It is OPTIONAL: a flat legacy section has no collapsible surface,
+        // so it gets no toggle. The toggle is appended HERE — at creation, before any
+        // answer can complete — which is what lets the Copy button that arrives later
+        // be PREPENDED in front of it (copy left, toggle right) in every order.
         const createSection = (
             container: HTMLElement,
             agentName: string,
             role: 'primary' | 'subagent',
-            label: string
+            label: string,
+            collapse?: SectionCollapse
         ): AgentSection => {
             const root = el('section', 'agent');
             root.dataset.role = role;
@@ -2841,15 +3150,16 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             head.append(el('span', 'agent-name', label));
 
             const sectionFlow = el('div', 'agent-flow');
-            // R5: the footer row. It stays EMPTY until this block completes an
-            // answer, so a tool-only or still-streaming block paints no orphan
-            // control (`display: none` on `:empty`, styles.css).
+            // R5: the footer row. A block WITH a collapsible surface owns its
+            // Collapse/Expand toggle from the moment it exists; a block without one
+            // (a flat legacy section) stays EMPTY until it completes an answer, so it
+            // paints no orphan control (`display: none` on `:empty`, styles.css).
             const sectionActions = el('div', 'agent-answer-actions');
 
             root.append(head, sectionFlow, sectionActions);
             container.append(root);
 
-            return {
+            const section: AgentSection = {
                 root,
                 flow: sectionFlow,
                 actions: sectionActions,
@@ -2857,6 +3167,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 lastText: undefined,
                 finalAnswer: undefined,
                 answerAction: undefined,
+                collapse: undefined,
                 reasoning: undefined,
                 thinking: [],
                 tools: [],
@@ -2865,6 +3176,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 pendingCalls: new Map(),
                 attempt: undefined
             };
+
+            // R5: the toggle is created and appended HERE, before anything can stream,
+            // so it is permanently the LAST control in the row: `paintAnswerAction`
+            // PREPENDS the copy button, and a later answer can never slip in front of
+            // the toggle or displace it. `sync()` paints the state the surface is
+            // already in (a restored projection re-opens this block right after).
+            if (collapse !== undefined) section.collapse = attachSectionCollapse(sectionActions, collapse);
+
+            return section;
         };
 
         // Collapse/expand one entry. Independent of the board's single expanded
@@ -2887,6 +3207,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             entry.tile?.classList.toggle('is-expanded', expanded);
             entry.select?.setAttribute('aria-expanded', String(expanded));
             syncThreadTranscriptAction(entry);
+            // R5: this is the ONLY transition of a nested card's expansion (a header
+            // click, the footer toggle, and the board's implicit open/close all route
+            // through here), so the footer toggle repaints with it — which is what keeps
+            // `aria-expanded` correct after a rebuild restore or an `openEnclosingCards`
+            // reveal, not just after a click.
+            entry.section.collapse?.sync();
 
             // Remember the reader's choice by canonical key so a projection rebuild
             // can restore it (the entry objects are recreated, the keys are stable).
@@ -3431,7 +3757,32 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 kindTag,
                 started: options.started,
                 state: options.state,
-                section: createSection(threadFlow, options.agent, 'subagent', label),
+                // R5/T6: the two Collapse/Expand chevrons for THIS card — the footer
+                // one in the block's action row, the header one inserted after
+                // `.thread-select` so a COLLAPSED card is still reachable (the footer
+                // row lives inside `.thread-body`, which styles.css hides while the card
+                // is closed).
+                //
+                // The descriptor READS the row's own class rather than `entry.expanded`,
+                // because the section is part of `entry`'s literal: `entry` is still in
+                // its temporal dead zone while `createSection` paints the buttons. `is-
+                // expanded` on `threadRow` is exactly what styles.css uses to show or
+                // hide `.thread-body` (and it is mirrored onto `.thread-tile`, which is
+                // what the chevrons are positioned against), so the announced state can
+                // never disagree with what the reader sees — and `setThreadExpanded`
+                // keeps it in lockstep with `entry.expanded`. `toggle` reads `entry` only
+                // at CLICK time, when the literal has long been assigned. It performs the
+                // card's own expand/collapse and deliberately does NOT route through
+                // `focusThread` the way the header button does for a PERSISTENT child
+                // (see the click handler below): pressing a chevron moves this card's
+                // body, it never re-targets the composer.
+                section: createSection(threadFlow, options.agent, 'subagent', label, {
+                    label: 'thread',
+                    controls: bodyId,
+                    header: select,
+                    isExpanded: () => threadRow.classList.contains('is-expanded'),
+                    toggle: () => setThreadExpanded(entry, !entry.expanded)
+                }),
                 row: threadRow,
                 tile,
                 body,
@@ -3517,7 +3868,31 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             const conversationLabel = rootConversationLabel();
             reserveConversationLabel(conversationLabel);
             const label = conversationLabel ?? nextLabel(agentName);
-            const section = createSection(flow, agentName, 'primary', label);
+            // R5/T6: the root block's content IS `.tile-body`, so its chevrons drive the
+            // BOARD's single expanded conversation — the footer one in the action row
+            // while the tile is open, the header one after `.tile-select` while it is
+            // closed (a collapsed tile hides `.tile-body`, so the footer row is not
+            // renderable there).
+            //
+            // `isExpanded` reuses the exact pair the tile's own action bar keys on
+            // (`expandedTurn?.element === card` plus the `is-expanded` class, see the
+            // `visible` predicate above), i.e. the state AS RENDERED, and it avoids
+            // reading `turn` — which does not exist yet when a projection paints this
+            // section. `toggle` performs the same two board transitions as the tile
+            // header (`select`'s click handler): collapse the expanded conversation,
+            // otherwise expand this one. The chevrons add no focus routing of their own,
+            // so an in-place collapse of a nested card never moves the composer target.
+            const section = createSection(flow, agentName, 'primary', label, {
+                label: 'conversation',
+                controls: `${id}-body`,
+                header: select,
+                isExpanded: () =>
+                    expandedTurn?.element === card && card.classList.contains('is-expanded'),
+                toggle: () => {
+                    if (expandedTurn?.element === card) collapse();
+                    else expand(turn);
+                }
+            });
             // R1/F3: the compact root header shows the same code as a child header.
             // The section's own `.agent-head` is hidden by CSS for the primary part
             // (the code would otherwise appear twice); flat legacy subagent sections
@@ -3848,7 +4223,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     text: () => section.finalAnswer ?? '',
                     className: 'answer-copy'
                 });
-                section.actions.append(button);
+                // R5: PREPENDED, so the copy control is always the FIRST child of the
+                // row (left) and the collapse toggle — created with the block — stays the
+                // last (right, pinned by `margin-left: auto`). Appending here would put
+                // the copy button after the toggle and reverse the agreed order.
+                section.actions.prepend(button);
                 section.answerAction = button;
                 return;
             }
@@ -4645,6 +5024,13 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             actionCards.clear();
             actionAnswers.clear();
             flow.replaceChildren();
+            // R5/T6: a block's collapsed-state chevron is created WITH its section but
+            // lives in the BLOCK surface (a sibling of `.tile-select` inside the tile),
+            // so clearing `.tile-flow` alone would leave the discarded one in the header
+            // and the replay would add a second — two chevrons in one row, the older one
+            // never repainted again. Nested rows do not need this: their chevron is inside
+            // `.thread-tile`, which is inside the row being replaced below.
+            for (const stale of card.querySelectorAll(':scope > .header-collapse')) stale.remove();
             // Invocation rows live OUTSIDE the tile flow, so clearing the flow alone
             // would leave orphan entries after a superseding record arrives.
             threadHost.replaceChildren();
@@ -5320,6 +5706,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             threadId: () => runtimeThreadId,
             refreshThreadRoster,
             syncTranscriptAction,
+            syncCollapseAction,
             knowsThread,
             focusChildThread,
             clearThreadFocus,
@@ -5717,6 +6104,22 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
     // Authoritative roster update (S2/S6). Repaints every roster-derived label and
     // child marker; drops a focus the roster no longer describes (a deleted thread),
     // which is what keeps a late/stale roster from re-opening a deleted conversation.
+    //
+    // C5: an unreadable transcript is marked on the surfaces that represent the
+    // conversation, never by hiding them — the reader has to be able to reach the
+    // editor, so the state is one attribute on the card plus one short line.
+    const paintRosterInvalid = (): void => {
+        for (const [threadId, host] of conversationHosts) {
+            const entry = roster.find((candidate) => candidate.id === threadId);
+            if (entry === undefined || entry.invalid === undefined) {
+                delete host.dataset.invalid;
+                continue;
+            }
+
+            host.dataset.invalid = 'true';
+        }
+    };
+
     const setThreads = (entries: readonly SessionThreadEntry[]): void => {
         roster = [...entries];
 
@@ -5740,6 +6143,9 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
         // its own card.
         for (const turn of turns) turn.refreshThreadRoster();
         placeAllTurns();
+        // Cards are (re)created by the projection above, so the invalid marks are
+        // applied after it and always describe the roster this call just installed.
+        paintRosterInvalid();
 
         if (focusedThreadId === undefined) return;
 

@@ -20,15 +20,22 @@
 // and the frozen `definition` are untouched. Snapshots therefore report the live
 // map, and `definition.agentModels` stays the creation-time record.
 //
-// TWO SUBMIT PATHS (R4, both retained):
+// THREE SUBMIT PATHS (R4, all retained):
 //   - LEGACY: run() backs POST /sessions/:id/messages. The run is owned by that SSE
 //     response: if its emitter fails the run is aborted, and a busy session is
 //     rejected with 409 before a status line is sent.
-//   - QUEUE: enqueue() backs POST /sessions/:id/tasks. It answers 202 immediately
-//     and the private lane pump executes each THREAD's backlog FIFO, so a task
-//     keeps running after the browser disconnects. Watchers
+//   - QUEUE: enqueue() backs POST /sessions/:id/tasks for MODEL work. It answers 202
+//     immediately and the private lane pump executes each THREAD's backlog FIFO, so a
+//     task keeps running after the browser disconnects. Watchers
 //     (GET /sessions/:id/events) only unsubscribe on disconnect; nothing aborts an
 //     accepted task except cancel/remove/delete.
+//   - COMMAND: dispatch() is what POST /sessions/:id/tasks actually calls, and it is
+//     the ONE splitter. A leading "/" is an OPERATOR command, so it runs HERE
+//     (`harness.executeCommand`: no model request, no lane, no steering, no pending
+//     cap) and its answer is recorded as one ordinary SessionTurn with SYNTHESIZED
+//     `start`/`tool_call`/`tool_result` events, which is what lets the existing
+//     renderers and a reload show it with zero frontend changes. Every other input
+//     falls through to enqueue() untouched, so the queue contract is unchanged.
 //
 // SINGLE FLIGHT: every operation that mutates a session's harness is mutually
 // exclusive: a queue pump turn, a legacy streaming run, a manual `callTool` (R8),
@@ -130,6 +137,7 @@
 //   - ./handler.ts  — forwards stream items verbatim; no turn inference there
 //   - ./api.ts      — POST /tasks (202), GET /events (watcher), POST /cancel {all},
 //                     POST/DELETE /sessions/:id/threads/:threadId[/cancel],
+//                     GET/PUT /sessions/:id/threads/:threadId/transcript (C4),
 //                     POST /sessions/:id/actions/:requestId/answer
 //   - ./harnesses/registry.ts — the in-memory harness registry
 //   - ./harnesses/descriptor.ts — describeHarness, the frozen definition
@@ -146,6 +154,7 @@ import type {
     HarnessActionRequest,
     HarnessActionRequestContext,
     HarnessAttachment,
+    HarnessCommandResult,
     HarnessEvent,
     HarnessInteractionConfiguration,
     HarnessMessage,
@@ -168,6 +177,16 @@ import {
 } from '../shared/agent-results';
 import type { AgentResultBlock, AgentResultReference, AgentResultTurn } from '../shared/agent-results';
 import { validateActionChoice } from '../core/action';
+// C4: the ONE transcript reader (`readHarnessMessages`) shared by snapshot(),
+// restore() and the transcript editor, so the server can never persist a
+// transcript its own restore would refuse, and a transcript it refuses is refused
+// with the exact same message everywhere. Barrel import (core/index.ts) keeps the
+// module graph identical to the rest of the server.
+import { readHarnessMessages, THREAD_AGENT_PREFIX } from '../core';
+// The ONE slash-line parser (core/command.ts). The store uses it only to DECIDE
+// whether a submit is a command; the harness re-parses the same line when it
+// executes it, so a host can never disagree with the server about what "/x" means.
+import { parseCommandLine } from '../core/command';
 import { describeHarness } from './harnesses/descriptor';
 import {
     createHarnessRegistry,
@@ -181,16 +200,19 @@ import type { HarnessRegistry } from './harnesses/registry';
 import { mergeSettings } from './config';
 import { HarnessPersistenceError } from './persistence';
 import { HARNESS_DATABASE_VERSION, repairInterruptedToolCalls } from './persistence';
-import type { HarnessDatabase, HarnessPersistence, HarnessSessionRecord } from './persistence';
+import type { HarnessDatabase, HarnessInvalidThreadRecord, HarnessPersistence, HarnessSessionRecord } from './persistence';
 import type {
     CancelThreadResult,
     HarnessDescriptor,
     HarnessUsage,
+    SessionInvalidThread,
     SessionSnapshot,
     SessionStatus,
     SessionStreamItem,
     SessionThread,
-    SessionTurn
+    SessionTurn,
+    ThreadTranscriptResponse,
+    UpdateThreadTranscriptResult
 } from './protocol';
 
 const MAX_INPUT_LENGTH = 200_000;
@@ -407,6 +429,16 @@ type Session = {
     // map is what lets deletion purge EVERY persisted agent-result record the
     // runtime removes. Persisted, because a restart must still purge correctly.
     invocationThreads: Map<string, string>;
+    // C4: conversations whose stored transcript could NOT be read, keyed by thread
+    // id. Populated by tolerant restore (one broken thread cannot drop a whole
+    // session) and by a PUT that submits a structurally invalid transcript.
+    //
+    // The thread itself always stays in the harness with a VALID placeholder
+    // transcript, so the roster, the model path and persistence keep working;
+    // this map is where the raw, unmodified value lives so the visualiser can show
+    // it and the operator can fix it. An entry is dropped as soon as a readable
+    // transcript replaces it.
+    invalidThreads: Map<string, HarnessInvalidThreadRecord>;
     // True while a LEGACY /messages run owns this harness. Manual calls set `busy`
     // without changing `status`, so the aggregate status needs its own flag to know
     // when a real run is active.
@@ -518,6 +550,117 @@ const messageOf = (error: unknown): string => (error instanceof Error ? error.me
 // snapshot must not expose the live arrays the harness keeps mutating.
 const copyMessages = (messages: readonly HarnessMessage[]): HarnessMessage[] =>
     messages.map((message) => JSON.parse(JSON.stringify(message)) as HarnessMessage);
+
+// ---------------------------------------------------------------------------
+// C4: tolerant transcripts (one unreadable thread must not cost the session)
+// ---------------------------------------------------------------------------
+//
+// A transcript is fully user-editable JSON, so a hand edit CAN break it. The whole
+// session is still worth loading, so a thread whose stored `messages` value fails
+// `readHarnessMessages` keeps its identity and gets this VALID placeholder in the
+// live transcript, while the raw broken value is retained beside it
+// (`Session.invalidThreads`, persisted as `HarnessSessionRecord.invalidThreads`).
+//
+// Why a `system` entry: it is the only role with no structural partners to satisfy
+// (no toolCallId pairing, no attachment validation), so the placeholder can never
+// itself become the invalid-transcript problem, and a run of the thread still gets
+// a readable explanation in the model's context.
+const TRANSCRIPT_UNREADABLE_PREFIX = '[transcript unreadable: ';
+
+const unreadableTranscript = (error: string): HarnessMessage[] => [
+    { role: 'system', content: `${TRANSCRIPT_UNREADABLE_PREFIX}${error}]` }
+];
+
+// True when `messages` IS one of the placeholders above (and therefore still
+// unreadable). Tolerant restore uses this to tell "the operator repaired the
+// transcript by hand" (the persisted raw entry is now stale) from "this thread is
+// still broken" (the raw entry is the ONLY copy of what the user wrote).
+//
+// Exact-shape on purpose: `[transcript unreadable: …]` is text this package mints
+// and nothing else writes, so matching the prefix + single-entry system shape is a
+// reliable signal rather than a heuristic over arbitrary user content.
+const isUnreadablePlaceholder = (messages: unknown): boolean => {
+    if (!Array.isArray(messages) || messages.length !== 1) return false;
+
+    const entry = messages[0] as { role?: unknown; content?: unknown } | null;
+    if (entry === null || typeof entry !== 'object') return false;
+
+    return (
+        entry.role === 'system' &&
+        typeof entry.content === 'string' &&
+        entry.content.startsWith(TRANSCRIPT_UNREADABLE_PREFIX) &&
+        entry.content.endsWith(']')
+    );
+};
+
+// C8-m3: the same "still unreadable?" question for a DEFAULT conversation
+// (`agent:<name>`). Those ids never appear in `core.threads` — the persisted thread
+// list is host-thread ids only (src/core/snapshot.ts readThreads refuses an
+// `agent:` id), and the default transcript lives on the AGENT entry
+// (`core.agents[name].messages`, see src/harness.ts `setThreadMessages`, which writes
+// through to `target.agent.messages`).
+//
+// Why the store must ask it at all: `updateThreadTranscript` DOES accept a default
+// conversation, so a live PUT of an invalid value records the raw text under
+// `agent:<name>` and installs the placeholder on the agent. Tolerant restore then
+// has no `core.threads` entry to revalidate, and without this branch the persisted
+// raw value is dropped on restart while the placeholder is still what the model is
+// sent — the conversation silently reads as healthy and the operator's text is gone.
+//
+// Strictness is unchanged: this only keeps a raw value while the agent transcript IS
+// a placeholder this package minted. A hand-edited `core.agents[name].messages` that
+// is invalid is refused by `readHarnessSnapshot` during restore (the session is
+// dropped) and never reaches this comparison.
+const defaultTranscriptStillUnreadable = (
+    threadId: string,
+    agents: Record<string, { messages?: unknown }> | undefined
+): boolean => {
+    if (!threadId.startsWith(THREAD_AGENT_PREFIX)) return false;
+
+    const name = threadId.slice(THREAD_AGENT_PREFIX.length);
+    if (name.length === 0 || agents === null || typeof agents !== 'object') return false;
+
+    // Own-key: `agent:` + `constructor` must not resolve to the prototype chain.
+    if (!Object.prototype.hasOwnProperty.call(agents, name)) return false;
+
+    const entry = agents[name];
+
+    return entry !== null && typeof entry === 'object' && isUnreadablePlaceholder(entry.messages);
+};
+
+// Pretty JSON for the editor. `raw` is what the user reads and edits, so a value
+// that cannot be stringified (a circular JS object handed to the store directly,
+// never over HTTP) must degrade to readable text instead of failing the request,
+// and `undefined` degrades to `null` because JSON has no undefined value.
+const transcriptRawJson = (value: unknown): string => {
+    try {
+        return JSON.stringify(value, null, 2) ?? 'null';
+    } catch {
+        return String(value);
+    }
+};
+
+// C8-m7: the raw unreadable value must never be SHARED with a caller. It is
+// arbitrary user JSON (an object or array is the common case), so storing/returning
+// it by reference lets an in-process host — the API layer, a tool, a test — mutate
+// server state through the value it was handed, rewriting the operator's broken text
+// without a single write going through `updateThreadTranscript`.
+//
+// A JSON round trip is the same total deep copy `copyEvent`/`copyTurn` use, and the
+// value is only ever read back as JSON (`transcriptRawJson`, the persisted document,
+// the snapshot projection), so a round trip loses nothing that matters.
+//
+// Edge case: a value JSON cannot carry (a circular object built in-process, a bare
+// `undefined`, a function). Those keep their original reference — they cannot be
+// copied, and the readers above already degrade them to readable text instead of
+// refusing the request.
+const copyInvalidMessages = (value: unknown): unknown => {
+    try {
+        return JSON.parse(JSON.stringify(value));
+    } catch {
+        return value;
+    }
+};
 
 // One progress event is plain JSON data (message bodies, tool calls, error info),
 // so a round trip is a safe deep copy. Events are copied twice on purpose:
@@ -653,6 +796,59 @@ const validateInput = (rawInput: string, attachmentCount: number): string => {
     }
 
     return input;
+};
+
+// ---------------------------------------------------------------------------
+// SERVER-SIDE SLASH COMMANDS (dispatch / executeCommandTurn)
+// ---------------------------------------------------------------------------
+
+// The synthesized `tool_call`/`tool_result` name for one command turn. "command" is
+// not a registered TOOL: it is the transcript's label for "the server ran a slash
+// line". A real tool would have to be declared to the model to take this name, and
+// a command never reaches the model, so the two cannot collide.
+const COMMAND_TOOL_NAME = 'command';
+
+// Rejections for the two submit payloads a command line cannot express. Commands
+// take ONE contract (a slash line) and silently dropping a clipped image or a
+// referenced result block would answer "it worked" while losing user work.
+const COMMAND_ATTACHMENT_MESSAGE = 'A slash command cannot carry attachments.';
+const COMMAND_REFERENCE_MESSAGE = 'A slash command cannot carry result references.';
+
+// "How many submitted entries are present", for the command rejections and for the
+// shared empty-prompt rule. Deliberately total over unvalidated JSON: `undefined`
+// and `null` are absent, an array answers its length, and ANY other value the
+// dispatcher could not have produced (a bare object, a string) counts as one, so a
+// malformed payload is rejected instead of being read as "nothing was submitted".
+const submittedCount = (value: unknown): number => {
+    if (value === undefined || value === null) return 0;
+    if (Array.isArray(value)) return value.length;
+
+    return 1;
+};
+
+// The agent a command turn's synthesized events are attributed to, and the model the
+// `start` frame reports. Both MUST equal what `snapshot()` already publishes
+// (`agentModels[primary]` / `model`), otherwise a live tile and a reloaded tile
+// disagree about the same turn. A host handle without the entry-agent member falls
+// back to the frozen descriptor and the session model, so these are never empty.
+const commandAgentOf = (session: Session): string => {
+    const harness = session.harness as Partial<Harness>;
+    const name = typeof harness.name === 'string' && harness.name.length > 0
+        ? harness.name
+        : session.definition.primary;
+
+    // `name` and `definition.primary` are the SAME string for every preset built by
+    // the registry (HarnessPreset.primary is the entry agent), so the fallback only
+    // fires for a hand-built handle; the agent-name guard then keeps the frontend's
+    // primary/subagent colouring exact instead of colouring a command as a subagent.
+    return name;
+};
+
+const commandModelOf = (session: Session): string => {
+    const harness = session.harness as Partial<Harness>;
+    const model = typeof harness.agent?.model === 'function' ? harness.agent.model() : '';
+
+    return model.length > 0 ? model : session.settings.model;
 };
 
 // HTTP status for a rejected attachment. The shared validator throws plain
@@ -854,6 +1050,8 @@ export class SessionStore {
             threadLabelHighWater: new Map(),
             turnInvocations: new Map(),
             invocationThreads: new Map(),
+            // C4: a fresh session has no unreadable transcript by construction.
+            invalidThreads: new Map(),
             legacyRunning: false,
             watchers: new Set(),
             pumping: false,
@@ -1304,6 +1502,18 @@ export class SessionStore {
             ...(session.invocationThreads.size === 0
                 ? {}
                 : { invocationThreads: Object.fromEntries(session.invocationThreads) }),
+            // C4: the raw unreadable transcripts. Written only when present, so a
+            // session that never had a broken thread keeps its exact pre-C4
+            // document shape. Keyed by thread id; values keep `messages` verbatim.
+            ...(session.invalidThreads.size === 0
+                ? {}
+                : {
+                      invalidThreads: Object.fromEntries(
+                          [...session.invalidThreads].sort(([left], [right]) =>
+                              left.localeCompare(right)
+                          )
+                      )
+                  }),
             // The last committed snapshot. During an active run this is the latest
             // mutation boundary the observer captured (a completed tool's store
             // writes and tool-result message together), plus the event log above.
@@ -1433,6 +1643,133 @@ export class SessionStore {
         this.persistBestEffort();
     }
 
+    // C4: validate every HOST thread transcript in a persisted snapshot and
+    // neutralise the unreadable ones. Pure apart from the deliberate in-place
+    // replacement, and it must run BEFORE `harness.restore()` (which validates the
+    // whole document and refuses it atomically).
+    //
+    // Returns the threads that failed, keyed by id, with the raw value exactly as
+    // stored. A thread with no addressable `id` is left untouched: only
+    // `readHarnessSnapshot` can explain that corruption, and the session drop path
+    // already reports it, so guessing here would hide the real reason.
+    private tolerateThreadTranscripts(core: HarnessSnapshot): Map<string, HarnessInvalidThreadRecord> {
+        const invalid = new Map<string, HarnessInvalidThreadRecord>();
+
+        // `core` comes straight off disk, so every field here is `unknown` in
+        // practice even though the record type claims a snapshot. Only `threads` is
+        // inspected; anything structurally wrong elsewhere is restore's business.
+        const threads = core.threads as unknown as
+            | { id?: unknown; agent?: unknown; label?: unknown; messages?: unknown }[]
+            | undefined;
+
+        if (!Array.isArray(threads)) return invalid;
+
+        for (const thread of threads) {
+            if (thread === null || typeof thread !== 'object') continue;
+
+            const id = typeof thread.id === 'string' ? thread.id : undefined;
+            if (id === undefined) continue;
+
+            try {
+                // The same reader snapshot()/restore() enforce, so a transcript
+                // accepted here cannot be refused later, and the message below is
+                // exactly what the editor shows the user.
+                readHarnessMessages(thread.messages, `thread "${id}" messages`);
+            } catch (error) {
+                const reason = messageOf(error);
+
+                invalid.set(id, {
+                    error: reason,
+                    // Opaque on purpose: this is the user's broken value, and the
+                    // editor must show precisely what was stored.
+                    messages: thread.messages,
+                    ...(typeof thread.label === 'string' ? { label: thread.label } : {}),
+                    ...(typeof thread.agent === 'string' ? { agent: thread.agent } : {})
+                });
+
+                // Replace, do not delete: the thread must keep existing (with its
+                // id, agent, label and turn links) so the roster can still address
+                // it and the user can still fix it.
+                thread.messages = unreadableTranscript(reason);
+            }
+        }
+
+        return invalid;
+    }
+
+    // C4: reconcile the transcripts that failed validation THIS load
+    // (`restored`) with the raw values the document already recorded as unreadable
+    // (`persisted`). The result lands in `session.invalidThreads`.
+    //
+    // A persisted entry is only worth keeping while the thread is STILL unreadable,
+    // which after `harness.restore()` means its messages are still one of our
+    // placeholders:
+    //   - thread gone            → stale (the conversation was deleted; ids are
+    //     never reused, so nothing can adopt the orphaned raw value);
+    //   - thread repaired by hand → stale (its messages are now valid AND not a
+    //     placeholder, so the raw value is no longer what the transcript says);
+    //   - thread still a placeholder → KEEP. The placeholder is what makes the
+    //     session loadable; the raw value only exists here, and it is what the
+    //     operator needs in order to fix the thread.
+    //
+    // C8-m3: a DEFAULT conversation (`agent:<name>`) has no entry in `core.threads`
+    // at all, so its "still a placeholder?" test runs against
+    // `core.agents[name].messages` instead (see `defaultTranscriptStillUnreadable`).
+    // Without that branch a live PUT of an invalid default transcript was a durable
+    // record for exactly one process: the restart dropped the raw value and the
+    // placeholder started reading as the conversation's real history.
+    //
+    // A thread that failed THIS load keeps the freshly captured value (`restored`
+    // already holds it): the same broken text was re-read from a live transcript,
+    // which is authoritative over an older recording of it.
+    private mergeInvalidTranscripts(
+        session: Session,
+        restored: Map<string, HarnessInvalidThreadRecord>,
+        persisted: Record<string, HarnessInvalidThreadRecord> | undefined,
+        core: HarnessSnapshot
+    ): void {
+        if (persisted !== undefined) {
+            // Addressable threads of the (already neutralised) snapshot.
+            const threads = new Map<string, { messages?: unknown }>();
+            const entries = core.threads as unknown as
+                { id?: unknown; messages?: unknown }[] | undefined;
+
+            if (Array.isArray(entries)) {
+                for (const entry of entries) {
+                    if (entry === null || typeof entry !== 'object') continue;
+                    if (typeof entry.id !== 'string') continue;
+
+                    threads.set(entry.id, entry);
+                }
+            }
+
+            // Agent-keyed DEFAULT conversations (C8-m3), read raw off the same
+            // (unvalidated) persisted snapshot the thread list above came from.
+            const agents = core.agents as unknown as
+                | Record<string, { messages?: unknown }>
+                | undefined;
+
+            for (const [id, entry] of Object.entries(persisted)) {
+                if (restored.has(id)) continue;
+
+                const thread = threads.get(id);
+                const stillUnreadable =
+                    thread === undefined
+                        ? defaultTranscriptStillUnreadable(id, agents)
+                        : isUnreadablePlaceholder(thread.messages);
+
+                if (!stillUnreadable) continue;
+
+                restored.set(id, entry);
+            }
+        }
+
+        // Assigned in BOTH cases: a document with no `invalidThreads` field can
+        // still carry transcripts that failed THIS load, and those fresh entries
+        // are the only record of them.
+        session.invalidThreads = restored;
+    }
+
     // Rebuild one session from a validated record. Order matters: the frozen
     // preset decides the harness shape, the harness must be built from it, and only
     // then can the core snapshot be applied (restore validates against the exact
@@ -1558,6 +1895,9 @@ export class SessionStore {
                 // F6: invocation → conversation, kept across a restart so a later
                 // deletion can purge the runtime's agent-result records exactly.
                 invocationThreads: new Map(Object.entries(record.invocationThreads ?? {})),
+                // C4: replaced by tolerant restore below (persisted entries are
+                // re-validated there, so a stale one cannot survive a restart).
+                invalidThreads: new Map(),
                 legacyRunning: false,
                 watchers: new Set(),
                 pumping: false,
@@ -1587,8 +1927,28 @@ export class SessionStore {
             // explicit interrupted result for each unmatched id, never execute the
             // call. A fully paired transcript is returned unchanged.
             const core = repairInterruptedToolCalls(record.core);
+
+            // C4: make every UNREADABLE THREAD survivable before restore validates
+            // the document. `readHarnessSnapshot` refuses a thread whose `messages`
+            // is not a valid transcript, and that refusal used to drop the ENTIRE
+            // session — one broken hand edit costing every conversation in it. Each
+            // bad thread's messages are replaced with a valid placeholder here and
+            // the raw value is captured, so `harness.restore` sees a snapshot it
+            // accepts and the broken text stays visible/editable.
+            //
+            // Scope is deliberately per THREAD: an invalid DEFAULT conversation
+            // (`core.agents[name].messages`) still fails the restore, because the
+            // agent transcript is what the entry point runs and a placeholder there
+            // would silently rewrite the session's primary conversation.
+            const invalidThreads = this.tolerateThreadTranscripts(core);
+
             session.core = core;
             harness.restore(core);
+
+            // Merge what the document recorded as unreadable (C4). A thread that is
+            // still a placeholder is the one case where the persisted raw value is
+            // the only copy of the user's text, so it wins; anything else is stale.
+            this.mergeInvalidTranscripts(session, invalidThreads, record.invalidThreads, core);
 
             // Re-apply the live per-agent models recorded beside the snapshot. The
             // snapshot usually already carries them; the extra map is what makes a
@@ -1918,6 +2278,27 @@ export class SessionStore {
             // Omitted entirely when the session owns no host thread, so every
             // pre-thread snapshot keeps its exact shape.
             ...(threads.length === 0 ? {} : { threads }),
+            // C4: conversations whose stored transcript could not be read. Omitted
+            // when there are none, so a healthy session's snapshot is byte-identical
+            // to its pre-C4 shape. Sorted by thread id so the same session always
+            // serialises the same way (deterministic tests and SSE repaints).
+            ...(session.invalidThreads.size === 0
+                ? {}
+                : {
+                      invalidThreads: [...session.invalidThreads]
+                          .sort(([left], [right]) => left.localeCompare(right))
+                          .map(([id, entry]): SessionInvalidThread => ({
+                              id,
+                              ...(entry.label === undefined ? {} : { label: entry.label }),
+                              ...(entry.agent === undefined ? {} : { agent: entry.agent }),
+                              error: entry.error,
+                              // Verbatim, never normalised: this is the text the
+                              // operator has to fix. C8-m7: copied, so a snapshot
+                              // consumer (the SSE frame, `store.get()`) cannot mutate
+                              // the stored raw value through the object it was handed.
+                              messages: copyInvalidMessages(entry.messages)
+                          }))
+                  }),
             ...(session.labelSeeds.size === 0
                 ? {}
                 : {
@@ -2956,6 +3337,298 @@ export class SessionStore {
         else void this.pumpLane(session, lane);
 
         return { session: snapshot, turn: queuedTurn, settled };
+    }
+
+    // -----------------------------------------------------------------------
+    // SERVER-SIDE SLASH COMMANDS: dispatch() + executeCommandTurn()
+    // -----------------------------------------------------------------------
+    //
+    // WHY A THIRD SUBMIT PATH EXISTS
+    // ------------------------------
+    // `run()` owns its run in an SSE response and `enqueue()` hands work to a lane
+    // pump. Both send the text to a MODEL. A slash command must do neither: it is an
+    // operator action whose answer is produced in THIS process by the harness's own
+    // command registry (../harness.ts executeCommand, ../core/command.ts grammar).
+    // So dispatch() is the ONE submit surface a host calls, and it splits:
+    //
+    //   - NOT command-shaped text  -> enqueue(), untouched;
+    //   - `/name ...`              -> executeCommandTurn(), no model, no lane.
+    //
+    // The command still becomes a normal SessionTurn with synthesized events, so the
+    // transcript, the reload, and GET /events need ZERO frontend changes; and it is
+    // terminal BEFORE the 202 body is produced, which is why nothing enters a queue.
+    //
+    // Commands deliberately bypass the single-flight gate and the pending cap: they
+    // are short, they never touch a conversation's transcript, and `/task` has to
+    // stay readable while a model run is streaming. A command whose tool call is
+    // genuinely unsafe right now is refused by the harness itself, and that refusal
+    // becomes an error TURN (a visible answer), not a 500.
+    //
+    // `attachments`/`references`/`threadId` are typed (not `unknown` like enqueue's):
+    // a command has no schema to validate against — all three are refused or ignored,
+    // so the only caller is the /tasks route, which already passes those fields.
+    async dispatch(
+        id: string,
+        rawInput: string,
+        attachments?: readonly HarnessAttachment[],
+        references?: readonly AgentResultReference[],
+        threadId?: string
+    ): Promise<EnqueuedTask> {
+        // NOT a command: hand the submit to enqueue() UNTOUCHED, before validating
+        // anything here. enqueue() validates attachments BEFORE the empty/length
+        // check, and a malformed clip plus an empty prompt must keep answering the
+        // attachment error it answers today (a pre-check here would turn that into
+        // "A task cannot be empty."). parseCommandLine also answers undefined for a
+        // non-string, so the whole legacy surface is preserved by this one branch.
+        if (parseCommandLine(rawInput) === undefined) {
+            return this.enqueue(id, rawInput, attachments, references, threadId);
+        }
+
+        const session = this.require(id);
+
+        // A host handle built before the command registry has no `executeCommand`
+        // (same capability-guard shape as threadsSupported). Sending the line to the
+        // model is exactly what such a server did before, so it stays the fallback.
+        if (typeof (session.harness as Partial<Harness>).executeCommand !== 'function') {
+            return this.enqueue(id, rawInput, attachments, references, threadId);
+        }
+
+        // Refuse what a command cannot express, BEFORE any turn exists and before the
+        // input is bounded, so a rejected command mutates nothing and a retry is safe
+        // (the same rule, and the same order, as enqueue).
+        if (submittedCount(attachments) > 0) {
+            throw new SessionError(400, COMMAND_ATTACHMENT_MESSAGE);
+        }
+
+        if (submittedCount(references) > 0) {
+            throw new SessionError(400, COMMAND_REFERENCE_MESSAGE);
+        }
+
+        // ONE shared validation (empty/200k), so a command cannot dodge the bounds a
+        // prompt is held to. The count only matters for an EMPTY prompt, and a
+        // command line is never empty (a leading "/" is required to get here), so it
+        // can only ever contribute the 413 — never a different error than enqueue's.
+        //
+        // ORDER (C8-m5): this runs AFTER the two rejections above, exactly like
+        // enqueue(), which validates attachments before `validateInput`. An over-long
+        // submit that also carries an attachment must answer the attachment problem it
+        // answers on the queue path, not a length 413.
+        const input = validateInput(rawInput, submittedCount(attachments));
+
+        // `threadId` is ACCEPTED and ignored on purpose. The command acts on the
+        // SESSION (its task list, its tool registry), never on a conversation, so its
+        // turn must not join a lane, must not be steered into a running thread, and
+        // must not be purged when the focused conversation is later stopped/deleted.
+        // Validating the field would only invent a 400 for a value with no meaning.
+        return this.executeCommandTurn(session, input);
+    }
+
+    // Execute one command line as a single, fully-recorded turn. Called only by
+    // dispatch() once the input is known to be command-shaped and `id` resolves.
+    //
+    // Event shapes are NOT invented: `start` + `tool_call` + `tool_result` are the
+    // frames the renderers already switch on (frontend/ui/turns.ts `case 'start'` /
+    // `'tool_call'` / `'tool_result'`, ui/activity.ts), paired by `callId`. A command
+    // produces no `text`/`usage`/`done` because nothing was generated and nothing was
+    // billed.
+    private async executeCommandTurn(session: Session, input: string): Promise<EnqueuedTask> {
+        const now = Date.now();
+
+        // Monotonic index, exactly like enqueue: the high-water mark moves even if
+        // this turn is later rolled back, so no two records ever share an index.
+        const index = session.turnSequence;
+        session.turnSequence += 1;
+
+        // Born 'running' (never 'queued' — there is no pump in its life) and with NO
+        // threadId/threadLabel, which is the record shape the UI already renders for a
+        // thread-less turn. No `attachments`/`references`/`usage` keys at all, so the
+        // record keeps the plainest historical shape (copyTurn omits absent keys).
+        const turn: SessionTurn = {
+            id: randomUUID(),
+            index,
+            prompt: input,
+            status: 'running',
+            startedAt: now,
+            updatedAt: now,
+            events: [],
+            eventTimes: []
+        };
+
+        session.turns.push(turn);
+        session.updatedAt = now;
+
+        // DURABILITY BEFORE WORK (R3b): nothing has executed yet, so a failed write
+        // means the command simply did not happen, and the record rolls back the same
+        // way a failed enqueue does. The 500 from persistOrThrow propagates.
+        try {
+            this.persistOrThrow();
+        } catch (error) {
+            const at = session.turns.indexOf(turn);
+            if (at !== -1) session.turns.splice(at, 1);
+
+            throw error;
+        }
+
+        // Open the turn frame before ANY event, so a watcher can always attribute what
+        // it receives (the rule executeTurn follows for a model run).
+        this.publish(session, { type: 'turn', turn: copyTurn(turn) });
+
+        const agent = commandAgentOf(session);
+        const model = commandModelOf(session);
+
+        // One synthesized call id pairs the tool_call with its result, which is how
+        // the frontend resolves a call row (callId matching, never positional).
+        const callId = randomUUID();
+
+        // Record-then-publish for every event: the server's transcript is
+        // authoritative even when every watcher is gone, and `at` is the ONE timestamp
+        // shared by the frame and the parallel `eventTimes` entry, so a live view and
+        // a reload agree exactly.
+        const record = (event: HarnessEvent): void => {
+            const stored = copyEvent(event);
+            const at = Date.now();
+
+            turn.events.push(stored);
+            turn.eventTimes?.push(at);
+            turn.updatedAt = at;
+
+            // Background durability for a non-delta event (every event here is one).
+            // A failed write is recorded, never thrown: the command's outcome must not
+            // depend on the disk, and the terminal save below is the strict one.
+            this.persistBestEffort();
+
+            this.publish(session, {
+                type: 'event',
+                turnId: turn.id,
+                event: copyEvent(stored),
+                at
+            });
+        };
+
+        record({ type: 'start', agent, model });
+
+        record({
+            type: 'tool_call',
+            agent,
+            call: {
+                id: callId,
+                name: COMMAND_TOOL_NAME,
+                // `HarnessToolCall.arguments` is a raw JSON STRING (the wire shape —
+                // see ../types/index.ts), so the command line rides INSIDE that JSON
+                // instead of being an object literal. Echoing the whole line keeps the
+                // record re-runnable by hand.
+                arguments: JSON.stringify({ input })
+            }
+        });
+
+        let result: HarnessCommandResult;
+
+        try {
+            // THE command. No model request, no lane, no steering, no gate. The
+            // harness owns the "unsafe right now" decision (a built-in that calls a
+            // tool can be refused mid-run); that refusal throws and lands below as an
+            // error turn, which is an answer rather than a transport failure.
+            result = await session.harness.executeCommand(input);
+        } catch (error) {
+            // Total, on purpose. `executeCommand` THROWS for an unknown name
+            // ("unknown command: /nope") and rethrows whatever a host command throws.
+            // A user-visible typo must never become an unhandled rejection or a 500,
+            // so it becomes the same error-shaped result a built-in returns.
+            result = { content: messageOf(error), isError: true };
+        }
+
+        const isError = result.isError === true;
+
+        record({
+            type: 'tool_result',
+            agent,
+            name: COMMAND_TOOL_NAME,
+            callId,
+            // Always a string: executeCommand normalizes `content`, and the catch
+            // above builds one, so a renderer never sees undefined.
+            content: result.content,
+            isError,
+            // Supplied explicitly because `outcome` is authoritative for the UI (an
+            // error-shaped call with no outcome reads as 'failed' anyway, but naming it
+            // keeps the record self-describing, and 'completed' is the real state).
+            outcome: isError ? 'failed' : 'completed'
+        });
+
+        // Terminal status. NO `usage` (no provider request happened — an absent tally
+        // is the honest "nothing was billed", never a fabricated 0).
+        turn.status = isError ? 'error' : 'done';
+        turn.updatedAt = Date.now();
+
+        // `session.status` is NOT touched, and neither is `lastError`: a command is
+        // not a run, so an idle session stays idle while it executes and a failed
+        // `/task bogus` must not raise the session-wide error banner a real run owns.
+        // Only the activity timestamp moves.
+        session.updatedAt = turn.updatedAt;
+
+        // Commit the harness state the command mutated (a `/task add` changed the task
+        // store; the core observer captured that boundary already, this refresh makes
+        // the terminal record and the post-command snapshot agree).
+        try {
+            session.core = session.harness.snapshot();
+        } catch {
+            // Defensive: keep the last committed snapshot; the turn is terminal either
+            // way and the command already produced its answer.
+        }
+
+        // The TURN record must be durable before the 202 leaves. Unlike the core
+        // refresh above (best effort), a failed terminal save IS an error: the server
+        // cannot promise a transcript it did not write.
+        //
+        // SKIPPED for a disposed session or a closing store (the P1-B rule executeTurn
+        // follows): remove()/dispose() already cleared this session from the map, so a
+        // save here would rewrite the document WITHOUT it (or with an empty session
+        // list) and destroy the graceful-shutdown file. The command already ran, and
+        // publish() is a no-op for a disposed session either way.
+        //
+        // C8-m4: a failed write must still TERMINATE the live turn. The published
+        // frames are the only view a watcher has, and the one before this call said
+        // `running`; skipping the terminal upsert (the old behaviour: throw first,
+        // publish never) left every browser with an in-flight card that no later frame
+        // would ever close. So the terminal frames go out FIRST, and the failure is
+        // rethrown so the route still answers 500 — the durability problem is
+        // reported, never swallowed. The status is downgraded to `error` rather than
+        // kept `done`, because "done" would claim a transcript the disk refused.
+        if (!session.disposed && !this.shuttingDown) {
+            try {
+                this.persistOrThrow();
+            } catch (error) {
+                turn.status = 'error';
+                turn.updatedAt = Date.now();
+                session.updatedAt = turn.updatedAt;
+
+                // Same closing sequence as the success path below: one terminal upsert
+                // replaces the running row, and the idle snapshot only rides out when
+                // nothing else in this session is still live.
+                this.publish(session, { type: 'turn', turn: copyTurn(turn) });
+
+                if (this.isIdle(session)) {
+                    this.publish(session, { type: 'snapshot', session: this.snapshot(session) });
+                }
+
+                throw error;
+            }
+        }
+
+        // One terminal upsert replaces the running row for every watcher.
+        this.publish(session, { type: 'turn', turn: copyTurn(turn) });
+
+        // The drain snapshot rides the SAME rule as the lane pump: publish only when
+        // NOTHING else is live, so a sibling conversation that is still executing
+        // never receives a premature "everything settled".
+        const finished = this.snapshot(session);
+
+        if (this.isIdle(session)) {
+            this.publish(session, { type: 'snapshot', session: finished });
+        }
+
+        // `settled` is already resolved: the caller (a test, or a host that wants the
+        // answer) never has to poll, because the command completed before the response.
+        return { session: finished, turn: copyTurn(turn), settled: Promise.resolve() };
     }
 
     // Validate the optional `threadId` submit field. A non-string or blank value is
@@ -4165,6 +4838,159 @@ export class SessionStore {
         return ids;
     }
 
+    // -----------------------------------------------------------------------
+    // C4: the per-thread transcript editor
+    //     (GET / PUT /sessions/:id/threads/:threadId/transcript)
+    // -----------------------------------------------------------------------
+
+    // Whether this session's harness can REPLACE a thread transcript (C4).
+    //
+    // Deliberately NOT folded into `threadsSupported`: a host-supplied handle that
+    // predates the transcript editor must keep its exact roster/queue behaviour, so
+    // only the transcript write is unavailable to it (a 409 below, never a changed
+    // snapshot shape).
+    private transcriptSupported(session: Session): boolean {
+        return (
+            this.threadsSupported(session) &&
+            typeof (session.harness as Partial<Harness>).setThreadMessages === 'function'
+        );
+    }
+
+    // C4: one thread's transcript in the shape the visualiser edits.
+    //
+    //   - readable thread  → `messages` is the live transcript and `raw` is its
+    //     pretty JSON (the value to edit), with no `invalid`;
+    //   - unreadable thread → `messages` is the live PLACEHOLDER (what the model
+    //     would actually be sent) and `raw`/`invalid` carry the broken value
+    //     verbatim, so the UI can show the error plus the text to fix;
+    //   - unknown thread    → 404. A thread that exists ONLY in the invalid map
+    //     (a stale record with no harness thread) is still readable here, because
+    //     the raw value is the useful part.
+    threadTranscript(id: string, threadId: string): ThreadTranscriptResponse {
+        const session = this.require(id);
+
+        const invalid = session.invalidThreads.get(threadId);
+        const record = this.threadsSupported(session) ? session.harness.thread(threadId) : undefined;
+
+        if (invalid === undefined && record === undefined) {
+            throw new SessionError(404, `Unknown thread "${threadId}".`);
+        }
+
+        // `threadMessages` throws for a thread the harness does not have, which is
+        // exactly the stale-map case above; stay empty then.
+        const messages = record === undefined ? [] : session.harness.threadMessages(threadId);
+        const agent = record?.agent ?? invalid?.agent ?? '';
+
+        if (invalid === undefined) {
+            return { threadId, agent, messages, raw: transcriptRawJson(messages) };
+        }
+
+        return {
+            threadId,
+            agent,
+            messages,
+            raw: transcriptRawJson(invalid.messages),
+            // C8-m7: returned by VALUE — the caller gets its own object, so mutating
+            // `transcript.invalid.messages` cannot rewrite what the store holds.
+            invalid: { error: invalid.error, messages: copyInvalidMessages(invalid.messages) }
+        };
+    }
+
+    // C4: replace one thread's transcript with a value the user edited.
+    //
+    // THE CONTRACT that makes this safe (and why a broken value is a 200):
+    //   - a structurally invalid `messages` is ACCEPTED and PERSISTED: the raw
+    //     value is recorded as unreadable and the live transcript becomes a valid
+    //     placeholder, so the session stays runnable, snapshot-able and restorable
+    //     while the user keeps fixing the JSON;
+    //   - a valid value clears the unreadable record and is installed as-is
+    //     (validated + detached by the shared reader, in place, so every existing
+    //     reference to the transcript array stays correct);
+    //   - a RUNNING thread is refused (409): the run loop appends to the array
+    //     being replaced, and a lost mid-run edit is worse than a refusal;
+    //   - the write is DURABLE before the response (`persistOrThrow`), and watchers
+    //     get one `snapshot` frame so a focused conversation repaints.
+    updateThreadTranscript(
+        id: string,
+        threadId: string,
+        messages: unknown
+    ): UpdateThreadTranscriptResult {
+        const session = this.require(id);
+
+        if (!this.transcriptSupported(session)) {
+            throw new SessionError(
+                409,
+                `This session's harness does not support replacing a thread transcript.`
+            );
+        }
+
+        const record = session.harness.thread(threadId);
+
+        if (record === undefined) {
+            throw new SessionError(404, `Unknown thread "${threadId}".`);
+        }
+
+        // Live work owns the transcript. The record's status plus a lane still
+        // holding an active run is the same predicate `deleteThread` uses for its
+        // 409 (a stopped-but-still-unwinding run reports 'stopped').
+        if (record.status === 'running' || session.lanes.get(threadId)?.active !== undefined) {
+            throw new SessionError(
+                409,
+                `Thread "${threadId}" is running; stop it before replacing its transcript.`
+            );
+        }
+
+        // One validation attempt, using the reader the runtime itself enforces. A
+        // refusal is data here, not a failure: it becomes `transcript.invalid`.
+        let validated: HarnessMessage[] | undefined;
+        let reason: string | undefined;
+
+        try {
+            validated = readHarnessMessages(messages, `thread "${threadId}" messages`);
+        } catch (error) {
+            reason = messageOf(error);
+        }
+
+        try {
+            if (validated !== undefined) {
+                session.harness.setThreadMessages(threadId, validated);
+                session.invalidThreads.delete(threadId);
+            } else {
+                // Order matters: the placeholder is installed FIRST so the harness
+                // can never be left holding the broken value (which its own
+                // snapshot() would refuse), and only then is the raw value recorded.
+                const error = reason ?? 'the transcript failed validation.';
+
+                session.harness.setThreadMessages(threadId, unreadableTranscript(error));
+                session.invalidThreads.set(threadId, {
+                    error,
+                    // C8-m7: stored by VALUE. `messages` is the caller's object, and
+                    // an in-process host keeps a reference to what it submitted.
+                    messages: copyInvalidMessages(messages),
+                    ...(record.label === undefined ? {} : { label: record.label }),
+                    agent: record.agent
+                });
+            }
+        } catch (error) {
+            // Unreachable for validation (already checked) or an unknown id (already
+            // resolved). The one live case is the runtime's own running refusal — a
+            // run that started between the check above and this call — so the
+            // caller's 409 stays honest instead of becoming a 500.
+            throw new SessionError(409, messageOf(error));
+        }
+
+        session.core = session.harness.snapshot();
+        session.updatedAt = Date.now();
+
+        this.persistOrThrow();
+        this.publish(session, { type: 'snapshot', session: this.snapshot(session) });
+
+        return {
+            session: this.snapshot(session),
+            transcript: this.threadTranscript(id, threadId)
+        };
+    }
+
     // DELETE ONE THREAD (R6, DELETE /sessions/:id/threads/:threadId).
     //
     // Removes the thread, its descendants, every owning turn, every result
@@ -4386,6 +5212,10 @@ export class SessionStore {
         // high-water STAYS, so the retired name is never minted again.
         const threadLabelEntries = [...session.threadLabels].filter(([id]) => !doomed.has(id));
         const threadLabelHighWaterEntries = [...session.threadLabelHighWater];
+        // C4: an unreadable transcript belongs to a conversation, so the doomed
+        // conversations' raw values leave the durable record with them. (A stale
+        // entry would otherwise be re-offered for a thread that no longer exists.)
+        const invalidEntries = [...session.invalidThreads].filter(([id]) => !doomed.has(id));
 
         const previous = this.sessionRecord(session);
 
@@ -4406,7 +5236,8 @@ export class SessionStore {
                 : { threadLabels: Object.fromEntries(threadLabelEntries) }),
             ...(threadLabelHighWaterEntries.length === 0
                 ? {}
-                : { threadLabelHighWater: Object.fromEntries(threadLabelHighWaterEntries) })
+                : { threadLabelHighWater: Object.fromEntries(threadLabelHighWaterEntries) }),
+            ...(invalidEntries.length === 0 ? {} : { invalidThreads: Object.fromEntries(invalidEntries) })
         };
 
         // Drop the stale keys from the override when they are absent in the
@@ -4416,6 +5247,7 @@ export class SessionStore {
         if (highWaterEntries.length === 0) delete projected.labelHighWater;
         if (threadLabelEntries.length === 0) delete projected.threadLabels;
         if (threadLabelHighWaterEntries.length === 0) delete projected.threadLabelHighWater;
+        if (invalidEntries.length === 0) delete projected.invalidThreads;
 
         this.persistOrThrow(new Map([[session.id, projected]]));
 
@@ -4472,6 +5304,10 @@ export class SessionStore {
         for (const [invocationId, threadId] of session.invocationThreads) {
             if (doomed.has(threadId)) session.invocationThreads.delete(invocationId);
         }
+
+        // C4: same rule for an unreadable transcript — the durable projection above
+        // already dropped it, so the live map must match the file.
+        for (const targetId of doomed) session.invalidThreads.delete(targetId);
 
         session.queue = session.queue.filter((turn) => !removedIds.has(turn.id));
         session.updatedAt = Date.now();
@@ -4535,6 +5371,10 @@ export class SessionStore {
         session.threadLabelHighWater.clear();
         session.turnInvocations.clear();
         session.invocationThreads.clear();
+        // C4: every conversation is gone, so an unreadable transcript from this
+        // conversation has nothing left to describe. A reset starts the raw-JSON
+        // editing over too.
+        session.invalidThreads.clear();
         // N4: a reset forgets the conversation, so a question from it is no longer
         // answerable. No pending entry exists here (reset refuses a busy session,
         // and a run expires its own questions), but the bounded history is cleared

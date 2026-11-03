@@ -323,12 +323,11 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
     await flush();
     await flush();
 
-    // R21.2 shell order: scratch board FIRST, sessions second, no tool list.
+    // R21.2 shell order: scratch board FIRST. T3/R1: it is the rail's ONLY section — the
+    // sessions moved into the pill strip under the Instruct title.
     const sections = [...document.querySelectorAll<HTMLElement>('.rail-right > .rail-section')];
-    expect(sections.map((section) => section.className)).toEqual([
-        'rail-section scratch-section',
-        'rail-section sessions'
-    ]);
+    expect(sections.map((section) => section.className)).toEqual(['rail-section scratch-section']);
+    expect(document.querySelector('.rail-right .session-pill')).toBeNull();
     expect(document.querySelector('.rail-right .tool-list')).toBeNull();
     expect(document.querySelector('.rail-right .core-tools')).toBeNull();
 
@@ -338,11 +337,14 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
     expect(document.querySelectorAll('.rail-right > .scratch-section > .panel-host[data-slot="scratch"]')).toHaveLength(
         1
     );
-    // centre host sits directly above the turn stage; left host above the endpoint.
+    // centre host sits directly above the turn stage; the left host is the rail's LAST
+    // child (T4/R4: the endpoint settings left the rail for the status-pill dialog, so
+    // the `.endpoint` disclosure that used to follow it is gone).
     const centerHost = host('center');
     expect(centerHost.nextElementSibling).toBe(byClass('.stage', 'div'));
     const leftHost = host('left');
-    expect(leftHost.nextElementSibling).toBe(byClass('.endpoint', 'details'));
+    expect(leftHost.nextElementSibling).toBeNull();
+    expect(document.querySelector('.rail-left .endpoint-body')).toBeNull();
 
     // s1: only the scratch board has content; the other hosts stay hidden.
     expect(panelIds('scratch')).toEqual(['status']);
@@ -357,7 +359,7 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
 
     // Opening s2 replaces the board with that conversation's panels (no leakage
     // of s1's panel), and the two secondary hosts light up.
-    byClass('.session[data-session-id="s2"]', 'button').click();
+    byClass('.session-pill-select[data-session-id="s2"]', 'button').click();
     await flush();
     await flush();
 
@@ -387,7 +389,7 @@ it('derives recorded panels per session and keeps the hosts session-scoped', asy
     );
 
     // Reopening s1 restores exactly its recorded panel.
-    byClass('.session[data-session-id="s1"]', 'button').click();
+    byClass('.session-pill-select[data-session-id="s1"]', 'button').click();
     await flush();
     await flush();
 

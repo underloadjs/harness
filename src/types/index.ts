@@ -2174,6 +2174,74 @@ export type HarnessSnapshot = {
     };
 };
 
+// ---------------------------------------------------------------------------
+// Slash commands
+// ---------------------------------------------------------------------------
+//
+// A command is a NAMED, SERVER-SIDE operation a host invokes with a slash line
+// (`/task add "testing"`), not a prompt for the model. The harness owns the
+// registry so every front end (CLI, HTTP server, UI composer) executes the same
+// implementation, and `executeCommand` never spends a model request.
+//
+// The parser and the built-in set live in core/command.ts and
+// core/command-builtins.ts; this file only carries the wire types so a host can
+// type its own contributions. Commands are NOT tools: a tool is declared to the
+// model and schema-validated, a command is invoked by an operator and receives
+// the raw tokenized line. A built-in may still call a tool internally through
+// `context.harness.executeTool(...)` (that is how /task, /websearch and
+// /webfetch work), which is why the tool names are quoted there rather than
+// duplicated as a second source of truth.
+
+// What a command implementation is handed. `name`/`args`/`rest` come from the
+// shared parser (core/command.ts), so quoting and escaping behave identically
+// for every command and every host.
+export type HarnessCommandContext = {
+    // The LIVE harness handle, so a command can read the registries and call
+    // tools exactly like a host would (`harness.executeTool('task', {})`).
+    harness: Harness;
+    // Command name WITHOUT the leading slash, lowercased by the parser.
+    name: string;
+    // Tokenized arguments: whitespace-separated, quotes removed, escapes
+    // resolved, case preserved. An explicit `""` is an empty argument.
+    args: readonly string[];
+    // Raw trimmed text after the command name (pre-tokenized). Commands that
+    // take free-form text (/websearch) use this; commands with structured
+    // arguments use `args`.
+    rest: string;
+    // The full original input line, verbatim, for echo/logging.
+    input: string;
+};
+
+// What a command returns. `content` is always displayable text; `isError` marks
+// a recoverable usage/provider failure so a host can style it without parsing
+// prose; `data` carries the structured value for a host that wants it (a CLI
+// ignores it, a UI may render a table).
+export type HarnessCommandResult = {
+    content: string;
+    isError?: boolean;
+    data?: unknown;
+};
+
+// One registered command. Names are validated against COMMAND_NAME_PATTERN in
+// core/command.ts, so a registry key is always `/`-safe and lowercase.
+export type HarnessCommand = {
+    // Registry key: `/name` is what the parser resolves. Must match
+    // /^[a-z][a-z0-9-]{0,31}$/.
+    name: string;
+    // One-line summary shown by /help and /help <name>.
+    description: string;
+    // Optional argument template shown by /help (e.g. '/task add <text>').
+    usage?: string;
+    // Runs the command. May be sync or async; a thrown error is not wrapped
+    // into a result, so a recoverable failure should come back as
+    // `{ content, isError: true }` instead.
+    execute: (context: HarnessCommandContext) => Promise<HarnessCommandResult> | HarnessCommandResult;
+};
+
+// A command as declared in `HarnessConfiguration.commands` or added through a
+// plugin. Same shape, optional `name` (the registry validates/fills it).
+export type HarnessCommandConfiguration = Omit<HarnessCommand, 'name'> & { name?: string };
+
 export type HarnessConfiguration = {
     // Every brain the harness can run, keyed by name. The FIRST entry is the
     // entry point unless `primary` names another one: `writer(...)` runs that
@@ -2311,6 +2379,12 @@ export type HarnessConfiguration = {
         // and does not cover.
         stateChange?: (event: HarnessStateChangeEvent) => void;
     };
+    // Slash commands available through the harness command registry.
+    // Registered AFTER the built-ins (/help, /tools, /task, /websearch,
+    // /webfetch), so a name that collides with a built-in or repeats another
+    // configured entry fails construction. A plugin (or
+    // `harness.registerCommand`) runs later and therefore MAY replace a name.
+    commands?: readonly HarnessCommandConfiguration[];
     // Optional programmatic extension point, retained from the plugin design.
     plugins?: readonly HarnessPlugin[];
 };
@@ -2404,6 +2478,26 @@ export type Harness = {
     // budget; a server that serializes it for a client should apply
     // `boundToolResult` (exported from the package root) itself.
     executeTool: (name: string, parameters: unknown) => Promise<unknown>;
+    // The registered slash commands, keyed by name WITHOUT the leading slash
+    // (so `commands.help` answers `/help`). Each read is a frozen defensive
+    // copy of the live registry: mutating it never changes harness state, and
+    // a command registered after this read still appears in the next one.
+    readonly commands: Readonly<Record<string, HarnessCommand>>;
+    // Execute one slash command line (e.g. `/task add "testing"`) in THIS
+    // process. The model is never called and no progress event is emitted; a
+    // built-in that calls a tool still fires the usual `stateChange`
+    // ('tool_execute'), so a persistence layer sees the mutation.
+    //
+    // Throws HarnessError when the line is not a command (no leading "/") or
+    // names an unknown command, and rethrows whatever the implementation
+    // throws. A RECOVERABLE failure comes back as `{ content, isError: true }`
+    // instead, which is what a host should print rather than catch.
+    executeCommand: (input: string) => Promise<HarnessCommandResult>;
+    // Register (or REPLACE) one command at runtime, mirroring `registerTool`
+    // replace semantics: names are not reserved and a replacement costs
+    // nothing. Validates the name and the definition, and throws HarnessError
+    // without touching the registry when either is invalid.
+    registerCommand: (command: HarnessCommandConfiguration) => HarnessCommand;
     // Names of the applied plugins, in order.
     readonly plugins: readonly string[];
     // A complete, JSON-serializable core-state snapshot (R3a). See HarnessSnapshot
@@ -2478,6 +2572,26 @@ export type Harness = {
     thread: (id: string) => HarnessThreadRecord | undefined;
     // The thread's committed transcript, as a detached copy.
     threadMessages: (id: string) => HarnessMessage[];
+    // C4: REPLACE one thread's committed transcript wholesale (the transcript
+    // editor's write primitive). `messages` is validated with the same reader
+    // `snapshot()`/`restore()` enforce, so a harness can never hold a transcript
+    // its own snapshot would refuse.
+    //
+    //   - unknown/deleted `threadId`           → HarnessError;
+    //   - a thread with live work              → HarnessError (replacing a
+    //     transcript the run loop is reading would tear it; stop it first);
+    //   - validation failure                   → HarnessError, NOTHING mutated.
+    //
+    // The live array is replaced IN PLACE (like `restore()`), because
+    // `agent.messages` is exposed by reference; a later holder of that reference
+    // must see the new transcript. A stopped thread is writable — the whole point
+    // is letting an operator repair a broken conversation. A default
+    // `agent:<name>` conversation is writable for the same reason: it is that
+    // registry agent's transcript.
+    //
+    // Notifies `agent_message` (the existing reason; no new reason is added) and
+    // emits NO progress event: this is a host edit, not model output.
+    setThreadMessages: (threadId: string, messages: HarnessMessage[]) => void;
     // Open an independent conversation owned by `agent`. Throws for an unknown
     // agent or an invalid/blank label, and when an `ownerThreadId` names no
     // thread in this harness.
@@ -2552,4 +2666,10 @@ export type HarnessPluginApi = {
     createAgent: (name: string, configuration: AgentConfiguration) => Agent;
     // Register another tool under `name`.
     addTool: (name: string, definition: ToolConfiguration) => Tool;
+    // Register another slash command under `name` (the leading "/" is
+    // optional and stripped). Plugins apply AFTER the built-ins and
+    // `configuration.commands`, so this REPLACES an existing name — the same
+    // override semantics `addTool` has — which is how a plugin swaps a
+    // built-in out. Throws HarnessError for an invalid name or definition.
+    addCommand: (name: string, definition: Omit<HarnessCommand, 'name'>) => HarnessCommand;
 };

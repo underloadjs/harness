@@ -911,6 +911,15 @@ describe('queue HTTP contract', () => {
         if (frames[0].type !== 'snapshot') throw new Error('expected the snapshot first');
         expect(frames[0].session.turns.map((turn) => turn.status)).toEqual(['running']);
 
+        // C2: POST /tasks now AWaits `store.dispatch` (the slash-command path must be
+        // able to run a command inline), and awaiting an already-settled promise
+        // resolves the response one microtask later. This watcher attaches AFTER that
+        // response, so the first turn's `start` frame can now be published before the
+        // attach — which is exactly why the stream opens with a complete snapshot: the
+        // record below already carries the start event, so nothing is lost, and every
+        // frame from the attach onwards still arrives in publish order.
+        expect(frames[0].session.turns[0].events.map((event) => event.type)).toEqual(['start']);
+
         const second = await callApi(runtime, 'POST', `/v1/harness/sessions/${id}/tasks`, {
             input: 'second'
         });
@@ -932,11 +941,11 @@ describe('queue HTTP contract', () => {
 
         // The watch frame sequence proves upserts, event attribution under
         // CONCURRENCY (F1), and the drain snapshot. (Queued/running first predate the
-        // watcher; its start event is the first frame after the opening snapshot.)
+        // watcher, and so does the first `start` frame — see the snapshot assertion
+        // above, which is where that event is delivered.)
         const turnIds = runtime.store.get(id).turns.map((turn) => turn.id);
         expect(frames.map(frameKey)).toEqual([
             'snapshot',
-            `event:start:${turnIds[0]}`,
             'turn:queued:second',
             'turn:running:second',
             `event:start:${turnIds[1]}`,

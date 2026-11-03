@@ -100,6 +100,22 @@ export type HarnessSessionSettingsRecord = {
     model: string;
 };
 
+// C4: one persisted unreadable transcript (see `HarnessSessionRecord.invalidThreads`).
+// Additive and OPTIONAL: a document written before the transcript editor loads
+// exactly as it did, and a session that never had a broken transcript never
+// writes this shape at all.
+export type HarnessInvalidThreadRecord = {
+    // The validation message that refused `messages` (`readHarnessMessages`).
+    error: string;
+    // The transcript EXACTLY as submitted/stored: opaque, never normalised, so a
+    // restart shows the user the same text they are trying to fix.
+    messages: unknown;
+    // Display hints copied from the thread record when it was recorded. Both are
+    // optional because a hand-edited thread may carry neither.
+    label?: string;
+    agent?: string;
+};
+
 // One restorable session. `preset` is a frozen copy of the creation-time preset
 // metadata, so restoring does not depend on the live registry still matching.
 export type HarnessSessionRecord = {
@@ -148,6 +164,14 @@ export type HarnessSessionRecord = {
     // the runtime removes — including a child conversation's EARLIER runs, which its
     // single `invocationId` slot no longer names.
     invocationThreads?: Record<string, string>;
+    // C4 (ADDITIVE): conversations whose stored transcript could not be read,
+    // keyed by thread id. The thread itself is persisted inside `core` with a
+    // valid PLACEHOLDER transcript; only the raw, unreadable value lives here, so
+    // a broken transcript survives a restart instead of being silently repaired
+    // and forgotten. `messages` is opaque by design (it is exactly what
+    // `readHarnessMessages` refused), `error` is the refusal text, and
+    // `label`/`agent` are the display hints captured when it was recorded.
+    invalidThreads?: Record<string, HarnessInvalidThreadRecord>;
     // Last committed core snapshot. Core permits a synchronous snapshot at each
     // mutation boundary, so an active turn's completed tool/store changes are
     // included as they happen. A tool that is still executing when the process
@@ -697,6 +721,45 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
             ? undefined
             : readCounterMap(record.threadLabelHighWater, `${label}.threadLabelHighWater`);
 
+    // C4: unreadable transcripts (see `HarnessSessionRecord.invalidThreads`).
+    // OPTIONAL in every direction: an absent field stays absent through a round
+    // trip, `messages` is kept EXACTLY as stored (it is the user's broken text, so
+    // normalising it here would destroy the thing being shown), `error` is the one
+    // field with a hard shape requirement, and a map that is not an object is
+    // document corruption like every other field in this record.
+    const invalidThreads =
+        record.invalidThreads === undefined
+            ? undefined
+            : (() => {
+                  const entry = requireRecord(record.invalidThreads, `${label}.invalidThreads`);
+
+                  // C8-m8: NULL prototype. Thread ids are opaque and a document may
+                  // name one `__proto__`; an ordinary bracket assignment on a `{}`
+                  // literal hits the prototype SETTER, which re-points the object's
+                  // prototype instead of storing the entry — the raw transcript then
+                  // silently disappears (`Object.keys` never shows that id) and the
+                  // operator loses the only copy of the broken text.
+                  const mapped = Object.create(null) as Record<string, HarnessInvalidThreadRecord>;
+
+                  for (const [threadId, value] of Object.entries(entry)) {
+                      const itemLabel = `${label}.invalidThreads.${threadId}`;
+                      const item = requireRecord(value, itemLabel);
+
+                      mapped[threadId] = {
+                          error: requireString(item.error, `${itemLabel}.error`),
+                          messages: item.messages,
+                          ...(item.label === undefined
+                              ? {}
+                              : { label: requireString(item.label, `${itemLabel}.label`) }),
+                          ...(item.agent === undefined
+                              ? {}
+                              : { agent: requireString(item.agent, `${itemLabel}.agent`) })
+                      };
+                  }
+
+                  return mapped;
+              })();
+
     return {
         id: requireString(record.id, `${label}.id`),
         harness: requireString(record.harness, `${label}.harness`),
@@ -719,6 +782,7 @@ const readSessionRecord = (value: unknown, label: string): HarnessSessionRecord 
         ...(threadLabelHighWater === undefined ? {} : { threadLabelHighWater }),
         ...(turnInvocations === undefined ? {} : { turnInvocations }),
         ...(invocationThreads === undefined ? {} : { invocationThreads }),
+        ...(invalidThreads === undefined ? {} : { invalidThreads }),
         core: core as unknown as HarnessSnapshot,
         ...(agentModels === undefined ? {} : { agentModels })
     };

@@ -10,7 +10,11 @@
 //     that needs async work does it lazily on first use, or the host grows an
 //     explicit `ready()` later — either way the call site does not change shape.
 //   - Setup receives a HarnessPluginApi with the live agent and tool registries
-//     plus createAgent()/addTool(). That is the entire surface.
+//     plus createAgent()/addTool()/addCommand(). That is the entire surface.
+//     addCommand() registers a slash command (`/task add "testing"` runs in THIS
+//     process, never as a model prompt) and REPLACES by name, exactly like
+//     addTool(): plugins apply after the built-in command set and after
+//     `configuration.commands`, so overriding one is the supported move.
 //
 // Why the declarative config exists alongside this:
 //   `agents` and `tools` cover the overwhelming majority of cases with no code.

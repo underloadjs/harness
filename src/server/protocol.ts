@@ -345,6 +345,28 @@ export type SessionThread = {
     messages: HarnessMessage[];
 };
 
+// C4: one conversation whose stored transcript this build could NOT read.
+//
+// A transcript is fully user-editable JSON, so it can be broken by hand. One
+// unreadable thread must never cost the user the whole session: the thread keeps
+// its identity with a valid placeholder transcript (so the model path and the
+// roster still work), and the value exactly as stored is preserved here so the
+// visualiser can show it and let the operator fix it.
+//
+//   - `error`    is the validation message (`readHarnessMessages`) that refused
+//     the stored value;
+//   - `messages` is the RAW stored value, opaque and unmodified — deliberately
+//     not `HarnessMessage[]`, because it is precisely what is not one;
+//   - `label`/`agent` come from the thread record and are best-effort (a
+//     hand-edited record may omit them).
+export type SessionInvalidThread = {
+    id: string;
+    label?: string;
+    agent?: string;
+    error: string;
+    messages: unknown;
+};
+
 // A conversation held by the server. `messages` is the entry agent's transcript.
 //
 // `turns` is the authoritative renderable record and is always present (an empty
@@ -381,6 +403,13 @@ export type SessionSnapshot = {
     // pre-thread snapshot shape. The default `agent:<name>` conversations are
     // internal plumbing and deliberately omitted.
     threads?: SessionThread[];
+    // C4 (ADDITIVE): conversations whose stored transcript could not be read.
+    // Present ONLY when at least one thread is unreadable, so every existing
+    // snapshot keeps its exact shape. Sorted by thread id for determinism. The
+    // matching `threads[]` entry still exists and carries a valid placeholder
+    // transcript; this list is where the raw, broken value lives so a client can
+    // show it and edit it back into something readable.
+    invalidThreads?: SessionInvalidThread[];
     // Conversation-scoped label counters AT THE START of each turn, keyed by turn
     // id (see shared/agent-results.ts). A client that projects result-block labels
     // seeds its allocator from the entry, so deleting a thread (and its turns)
@@ -599,6 +628,43 @@ export type CancelThreadResult = {
 export type DeleteThreadResult = {
     deleted: true;
     session: SessionSnapshot;
+};
+
+// Body of PUT /sessions/:id/threads/:threadId/transcript (C4).
+//
+// `messages` is DELIBERATELY `unknown`: the transcript is fully user-modifiable
+// JSON, and a structurally broken value is a SUCCESSFUL write (200), not a 400.
+// Only an absent `messages` property (a malformed HTTP/JSON body) is a 400.
+export type UpdateThreadTranscriptRequest = {
+    messages: unknown;
+};
+
+// One thread's transcript as the editor sees it (C4).
+//
+//   - `messages` is the LIVE harness transcript the model will be sent. For an
+//     unreadable thread that is the placeholder, never the broken value;
+//   - `raw` is the pretty-printed JSON the editor edits. For an unreadable thread
+//     that is the raw stored value verbatim, so the operator can see and fix what
+//     was actually saved;
+//   - `invalid` is present ONLY when the transcript cannot be read, carrying the
+//     reason plus the same raw value (a client can render either without parsing).
+export type ThreadTranscriptResponse = {
+    threadId: string;
+    agent: string;
+    messages: HarnessMessage[];
+    raw: string;
+    invalid?: { error: string; messages: unknown };
+};
+
+// Response of PUT /sessions/:id/threads/:threadId/transcript (C4).
+//
+// A broken submission is ACCEPTED: the raw value is persisted, the thread's live
+// transcript becomes a valid placeholder, and `transcript.invalid` explains why.
+// `session` is the post-write snapshot (it carries `invalidThreads`), so a client
+// repaints the whole visualiser from one response.
+export type UpdateThreadTranscriptResult = {
+    session: SessionSnapshot;
+    transcript: ThreadTranscriptResponse;
 };
 
 // Body of POST /api/sessions/:id/actions/:requestId/answer (N4).

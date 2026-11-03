@@ -27,6 +27,10 @@ import type { Harness, HarnessInteractionConfiguration } from '../../harness';
 import { createRenderer } from './render';
 import type { Renderer } from './render';
 import { DEFAULT_CLI_PRESET, parseCliOptions } from './options';
+// Shared command layer: the REPL keeps only the commands that need a terminal, and
+// routes every other "/name" through the harness registry (see ./commands.ts).
+import { runCliCommand } from './commands';
+import type { CliCommandHost } from './commands';
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
@@ -191,7 +195,16 @@ const interactive = async (
             ? `model ${settings.model} · ${settings.baseURL}\n`
             : `model ${settings.model} · scripted transport\n`
     );
-    output.write('commands: /help /reset /tools /presets /exit\n\n');
+    output.write('commands: /help /reset /tools /presets /exit\n');
+    // The rest comes from the live registry, not a hard-coded string: the
+    // built-ins (/help /task /tools /webfetch /websearch), anything a preset
+    // declares, and plugin additions all show up here. Sorted, so the banner is
+    // stable across runs and assertable.
+    const harnessCommands = Object.keys(harness.commands)
+        .sort()
+        .map((name) => `/${name}`)
+        .join(' ');
+    output.write(`harness: ${harnessCommands}\n\n`);
 
     const readline = createInterface({
         input: process.stdin,
@@ -202,6 +215,11 @@ const interactive = async (
     let controller: AbortController | undefined;
     let running = false;
     let closed = false;
+    // True while ONE line is being handled. `running` alone is no longer enough
+    // now that `handle` is async: a harness command awaits
+    // `harness.executeCommand('/websearch …')` with `running` still false, and
+    // without this gate a second line could start a prompt run underneath it.
+    let busy = false;
 
     readline.on('SIGINT', () => {
         if (controller !== undefined) {
@@ -217,43 +235,41 @@ const interactive = async (
         closed = true;
     });
 
+    // The effects the command dispatcher needs, injected (see ./commands.ts):
+    // nothing in that module calls process.exit or writes to a stream directly,
+    // which is exactly what makes the slash-command layer testable from a plain
+    // object. `write` follows the same routing as the old switch: in `--json`
+    // mode stdout carries the event stream, so command output goes to stderr.
+    const host: CliCommandHost = {
+        harness,
+        presets,
+        write: (text) => {
+            output.write(text);
+        },
+        writeError: (text) => {
+            process.stderr.write(text);
+        },
+        reset: () => resetHarness(harness),
+        exit: () => {
+            closed = true;
+            readline.close();
+        },
+        printTools,
+        printPresets
+    };
+
     const handle = async (raw: string): Promise<void> => {
         const input = raw.trim();
         if (input.length === 0) return;
 
-        if (input.startsWith('/')) {
-            const command = input.toLowerCase();
-
-            if (command === '/exit' || command === '/quit') {
-                closed = true;
-                readline.close();
-                return;
-            }
-
-            if (command === '/help') {
-                output.write('commands: /reset clears the conversation, /tools lists tools, /presets lists presets, /exit quits\n');
-                return;
-            }
-
-            if (command === '/reset') {
-                resetHarness(harness);
-                output.write('conversation reset\n');
-                return;
-            }
-
-            if (command === '/tools') {
-                printTools();
-                return;
-            }
-
-            if (command === '/presets') {
-                printPresets();
-                return;
-            }
-
-            output.write(`unknown command: ${input}\n`);
-            return;
-        }
+        // The command layer first. It answers the REPL's own commands (/exit,
+        // /quit, /help, /reset, /tools, /presets), forwards every other "/name"
+        // to `harness.executeCommand`, and reports an unknown command instead of
+        // throwing. The line is passed VERBATIM — the shared parser folds only
+        // the command name, so `/task add "Testing"` keeps its case, which the
+        // old whole-input toLowerCase() destroyed. `false` means "ordinary
+        // prompt text", and only then does a run start.
+        if (await runCliCommand(input, host)) return;
 
         running = true;
         controller = new AbortController();
@@ -273,8 +289,26 @@ const interactive = async (
     };
 
     readline.on('line', (line) => {
-        if (running) return;
-        void handle(line);
+        // Existing behaviour kept: while one line is in flight, extra input is
+        // dropped rather than queued, so a command and a prompt run never
+        // overlap and no two runs do either.
+        if (busy) return;
+
+        busy = true;
+
+        // `handle` is async now because a command awaits the tool behind it. It
+        // reports its own failures, so the rejection branch is only the net for
+        // an unexpected throw (a printer that fails on a bad `.env`, say): the
+        // REPL must never die on an unhandled rejection.
+        handle(line).then(
+            () => {
+                busy = false;
+            },
+            (error: unknown) => {
+                busy = false;
+                process.stderr.write(`${messageOf(error)}\n`);
+            }
+        );
     });
 
     readline.prompt();
@@ -283,8 +317,9 @@ const interactive = async (
         readline.once('close', resolve);
     });
 
-    // A line handler can still be in flight when the user quits.
-    while (running) {
+    // A line handler can still be in flight when the user quits: a prompt run
+    // (`running`) or an awaited command (`busy`).
+    while (running || busy) {
         await new Promise((resolve) => setTimeout(resolve, 10));
     }
 };

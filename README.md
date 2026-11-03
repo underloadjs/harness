@@ -114,6 +114,7 @@ const research = writer.createThread('writer', { label: 'research' });
 await writer.sendThreadInput(research.id, 'draft a plan');   // runs that thread
 writer.thread(research.id)?.status;                          // 'idle' | 'running' | 'stopped'
 writer.threadMessages(research.id);                          // detached transcript copy
+writer.setThreadMessages(research.id, messages);             // wholesale transcript replace
 writer.threads();                                            // default + host records
 ```
 
@@ -1342,7 +1343,8 @@ const writer = harness({
 | `websearch` | `true` or `{ env?, exa?, tavily?, linkup? }`. Registers the core `search` tool when at least one provider key resolves; the default provider is the first key in the **exa → tavily → linkup** order and `provider` overrides per call. Absent, `false`, or no key means no tool. A configured `tools.search` wins. |
 | `webfetch` | `true` or `{ env?, exa?, linkup? }`. Registers the `fetch` tool even with no key at all, because the default provider is the keyless native GET; `EXA_API_KEY` / `LINKUP_API_KEY` only add the per-call hosted crawlers. Absent or `false` means no tool. A configured `tools.fetch` wins. |
 | `report.progress` | Awaited for every step — a UI or `console.log`. |
-| `plugins` | Optional programmatic extension (`createAgent`, `addTool`). |
+| `commands` | Slash commands this harness can run: `{ name, description, usage?, execute }`. Registered **after** the built-ins (`/help`, `/tools`, `/task`, `/websearch`, `/webfetch`), so a name that collides with one — or repeats inside the list — fails construction. See [Slash commands](#slash-commands). |
+| `plugins` | Optional programmatic extension (`createAgent`, `addTool`, `addCommand`). The plugin phase runs after the built-ins and `commands`, so a plugin **replaces** a name rather than colliding with it — the same override semantics `addTool` has. |
 
 The registry key is the identity: `writer: agent({...})` names the agent
 `writer` and `search: tool({...})` is the name the model calls. You never
@@ -1359,6 +1361,9 @@ repeat the name inside the definition.
 | `writer.discoveredTools` | Names `toolRequest` has enabled, in discovery order. Read-only copy; `reset()` empties it. |
 | `writer.toolCreate(config)` | Host-side runtime creation. Same validation/registry/budget as the model's `toolCreate`; throws `HarnessError`. |
 | `writer.executeTool(name, parameters)` | Run one registered tool directly, with this harness's context (`agent`, `agents`, `run`). The server's manual-execution path: discovery gates the model, not the operator, so an un-discovered searchable tool still runs. Reserved policy is kept (`toolCreate` registration, primary-only `delegate`); an unregistered name throws, and `actionRequest`/`threadFork` are refused because they need the owning run. |
+| `writer.commands` | The registered slash commands, keyed by name **without** the leading slash (`commands.help` answers `/help`). Every read is a frozen defensive copy of the live registry, so a command registered later shows up in the next read — and mutating the copy changes nothing. |
+| `writer.executeCommand(input)` | Run one slash line (`'/task add "testing"'`) in THIS process. The model is never called and no progress event is emitted; a built-in that calls a tool still fires `stateChange('tool_execute')`, so a persistence layer sees the mutation. Throws `HarnessError` for a line without a leading `/` or an unknown name, and rethrows what a host command throws; every recoverable failure comes back as `{ content, isError: true }`. See [Slash commands](#slash-commands). |
+| `writer.registerCommand(command)` | Register or **replace** one command at runtime, with `registerTool`'s replace semantics. Validates the name and the definition and throws `HarnessError` without touching the registry when either is invalid. |
 | `writer.branches()` | Detached copies of retained branch audit records (`HarnessBranchRecord[]`), newest terminal records within `maxBranchRecords`; active records are never evicted. Ephemeral: not part of the snapshot. |
 | `writer.branch(id)` | One detached branch record by id, or `undefined`. |
 | `writer.reset()` | Reset the entry agent's conversation, forget discovered tools, and clear `task`, `profileManage`, `chapterManage`, `locationManage`, and the `agentManage`/`agentResult` registry. Created tools stay registered but are no longer enabled. Branch records and pending questions are ephemeral runtime state and are **not** cleared here. |
@@ -1918,6 +1923,221 @@ Rules:
   hot-reloaded; a fresh terminal or session is enough. `yarn preview:frontend`
   is only the static UI and does not read `.env`.
 
+## Slash commands
+
+A slash line is an **operator action, not a prompt**. `/task add "testing"` runs in
+the process that owns the session — the CLI, the HTTP server, a UI composer's submit
+handler — and it never reaches a model, never enters a queue lane, and never spends a
+request. The harness owns the registry (`src/harness.ts`), so every front end resolves
+one name to one implementation and `/help` reports the same list everywhere.
+
+```ts
+const writer = harness({
+    agents: { /* … */ },
+    commands: [
+        {
+            name: 'standup',
+            description: 'Summarize today.',
+            usage: '/standup [channel]',
+            execute: ({ harness, rest }) => ({ content: `standup ${rest}`.trim() })
+        }
+    ]
+});
+
+await writer.executeCommand('/standup general');   // { content: 'standup general' }
+writer.commands.standup;                           // the installed definition
+```
+
+### One grammar for every surface
+
+`parseCommandLine` (exported from the package root, implemented in
+`src/core/command.ts`) is the ONE tokenizer, so the same line means the same thing in
+a terminal and over HTTP:
+
+| Input | Resolves to |
+|---|---|
+| `draft a plan` | not a command — the parser answers `undefined` and the host sends the text to the model |
+| `/task add "fix: the build"` | `name: 'task'`, `args: ['add', 'fix: the build']` |
+| `/websearch Professor Vance` | `name: 'websearch'`, `args: ['Professor', 'Vance']`, `rest: 'Professor Vance'` |
+| `/task ""` | `args: ['']` — an explicit empty argument, not a missing one |
+| `/Task ADD note` | the NAME alone is folded → `name: 'task'`, `args: ['ADD', 'note']` (so `/task ADD` really is an unknown action, while `/TASK add` is not) |
+| `/` | a command-shaped line with an EMPTY name, so the lookup misses and reports an unknown command |
+
+The tokenizer is the shell-ish minimum and the whole contract: whitespace separates
+tokens, `"…"` and `'…'` group text, `\` escapes the next character inside and outside
+quotes, an unmatched quote consumes the rest of the line instead of throwing (an
+operator is mid-edit in a REPL), and a trailing `\` keeps itself. Only the command
+name is case-folded, because **arguments are data**: a task text or a search query
+must reach the tool exactly as written.
+
+A command implementation receives
+`{ harness, name, args, rest, input }` — the live handle, the folded name, the
+tokenized arguments, the verbatim trimmed tail, and the original line — and returns
+`{ content, isError?, data? }` (`HarnessCommandContext` / `HarnessCommandResult` in
+`src/types/index.ts`). `content` is always displayable text, `isError` marks a
+recoverable failure so a host styles it instead of parsing prose, and `data` carries
+the structured value for a host that wants a table (a CLI ignores it).
+
+Registration validates the name against `COMMAND_NAME_PATTERN`
+(`/^[a-z][a-z0-9-]{0,31}$/`): one lowercase letter, then lowercase letters, digits or
+`-`, at most 32 characters. Lowercase-only is what keeps ONE canonical spelling, so
+`/Task` and `/task` can never become two entries that disagree. A name may be written
+`'/plugin'` or `'plugin'` — the slash and the case are stripped before validation.
+
+### Built-ins
+
+| Command | Behavior |
+|---|---|
+| `/help [command]` | Every command in this harness, sorted, one `/name  description` line each plus an indented `usage:` line when the command declares one. `/help <name>` prints that one entry through the same renderer; an unknown name is a readable answer with `isError`, never an exception. |
+| `/tools [filter]` | The tools registered in this harness, sorted, as `name — description…` lines. Descriptions are previewed at 200 characters and newlines collapse, because a full `task` description alone is ~1.5 KB. The filter is the raw tail (several words work) and matches the name **or** the description, case-insensitively; no match answers `no registered tool matches "…"` with `isError`. |
+| `/task [list \| add <text> \| complete <id> \| reopen <id> \| remove <id>...]` | This session's task list, through the live `task` tool. See the actions below. |
+| `/websearch <query>` | Searches with this session's `search` tool and prints `N result(s) via <provider>:`, then title / URL / snippet / published per hit. The **raw tail** is the query, so quoting an exact phrase survives tokenization. |
+| `/webfetch <url>` | Fetches one page through this session's `fetch` tool and prints `title`, `url`, `content type`, `characters`, then the extracted text. The **first token** is the URL, so a trailing flag cannot corrupt the address. |
+
+`/task` actions, every one of them against the live tool:
+
+```text
+/task                    read the current page (same as `/task list`)
+/task add <text>         add one task — quotes let a space-bearing text through
+/task complete <id>      mark one task completed (a patch: the stored text is untouched)
+/task reopen <id>        mark one task pending
+/task remove <id>...     remove one or more ids
+```
+
+Each answers the same readable block: `#<id> [x]/[ ] <text>` rows (or `No tasks.`),
+the `N total, N completed, N pending` tally, and the page cursor
+(`page: offset 0, limit 20, showing 3, next offset 20`). The `#` prefix on each id is
+there so an operator can copy `/task complete 7` straight out of the listing. Because
+these are `harness.executeTool('task', …)` calls and not a private store, the command
+inherits the tool's own bounds (200 tasks, 4000 characters each, 20 per page by
+default, 100 maximum) and the next `/task` really lists what `/task add` wrote.
+
+`/websearch` and `/webfetch` are pass-throughs to the **conditional** `search` and
+`fetch` tools, so an unconfigured session gets guidance instead of a registry error:
+`/websearch` names `websearch: true` plus `EXA_API_KEY` / `TAVILY_API_KEY` /
+`LINKUP_API_KEY`, `/webfetch` names `webfetch: true` and notes that its native
+provider needs no key, and `/task` in a harness without the `task` tool says the tool
+is not registered. Every command body is capped at the same 64 KiB the model path uses
+(`MODEL_TOOL_RESULT_BUDGET_BYTES`) with a plain `… truncated: …` marker, because a
+command result is human-facing rather than a JSON envelope for a model.
+
+### Contributing commands
+
+| Path | Collision policy |
+|---|---|
+| `commands: [...]` in `harness({})` | Registered after the built-ins in the same declarative phase, so colliding with a built-in or repeating a name inside the list **fails construction**: `Command "/task" is already registered. Built-in commands and "commands" entries share one namespace and must be unique; use a plugin or harness.registerCommand() to override "/task".` |
+| `api.addCommand(name, definition)` in a plugin | The plugin phase runs after the built-ins and `commands`, so it **replaces** by name — exactly like `addTool`. This is how a tool package swaps a built-in out. |
+| `harness.registerCommand(command)` at runtime | Also **replaces** by name (the `registerTool` rule: "already registered" is never an error). The next command and the next `/help` see the new implementation. |
+
+`description` is required, `usage` is optional (a blank one is dropped), and `execute`
+must be a function — sync or async. All validation happens before the first mutation,
+so a rejected candidate leaves the registry exactly as it was, and the installed
+record is a NEW object: mutating the definition you passed in cannot edit a published
+command (or its `/help` line) afterwards. `Harness.commands` is a frozen copy **per
+read** and `executeCommand` looks the name up at call time, so a replacement is
+visible to the next command and never to one already in flight.
+
+```ts
+// Runtime registration replaces by name, exactly like registerTool.
+writer.registerCommand({
+    name: 'standup',
+    description: 'Today, briefly.',
+    execute: () => ({ content: 'ship the docs' })
+});
+
+writer.registerCommand({
+    name: '/task',
+    description: 'Ours now.',
+    execute: () => ({ content: 'our /task wins' })
+});   // overrides the built-in by name
+await writer.executeCommand('/TASK add "note"');   // one name, case-folded on lookup
+```
+
+### Commands over HTTP
+
+`POST /sessions/:id/tasks` is the supported command surface, and the store's
+`dispatch()` (`src/server/sessions.ts`) is the one splitter: text that is not
+command-shaped goes to `enqueue()` **untouched**, and a leading `/` runs
+`executeCommandTurn()` **before the `202` body is produced** — so the turn in the
+response is already terminal and nothing ever entered a queue.
+
+- The recorded turn is an ordinary `SessionTurn` whose `prompt` is the line you typed,
+  carrying three synthesized events: `start`, `tool_call` (`name: 'command'`,
+  `arguments: '{"input":"/task add …"}'`), and `tool_result` with the command's
+  `content`, its `isError`, and `outcome: 'completed' | 'failed'`, paired by `callId`.
+  The browser therefore draws a command with the same tool card it uses for a real
+  tool call, and the transcript survives a reload with no special case anywhere.
+- There is no `text`, no `done`, and **no `usage`**: nothing was generated and nothing
+  was billed, and an absent tally is more honest than a fabricated zero. `status` is
+  `done` or `error`.
+- The turn has no `threadId`, because a command acts on the **session** (its task
+  list, its tool registry), never on one conversation. A `threadId` in the request
+  body is therefore accepted and ignored — validating it would invent a 400 for a
+  value with no meaning — while `attachments` and `references` are a `400`
+  (`A slash command cannot carry attachments.` /
+  `A slash command cannot carry result references.`), because a command has no schema
+  to bind media to.
+- Commands deliberately bypass the single-flight gate and the pending-turn cap, so
+  `/task` stays readable while a model run streams. `session.status` and `lastError`
+  are untouched: a command is not a run, and a failed `/task bogus` must not raise the
+  session-wide error banner a real run owns. A command whose tool call is genuinely
+  unsafe right now is refused by the harness, and that refusal becomes an error turn.
+- An unknown command, and anything a host command throws, becomes a **readable error
+  turn** (status `error`, the message as the tool result) rather than a `500`.
+- The legacy `POST /sessions/:id/messages` route does **not** treat a leading `/` as a
+  command: its response-owned SSE contract predates the registry, so that line still
+  goes to the model. Slash commands are supported on `/tasks` only.
+- A host handle built before the command registry has no `executeCommand`; `dispatch`
+  then falls back to `enqueue()`, which is exactly what such a server did before.
+
+The harness state a command mutated (a `/task add`) is committed with the terminal
+turn record: `session.core` is refreshed from the live harness (best-effort — the turn
+is terminal either way) and the turn itself is saved with a strict write **before** the
+`202` leaves, so a reload shows the same task list. A failed write is an error, not a
+silent success: the server never promises a transcript it did not write.
+
+### Commands in the CLI
+
+The terminal resolves a line through the same parser and the same registry
+(`src/server/cli/commands.ts`), with one deliberate difference: its own commands are
+checked **first**, so they shadow harness commands of the same name.
+
+| CLI command | What answers |
+|---|---|
+| `/help` | The REPL's own list, then `harness commands:` — `harness.commands` rendered verbatim, so a plugin override or a runtime `registerCommand` appears there automatically. Both sections stay, even where a name is shadowed, so the listing cannot disagree with the registry. |
+| `/tools` | The direct-call **catalogue** (grouped, with the `.env`-aware availability hints, rebuilt after `.env` is read) — not the session registry. This is the shadow an operator wants. |
+| `/reset` | Clears every agent conversation plus the entry harness. |
+| `/presets` | The preset catalogue. |
+| `/exit`, `/quit` | Quit. Closing readline and draining an in-flight run stay in `src/server/cli/index.ts`. |
+
+Anything else command-shaped is forwarded to `harness.executeCommand` **verbatim**:
+only the parser folds the name, so `/websearch Mixed Case Query` searches for exactly
+what was typed and `/task add "Testing"` stores the case the operator wrote (the old
+whole-input `toLowerCase()` is gone). Ordinary text is the only thing that starts a
+model run, and a line typed while another line is still in flight is dropped, so a
+command and a run never overlap. The interactive banner prints the live registry
+(`harness: /help /task /tools /webfetch /websearch`) so the operator sees what this
+session can run. In `--json` mode stdout carries the event stream, so command output
+is written to stderr; an `isError` result always goes to stderr.
+
+### Errors a command can produce
+
+Everything an operator can get wrong is an answer, not an exception:
+
+| Situation | What comes back |
+|---|---|
+| line without a leading `/` | `executeCommand` **throws** `a command must start with "/"` — that is a host bug, since only command-shaped lines should reach it |
+| unknown command (`/nope`, or a bare `/`) | `executeCommand` **throws** `unknown command: /nope`. The CLI prints it plus `hint: /help lists the commands this session can run`; the server records an error turn |
+| missing argument | `/task: "add" needs the task text.` then `usage: …`, with `isError` (same for `"complete" needs a task id.` and `a query is required.` / `a URL is required.`) |
+| too many arguments | `/task: "list" takes no arguments (got 1).`, `/task: "complete" takes one id (got 2).`, `/help: "help" takes at most one command name.` |
+| unknown `/task` action | `/task: unknown action "bogus".` plus the usage line |
+| tool not registered | the `/websearch` / `/webfetch` guidance text above, or `/task: the "task" tool is not registered in this harness.` |
+| the tool rejects the call | `<label>: <the tool's own message>` — the label is the command and subaction (`/task add`, `/webfetch`), covering an unknown task id, a failed provider call, or a non-text page |
+
+Only a command that throws on purpose escapes: `executeCommand` does not wrap a host
+command's exception, so a built-in's recoverable failures return
+`{ content, isError: true }` by convention.
+
 ## CLI
 
 The CLI runs a preset in-process. No UI, no HTTP server, no browser. It runs from
@@ -1957,8 +2177,14 @@ inventing a demo transcript.
 | `--port`, `--host` | Server bind address (default `127.0.0.1:5181`) |
 | `--no-color` | Disable ANSI colour |
 
-In an interactive session, `/reset` clears the conversation, `/tools` and
-`/presets` print the catalogues, and `/exit` quits. `HARNESS_BASE_URL`,
+In an interactive session the terminal answers its own `/reset`, `/tools`,
+`/presets`, `/help` and `/exit` (or `/quit`), and every other command-shaped line —
+the harness built-ins `/help`, `/tools`, `/task`, `/websearch` and `/webfetch` plus
+anything a plugin or `harness.registerCommand()` contributes — runs through this
+session's command registry, with the line forwarded verbatim so argument case is
+preserved. `/help` prints both sets. See [Slash commands](#slash-commands) for the
+command table, the collision rules, and how a command becomes a recorded turn.
+`HARNESS_BASE_URL`,
 `HARNESS_API_KEY`, and `HARNESS_MODEL` provide the same defaults as the flags;
 they can come from the shell or from the package-root `.env` (see
 [Environment file](#environment-file)). `EXA_API_KEY`, `TAVILY_API_KEY` or
@@ -2431,10 +2657,121 @@ without `threadId` renders no badge, and a submit with no target omits `threadId
 
 ```
 POST   /sessions/:id/tasks                    { input, attachments?, references?, threadId? }
+GET    /sessions/:id/threads/:threadId/transcript                           -> { transcript }
+PUT    /sessions/:id/threads/:threadId/transcript { messages }              -> { session, transcript }
 POST   /sessions/:id/threads/:threadId/cancel { }                        -> { cancelled, session? }
 DELETE /sessions/:id/threads/:threadId                                  -> { deleted: true, session }
 POST   /sessions/:id/cancel                   { all: true }              -> { cancelled }
 ```
+
+A `/tasks` submit whose `input` starts with `/` is a **slash command**, not a prompt:
+the `202` envelope is identical, but its `turn` is already terminal because the server
+executed it in this process — see [Slash commands](#slash-commands).
+
+### Editable thread transcripts
+
+A conversation's transcript is the user's own JSON, and the transcript dialog in the
+browser UI edits it. Only `messages` are editable: turns, events, statuses, timestamps
+and `usage` stay server-owned history, because they are the record of what actually
+ran, not an input to it.
+
+`GET /sessions/:id/threads/:threadId/transcript` answers the editor's document
+(`ThreadTranscriptResponse`, `src/server/protocol.ts`):
+
+```json
+{
+  "transcript": {
+    "threadId": "0f0d…",
+    "agent": "instruct",
+    "messages": [{ "role": "user", "content": "draft a plan" }],
+    "raw": "[\n  {\n    \"role\": \"user\",\n    \"content\": \"draft a plan\"\n  }\n]"
+  }
+}
+```
+
+- `messages` is the LIVE transcript the model will be sent next;
+- `raw` is the pretty-printed (2-space) JSON the editor holds and edits;
+- `invalid: { error, messages }` is present **only** when the stored value cannot be
+  read — then `messages` is the placeholder and `raw` is the broken value verbatim.
+
+`PUT /sessions/:id/threads/:threadId/transcript` with body `{ messages }` replaces the
+whole transcript and answers `{ session, transcript }` — the post-write snapshot plus
+the same document — so a client repaints everything from one response.
+
+**A broken value is a successful write.** `messages` is deliberately `unknown`
+(`UpdateThreadTranscriptRequest`): any JSON value round-trips. A structurally invalid
+value is persisted as submitted, the thread's live transcript becomes a valid one-entry
+`system` placeholder whose text is `[transcript unreadable: <reason>]`, and the answer
+carries `transcript.invalid` with the reason and the raw text
+(`updateThreadTranscript`, `src/server/sessions.ts`). The session therefore stays
+runnable, snapshot-able and restorable while the operator keeps fixing the JSON, and
+the dialog opens an unreadable thread **directly in the editor** with that banner and
+the raw value, because the only useful thing that surface can do then is help them
+repair it. Only an absent `messages` property is a `400` — the server answers
+``A transcript update requires a `messages` value.`` because the service adapter hands
+a body that failed to parse as `{}`, so refusing it is what keeps a malformed request
+from silently emptying a transcript.
+
+| Status | When |
+|---|---|
+| `200` | a valid replacement, **or** a value that is not a readable transcript (it is stored and reported as unreadable) |
+| `400` | absent `messages`, or a body that is not an object |
+| `404` | unknown session or unknown thread. On `GET`, a thread that survives only in the unreadable map is still served — its raw value is the useful part |
+| `405` | any method other than `GET` / `PUT` |
+| `409` | the thread is running (stop it first), or the session's harness handle predates `setThreadMessages` |
+
+Live work is refused twice, on purpose: the store checks the thread record and its
+execution lane before touching anything, and `harness.setThreadMessages(threadId,
+messages)` re-checks the run state before it mutates, so a run that starts in between
+still answers `409` rather than losing the edit. That primitive validates with the
+SAME reader `snapshot()`/`restore()` enforce (`readHarnessMessages`,
+`src/core/snapshot.ts`), so a harness can never be left holding a transcript its own
+snapshot would refuse; a rejected write mutates nothing, and an accepted one is
+installed **in place** because `agent.messages` is exposed by reference. An empty array
+is a legal transcript, and a **stopped** thread is writable — repairing a broken
+conversation is the whole point. The write notifies `agent_message`, the existing
+persistence reason, and emits no progress event: a host edit is not model output.
+
+**Reload is tolerant per thread and fatal per document.** A transcript broken by hand
+in `state.json` cannot cost the whole session: the store validates every host thread's
+`messages` before `harness.restore()` and neutralises the unreadable ones with the same
+placeholder, keeping each thread's id, agent, label and turn links so the roster can
+still address it
+(`tolerateThreadTranscripts` / `mergeInvalidTranscripts`, `src/server/sessions.ts`).
+The tolerance is deliberately scoped to host threads: an invalid **default**
+(`agent:<name>`) conversation still fails the restore and drops the session, because
+that transcript is what the entry point runs and a placeholder there would silently
+rewrite the session's primary conversation. Retention also covers a default conversation
+whose placeholder came from a live `PUT`; only a hand-broken `core.agents[name].messages`
+in the stored file stays fatal. The raw value of an unreadable host thread
+is retained beside it as `SessionSnapshot.invalidThreads` — additive
+(present only when at least one thread is unreadable), sorted by thread id, and
+persisted as the optional `invalidThreads` map on the session record — so a restart
+still shows the operator exactly what they typed:
+
+```json
+{
+  "id": "0f0d…",
+  "agent": "instruct",
+  "label": "IT1",
+  "error": "thread \"0f0d…\" messages[0].role must be one of: system, user, assistant, tool.",
+  "messages": [{ "role": "sysytem", "content": "a typo a human made" }]
+}
+```
+
+An entry is dropped as soon as it stops being useful: the thread was deleted, or its
+live transcript is no longer a placeholder (the operator repaired the JSON by hand, or
+a `PUT` installed a valid value). Document-level corruption stays **fatal** — an
+unreadable file, malformed JSON, an unknown database version, an invalid record shape,
+or a malformed `invalidThreads` map still aborts startup — and a failed load never
+rewrites the operator's file.
+
+The browser client surface is `getThreadTranscript(sessionId, threadId)` and
+`updateThreadTranscript(sessionId, threadId, messages)` (`src/frontend/api.ts`); the
+dialog is `src/frontend/ui/thread-transcript.ts`. A Save parses locally first (invalid
+JSON keeps the text in the editor and never sends it), and a refresh never overwrites
+the textarea — only an explicit Save, Cancel, or opening a different thread does — so
+an unrelated stream frame cannot destroy an in-progress repair.
 
 ### Task queue, timeline, and message rendering (R4/R5)
 
@@ -2689,6 +3026,11 @@ Recovery policy on restart:
 - queued (never started) prompts are preserved in FIFO order but stay **paused**:
   nothing starts automatically. An explicit new submit starts the pump and drains
   the restored backlog first; `POST /cancel { all: true }` drops it.
+- one conversation whose stored transcript cannot be read does **not** cost the
+  session: the thread keeps its id, agent, label and turn links, its live transcript
+  becomes the `[transcript unreadable: …]` placeholder, and the raw value is retained
+  in the additive `invalidThreads` roster so the operator can still repair it (see
+  [Editable thread transcripts](#editable-thread-transcripts));
 - a session this build **cannot rebuild** (a snapshot naming a tool that has since
   been renamed, a model map naming a retired agent, an internally inconsistent
   record) is **dropped on load instead of failing startup**: every other session,
@@ -2736,12 +3078,19 @@ GET    /v1/harness/sessions/:id           one snapshot (with turns)
 PATCH  /v1/harness/sessions/:id           retarget agent models (next request)
 DELETE /v1/harness/sessions/:id           forget a session
 POST   /v1/harness/sessions/:id/messages  legacy task → text/event-stream (owns the run)
-POST   /v1/harness/sessions/:id/tasks     queue a task → 202 { session, turn }
+POST   /v1/harness/sessions/:id/tasks     queue a task, or run a `/command` → 202 { session, turn }
 GET    /v1/harness/sessions/:id/events    watch the queue → text/event-stream
 POST   /v1/harness/sessions/:id/reset     reset agents, discovery, tasks, records
 POST   /v1/harness/sessions/:id/cancel    cancel active work ({ all } also drops the queue)
 POST   /v1/harness/sessions/:id/actions/:requestId/answer   answer one pending actionRequest
+GET    /v1/harness/sessions/:id/threads/:threadId/transcript       one transcript (editable JSON)
+PUT    /v1/harness/sessions/:id/threads/:threadId/transcript       replace it → { session, transcript }
 ```
+
+A `POST …/tasks` whose `input` starts with `/` is executed as a slash command in the
+server process and answers `202` with an already-terminal turn; the legacy `/messages`
+route keeps sending such a line to the model
+(see [Slash commands](#slash-commands)).
 
 **Standalone `/api` compatibility is unchanged.** The `/api` root stays a 404 (it
 has no bootstrap document), every `/api` request still needs

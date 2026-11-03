@@ -342,7 +342,13 @@ describe('invocation thread entries', () => {
         // invocation's completed answer (the interim `done` message) and not the
         // parent's or the whole transcript's.
         expect(row.querySelectorAll('.agent-meta')).toHaveLength(0);
+        // R5: the row is icon-only in BOTH controls, so the row still carries no text.
+        // The child card owns its Collapse/Expand toggle from creation, and the copy
+        // action that the completed interim answer adds sits in FRONT of it.
         expect(row.querySelector('.agent-answer-actions')?.textContent).toBe('');
+        expect(
+            [...(row.querySelector('.agent-answer-actions')?.children ?? [])].map((node) => node.className)
+        ).toEqual(['text-copy answer-copy', 'answer-collapse']);
         expect(row.querySelector('.answer-copy')?.getAttribute('aria-label')).toBe('Copy the final answer');
 
         turn.apply({
@@ -1603,6 +1609,18 @@ describe('per-block final answer copy (R5)', () => {
         const row = threadRows(turn)[0];
         // Each block has its OWN action, and each writes only its own raw Markdown.
         expect(row.querySelectorAll('.agent-answer-actions .answer-copy')).toHaveLength(1);
+        // R5: exactly one copy and one collapse toggle per block, in that DOM order
+        // (copy first / toggle last) in the CHILD card as well as in the root block.
+        expect(
+            [...row.querySelectorAll<HTMLElement>('.agent-answer-actions')].map((actions) =>
+                [...actions.children].map((node) => node.className)
+            )
+        ).toEqual([['text-copy answer-copy', 'answer-collapse']]);
+        expect(
+            [...(turn.element.querySelector<HTMLElement>('.agent-answer-actions')?.children ?? [])].map(
+                (node) => node.className
+            )
+        ).toEqual(['text-copy answer-copy', 'answer-collapse']);
         expect(await copyPayloads(row.querySelector('.answer-copy'))).toEqual(['# child answer']);
         expect(await copyPayloads(turn.element.querySelector('.agent-answer-actions .answer-copy'))).toEqual([
             'root **answer**'

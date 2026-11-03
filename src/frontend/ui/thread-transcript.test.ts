@@ -910,12 +910,13 @@ describe('responsive thread action bar', () => {
         // T26: no disclosure chevron anywhere — `<summary>` is neutralised as a BASE
         // element, so every `<details>` control (tool chip, think chip, anything added
         // later) inherits it; the per-chip `::before` triangles are deleted rather than
-        // overridden. The endpoint accordion still draws its OWN glyph, which is why the
-        // base rule is a marker reset and not a `content` override.
+        // overridden. T4/R4 removed the last one with the endpoint accordion: the
+        // settings open from the status-pill dialog now, whose TITLE is the label, so the
+        // base rule is a plain marker reset with nothing left to override.
         expect(css).toMatch(/\nsummary \{\s*list-style: none;/);
         expect(css).toMatch(/\nsummary::-webkit-details-marker \{\s*display: none;/);
         expect(rules).not.toContain('.tool-summary::before');
-        expect(css).toMatch(/\.endpoint-summary::before \{\s*content: '▸';/);
+        expect(css).not.toContain('.endpoint-summary');
     });
 
     // T2: the state word is not visible in EITHER header state, so the T5 clip machinery
@@ -1015,9 +1016,15 @@ describe('responsive thread action bar', () => {
         expect(board.focusThread('thread-child')).toBe(true);
         expect(childBar?.hidden).toBe(false);
         // T26: header → bar → body, and the bar is Delete, Transcript, confirmation — the
-        // identical anatomy of the main tile.
+        // identical anatomy of the main tile. T6 adds ONE sibling: the card's collapsed-
+        // state Collapse/Expand chevron, created with its agent section and inserted
+        // immediately after `.thread-select` (a SIBLING of the header button, never nested
+        // in it). It is `display: none` in exactly this state — the expanded card renders
+        // the footer chevron instead — and the bar still sits between the header and the
+        // body, which is what this anatomy assertion is about.
         expect([...(tile?.children ?? [])].map((node) => node.className)).toEqual([
             'thread-select',
+            'header-collapse',
             'thread-transcript-action',
             'thread-body'
         ]);

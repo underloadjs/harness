@@ -596,11 +596,12 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     // The TEAM and the INSTRUCTIONS are still frozen: the roster controls and the
     // instruction editor are disabled with the real reason on each of them, `[+]`
     // cannot add, and the action cannot promote. R7: there is no lock notice and no
-    // in-row "New session" link; the Sessions rail keeps its own independent New
-    // session action, which stays usable.
-    expect(document.querySelector('.harness-note')?.textContent).toBe(
-        'Viewing a saved session · agent team frozen'
-    );
+    // in-row "New session" link. T3/R1: a saved session prints NO header note at all —
+    // the strip under the title is what says which conversation is open, and it keeps its
+    // own independent New session action, which stays usable.
+    expect(document.querySelector('.harness-note')?.textContent).toBe('');
+    expect(document.querySelector<HTMLElement>('.harness-note')?.hidden).toBe(true);
+    expect(document.querySelector('.session-pill-select')?.getAttribute('data-active')).toBe('true');
     openDeck();
     const frozenReason =
         'A saved conversation keeps the agent team and the instructions it was created with; only models can change here. Edits saved on the harness apply to a new session.';
@@ -618,9 +619,9 @@ it('edits a saved session’s live models through PATCH /sessions/:id and keeps 
     expect(applyAction().disabled).toBe(true);
     expect(document.querySelector('.agent-lock')).toBeNull();
     expect(document.querySelector('.agent-row-wrap .link-button')).toBeNull();
-    const railNewSession = byClass('.new-session', 'button');
-    expect(railNewSession.textContent).toBe('New session');
-    expect(railNewSession.disabled).toBe(false);
+    const stripNewSession = byClass('.new-session', 'button');
+    expect(stripNewSession.textContent).toBe('+ New');
+    expect(stripNewSession.disabled).toBe(false);
 
     // Effective live values (not the live descriptor's map, which only has instruct)
     // with the MODEL control enabled (R2). One select per configuration, reached

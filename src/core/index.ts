@@ -14,6 +14,16 @@
 //   createTaskTool() — the harness's per-session task list, as a factory.
 //                  State stays in the closure so a harness (and nothing global)
 //                  owns it. See ../core/task.ts.
+//   parseCommandLine()/validateCommandName()/normalizeCommandName()/
+//   formatCommandHelp() — the slash-command grammar, PURE (no harness, no
+//                  transport, no Node built-in) so a CLI, a server route, and the
+//                  harness registry resolve `/task add "testing"` the same way.
+//                  COMMAND_NAME_PATTERN is the name rule. See ./command.ts.
+//   createBuiltinCommands() — the built-in /help, /tools, /task, /websearch and
+//                  /webfetch commands. The last three are pass-throughs to the
+//                  task/search/fetch TOOLS, so a slash line mutates the same
+//                  session state a model tool call would. `harness()` registers
+//                  them before `configuration.commands`. See ./command-builtins.ts.
 //   createProfileTool()/createChapterTool()/createLocationTool() — the same
 //                  factory pattern for the session record tools (profiles,
 //                  chapters, locations). See ../core/profile.ts, chapter.ts,
@@ -130,6 +140,31 @@ export { createTaskTool } from './task';
 export { createProfileTool } from './profile';
 export { createChapterTool } from './chapter';
 export { createLocationTool } from './location';
+// Slash commands. The parser is PURE (no harness, no transport, no Node built-in)
+// so every host resolves one line the same way: `/task add "testing"` becomes
+// `{ name: 'task', args: ['add', 'testing'], rest, input }`. `harness()` owns the
+// registry; these helpers are its grammar and its name rule, exported so a CLI or
+// a server route never grows a second tokenizer. See ./command.ts.
+export {
+    COMMAND_NAME_PATTERN,
+    formatCommandHelp,
+    normalizeCommandName,
+    parseCommandLine,
+    validateCommandName
+} from './command';
+export type { ParsedCommand } from './command';
+// The built-in command set (`/help`, `/tools`, `/task`, `/websearch`, `/webfetch`).
+// The last three are pass-throughs to the `task`/`search`/`fetch` TOOLS through
+// `context.harness.executeTool`, so the command layer adds argument shaping and
+// readable output only. A harness registers these before `configuration.commands`.
+export {
+    createBuiltinCommands,
+    HELP_COMMAND_NAME,
+    TOOLS_COMMAND_NAME,
+    TASK_COMMAND_NAME,
+    WEBSEARCH_COMMAND_NAME,
+    WEBFETCH_COMMAND_NAME
+} from './command-builtins';
 // R3a persistence: schema/version + the pure snapshot reader. The store readers
 // live in their own modules (task/profile/chapter/location) because each owns its
 // invariants; harness.ts is the only caller of the harness-wide reader.

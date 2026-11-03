@@ -288,10 +288,11 @@ it('lists core tools in the global tools view, calls with the captured session a
         'Session-bound: runs in the playground’s own temporary session for instruct · session s1. The conversation you selected is untouched.'
     );
 
-    // R7: the temporary session is not adopted into the reader's chat. The sessions rail
-    // has no row for it, and no conversation was opened.
-    expect(document.querySelectorAll('.session-row')).toHaveLength(0);
-    expect(document.querySelector('.sessions-scope')?.textContent).toBe('Locked to instruct.');
+    // R7: the temporary session is not adopted into the reader's chat. The pill strip has
+    // no entry for it, and no conversation was opened.
+    expect(document.querySelectorAll('.session-pill')).toHaveLength(0);
+    // T3/R1: the strip is empty for a harness with no conversation, and says so shortly.
+    expect(document.querySelector('.session-pills-empty')?.textContent).toBe('No sessions yet.');
 
     // The raw structured result is intact …
     const output = document.querySelector('.tool-output .card-body')?.textContent ?? '';

@@ -52,10 +52,15 @@ import type {
     SessionStreamItem,
     SessionTurn,
     SubmitTaskResult,
+    // C4 transcript documents, aliased below as the client-facing `...Payload` names.
+    ThreadTranscriptResponse,
     ToolCallResult,
     ToolDescriptor,
     ToolIndex,
     UpdateHarnessRequest,
+    // The PUT body, used verbatim by updateThreadTranscript().
+    UpdateThreadTranscriptRequest,
+    UpdateThreadTranscriptResult,
     // Needed locally for updateSession() and re-exported below.
     UpdateSessionRequest
 } from '../server/protocol';
@@ -617,6 +622,76 @@ export const deleteSessionThread = async (
         `/sessions/${encodeURIComponent(id)}/threads/${encodeURIComponent(threadId)}`,
         { method: 'DELETE' }
     );
+
+// --- thread transcript (C5, editable JSON) ---------------------------------
+//
+// A thread's transcript is USER data: the reader may rewrite the whole structure,
+// including into something the harness can no longer read. The server therefore
+// never refuses a JSON value — it persists it and reports the damage in
+// `transcript.invalid` — which is why this client has a typed `messages: unknown`
+// instead of `HarnessMessage[]` on the write path.
+//
+// ALIASES of the C4 wire types in src/server/protocol.ts, not copies: the client and
+// the server therefore cannot drift, and a new server field on either document is
+// visible here without touching this file. The local NAMES stay (`...Payload`) because
+// `src/index.ts` star-exports the server and the client barrels side by side, and the
+// client-facing surface of the transcript feature is this barrel — a reader who imports
+// `@underload/harness/frontend` gets `ThreadTranscriptPayload` exactly as before.
+//
+// `raw` is the editable document: pretty JSON of the value the server holds
+// (the raw invalid value verbatim when the transcript cannot be read). `invalid`
+// carries the read failure plus that raw value, so a client that never saw the
+// transcript route can still offer the same repair surface. For an UNREADABLE thread
+// `messages` is the server's placeholder (`[{ role: 'system', content:
+// '[transcript unreadable: …]' }]`) — never the value to edit. The roster copy of that
+// raw value is `SessionSnapshot.invalidThreads` (aliased in ui/threads.ts as
+// `InvalidThreadRecord`), which is what the dialog puts in the editor.
+export type ThreadTranscriptPayload = ThreadTranscriptResponse;
+
+// PUT answer: the authoritative post-write snapshot plus the transcript document.
+// Callers apply `session` through the normal snapshot path (tombstones, watermark,
+// focus) and repaint the dialog from `transcript`.
+export type UpdateThreadTranscriptPayload = UpdateThreadTranscriptResult;
+
+// GET /sessions/:id/threads/:threadId/transcript.
+//
+// The board's own freshness path reads the WHOLE session (main.ts
+// `refreshTranscriptSnapshot`), because the dialog's read-only document needs the
+// turns/events the transcript route does not carry. This route is the narrow read of
+// exactly the editable value, and the client surface for a host that only wants the
+// transcript; a structurally invalid value is still a 200 with `transcript.invalid`.
+export const getThreadTranscript = async (
+    sessionId: string,
+    threadId: string
+): Promise<ThreadTranscriptPayload> => {
+    const body = await request<{ transcript: ThreadTranscriptPayload }>(
+        `/sessions/${encodeURIComponent(sessionId)}/threads/${encodeURIComponent(threadId)}/transcript`
+    );
+
+    return body.transcript;
+};
+
+// PUT /sessions/:id/threads/:threadId/transcript — replace the whole transcript.
+//
+// `messages` is sent EXACTLY as parsed from the editor: any JSON value round-trips,
+// because the point of the route is that the user may break it. The body is the wire's
+// `UpdateThreadTranscriptRequest` (`{ messages: unknown }`), so no client-side narrowing
+// can quietly reject a value the server would have accepted. Only a transport failure
+// throws; a 200 carrying `transcript.invalid` is a SUCCESS the caller renders as a
+// banner (409 running thread / 404 unknown thread / 400 missing `messages` all surface
+// the server's own message through `request`).
+export const updateThreadTranscript = async (
+    sessionId: string,
+    threadId: string,
+    messages: unknown
+): Promise<UpdateThreadTranscriptPayload> => {
+    const body: UpdateThreadTranscriptRequest = { messages };
+
+    return request<UpdateThreadTranscriptPayload>(
+        `/sessions/${encodeURIComponent(sessionId)}/threads/${encodeURIComponent(threadId)}/transcript`,
+        { method: 'PUT', body: JSON.stringify(body) }
+    );
+};
 
 export const cancelSession = async (id: string, all = false): Promise<boolean> => {
     // `all: true` is the Stop-all signal: the server aborts the active run AND

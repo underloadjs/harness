@@ -32,6 +32,9 @@
 //       originTurnId?: string; originInvocationId?: string; references?: unknown[];
 //       invocationIds?: string[];
 //   }>
+//   SessionSnapshot.invalidThreads?: SessionInvalidThread[]   // C4/C5, additive
+//       = Array<{ id; label?; agent?; error: string; messages: unknown }>
+//       (src/server/protocol.ts; aliased below as `InvalidThreadRecord`)
 //   SessionTurn.threadId?: string          // the turn's persistent thread
 //   SubmitTaskRequest.threadId?: string    // absent = create a NEW thread
 //   POST   /sessions/:id/threads/:threadId/cancel -> { cancelled, session? }
@@ -42,6 +45,9 @@
 // the two by assumption: the runtime roster is the live view.
 
 import { agentCodeOf } from './agent-label';
+// Type-only: the browser bundle never loads server code, and this import is erased at
+// build time (same pattern as ui/thread-transcript.ts and contract.ts).
+import type { SessionInvalidThread } from '../../server/protocol';
 
 // One live persistent thread, as the session snapshot reports it. Every field is
 // validated on read (see sessionThreadsOf) because the roster is server data and a
@@ -82,6 +88,65 @@ export type SessionThreadEntry = {
     // so this is the only way the UI can render that conversation (S2). Kept as an
     // opaque array: the board renders role/content defensively.
     messages?: readonly unknown[];
+    // C5: this thread's stored transcript value cannot be read as
+    // `HarnessMessage[]`. The record is the raw `SessionSnapshot.invalidThreads`
+    // entry (error + the unreadable value verbatim), joined onto the roster so the
+    // conversation stays focusable, inspectable and FIXABLE from the normal surfaces.
+    // Absent = readable, which is every pre-C5 payload.
+    invalid?: InvalidThreadRecord;
+};
+
+// One `SessionSnapshot.invalidThreads` entry (C4, additive): the roster's row for a
+// conversation whose persisted `messages` value is not a transcript. `messages` is
+// the offending value EXACTLY as stored, so the UI can put it in an editor and let
+// the reader repair it instead of hiding the conversation.
+//
+// This is an ALIAS of the server protocol type, not a copy: the shape the client joins
+// and the shape the server writes are one declaration, so a new roster field cannot
+// appear on the wire and silently miss the UI. The local name stays because the board
+// and the transcript dialog (and this module's own `SessionThreadEntry.invalid`)
+// already consume it by that name.
+export type InvalidThreadRecord = SessionInvalidThread;
+
+const invalidErrorOf = (value: unknown): string =>
+    typeof value === 'string' && value.trim().length > 0
+        ? value
+        : 'the stored transcript could not be read';
+
+// Read the optional invalid roster STRUCTURALLY, like every other snapshot field: a
+// server that has no C4 support sends nothing ([] => every existing behaviour is
+// byte-identical), and a malformed entry is skipped rather than rendered as a fake
+// conversation. An entry with no usable id cannot be joined to anything, so it is
+// dropped; ids are deduplicated in server order (first entry wins).
+export const invalidThreadsOf = (session: unknown): InvalidThreadRecord[] => {
+    if (!isObjectLike(session)) return [];
+
+    const value = session.invalidThreads;
+    if (!Array.isArray(value)) return [];
+
+    const records: InvalidThreadRecord[] = [];
+    const seen = new Set<string>();
+
+    for (const entry of value) {
+        if (!isObjectLike(entry)) continue;
+
+        const id = nonEmptyString(entry.id);
+        if (id === undefined || seen.has(id)) continue;
+        seen.add(id);
+
+        const label = nonEmptyString(entry.label);
+        const agent = nonEmptyString(entry.agent);
+
+        records.push({
+            id,
+            ...(label === undefined ? {} : { label }),
+            ...(agent === undefined ? {} : { agent }),
+            error: invalidErrorOf(entry.error),
+            messages: entry.messages
+        });
+    }
+
+    return records;
 };
 
 // The wire may carry extra fields (`origin`, `references`); the UI ignores them.
@@ -167,6 +232,36 @@ export const sessionThreadsOf = (session: unknown): SessionThreadEntry[] => {
                 : { originInvocationId: nonEmptyString(entry.originInvocationId) as string }),
             ...(invocationIds === undefined ? {} : { invocationIds }),
             ...(Array.isArray(entry.messages) ? { messages: [...entry.messages] } : {})
+        });
+    }
+
+    // C5: join the invalid-transcript roster. The server either keeps the thread's
+    // `threads[]` row and ALSO names it in `invalidThreads` (its `messages` cannot be
+    // typed as `HarnessMessage[]`), or reports the conversation ONLY there. Both
+    // shapes must reach the same surfaces, so the record is stamped onto a matching
+    // entry and synthesized for one the roster lost. A conversation the reader cannot
+    // see cannot be repaired, which is the whole point of the editable transcript.
+    //
+    // A synthesized entry is a HONEST PARTIAL: no status/origin is knowable from the
+    // invalid record, so it reads as an idle host conversation and the server stays
+    // the authority for what is actually running (a 409 on delete/steer is possible
+    // and handled by the existing paths).
+    const invalidRecords = invalidThreadsOf(session);
+    for (const record of invalidRecords) {
+        const existing = threads.find((entry) => entry.id === record.id);
+        if (existing !== undefined) {
+            existing.invalid = record;
+            continue;
+        }
+
+        threads.push({
+            id: record.id,
+            agent: record.agent ?? '',
+            origin: 'host',
+            status: 'idle',
+            sequence: threads.length + 1,
+            ...(record.label === undefined ? {} : { label: record.label }),
+            invalid: record
         });
     }
 
