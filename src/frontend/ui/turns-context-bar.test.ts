@@ -207,7 +207,7 @@ describe('one bar per turn', () => {
         expect(tile().querySelector('.context-bar-host')?.hidden).toBe(false);
     });
 
-    it('sizes each segment by its exact characters, with a visible gap between them', () => {
+    it('sizes each segment by its recorded TIME and each bar by its characters (R27)', () => {
         const view = documentOf([summary()], { t1: [rootSection({ context: CONTEXT })] });
         const { board, tile } = mount();
         board.upsertView(summary(), view).renderDisplay((view.displays as Record<string, TurnDisplay>).t1);
@@ -215,18 +215,25 @@ describe('one bar per turn', () => {
         const segments = blocksOf(tile());
         const weights = segments.map((node) => Number(node.style.flexGrow));
 
-        // 1,184 characters is the widest segment and 40 the narrowest, and the order of the
-        // weights is the order of the characters. The numbers are the model's shares of the
-        // fallback track (640px, 2px gaps) scaled to flex units: 40/1,574, 60/1,574,
-        // 200/1,574, 1,184/1,574 and 90/1,574.
-        expect(Math.max(...weights)).toBe(Number(segments[3].style.flexGrow));
-        expect(Math.min(...weights)).toBe(Number(segments[0].style.flexGrow));
-        expect(weights).toEqual([254, 381, 1271, 7522, 572]);
+        // The two prompt-ish blocks were never bracketed, so they hold the honest BASELINE and
+        // never a share of the timeline; the three 800ms blocks divide what is left equally.
+        // The numbers are the model's shares of the fallback track (640px, 2px gaps = 632px
+        // usable) scaled to flex units: 8/632 -> 127, and (616/3)/632 -> 3249.
+        expect(weights).toEqual([127, 127, 3249, 3249, 3249]);
+        expect(segments.map((node) => node.dataset.durationKnown)).toEqual(['false', 'false', 'true', 'true', 'true']);
+        // The WIDEST bar by characters (1,184) is NOT the widest segment any more — the axis
+        // changed, and this is the assertion that pins which axis drives which direction.
+        expect(segments.map((node) => node.dataset.heightPx)).toEqual(['3', '3', '6', '36', '3']);
+        expect(segments.map((node) => node.style.height)).toEqual(['3px', '3px', '6px', '36px', '3px']);
         // Every weight is at least 1 flex unit: a recorded block never disappears.
         expect(weights.every((weight) => weight >= 1)).toBe(true);
         // The gap is the model's, and CSS keeps it (see ui/context-bar-style.test.ts).
         expect(tile().querySelector('.context-bar')?.getAttribute('data-mode')).toBe('dom');
         expect(tile().querySelector('.context-bar')?.querySelectorAll('.context-bar-segment')).toHaveLength(5);
+        expect(tile().querySelector('.context-bar')?.getAttribute('data-gap-px')).toBe('2');
+        expect(tile().querySelector('.context-bar')?.getAttribute('data-unknown-durations')).toBe('2');
+        expect(tile().querySelector('.context-bar')?.getAttribute('data-total-duration-ms')).toBe('2400');
+        expect(tile().querySelector('.context-bar')?.getAttribute('data-max-chars')).toBe('1184');
     });
 
     it('gives the root strip only its own segments, and the delegated card its own strip', () => {
@@ -330,7 +337,8 @@ describe('one bar per turn', () => {
         // accessible name. The unit still has to be spelled out, so a reader can never
         // mistake this strip for a context-window gauge.
         expect(bar.getAttribute('aria-label')).toBe(
-            'context character distribution · 5 segments · 1,574 characters · 200 characters not replayed into the prompt'
+            'context bar: width is time taken, height is recorded characters · 5 segments · 1,574 characters' +
+                ' · 2.4s of recorded time · 2 segments have no recorded time · 200 characters not replayed into the prompt'
         );
         expect(bar.querySelector('.context-bar-caption')?.textContent).toBe('5 segments');
         // T22 (R24): count only on the printed line. The label phrase that used to head it,
@@ -339,7 +347,7 @@ describe('one bar per turn', () => {
         // acted on them. Both stay in the ACCESSIBLE name above, and every segment still
         // states its own exact figures, so the strip can never read as a token gauge.
         expect(bar.querySelector('.context-bar-caption')?.textContent).not.toContain('characters');
-        expect(bar.querySelector('.context-bar-caption')?.textContent).not.toContain('context character distribution');
+        expect(bar.querySelector('.context-bar-caption')?.textContent).not.toContain('context bar: width is time taken');
         expect(bar.querySelectorAll<HTMLElement>('.context-bar-segment')[3].title).toContain('1,184 characters');
         expect(bar.textContent).not.toMatch(/token/i);
     });
@@ -539,7 +547,7 @@ describe('a running turn', () => {
         // lives on in `aria-label` only.
         expect(tile().querySelector('.context-bar-caption')?.textContent).toBe('no recorded context');
         expect(tile().querySelector('.context-bar')?.getAttribute('aria-label')).toBe(
-            'context character distribution · no recorded context'
+            'context bar: width is time taken, height is recorded characters · no recorded context'
         );
         // A bar with nothing in it does not get to swallow three hundred recorded calls.
         expect(tile().querySelectorAll('.tool')).toHaveLength(1);

@@ -51,6 +51,16 @@
        of drifting from it as two hand-tuned magic numbers. */
     --scratch-fab-size: 32px;
 
+    /* Context bar geometry (T26, R27) — the ONE source for the strip's vertical scale.
+       The canvas painter reads all three (`ui/context-bar.ts` `resolveContextBarTrackHeights`)
+       and the stylesheet uses the same values, so "maximum 2 line-heights" is the same two
+       lines of THIS host's text in both renderers, at any theme, font size or
+       `devicePixelRatio` (the ratio only ever scales the canvas backing store). A host that
+       restyles the bar overrides the tokens and never has to touch the painter. */
+    --context-bar-line-height: 18px;
+    --context-bar-max-height: 36px;
+    --context-bar-min-height: 3px;
+
     /* Agent identity (R3, recoloured by T5/R4). Every agent-owned block is painted from
        ui/agent-color.ts, which overrides these two on the element: `.tile` and `.agent`
        plus the `IT1`/`RR2` labels (`.thread-tile`/`.thread-select`, ui/turns.ts),
@@ -6761,8 +6771,17 @@ summary::-webkit-details-marker {
    pins both numbers:
      - the visible gap between segments is `CONTEXT_BAR_GAP_PX` (2px) in DOM mode, so
        the segments read as separate blocks instead of one merged band;
-     - the track height is `CONTEXT_BAR_TRACK_HEIGHT_PX` (18px) for BOTH modes, so the
-       canvas pixels and the flex row describe the same box.
+     - the strip's box is `CONTEXT_BAR_MAX_TRACK_HEIGHT_PX` (36px = two line-heights) for
+       BOTH modes, so the canvas pixels and the flex row describe the same rectangle. The
+       painter sizes each strip to its OWN tallest bar with an inline height; the value in
+       this sheet is what a host with no inline style (or no JS at all) keeps.
+
+    T26 (R27) made the strip TWO-DIMENSIONAL: a segment's WIDTH is the recorded time taken
+    and its HEIGHT is the recorded context size, normalized per strip and capped at two
+    line-heights. Every bar sits on the strip's bottom edge — `align-items: flex-end` here,
+    `height - barHeight` in the canvas — which is why the row is a flex box that SEATS bars
+    instead of a track that stretches them. The three vertical numbers live once, as the
+    `--context-bar-*` tokens in `:root`, and the painter reads them off the document.
 
    Colours come from `data-tone`, which ./view-context.ts `contextBarToneOf` decided
    from the SERVER's `kind`/`state`: settled tool green, failed/cancelled tool red,
@@ -6797,30 +6816,44 @@ summary::-webkit-details-marker {
     outline-offset: 1px;
 }
 
-/* Canvas mode: one element, sized by the model's own geometry. `height` also arrives as
-   an inline style from the painter (jsdom has no layout, so the stylesheet is the
-   contract here and the inline value is the one that survives a missing rule). */
+/* Canvas mode: one element, sized by the model's own geometry. The MAXIMUM box (two
+   line-heights, R27) is the fallback; the painter sets the strip's own inline height from
+   `layout.heightPx`, and the canvas BACKING STORE is that height times `devicePixelRatio`,
+   which is why a bar capped at 2lh is 2lh physically at 1x, 2x and a 90% zoom. */
 .context-bar-canvas {
     display: block;
     width: 100%;
-    height: 18px;
+    height: var(--context-bar-max-height);
 }
 
-/* DOM mode: the same box, built from flex weights instead of pixels. */
+/* DOM mode: the same box, built from flex weights instead of pixels. `align-items:
+   flex-end` SEATS the bars on the strip's bottom edge — the canvas draws each bar at
+   `height - barHeight`, and a strip whose bars floated in the middle of the track would
+   read as two different charts in the two modes (R28). */
 .context-bar-segments {
     display: flex;
     flex-direction: row;
-    align-items: stretch;
+    align-items: flex-end;
     gap: 2px;
-    height: 18px;
+    height: var(--context-bar-max-height);
     overflow: hidden;
     border-radius: 3px;
 }
 
+/* The bar itself. The inline `height` the model sets is its VERTICAL value (R27: recorded
+   context size, normalized per strip, at most two line-heights), and
+   `--context-bar-max-height` is what an unstyled host keeps so the strip never collapses to
+   a line. The box is a flex column so the in-segment name is vertically centred the way the
+   canvas centres it (`textBaseline: middle`), which keeps the two renderers' labels in the
+   same place. */
 .context-bar-segment {
-    display: block;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-self: flex-end;
     min-width: 1px;
-    height: 100%;
+    min-height: var(--context-bar-min-height);
+    height: var(--context-bar-max-height);
     margin: 0;
     padding: 0;
     overflow: hidden;
@@ -6865,8 +6898,11 @@ summary::-webkit-details-marker {
     outline-offset: -2px;
 }
 
-/* In-segment name: only minted for a uncrowded bar (CONTEXT_BAR_DOM_LABEL_LIMIT), and
-   clipped rather than wrapped so one long tool name cannot resize the track. */
+/* In-segment name: only minted for an uncrowded bar (CONTEXT_BAR_DOM_LABEL_LIMIT) AND for a
+   segment that is wide enough (`CONTEXT_BAR_LABEL_MIN_PX`) and one line-height tall enough to
+   hold it — the same two gates the canvas applies, so a segment carries a label in one mode
+   exactly when it does in the other (R28). Clipped rather than wrapped, so one long tool name
+   cannot resize the track. */
 .context-bar-segment-name {
     display: block;
     padding: 0 4px;
@@ -6874,7 +6910,7 @@ summary::-webkit-details-marker {
     color: var(--bg);
     font-family: var(--mono);
     font-size: 10px;
-    line-height: 18px;
+    line-height: var(--context-bar-line-height);
     text-overflow: ellipsis;
     white-space: nowrap;
 }
@@ -6916,9 +6952,11 @@ summary::-webkit-details-marker {
 }
 
 /* An authoritative empty bar (every section answered `context: []`) says so, rather than
-   showing a blank track that could be read as "nothing ran". */
+   showing a blank track that could be read as "nothing ran". One line-height is the minimum:
+   `layoutContextBar` reports the base box for an empty strip, and the dashed frame needs that
+   much height to read as a box rather than as a rule. */
 .context-bar[data-empty='true'] .context-bar-segments {
-    min-height: 18px;
+    min-height: var(--context-bar-line-height);
     border: 1px dashed var(--border-strong);
 }
 
@@ -7007,6 +7045,13 @@ summary::-webkit-details-marker {
     overflow-wrap: anywhere;
 }
 
+/* T26 (R26): the prose body is the CURRENT window of the block, not its first lines.
+   `ui/turns.ts` paints `ContextTail.renderText` — the latest `CONTEXT_TAIL_PREVIEW_CHARS`
+   characters (the same bound the display contract already publishes, no new number) — and
+   marks the box `data-follow='latest'`, scrolling it to the bottom so a thinking window that
+   is still streaming reads as TEXT THAT MOVES rather than a static opening sentence. The
+   height bound below stays as the outer safety rail: a window is short by construction, and a
+   host with a bigger line-height still cannot grow the tile without limit. */
 .context-bar-tail-body {
     margin: 0;
     max-height: 22rem;
@@ -7039,7 +7084,14 @@ summary::-webkit-details-marker {
 
 /* Byte-identical to the recorded payload: the pane's text is written with `textContent`
    and nothing here adds generated content, so `pre[data-field]` reads back exactly the
-   bytes the server sent (the rule `ui/tools.ts` states for its own viewer). */
+   bytes the server sent (the rule `ui/tools.ts` states for its own viewer).
+
+   T26 (R26): a recorded payload is NOT windowed the way a prose preview is — capping the
+   bytes T25 made whole would be the gratuitous cap the requirement warns off. What the pane
+   does instead is follow the newest byte: `ui/turns.ts` marks it `data-follow='latest'` and
+   scrolls it to the bottom when its CONTENT changes, so a long running result shows its end
+   rather than a frozen beginning. The full bytes remain one scroll up, and the exact
+   recorded length stays printed in the caption line above. */
 .context-bar-tail-pane-body {
     margin: 0;
     max-height: 14rem;

@@ -179,9 +179,11 @@ describe('the ops a live run sends rebuild the exact tree a reload receives', ()
         const [liveThink] = reasoningNodes(live);
         const [coldThink] = reasoningNodes(cold);
 
-        // 320 characters of head-kept preview + the ellipsis marker, and the FULL recorded
-        // length beside it — never the preview's length, and never an empty body.
-        expect(liveThink.text).toBe(`${THINKING.slice(0, 319)}\u2026`);
+        // 320 characters of LATEST-kept preview (T26, R26: the newest bytes survive the bound,
+        // so a reconnect replays what the reader was watching rather than the opening line)
+        // plus the marker, and the FULL recorded length beside it — never the preview's length,
+        // and never an empty body.
+        expect(liveThink.text).toBe(`\u2026${THINKING.slice(-319)}`);
         expect(liveThink.text.length).toBe(320);
         expect(liveThink.chars).toBe(THINKING.length);
         expect(liveThink.redacted).toBe(true);
@@ -192,9 +194,9 @@ describe('the ops a live run sends rebuild the exact tree a reload receives', ()
         const liveProse = proseNodes(live);
         const [superseded, current] = liveProse;
 
-        // The older answer: preview bytes + its true length + the marker, exactly what the
-        // reload's tree carries.
-        expect(superseded.text).toBe(`${'a'.repeat(319)}\u2026`);
+        // The older answer: latest-kept preview bytes + its true length + the marker, exactly
+        // what the reload's tree carries.
+        expect(superseded.text).toBe(`\u2026${'a'.repeat(319)}`);
         expect(superseded.chars).toBe(FIRST_ANSWER.length);
         expect(superseded.redacted).toBe(true);
 

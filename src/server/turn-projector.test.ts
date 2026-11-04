@@ -17,7 +17,7 @@
 
 import { describe, expect, it } from 'vitest';
 import type { HarnessEvent } from '../harness';
-import { DISPLAY_ARGS_PREVIEW_CHARS, DISPLAY_PANELS_PER_STEP, DISPLAY_PREVIEW_CHARS, DISPLAY_TAIL_PAYLOAD_CHARS } from '../shared/turn-display';
+import { DISPLAY_ARGS_PREVIEW_CHARS, DISPLAY_PANELS_PER_STEP, DISPLAY_PREVIEW_CHARS } from '../shared/turn-display';
 import type {
     DisplayProjectContext,
     TurnDisplayOp,
@@ -26,7 +26,7 @@ import type {
     TurnSection
 } from '../shared/turn-display';
 import type { SessionTurn } from './protocol';
-import { createTurnProjector, formatDuration, previewText, projectTurn, refoldTurn, steerSubmitList } from './turn-projector';
+import { createTurnProjector, formatDuration, previewText, previewTextTail, projectTurn, refoldTurn, steerSubmitList } from './turn-projector';
 
 const turnOf = (overrides: Partial<SessionTurn> = {}): SessionTurn => ({
     id: 'turn-1',
@@ -426,22 +426,27 @@ describe('compactness bounds (R1)', () => {
         expect(step.detail.truncated).toBe(true);
 
         // The STEP is still a summary, so a RAIL or a re-issued `step:set` never carries a
-        // megabyte: the full bytes appear exactly once, on the ONE designated tail block,
-        // each field bounded by `DISPLAY_TAIL_PAYLOAD_CHARS` with `truncated: true` saying
-        // the record holds more (and the lazy step/block routes still answer in full).
-        const tail = result.display().sections[0].tail as NonNullable<TurnSection['tail']>;
+        // megabyte. The full bytes ride the ONE designated tail block EXACTLY as recorded —
+        // T25 removed the display contract's own 64 KiB cap, so `truncated` is false and the
+        // body is the whole recorded request AND response (the lazy step/block routes still
+        // answer in full, and the step keeps its own bounded previews, asserted above).
+        const display = result.display();
+        const tail = display.sections[0].tail as NonNullable<TurnSection['tail']>;
 
         expect(tail).toEqual({
             kind: 'tool',
             nodeId: '1',
             blockId: '0-tool-1',
             chars: huge.length * 2,
-            truncated: true,
-            args: huge.slice(0, DISPLAY_TAIL_PAYLOAD_CHARS),
-            result: huge.slice(0, DISPLAY_TAIL_PAYLOAD_CHARS)
+            truncated: false,
+            args: huge,
+            result: huge
         });
-        expect(JSON.stringify(result.display())).toContain('SENTINEL');
-        expect(JSON.stringify(result.display()).length).toBeLessThan(DISPLAY_TAIL_PAYLOAD_CHARS * 5);
+        // "Once, and once only": the WHOLE payload string occurs twice in the compiled view
+        // — its request and its response — never a third time in a duplicated tail, a step
+        // or a notice. The 280/200-character previews are strictly shorter, so they cannot
+        // hold this string, which is what makes the count an exact claim.
+        expect(JSON.stringify(display).split(huge).length - 1).toBe(2);
         // The compact ROW — what the rail and every list read — still holds no payload.
         expect(JSON.stringify(result.summary())).not.toContain('SENTINEL');
     });
@@ -1000,6 +1005,25 @@ describe('live and replay are one fold (the parity rule)', () => {
         expect(previewText('**bold** and `code`', 200)).toBe('bold and code');
         expect(previewText('x'.repeat(30), 10)).toBe(`${'x'.repeat(9)}\u2026`);
     });
+
+    it('previewTextTail keeps the LATEST characters behind a leading marker (T26, R26)', () => {
+        // The prose-node bound, in the other direction: the newest text survives, and the
+        // marker moves to the FRONT so a reader can never mistake the window for an opening.
+        expect(previewTextTail('a'.repeat(200) + 'b'.repeat(400), 320)).toBe(`\u2026${'b'.repeat(319)}`);
+        // Under the bound the body is verbatim, with no marker at all.
+        expect(previewTextTail('the whole body', 320)).toBe('the whole body');
+        // The same flattening rules as the head preview: ONE definition of "flattened".
+        expect(previewTextTail('**bold** and `code`', 200)).toBe('bold and code');
+        // Same total length as `previewText` for the same input, which is what lets the two
+        // directions share one configured bound without changing any size assertion.
+        expect(previewTextTail('x'.repeat(30), 10)).toBe(`\u2026${'x'.repeat(9)}`);
+        expect(previewTextTail('x'.repeat(30), 10).length).toBe(previewText('x'.repeat(30), 10).length);
+        // A bound of 1 or 0 states the marker, never an empty box that could be a missing body.
+        expect(previewTextTail('abc', 1)).toBe('\u2026');
+        expect(previewTextTail('abc', 0)).toBe('\u2026');
+        // An astral cut opens on a whole code point.
+        expect(previewTextTail('a'.repeat(300) + '\u{1F468}', 3)).toBe(`\u2026\u{1F468}`);
+    });
 });
 
 // ---------------------------------------------------------------------------
@@ -1185,12 +1209,13 @@ describe('context bar (R6/R8)', () => {
 
         // R23 (T23): the thinking window WAS the section's displayed body, so every delta
         // travelled whole; the answer is the newest block now, so the wire copy is the
-        // 320-character preview and the EXACT 600 lives on the segment (and on the lazy
+        // 320-character preview of its LATEST characters (T26, R26 — the opening lines are
+        // what the reader already saw) and the EXACT 600 lives on the segment (and on the lazy
         // detail route). A historical window is never replayed in full.
         expect(nodes[0]).toEqual({
             kind: 'reasoning',
             id: 'n1',
-            text: `${'a'.repeat(200)}${'b'.repeat(119)}\u2026`,
+            text: `\u2026${'b'.repeat(119)}${'c'.repeat(200)}`,
             chars: 600,
             redacted: true
         });
@@ -1264,7 +1289,7 @@ describe('context bar (R6/R8)', () => {
                 turnId: 'turn-1',
                 sectionId: 'turn-1:0',
                 nodeId: 'n1',
-                patch: { text: `${'a'.repeat(200)}${'b'.repeat(119)}\u2026`, chars: 600, redacted: true }
+                patch: { text: `\u2026${'b'.repeat(119)}${'c'.repeat(200)}`, chars: 600, redacted: true }
             },
             {
                 op: 'tail:set',
@@ -1303,7 +1328,7 @@ describe('context bar (R6/R8)', () => {
                 turnId: 'turn-1',
                 sectionId: 'turn-1:0',
                 nodeId: 'n1',
-                patch: { text: `${'a'.repeat(319)}\u2026`, chars: 400, redacted: true }
+                patch: { text: `\u2026${'a'.repeat(319)}`, chars: 400, redacted: true }
             },
             {
                 op: 'tail:set',
@@ -1325,7 +1350,7 @@ describe('context bar (R6/R8)', () => {
         expect(nodes[0]).toEqual({
             kind: 'text',
             id: 'n1',
-            text: `${'a'.repeat(319)}\u2026`,
+            text: `\u2026${'a'.repeat(319)}`,
             committed: true,
             chars: 400,
             redacted: true

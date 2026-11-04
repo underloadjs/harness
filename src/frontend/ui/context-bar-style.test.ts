@@ -5,7 +5,11 @@
 //
 //   - the two numbers that MUST agree with `view-context.ts` (the painter cannot ask CSS
 //     for either one): `CONTEXT_BAR_GAP_PX` as `.context-bar-segments { gap }` and
-//     `CONTEXT_BAR_TRACK_HEIGHT_PX` as the track height in BOTH modes;
+//     `CONTEXT_BAR_MAX_TRACK_HEIGHT_PX` as the strip box in BOTH modes — the latter published
+//     as the `--context-bar-*` tokens in `:root`, which `resolveContextBarTrackHeights` reads
+//     so a theme change moves the canvas and the DOM row together (T26, R27);
+//   - that the DOM row SEATS its bars (`align-items: flex-end`) exactly as the canvas
+//     bottom-aligns its rectangles (R28);
 //   - the tone table, from the same `--ok` / `--danger` / `--warn` / `--text` values
 //     `CONTEXT_BAR_TONE_STYLES` repeats for the canvas, so a theme change to one of the
 //     four tokens moves both renderers together;
@@ -26,7 +30,15 @@
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { expect, it } from 'vitest';
-import { CONTEXT_BAR_GAP_PX, CONTEXT_BAR_TRACK_HEIGHT_PX, CONTEXT_BAR_TONE_STYLES } from '../view-context';
+import {
+    CONTEXT_BAR_GAP_PX,
+    CONTEXT_BAR_LINE_HEIGHT_PX,
+    CONTEXT_BAR_MAX_HEIGHT_LINES,
+    CONTEXT_BAR_MAX_TRACK_HEIGHT_PX,
+    CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX,
+    CONTEXT_BAR_TONE_STYLES,
+    CONTEXT_BAR_TRACK_HEIGHT_PX
+} from '../view-context';
 
 const stylesheet = ['src/frontend/styles.css', 'src/styles.css']
     .map((candidate) => resolve(process.cwd(), candidate))
@@ -45,22 +57,53 @@ const blockOf = (selector: string): string => {
     return css.slice(open + 1, close);
 };
 
-it('gives DOM mode the model gap and the model track height', () => {
+it('gives DOM mode the model gap and the model strip box', () => {
     const segments = blockOf('.context-bar-segments {');
 
     // `gap` is what makes the segments VISIBLY separate; without it a proportional bar
     // reads as one merged band and the reader cannot tell where one call ends.
     expect(segments).toContain(`gap: ${CONTEXT_BAR_GAP_PX}px;`);
-    expect(segments).toContain(`height: ${CONTEXT_BAR_TRACK_HEIGHT_PX}px;`);
+    // T26 (R27): the box is the TWO-LINE-HEIGHT ceiling, stated once as a token the painter
+    // also reads. The per-strip inline height `layout.heightPx` overrides it at runtime; this
+    // is what a host with no inline style keeps, and it must agree with the canvas.
+    expect(segments).toContain('height: var(--context-bar-max-height);');
     expect(segments).toContain('display: flex;');
     expect(segments).toContain('flex-direction: row;');
+    // R27/R28: the bars SEAT on the floor. `align-items: stretch` would turn the row back
+    // into a ribbon and disagree with the canvas' bottom-aligned rectangles.
+    expect(segments).toContain('align-items: flex-end;');
     // The floor lives in CSS too, so a flex weight that rounds below a pixel is still
     // aimable (the model promises `width >= 1`, the sheet promises it on the DOM side).
     expect(blockOf('.context-bar-segment {')).toContain('min-width: 1px;');
+    expect(blockOf('.context-bar-segment {')).toContain('height: var(--context-bar-max-height);');
+    expect(blockOf('.context-bar-segment {')).toContain('align-self: flex-end;');
+    expect(blockOf('.context-bar-segment {')).toContain('min-height: var(--context-bar-min-height);');
 });
 
-it('paints the same track height in canvas mode', () => {
-    expect(blockOf('.context-bar-canvas {')).toContain(`height: ${CONTEXT_BAR_TRACK_HEIGHT_PX}px;`);
+it('publishes the vertical scale as tokens the painter resolves, with the model numbers', () => {
+    // One source for "what is a line-height here": the sheet declares the three numbers and
+    // `resolveContextBarTrackHeights` reads them, so a theme that restyles the bar moves BOTH
+    // renderers without either one hardcoding a scale (T26, R27).
+    const root = blockOf(':root {');
+
+    expect(root).toContain(`--context-bar-line-height: ${CONTEXT_BAR_LINE_HEIGHT_PX}px;`);
+    expect(root).toContain(`--context-bar-max-height: ${CONTEXT_BAR_MAX_TRACK_HEIGHT_PX}px;`);
+    expect(root).toContain(`--context-bar-min-height: ${CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX}px;`);
+    // The ceiling is TWO line-heights, and the empty strip reserves exactly one of them.
+    expect(CONTEXT_BAR_MAX_TRACK_HEIGHT_PX).toBe(CONTEXT_BAR_LINE_HEIGHT_PX * CONTEXT_BAR_MAX_HEIGHT_LINES);
+    expect(CONTEXT_BAR_TRACK_HEIGHT_PX).toBe(CONTEXT_BAR_LINE_HEIGHT_PX);
+
+    // The name line uses the same token it is measured against, so a label is never minted
+    // into a bar too short to hold it.
+    expect(blockOf('.context-bar-segment-name {')).toContain('line-height: var(--context-bar-line-height);');
+    // And the dashed "nothing recorded" box keeps one line-height of height.
+    expect(blockOf(".context-bar[data-empty='true'] .context-bar-segments {")).toContain(
+        'min-height: var(--context-bar-line-height);'
+    );
+});
+
+it('paints the same box in canvas mode', () => {
+    expect(blockOf('.context-bar-canvas {')).toContain('height: var(--context-bar-max-height);');
     expect(blockOf('.context-bar-canvas {')).toContain('width: 100%;');
 });
 
@@ -94,8 +137,9 @@ it('puts the figures at the right of the bar, with the unit and without the labe
     // The stats line is where "characters, not tokens" is written down for the reader; the
     // text itself is `contextBarStatsOf`, pinned in view-context.test.ts. T16 (R16b) moved
     // it to the RIGHT edge — the figures belong at the end of the strip the reader just
-    // scanned, and the sentence "context character distribution" is no longer printed at
-    // all (`aria-label` still carries it, from `contextBarSummaryOf`).
+    // scanned, and the sentence "context bar: width is time taken, height is recorded
+    // characters" is no longer printed at all (`aria-label` still carries it, from
+    // `contextBarSummaryOf`).
     const caption = blockOf('.context-bar-caption {');
 
     expect(caption).toContain('font-family: var(--mono);');

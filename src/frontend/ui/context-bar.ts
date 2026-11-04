@@ -19,6 +19,20 @@
 // activation. The mode is reported on `data-mode` and via `mode()` so a host (and a
 // test) can assert which one it got.
 //
+// THE TWO AXES (T26, R27)
+// -----------------------
+// The strip is a column chart, not a stacked ribbon. A segment's WIDTH is the recorded TIME
+// TAKEN (laid out sequentially, never as an overlapping timeline) and its HEIGHT is the
+// recorded CONTEXT SIZE in characters, normalized to the biggest block in the SAME strip and
+// capped at two line-heights; every bar sits on the strip's bottom edge, and both renderers
+// seat, size and hit-test from the one `layoutContextBar` result. The vertical line-height
+// comes from the host (`--context-bar-line-height`, else the computed line-height, else the
+// shared constant), so "2 line-heights" is two lines of THAT host's text at any font size,
+// any theme and any `devicePixelRatio` — the ratio only ever scales the canvas backing store.
+// Aim policy is the column, not the painted pixels: a pointer in the blank area above a short
+// bar still activates that segment, in canvas mode by construction and in DOM mode by the
+// documented x-coordinate fallback in `onSegmentClick`.
+//
 // THE BAR NEVER FETCHES (R8)
 // --------------------------
 // Rendering reads nothing but the block metadata. A request happens when the reader
@@ -35,12 +49,13 @@
 import type { ContextBlock } from '../../shared/turn-display';
 import {
     CONTEXT_BAR_FALLBACK_WIDTH,
-    CONTEXT_BAR_GAP_PX,
     CONTEXT_BAR_LABEL,
-    CONTEXT_BAR_MIN_SEGMENT_PX,
+    CONTEXT_BAR_LINE_HEIGHT_PX,
+    CONTEXT_BAR_MAX_HEIGHT_LINES,
+    CONTEXT_BAR_MAX_TRACK_HEIGHT_PX,
+    CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX,
     CONTEXT_BAR_OPTION_LIMIT,
     CONTEXT_BAR_TONE_STYLES,
-    CONTEXT_BAR_TRACK_HEIGHT_PX,
     contextBarSegmentAt,
     contextBarStatsOf,
     contextBarSummaryOf,
@@ -55,6 +70,11 @@ import type { ContextBarLayout, ContextBarModel } from '../view-context';
 // be clipped to noise, so the colour and the tooltip carry it instead. The DOM mode uses
 // the same idea for whether a segment carries a label element at all.
 export const CONTEXT_BAR_LABEL_MIN_PX = 44;
+
+// T26 (R27): and it needs the bar to be at least this many line-heights tall, because a
+// 6px-high bar has no room for an 18px line of text. Both modes apply this rule, so a
+// segment is labelled in the DOM fallback exactly when it is labelled on the canvas.
+export const CONTEXT_BAR_LABEL_MIN_LINES = 1;
 
 // In-segment label colour. The segment itself IS the background, so the text is the
 // track's own dark (the `styles.css` `--bg`), not a per-tone computation.
@@ -81,6 +101,10 @@ export type ContextBarOptions = {
     /** Geometry overrides, primarily for a host that paints a denser bar. */
     gapPx?: number;
     minSegmentPx?: number;
+    /** Vertical overrides (R27): a host that knows its own line-height passes it here. */
+    lineHeightPx?: number;
+    maxHeightPx?: number;
+    minSegmentHeightPx?: number;
 };
 
 export type ContextBarMode = 'canvas' | 'dom';
@@ -123,6 +147,79 @@ const toneColorOf = (tone: ReturnType<typeof contextBarToneOf>, computed: CSSSty
     const value = typeof raw === 'string' ? raw.trim() : '';
 
     return value.length > 0 ? value : style.color;
+};
+
+// A resolved CSS length in pixels, or undefined for anything this painter cannot use.
+// `getComputedStyle` answers with an ABSOLUTE value, so a `px` result is already device-
+// independent; `normal`, a unitless `1.5`, an `em`, a `%` or an unset custom property all
+// answer undefined, which is what keeps a themeless host (and jsdom, which lays nothing out)
+// on the documented constants instead of on NaN.
+const pixelsOf = (value: string | null | undefined): number | undefined => {
+    const raw = typeof value === 'string' ? value.trim() : '';
+    const match = /^(\d+(?:\.\d+)?)px$/.exec(raw);
+
+    if (match === null) return undefined;
+
+    const parsed = Number.parseFloat(match[1]);
+
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
+};
+
+/** The vertical band one strip paints into: one line-height, its 2-line ceiling, and the
+ *  shortest bar that still reads as a bar. */
+export type ContextBarTrackHeights = {
+    lineHeightPx: number;
+    maxHeightPx: number;
+    minSegmentHeightPx: number;
+};
+
+/**
+ * Resolve the vertical scale from the HOST (T26, R27), in this order:
+ *
+ *   1. `--context-bar-line-height` / `--context-bar-max-height` / `--context-bar-min-height`
+ *      on the document root — the tokens `styles.css` ships, and the only way a themed host
+ *      can say "my line-height is 22px" without the painter guessing;
+ *   2. the bar element's own computed `line-height` (inherited from the host's prose), which
+ *      is the literal "line-height" a reader counts;
+ *   3. the constants in ../view-context.ts, which `styles.css` mirrors so the DOM fallback is
+ *      sized identically without any JS.
+ *
+ * The ceiling is always TWO line-heights of whatever scale won (R27), and everything here is
+ * CSS pixels: `devicePixelRatio` scales the canvas backing store only, so 2lh measures the
+ * same at 1x, 2x and a 90% browser zoom.
+ */
+export const resolveContextBarTrackHeights = (element: HTMLElement): ContextBarTrackHeights => {
+    const fallback: ContextBarTrackHeights = {
+        lineHeightPx: CONTEXT_BAR_LINE_HEIGHT_PX,
+        maxHeightPx: CONTEXT_BAR_MAX_TRACK_HEIGHT_PX,
+        minSegmentHeightPx: CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX
+    };
+
+    if (typeof getComputedStyle !== 'function') return fallback;
+
+    let tokens: CSSStyleDeclaration | undefined;
+    let own: CSSStyleDeclaration | undefined;
+
+    try {
+        tokens = getComputedStyle(document.documentElement);
+        own = getComputedStyle(element);
+    } catch {
+        return fallback;
+    }
+
+    const token = (name: string): number | undefined => (tokens === undefined ? undefined : pixelsOf(tokens.getPropertyValue(name)));
+
+    const lineHeightPx = token('--context-bar-line-height') ?? pixelsOf(own?.lineHeight) ?? fallback.lineHeightPx;
+    const maxHeightPx = token('--context-bar-max-height') ?? lineHeightPx * CONTEXT_BAR_MAX_HEIGHT_LINES;
+    const minSegmentHeightPx = token('--context-bar-min-height') ?? fallback.minSegmentHeightPx;
+
+    return {
+        lineHeightPx,
+        maxHeightPx: Math.max(1, Math.round(maxHeightPx)),
+        // A ceiling below the floor is a broken token pair: the floor cannot win, because
+        // "maximum 2 line-heights" is the rule the reader sees.
+        minSegmentHeightPx: Math.max(1, Math.min(Math.round(minSegmentHeightPx), Math.round(maxHeightPx)))
+    };
 };
 
 /**
@@ -197,24 +294,48 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
     // --- geometry ---------------------------------------------------------
 
     // Measured width, with the documented fallbacks: an explicit `setWidth` (or a width a
-    // resize observer just measured), then the laid-out host, then the caller's initial
-    // hint, then CONTEXT_BAR_FALLBACK_WIDTH. A detached tile (jsdom, a collapsed
+    // resize observer just measured), then the laid-out PAINTED SURFACE, then the caller's
+    // initial hint, then CONTEXT_BAR_FALLBACK_WIDTH. A detached tile (jsdom, a collapsed
     // conversation) therefore still has real geometry, and a host that LAYS OUT later gets
     // its true width from the observer rather than keeping the hint.
+    //
+    // T27 (parity check): the surface first, NOT the wrapper. The canvas and the flex row are
+    // both `width: 100%` of `.context-bar`'s CONTENT box, while `element.clientWidth` also
+    // counts the strip's own `padding: 4px` — 8px of phantom track. Sizing the geometry from
+    // the wrapper squashed every bar by that ratio and drifted the pointer mapping (the canvas
+    // hit test measures `canvas.getBoundingClientRect()`, i.e. the content box), and it stays
+    // wrong for a host with no `ResizeObserver` to correct it. The observer path already reports
+    // the content box, so this only makes the pre-observer and observer-less paths agree with it.
+    const surfaceWidth = (): number =>
+        (mode === 'canvas' ? canvas.clientWidth : rows.clientWidth) || element.clientWidth || 0;
+
     const resolveWidth = (): number => {
         if (width > 0) return width;
 
-        const measured = element.clientWidth || canvas.clientWidth || 0;
+        const measured = surfaceWidth();
         if (measured > 0) return measured;
         if (options.width !== undefined && options.width > 0) return options.width;
 
         return CONTEXT_BAR_FALLBACK_WIDTH;
     };
 
+    // The vertical band (R27), resolved whenever the bar is (re)laid out and then CACHED:
+    // `recompute` also runs on a pointer event to re-aim the geometry, and a hit test must not
+    // pay for a style read. A font or theme change reaches the bar as a resize (a browser zoom
+    // changes the laid-out width too, whenever the host is width-relative), and every resize path
+    // goes through `apply`, which re-resolves. A zoom inside a FIXED-PIXEL host moves only
+    // `devicePixelRatio`, which `paint()` re-reads on any repaint but nothing forces on its own —
+    // a stated limit, and it costs resolution only: 2 line-heights stay 2 line-heights in CSS
+    // pixels at every ratio, because the ratio scales the backing store alone.
+    let heights = resolveContextBarTrackHeights(element);
+
     const recompute = (): void => {
         layout = layoutContextBar(model?.blocks ?? [], resolveWidth(), {
             ...(options.gapPx === undefined ? {} : { gapPx: options.gapPx }),
-            ...(options.minSegmentPx === undefined ? {} : { minSegmentPx: options.minSegmentPx })
+            ...(options.minSegmentPx === undefined ? {} : { minSegmentPx: options.minSegmentPx }),
+            lineHeightPx: options.lineHeightPx ?? heights.lineHeightPx,
+            maxHeightPx: options.maxHeightPx ?? heights.maxHeightPx,
+            minSegmentHeightPx: options.minSegmentHeightPx ?? heights.minSegmentHeightPx
         });
     };
 
@@ -224,13 +345,17 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
         if (mode !== 'canvas' || context === null || destroyed) return;
 
         const tracks = layout;
-        const height = CONTEXT_BAR_TRACK_HEIGHT_PX;
+        // The strip's box is the TALLEST bar in this strip (at most two line-heights), so the
+        // canvas and the DOM row reserve the same rectangle and the reader can compare bar
+        // bottoms across both modes. An empty strip keeps the base box (the dashed
+        // "nothing recorded" affordance), which `layout.heightPx` already says.
+        const height = Math.max(1, tracks.heightPx);
         const ratio = typeof window === 'undefined' ? 1 : window.devicePixelRatio || 1;
 
         // Backing store at device scale, coordinates in CSS pixels: one line of setup per
         // repaint, so a resize or a DPR change (a zoom) needs no extra bookkeeping.
         canvas.width = Math.max(1, Math.round(tracks.width * ratio));
-        canvas.height = Math.round(height * ratio);
+        canvas.height = Math.max(1, Math.round(height * ratio));
         canvas.style.height = `${height}px`;
 
         context.setTransform(ratio, 0, 0, ratio, 0, 0);
@@ -248,28 +373,39 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
             const tone = contextBarToneOf(segment.block);
             const style = CONTEXT_BAR_TONE_STYLES[tone];
 
+            // BOTTOM-ALIGNED (R27): every bar sits on the strip's floor, so "less context"
+            // reads as a shorter bar against one shared baseline instead of a floating block.
+            const barHeight = Math.max(1, Math.min(segment.heightPx, height));
+            const top = height - barHeight;
+
             context.globalAlpha = style.alpha;
             context.fillStyle = colorOf(tone);
-            context.fillRect(segment.x, 0, segment.width, height);
+            context.fillRect(segment.x, top, segment.width, barHeight);
             context.globalAlpha = 1;
 
-            // The name, but only where it fits (a documented approximation of an 11px
-            // monospace cell, chosen so no text-measurement API is required).
-            if (segment.width >= CONTEXT_BAR_LABEL_MIN_PX && segment.block.name.length * 7 + 12 <= segment.width) {
+            // The name, but only where it fits BOTH ways (a documented approximation of an
+            // 11px monospace cell, chosen so no text-measurement API is required): wide enough
+            // for the glyphs, and one line-height tall enough to hold the line of text.
+            if (
+                segment.width >= CONTEXT_BAR_LABEL_MIN_PX &&
+                segment.heightPx >= tracks.lineHeightPx * CONTEXT_BAR_LABEL_MIN_LINES &&
+                segment.block.name.length * 7 + 12 <= segment.width
+            ) {
                 // The label is painted in the track colour: the segment IS the background,
                 // so one constant stays readable on every tone.
                 context.fillStyle = CONTEXT_BAR_ON_SEGMENT_TEXT;
                 context.font = '11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
                 context.textBaseline = 'middle';
-                context.fillText(segment.block.name, segment.x + 6, height / 2);
+                context.fillText(segment.block.name, segment.x + 6, top + barHeight / 2);
             }
 
             // Focus and hover share one highlight, so the keyboard and the pointer cannot
-            // disagree about which segment is "the current one".
+            // disagree about which segment is "the current one". The ring hugs the PAINTED
+            // bar, which is the thing the reader is looking at.
             if (segment.index === focused) {
                 context.strokeStyle = colorOf('neutral');
                 context.lineWidth = 2;
-                context.strokeRect(segment.x + 1, 1, Math.max(1, segment.width - 2), height - 2);
+                context.strokeRect(segment.x + 1, top + 1, Math.max(1, segment.width - 2), Math.max(1, barHeight - 2));
             }
         }
     };
@@ -280,9 +416,10 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
         // TWO strings, two audiences (T16, R16b):
         //   - `summary` is the ACCESSIBLE name: label phrase + figures, so a screen reader
         //     still hears what the strip is even though the phrase is no longer printed;
-        //   - `stats` is the VISIBLE line under the track: the segment count and the exact
-        //     character total, nothing else. `styles.css` right-aligns it, which is where
-        //     the reader's eye already is after reading the bar left to right.
+        //   - `stats` is the VISIBLE line under the track: the segment COUNT, nothing else
+        //     (T22, R24 — the character totals moved into `aria-label` alone, so losing the
+        //     printed line never loses the figure). `styles.css` right-aligns it, which is
+        //     where the reader's eye already is after reading the bar left to right.
         const summary = model === undefined ? CONTEXT_BAR_LABEL : contextBarSummaryOf(model);
         const stats = model === undefined ? '' : contextBarStatsOf(model);
 
@@ -292,6 +429,17 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
         element.dataset.gapPx = String(layout.gapPx);
         element.dataset.minSegmentPx = String(Math.round(layout.minSegmentPx * 100) / 100);
         element.dataset.width = String(Math.round(layout.width));
+        // T26 (R27): the vertical axis and its scale, readable without a layout pass — the
+        // strip's own box, the two-line ceiling it was capped to, the line-height that ceiling
+        // was counted from, the shortest bar, the strip's height denominator, and how many
+        // segments had no recorded span at all.
+        element.dataset.heightPx = String(Math.round(layout.heightPx));
+        element.dataset.maxHeightPx = String(Math.round(layout.maxHeightPx));
+        element.dataset.lineHeightPx = String(Math.round(layout.lineHeightPx * 100) / 100);
+        element.dataset.minHeightPx = String(Math.round(layout.minSegmentHeightPx));
+        element.dataset.maxChars = String(layout.maxChars);
+        element.dataset.unknownDurations = String(layout.durationsUnknown);
+        element.dataset.totalDurationMs = layout.totalDurationMs === undefined ? '' : String(Math.round(layout.totalDurationMs));
         element.dataset.empty = model !== undefined && model.available && model.blocks.length === 0 ? 'true' : 'false';
         caption.textContent = stats;
 
@@ -308,7 +456,7 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
         if (mode === 'canvas') {
             // Bounded option list: below the limit every segment is enumerable by a screen
             // reader in browse mode; above it the live region is the contract (and the
-            // caption states the totals).
+            // caption states how many segments there are).
             const nodes: Element[] = [];
 
             if (model.blocks.length <= CONTEXT_BAR_OPTION_LIMIT) {
@@ -368,6 +516,22 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
         const withLabels = blocks.length <= CONTEXT_BAR_DOM_LABEL_LIMIT;
         const nodes: Element[] = [];
 
+        // The row is the SAME box the canvas sized itself to, and `styles.css` gives it
+        // `align-items: flex-end` so every bar sits on the strip's bottom edge exactly where
+        // the painter puts it (R28).
+        rows.style.height = layout.heightPx > 0 ? `${Math.round(layout.heightPx)}px` : '';
+
+        // RENDERED gap = the gap the geometry was divided by (T27 parity check). The stylesheet
+        // ships `gap: 2px`, which is `CONTEXT_BAR_GAP_PX` and therefore correct for a short
+        // strip; but `layoutContextBar` SHRINKS the gap when hundreds of segments cannot afford
+        // it (300 bars in a 600px track drop to 1px, 600 bars to 0), and the canvas paints the
+        // shrunk gaps. With a fixed 2px the flex row pays 299px of phantom space at n=300: every
+        // bar clamps to its 1px `min-width`, the row overflows its `overflow: hidden` box, and
+        // the last third of the strip disappears — while `nearestIndex` still aims at columns the
+        // model placed with the shrunk gap. Pinning the inline value keeps both renderers on one
+        // arithmetic (R28) and leaves the CSS default in charge for an unscripted host.
+        rows.style.gap = `${layout.gapPx}px`;
+
         for (const segment of layout.segments) {
             const button = document.createElement('button');
             button.type = 'button';
@@ -380,17 +544,33 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
             button.dataset.state = segment.block.state ?? '';
             button.dataset.chars = String(segment.chars);
             button.dataset.durationMs = contextDurationAttr(segment.block);
+            // R27: which axis is which, per segment. `durationKnown='false'` is the strip's
+            // way of saying "this width is the honest baseline, not a measurement", and the
+            // height figures are what the bar was actually seated at.
+            button.dataset.durationKnown = segment.durationKnown ? 'true' : 'false';
+            button.dataset.heightPx = String(segment.heightPx);
+            button.dataset.heightShare = String(Math.round(segment.heightShare * 10_000) / 10_000);
             button.setAttribute('aria-label', contextSegmentLabelOf(segment.block, segment.index, blocks.length));
             button.title = contextSegmentTitleOf(segment.block);
-            // The weight is the layout's, so both modes are sized by the same arithmetic.
+            // The flex weight carries the layout's WIDTH share and the inline style carries
+            // its HEIGHT, so both modes are sized by one arithmetic (R28).
             button.style.flexGrow = String(Math.max(1, Math.round(segment.share * 10_000)));
             button.style.flexBasis = '0%';
+            button.style.height = `${segment.heightPx}px`;
             // Same roving rule as `paintFocused`: the first segment is the Tab entry until the
             // reader aims somewhere specific.
             button.tabIndex = segment.index === (focused >= 0 ? focused : 0) ? 0 : -1;
             button.dataset.focused = segment.index === focused ? 'true' : 'false';
 
-            if (withLabels) {
+            // The same minting rule the canvas applies (R28): wide enough for the glyphs AND
+            // at least one line-height tall. A 6px bar has no room for an 18px line of text in
+            // either renderer, so a segment is labelled in one mode exactly when it is in the
+            // other.
+            const labelFits =
+                segment.width >= CONTEXT_BAR_LABEL_MIN_PX &&
+                segment.heightPx >= layout.lineHeightPx * CONTEXT_BAR_LABEL_MIN_LINES;
+
+            if (withLabels && labelFits) {
                 const label = document.createElement('span');
                 label.className = 'context-bar-segment-name';
                 label.textContent = segment.block.name;
@@ -404,6 +584,9 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
     };
 
     const apply = (): void => {
+        // Every state change (and every resize, which lands here too) re-reads the host's
+        // vertical scale, so a font or zoom change moves both axes together.
+        heights = resolveContextBarTrackHeights(element);
         recompute();
 
         if (mode === 'dom') buildDomSegments();
@@ -494,7 +677,17 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
 
     const onSegmentClick = (event: MouseEvent): void => {
         const button = (event.target as Element | null)?.closest?.('.context-bar-segment') as HTMLElement | null;
-        if (button === null) return;
+
+        if (button === null) {
+            // T26 (R28) parity, and the documented answer for the blank area: the strip's aim
+            // target is the COLUMN, not the painted pixels. A click above a short bar, or in a
+            // gap between flex items, belongs to the segment whose x-range it landed in — the
+            // exact rule the canvas hit test applies. A miss past the last column stays a miss
+            // (`activateIndex` ignores an index of -1).
+            activateIndex(nearestIndex(localX(event)), 'pointer');
+
+            return;
+        }
 
         const index = Number(button.dataset.index ?? '-1');
         if (mode === 'dom') rememberFocus(index);
@@ -546,7 +739,8 @@ export const mountContextBar = (options: ContextBarOptions = {}): ContextBar => 
         onWindowResize = (): void => {
             if (destroyed) return;
 
-            const measured = element.clientWidth || canvas.clientWidth || 0;
+            // Same origin as `resolveWidth`: the painted surface, not the padded wrapper.
+            const measured = surfaceWidth();
             if (measured <= 0 || Math.round(measured) === Math.round(layout.width)) return;
 
             width = measured;

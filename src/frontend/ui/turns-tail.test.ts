@@ -22,8 +22,8 @@
 //   - a recorded CALL supersedes prose, so the previous body hides when a call lands
 //     (R23: "reasoning -> tool hides previous");
 //   - the designated call prints its COMPLETE recorded request, and its response once the call
-//     settles, as two labelled panes inside that one body — bounded only by
-//     `DISPLAY_TAIL_PAYLOAD_CHARS`, never by the step's own `argsPreview` (R23);
+//     settles, as two labelled panes inside that one body — the exact recorded bytes, capped
+//     by nothing in the display contract (T25) and never by the step's own `argsPreview` (R23);
 //   - a bounded thinking preview is labelled as one, beside the server's EXACT character
 //     count — the browser never claims a 320-character preview is the whole round (R23);
 //   - the visible stats line is the segment COUNT, pluralized correctly (R24);
@@ -247,6 +247,8 @@ const tailState = (scope: Element): Record<string, unknown> | undefined => {
     const tail = tails(scope)[0];
     if (tail === undefined) return undefined;
 
+    const body = tail.querySelector<HTMLElement>('.context-bar-tail-body');
+
     return {
         hidden: tail.hidden,
         kind: tail.dataset.kind,
@@ -254,8 +256,19 @@ const tailState = (scope: Element): Record<string, unknown> | undefined => {
         blockId: tail.dataset.blockId,
         chars: tail.dataset.chars,
         truncated: tail.dataset.truncated,
+        // T26 (R26): the WIRE's truncation state above, and the PANE's below — how many
+        // recorded characters are on screen, whether that is fewer than the record, and the
+        // scroll policy the clipped box declares. `follow` is asserted rather than `scrollTop`
+        // because jsdom has no layout: the intent is the testable fact, the pixel is not. A
+        // prose body follows on its own box; a call's panes follow on each payload box.
+        shownChars: tail.dataset.shownChars,
+        renderBounded: tail.dataset.renderBounded,
+        follow:
+            body?.dataset.follow ??
+            body?.querySelector('pre[data-field]')?.getAttribute('data-follow') ??
+            undefined,
         caption: tail.querySelector('.context-bar-tail-caption')?.textContent,
-        body: tail.querySelector('.context-bar-tail-body')?.textContent
+        body: body?.textContent
     };
 };
 
@@ -311,6 +324,10 @@ describe('the current tail block, streamed frame by frame', () => {
             // The EXACT recorded length (invariant 5), never the preview's length.
             chars: '1234',
             truncated: 'true',
+            // The pane paints those 33 wire characters and says that is all of what it has.
+            shownChars: String(PREVIEW.length),
+            renderBounded: 'true',
+            follow: 'latest',
             caption: `thinking · showing ${PREVIEW.length} of 1,234 characters — click the segment for the exact text`,
             body: PREVIEW
         });
@@ -347,6 +364,67 @@ describe('the current tail block, streamed frame by frame', () => {
             truncated: 'false',
             caption: 'thinking · 30 characters'
         });
+    });
+
+    it('shows the LATEST window of a long body, and moves it as the round streams (R26)', () => {
+        // The requirement in one test: a thinking window longer than the display bound used to
+        // keep its FIRST lines on screen, so the reader watched static text while the model
+        // wrote. The pane now paints the newest `CONTEXT_TAIL_PREVIEW_CHARS` characters behind a
+        // leading `…`, and every delta moves that window forward.
+        const first = `HEAD-${'x'.repeat(380)}`; // 385 characters, over the 320 bound
+        const more = `-TAIL-${'y'.repeat(200)}`; // 206 more
+        const view = documentOf([summary()], { t1: [rootSection()] });
+        const { board, tile } = mount();
+        board.upsertView(summary(), view).renderDisplay(displayOf(view));
+
+        frame(board, view, 't1', [
+            { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: thinkBlock('0-reasoning-3', first.length) },
+            { op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: thinkNode('3', first, { chars: first.length }) }
+        ]);
+
+        const state = tailState(tile()) as Record<string, string | boolean>;
+
+        expect(state.body).toBe(`…${first.slice(-320)}`);
+        // The front is gone from the PAINTED body, and the newest byte is on screen.
+        expect(String(state.body)).not.toContain('HEAD-');
+        expect(String(state.body).endsWith('x')).toBe(true);
+        // `data-chars` is the whole recorded length (invariant 5); `data-shown-chars` is the
+        // window; the caption states both, so a shorter pane never lies about the block.
+        expect(state.chars).toBe('385');
+        expect(state.shownChars).toBe('320');
+        expect(state.renderBounded).toBe('true');
+        expect(state.truncated).toBe('false');
+        expect(state.follow).toBe('latest');
+        expect(state.caption).toBe('thinking · showing 320 of 385 characters — click the segment for the exact text');
+
+        // The next delta: the SAME element, and its text changed — which is the "I can see it
+        // scroll" half of the requirement, and the exact thing the old first-lines body could
+        // never do.
+        frame(board, view, 't1', [
+            { op: 'node:append', turnId: 't1', sectionId: 't1:0', nodeId: '3', delta: more },
+            { op: 'context:set', turnId: 't1', sectionId: 't1:0', blockId: '0-reasoning-3', patch: { chars: first.length + more.length } }
+        ]);
+
+        const grown = tailState(tile()) as Record<string, string | boolean>;
+
+        expect(grown.body).toBe(`…${'x'.repeat(114)}-TAIL-${'y'.repeat(200)}`);
+        expect(grown.body).not.toBe(state.body);
+        expect(grown.chars).toBe('591');
+        expect(grown.shownChars).toBe('320');
+        expect(grown.caption).toBe('thinking · showing 320 of 591 characters — click the segment for the exact text');
+
+        // A body under the bound still prints whole, with no marker and no hedge.
+        frame(board, view, 't1', [
+            { op: 'context:add', turnId: 't1', sectionId: 't1:0', block: thinkBlock('0-reasoning-9', 15) },
+            { op: 'node:insert', turnId: 't1', sectionId: 't1:0', node: thinkNode('9', 'a short thought') }
+        ]);
+
+        const short = tailState(tile()) as Record<string, string | boolean>;
+
+        expect(short.body).toBe('a short thought');
+        expect(short.shownChars).toBe('15');
+        expect(short.renderBounded).toBe('false');
+        expect(short.caption).toBe('thinking · 15 characters');
     });
 
     it('hides the previous body the moment a recorded call becomes the newest block', () => {
@@ -662,6 +740,11 @@ describe('the current call, printed in full at the tail', () => {
             blockId: '0-tool-7',
             chars: String(args.length + result.length),
             truncated: 'false',
+            // A recorded CALL is windowed by nothing: the panes print the bytes whole, so the
+            // painted length equals the recorded one (T25 kept that, T26 only follows the end).
+            shownChars: String(args.length + result.length),
+            renderBounded: 'false',
+            follow: 'latest',
             caption: `read · ok · 800ms · ${args.length + result.length} characters · args ${args.length} + result ${result.length}`,
             // The body element holds two labelled panes: the request first, then the
             // response, each behind its own label, byte for byte.
@@ -713,7 +796,10 @@ describe('the current call, printed in full at the tail', () => {
         expect((tails(tile())[0] as HTMLElement).dataset.state).toBe('running');
         // A call with no recorded result says so instead of leaving a blank box.
         expect(note(tile(), 'result')).toEqual({ text: 'no result recorded for this call yet', note: 'no-result' });
-        expect(tailState(tile())?.caption).toBe(`read · running · ${args.length} characters · args ${args.length} · no result recorded yet`);
+        expect(tailState(tile())?.caption).toBe(
+            // R27: an unsettled call has no span, and the caption says so out loud.
+            `read · running · time not recorded · ${args.length} characters · args ${args.length} · no result recorded yet`
+        );
 
         // 2. the result lands: the designation is re-sent with the response, and the body
         //    grows in place — one element, no new strip, no fetch.

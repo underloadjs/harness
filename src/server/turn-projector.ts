@@ -128,9 +128,13 @@ export const formatDuration = (milliseconds: number): string => {
 
 /** Mirror of `plainPreview` (../frontend/ui/markdown.ts:474). Copied rather than
  *  imported because that module is frontend-owned; the rule itself is pure regex. */
-export const previewText = (text: string, limit: number): string => {
+/** The markdown-stripping, whitespace-collapsing form of a recorded body (shared by both
+ *  preview directions, so there is ONE definition of "flattened for display"). Mirror of
+ *  `plainPreview` (../frontend/ui/markdown.ts:474). */
+const flattenForDisplay = (text: string): string => {
     const source = typeof text === 'string' ? text : '';
-    const flattened = source
+
+    return source
         .replace(/```[^\n]*\n?/g, ' ')
         .replace(/!\[([^\]]*)]\([^)]*\)/g, '$1')
         .replace(/\[([^\]]*)]\([^)]*\)/g, '$1')
@@ -141,10 +145,48 @@ export const previewText = (text: string, limit: number): string => {
         .replace(/\s+/g, ' ')
         .replace(/\s+([.,!?;:])/g, '$1')
         .trim();
+};
+
+export const previewText = (text: string, limit: number): string => {
+    const flattened = flattenForDisplay(text);
 
     if (flattened.length <= limit) return flattened;
 
     return `${flattened.slice(0, Math.max(0, limit - 1)).trimEnd()}\u2026`;
+};
+
+/**
+ * The prose-node bound, from the END (T26, R26): the LATEST characters of a body, not the
+ * earliest.
+ *
+ * `previewText` answers "what is this block about" out of its opening, which is the right
+ * shape for a one-line step, panel or notice summary. A thinking window's NODE body is a
+ * different object: it is the text a reader watches GROW, and a preview pinned to its first
+ * 320 characters is what left the pane showing the same static opening line. Bounding from
+ * the end keeps the newest bytes on the wire, so a live stream, a reconnect and a cold reload
+ * all show the same latest lines — and it matches the render-side window the browser applies
+ * to a whole body (../frontend/view-context.ts `contextTextSuffixOf`), which is what makes
+ * the two bounds one policy instead of two.
+ *
+ * Cutting is display-only, exactly like the head bound: the projector's internal node keeps
+ * every recorded byte, the exact `chars` figure still rides the wire beside the marker, and
+ * the lazy block/step routes answer with the whole payload. The window opens on a whole code
+ * point — a flattened summary has no combining marks left to split, but an emoji survives.
+ */
+export const previewTextTail = (text: string, limit: number): string => {
+    const flattened = flattenForDisplay(text);
+    const bound = Number.isFinite(limit) && limit > 0 ? Math.trunc(limit) : 0;
+
+    if (flattened.length <= bound) return flattened;
+
+    let cut = Math.max(0, flattened.length - Math.max(0, bound - 1));
+
+    // Never open the window between the halves of a surrogate pair.
+    const unit = flattened.charCodeAt(cut);
+
+    if (cut > 0 && cut < flattened.length && unit >= 0xdc00 && unit <= 0xdfff) cut += 1;
+
+    return `\u2026${flattened.slice(cut).trimStart()}`;
 };
 
 // `arguments` is the raw provider JSON string (types/index.ts:100-111) and stays
@@ -1637,21 +1679,26 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
         // A bounded node states its exact length and says so; the designated carrier
         // carries the whole text, so its length IS the count. The `redacted` marker is
         // dropped here on purpose: a node printed in full must never claim to be a
-        // preview, and one printed as a preview must never claim to be whole.
+        // preview, and one printed as a preview must never claim to be whole. A preview is
+        // cut from the END (T26, R26), so the newest lines are the ones that survive the bound.
         if (isFullCarrier(record, node) || chars <= DISPLAY_NODE_PREVIEW_CHARS) {
             delete wire.redacted;
 
             return { ...wire, chars };
         }
 
-        return { ...wire, text: previewText(node.text, DISPLAY_NODE_PREVIEW_CHARS), chars, redacted: true };
+        // T26 (R26): a bounded body keeps its LATEST characters, so the preview a reader sees
+        // is the end of what the model wrote rather than the beginning it already read.
+        return { ...wire, text: previewTextTail(node.text, DISPLAY_NODE_PREVIEW_CHARS), chars, redacted: true };
     };
 
     /**
      * Move the wire bodies to match a designation, in BOTH directions (R23).
      *
      * The node that LOST the tail becomes history: one patch carrying the
-     * `DISPLAY_NODE_PREVIEW_CHARS` preview, the exact length, and `redacted: true`. The
+     * `DISPLAY_NODE_PREVIEW_CHARS` preview of its LATEST characters (T26, R26 — the newest
+     * lines survive the bound, never the opening ones), the exact length, and
+     * `redacted: true`. The
      * node that GAINED it back (a retry discarded the block that superseded it) is
      * restored: one patch carrying the full recorded text and `unredacted: true`, so a
      * live client cannot keep a preview the cold document no longer shows.
@@ -1693,7 +1740,7 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                 sectionId: record.section.id,
                 nodeId: node.id,
                 patch: {
-                    text: previewText(node.text, DISPLAY_NODE_PREVIEW_CHARS),
+                    text: previewTextTail(node.text, DISPLAY_NODE_PREVIEW_CHARS),
                     chars: node.chars,
                     redacted: true
                 }

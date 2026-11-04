@@ -8,20 +8,24 @@
 // model could not ask for "just file names" and "just matching lines" with different
 // names. The rename splits those responsibilities:
 //
-//     glob  ({ patterns?, paths?, maxResults? })          -> { files, truncated }
-//     grep  ({ pattern, patterns?, paths?, maxResults? })  -> { matches, truncated, bytes, contentBudget }
+//     glob  ({ patterns?, paths?, maxResults?, offset? }) -> { files, truncated, offset, limit, nextOffset, bytes, contentBudget, excluded }
+//     grep  ({ pattern, patterns?, paths?, maxResults?, offset?, flags?, output?, context? })
+//                                                        -> { matches, truncated, offset, limit, nextOffset, bytes, contentBudget, searched, skipped, excluded }
 //
 // Both walk the SAME tree with the SAME rules, and that shared half lives here so the
-// two entries cannot drift: pattern compilation, the "no slash also matches the file
-// name" rule, root identity + file identity dedupe, and the argument-validation wording
-// are defined once. Each `*.tool.ts` entry keeps only its own verdict step (list the
-// path, or read the file and match its lines).
+// two entries cannot drift: pattern compilation (brace expansion and `!` negation), the
+// "no slash also matches the file name" rule, root identity + file identity dedupe, the
+// per-root coverage counters, the root error boundary, and the argument-validation
+// wording are defined once. Each `*.tool.ts` entry keeps only its own verdict step
+// (list the path, or read the file and match its lines).
 //
 // WALKER RULES (owned by ./glob.ts and ./gitignore.ts, documented there)
 // ----------------------------------------------------------------
 //   - patterns are matched against each file's path RELATIVE TO THE ROOT that found
 //     it, never against an absolute path, and every result is prefixed with that root;
 //   - a pattern with no "/" additionally matches the bare file name at any depth;
+//   - `{a,b}` is expanded into one pattern per alternative, and a leading `!` excludes
+//     (see `compilePatterns` below — both used to be silent wrong answers);
 //   - .git and symlinks are never entered; node_modules is skipped unless the caller
 //     roots the search inside it;
 //   - `.gitignore` files AT OR BELOW each root are honored (./gitignore.ts): an ignored
@@ -29,7 +33,7 @@
 //     when a .gitignore above it ignores it. No rule from above a root reaches into it,
 //     which is what makes `paths: ['Temp']` answer for a directory the repo ignores;
 //   - the walk is depth-first over name-sorted entries, so a capped result is a
-//     deterministic prefix of the tree.
+//     deterministic prefix of the tree — which is exactly the precondition for paging.
 //
 // DEDUPE (why two levels, and why `resolve()` alone is not enough)
 // ---------------------------------------------------------------
@@ -41,6 +45,25 @@
 //     enters a symlink, so once the root is resolved a resolved path is a sufficient
 //     per-file key and costs no extra stat.
 //
+// THE ROOT ERROR BOUNDARY (this revision)
+// ---------------------------------------
+// A root that cannot be opened used to surface the raw OS string: `ENOTDIR: not a
+// directory, scandir '…/glob.ts'` for the single most natural mistake in a search tool
+// (naming a FILE as a root), and `ENOENT … scandir` for a typo. Both are things a model
+// does by accident, both are inside a tool family where read/edit accept files, and
+// neither string says what to type instead. `openRoot` therefore classifies the root
+// once per root and either handles the file case (search just that file) or throws a
+// HarnessError naming the fix.
+//
+// COVERAGE COUNTERS (why "no matches" is now explainable)
+// ------------------------------------------------------
+// `SearchStats` is the answer to the question an empty result cannot ask on its own:
+// "was there nothing, or did the policy hide something?" Files an ignore rule excluded,
+// directories pruned by rule or by name, directories that could not be read, symlinks
+// skipped, and the number of files actually examined are all counted per walk and
+// published by both presets. They are counts, not paths, so they cost integer increments
+// and no memory, and they stay meaningful when the caller stops the generator early.
+//
 // Cross-references:
 //   - ./glob.tool.ts    — filename search (this module's only list-paths caller)
 //   - ./grep.tool.ts    — content search (this module's only read-lines caller)
@@ -49,17 +72,22 @@
 //   - ./identity.ts     — the canonical per-root / per-file comparison keys
 //   - ./bounded-regex.ts— the time-bounded regex grep runs inside `node:vm`
 
+import { stat } from 'node:fs/promises';
 import { join, resolve } from 'node:path';
 import { HarnessError } from '../../util';
 import { canonicalPathKey, fileIdentity } from './identity';
 import {
     ALWAYS_SKIPPED_DIRECTORIES,
     SKIPPED_DIRECTORIES,
+    createWalkStats,
+    errorCode,
+    expandBraces,
     globToRegExp,
     rootTargetsSkippedDirectory,
     toPosixPath,
     walkFiles
 } from './glob';
+import type { WalkStats } from './glob';
 import { createGitignoreMatcher } from './gitignore';
 
 // One compiled pattern plus the "slashless patterns also match the name" flag. This
@@ -71,30 +99,95 @@ export type CompiledPattern = {
     namesOnly: boolean;
 };
 
-// Compile every pattern ONCE per call. Compiling per file would be correct but
-// wasteful, and the caps in ./glob.ts make one compile pass per call the honest
-// shape. An invalid glob never throws here: ./glob.ts treats an unterminated
-// character class as a literal, so a typo yields a search with no matches.
-export const compilePatterns = (patterns: readonly string[]): CompiledPattern[] =>
-    patterns.map((pattern) => ({
-        matcher: globToRegExp(pattern),
-        namesOnly: !pattern.includes('/')
-    }));
+// A whole pattern list, split into what includes and what excludes.
+export type PatternSet = {
+    // Patterns a path must match. EMPTY means "everything" (the caller only sent
+    // exclusions, which is how .gitignore semantics work).
+    include: CompiledPattern[];
+    // Patterns that veto a path. Checked FIRST, so an exclusion always wins over an
+    // inclusion — the documented rule, and the one a caller assumes.
+    exclude: CompiledPattern[];
+    // The patterns actually compiled, after brace expansion, in caller order.
+    // Echoed in the result: `{a,b}` becomes two entries here, so a caller can see the
+    // request it made was understood rather than matched literally.
+    effective: string[];
+    // True when the caller sent at least one `!` pattern.
+    negated: boolean;
+};
 
-// Does one root-relative path match ANY of the compiled patterns?
-export const matchesAnyPattern = (
-    compiled: readonly CompiledPattern[],
-    relativePath: string
-): boolean => {
+// Compile every pattern ONCE per call, expanding braces and splitting off negations.
+//
+// Compiling per file would be correct but wasteful, and the caps in ./glob.ts make one
+// compile pass per call the honest shape. Two behaviours were missing and both produced
+// a WRONG answer that looked like a complete one:
+//
+//   - `**/*.{ts,tsx}` matched nothing, because `{` and `}` are literal characters in
+//     this matcher. It is now expanded into two patterns (./glob.ts `expandBraces`).
+//   - `['**/*', '!**/*.test.ts']` returned the test files, because there was no way to
+//     exclude. A leading `!` now vetoes, and a list of ONLY negations means "everything
+//     except" rather than "nothing" — `['!**/*.ts']` used to answer `[]`.
+//
+// An invalid glob never throws here: ./glob.ts treats an unterminated character class
+// as a literal, so a typo yields a search with no matches.
+export const compilePatterns = (patterns: readonly string[]): PatternSet => {
+    const include: CompiledPattern[] = [];
+    const exclude: CompiledPattern[] = [];
+    const effective: string[] = [];
+
+    for (const pattern of patterns) {
+        const negated = pattern.startsWith('!');
+        const body = negated ? pattern.slice(1) : pattern;
+
+        // A lone "!" is not a pattern. Treat it as the literal name, the way git does
+        // with a lone "!" in an ignore file, rather than meaning "exclude everything".
+        if (body.length === 0) {
+            include.push({ matcher: globToRegExp('!'), namesOnly: true });
+            effective.push('!');
+            continue;
+        }
+
+        for (const expanded of expandBraces(body)) {
+            const compiled = { matcher: globToRegExp(expanded), namesOnly: !expanded.includes('/') };
+
+            if (negated) exclude.push(compiled);
+            else include.push(compiled);
+
+            effective.push(negated ? `!${expanded}` : expanded);
+        }
+    }
+
+    return { include, exclude, effective, negated: exclude.length > 0 };
+};
+
+// Does one root-relative path survive the pattern set?
+//
+// Exclusions are tested before inclusions, so `['**/*.ts', '!**/*.test.ts']` is
+// unambiguous no matter what order the caller wrote them in.
+export const matchesPatterns = (set: PatternSet, relativePath: string): boolean => {
     const name = relativePath.slice(relativePath.lastIndexOf('/') + 1);
 
-    for (const { matcher, namesOnly } of compiled) {
+    for (const { matcher, namesOnly } of set.exclude) {
+        if (matcher.test(relativePath)) return false;
+        if (namesOnly && matcher.test(name)) return false;
+    }
+
+    // Only exclusions: everything else is included.
+    if (set.include.length === 0) return true;
+
+    for (const { matcher, namesOnly } of set.include) {
         if (matcher.test(relativePath)) return true;
         if (namesOnly && matcher.test(name)) return true;
     }
 
     return false;
 };
+
+// Kept as the inclusion-only spelling of the same test, so a caller that has no
+// exclusions reads the same way it always did.
+export const matchesAnyPattern = (
+    compiled: readonly CompiledPattern[],
+    relativePath: string
+): boolean => matchesPatterns({ include: [...compiled], exclude: [], effective: [], negated: false }, relativePath);
 
 // A candidate file: its dedupe identity, the path shown to the caller, and the
 // absolute path used to read it.
@@ -105,6 +198,80 @@ export type SearchCandidate = {
     display: string;
     // Absolute path for a content read.
     absolute: string;
+};
+
+// Everything one walk (across all its roots) dropped, and why.
+export type SearchStats = {
+    // Files the walk yielded, i.e. files that survived the ignore rules and the skip
+    // list and were therefore candidates for the caller's patterns. This is the number
+    // a content search charges its reads against, and the number that turns an empty
+    // result into "looked at N files, none matched".
+    candidates: number;
+    // Files an ignore rule excluded.
+    ignoredFiles: number;
+    // DIRECTORIES an ignore rule pruned (counted once each, not per file inside).
+    prunedDirectories: number;
+    // DIRECTORIES dropped by the name skip list (`.git`, `node_modules`).
+    skippedDirectories: number;
+    // DIRECTORIES `readdir` could not open. These are the only entries that make a
+    // result incomplete for a reason that is not policy.
+    unreadableDirectories: number;
+    // Symlinked entries never followed.
+    symlinks: number;
+    // `.gitignore` files parsed across all roots.
+    ignoreFiles: number;
+    // True when a per-walk gitignore cap (MAX_GITIGNORE_FILES or MAX_GITIGNORE_BYTES)
+    // dropped rules, so the ignore verdicts below are a subset of the repository's.
+    ignoreRulesTruncated: boolean;
+    // Roots actually walked. A duplicate/alias root is skipped, and a root that is a
+    // FILE contributes one candidate, so this is not `paths.length`.
+    roots: number;
+};
+
+// A zeroed counter set.
+export const createSearchStats = (): SearchStats => ({
+    candidates: 0,
+    ignoredFiles: 0,
+    prunedDirectories: 0,
+    skippedDirectories: 0,
+    unreadableDirectories: 0,
+    symlinks: 0,
+    ignoreFiles: 0,
+    ignoreRulesTruncated: false,
+    roots: 0
+});
+
+// Classify one root and return the absolute path to walk, or throw a HarnessError
+// naming the fix. A root that IS a file is reported through `isFile` so the caller can
+// search that one file instead of failing.
+export type OpenedRoot = {
+    requested: string;
+    absolute: string;
+    isFile: boolean;
+};
+
+// The message for a root that is not a directory. Two shapes, because the two causes
+// have different fixes and one string would send the caller the wrong way.
+const rootErrorMessage = (tool: string, root: string, code: string, cwd: string): string => {
+    if (code === 'ENOENT') {
+        return (
+            `${tool} path "${root}" does not exist. Roots are resolved against the working directory (${toPosixPath(
+                cwd
+            )}); check the spelling, or list the parent with fileList to see what is there.`
+        );
+    }
+
+    if (code === 'ENOTDIR') {
+        return (
+            `${tool} path "${root}" is not a directory: a component of it is a file. Pass the file itself as the root to search just that file, or the directory that contains it.`
+        );
+    }
+
+    if (code === 'EPERM' || code === 'EACCES') {
+        return `${tool} path "${root}" could not be read (${code}: permission denied). Narrow the search to a directory this process can open.`;
+    }
+
+    return `${tool} path "${root}" could not be walked (${code}).`;
 };
 
 // Walk every root in caller order and yield the files matching any pattern.
@@ -122,10 +289,20 @@ export type SearchCandidate = {
 // as well, so a caller that names an otherwise-skipped directory ('node_modules', or a
 // path under it) still gets it walked — the same "explicit path wins" rule gitignore
 // scoping already gives an ignored directory.
+//
+// `stats` is optional and caller-owned: a walk that is abandoned part-way (the caller
+// hit its cap) has already incremented everything it saw, which is what makes the
+// counters describe the SEARCH rather than the RESULT.
 export async function* collectCandidates(
     roots: readonly string[],
-    compiled: readonly CompiledPattern[]
+    patterns: PatternSet | readonly CompiledPattern[],
+    options: { tool?: string; stats?: SearchStats } = {}
 ): AsyncGenerator<SearchCandidate> {
+    const tool = options.tool ?? 'search';
+    const set: PatternSet = Array.isArray(patterns)
+        ? { include: [...patterns], exclude: [], effective: [], negated: false }
+        : patterns;
+
     const seenFiles = new Set<string>();
     const seenRoots = new Set<string>();
 
@@ -142,29 +319,180 @@ export async function* collectCandidates(
         if (seenRoots.has(rootKey)) continue;
         seenRoots.add(rootKey);
 
+        // THE ROOT ERROR BOUNDARY. One stat per root, and it decides the three cases
+        // the raw OS strings used to blur together: a file (search it), a missing path
+        // (say so), and a path whose parent is a file (say which part is wrong).
+        let rootIsFile = false;
+
+        try {
+            const info = await stat(absoluteRoot);
+            rootIsFile = info.isFile();
+        } catch (error) {
+            throw new HarnessError(
+                rootErrorMessage(tool, root, errorCode(error), process.cwd()),
+                { cause: error }
+            );
+        }
+
+        if (options.stats) options.stats.roots += 1;
+
+        if (rootIsFile) {
+            // "Search this file" is a legitimate request, and read/edit accept a file
+            // everywhere else in this family. One candidate, presented exactly as the
+            // caller named it, so `paths: ['src/a.ts']` answers about `src/a.ts`.
+            //
+            // The pattern filter still applies, tested against BOTH the bare name and
+            // the caller's own spelling: a file root has no root-relative path, and
+            // either reading is one the caller could reasonably have meant. Counting the
+            // candidate before the filter is what lets a result say "1 file was in
+            // scope, the pattern excluded it" instead of "0 files".
+            const fileKey = canonicalPathKey(absoluteRoot);
+            const display = toPosixPath(root);
+            const name = display.slice(display.lastIndexOf('/') + 1);
+
+            if (options.stats) options.stats.candidates += 1;
+
+            if (seenFiles.has(fileKey)) continue;
+            if (!matchesPatterns(set, name) && !matchesPatterns(set, display)) continue;
+
+            seenFiles.add(fileKey);
+
+            yield { identity: fileKey, display, absolute: absoluteRoot };
+            continue;
+        }
+
         const ignores = createGitignoreMatcher();
         const skipDirectories = rootTargetsSkippedDirectory(absoluteRoot)
             ? ALWAYS_SKIPPED_DIRECTORIES
             : SKIPPED_DIRECTORIES;
 
-        for await (const relativePath of walkFiles(absoluteRoot, { ignores, skipDirectories })) {
-            if (!matchesAnyPattern(compiled, relativePath)) continue;
+        const walkStats: WalkStats | undefined = options.stats ? createWalkStats() : undefined;
 
-            const absolute = join(absoluteRoot, relativePath);
-            const fileKey = canonicalPathKey(absolute);
+        try {
+            for await (const relativePath of walkFiles(absoluteRoot, {
+                ignores,
+                skipDirectories,
+                stats: walkStats
+            })) {
+                if (options.stats) options.stats.candidates += 1;
 
-            if (seenFiles.has(fileKey)) continue;
-            seenFiles.add(fileKey);
+                if (!matchesPatterns(set, relativePath)) continue;
 
-            yield {
-                identity: fileKey,
-                // join() collapses "./src" to "src" and "." to a bare name, so the
-                // display path is root-prefixed without ever doubling a separator.
-                // toPosixPath keeps the separator convention of every other result.
-                display: toPosixPath(join(root, relativePath)),
-                absolute
-            };
+                const absolute = join(absoluteRoot, relativePath);
+                const fileKey = canonicalPathKey(absolute);
+
+                if (seenFiles.has(fileKey)) continue;
+                seenFiles.add(fileKey);
+
+                yield {
+                    identity: fileKey,
+                    // join() collapses "./src" to "src" and "." to a bare name, so the
+                    // display path is root-prefixed without ever doubling a separator.
+                    // toPosixPath keeps the separator convention of every other result.
+                    display: toPosixPath(join(root, relativePath)),
+                    absolute
+                };
+            }
+        } catch (error) {
+            // Only the root's own `readdir` throws (the walker swallows everything
+            // deeper), and the OS string for it names `scandir`, not the path the
+            // caller typed.
+            const code = errorCode(error);
+
+            throw new HarnessError(
+                code === 'ENOTDIR'
+                    ? `${tool} path "${root}" is not a directory. Pass the file itself as the root to search just that file, or the directory that contains it.`
+                    : rootErrorMessage(tool, root, code, process.cwd()),
+                { cause: error }
+            );
+        } finally {
+            // The counters and the gitignore accounting are read whether the walk
+            // finished, stopped early, or threw — a partial walk still has to report
+            // what it covered.
+            if (options.stats && walkStats) {
+                options.stats.ignoredFiles += walkStats.ignoredFiles;
+                options.stats.prunedDirectories += walkStats.ignoredDirectories;
+                options.stats.skippedDirectories += walkStats.skippedDirectories;
+                options.stats.unreadableDirectories += walkStats.unreadableDirectories;
+                options.stats.symlinks += walkStats.symlinks;
+            }
+
+            if (options.stats) {
+                const ignoreStats = ignores.stats();
+                options.stats.ignoreFiles += ignoreStats.files;
+                options.stats.ignoreRulesTruncated =
+                    options.stats.ignoreRulesTruncated || ignoreStats.truncated;
+            }
         }
+    }
+}
+
+// Run `mapper` over an async source with at most `concurrency` in flight, preserving
+// ORDER in what it yields.
+//
+// Why this exists: a content search is I/O-bound, and the previous shape was strictly
+// serial — walk one file, stat it, open it, read it, match it, repeat. On a tree of
+// 16k searchable files that is one syscall round trip at a time, which is most of the
+// 15-30s a repo-wide grep used to cost. Reads overlap (they are the part of the loop
+// that waits on the OS), while the walk and the matching stay in order, so the result
+// sequence is IDENTICAL to the serial one and only the wall clock changes.
+//
+// Two properties the caller depends on:
+//   - ORDER: a page of results is still the deterministic prefix of the walk, so
+//     `offset`/`nextOffset` arithmetic stays correct;
+//   - CANCELLATION: when the consumer stops early it calls `source.return()`, which
+//     stops the walk and lets the in-flight reads finish into nothing. A search that
+//     found its last match does not keep walking the tree.
+export async function* mapConcurrent<T, R>(
+    source: AsyncGenerator<T>,
+    concurrency: number,
+    mapper: (value: T) => Promise<R>
+): AsyncGenerator<R> {
+    const limit = Math.max(1, Math.floor(concurrency));
+
+    // Every slot carries its verdict, so a mapper that legitimately resolves to
+    // `undefined` is still yielded, and a rejection is re-thrown at its own position
+    // instead of becoming an unhandled rejection while a sibling is awaited.
+    type Settled = { ok: true; value: R } | { ok: false; error: unknown };
+
+    const inFlight: Promise<Settled>[] = [];
+    let exhausted = false;
+
+    // Pull the source forward, keeping at most `limit` mapper promises queued.
+    const fill = async (): Promise<void> => {
+        while (!exhausted && inFlight.length < limit) {
+            const next = await source.next();
+
+            if (next.done) {
+                exhausted = true;
+                return;
+            }
+
+            inFlight.push(
+                Promise.resolve().then(() => mapper(next.value)).then(
+                    (value) => ({ ok: true, value }) as Settled,
+                    (error: unknown) => ({ ok: false, error }) as Settled
+                )
+            );
+        }
+    };
+
+    try {
+        await fill();
+
+        while (inFlight.length > 0) {
+            const settled = await (inFlight.shift() as Promise<Settled>);
+
+            if (!settled.ok) throw settled.error;
+
+            yield settled.value;
+
+            await fill();
+        }
+    } finally {
+        // Abandoning the generator must abandon the walk too, or a capped search still
+        // enumerates every directory it could reach.
+        await source.return(undefined).catch(() => undefined);
     }
 }
 

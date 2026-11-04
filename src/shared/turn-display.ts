@@ -126,7 +126,12 @@ export const DISPLAY_PANEL_PREVIEW_CHARS = 240;
  *  R1/R3; T23, R23). A node streams in full while the server designates it the tail
  *  (`TurnSection.tail`), and the instant a later block takes the tail the projector
  *  rewrites it to a preview of this size — for a thinking window AND for an answer, so
- *  "no historical full-text replay" is one rule, not two. The exact length always
+ *  "no historical full-text replay" is one rule, not two. T26 (R26): the preview keeps the
+ *  LATEST `DISPLAY_NODE_PREVIEW_CHARS` characters behind a leading `…`, not the opening ones,
+ *  which is what lets a reader watch a body's newest lines on a live stream, on a reconnect
+ *  and on a reload alike (`turn-projector.ts` `previewTextTail`); the browser applies the same
+ *  direction to a whole body it has to window (../frontend/view-context.ts
+ *  `contextTextSuffixOf`). The exact length always
  *  travels beside it (`DisplayTextNode.chars` / `DisplayReasoningNode.chars`) and the
  *  verbatim text is one click away on
  *  `GET views/:id/turns/:tid/blocks/:blockId`. Set above `DISPLAY_PREVIEW_CHARS`

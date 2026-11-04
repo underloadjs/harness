@@ -26,11 +26,26 @@
 //      already resolved identity and sequence (src/shared/turn-display.ts:334). The only
 //      local decision is a defensive first-wins drop of a duplicated `sectionId|id`,
 //      which the contract says cannot happen.
-//   2. WIDTH is proportional to the exact `chars`, with an honest DISPLAY FLOOR: a
-//      segment is never thinner than `CONTEXT_BAR_MIN_SEGMENT_PX` while that still fits,
-//      so a 40-character tool call stays clickable beside a 40,000-character result. The
-//      floor is a display rule, never a claim about the data: the tooltip and the
-//      accessible label always carry the true figures.
+//   2. TWO DIMENSIONS (T26, R27), one strip:
+//        - HORIZONTAL — segment WIDTH is the RECORDED TIME TAKEN (`ContextBlock.durationMs`,
+//          else `endedAt - at`), laid out SEQUENTIALLY (segment after segment, never an
+//          absolute overlapping timeline). A block the record never bracketed gets the
+//          honest BASELINE width (`CONTEXT_BAR_UNKNOWN_DURATION_PX`, the same figure as the
+//          pointer floor, so "not measured" visibly reads as a floor and not as a
+//          measurement), and its label says `time not recorded` out loud. A 0ms span is a
+//          real measurement and shares the floor path with zero-weight data; nothing is ever
+//          invented.
+//        - VERTICAL — each bar's HEIGHT is the CONTEXT SIZE (`chars`, the exact recorded
+//          characters), NORMALIZED to the largest `chars` figure in the SAME strip and
+//          clamped to a legible band: at least `CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX`, at most
+//          `CONTEXT_BAR_MAX_TRACK_HEIGHT_PX` = TWO line-heights. Normalizing per strip is
+//          what keeps a delegated thread's own strip readable beside a caller's strip that
+//          happens to hold a 40,000-character result.
+//      Both axes carry an honest DISPLAY FLOOR (a segment is never thinner than
+//      `CONTEXT_BAR_MIN_SEGMENT_PX` while that still fits), so a 40-character tool call
+//      stays clickable beside a 40,000-character result. The floors are display rules, never
+//      claims about the data: the tooltip and the accessible label always carry the true
+//      figures, and the accessible name says which axis is which.
 //   3. TONE comes from `kind` + `state` ONLY (the server decides, the renderer colours):
 //      a settled tool is green, a failed/cancelled tool red, a running tool faded green,
 //      reasoning amber, and `user`/`system`/`assistant` neutral. No text is ever
@@ -52,6 +67,17 @@
 //      renders no body, so a long run never leaves a pile of stale think chips (or call
 //      payloads) under the strip. The rule lives here, not in the painter, so a live
 //      frame, a rebuild and a cold reload agree by construction.
+//   7. TAIL PREVIEW WINDOW (T26, R26): a CURRENT prose body is painted as its LATEST
+//      SUFFIX, never its first lines. A thinking window that grows past the display bound
+//      used to sit in a scroll box pinned at the top, so the reader watched a block of text
+//      that never changed while the model kept writing. `contextTextSuffixOf` cuts the
+//      rendered string at the SAME configured bound the display contract already publishes
+//      (`DISPLAY_NODE_PREVIEW_CHARS`, ../shared/turn-display.ts:135 — no new arbitrary cap)
+//      and keeps the END, so the visible text scrolls as it grows. Slicing is render-only
+//      and Unicode-safe (no split code point, no orphan combining mark): the model, the
+//      wire bytes, the segment's exact `chars` and the click-time detail dialog all still
+//      hold the whole recorded block. A recorded CALL is the exception — its panes print the
+//      complete recorded request/response (T25) and only follow the newest byte by scrolling.
 //   6. CAPTION (T22/R24): the visible line under the strip is the segment COUNT only.
 //      The character figures stay where they are useful — the tooltip, the accessible
 //      name and the segment detail — because a count is the one number a reader can act
@@ -81,6 +107,9 @@ import type {
     TurnDisplay,
     TurnSection
 } from '../shared/turn-display';
+// T26 (R26): the ONE configured bound a bounded prose body already uses, reused for the
+// render-side preview window so no second arbitrary cap is invented (../shared/turn-display.ts:135).
+import { DISPLAY_NODE_PREVIEW_CHARS } from '../shared/turn-display';
 import { elapsedBetween, formatDuration } from './ui/time';
 
 // ---------------------------------------------------------------------------
@@ -92,14 +121,42 @@ import { elapsedBetween, formatDuration } from './ui/time';
 // it (never below 0) so every segment keeps at least one pixel.
 export const CONTEXT_BAR_GAP_PX = 2;
 
-// The honest minimum: a segment this thin cannot be aimed at, and a label inside it is
+// The honest minimum WIDTH: a segment this thin cannot be aimed at, and a label inside it is
 // unreadable. 8px is the pointer target; the floor is only applied while the whole bar
 // still fits (see rule 2 above).
 export const CONTEXT_BAR_MIN_SEGMENT_PX = 8;
 
-// Track height in CSS pixels. The canvas paints at this height (scaled by
-// `devicePixelRatio`), and `styles.css` gives `.context-bar-track`/`.context-bar-canvas`
-// the same box, so both modes agree on what the bar measures.
+// T26 (R27): the width of a segment whose time taken the record never bracketed (a `user`
+// prompt, a `system` instruction block, a one-event prose window). It deliberately EQUALS
+// the display floor above, so an unmeasured block reads as "as thin as the thinnest thing
+// the data can prove" rather than as a fabricated 0ms or an invented average. The label
+// states it in words (`time not recorded`), which is what keeps the baseline honest.
+export const CONTEXT_BAR_UNKNOWN_DURATION_PX = CONTEXT_BAR_MIN_SEGMENT_PX;
+
+// One line-height of the bar's own label, in CSS pixels — the figure `styles.css` gives
+// `.context-bar-segment-name` (`line-height: 18px`) and the height the strip reserved before
+// T26. A host that themes the bar overrides it with `--context-bar-line-height`, which the
+// painter reads (./ui/context-bar.ts `resolveTrackHeights`) so "2 line-heights" means two
+// lines of THIS host's text rather than a hardcoded scale that breaks on a font change.
+export const CONTEXT_BAR_LINE_HEIGHT_PX = 18;
+
+// The maximum number of line-heights one bar may occupy (T26, R27: "maximum 2 line-heights").
+export const CONTEXT_BAR_MAX_HEIGHT_LINES = 2;
+
+// The tallest possible bar in CSS pixels: `CONTEXT_BAR_MAX_HEIGHT_LINES` line-heights. A
+// custom property or a measured line-height replaces it at paint time; this is the fallback
+// both modes share, and `styles.css` states the same 36px so a canvas-less host agrees.
+export const CONTEXT_BAR_MAX_TRACK_HEIGHT_PX = CONTEXT_BAR_LINE_HEIGHT_PX * CONTEXT_BAR_MAX_HEIGHT_LINES;
+
+// The shortest bar that still reads as a bar. A block with recorded characters always
+// paints at least this much, so a 12-character call is visible beside a 40,000-character
+// one instead of being a hairline the eye skips.
+export const CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX = 3;
+
+// The BASE strip height, in CSS pixels: what an empty strip reserves (the dashed "nothing
+// recorded" box in `styles.css`) and the fallback a host with no themed line-height keeps for
+// a strip with no characters. A strip WITH content is sized by `layout.heightPx` (T26), which
+// both modes set inline, so this constant is the floor and the empty case only.
 export const CONTEXT_BAR_TRACK_HEIGHT_PX = 18;
 
 // A host that has not been laid out yet (a detached tile, a collapsed conversation, a
@@ -112,12 +169,13 @@ export const CONTEXT_BAR_FALLBACK_WIDTH = 640;
 // live-region label of the segment under focus. Keyboard traversal is unaffected.
 export const CONTEXT_BAR_OPTION_LIMIT = 600;
 
-// The bar's stable ACCESSIBLE name. `contextBarSummaryOf` prefixes it with the full
-// figures; the visible line under the track shows `contextBarStatsOf` alone, which since
-// T22/R24 is the segment COUNT only (the phrase must not be printed above every turn, and
-// the character totals moved to the tooltip, the accessible name and the segment detail).
-// Every label built from this string still says CHARACTERS.
-export const CONTEXT_BAR_LABEL = 'context character distribution';
+// The bar's stable ACCESSIBLE name: the sentence that explains its TWO axes (T26, R27).
+// Since T22/R24 the VISIBLE line under the track is the segment count only, so this phrase
+// exists for the reader who cannot see the picture — it names the unit (CHARACTERS, never
+// tokens) and says which direction is TIME TAKEN and which is CONTEXT SIZE, which is exactly
+// the pair a sighted reader reads off the shape. `contextBarSummaryOf` puts the figures behind
+// it, and the segment tooltip repeats both figures per segment.
+export const CONTEXT_BAR_LABEL = 'context bar: width is time taken, height is recorded characters';
 
 // ---------------------------------------------------------------------------
 // Tone: colour decided by the SERVER's kind/state, never by the text
@@ -187,6 +245,15 @@ export type ContextBarModel = {
     counts: ContextBarTally;
     /** Exact character sum per kind. */
     charsByKind: ContextBarTally;
+    /**
+     * Sum of every segment's RECORDED span in ms, or undefined when NO segment has one
+     * (T26, R27 — the horizontal axis' total). Never a guess: a turn whose blocks were all
+     * unbracketed reports undefined, and the accessible name says so instead of printing
+     * `0ms of recorded time`, which would read as an instantaneous turn.
+     */
+    totalDurationMs: number | undefined;
+    /** How many segments have no recorded span and therefore paint at the baseline width. */
+    durationsUnknown: number;
 };
 
 const emptyTally = (): ContextBarTally => ({
@@ -253,6 +320,13 @@ export const contextBarOf = (display: TurnDisplay | undefined): ContextBarModel 
     const charsByKind = emptyTally();
     let totalChars = 0;
     let unpromptedChars = 0;
+    // T26 (R27): the horizontal axis' figures, folded in the same pass as the characters so
+    // one traversal answers both dimensions. `knownDuration` stays false until a segment
+    // actually reports a span, which is what keeps `totalDurationMs` undefined (rather than 0)
+    // for a turn the record cannot bracket at all.
+    let totalDurationMs = 0;
+    let knownDuration = false;
+    let durationsUnknown = 0;
     // "This frame says nothing" until a section actually carries an array.
     let available = false;
     // Defensive first-wins set: ids are unique within a turn by contract
@@ -280,6 +354,15 @@ export const contextBarOf = (display: TurnDisplay | undefined): ContextBarModel 
             charsByKind[block.kind] += chars;
             totalChars += chars;
             if (block.inPrompt !== true) unpromptedChars += chars;
+
+            // The span the record supports for THIS segment (measured `durationMs`, else the
+            // open/settle pair, else nothing) — see `contextBlockDurationOf`.
+            const span = contextBlockDurationOf(block);
+            if (span === undefined) durationsUnknown += 1;
+            else {
+                totalDurationMs += span;
+                knownDuration = true;
+            }
         }
     }
 
@@ -290,7 +373,9 @@ export const contextBarOf = (display: TurnDisplay | undefined): ContextBarModel 
         totalChars,
         unpromptedChars,
         counts,
-        charsByKind
+        charsByKind,
+        totalDurationMs: knownDuration ? totalDurationMs : undefined,
+        durationsUnknown
     };
 };
 
@@ -347,8 +432,11 @@ export const contextSegmentTitleOf = (block: ContextBlock): string => {
             parts.push(`result ${formatContextCharCount(block.resultChars)}`);
     }
 
+    // T26 (R27): TIME is the horizontal axis, so a segment the record never bracketed states
+    // that out loud rather than leaving a baseline-width bar to be read as a measurement. A
+    // 0ms span IS a measurement and prints as one (`formatDuration(0)` -> `0ms`).
     const span = contextBlockDurationOf(block);
-    if (span !== undefined) parts.push(formatDuration(span));
+    parts.push(span === undefined ? 'time not recorded' : formatDuration(span));
 
     if (block.inPrompt !== true) parts.push('not replayed into the prompt');
 
@@ -383,14 +471,16 @@ export const contextBarStatsOf = (model: ContextBarModel): string => {
 };
 
 /**
- * The FULL figures — count, exact character total, and the honest note when the server
- * marks part of the strip `inPrompt: false`. Not printed (R24); this is the text a
- * screen reader hears inside `contextBarSummaryOf`, so losing the visible line never
- * loses the information.
+ * The FULL figures — count, exact character total, the recorded TIME the strip spans, how
+ * many segments have none, and the honest note when the server marks part of the strip
+ * `inPrompt: false`. Not printed (R24); this is the text a screen reader hears inside
+ * `contextBarSummaryOf`, so losing the visible line never loses the information — and since
+ * T26 (R27) it is also where the strip's two axes are stated as numbers.
  *
  * Exact strings, pinned by ./view-context.test.ts:
  *   empty (authoritative)  `no recorded context`
- *   with segments          `4 segments · 1,300 characters`
+ *   with segments          `4 segments · 1,300 characters · 2.6s of recorded time`
+ *                          [+ ` · 2 segments have no recorded time`]
  *                          [+ ` · 300 characters not replayed into the prompt`]
  */
 export const contextBarFiguresOf = (model: ContextBarModel): string => {
@@ -401,6 +491,17 @@ export const contextBarFiguresOf = (model: ContextBarModel): string => {
         `${formatContextCharCount(model.totalChars)} characters`
     ];
 
+    // The horizontal axis, stated as a total — and `undefined` (NOT `0ms`) when the record
+    // bracketed nothing at all, because "an instantaneous turn" is a different claim from
+    // "a turn whose events carried no timestamps".
+    if (model.totalDurationMs !== undefined) parts.push(`${formatDuration(model.totalDurationMs)} of recorded time`);
+
+    // Which segments therefore paint at the honest baseline width (R27: explicitly labelled).
+    if (model.durationsUnknown > 0)
+        parts.push(
+            `${model.durationsUnknown} ${model.durationsUnknown === 1 ? 'segment has' : 'segments have'} no recorded time`
+        );
+
     if (model.unpromptedChars > 0)
         parts.push(`${formatContextCharCount(model.unpromptedChars)} characters not replayed into the prompt`);
 
@@ -408,17 +509,107 @@ export const contextBarFiguresOf = (model: ContextBarModel): string => {
 };
 
 /**
- * The bar's accessible name: the label phrase plus the FULL figures, so a screen reader
- * still hears WHAT the strip is and how large it is (the visible caption is only the
- * count — R24), while a sighted reader never sees the phrase twice.
+ * The bar's accessible name: the axis-explaining label phrase plus the FULL figures, so a
+ * screen reader hears WHAT the strip is, which way each dimension runs, and how large it is
+ * (the visible caption is only the count — R24), while a sighted reader never sees the phrase
+ * twice.
  *
  * Exact strings, pinned by ./view-context.test.ts:
- *   empty (authoritative)  `context character distribution · no recorded context`
- *   with segments          `context character distribution · 4 segments · 1,300 characters`
+ *   empty (authoritative)  `context bar: width is time taken, height is recorded characters
+ *                           · no recorded context`
+ *   with segments          `context bar: width is time taken, height is recorded characters
+ *                           · 4 segments · 1,300 characters · 2.6s of recorded time`
  *                          [+ ` · 300 characters not replayed into the prompt`]
  */
 export const contextBarSummaryOf = (model: ContextBarModel): string =>
     `${CONTEXT_BAR_LABEL} · ${contextBarFiguresOf(model)}`;
+
+// ---------------------------------------------------------------------------
+// The render-side preview window (T26, R26): LATEST suffix, never first lines
+// ---------------------------------------------------------------------------
+
+/** "There is text before this." One character, and never counted as recorded content. */
+export const CONTEXT_TEXT_ELLIPSIS = '…';
+
+/**
+ * How many characters of a prose body the pane paints. This is the SAME configured bound the
+ * display contract already publishes for a bounded node (`DISPLAY_NODE_PREVIEW_CHARS`,
+ * ../shared/turn-display.ts:135) — T26 reuses it deliberately instead of inventing a second
+ * number, so the wire's own idea of "a preview" and the render's idea of one cannot drift.
+ */
+export const CONTEXT_TAIL_PREVIEW_CHARS = DISPLAY_NODE_PREVIEW_CHARS;
+
+export type ContextTextSuffix = {
+    /** The painted string: `…` + the latest `shown` characters when bounded, else the input verbatim. */
+    text: string;
+    /** EXACT characters of the source that survive in `text` (the marker is never counted). */
+    shown: number;
+    /** EXACT characters dropped from the FRONT of the source. */
+    omitted: number;
+    /** True exactly when `omitted > 0`. */
+    bounded: boolean;
+};
+
+/** True when a UTF-16 unit cannot legally START a kept suffix: the tail of a split astral
+ *  pair, a combining mark, a joiner, or a variation selector. */
+const isClusterContinuation = (unit: number): boolean =>
+    (unit >= 0x0300 && unit <= 0x036f) ||
+    (unit >= 0x1ab0 && unit <= 0x1aff) ||
+    (unit >= 0x1dc0 && unit <= 0x1dff) ||
+    (unit >= 0x20d0 && unit <= 0x20ff) ||
+    (unit >= 0xfe00 && unit <= 0xfe0f) ||
+    (unit >= 0xfe20 && unit <= 0xfe2f) ||
+    unit === 0x200d ||
+    unit === 0x200c ||
+    (unit >= 0xdc00 && unit <= 0xdfff);
+
+/**
+ * Keep the END of a preview rather than the beginning (T26, R26).
+ *
+ * WHY: a current thinking window grows every frame. Clipping it from the front (or leaving
+ * the front visible in a scroll box) shows the reader the SAME first lines forever, which is
+ * the "static text" complaint this rule exists to answer; keeping the newest characters makes
+ * the pane visibly scroll as the model writes.
+ *
+ * HOW: slice on UTF-16 units (the same unit `chars` counts — invariant 5), then walk FORWARD
+ * to a safe boundary so the kept suffix never starts inside a code point or a combining
+ * sequence. Walking forward drops one more character rather than emitting half an emoji, and
+ * `shown`/`omitted` stay exact so the caption can still state the whole truth. Slicing is
+ * RENDER-ONLY: nothing here touches the recorded bytes, the wire text or the detail dialog.
+ */
+export const contextTextSuffixOf = (value: string | undefined, limit: number = CONTEXT_TAIL_PREVIEW_CHARS): ContextTextSuffix => {
+    const source = typeof value === 'string' ? value : '';
+
+    if (source.length === 0) return { text: '', shown: 0, omitted: 0, bounded: false };
+
+    const bound = Number.isFinite(limit) && limit > 0 ? Math.trunc(limit) : 0;
+
+    if (source.length <= bound) return { text: source, shown: source.length, omitted: 0, bounded: false };
+
+    // A zero bound keeps no text at all; the marker still says why the pane is not empty-because
+    // -whole rather than empty-by-accident.
+    if (bound === 0) return { text: CONTEXT_TEXT_ELLIPSIS, shown: 0, omitted: source.length, bounded: true };
+
+    let cut = source.length - bound;
+
+    // Each step moves the cut one unit past a unit that cannot open a cluster, so the loop
+    // runs at most once per mark in a single grapheme cluster.
+    while (cut > 0 && cut < source.length) {
+        const unit = source.charCodeAt(cut);
+        const previous = source.charCodeAt(cut - 1);
+
+        if (isClusterContinuation(unit) || (previous >= 0xd800 && previous <= 0xdbff)) {
+            cut += 1;
+            continue;
+        }
+
+        break;
+    }
+
+    const shown = source.length - cut;
+
+    return { text: `${CONTEXT_TEXT_ELLIPSIS}${source.slice(cut)}`, shown, omitted: cut, bounded: true };
+};
 
 // ---------------------------------------------------------------------------
 // The ONE current tail block (T22, R23; T23 widened it to EVERY current block)
@@ -440,10 +631,11 @@ export type ContextTailKind = 'reasoning' | 'assistant' | 'tool';
  * lazy step/block routes would answer with, delivered once, on the frame that made this
  * call the newest block, and dropped from the compiled view the moment a newer block takes
  * the tail. `chars` figures stay the segment's exact recorded counts (invariant 5), so the
- * caption can state the whole payload's size even when `DISPLAY_TAIL_PAYLOAD_CHARS`
- * bounded what the wire carried. Panels and media are counted, never copied: the step node
- * this tail points at still carries their bounded summaries, and the shell's panel hosts
- * draw them from the document (../view-state.ts `panelEntriesOf`).
+ * caption states the whole payload's size whatever the wire carries — and a server producer
+ * carries ALL of it (T25: the designated payload has no display-side cap, so `truncated` is
+ * false and the pane is the recorded bytes). Panels and media are counted, never copied: the
+ * step node this tail points at still carries their bounded summaries, and the shell's panel
+ * hosts draw them from the document (../view-state.ts `panelEntriesOf`).
  */
 export type ContextTailTool = {
     /** The recorded tool name, verbatim (`read`, `delegate`, …). Never derived locally. */
@@ -488,14 +680,34 @@ export type ContextTail = {
     /**
      * The wire text of a PROSE tail: COMPLETE for a designated carrier, bounded for a
      * window that lost the tail. Empty for a tool, whose body is `tool.args`/`tool.result`.
+     * This stays the wire's own bytes — the render window below is a separate value, so no
+     * consumer of the model can mistake a preview for the record.
      */
     text: string;
+    /**
+     * The PROSE body actually painted: the LATEST `shownChars` characters of `text` behind a
+     * leading `…` when anything is missing (T26, R26) — never its first lines. Empty for a
+     * tool, whose panes print the recorded bytes whole.
+     */
+    renderText: string;
+    /**
+     * EXACT characters of the recorded block that are on screen. `chars` when the body fits
+     * whole; the wire payload's length when the server bounded it; the render window's length
+     * when the pane caps a long prose body. The caption's "showing N of M" reads from here, so
+     * a front-bounded wire body and a render-capped one are stated the same way.
+     */
+    shownChars: number;
     /** EXACT recorded characters of the block (invariant 5) — never `text.length`. */
     chars: number;
     /**
-     * True when the body on screen is strictly less than what the record holds. Stated by
-     * the server (`DisplayTail.truncated`) or, for a legacy producer, derived honestly from
-     * its own `redacted` marker and `chars` figure — never by measuring a preview.
+     * True when the WIRE body is strictly less than what the record holds — the server's own
+     * statement (`DisplayTail.truncated`) or, for a legacy producer, an honest reading of its
+     * `redacted` marker against its `chars` figure. Never derived by measuring a preview.
+     *
+     * T26 (R26) note: this is the WIRE's truth, not the pane's. The pane may cap a whole body
+     * further (`shownChars < chars`), and the caption reports the pane; `data-truncated` keeps
+     * reporting the wire, so "the record sent me a preview" and "I am showing you a window"
+     * stay two separate, individually honest facts.
      */
     truncated: boolean;
     /** The current call's payload, present exactly when `kind === 'tool'`. */
@@ -597,12 +809,23 @@ const designatedTailOf = (section: TurnSection, designation: DisplayTail): Conte
               ? undefined
               : exactCharsOf(undefined, result.length);
 
+        // One exact figure, computed once and read by both the block's `chars` and the
+        // pane's `shownChars` (they differ only when the wire bounded the payload).
+        const payloadChars = (args?.length ?? 0) + (result?.length ?? 0);
+        const callChars = exactCharsOf(segment?.chars ?? designation.chars, payloadChars);
+
         return {
             kind: 'tool',
             nodeId: step.id,
             blockId: designation.blockId,
             text: '',
-            chars: exactCharsOf(segment?.chars ?? designation.chars, (args?.length ?? 0) + (result?.length ?? 0)),
+            // A call's panes print the recorded bytes whole (T25), so what is on screen is the
+            // payload the designation carried. `renderText` stays empty: the suffix window of
+            // R26 is a PROSE preview rule, and capping a recorded payload further would be the
+            // gratuitous cap the requirement warns about.
+            renderText: '',
+            shownChars: Math.min(callChars, payloadChars),
+            chars: callChars,
             truncated: designation.truncated === true,
             designated: true,
             tool: {
@@ -627,11 +850,19 @@ const designatedTailOf = (section: TurnSection, designation: DisplayTail): Conte
     const prose = node as DisplayTextNode | DisplayReasoningNode;
     const chars = exactCharsOf(segment?.chars ?? prose.chars ?? designation.chars, prose.text.length);
 
+    // T26 (R26): the pane paints the LATEST suffix of the wire body. A designated carrier's
+    // text IS the whole recorded window, so live and reload slice the same bytes the same way;
+    // a body the wire already bounded keeps the end of what the wire sent, and `shownChars`
+    // states how much of the record that is.
+    const render = contextTextSuffixOf(prose.text);
+
     return {
         kind: designation.kind,
         nodeId: prose.id,
         blockId: designation.blockId,
         text: prose.text,
+        renderText: render.text,
+        shownChars: Math.min(chars, render.shown),
         chars,
         truncated: proseIsBounded(prose, chars, prose.text),
         designated: true
@@ -664,12 +895,15 @@ const legacyTailOf = (section: TurnSection): ContextTail | undefined => {
         const prose = node as DisplayTextNode | DisplayReasoningNode;
         const segment = lastBlockOfKind(section, kind);
         const chars = exactCharsOf(segment?.chars ?? prose.chars, prose.text.length);
+        const render = contextTextSuffixOf(prose.text);
 
         return {
             kind,
             nodeId: prose.id,
             blockId: segment?.id,
             text: prose.text,
+            renderText: render.text,
+            shownChars: Math.min(chars, render.shown),
             chars,
             truncated: proseIsBounded(prose, chars, prose.text),
             designated: false
@@ -711,29 +945,34 @@ export const contextTailLabelOf = (tail: ContextTail): string => {
 };
 
 /**
- * The tail's ONE figure line, and the honest one at that (R23).
+ * The tail's ONE figure line, and the honest one at that (R23; windowed by T26, R26).
  *
- * `chars` is always the EXACT recorded length (invariant 5). When the wire body is a
- * bounded payload the line says how much of it is on screen, so a 320-character think
- * window or a `DISPLAY_TAIL_PAYLOAD_CHARS`-capped result never reads as the whole block —
- * and when it is not bounded, the line states the length without hedging, because the
- * designated carrier IS the whole text.
+ * `chars` is always the EXACT recorded length (invariant 5) and `shownChars` is always the
+ * exact length ON SCREEN. The two differ when the wire sent a bounded payload, and they also
+ * differ when the pane caps a whole prose body at `CONTEXT_TAIL_PREVIEW_CHARS` to show its
+ * latest lines — either way the line states the painted figure beside the recorded one, so a
+ * 320-character window of a 1,234-character block never reads as the whole block. When the
+ * pane does hold the whole block the line states the length without hedging, because the
+ * designated carrier IS the whole text (T25: a server's tool payload is never capped away).
  *
- * Exact strings, pinned by ./view-context.test.ts:
- *   thinking whole   `thinking · 1,234 characters`
- *   thinking bounded `thinking · showing 320 of 1,234 characters — click the segment for the exact text`
- *   answer whole     `answer · 96 characters`
- *   call settled     `read · ok · 1.3s · 1,204 characters · args 20 + result 1,184`
- *   call running     `read · running · 20 characters · no result recorded yet`
+ * The exact strings are pinned by ./view-context.test.ts: a whole prose body prints its exact
+ * length alone; a bounded or windowed one prints `showing N of M characters` with the pointer
+ * to the segment detail; a settled call names its state, its measured span (or `time not
+ * recorded` when the record never bracketed one, R27), its exact length and the args/result
+ * split; a running call says `no result recorded yet`.
  */
 export const contextTailCaptionOf = (tail: ContextTail): string => {
     const label = contextTailLabelOf(tail);
 
     if (tail.kind !== 'tool') {
-        if (!tail.truncated) return `${label} · ${formatContextCharCount(tail.chars)} characters`;
+        // Whole means WHOLE: every recorded character is on screen. Anything else states the
+        // exact number painted — whether the wire sent a bounded body or the pane capped a
+        // whole one at `CONTEXT_TAIL_PREVIEW_CHARS` (T26, R26). `shownChars` is the one figure
+        // both cases agree on, so the line can never claim more than the reader is looking at.
+        if (tail.shownChars >= tail.chars) return `${label} · ${formatContextCharCount(tail.chars)} characters`;
 
         return (
-            `${label} · showing ${formatContextCharCount(tail.text.length)} of ` +
+            `${label} · showing ${formatContextCharCount(tail.shownChars)} of ` +
             `${formatContextCharCount(tail.chars)} characters — click the segment for the exact text`
         );
     }
@@ -742,15 +981,12 @@ export const contextTailCaptionOf = (tail: ContextTail): string => {
     const parts = [label, tool?.state ?? 'running'];
 
     if (tool?.durationMs !== undefined) parts.push(formatDuration(tool.durationMs));
+    else parts.push('time not recorded');
 
     // The body this pane prints, when the wire bounded it, beside the block's EXACT size.
-    if (tail.truncated) {
-        const shown = (tool?.args?.length ?? 0) + (tool?.result?.length ?? 0);
-
-        parts.push(`showing ${formatContextCharCount(shown)} of ${formatContextCharCount(tail.chars)} characters`);
-    } else {
-        parts.push(`${formatContextCharCount(tail.chars)} characters`);
-    }
+    if (tail.truncated)
+        parts.push(`showing ${formatContextCharCount(tail.shownChars)} of ${formatContextCharCount(tail.chars)} characters`);
+    else parts.push(`${formatContextCharCount(tail.chars)} characters`);
 
     // The split the strip's tooltip already states, so the body and the segment agree.
     if (tool !== undefined && !tail.truncated) {
@@ -783,20 +1019,37 @@ export const contextTailShowsProse = (tail: ContextTail | undefined, nodeId: str
     tail !== undefined && tail.kind === 'assistant' && tail.nodeId === nodeId;
 
 // ---------------------------------------------------------------------------
-// Geometry: proportional widths with an honest display floor
+// Geometry: TWO dimensions (T26, R27) — width from recorded time, height from
+// recorded characters, each with an honest display floor
 // ---------------------------------------------------------------------------
 
 export type ContextBarSegmentLayout = {
     index: number;
     block: ContextBlock;
-    /** The exact character count this segment stands for (the weight it was sized from). */
+    /** The exact character count this segment stands for — the HEIGHT weight. */
     chars: number;
-    /** Fraction of the usable track, after the display floor, summing to exactly 1. */
+    /**
+     * The RECORDED span in ms this segment stands for, or undefined when the record cannot
+     * bracket it (`durationMs` first, then `endedAt - at` — never a guess). This is the WIDTH
+     * weight, because the horizontal axis is TIME TAKEN.
+     */
+    durationMs: number | undefined;
+    /** False when `durationMs` is undefined: this bar's width is the honest baseline. */
+    durationKnown: boolean;
+    /** Fraction of the usable track WIDTH, after the floor and the baseline, summing to exactly 1. */
     share: number;
-    /** Left edge in CSS pixels from the start of the track. */
+    /** Left edge in CSS pixels from the start of the track (sequential, never overlapping). */
     x: number;
     /** Painted width in CSS pixels, at least 1. */
     width: number;
+    /** `chars / maxChars` inside THIS strip (0 when the strip recorded no characters). */
+    heightShare: number;
+    /**
+     * Painted bar HEIGHT in CSS pixels: `maxHeightPx * heightShare`, clamped into
+     * `[minSegmentHeightPx, maxHeightPx]` so the tallest bar in the strip is exactly two
+     * line-heights and a small-but-real block is still a visible bar.
+     */
+    heightPx: number;
 };
 
 export type ContextBarLayout = {
@@ -808,6 +1061,26 @@ export type ContextBarLayout = {
     trackPx: number;
     /** The minimum segment width actually applied (the floor, shrunk when it cannot fit). */
     minSegmentPx: number;
+    /** The baseline width actually applied to a segment with no recorded span. */
+    unknownDurationPx: number;
+    /** How many segments took that baseline (R27: the strip's unmeasured count). */
+    durationsUnknown: number;
+    /** Sum of every recorded span, or undefined when this strip has none at all. */
+    totalDurationMs: number | undefined;
+    /** The line-height the vertical axis was scaled from (R27: 2 of these is the ceiling). */
+    lineHeightPx: number;
+    /** The tallest possible bar: `CONTEXT_BAR_MAX_HEIGHT_LINES` line-heights. */
+    maxHeightPx: number;
+    /** The shortest bar a block with recorded characters can paint. */
+    minSegmentHeightPx: number;
+    /** The largest `chars` figure in this strip — the height denominator. */
+    maxChars: number;
+    /**
+     * The strip's own physical box: the tallest bar it paints (so a canvas and a flex row
+     * reserve the same rectangle), or `CONTEXT_BAR_TRACK_HEIGHT_PX` for an empty strip, which
+     * is the box the dashed "nothing recorded" affordance needs.
+     */
+    heightPx: number;
     segments: ContextBarSegmentLayout[];
     /** Right edge of the last segment: what a pointer test must reject beyond. */
     rightEdge: number;
@@ -880,23 +1153,139 @@ export const contextBarSharesOf = (weights: readonly number[], minShare: number)
 };
 
 /**
- * Pixel geometry for one bar.
+ * Width shares from the RECORDED spans (T26, R27): the horizontal axis is TIME TAKEN.
  *
- * Deterministic and total-exact: segment edges come from rounding the CUMULATIVE share,
- * so rounding cannot drift a segment out of the track, and the right edge of the last
- * segment is the width the painter has. The gap and the display floor both shrink when
- * they cannot fit (a 3,000-segment turn in a 600px track), which is honest: below ~2px a
- * proportion is not visible anyway, and the tooltip still carries the true counts.
+ * `durations[i]` is the exact span in ms, or undefined when the record cannot say. Known
+ * spans divide whatever the unmeasured ones leave, proportionally and water-filled against
+ * the same display floor the strip has always had (so a 40ms call stays clickable beside a
+ * 40s one); an undefined span takes a fixed BASELINE width instead of a fabricated number,
+ * and a strip with no measurement at all splits equally because there is nothing to be
+ * proportional about. Every 0ms span is real data, so an all-zero strip is the same
+ * "nothing is proportional" case and splits equally rather than collapsing to baselines.
+ *
+ * The result sums to exactly 1, which is what lets the canvas (pixels) and the DOM mode
+ * (flex weights) size themselves from one arithmetic.
+ */
+export const contextBarDurationSharesOf = (
+    durations: readonly (number | undefined)[],
+    options: { trackPx?: number; minSegmentPx?: number; unknownDurationPx?: number } = {}
+): number[] => {
+    const n = durations.length;
+    if (n === 0) return [];
+
+    const requestedTrack = options.trackPx ?? 0;
+    const track = Number.isFinite(requestedTrack) && requestedTrack > 0 ? requestedTrack : CONTEXT_BAR_FALLBACK_WIDTH;
+    const requestedMin = options.minSegmentPx ?? CONTEXT_BAR_MIN_SEGMENT_PX;
+    const requestedBaseline = options.unknownDurationPx ?? CONTEXT_BAR_UNKNOWN_DURATION_PX;
+
+    // A malformed figure (NaN, negative, a string) is "the record cannot say", the same
+    // answer `contextBlockDurationOf` gives — never a coerced 0, which would read as
+    // "instantaneous".
+    const clean = durations.map((span) => (typeof span === 'number' && Number.isFinite(span) && span >= 0 ? Math.round(span) : undefined));
+    const unknown = clean.reduce<number>((count, span) => (span === undefined ? count + 1 : count), 0);
+
+    if (unknown === n) return clean.map(() => 1 / n);
+
+    // A baseline may never steal more than a fair share of the strip from the measured bars,
+    // so hundreds of unbracketed segments still leave the timeline readable.
+    const baselinePx = Math.max(0, Math.min(requestedBaseline, track / n));
+    const restPx = Math.max(0, track - baselinePx * unknown);
+    const known = clean.filter((span): span is number => span !== undefined);
+    const total = known.reduce((sum, span) => sum + span, 0);
+
+    if (restPx <= 0) return clean.map(() => 1 / n);
+
+    const restShare = restPx / track;
+    const knownShares =
+        total > 0 ? contextBarSharesOf(known, requestedMin / restPx) : known.map(() => 1 / known.length);
+
+    let cursor = 0;
+
+    return clean.map((span) => (span === undefined ? baselinePx / track : knownShares[cursor++] * restShare));
+};
+
+/**
+ * Bar heights from the RECORDED characters (T26, R27): the vertical axis is CONTEXT SIZE.
+ *
+ * One denominator per STRIP — the largest `chars` figure this strip holds — so a delegated
+ * thread's own bars stay readable beside a caller's strip whose biggest block happens to be
+ * a 40,000-character result. The largest block paints exactly `maxHeightPx` (two
+ * line-heights), anything smaller is proportional, and a block with characters never
+ * collapses under `minSegmentHeightPx`. A strip that recorded no characters at all is a row
+ * of minimum bars: short, because there is nothing tall to show.
+ */
+export const contextBarHeightsOf = (
+    chars: readonly number[],
+    options: { maxHeightPx?: number; minSegmentHeightPx?: number } = {}
+): number[] => {
+    const requestedMax = options.maxHeightPx ?? CONTEXT_BAR_MAX_TRACK_HEIGHT_PX;
+    const maxHeightPx = Number.isFinite(requestedMax) && requestedMax > 0 ? Math.round(requestedMax) : CONTEXT_BAR_MAX_TRACK_HEIGHT_PX;
+    const requestedMin = options.minSegmentHeightPx ?? CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX;
+    const minSegmentHeightPx =
+        Number.isFinite(requestedMin) && requestedMin > 0 ? Math.min(maxHeightPx, Math.round(requestedMin)) : Math.min(maxHeightPx, CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX);
+
+    const clean = chars.map((value) => (Number.isFinite(value) && value > 0 ? Math.trunc(value) : 0));
+    const maxChars = clean.reduce((best, value) => (value > best ? value : best), 0);
+
+    if (maxChars === 0) return clean.map(() => minSegmentHeightPx);
+
+    return clean.map((value) => Math.min(maxHeightPx, Math.max(minSegmentHeightPx, Math.round((maxHeightPx * value) / maxChars))));
+};
+
+/**
+ * Pixel geometry for one bar, both axes (T26, R27).
+ *
+ * Deterministic and total-exact: the horizontal edges come from rounding the CUMULATIVE
+ * share, so rounding cannot drift a segment out of the track and the right edge of the last
+ * segment is the width the painter has; segments follow each other SEQUENTIALLY (never an
+ * absolute overlapping timeline). The vertical band comes from `contextBarHeightsOf`, and
+ * `heightPx` is the tallest bar in the strip so both renderers reserve the same box and seat
+ * every bar on its bottom edge. The gap and both floors shrink when they cannot fit (a
+ * 3,000-segment turn in a 600px track), which is honest: below ~2px a proportion is not
+ * visible anyway, and the tooltip still carries the true counts.
  */
 export const layoutContextBar = (
     blocks: readonly ContextBlock[],
     width: number,
-    options: { gapPx?: number; minSegmentPx?: number } = {}
+    options: {
+        gapPx?: number;
+        minSegmentPx?: number;
+        unknownDurationPx?: number;
+        lineHeightPx?: number;
+        maxHeightPx?: number;
+        minSegmentHeightPx?: number;
+    } = {}
 ): ContextBarLayout => {
     const n = blocks.length;
     const requestedGap = options.gapPx ?? CONTEXT_BAR_GAP_PX;
     const requestedMin = options.minSegmentPx ?? CONTEXT_BAR_MIN_SEGMENT_PX;
     const safeWidth = Number.isFinite(width) && width > 0 ? width : CONTEXT_BAR_FALLBACK_WIDTH;
+
+    // The vertical scale comes from the HOST first (./ui/context-bar.ts resolves the real
+    // line-height, so "2 line-heights" survives a font or theme change), then from the shared
+    // constants. CSS pixels throughout: `devicePixelRatio` only ever scales the canvas BACKING
+    // STORE, so two line-heights are the same physical height in both modes and at any zoom.
+    const requestedLine = options.lineHeightPx ?? CONTEXT_BAR_LINE_HEIGHT_PX;
+    const lineHeightPx = Number.isFinite(requestedLine) && requestedLine > 0 ? requestedLine : CONTEXT_BAR_LINE_HEIGHT_PX;
+    const requestedMax = options.maxHeightPx ?? lineHeightPx * CONTEXT_BAR_MAX_HEIGHT_LINES;
+    const maxHeightPx = Number.isFinite(requestedMax) && requestedMax > 0 ? Math.round(requestedMax) : CONTEXT_BAR_MAX_TRACK_HEIGHT_PX;
+    const requestedBarMin = options.minSegmentHeightPx ?? CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX;
+    const minSegmentHeightPx =
+        Number.isFinite(requestedBarMin) && requestedBarMin > 0
+            ? Math.min(maxHeightPx, Math.round(requestedBarMin))
+            : Math.min(maxHeightPx, CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX);
+
+    // The two axes, read once per segment from the server's own figures: `chars` for the
+    // vertical, the recorded span for the horizontal.
+    const chars = blocks.map(contextBlockCharsOf);
+    const durations = blocks.map(contextBlockDurationOf);
+    const maxChars = chars.reduce((best, value) => (value > best ? value : best), 0);
+    const durationsUnknown = durations.reduce<number>((count, span) => (span === undefined ? count + 1 : count), 0);
+    // undefined — NOT 0 — when nothing in this strip was ever bracketed by timestamps.
+    const totalDurationMs = durations.reduce<number | undefined>(
+        (sum, span) => (span === undefined ? sum : (sum ?? 0) + span),
+        undefined
+    );
 
     if (n === 0)
         return {
@@ -904,6 +1293,16 @@ export const layoutContextBar = (
             gapPx: 0,
             trackPx: safeWidth,
             minSegmentPx: 0,
+            unknownDurationPx: 0,
+            durationsUnknown: 0,
+            totalDurationMs: undefined,
+            lineHeightPx,
+            maxHeightPx,
+            minSegmentHeightPx,
+            maxChars: 0,
+            // An empty strip reserves the base box: that is the rectangle the dashed "nothing
+            // recorded" affordance in `styles.css` draws.
+            heightPx: CONTEXT_BAR_TRACK_HEIGHT_PX,
             segments: [],
             rightEdge: 0
         };
@@ -913,9 +1312,16 @@ export const layoutContextBar = (
     const gapPx = Math.max(0, Math.min(requestedGap, maxGap));
     const trackPx = Math.max(0, safeWidth - gapPx * (n - 1));
 
-    // Then the display floor, shrunk to what the track can actually afford.
+    // Then the two width floors: the aimable minimum, and the baseline for a span the record
+    // never bracketed. Both shrink to what the track can actually afford.
     const minSegmentPx = Math.max(0, Math.min(requestedMin, trackPx > 0 ? trackPx / n : 0));
-    const shares = contextBarSharesOf(blocks.map(contextBlockCharsOf), trackPx > 0 ? minSegmentPx / trackPx : 0);
+    const unknownDurationPx = Math.max(
+        0,
+        Math.min(options.unknownDurationPx ?? CONTEXT_BAR_UNKNOWN_DURATION_PX, trackPx > 0 ? trackPx / n : 0)
+    );
+
+    const shares = contextBarDurationSharesOf(durations, { trackPx, minSegmentPx, unknownDurationPx });
+    const heights = contextBarHeightsOf(chars, { maxHeightPx, minSegmentHeightPx });
 
     const segments: ContextBarSegmentLayout[] = [];
     let cursor = 0;
@@ -932,10 +1338,14 @@ export const layoutContextBar = (
         segments.push({
             index: i,
             block,
-            chars: contextBlockCharsOf(block),
+            chars: chars[i],
+            durationMs: durations[i],
+            durationKnown: durations[i] !== undefined,
             share: shares[i],
             x,
-            width: painted
+            width: painted,
+            heightShare: maxChars === 0 ? 0 : chars[i] / maxChars,
+            heightPx: heights[i]
         });
 
         cursor = end + gapPx;
@@ -946,6 +1356,16 @@ export const layoutContextBar = (
         gapPx,
         trackPx,
         minSegmentPx,
+        unknownDurationPx,
+        durationsUnknown,
+        totalDurationMs,
+        lineHeightPx,
+        maxHeightPx,
+        minSegmentHeightPx,
+        maxChars,
+        // The strip's box is its tallest bar: two line-heights when anything was recorded, the
+        // minimum bar height when the whole strip recorded zero characters.
+        heightPx: maxChars > 0 ? maxHeightPx : minSegmentHeightPx,
         segments,
         rightEdge: Math.round(cursor - gapPx)
     };
@@ -958,6 +1378,12 @@ export const layoutContextBar = (
  * not a dead zone, and a reader aiming at a thin segment must not be told they missed.
  * Linear on purpose — this runs on a pointer event, not per frame — and bounded by
  * `rightEdge` so a click past the last segment is a miss.
+ *
+ * THE VERTICAL POLICY (T26, R27, stated because both renderers implement exactly this): the
+ * strip is a COLUMN chart, so the aim target is the whole column, not only the painted bar.
+ * A pointer in the blank area above a 6px bar still activates that segment. A 2px-tall bar
+ * would otherwise be a target nobody could hit with a mouse, and the DOM mode reproduces the
+ * same rule by falling back to this function when a click lands beside the buttons.
  */
 export const contextBarSegmentAt = (layout: ContextBarLayout, x: number): number => {
     if (layout.segments.length === 0) return -1;

@@ -1294,7 +1294,10 @@ type ContextBarSurface = {
      * that sits immediately below this host, so printing it twice would duplicate the answer.
      * Every body carries the SERVER's figures (`data-chars`, `data-truncated`, and for a call
      * `data-state`/`data-duration`/`data-args-chars`/`data-result-chars`), so a bounded
-     * payload says so instead of letting a prefix read as the whole block.
+     * payload says so instead of letting a prefix read as the whole block. T26 (R26) adds the
+     * PANE's own pair, `data-shown-chars` / `data-render-bounded`: a prose body paints its
+     * latest window (not its first lines), and the element states exactly how many recorded
+     * characters that window is, beside the exact whole length.
      */
     setTail: (tail: ContextTail | undefined) => void;
     /** Repaint the dialog this surface owns from the section's current metadata. */
@@ -5674,6 +5677,10 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 delete tail.dataset.blockId;
                 delete tail.dataset.chars;
                 delete tail.dataset.truncated;
+                // T26 (R26): the painted-length pair goes with the body, or a rebuilt pane
+                // could report the previous block's window.
+                delete tail.dataset.shownChars;
+                delete tail.dataset.renderBounded;
                 delete tail.dataset.state;
                 delete tail.dataset.duration;
                 delete tail.dataset.argsChars;
@@ -5682,6 +5689,29 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 delete tail.dataset.media;
                 tailCaption.textContent = '';
                 tailBody.replaceChildren();
+                // A cleared body describes NOTHING, the follow policy included: leaving
+                // `data-follow` on an empty box would make a cold-rendered section and a
+                // live-cleared one report different state for the same "no body" answer.
+                delete tailBody.dataset.follow;
+            };
+
+            /**
+             * Keep the NEWEST byte visible in a clipped box (T26, R26).
+             *
+             * Every preview box in this surface is height-bounded with its own scrollbar, so a
+             * body that grows stays pinned at the top and the reader watches a block of text
+             * that never changes — the "static text" the requirement names. Scrolling to the
+             * bottom is the cheap, layout-honest answer, and it touches no recorded byte.
+             *
+             * `data-follow` states the policy ON the element: a host with no layout (jsdom, a
+             * stripped webview) cannot report `scrollTop`, but it can report the intent, and the
+             * attribute is the assertion surface. A pane is only re-aimed when its CONTENT
+             * changed, because every caller here is behind the `tailKey` guard — a reader who
+             * scrolled up to re-read is never yanked by an unrelated repaint.
+             */
+            const followLatest = (box: HTMLElement): void => {
+                box.dataset.follow = 'latest';
+                box.scrollTop = box.scrollHeight;
             };
 
             // One labelled pane of the current call's body, and its stated absence. The
@@ -5720,13 +5750,17 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 body.className = 'context-bar-tail-pane-body';
                 body.dataset.field = pane;
                 body.textContent = value;
+                // The bytes stay WHOLE (T25: a designated payload is never capped away), so
+                // this pane adds no text bound of its own — it only aims the scroll at the
+                // newest byte, which is the R26 rule for every clipped preview here.
+                followLatest(body);
                 section.append(body);
 
                 return section;
             };
 
             /**
-             * Print the section's current block in full, or hide the body.
+             * Print the section's current block, or hide the body.
              *
              * An `assistant` tail deliberately prints NOTHING here: its full text is the
              * section's designated answer node, and the flow already renders that in the
@@ -5734,6 +5768,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
              * surface R23 points at. A thinking window and a recorded call DO need a body
              * minted at the tail of the strip, because the think chip and the tool card that
              * used to hold them are the wall this bar replaced.
+             *
+             * WHAT "the whole block" means on screen (T26, R26): a recorded call prints its
+             * complete recorded request and response, byte for byte, with the scroll aimed at
+             * the newest byte. A PROSE body prints its LATEST window
+             * (`ContextTail.renderText`, `CONTEXT_TAIL_PREVIEW_CHARS` wide) so a streaming
+             * thinking window visibly moves instead of holding its first lines; the exact
+             * recorded length stays on `data-chars`, the painted length on `data-shown-chars`,
+             * and the complete bytes are one segment click away in ./context-detail.ts.
              */
             const paintTail = (next: ContextTail | undefined): void => {
                 if (next === undefined || next.kind === 'assistant') {
@@ -5752,13 +5794,15 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     return;
                 }
 
-                // Prose compares its text (the body IS the text); a call compares the
-                // payload sizes and the server's figures, because its bytes are minted once
+                // Prose compares what it PAINTS (the body IS that text), and the painted text
+                // is the R26 suffix window — so a longer tail of the same window repaints,
+                // while a frame that changed nothing costs no DOM work at all. A call compares
+                // the payload sizes and the server's figures, because its bytes are minted once
                 // per recorded event and can only move by one arriving.
                 const key =
                     next.kind === 'tool'
                         ? `tool|${next.nodeId}|${next.blockId ?? ''}|${next.chars}|${next.truncated}|${kind?.state ?? ''}|${kind?.durationMs ?? -1}|${kind?.args?.length ?? -1}|${kind?.result?.length ?? -1}|${kind?.panelCount ?? 0}|${kind?.mediaCount ?? 0}`
-                        : `${next.kind}|${next.nodeId}|${next.blockId ?? ''}|${next.chars}|${next.truncated}|${next.text}`;
+                        : `${next.kind}|${next.nodeId}|${next.blockId ?? ''}|${next.chars}|${next.truncated}|${next.shownChars}|${next.renderText}`;
 
                 if (key === tailKey) return;
 
@@ -5773,6 +5817,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 // as the whole block.
                 tail.dataset.chars = String(next.chars);
                 tail.dataset.truncated = next.truncated ? 'true' : 'false';
+                // T26 (R26): the WIRE's truth (`data-truncated`) and the PANE's truth
+                // (`data-shown-chars` / `data-render-bounded`) are stated separately, so
+                // "the record sent a preview" and "this pane shows a window of it" never get
+                // conflated, and the exact recorded length is always on the element.
+                tail.dataset.shownChars = String(next.shownChars);
+                tail.dataset.renderBounded = next.shownChars < next.chars ? 'true' : 'false';
                 tailCaption.textContent = contextTailCaptionOf(next);
 
                 if (next.kind === 'reasoning') {
@@ -5784,7 +5834,12 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                     delete tail.dataset.media;
                     // Plain text, never Markdown — the think chip's rule verbatim: scratch
                     // space can contain anything the model wrote, and this path parses no HTML.
-                    tailBody.textContent = next.text;
+                    // T26 (R26): the painted string is the LATEST window of the body
+                    // (`renderText`), never its first lines, and the box follows it to the
+                    // bottom — which is what makes a growing thinking window visibly scroll
+                    // instead of sitting there showing the same opening sentence.
+                    tailBody.textContent = next.renderText;
+                    followLatest(tailBody);
 
                     return;
                 }
@@ -6645,7 +6700,8 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
          * Two surfaces are narrowed, and only while the section is bar-described
          * (`driven()`), so a pre-T9 record keeps the historical flow untouched:
          *   - the strip's OWN tail body (this section's current thinking window or current
-         *     call, printed in full directly after the graph — `surface.setTail`), and
+         *     call, printed directly after the graph - `surface.setTail`; a call whole, prose
+         *     as its latest window per T26/R26), and
          *   - the flow's prose blocks: the current answer prints, every earlier window is
          *     hidden because the segment plus its lazy detail is how it is represented now.
          */

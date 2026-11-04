@@ -1,13 +1,16 @@
-// The context bar's MODEL and GEOMETRY, tested as pure data (T11: R6/R7).
+// The context bar's MODEL and GEOMETRY, tested as pure data (T11: R6/R7; T26: R26/R27).
 //
-// Why a separate file: the bar's two riskiest rules are arithmetic, not DOM — the width
-// floor and the tone mapping. Both must hold for a turn with THREE HUNDRED segments as
-// exactly as they do for three, and neither is testable through pixels. Every fixture here
-// is a hand-written `ContextBlock` (../shared/turn-display.ts:381) spelled out field by
-// field, so a contract change in the frozen type fails this file rather than a mock.
+// Why a separate file: the bar's riskiest rules are arithmetic, not DOM — the WIDTH floor,
+// the two axes (width = recorded time taken, height = recorded characters, capped at two
+// line-heights) and the tone mapping. All of them must hold for a turn with THREE HUNDRED
+// segments as exactly as they do for three, and none of them is testable through pixels.
+// Every fixture here is a hand-written `ContextBlock` (../shared/turn-display.ts:381) spelled
+// out field by field, so a contract change in the frozen type fails this file rather than a
+// mock.
 //
 // The expected values are exact, not ranges: `toEqual` on the whole layout object, on the
-// whole label string, and on the whole share array. A width of 99px is asserted as 99px.
+// whole label string, and on the whole share array. A width of 99px is asserted as 99px, a
+// bar of 24px as 24px, and a preview window as the exact string it paints.
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts view-context.test.ts
 
@@ -16,8 +19,19 @@ import {
     CONTEXT_BAR_FALLBACK_WIDTH,
     CONTEXT_BAR_GAP_PX,
     CONTEXT_BAR_LABEL,
+    CONTEXT_BAR_LINE_HEIGHT_PX,
+    CONTEXT_BAR_MAX_HEIGHT_LINES,
+    CONTEXT_BAR_MAX_TRACK_HEIGHT_PX,
+    CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX,
     CONTEXT_BAR_MIN_SEGMENT_PX,
     CONTEXT_BAR_TONE_STYLES,
+    CONTEXT_BAR_TRACK_HEIGHT_PX,
+    CONTEXT_BAR_UNKNOWN_DURATION_PX,
+    CONTEXT_TEXT_ELLIPSIS,
+    CONTEXT_TAIL_PREVIEW_CHARS,
+    contextBarDurationSharesOf,
+    contextBarFiguresOf,
+    contextBarHeightsOf,
     contextBarOf,
     contextBarReplacesChips,
     contextBarSegmentAt,
@@ -27,13 +41,13 @@ import {
     contextBarToneOf,
     contextBlockCharsOf,
     contextBlockDurationOf,
-    contextBarFiguresOf,
     contextSegmentLabelOf,
     contextSegmentTitleOf,
     contextTailCaptionOf,
     contextTailLabelOf,
     contextTailOf,
     contextTailShowsProse,
+    contextTextSuffixOf,
     formatContextCharCount,
     layoutContextBar
 } from './view-context';
@@ -167,8 +181,33 @@ describe('contextBarOf', () => {
             totalChars: 0,
             unpromptedChars: 0,
             counts: { user: 0, system: 0, reasoning: 0, assistant: 0, tool: 0 },
-            charsByKind: { user: 0, system: 0, reasoning: 0, assistant: 0, tool: 0 }
+            charsByKind: { user: 0, system: 0, reasoning: 0, assistant: 0, tool: 0 },
+            // T26 (R27): no segments means no time figure at all — NOT `0ms`, which would be
+            // a claim about the turn rather than the absence of one.
+            totalDurationMs: undefined,
+            durationsUnknown: 0
         });
+    });
+
+    it('totals the recorded spans for the horizontal axis and counts the unmeasured ones', () => {
+        // 1,200ms of thinking + 800ms of tool, and a prompt the record never bracketed: the
+        // strip's width axis has one total (2,000ms) and one honest exception (1 segment).
+        const model = contextBarOf(displayOf([section('t1:0', [prompt(), think(), tool()])]));
+
+        expect(model.totalDurationMs).toBe(2_000);
+        expect(model.durationsUnknown).toBe(1);
+
+        // Every span 0ms IS data: the total is exactly 0, and nothing is "unknown".
+        const instant = contextBarOf(displayOf([section('t1:0', [tool({ endedAt: T }), tool({ endedAt: T })])]));
+
+        expect(instant.totalDurationMs).toBe(0);
+        expect(instant.durationsUnknown).toBe(0);
+
+        // And a turn made only of unbracketed blocks reports undefined, not a fabricated 0.
+        const unbracketed = contextBarOf(displayOf([section('t1:0', [prompt(), prompt({ id: 'p2' })])]));
+
+        expect(unbracketed.totalDurationMs).toBeUndefined();
+        expect(unbracketed.durationsUnknown).toBe(2);
     });
 
     it('drops a duplicated section+id rather than counting one block twice', () => {
@@ -285,7 +324,9 @@ describe('contextSegmentTitleOf', () => {
         expect(contextSegmentTitleOf(tool())).toBe(
             'read · tool · ok · 1,204 characters · args 20 + result 1,184 · 800ms'
         );
-        expect(contextSegmentTitleOf(prompt())).toBe('prompt · user · 42 characters');
+        // T26 (R27): the prompt has no recorded span, and the tooltip SAYS so — the baseline
+        // width it paints would otherwise read as a measurement of something.
+        expect(contextSegmentTitleOf(prompt())).toBe('prompt · user · 42 characters · time not recorded');
         expect(contextSegmentTitleOf(think())).toBe(
             'reasoning · reasoning · 300 characters · 1.2s · not replayed into the prompt'
         );
@@ -297,14 +338,24 @@ describe('contextSegmentTitleOf', () => {
         // to name, and there is no settle stamp to build a span from.
         expect(
             contextSegmentTitleOf(tool({ state: 'running', chars: 20, resultChars: undefined, endedAt: undefined, name: 'write' }))
-        ).toBe('write · tool · running · 20 characters · args 20, no result recorded');
+        ).toBe('write · tool · running · 20 characters · args 20, no result recorded · time not recorded');
         // A result-only recording names the part it does hold.
         expect(contextSegmentTitleOf(tool({ argsChars: undefined }))).toBe(
             'read · tool · ok · 1,204 characters · result 1,184 · 800ms'
         );
         // A non-tool block marked not-in-prompt still gets the honest note.
         expect(contextSegmentTitleOf(prompt({ inPrompt: false }))).toBe(
-            'prompt · user · 42 characters · not replayed into the prompt'
+            'prompt · user · 42 characters · time not recorded · not replayed into the prompt'
+        );
+    });
+
+    it('prints a measured 0ms as data, never as "time not recorded"', () => {
+        // R27: an instant call is a REAL measurement. Only the absence of one is labelled.
+        expect(contextSegmentTitleOf(tool({ at: T, endedAt: T }))).toBe(
+            'read · tool · ok · 1,204 characters · args 20 + result 1,184 · 0ms'
+        );
+        expect(contextSegmentTitleOf(tool({ at: T, endedAt: undefined, durationMs: 0 }))).toBe(
+            'read · tool · ok · 1,204 characters · args 20 + result 1,184 · 0ms'
         );
     });
 
@@ -316,16 +367,18 @@ describe('contextSegmentTitleOf', () => {
 });
 
 describe('contextBarSummaryOf', () => {
-    it('names the unit and the segment count, and calls out the thinking share', () => {
+    it('explains both axes, names the unit, and totals the recorded time', () => {
         const model = contextBarOf(displayOf([section('t1:0', [prompt(), think(), tool()])]));
 
         expect(contextBarSummaryOf(model)).toBe(
-            'context character distribution · 3 segments · 1,546 characters · 300 characters not replayed into the prompt'
+            `${CONTEXT_BAR_LABEL} · 3 segments · 1,546 characters · 2.0s of recorded time` +
+                ` · 1 segment has no recorded time · 300 characters not replayed into the prompt`
         );
 
-        // No reasoning share => no trailing clause, and ONE segment says "segment".
+        // No reasoning share => no trailing clause, and ONE segment says "segment". The
+        // prompt's unbracketed span still gets its own honest clause.
         expect(contextBarSummaryOf(contextBarOf(displayOf([section('t1:0', [prompt()])])))).toBe(
-            'context character distribution · 1 segment · 42 characters'
+            `${CONTEXT_BAR_LABEL} · 1 segment · 42 characters · 1 segment has no recorded time`
         );
 
         // The authoritative empty bar says so in the same voice.
@@ -333,6 +386,16 @@ describe('contextBarSummaryOf', () => {
             `${CONTEXT_BAR_LABEL} · no recorded context`
         );
         expect(contextBarSummaryOf(contextBarOf(undefined))).toBe(`${CONTEXT_BAR_LABEL} · no recorded context`);
+    });
+
+    it('states the axes in words, because the visible caption no longer does', () => {
+        // R27: the strip is two-dimensional, and a reader who cannot see it has to be told
+        // which way each dimension runs. The words are on the group's accessible name.
+        expect(CONTEXT_BAR_LABEL).toContain('width is time taken');
+        expect(CONTEXT_BAR_LABEL).toContain('height is recorded characters');
+        // R24 keeps the UNIT in the wording: a character strip must never be mistaken for a
+        // token counter or a context-window gauge.
+        expect(CONTEXT_BAR_LABEL).toContain('characters');
     });
 
     it('never calls a character count a token count', () => {
@@ -391,18 +454,31 @@ describe('contextBarStatsOf', () => {
 describe('contextBarFiguresOf', () => {
     // R24 moved these figures off the visible line, and they are still the ACCESSIBLE
     // name's content: `contextBarSummaryOf` is the label phrase plus exactly this string,
-    // so the unit ("characters", never tokens) and the not-replayed note survive.
-    it('states the count, the exact character total and the thinking share', () => {
+    // so the unit ("characters", never tokens), the recorded TIME total and the not-replayed
+    // note survive. T26 (R27) added the two time clauses, because the horizontal axis is the
+    // one a reader cannot infer from a picture they cannot see.
+    it('states the count, the exact character total, the recorded time and the thinking share', () => {
         const model = contextBarOf(displayOf([section('t1:0', [prompt(), think(), tool()])]));
 
         expect(contextBarFiguresOf(model)).toBe(
-            '3 segments · 1,546 characters · 300 characters not replayed into the prompt'
+            '3 segments · 1,546 characters · 2.0s of recorded time · 1 segment has no recorded time' +
+                ' · 300 characters not replayed into the prompt'
         );
+
+        // A strip where EVERY span was recorded says the total and never the exception.
+        expect(
+            contextBarFiguresOf(contextBarOf(displayOf([section('t1:0', [think(), tool()])])))
+        ).toBe('2 segments · 1,504 characters · 2.0s of recorded time · 300 characters not replayed into the prompt');
 
         // One segment pluralizes as "segment", and no unprompted characters => no clause.
         expect(contextBarFiguresOf(contextBarOf(displayOf([section('t1:0', [prompt()])])))).toBe(
-            '1 segment · 42 characters'
+            '1 segment · 42 characters · 1 segment has no recorded time'
         );
+
+        // Several unbracketed segments pluralize the same way.
+        expect(
+            contextBarFiguresOf(contextBarOf(displayOf([section('t1:0', [prompt(), prompt({ id: 'p2' })])])))
+        ).toBe('2 segments · 84 characters · 2 segments have no recorded time');
 
         // The empty bar keeps the same wording the caption uses, so the two never disagree.
         expect(contextBarFiguresOf(contextBarOf(displayOf([section('t1:0', [])])))).toBe('no recorded context');
@@ -481,10 +557,38 @@ describe('contextTailOf', () => {
             // exact `chars`, which is the same invariant-5 number.
             blockId: undefined,
             text: preview,
+            // T26 (R26): 40 characters fit the window, so the painted body is the wire text
+            // verbatim — the suffix rule adds no marker to a body it did not have to cut.
+            renderText: preview,
+            shownChars: preview.length,
             chars: 1_234,
             truncated: true,
             designated: false
         });
+    });
+
+    it('paints the LATEST window of a prose body longer than the bound (R26)', () => {
+        // A designated carrier streams the WHOLE text, so this is exactly what a live thinking
+        // window looks like: 530 recorded characters, 320 of them painted, and the 320 are the
+        // NEWEST. The old behaviour kept the first 320, which is the static-text complaint.
+        const streamed = `${'head-'.repeat(10)}${'t'.repeat(480)}`;
+
+        expect(streamed.length).toBe(530);
+
+        const tail = contextTailOf(
+            flowOf([{ kind: 'reasoning', id: '3', text: streamed, chars: streamed.length } as never], [think({ chars: streamed.length })])
+        );
+
+        expect(tail?.truncated).toBe(false);
+        expect(tail?.chars).toBe(530);
+        expect(tail?.shownChars).toBe(CONTEXT_TAIL_PREVIEW_CHARS);
+        // The painted string is the marker plus the last `CONTEXT_TAIL_PREVIEW_CHARS` units.
+        expect(tail?.renderText).toBe(`${CONTEXT_TEXT_ELLIPSIS}${streamed.slice(-CONTEXT_TAIL_PREVIEW_CHARS)}`);
+        expect(tail?.text).toBe(streamed);
+        // And the caption states the window, not the whole.
+        expect(contextTailCaptionOf(tail!)).toBe(
+            `thinking · showing ${CONTEXT_TAIL_PREVIEW_CHARS} of 530 characters — click the segment for the exact text`
+        );
     });
 
     it('takes the exact figure and the provenance id from the section context list', () => {
@@ -506,6 +610,8 @@ describe('contextTailOf', () => {
             nodeId: '5',
             blockId: '0-assistant-5',
             text: answerText,
+            renderText: answerText,
+            shownChars: answerText.length,
             chars: answerText.length,
             truncated: false,
             designated: false
@@ -620,6 +726,10 @@ describe('contextTailOf, from the server designation', () => {
             // The exact recorded figures come from the SEGMENT (invariant 5); the designation
             // decides which block prints, not what the numbers say.
             text: '',
+            // T26 (R26): a recorded CALL keeps its bytes whole (T25), so the painted length is
+            // the payload length and `renderText` is unused — the suffix window is a prose rule.
+            renderText: '',
+            shownChars: callArgs.length + callResult.length,
             chars: callArgs.length + callResult.length,
             truncated: false,
             designated: true,
@@ -680,7 +790,9 @@ describe('contextTailOf, from the server designation', () => {
             hasResult: false
         });
         expect(contextTailCaptionOf(tail as never)).toBe(
-            `read · running · ${callArgs.length} characters · args ${callArgs.length} · no result recorded yet`
+            // R27: a call that has not settled has no span yet, and the caption says so in
+            // words instead of leaving the reader to infer it from a baseline-width segment.
+            `read · running · time not recorded · ${callArgs.length} characters · args ${callArgs.length} · no result recorded yet`
         );
     });
 
@@ -718,6 +830,8 @@ describe('contextTailOf, from the server designation', () => {
             nodeId: '3',
             blockId: '0-reasoning-3',
             text: whole,
+            renderText: whole,
+            shownChars: whole.length,
             chars: whole.length,
             truncated: false,
             designated: true
@@ -770,16 +884,32 @@ describe('contextTailOf, from the server designation', () => {
 });
 
 describe('contextTailCaptionOf', () => {
+    // A hand-written tail now states BOTH figures, which is exactly the pair the caption
+    // reports (T26, R26): `chars` is the invariant-5 recorded length, `shownChars` is the
+    // length the PANE paints — whether the wire bounded it or the render window did.
+    const preview = 'a bounded preview of the thinking window';
+    const wholeText = 'every character of this window, streamed in full';
+
     const tailOf = (overrides: Record<string, unknown> = {}) =>
         ({
             kind: 'reasoning',
             nodeId: '3',
             blockId: '0-reasoning-3',
-            text: 'a bounded preview of the thinking window',
+            text: preview,
+            renderText: `${CONTEXT_TEXT_ELLIPSIS}${preview}`,
+            shownChars: preview.length,
             chars: 1_234,
             truncated: true,
             ...overrides
         }) as never;
+
+    const whole = (chars: number) => ({
+        truncated: false,
+        chars,
+        text: 'w'.repeat(chars),
+        renderText: 'w'.repeat(chars),
+        shownChars: chars
+    });
 
     it('states the exact length, and how much of a bounded round is on screen', () => {
         expect(contextTailCaptionOf(tailOf())).toBe(
@@ -787,9 +917,28 @@ describe('contextTailCaptionOf', () => {
         );
 
         // The designated carrier needs no hedge: what prints IS the whole block.
-        expect(contextTailCaptionOf(tailOf({ truncated: false }))).toBe('thinking · 1,234 characters');
-        expect(contextTailCaptionOf(tailOf({ kind: 'assistant', truncated: false, chars: 46 }))).toBe(
-            'answer · 46 characters'
+        expect(contextTailCaptionOf(tailOf(whole(1_234)))).toBe('thinking · 1,234 characters');
+        expect(contextTailCaptionOf(tailOf({ kind: 'assistant', ...whole(46) }))).toBe('answer · 46 characters');
+    });
+
+    it('reports the render WINDOW as a preview, even when the wire sent the whole body', () => {
+        // R26: the pane caps a long streaming window at `CONTEXT_TAIL_PREVIEW_CHARS` so the
+        // reader sees the newest lines. The caption follows the painted text, never the wire,
+        // so a windowed body can never claim to be whole.
+        const streamed = 's'.repeat(530);
+
+        expect(
+            contextTailCaptionOf(
+                tailOf({
+                    truncated: false,
+                    chars: 530,
+                    text: streamed,
+                    renderText: `${CONTEXT_TEXT_ELLIPSIS}${streamed.slice(-CONTEXT_TAIL_PREVIEW_CHARS)}`,
+                    shownChars: CONTEXT_TAIL_PREVIEW_CHARS
+                })
+            )
+        ).toBe(
+            `thinking · showing ${CONTEXT_TAIL_PREVIEW_CHARS} of 530 characters — click the segment for the exact text`
         );
     });
 
@@ -818,11 +967,14 @@ describe('contextTailShowsProse', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Geometry: proportional to the exact characters, with a display floor
+// Geometry: WIDTH from the recorded time, HEIGHT from the recorded characters,
+// each with an honest display floor (T26, R27)
 // ---------------------------------------------------------------------------
 
 describe('contextBarSharesOf', () => {
     it('divides by the exact weights when every segment clears the floor', () => {
+        // The generic water-fill keeps its own contract (it is what sizes the TIME axis):
+        // exact proportions, summing to exactly 1.
         expect(contextBarSharesOf([100, 200, 300], 0)).toEqual([1 / 6, 1 / 3, 1 / 2]);
         expect(contextBarSharesOf([100, 200, 300], 8 / 596)).toEqual([1 / 6, 1 / 3, 1 / 2]);
     });
@@ -850,30 +1002,158 @@ describe('contextBarSharesOf', () => {
 });
 
 describe('layoutContextBar', () => {
-    it('places three segments proportionally with the declared gap', () => {
-        const layout = layoutContextBar([tool({ chars: 100 }), tool({ id: 'b', chars: 200 }), tool({ id: 'c', chars: 300 })], 600);
+    it('sizes WIDTH from the recorded time and HEIGHT from the recorded characters (R27)', () => {
+        // Deliberately crossed: the FIRST block is the biggest by characters and the shortest
+        // by time. A width that came from `chars`, or a height that came from the span, fails
+        // this fixture in a different way — which is the point of writing it this way.
+        const layout = layoutContextBar(
+            [
+                tool({ chars: 300, at: T, endedAt: T + 1_000 }),
+                tool({ id: 'b', chars: 200, at: T, endedAt: T + 2_000 }),
+                tool({ id: 'c', chars: 100, at: T, endedAt: T + 7_000 })
+            ],
+            600
+        );
 
         expect(layout.width).toBe(600);
         expect(layout.gapPx).toBe(CONTEXT_BAR_GAP_PX);
         expect(layout.trackPx).toBe(596);
         expect(layout.minSegmentPx).toBe(CONTEXT_BAR_MIN_SEGMENT_PX);
+        // The strip's own axis figures: 1,000 + 2,000 + 7,000 ms, no unmeasured segment, and
+        // a height denominator of 300 characters.
+        expect(layout.totalDurationMs).toBe(10_000);
+        expect(layout.durationsUnknown).toBe(0);
+        expect(layout.maxChars).toBe(300);
+        // The vertical band: one line-height, the two-line ceiling, the legible floor, and
+        // the box the strip paints into (its tallest bar).
+        expect(CONTEXT_BAR_MAX_TRACK_HEIGHT_PX).toBe(CONTEXT_BAR_LINE_HEIGHT_PX * CONTEXT_BAR_MAX_HEIGHT_LINES);
+        expect(CONTEXT_BAR_MAX_TRACK_HEIGHT_PX).toBe(36);
+        expect(layout.lineHeightPx).toBe(CONTEXT_BAR_LINE_HEIGHT_PX);
+        expect(layout.maxHeightPx).toBe(36);
+        expect(layout.minSegmentHeightPx).toBe(CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX);
+        expect(layout.heightPx).toBe(36);
         expect(layout.rightEdge).toBe(600);
+
+        // Widths follow the SPAN (10% / 20% / 70%), heights follow the CHARACTERS
+        // (36 / 24 / 12 of the 36px ceiling), and every bar sits on the bottom edge.
         expect(layout.segments).toEqual([
-            { index: 0, block: expect.objectContaining({ id: '0-tool-7' }), chars: 100, share: 1 / 6, x: 0, width: 99 },
-            { index: 1, block: expect.objectContaining({ id: 'b' }), chars: 200, share: 1 / 3, x: 101, width: 199 },
-            { index: 2, block: expect.objectContaining({ id: 'c' }), chars: 300, share: 1 / 2, x: 302, width: 298 }
+            {
+                index: 0,
+                block: expect.objectContaining({ id: '0-tool-7' }),
+                chars: 300,
+                durationMs: 1_000,
+                durationKnown: true,
+                share: 0.1,
+                x: 0,
+                width: 60,
+                heightShare: 1,
+                heightPx: 36
+            },
+            {
+                index: 1,
+                block: expect.objectContaining({ id: 'b' }),
+                chars: 200,
+                durationMs: 2_000,
+                durationKnown: true,
+                share: 0.2,
+                x: 62,
+                width: 119,
+                heightShare: 2 / 3,
+                heightPx: 24
+            },
+            {
+                index: 2,
+                block: expect.objectContaining({ id: 'c' }),
+                chars: 100,
+                durationMs: 7_000,
+                durationKnown: true,
+                share: 0.7,
+                x: 183,
+                width: 417,
+                heightShare: 1 / 3,
+                heightPx: 12
+            }
         ]);
+        expect(layout.segments.reduce((sum, segment) => sum + segment.share, 0)).toBeCloseTo(1, 12);
     });
 
-    it('honors the minimum width for a segment the data would have made invisible', () => {
-        const layout = layoutContextBar([tool({ chars: 1_000_000 }), tool({ id: 'b', chars: 5 }), tool({ id: 'c', chars: 5 })], 600);
+    it('honors the width floor for a span the data would have made invisible', () => {
+        // 1ms beside two 80s calls: the 1ms bar would be 0.01px, so it keeps the 8px aim floor
+        // and the two measured calls pay for it out of their own widths.
+        const layout = layoutContextBar(
+            [
+                tool({ chars: 1_000_000, at: T, endedAt: T + 1 }),
+                tool({ id: 'b', chars: 5, at: T, endedAt: T + 80_000 }),
+                tool({ id: 'c', chars: 5, at: T, endedAt: T + 80_000 })
+            ],
+            600
+        );
 
         expect(layout.segments.map((segment) => [segment.x, segment.width])).toEqual([
-            [0, 580],
-            [582, 8],
-            [592, 8]
+            [0, 8],
+            [10, 294],
+            [306, 294]
         ]);
+        expect(layout.totalDurationMs).toBe(160_001);
         expect(layout.rightEdge).toBe(600);
+
+        // And the vertical floor for a 5-character block beside a 1,000,000-character one:
+        // proportional would be 0.0002px, so the small bar keeps 3 legible pixels and its
+        // tooltip still states the exact figure.
+        expect(layout.segments.map((segment) => segment.heightPx)).toEqual([36, 3, 3]);
+        expect(layout.segments.map((segment) => segment.heightShare)).toEqual([1, 0.000005, 0.000005]);
+    });
+
+    it('gives an UNMEASURED span the honest baseline width, never a fabricated timing (R27)', () => {
+        // A prompt and an instruction block have no settle stamp; two calls have 2s and 6s.
+        // The unmeasured bars get exactly `CONTEXT_BAR_UNKNOWN_DURATION_PX`, the measured ones
+        // divide what is left in their real 1:3 proportion, and the counts are reported so the
+        // accessible name can say how many segments are baselines.
+        const layout = layoutContextBar(
+            [
+                tool({ id: 'u', kind: 'user', name: 'prompt', endedAt: undefined }),
+                tool({ id: 'a', at: T, endedAt: T + 2_000 }),
+                tool({ id: 'v', kind: 'system', name: 'instructions', endedAt: undefined }),
+                tool({ id: 'z', at: T, endedAt: T + 6_000 })
+            ],
+            600
+        );
+
+        expect(layout.trackPx).toBe(594);
+        expect(layout.unknownDurationPx).toBe(CONTEXT_BAR_UNKNOWN_DURATION_PX);
+        expect(layout.durationsUnknown).toBe(2);
+        // 2,000 + 6,000 of RECORDED time — the baselines contribute nothing to it.
+        expect(layout.totalDurationMs).toBe(8_000);
+        expect(layout.segments.map((segment) => [segment.durationKnown, segment.x, segment.width])).toEqual([
+            [false, 0, 8],
+            [true, 10, 145],
+            [false, 157, 8],
+            [true, 167, 433]
+        ]);
+        expect(layout.segments.map((segment) => segment.durationMs)).toEqual([undefined, 2_000, undefined, 6_000]);
+        expect(layout.rightEdge).toBe(600);
+
+        // A strip where NOTHING was bracketed splits equally: a list of unmeasured blocks is
+        // not a timeline, and inventing proportions would be the lie.
+        const allUnknown = layoutContextBar([tool({ id: 'u', endedAt: undefined }), tool({ id: 'v', endedAt: undefined })], 100);
+
+        expect(allUnknown.durationsUnknown).toBe(2);
+        expect(allUnknown.totalDurationMs).toBeUndefined();
+        expect(allUnknown.segments.map((segment) => [segment.x, segment.width])).toEqual([
+            [0, 49],
+            [51, 49]
+        ]);
+
+        // A 0ms span IS a measurement, so it shares the strip equally with the other 0ms spans
+        // rather than dropping to the unmeasured baseline, and the total stays exactly 0.
+        const allZero = layoutContextBar([tool({ id: 'a', at: T, endedAt: T }), tool({ id: 'b', at: T, endedAt: T })], 100);
+
+        expect(allZero.durationsUnknown).toBe(0);
+        expect(allZero.totalDurationMs).toBe(0);
+        expect(allZero.segments.map((segment) => [segment.durationMs, segment.x, segment.width])).toEqual([
+            [0, 0, 49],
+            [0, 51, 49]
+        ]);
     });
 
     it('shrinks the gap and the floor before it ever overflows the track', () => {
@@ -883,6 +1163,7 @@ describe('layoutContextBar', () => {
 
         expect(layout.gapPx).toBe(1);
         expect(layout.trackPx).toBe(4);
+        expect(layout.unknownDurationPx).toBeLessThanOrEqual(layout.trackPx / 3);
         expect(layout.segments.map((segment) => [segment.x, segment.width])).toEqual([
             [0, 1],
             [2, 2],
@@ -901,13 +1182,57 @@ describe('layoutContextBar', () => {
         expect(many.rightEdge).toBe(300);
     });
 
+    it('caps the tallest bar at two line-heights of the HOST scale, not a hardcoded 36 (R27)', () => {
+        // A theme that sets `--context-bar-line-height: 22px` (or a bigger font) gets a 44px
+        // ceiling — the same two text lines, because the number is counted, not copied.
+        const layout = layoutContextBar([tool({ chars: 10 }), tool({ id: 'b', chars: 40_000 })], 600, { lineHeightPx: 22 });
+
+        expect(layout.lineHeightPx).toBe(22);
+        expect(layout.maxHeightPx).toBe(44);
+        expect(layout.heightPx).toBe(44);
+        expect(layout.segments.map((segment) => segment.heightPx)).toEqual([3, 44]);
+
+        // And a caller may name the ceiling directly, which is what the painter does with the
+        // values it resolves from the document.
+        expect(layoutContextBar([tool({ chars: 10 }), tool({ id: 'b', chars: 40_000 })], 600, { maxHeightPx: 20 }).segments.map((s) => s.heightPx)).toEqual([
+            3, 20
+        ]);
+    });
+
     it('splits a bar whose every segment recorded zero characters', () => {
+        // The widths are still proportional (both spans are 800ms), but the strip has no
+        // vertical story to tell: every bar is the minimum, and the strip's BOX is the minimum
+        // too, rather than 36px of blank space over a hairline.
         const layout = layoutContextBar([tool({ chars: 0 }), tool({ id: 'b', chars: 0 })], 100);
 
         expect(layout.trackPx).toBe(98);
+        expect(layout.maxChars).toBe(0);
+        expect(layout.heightPx).toBe(CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX);
         expect(layout.segments).toEqual([
-            { index: 0, block: expect.objectContaining({ id: '0-tool-7' }), chars: 0, share: 0.5, x: 0, width: 49 },
-            { index: 1, block: expect.objectContaining({ id: 'b' }), chars: 0, share: 0.5, x: 51, width: 49 }
+            {
+                index: 0,
+                block: expect.objectContaining({ id: '0-tool-7' }),
+                chars: 0,
+                durationMs: 800,
+                durationKnown: true,
+                share: 0.5,
+                x: 0,
+                width: 49,
+                heightShare: 0,
+                heightPx: CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX
+            },
+            {
+                index: 1,
+                block: expect.objectContaining({ id: 'b' }),
+                chars: 0,
+                durationMs: 800,
+                durationKnown: true,
+                share: 0.5,
+                x: 51,
+                width: 49,
+                heightShare: 0,
+                heightPx: CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX
+            }
         ]);
         expect(layout.rightEdge).toBe(100);
     });
@@ -925,13 +1250,24 @@ describe('layoutContextBar', () => {
             gapPx: 0,
             trackPx: 600,
             minSegmentPx: 0,
+            unknownDurationPx: 0,
+            durationsUnknown: 0,
+            totalDurationMs: undefined,
+            lineHeightPx: CONTEXT_BAR_LINE_HEIGHT_PX,
+            maxHeightPx: CONTEXT_BAR_MAX_TRACK_HEIGHT_PX,
+            minSegmentHeightPx: CONTEXT_BAR_MIN_SEGMENT_HEIGHT_PX,
+            maxChars: 0,
+            // The base box, which is the rectangle the dashed "nothing recorded" state draws.
+            heightPx: CONTEXT_BAR_TRACK_HEIGHT_PX,
             segments: [],
             rightEdge: 0
         });
     });
 
     it('keeps the widths of a 300-segment turn total, ordered and non-overlapping', () => {
-        const blocks = Array.from({ length: 300 }, (_, i) => tool({ id: `s${i}`, chars: i + 1 }));
+        // Every span different, so no two shares are equal and the sequential layout is the
+        // thing under test: segment after segment, never an absolute overlapping timeline.
+        const blocks = Array.from({ length: 300 }, (_, i) => tool({ id: `s${i}`, chars: i + 1, at: T, endedAt: T + i * 7 }));
         const layout = layoutContextBar(blocks, 900);
 
         let cursor = 0;
@@ -944,25 +1280,185 @@ describe('layoutContextBar', () => {
         // The last segment ends exactly at the width the painter was given.
         expect(layout.rightEdge).toBe(900);
         expect(layout.segments[299].x + layout.segments[299].width).toBe(900);
+        expect(layout.totalDurationMs).toBe(313_950);
+    });
+});
+
+describe('contextBarDurationSharesOf', () => {
+    it('divides the track by the recorded spans exactly', () => {
+        expect(contextBarDurationSharesOf([1_000, 2_000, 7_000], { trackPx: 596 })).toEqual([0.1, 0.2, 0.7]);
+        // A single segment owns the track whatever its span.
+        expect(contextBarDurationSharesOf([5], { trackPx: 100 })).toEqual([1]);
+        expect(contextBarDurationSharesOf([], { trackPx: 100 })).toEqual([]);
+    });
+
+    it('gives an unmeasured segment its baseline and re-divides the rest', () => {
+        // track 596, two unmeasured bars at 8px each, and the 2s:6s pair splits the 580 left.
+        expect(contextBarDurationSharesOf([undefined, 2_000, undefined, 6_000], { trackPx: 596, minSegmentPx: 8, unknownDurationPx: 8 })).toEqual([
+            8 / 596,
+            0.24328859060402686,
+            8 / 596,
+            0.7298657718120806
+        ]);
+    });
+
+    it('never lets the baselines steal more than a fair share of the strip', () => {
+        // 100px, 50 segments, one of them unmeasured: `track / n` is 2px, so the baseline
+        // falls to 2px instead of a 200-segment strip of unknowns eating the measured bars.
+        const durations = Array.from({ length: 50 }, (_, index) => (index === 0 ? undefined : 1_000));
+        const shares = contextBarDurationSharesOf(durations, { trackPx: 100, minSegmentPx: 8, unknownDurationPx: 8 });
+
+        expect(shares[0]).toBeCloseTo(2 / 100, 12);
+        expect(shares.reduce((sum, share) => sum + share, 0)).toBeCloseTo(1, 12);
+    });
+
+    it('answers the nothing-is-proportional cases by splitting equally', () => {
+        expect(contextBarDurationSharesOf([undefined, undefined], { trackPx: 98 })).toEqual([0.5, 0.5]);
+        // Every span is 0ms: real data, and still nothing to be proportional about.
+        expect(contextBarDurationSharesOf([0, 0, 0], { trackPx: 100 })).toEqual([1 / 3, 1 / 3, 1 / 3]);
+        // A junk figure (NaN, negative) is "the record cannot say", never a coerced 0 — so it
+        // takes the baseline rather than collapsing the bar.
+        expect(contextBarDurationSharesOf([Number.NaN, 10], { trackPx: 100 })).toEqual([0.08, 0.92]);
+        expect(contextBarDurationSharesOf([-5, 10], { trackPx: 100, unknownDurationPx: 0 })).toEqual([0, 1]);
+    });
+});
+
+describe('contextBarHeightsOf', () => {
+    it('normalizes to the largest characters in the SAME strip and clamps the band', () => {
+        expect(contextBarHeightsOf([300, 200, 100, 0], { maxHeightPx: 36, minSegmentHeightPx: 3 })).toEqual([36, 24, 12, 3]);
+        // A 1-character block beside a 40,000-character one is a 3px bar, not a 0px one.
+        expect(contextBarHeightsOf([1, 40_000], { maxHeightPx: 36 })).toEqual([3, 36]);
+        // The ceiling is the ceiling: nothing exceeds it, whatever the ratio.
+        expect(contextBarHeightsOf([9, 9, 9], { maxHeightPx: 18 })).toEqual([18, 18, 18]);
+        // No characters anywhere: a row of minimum bars.
+        expect(contextBarHeightsOf([0, 0], { maxHeightPx: 36 })).toEqual([3, 3]);
+        expect(contextBarHeightsOf([], { maxHeightPx: 36 })).toEqual([]);
+        // A floor above the ceiling cannot win — two line-heights is the rule the reader sees.
+        expect(contextBarHeightsOf([5, 10], { maxHeightPx: 10, minSegmentHeightPx: 40 })).toEqual([10, 10]);
+        // A junk character figure is a 0-height weight, not a NaN bar.
+        expect(contextBarHeightsOf([Number.NaN, 100], { maxHeightPx: 36 })).toEqual([3, 36]);
+    });
+});
+
+describe('contextTextSuffixOf', () => {
+    // T26 (R26): the preview window keeps the END of a body. Every case here is an exact
+    // string, because "shows the latest text" is only a fact if the bytes are pinned.
+    it('keeps a short body whole, with no marker and no claim', () => {
+        expect(contextTextSuffixOf('short')).toEqual({ text: 'short', shown: 5, omitted: 0, bounded: false });
+        expect(contextTextSuffixOf('')).toEqual({ text: '', shown: 0, omitted: 0, bounded: false });
+        expect(contextTextSuffixOf(undefined)).toEqual({ text: '', shown: 0, omitted: 0, bounded: false });
+
+        // Exactly at the bound is not over the bound: the whole body prints, unsullied.
+        const at = 'y'.repeat(CONTEXT_TAIL_PREVIEW_CHARS);
+
+        expect(contextTextSuffixOf(at)).toEqual({ text: at, shown: CONTEXT_TAIL_PREVIEW_CHARS, omitted: 0, bounded: false });
+    });
+
+    it('cuts the FRONT and keeps the latest characters behind a marker', () => {
+        const body = 'head-'.repeat(100); // 500 characters
+
+        // The cut lands on a fresh `h` (500 - 10 is a multiple of the 5-character period), so
+        // the window is the last 10 characters exactly and `omitted` accounts for the rest.
+        expect(contextTextSuffixOf(body, 10)).toEqual({ text: `${CONTEXT_TEXT_ELLIPSIS}head-head-`, shown: 10, omitted: 490, bounded: true });
+    });
+
+    it('uses the bound the display contract already publishes', () => {
+        // No new arbitrary number: the render window is `DISPLAY_NODE_PREVIEW_CHARS`, the same
+        // figure a bounded wire node uses (../shared/turn-display.ts:135).
+        expect(CONTEXT_TAIL_PREVIEW_CHARS).toBe(320);
+
+        const body = '0123456789'.repeat(50); // 500
+
+        expect(contextTextSuffixOf(body)).toEqual({
+            text: `${CONTEXT_TEXT_ELLIPSIS}${body.slice(-320)}`,
+            shown: 320,
+            omitted: 180,
+            bounded: true
+        });
+    });
+
+    it('never splits a code point, an emoji sequence or a combining mark', () => {
+        // The cut lands mid-astral-pair by arithmetic; the kept suffix must still start on a
+        // whole code point, which is what "Unicode safe" means here.
+        const astral = 'a'.repeat(321) + '\u{1F468}';
+
+        const split = contextTextSuffixOf(astral, 2);
+
+        expect(split.text).toBe(`${CONTEXT_TEXT_ELLIPSIS}\u{1F468}`);
+        expect(split.shown).toBe(2);
+        expect(split.omitted).toBe(321);
+        // No lone surrogate anywhere in the painted string.
+        expect(split.text.slice(1)).toBe(astral.slice(321));
+
+        // A combining mark may never open the window: the cut advances past it, so the base
+        // letter and its accent stay together.
+        const marks = 'prelude ' + 'e\u0301'.repeat(4);
+
+        const kept = contextTextSuffixOf(marks, 6);
+
+        expect(kept.text).toBe(`${CONTEXT_TEXT_ELLIPSIS}e\u0301e\u0301e\u0301`);
+        expect(kept.omitted).toBe(10);
+        expect(kept.shown).toBe(6);
+
+        // A ZWJ family emoji: the window opens on a whole joined member rather than on a
+        // dangling joiner or half a surrogate pair.
+        const family = 'a'.repeat(319) + '\u{1F468}\u200D\u{1F469}\u200D\u{1F467}';
+
+        const joined = contextTextSuffixOf(family, 4);
+
+        expect(family.length).toBe(327);
+        expect(joined.text).toBe(`${CONTEXT_TEXT_ELLIPSIS}\u{1F467}`);
+        expect(joined.shown).toBe(2);
+        expect(joined.omitted).toBe(325);
+    });
+
+    it('honors a zero bound as an empty window that still says so', () => {
+        expect(contextTextSuffixOf('abc', 0)).toEqual({ text: CONTEXT_TEXT_ELLIPSIS, shown: 0, omitted: 3, bounded: true });
+        // A junk bound (NaN, negative) is the same "no room" answer, never an unbounded copy.
+        expect(contextTextSuffixOf('abc', Number.NaN).shown).toBe(0);
+        expect(contextTextSuffixOf('abc', -8).shown).toBe(0);
     });
 });
 
 describe('contextBarSegmentAt', () => {
+    // Three blocks with the SAME 800ms span (equal widths) and different `chars` (different
+    // heights), so the hit test is exercised on a strip whose bars are NOT all the same
+    // picture: the column is the target, the bar is only what the eye sees (T26, R27/R28).
     const layout = layoutContextBar([tool({ chars: 100 }), tool({ id: 'b', chars: 200 }), tool({ id: 'c', chars: 300 })], 600);
 
     it('resolves a point to the segment it is on', () => {
+        expect(layout.segments.map((segment) => [segment.x, segment.width])).toEqual([
+            [0, 199],
+            [201, 198],
+            [401, 199]
+        ]);
+
         expect(contextBarSegmentAt(layout, 0)).toBe(0);
         expect(contextBarSegmentAt(layout, 50)).toBe(0);
-        expect(contextBarSegmentAt(layout, 150)).toBe(1);
-        expect(contextBarSegmentAt(layout, 400)).toBe(2);
+        expect(contextBarSegmentAt(layout, 150)).toBe(0);
+        expect(contextBarSegmentAt(layout, 250)).toBe(1);
+        expect(contextBarSegmentAt(layout, 400)).toBe(1);
+        expect(contextBarSegmentAt(layout, 500)).toBe(2);
         // The final pixel of the bar belongs to the final segment.
         expect(contextBarSegmentAt(layout, 600)).toBe(2);
     });
 
     it('gives a point in a visible gap to the nearer segment', () => {
         // The 2px gap is styling, not a dead zone between controls.
-        expect(contextBarSegmentAt(layout, 100)).toBe(0);
-        expect(contextBarSegmentAt(layout, 301)).toBe(1);
+        expect(contextBarSegmentAt(layout, 200)).toBe(0);
+        expect(contextBarSegmentAt(layout, 400)).toBe(1);
+    });
+
+    it('keeps the whole COLUMN as the target, whatever the bar height is (R27/R28)', () => {
+        // The shortest bar in this strip is 12px of a 36px box. A pointer 30px "above" it is
+        // still inside its column, and the documented policy is that the column answers: a
+        // hairline bar would otherwise be a target nobody could hit.
+        const heights = layout.segments.map((segment) => segment.heightPx);
+
+        expect(heights).toEqual([12, 24, 36]);
+        expect(layout.heightPx).toBe(36);
+        expect(contextBarSegmentAt(layout, 10)).toBe(0);
+        expect(contextBarSegmentAt(layout, 300)).toBe(1);
     });
 
     it('misses outside the painted track and for an empty bar', () => {

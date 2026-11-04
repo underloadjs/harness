@@ -25,8 +25,7 @@ import type { HarnessEvent } from '../harness';
 import {
     DISPLAY_ARGS_PREVIEW_CHARS,
     DISPLAY_NODE_PREVIEW_CHARS,
-    DISPLAY_PREVIEW_CHARS,
-    DISPLAY_TAIL_PAYLOAD_CHARS
+    DISPLAY_PREVIEW_CHARS
 } from '../shared/turn-display';
 import type { DisplayProjectContext, DisplayTail, TurnDisplay, TurnDisplayOp, TurnSection } from '../shared/turn-display';
 import type { SessionTurn } from './protocol';
@@ -554,21 +553,56 @@ describe('a discarded attempt hands the tail back exactly', () => {
     });
 });
 
-describe('the one payload bound that is not the node bound', () => {
-    it('states the cap honestly when a recorded argument list exceeds it', () => {
-        const args = `{"blob":"${'z'.repeat(DISPLAY_TAIL_PAYLOAD_CHARS + 25)}"}`;
+// T25 (R23): the designated payload IS the recorded payload. The display contract used to
+// cap a tail field at 64 KiB of its own, which silently re-truncated the ONE block it
+// promises to print in full — `tool_call.arguments` carries no runtime cap at all (only a
+// model-facing result does, ../core/result-budget.ts:42), so a 70 KiB write call lost
+// 6 KiB of its request while the caption claimed the block was whole.
+describe('the designated payload is the recorded payload, exactly', () => {
+    it('reproduces an argument list past any display bound without a second truncation', () => {
+        const args = `{"blob":"${'z'.repeat(70 * 1024)}"}`;
         const result = fold([starts(), toolCall('call-1', 'write', args)]);
         const tail = tailOf(result.display());
 
-        // Full means "as much of the recorded block as the tail contract carries", and the
-        // descriptor says so beside the EXACT recorded length — never a silent truncation.
-        expect(tail?.args).toBe(args.slice(0, DISPLAY_TAIL_PAYLOAD_CHARS));
-        expect(tail?.truncated).toBe(true);
+        // Full means every recorded byte of the current block, and `truncated` stays false
+        // because nothing was left behind — beside the EXACT length invariant 5 keeps.
+        expect(tail?.args).toBe(args);
+        expect(tail?.truncated).toBe(false);
         expect(tail?.chars).toBe(args.length);
         expect(result.display().sections[0].context?.find((block) => block.id === '0-tool-1')).toMatchObject({
             chars: args.length,
             argsChars: args.length
         });
+        // The payload still travels ONCE: the step row keeps its own bounded previews, so a
+        // rail or a re-issued `step:set` never carries the megabyte the tail does.
+        expect(
+            (result.display().sections[0].nodes[0] as { argsPreview?: string }).argsPreview
+        ).toHaveLength(DISPLAY_ARGS_PREVIEW_CHARS);
+    });
+
+    it('reproduces an oversized recorded result verbatim once the call settles', () => {
+        // A result longer than the runtime's own 64 KiB budget (a record written before the
+        // budget existed, or a tool that bounds itself differently): the tail QUOTES the
+        // record, it never re-edits it, and the descriptor says nothing was dropped.
+        const body = `${'r'.repeat(66 * 1024)}RESULT-END-4c1d`;
+        const result = fold([
+            starts(),
+            toolCall('call-1', 'read', '{}'),
+            toolResult('read', body, 'call-1', { outcome: 'completed' })
+        ]);
+
+        expect(tailOf(result.display())).toEqual({
+            kind: 'tool',
+            nodeId: '1',
+            blockId: '0-tool-1',
+            chars: 2 + body.length,
+            truncated: false,
+            args: '{}',
+            result: body
+        });
+        // Two designations for one call — the request, then the response — and no third one
+        // for the bytes that did not move.
+        expect(tailOps(result.ops)).toHaveLength(2);
     });
 
     it('reports a result-only legacy frame as a tool tail with no arguments', () => {

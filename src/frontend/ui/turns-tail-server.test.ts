@@ -11,9 +11,11 @@
 // identical rendered result.
 //
 // The rules pinned here, in order:
-//   1. a thinking window streams IN FULL at the tail while it is the newest block, however
-//      far past `DISPLAY_NODE_PREVIEW_CHARS` it runs (the requirement the old 320 bound left
-//      unmet), and its caption states the exact recorded length;
+//   1. a thinking window streams IN FULL on the wire while it is the newest block, however far
+//      past `DISPLAY_NODE_PREVIEW_CHARS` it runs (the requirement the old server-side 320 bound
+//      left unmet), and the PANE paints its LATEST `CONTEXT_TAIL_PREVIEW_CHARS` characters, so
+//      the reader watches the newest text move instead of a static opening line (T26, R26);
+//      the caption states the exact recorded length beside how much of it is on screen;
 //   2. the call that follows becomes the tail: its complete recorded arguments print, the
 //      thinking window is withdrawn, and the bytes are the ones the step's own bounded
 //      `argsPreview` cannot hold;
@@ -24,6 +26,9 @@
 //   6. none of this costs a request: the lazy step and block routes stay untouched, while a
 //      hidden historical window stays exactly one click away;
 //   7. a cold document of the same record paints the same single body.
+//   8. T25: a payload BIGGER than any display bound is printed whole, live and on a reload —
+//      the tail quotes the record byte for byte, and the display contract caps nothing of
+//      its own (`tool_call.arguments` has no runtime cap at all).
 //
 // Run: npx vitest run --config src/frontend/vitest.config.ts ui/turns-tail-server.test.ts
 
@@ -153,8 +158,18 @@ const tailState = (scope: Element): Record<string, unknown> | undefined => {
         blockId: tail.dataset.blockId,
         chars: tail.dataset.chars,
         truncated: tail.dataset.truncated,
+        // T26 (R26): the WIRE's state (`truncated`, from the server designation) and the
+        // PANE's state (`shownChars` / `renderBounded`) are different facts, and this file
+        // proves the live path keeps them different: the wire carries the whole streamed
+        // window, while the pane paints its latest `CONTEXT_TAIL_PREVIEW_CHARS`.
+        shownChars: tail.dataset.shownChars,
+        renderBounded: tail.dataset.renderBounded,
         state: tail.dataset.state,
         duration: tail.dataset.duration,
+        follow:
+            tail.querySelector<HTMLElement>('.context-bar-tail-body')?.dataset.follow ??
+            tail.querySelector('pre[data-field]')?.getAttribute('data-follow') ??
+            undefined,
         caption: tail.querySelector('.context-bar-tail-caption')?.textContent,
         body: tail.querySelector('.context-bar-tail-body')?.textContent
     };
@@ -221,7 +236,7 @@ afterEach(() => {
 });
 
 describe('the server-designated tail, rendered by the real tile', () => {
-    it('streams a thinking window past the node bound, whole, and never as a preview', () => {
+    it('streams a thinking window past the node bound and shows its LATEST lines (R26)', () => {
         // The loaders are spies, so "printing the current block costs nothing" is measured,
         // not assumed.
         const loadBlockDetail = vi.fn();
@@ -235,30 +250,43 @@ describe('the server-designated tail, rendered by the real tile', () => {
         board.upsertView(projector.summary(), view);
         frame(board, view, opened);
 
-        // delta 1: 410 characters, one `tail:set`, and the body prints all of it.
+        // delta 1: 410 characters, one `tail:set`, and the WIRE carries every one of them.
         frame(board, view, projector.apply(turn.events[1], timeOf(1), 1));
 
         const thinkingChars = DISPLAY_NODE_PREVIEW_CHARS + 90;
+        const windowChars = 320;
 
         expect(tailState(tile())).toMatchObject({
             hidden: false,
             kind: 'reasoning',
+            // The wire body is whole (T23/T25), and the PANE is still a window (T26): the two
+            // facts are stated separately rather than one of them silently overriding the other.
             truncated: 'false',
             chars: String(thinkingChars),
-            caption: `thinking · ${thinkingChars.toLocaleString('en-US')} characters`
+            shownChars: String(windowChars),
+            renderBounded: 'true',
+            follow: 'latest',
+            caption: `thinking · showing ${windowChars} of ${thinkingChars.toLocaleString('en-US')} characters — click the segment for the exact text`
         });
         expect(tails(tile())).toHaveLength(1);
-        // Every byte the model streamed, not a 320-character stub.
-        expect((tailState(tile()) as { body: string }).body.length).toBe(thinkingChars);
+        // The LAST 320 characters of what the model streamed — not a 320-character stub of its
+        // opening, which is exactly the body that used to sit there unchanged.
+        expect((tailState(tile()) as { body: string }).body).toBe(`…${'a'.repeat(windowChars)}`);
         expect(tile().querySelectorAll('.tool.think')).toHaveLength(0);
 
-        // delta 2: the SAME element grows; the designation is not re-sent per token.
+        // delta 2: the SAME element grows, the designation is not re-sent per token, and the
+        // painted text MOVES — the newest byte is always on screen.
         const grown = projector.apply(turn.events[2], timeOf(2), 2);
 
         expect(grown.filter((op) => op.op === 'tail:set')).toHaveLength(0);
         frame(board, view, grown);
-        expect((tailState(tile()) as { body: string }).body.length).toBe(thinkingChars + 120);
-        expect(tailState(tile())).toMatchObject({ chars: String(thinkingChars + 120) });
+
+        expect((tailState(tile()) as { body: string }).body).toBe(`…${'a'.repeat(200)}${'b'.repeat(120)}`);
+        expect(tailState(tile())).toMatchObject({
+            chars: String(thinkingChars + 120),
+            shownChars: String(windowChars),
+            renderBounded: 'true'
+        });
 
         expect(loadBlockDetail).not.toHaveBeenCalled();
         expect(loadStepDetail).not.toHaveBeenCalled();
@@ -407,5 +435,149 @@ describe('the server-designated tail, rendered by the real tile', () => {
         // tail — one compiled state, rendered by one painter.
         expect(boardSnapshot(document.querySelector<HTMLElement>('.tile') as Element)).toEqual(streamed);
         expect(live.view.displays.t1.sections.map((section) => section.tail)).toEqual(cold.display.sections.map((section) => section.tail));
+    });
+});
+
+// ---------------------------------------------------------------------------
+// T25 (R23): an OVERSIZED block, printed exactly
+// ---------------------------------------------------------------------------
+//
+// The rule this pins down is the one a size-capped tail used to break: `tool_call.arguments`
+// has NO runtime cap (only a model-facing result does, ../core/result-budget.ts:42), so a
+// 70 KiB write call is what the record holds — and "the current block in full" has to mean
+// those bytes, not the first 64 KiB of them. The markers sit in the MIDDLE of both payloads,
+// so "the whole payload arrived" and "the whole payload left again" are each a real
+// assertion: a head-truncated `preview`/`argsPreview` can never contain one.
+const BIG_ARGS = `{"path":"big.md","content":"${'w'.repeat(35 * 1024)}BIG-ARGS-CENTER-7k1m${'w'.repeat(35 * 1024)}"}`;
+const BIG_RESULT = `${'r'.repeat(33 * 1024)}BIG-RESULT-CENTER-7k1m${'r'.repeat(33 * 1024)}`;
+
+const bigEvents = (): HarnessEvent[] => [
+    { type: 'start', agent: AGENT, model: 'scripted/test' },
+    { type: 'tool_call', agent: AGENT, call: { id: 'call-1', name: 'write', arguments: BIG_ARGS } },
+    {
+        type: 'tool_result',
+        agent: AGENT,
+        name: 'write',
+        callId: 'call-1',
+        content: BIG_RESULT,
+        isError: false,
+        outcome: 'completed',
+        durationMs: 250
+    },
+    { type: 'reasoning', agent: AGENT, delta: 'now the round is over' },
+    { type: 'attempt_commit', agent: AGENT, attempt: 1, maxAttempts: 2 } as HarnessEvent
+];
+
+/** The same live sequence as `stream`, for the oversized record. */
+const streamBig = () => {
+    const turn = recordOf(bigEvents());
+    const projector = createTurnProjector(turn, CONTEXT);
+    const { board, view, tile } = mount();
+
+    board.upsertView(projector.summary(), view);
+
+    for (let index = 0; index < turn.events.length; index += 1) {
+        frame(board, view, projector.apply(turn.events[index], timeOf(index), index));
+    }
+
+    frame(board, view, projector.settle('done', T + 9_000));
+
+    return { board, view, tile, projector, turn };
+};
+
+describe('a current block larger than any display bound', () => {
+    it('prints the whole recorded request, then the whole recorded response, live', () => {
+        const turn = recordOf(bigEvents());
+        const projector = createTurnProjector(turn, CONTEXT);
+        const { board, view, tile } = mount();
+
+        board.upsertView(projector.summary(), view);
+        frame(board, view, projector.apply(turn.events[0], timeOf(0), 0));
+
+        // Past the cap the contract used to impose on itself, so this round is the case that
+        // used to lose bytes silently.
+        expect(BIG_ARGS.length).toBeGreaterThan(64 * 1024);
+
+        frame(board, view, projector.apply(turn.events[1], timeOf(1), 1));
+
+        // Byte for byte: the printed pane IS the recorded string, not a prefix of it.
+        expect(pane(tile(), 'args')).toBe(BIG_ARGS);
+        expect(tile().textContent).toContain('BIG-ARGS-CENTER-7k1m');
+        expect(tailState(tile())).toMatchObject({
+            hidden: false,
+            kind: 'tool',
+            nodeId: '1',
+            blockId: '0-tool-1',
+            state: 'running',
+            truncated: 'false',
+            chars: String(BIG_ARGS.length)
+        });
+        // The per-part figures are the segment's exact recorded counts, printed beside a
+        // body that holds every one of those bytes (invariant 5, and the point of T25).
+        expect(tails(tile())[0]?.dataset.argsChars).toBe(String(BIG_ARGS.length));
+        expect(tails(tile())[0]?.dataset.resultChars).toBeUndefined();
+        expect(tailState(tile())?.caption).toContain('no result recorded yet');
+
+        frame(board, view, projector.apply(turn.events[2], timeOf(2), 2));
+
+        // The settled response joins the SAME body, whole, and the honest caption figures
+        // match the recorded lengths — no "showing X of Y" hedge on a body that is complete.
+        expect(pane(tile(), 'args')).toBe(BIG_ARGS);
+        expect(pane(tile(), 'result')).toBe(BIG_RESULT);
+        expect(tailState(tile())).toMatchObject({
+            kind: 'tool',
+            state: 'ok',
+            duration: '250',
+            truncated: 'false',
+            chars: String(BIG_ARGS.length + BIG_RESULT.length)
+        });
+        expect(tails(tile())[0]?.dataset.argsChars).toBe(String(BIG_ARGS.length));
+        expect(tails(tile())[0]?.dataset.resultChars).toBe(String(BIG_RESULT.length));
+        expect(tailState(tile())?.caption).not.toContain('showing');
+    });
+
+    it('reloads to the identical board, and keeps the oversized payload out of the history', () => {
+        const live = streamBig();
+        const streamed = boardSnapshot(live.tile());
+
+        // The thinking window that took the tail is the one body left: the 138 KiB of request
+        // and response the round printed a moment ago is gone from the rendered document, and
+        // the segment that owns them stays one click away.
+        expect(streamed.tail).toMatchObject({ kind: 'reasoning', nodeId: 'n3', body: 'now the round is over' });
+        expect(String(streamed.flow)).not.toContain('BIG-ARGS-CENTER-7k1m');
+        expect(String(streamed.flow)).not.toContain('BIG-RESULT-CENTER-7k1m');
+        expect((streamed.panes as { args: string | undefined; result: string | undefined }).args).toBeUndefined();
+
+        const cold = projectTurn(recordOf(bigEvents(), { status: 'done', updatedAt: T + 9_000 }), CONTEXT);
+        const coldView = {
+            id: 's1',
+            harness: AGENT,
+            status: 'idle',
+            model: 'scripted/test',
+            createdAt: T,
+            updatedAt: T + 9_000,
+            turns: [cold.summary],
+            displays: { t1: cold.display }
+        } as unknown as SessionView;
+
+        const empty = document.createElement('div');
+        const coldBoard = createTurnBoard({ empty });
+
+        coldBoard.bindSession('s1');
+        document.body.replaceChildren(coldBoard.element);
+        coldBoard.upsertView(cold.summary, coldView).renderDisplay(cold.display);
+
+        // Same single body, same segments, same flow — a reload that switches the tail to a
+        // different block than the live stream showed is the failure this file exists for.
+        expect(boardSnapshot(document.querySelector<HTMLElement>('.tile') as Element)).toEqual(streamed);
+        // The cold fold designates the block the stream ended on, and the superseded call
+        // keeps ONLY its own bounded previews: while that call was current the document held
+        // all 138 KiB of it, and now it holds none of the markers — one full block per
+        // section is the whole rule, in both directions and on both paths.
+        expect(cold.display.sections[0].tail).toMatchObject({ kind: 'reasoning', nodeId: 'n3', truncated: false });
+        expect(JSON.stringify(cold.display)).not.toContain('BIG-ARGS-CENTER-7k1m');
+        expect(
+            (cold.display.sections[0].nodes.find((node) => node.id === '1') as { preview?: string }).preview
+        ).toHaveLength(DISPLAY_PREVIEW_CHARS);
     });
 });
