@@ -28,6 +28,11 @@ const CONFIGURATION_KEYS = [
     'HARNESS_API_KEY',
     'OPENAI_API_KEY',
     'HARNESS_MODEL',
+    'HARNESS_THREAD_EXECUTION',
+    'HARNESS_WORKER_IDLE_MS',
+    'HARNESS_MAX_LANE_WORKERS',
+    'HARNESS_WORKER_HANDSHAKE_MS',
+    'HARNESS_WORKER_ENTRY',
     'EXA_API_KEY',
     'TAVILY_API_KEY'
 ] as const;
@@ -198,6 +203,14 @@ describe('configuration wiring', () => {
                 baseURL: 'http://env.example/v1',
                 model: 'file-model',
                 hasApiKey: true
+            },
+            // The runtime is the validated default: this fixture sets no HARNESS_*
+            // worker variable, and the isolation helper clears any inherited one.
+            runtime: {
+                threadExecution: 'inline',
+                workerIdleMs: 120_000,
+                maxLaneWorkers: 16,
+                workerHandshakeMs: 60_000
             }
         });
         expect(process.env.EXA_API_KEY).toBe('search-key');
@@ -225,6 +238,12 @@ describe('configuration wiring', () => {
                 baseURL: 'http://file.example/v1',
                 model: 'shell-model',
                 hasApiKey: false
+            },
+            runtime: {
+                threadExecution: 'inline',
+                workerIdleMs: 120_000,
+                maxLaneWorkers: 16,
+                workerHandshakeMs: 60_000
             }
         });
     });

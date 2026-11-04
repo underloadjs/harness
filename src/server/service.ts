@@ -76,6 +76,9 @@ import type { HarnessApiEmit, HarnessApiStream } from './api';
 import { isLoopbackHostname, isPagesOrigin } from '../shared/origin';
 import type { HarnessRuntime } from './runtime';
 import { getHarnessRuntime } from './runtime';
+// T5: the server RUNTIME shape, so a service host can forward `threadExecution` explicitly
+// instead of being limited to the HARNESS_* environment.
+import type { ServerRuntimeConfiguration } from './config';
 import { HarnessPersistenceError, normalizeHarnessDatabaseRoot } from './persistence';
 
 // The subset of Hono's Context this adapter reads. Typed structurally so the
@@ -260,6 +263,12 @@ export type HarnessServiceHandlerOptions = {
     // Override the database root for tests/embedders. When omitted, the loader's
     // `variables.root` (DATABASE_ROOT) selects it; no root means in-memory.
     root?: string;
+    // T5 (R1/R3): an explicit SERVER RUNTIME for the runtime this service creates -
+    // `threadExecution: 'worker'` and the worker bounds. Merged over the HARNESS_*
+    // environment by ./config.ts resolveRuntimeConfiguration, and ignored (with a thrown
+    // ServerRuntimeError for a bad value) rather than approximated. Only consulted when no
+    // `runtime` is injected: an injected store already carries its own execution model.
+    execution?: Partial<ServerRuntimeConfiguration>;
 };
 
 // Read the service loader's storage boundary. `variables.root` is the explicit
@@ -358,7 +367,17 @@ export const createHarnessServiceHandler = (
                     ? rootFromVariables(variables)
                     : normalizeHarnessDatabaseRoot(options.root);
 
-            runtime = options.runtime ?? getHarnessRuntime({ root });
+            // T5 (R1/R3): `execution` forwards a host-configured server RUNTIME (notably
+            // `threadExecution`) into the root-keyed runtime, which resolves it over
+            // HARNESS_THREAD_EXECUTION / HARNESS_WORKER_* and hands it to the SessionStore.
+            // Without this the service could only ever get the environment's value, and an
+            // explicit host option would be silently dropped.
+            runtime =
+                options.runtime ??
+                getHarnessRuntime({
+                    root,
+                    ...(options.execution === undefined ? {} : { runtime: options.execution })
+                });
         } catch (error) {
             if (error instanceof HarnessPersistenceError) {
                 return { status: 500, response: { error: { message: error.message } } };

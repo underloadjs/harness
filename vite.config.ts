@@ -139,7 +139,13 @@ const nodeConfig: UserConfig = {
                 index: entry('./src/index.ts'),
                 server: entry('./src/server/index.ts'),
                 frontend: entry('./src/frontend/index.ts'),
-                shared: entry('./src/shared/index.ts')
+                shared: entry('./src/shared/index.ts'),
+                // The lane-worker ENTRY (T5, R1). It is an executable, not an API: a Worker is
+                // spawned with this file's path (`@underload/harness/worker`, or
+                // HARNESS_WORKER_ENTRY). Keeping it in the same build as the server entry is
+                // deliberate - both evaluate the same session graph, and the bundler resolves
+                // the worker's dynamic import into a sibling chunk in dist/.
+                worker: entry('./src/server/workers/lane-worker.ts')
             },
             formats: ['es']
         },

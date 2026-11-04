@@ -160,7 +160,8 @@ import type {
     HarnessMessage,
     HarnessSnapshot,
     HarnessStateChangeEvent,
-    HarnessThreadRecord
+    HarnessThreadRecord,
+    HarnessThreadSteerReceipt
 } from '../harness';
 import type { HarnessPreset, RunnerSettings } from './harnesses/types';
 import { validateAttachments } from '../shared/attachments';
@@ -199,6 +200,19 @@ import {
 } from './harnesses/registry';
 import type { HarnessRegistry } from './harnesses/registry';
 import { mergeSettings } from './config';
+import type { ServerRuntimeConfiguration } from './config';
+import { DEFAULT_RUNTIME_CONFIGURATION } from './config';
+// T5 (R1): lane-worker execution. Imported through the subsystem barrel so the session layer
+// has ONE boundary to the worker machinery, and never reaches into a primitive directly.
+import {
+    assessLaneWorkerCapability,
+    createLaneAuthority,
+    createLaneHost,
+    laneWorkerEnvironment,
+    laneWorkerUnsupportedMessage,
+    planWorkerToolSurfaces
+} from './workers';
+import type { LaneAuthority, LaneBlueprintSource, LaneHost, LaneTarget, LaneTurnResult } from './workers';
 import { HarnessPersistenceError } from './persistence';
 import { HARNESS_DATABASE_VERSION, repairInterruptedToolCalls } from './persistence';
 import type { HarnessDatabase, HarnessInvalidThreadRecord, HarnessPersistence, HarnessSessionRecord } from './persistence';
@@ -580,6 +594,12 @@ export type SessionStoreOptions = {
     database?: HarnessDatabase;
     onPersistenceError?: (error: Error) => void;
     onRestoreError?: (error: Error) => void;
+    // T5 (R1/R3): the RESOLVED server runtime. `threadExecution: 'worker'` makes every turn,
+    // manual tool call and slash command run on a lane worker; the default is today's inline
+    // behaviour. Deliberately an OPTION on the store rather than a per-session field: the
+    // execution model is a deployment property, and a session cannot opt into a promise the
+    // process did not make.
+    runtime?: ServerRuntimeConfiguration;
 };
 
 // Recovery wording used when a turn was running at save time. The policy is
@@ -1255,6 +1275,24 @@ export class SessionStore {
     // True while the constructor replays a document: the restored harness emits
     // `restore` state changes, and writing the file back mid-load would be a
     // pointless (and possibly partial) round trip.
+    // T5 (R1): the resolved runtime, and the lane machinery it may switch on.
+    //
+    // `runtime` is kept as ONE object (not scattered flags) because every value in it is a
+    // deployment promise that must be reported, not inferred. `host` and `authorities` are
+    // created LAZILY: an inline store never touches `node:worker_threads`, and a worker store
+    // with no running session spawns nothing.
+    private readonly runtime: ServerRuntimeConfiguration;
+
+    private host?: LaneHost;
+
+    // One authority per session id. Rebuilt whenever the session's harness object is replaced
+    // (a restore, a reset), because the authority's ledgers are counters over THAT harness.
+    private readonly authorities = new Map<string, LaneAuthority>();
+
+    // The memory keys each session's tools may reach, computed once per harness from the
+    // captured tool sources (./workers/capability.ts). Absent means "not computed yet".
+    private readonly memoryKeys = new Map<string, string[]>();
+
     private loading = false;
     // Shutdown guards (T13 / P1-B). `closing` is set by dispose() AFTER the one
     // graceful save and BEFORE any session is aborted or the map is cleared;
@@ -1289,6 +1327,11 @@ export class SessionStore {
         this.persistence = options.persistence;
         this.onPersistenceError = options.onPersistenceError;
         this.onRestoreError = options.onRestoreError;
+
+        // R3: the runtime is already validated (./config.ts resolveRuntimeConfiguration), and
+        // ./runtime.ts asserted readiness BEFORE constructing this store. A missing option is
+        // inline: the historical behaviour, never a downgrade of an explicit request.
+        this.runtime = options.runtime ?? DEFAULT_RUNTIME_CONFIGURATION;
 
         if (options.database !== undefined) {
             this.loading = true;
@@ -1375,6 +1418,11 @@ export class SessionStore {
         // The sink and the persistence observer close over `session`, which is
         // assigned immediately after the harness is built. Construction never
         // reports progress or state changes.
+        // T5 (R3): a session whose harness a worker could not rebuild is REFUSED at creation,
+        // with the reason and the fix. Worker mode is never approximated by running that
+        // session inline (./workers/capability.ts states why).
+        this.assertWorkerCapable(preset);
+
         let harness: Harness;
         try {
             harness = this.buildHarness(preset, settings, () => session);
@@ -1505,6 +1553,144 @@ export class SessionStore {
         return preset.create(settings, progress, { stateChange, interaction });
     }
 
+    // -----------------------------------------------------------------------
+    // T5 (R1): lane-worker execution
+    // -----------------------------------------------------------------------
+    //
+    // WHY THESE HELPERS EXIST AS A GROUP
+    // ---------------------------------
+    // Worker mode changes exactly ONE thing about a session: where a harness body executes.
+    // Everything else - the recorder, the journal, the projector, the persistence, the SSE
+    // fan-out, the busy gate, the cancellation classification - is the inline code path
+    // running against the CANONICAL harness, which the lane's commits keep up to date. So the
+    // branch below is always "same turn, different CPU", never a second implementation.
+    //
+    // Nothing here may fall back to inline silently: `threadExecution: 'worker'` is a
+    // deployment promise, so a lane that cannot be created, or a session whose harness a
+    // worker could not rebuild, is reported (ServerRuntimeError / SessionError) instead of
+    // quietly executed on the event loop.
+
+    // True when THIS store promised CPU isolation.
+    get workerExecution(): boolean {
+        return this.runtime.threadExecution === 'worker';
+    }
+
+    // The host, created on first use. An inline store never calls this, so an inline server
+    // never touches `node:worker_threads` at all.
+    private lanes(): LaneHost {
+        if (this.host === undefined) this.host = createLaneHost(this.runtime);
+
+        return this.host;
+    }
+
+    // The session's own capability decision, taken where the session is BUILT (create and
+    // restore), because that is the last moment a refusal costs nobody any work.
+    private assertWorkerCapable(preset: HarnessPreset): void {
+        if (!this.workerExecution) return;
+
+        const capability = assessLaneWorkerCapability(preset, laneWorkerEnvironment());
+
+        if (!capability.supported) {
+            throw new SessionError(400, laneWorkerUnsupportedMessage(capability));
+        }
+    }
+
+    // The memory keys this session's tools may touch, derived from the CAPTURED tool sources
+    // (./workers/capability.ts). A tool that reaches the map dynamically is refused at hello
+    // rather than given the whole map, so the window stays bounded.
+    private memoryKeysFor(session: Session): string[] {
+        const cached = this.memoryKeys.get(session.id);
+
+        if (cached !== undefined) return cached;
+
+        const sources = session.harness.toolSources();
+        const installed = new Map(sources.map((source) => [source.name, source.source]));
+        const plan = planWorkerToolSurfaces(
+            Object.keys(session.harness.tools).map((name) => ({ name, source: installed.get(name) }))
+        );
+
+        this.memoryKeys.set(session.id, plan.memoryKeys);
+
+        return plan.memoryKeys;
+    }
+
+    // The authority for one session: the canonical harness plus the identity ledger, the
+    // writer leases, and the commit journal. Rebuilt whenever the harness OBJECT is replaced
+    // (a restore or a reset re-creates it), because the ledgers are counters over that object.
+    private authorityOf(session: Session): LaneAuthority {
+        const existing = this.authorities.get(session.id);
+
+        if (existing !== undefined && existing.harness === session.harness) return existing;
+
+        const authority = createLaneAuthority({
+            harness: session.harness,
+            memoryKeys: this.memoryKeysFor(session),
+            // An owner question asked from a lane is registered EXACTLY like one asked
+            // inline: same pending map, same 409/expiry rules, same view card.
+            ask: (request) => this.askFromLane(session, request),
+            // A registry change made anywhere (lane, operator, model) is applied here first,
+            // then pushed to every live replica so no lane keeps running a replaced revision.
+            onRegistryChange: (change) => this.host?.broadcastRegistry(session.id, change)
+        });
+
+        this.authorities.set(session.id, authority);
+
+        return authority;
+    }
+
+    // Broker a lane's owner question against this session's pending-action machinery.
+    private askFromLane(
+        session: Session,
+        request: { requestId: string; agent: string; threadId?: string; request: HarnessActionRequest }
+    ): Promise<HarnessActionChoice> {
+        // The inline path inherits the run's signal from AsyncLocalStorage. A lane's run is
+        // on another thread, so the owning conversation's controller is named explicitly -
+        // and `expireActions` in the turn's finally is what still rejects an unanswered
+        // question when its run ends.
+        const controller =
+            request.threadId === undefined
+                ? session.controller
+                : (session.lanes.get(request.threadId)?.controller ?? session.controller);
+
+        return this.registerActionRequest(
+            session,
+            { requestId: request.requestId, request: request.request } as HarnessActionRequestContext,
+            controller?.signal ?? new AbortController().signal,
+            request.threadId
+        );
+    }
+
+    // The per-lane rebuild data: the durable preset record, the session's provider settings,
+    // and the bounded memory window. The authority's snapshot is taken by the host at hello,
+    // because that is the one moment a full document may cross.
+    private blueprintFor(session: Session): LaneBlueprintSource {
+        return {
+            record: presetToRecord(session.preset),
+            settings: session.settings,
+            apiKey: session.settings.apiKey,
+            memoryKeys: this.memoryKeysFor(session)
+        };
+    }
+
+    // The lane a turn belongs to: its conversation, or the session's root lane for a legacy
+    // `/messages` run (decision D1 - the root run is isolated like any other).
+    private laneTargetFor(threadId: string | undefined, agent: string): LaneTarget {
+        return threadId === undefined ? { kind: 'root', agent } : { kind: 'thread', threadId };
+    }
+
+    // Guidance for a live run goes to the lane that OWNS the run: the authority's copy of this
+    // conversation is never executing, so steering it would steer nothing (T3 finding F9).
+    //
+    // With no live lane the canonical answer is the honest one - the run already ended, and
+    // `steerThread` reports `queued: false` with its own reason, exactly as inline.
+    private steerOnLane(session: Session, threadId: string, input: string): HarnessThreadSteerReceipt {
+        if (this.host !== undefined && this.host.steer(session.id, { kind: 'thread', threadId }, input)) {
+            return { threadId, queued: true };
+        }
+
+        return session.harness.steerThread(threadId, input);
+    }
+
     // Register one unanswered question from the runtime. Rejections are the
     // intentional failure mode: the runtime turns a rejected handler into a
     // readable tool result for the model, so an over-full session or a cancelled
@@ -1512,7 +1698,10 @@ export class SessionStore {
     private registerActionRequest(
         session: Session,
         context: HarnessActionRequestContext,
-        signal: AbortSignal
+        signal: AbortSignal,
+        // T5: a lane's question names its conversation explicitly, because the store is not
+        // inside the run's async context (the run is on another thread).
+        threadIdOverride?: string
     ): Promise<HarnessActionChoice> {
         if (session.disposed) {
             return Promise.reject(new Error(ACTION_SESSION_GONE_MESSAGE));
@@ -1550,9 +1739,10 @@ export class SessionStore {
             // (the runtime awaits this handler inside the run's chain), so the
             // owning thread comes from the environment, never from the request.
             const scopedThreadId =
-                this.runContexts.getStore()?.session === session
+                threadIdOverride ??
+                (this.runContexts.getStore()?.session === session
                     ? this.runContexts.getStore()?.threadId
-                    : undefined;
+                    : undefined);
 
             pending = {
                 requestId: context.requestId,
@@ -2228,6 +2418,12 @@ export class SessionStore {
             // prompt/attachments/thread association are all preserved.
 
             let session: Session | undefined;
+
+            // T5: a restored session is checked again, because the registry may have replaced
+            // the preset this record rebuilds from with an injected one. A refusal here lands
+            // in the per-session restore failure (noteRestoreError), not in a dropped database.
+            this.assertWorkerCapable(preset);
+
             const harness = this.buildHarness(preset, settings, () => session);
 
             session = {
@@ -2518,7 +2714,19 @@ export class SessionStore {
         try {
             // A manual call is NOT a turn: no SessionTurn, no events, and no change
             // to `status`. Only the private `busy` flag exists while it runs.
-            const result = await session.harness.executeTool(name, parameters);
+            //
+            // T5 (D1): in worker mode the body still runs OFF the event loop - on this
+            // session's operator lane - and every shared operation it performs is routed to
+            // the authority, so a manual mutation lands in the canonical harness exactly like
+            // an inline one and is persisted by the code below.
+            const result = this.workerExecution
+                ? await this.lanes().invoke({
+                      sessionKey: session.id,
+                      authority: this.authorityOf(session),
+                      request: { op: 'execute:tool', name, parameters },
+                      blueprint: this.blueprintFor(session)
+                  })
+                : await session.harness.executeTool(name, parameters);
 
             // The tool may have mutated the todo/record stores, discovery, or the
             // created-tool registry. Persist that before the caller sees success:
@@ -4804,7 +5012,18 @@ export class SessionStore {
             // harness owns the "unsafe right now" decision (a built-in that calls a
             // tool can be refused mid-run); that refusal throws and lands below as an
             // error turn, which is an answer rather than a transport failure.
-            result = await session.harness.executeCommand(input);
+            // T5 (D1): a slash command is an operator action, not a model turn - but in
+            // worker mode its BODY still runs on a lane worker (the session's operator lane),
+            // and the shared operations it performs route to the authority. A command that
+            // mutates (e.g. /tools enable) therefore lands canonically, exactly as inline.
+            result = this.workerExecution
+                ? (await this.lanes().invoke({
+                      sessionKey: session.id,
+                      authority: this.authorityOf(session),
+                      request: { op: 'execute:command', line: input },
+                      blueprint: this.blueprintFor(session)
+                  })) as HarnessCommandResult
+                : await session.harness.executeCommand(input);
         } catch (error) {
             // Total, on purpose. `executeCommand` THROWS for an unknown name
             // ("unknown command: /nope") and rethrows whatever a host command throws.
@@ -4960,7 +5179,9 @@ export class SessionStore {
 
         let receipt;
         try {
-            receipt = session.harness.steerThread(threadId, steeredText);
+            receipt = this.workerExecution
+                ? this.steerOnLane(session, threadId, steeredText)
+                : session.harness.steerThread(threadId, steeredText);
         } catch (error) {
             // A runtime refusal is a client/lifecycle error (400/429), never a 500.
             throw this.threadError(error, 'Could not steer the thread');
@@ -5739,7 +5960,49 @@ export class SessionStore {
             //
             // The async context is what attributes this run's progress events when
             // a sibling lane is emitting at the same time (see buildHarness).
-            if (threadId === undefined) {
+            if (this.workerExecution) {
+                // T5 (R1/D1): the whole turn - agent loop, provider stream handling, and
+                // every synchronous tool body - runs on this conversation's lane worker. The
+                // recorder `record` above is the lane's event sink, so the durable turn record,
+                // the display fold, the journal, and both SSE streams are filled by the SAME
+                // code the inline path uses; only the CPU moved.
+                const result = await this.lanes().runTurn({
+                    sessionKey: session.id,
+                    authority: this.authorityOf(session),
+                    turnId: turn.id,
+                    target: this.laneTargetFor(threadId, runAgentOf(session, turn)),
+                    prompt: runPrompt,
+                    ...(turn.attachments === undefined ? {} : { attachments: turn.attachments }),
+                    // The fresh-block rule is mirrored into the replica so both sides reset
+                    // identically; an append against a transcript the two disagree about would
+                    // otherwise be refused.
+                    ...(freshBlock ? { reset: true } : {}),
+                    signal: controller.signal,
+                    onEvent: record,
+                    blueprint: this.blueprintFor(session)
+                });
+
+                // Cancellation is decided HERE, from the store's own stop request - never from
+                // the lane's word - so a sibling lane's cancel cannot classify this turn.
+                if (result.cancelled === true) {
+                    if (lane === undefined) session.cancelled = true;
+                    else lane.stopRequested = true;
+                }
+
+                const fault = result.failure;
+                const commitFault = result.commitFaults?.[0];
+
+                // A lane failure is the turn's failure. A refused commit is reported with it,
+                // because "the answer arrived but the state behind it was not accepted" must
+                // never read as a clean success (T3 finding F8).
+                if (fault !== undefined && !controller.signal.aborted) {
+                    throw new Error(commitFault === undefined ? fault : `${fault} (${commitFault})`);
+                }
+
+                if (fault === undefined && commitFault !== undefined) {
+                    throw new Error(`The run answered, but the lane's state was not accepted: ${commitFault}`);
+                }
+            } else if (threadId === undefined) {
                 await this.runContexts.run({ session, turn, record }, () =>
                     session.harness(runPrompt, options)
                 );
@@ -6663,6 +6926,12 @@ export class SessionStore {
             throw new SessionError(500, `Could not delete thread "${threadId}": ${messageOf(error)}`);
         }
 
+        // T5: the conversation is gone, so its worker is gone with it. Preflight above
+        // refused a live or queued turn, so nothing is mid-flight here; the epoch is retired
+        // in the authority's journal, which is what makes any late frame from that worker a
+        // no-op instead of a write into a deleted conversation.
+        this.host?.closeLane(id, { kind: 'thread', threadId }, 'thread deleted');
+
         // Purge the owning turns and every link that pointed at them.
         session.turns = survivors;
 
@@ -6755,6 +7024,12 @@ export class SessionStore {
             agent.reset();
         }
         session.harness.reset();
+
+        // T5: a reset restarts record ids, the tool budget view, and the archive, so the
+        // session's identity ledger and memory plan are rebuilt from the fresh harness on the
+        // next turn rather than continuing counters over a conversation that no longer exists.
+        this.authorities.delete(id);
+        this.memoryKeys.delete(id);
 
         // Start over on the renderable record too: the todo list is cleared by the
         // harness reset above, and the turns belong to the same conversation, so
@@ -6873,12 +7148,26 @@ export class SessionStore {
 
         this.sessions.clear();
         this.closed = true;
+
+        // T5: the workers go last, after the document is on disk. Termination is async and a
+        // shutdown must not wait on an uncooperative lane, so this is fire-and-forget - and
+        // every lane's epoch was already retired by disposeSession above, which is what makes
+        // a late frame from a dying worker harmless rather than merely unlikely.
+        void this.host?.close('store disposed').catch(() => undefined);
     }
 
     // Shared teardown for remove()/dispose(): stop execution, drop accepted work,
     // release every waiter, and end every watcher. Idempotent: a second call finds
     // empty collections.
     private disposeSession(session: Session): void {
+        // T5: a session that goes away takes its lane workers with it. The epochs are retired
+        // FIRST (inside closeSession), so a frame from a worker that has not stopped yet
+        // cannot move state that is on its way out, and the authority for this id is rebuilt
+        // if the same id is ever restored again.
+        this.host?.closeSession(session.id, 'session disposed');
+        this.authorities.delete(session.id);
+        this.memoryKeys.delete(session.id);
+
         // Set BEFORE aborting: the aborted run's terminal publish is then
         // suppressed (the session no longer exists for any client).
         session.disposed = true;

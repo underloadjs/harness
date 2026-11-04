@@ -1502,7 +1502,10 @@ state after waking. This changes four things a caller must know:
   file writes or two commands may interleave, and results come back in the order
   they finish, not the order the model asked for them. Tools are async promises
   inside one Node process — **no OS worker or CPU isolation**, so CPU-bound
-  JavaScript still blocks the event loop.
+  JavaScript still blocks the event loop. A server-hosted session can opt out of
+  that limitation per deployment with `HARNESS_THREAD_EXECUTION=worker`, which runs
+  each conversation (loop and tool bodies) on its own worker thread; see
+  [Per-thread CPU isolation](#per-thread-cpu-isolation-threadexecution-worker).
 
 Cancellation follows the same model. A run's signal (and `toolCancel({ callId })`
 for one call) reaches every running tool; `shell` honours it and kills its
@@ -1901,6 +1904,8 @@ workspace root still finds it. In this workspace the file is
 | `EXA_API_KEY` | Opt-in `search` provider (the preferred default) for the real presets (`instruct`, `research`, `workspace`, `reviewer`, `planner`, and the `flaky` example), **and** the optional hosted `fetch` provider |
 | `TAVILY_API_KEY` | Second opt-in `search` provider (search only — Tavily has no `fetch` provider) |
 | `LINKUP_API_KEY` | Third opt-in `search` provider, and the second optional hosted `fetch` provider |
+| `HARNESS_THREAD_EXECUTION` | Server only: `inline` (default) or `worker` — runs each conversation's turn on its own OS worker thread. See [Per-thread CPU isolation](#per-thread-cpu-isolation-threadexecution-worker) |
+| `HARNESS_WORKER_IDLE_MS`, `HARNESS_MAX_LANE_WORKERS`, `HARNESS_WORKER_HANDSHAKE_MS`, `HARNESS_WORKER_ENTRY` | Server only: the lane-worker bounds and entry file for `worker` execution (same section; every value is validated, and a bad one aborts startup) |
 
 `fetch` and `download` need **no** key: `webfetch: true` registers the native
 page GET on a keyless host and declares it core (R9-R11), and `download` is an
@@ -2600,6 +2605,109 @@ execution — `turn` is an upsert for the queued, running, and terminal state of
 id, it opens with one `snapshot`, and it ends with one `snapshot` when the queue
 drains. Closing the watcher only unsubscribes; the server pump keeps running for
 nobody, which is why a reload or a hidden tab costs nothing.
+
+### Per-thread CPU isolation (`threadExecution: 'worker'`)
+
+By default the server is single-threaded in the honest sense: every session's turns
+interleave on one event loop, and the sentence in [The loop](#the-loop) still holds —
+a CPU-bound tool body blocks that loop, so a sibling conversation, an SSE stream and
+an HTTP read all wait for it.
+`threadExecution: 'worker'` removes that limitation for **server-hosted** sessions:
+each live conversation executes on its own OS worker thread.
+
+```bash
+HARNESS_THREAD_EXECUTION=worker yarn dev:server    # or: start-service / startHarnessServer()
+```
+
+What moves to the lane worker, and what does not:
+
+| Runs on the lane worker | Stays on the coordinator |
+|---|---|
+| the agent loop, provider stream handling, and **every tool body** (sync, CPU-heavy, or created by `toolCreate`) | the **canonical** harness and session document |
+| a queued thread turn **and** the legacy root `POST .../messages` run | persistence, the event journal, the display view, and every SSE response |
+| a session-bound manual `POST .../tools/:name` call and a slash `/command` (both on the session's operator lane) | the single-flight gate, the queue pump, and cancellation classification |
+| a nested `delegate` loop and a `threadFork` branch (lane-local, under a one-writer lease on the shared conversation) | the identity ledger, the writer leases, and the commit journal |
+
+Shared state is not merged. A lane sends **operations** carrying the facts they
+depend on, and the coordinator's authority (`src/server/workers/lane-authority.ts`)
+decides each one against the canonical harness:
+
+- a transcript **appends at the length the authority reported**; a stale prefix is
+  refused with the canonical length, so a committed run either lands whole or is
+  re-read — never silently overwritten;
+- `harness.memory` crosses as a **bounded declared window** and writes are
+  **compare-and-set** against a digest, so a sibling's key is never deleted by the
+  lane that never read it, and a function/symbol value is named instead of dropped;
+- a terminal run **archives its invocation** with ids the authority **leased** at
+  startup, and the authority reassigns the completion order, so two lanes can both
+  claim to be "latest finished" without colliding;
+- every session-shared operation a core tool performs (`task`, `profileManage`,
+  `chapterManage`, `locationManage`, `toolCreate`, `toolManage`, `toolRegistry`,
+  `toolRequest`, `toolList`, `threadSend`, `threadList`, `agentManage`,
+  `agentResult`) is **routed**, not executed locally: the lane replica's own
+  `harness.runtime` object is replaced, so the canonical harness performs the work
+  and the answer crosses back. Tool sources are unchanged.
+- an `actionRequest` (an owner question) crosses as data, is registered in the
+  session's normal pending map, and is answered by the usual HTTP route; a lane
+  whose run ends leaves no orphaned question.
+
+Those four writes need targeted core seams, because folding a lane commit with
+`harness.restore()` per commit would rebuild every created tool and thread agent on
+the coordinator (`src/harness.ts`, `src/types/index.ts`):
+
+| Seam | Contract |
+|---|---|
+| `harness.appendThreadMessages(threadId, messages, fromLength)` | append at a prefix; refuses (mutating nothing) when the canonical length moved; notifies `agent_message` |
+| `harness.setThreadStatus(threadId, status, invocationId?)` | mirror a lane conversation's roster state; refuses when a run is attached **in this** harness |
+| `harness.archiveInvocation(input)` | store one terminal invocation; identity is the caller's, counters are only ever **raised** |
+| `harness.reserveIdentity(input)` | raise this harness's minting counters so two replicas cannot mint the same id |
+
+Worker mode is a **promise, not a hint**, so an unsupported shape is an error with a
+name and a fix — never a quiet inline fallback:
+
+- a harness that cannot be rebuilt from its durable record (a preset injected as a
+  factory closure) is refused by `POST /sessions` with a 400, at creation;
+- a tool body that reaches a canonical-document member of the live handle
+  (`harness.snapshot/restore/reset/registerTool/createThread/sendThreadInput`, …) is
+  refused at the lane handshake, naming the tool;
+- a tool that walks `harness.memory` dynamically (`memory.data`, `memory.keys()`, a
+  computed key) is refused for the same reason;
+- no worker entry on disk is a `ServerRuntimeError` naming both candidate paths, and
+  a handshake that times out fails the turn.
+
+Compatibility is unchanged: the default stays `inline`, no existing host changes
+shape on upgrade, and a worker session answers exactly the same HTTP surface.
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HARNESS_THREAD_EXECUTION` | `inline` | `inline` or `worker`; any other value aborts startup |
+| `HARNESS_WORKER_IDLE_MS` | `120000` | reclaim a lane worker after this much idle time (`0` = keep it until the session goes). 0–3600000 |
+| `HARNESS_MAX_LANE_WORKERS` | `16` | upper bound on concurrently live lane workers — each owns a full harness replica, so this is the memory guard. 1–64 |
+| `HARNESS_WORKER_HANDSHAKE_MS` | `60000` | bound on worker import + build + capability report. 1000–600000 |
+| `HARNESS_WORKER_ENTRY` | unset | explicit worker entry file; otherwise `dist/underload-harness.worker.mjs`, else the source entry (dev/test) |
+
+Values are **validated, not coerced**: `HARNESS_WORKER_IDLE_MS=12s` aborts startup
+naming the variable and the accepted range, because an approximated runtime is the
+one thing this mode may not do.
+
+The lane worker is a published entry point — `@underload/harness/worker`, built as
+`dist/underload-harness.worker.mjs` by `yarn build` (`vite.config.ts`, `package.json`
+`exports`). Resolve order is: the configured `workerEntry`, the built bundle, the
+source module. A cold lane measures ~1.6–2.4 s in source mode (it rebuilds the
+harness, recompiles created-tool sources and restores the snapshot) and less against
+`dist/`; reclaim is always safe because the next turn rebuilds from committed state.
+
+A lane's `harness.branch` listing and a `threadFork` audit are lane-local by core
+design (branch state is deliberately absent from snapshot v1), so a fork commits the
+summary it returns and the branch detail stays with the conversation that ran it.
+
+Cross-references: `src/server/config.ts` (the validated runtime),
+`src/server/workers/` (protocol, lane host, worker entry + loop, authority,
+capability, identity/commit/memory primitives), `src/server/sessions.ts` (the
+worker branches — search for `workerExecution`), and
+`src/server/workers/lane-worker.test.ts` (the behavioral proofs: a CPU burn on one
+lane while a sibling and the event loop keep moving, a task written on one lane read
+back by a rebuilt lane, and cancel/crash leaving no late effects).
 
 ### Threads in the browser UI (R5/R6/R7)
 

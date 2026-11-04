@@ -355,6 +355,7 @@ import type {
     HarnessActionRequest,
     HarnessActionRequestContext,
     HarnessActionResult,
+    HarnessAgentResultSnapshot,
     HarnessAgentSnapshot,
     HarnessAssistantMessage,
     HarnessAttachment,
@@ -371,6 +372,8 @@ import type {
     HarnessEvent,
     HarnessForkConfiguration,
     HarnessForkResult,
+    HarnessIdentityReservation,
+    HarnessInvocationArchiveInput,
     HarnessMessage,
     HarnessPendingTool,
     HarnessProgress,
@@ -383,6 +386,7 @@ import type {
     HarnessThreadMessageResult,
     HarnessThreadRecord,
     HarnessThreadRoster,
+    HarnessThreadStatus,
     HarnessThreadSteerReceipt,
     HarnessToolCall,
     HarnessToolCallOptions,
@@ -3830,6 +3834,238 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         // owning agent's name is exactly what `postThreadMessage` reports for an
         // idle append (line ~3460); no new reason is introduced.
         notifyStateChange('agent_message', { agent: target.agent.name });
+    };
+
+    // ------------------------------------------------------------------
+    // LANE-WORKER seams (server/workers/lane-authority.ts)
+    // ------------------------------------------------------------------
+    //
+    // WHY THESE EXIST AND WHY THEY ARE TARGETED (T5)
+    // ---------------------------------------------
+    // When `threadExecution: 'worker'`, a conversation RUNS on a lane worker and the
+    // coordinator's harness holds the CANONICAL copy of everything the run produced.
+    // Folding that state with `restore()` per commit is not an option: restore rebuilds
+    // every created tool and thread agent, zeroes each thread's generation, and
+    // re-notifies observers, i.e. it costs main-thread CPU and disturbs live handles.
+    // These three operations are the whole applier surface: ONE call per committed
+    // change, each validating its own input so a rejected lane write mutates nothing.
+    //
+    // They deliberately do NOT reuse `setThreadMessages`' live-work guard: the thread is
+    // running ON ANOTHER THREAD, so the authority's record is a mirror while the lane
+    // writes. Refusing that mirror write would make a committed transcript unapplicable.
+
+    // Append the messages a lane committed at a known prefix.
+    //
+    // `fromLength` is the transcript length the LANE observed when it produced these
+    // messages; the canonical length must equal it, otherwise somebody else wrote this
+    // conversation first and the append is refused (nothing is overwritten). That single
+    // check is what replaces the retired replica-diff merge: an append either lands whole
+    // or is rejected with the canonical length so the lane can re-read.
+    //
+    // Returns the detached canonical transcript, so the caller can publish the committed
+    // length without a second read.
+    const appendThreadMessages = (
+        threadId: string,
+        messages: HarnessMessage[],
+        fromLength: number
+    ): HarnessMessage[] => {
+        const target = threadStateOf(threadId);
+
+        const validated = readHarnessMessages(messages, `thread "${threadId}" messages`);
+
+        // Checked BEFORE any mutation: a refused append must leave the transcript
+        // (and every observer) untouched.
+        if (!Number.isInteger(fromLength) || fromLength < 0) {
+            throw new HarnessError(
+                `Thread "${threadId}" append needs a non-negative message count; received ${JSON.stringify(fromLength)}.`
+            );
+        }
+
+        const current = target.agent.messages.length;
+
+        if (current !== fromLength) {
+            throw new HarnessError(
+                `Thread "${threadId}" holds ${current} messages, not ${fromLength}; re-read before appending.`
+            );
+        }
+
+        for (const message of validated) target.agent.messages.push(message);
+
+        // Same reason/payload as a wholesale transcript write, so the persistence
+        // observer sees a committed lane append exactly like an inline append.
+        notifyStateChange('agent_message', { agent: target.agent.name });
+
+        return cloneMessages(target.agent.messages);
+    };
+
+    // Record the roster-side state of a conversation that is running (or has finished)
+    // on a lane worker.
+    //
+    // The authority never runs this conversation itself, so nothing else would ever move
+    // its `status` or `invocationId`: without this the UI would show a lane as idle and
+    // the roster could not join a turn to its invocation.
+    //
+    // A thread with a LOCAL run attached refuses the write: the run loop owns its own
+    // status, and a mirror write would fake liveness for a conversation that is not
+    // running remotely.
+    const setThreadStatus = (
+        threadId: string,
+        status: HarnessThreadStatus,
+        invocationId?: string
+    ): HarnessThreadRecord => {
+        const target = threadStateOf(threadId);
+
+        if (target.run !== undefined && status !== target.record.status) {
+            throw new HarnessError(
+                `Thread "${threadId}" is running in this harness; its status is owned by that run.`
+            );
+        }
+
+        if (invocationId !== undefined) {
+            if (invocationId.trim().length === 0) {
+                throw new HarnessError(`Thread "${threadId}" needs a non-empty invocation id or none at all.`);
+            }
+
+            target.record.invocationId = invocationId;
+        }
+
+        target.record.status = status;
+
+        notifyStateChange('thread', { agent: target.agent.name });
+
+        return threadRecordCopy(target.record);
+    };
+
+    // Archive ONE completed invocation in the session's agent-result registry.
+    //
+    // The inline path fills that registry from `runAgent` (registerInvocation /
+    // finishInvocation, line ~2535). In worker mode the run happened on the lane, so the
+    // canonical registry would otherwise never see it and `/results`, `agentManage` and
+    // `agentResult` would answer "no such invocation" for work the session really did.
+    //
+    // Identity comes from the CALLER (the lane's leased ids), never minted here: a
+    // duplicate `invocationId` replaces the same slot exactly as the inline map write
+    // does, and is reported so the lane's receipt can name it.
+    //
+    // No state-change notification: the committed transcript/thread write that accompanies
+    // a terminal invocation already triggers the persistence observer, so a second
+    // notification would double-save the same document.
+    const archiveInvocation = (
+        input: HarnessInvocationArchiveInput
+    ): { record: HarnessAgentResultSnapshot; replaced: boolean } => {
+        const invocationId = input.invocationId?.trim() ?? '';
+
+        if (invocationId.length === 0) {
+            throw new HarnessError('An archived invocation needs a non-empty invocationId.');
+        }
+
+        if (agents[input.agent] === undefined) {
+            throw new HarnessError(
+                `Agent "${input.agent}" is not registered in this harness, so its invocation cannot be archived.`
+            );
+        }
+
+        if (!Number.isInteger(input.sequence) || input.sequence < 1) {
+            throw new HarnessError(
+                `Invocation "${invocationId}" needs a positive integer sequence; received ${JSON.stringify(input.sequence)}.`
+            );
+        }
+
+        // The snapshot union is exactly "terminal", which is all the archive may store.
+        const status: Exclude<AgentInvocationStatus, 'running'> = input.status;
+
+        // A JS caller can still pass 'running' (the type says it cannot); the archive must
+        // never hold an invocation that has no answer yet.
+        if ((status as AgentInvocationStatus) === 'running') {
+            throw new HarnessError(`Invocation "${invocationId}" must be archived terminal, not running.`);
+        }
+
+        const replaced = invocationRecords.has(invocationId);
+        const completedOrder =
+            input.completedOrder === undefined
+                ? ++invocationCompletionSequence
+                : Math.max(invocationCompletionSequence + 1, input.completedOrder);
+
+        invocationCompletionSequence = completedOrder;
+        runSequence = Math.max(runSequence, input.sequence);
+
+        const archived: AgentInvocationRecord = {
+            invocationId,
+            sequence: input.sequence,
+            agent: input.agent,
+            role: input.role,
+            kind: input.kind,
+            status,
+            content: status === 'completed' ? input.content ?? '' : '',
+            completedOrder,
+            ...(status === 'completed' ? {} : { error: input.error ?? 'The run ended without a result.' }),
+            ...(input.threadId === undefined ? {} : { threadId: input.threadId })
+        };
+
+        invocationRecords.set(invocationId, archived);
+
+        pruneInvocationRecords();
+
+        return {
+            record: {
+                invocationId: archived.invocationId,
+                sequence: archived.sequence,
+                completedOrder: archived.completedOrder,
+                agent: archived.agent,
+                role: archived.role,
+                kind: archived.kind,
+                status,
+                content: archived.content,
+                ...(archived.error === undefined ? {} : { error: archived.error })
+            },
+            replaced
+        };
+    };
+
+    // Reserve identity high-water marks in this harness (T5 lane-worker seam).
+    //
+    // A lane worker mints ids from its OWN counters: `runSequence` (the invocation id of a
+    // run with no persistent thread), the `thread-N` high-water marks, and
+    // `invocationCompletionSequence`. `restore()` raises those counters only from what the
+    // snapshot happens to contain, so a replica rebuilt from a snapshot whose newest record
+    // is sequence 4 would happily mint sequence 4 again, and two replicas would mint the
+    // SAME identity for different work (T3 finding F2).
+    //
+    // The coordinator therefore LEASES a range from its identity ledger and reserves it in
+    // every replica it starts. Rules, stated exactly:
+    //   - a value only ever RAISES a counter (a lower observation is ignored, never applied);
+    //   - the returned values are the ACTUAL counters afterwards, so the caller can prove the
+    //     reservation landed instead of assuming it;
+    //   - nothing here rewrites history: it is a counter bump, not a state change, so no
+    //     persistence observer is notified (an id nobody used costs nothing).
+    const reserveIdentity = (
+        input: HarnessIdentityReservation
+    ): HarnessIdentityReservation => {
+        if (input.runSequence !== undefined) {
+            runSequence = Math.max(runSequence, Math.trunc(input.runSequence));
+        }
+
+        if (input.threadSequence !== undefined) {
+            threadSequence = Math.max(threadSequence, Math.trunc(input.threadSequence));
+        }
+
+        if (input.threadIdSequence !== undefined) {
+            threadIdSequence = Math.max(threadIdSequence, Math.trunc(input.threadIdSequence));
+        }
+
+        if (input.invocationCompletionSequence !== undefined) {
+            invocationCompletionSequence = Math.max(
+                invocationCompletionSequence,
+                Math.trunc(input.invocationCompletionSequence)
+            );
+        }
+
+        return {
+            runSequence,
+            threadSequence,
+            threadIdSequence,
+            invocationCompletionSequence
+        };
     };
 
     // Every live run, so a scheduler wake can mark the right runs dirty. Runs are
@@ -7583,6 +7819,12 @@ export const harness = (configuration: HarnessConfiguration): Harness => {
         threadMessages,
         // C4: the transcript editor's write primitive (validate + replace in place).
         setThreadMessages,
+        // T5 lane-worker seams: targeted canonical writes the coordinator applies for a
+        // conversation that ran on a lane (no wholesale restore per commit).
+        appendThreadMessages,
+        setThreadStatus,
+        archiveInvocation,
+        reserveIdentity,
         createThread,
         sendThreadInput,
         steerThread,

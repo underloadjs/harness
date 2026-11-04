@@ -16,7 +16,8 @@
 import http from 'node:http';
 import { createHarnessRegistry, createToolCatalogue, describeHarness, restoreHarnessRegistry } from './harnesses';
 import type { HarnessRegistry, ToolCatalogue } from './harnesses';
-import { loadConfiguration } from './config';
+import { loadConfiguration, resolveRuntimeConfiguration } from './config';
+import type { ServerRuntimeConfiguration } from './config';
 import { loadEnvironmentFile } from './environment';
 import { createHarnessHandler } from './handler';
 import type { HarnessHandler } from './handler';
@@ -24,6 +25,9 @@ import { packagePath } from './package-root';
 import type { RunnerSettings } from './harnesses/types';
 import type { HarnessIndex } from './protocol';
 import { SessionStore } from './sessions';
+// Same subsystem boundary as ./runtime.ts: the worker readiness gate lives with the
+// worker code, not with the server entry points.
+import { assertWorkerRuntimeReady } from './workers';
 import {
     HarnessPersistence,
     HarnessPersistenceError,
@@ -51,6 +55,11 @@ export type StartServerOptions = {
     // The in-memory harness registry shared by the store and the API. Omitted
     // means the shipped catalogue; tests inject one to add scripted harnesses.
     registry?: HarnessRegistry;
+    // Server RUNTIME override (R3), merged over `HARNESS_THREAD_EXECUTION` and the
+    // other `HARNESS_WORKER_*` variables and validated the same way. `worker` is
+    // refused by this build until the lane coordinator lands, and the refusal is an
+    // error rather than a silent inline fallback.
+    runtime?: Partial<ServerRuntimeConfiguration>;
 };
 
 export type HarnessServer = {
@@ -58,6 +67,8 @@ export type HarnessServer = {
     host: string;
     url: string;
     store: SessionStore;
+    // The resolved, validated runtime this listener executes with (R3).
+    runtime: ServerRuntimeConfiguration;
     // Present when a database root was supplied; the resolved root and file owner.
     persistence?: HarnessPersistence;
     close: () => Promise<void>;
@@ -102,6 +113,12 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
 
     const configuration = loadConfiguration();
 
+    // R3: resolve and validate the runtime BEFORE any listener is created, so a bad
+    // `HARNESS_WORKER_*` value or an unsupported execution mode aborts startup with
+    // the variable name instead of serving a silently different model.
+    const runtime = resolveRuntimeConfiguration(configuration.runtime, options.runtime);
+    assertWorkerRuntimeReady(runtime);
+
     // Built after loadEnvironmentFile() on purpose: search resolves its
     // provider key here, once, and the handler keeps the snapshot for its whole
     // lifetime. A keyless host still gets the entry, marked unconfigured.
@@ -141,7 +158,11 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
         (preset) => describeHarness(preset, catalogue),
         {
             ...(persistence === undefined ? {} : { persistence }),
-            ...(database === undefined ? {} : { database })
+            ...(database === undefined ? {} : { database }),
+            // R1/R3: the standalone listener hands the store the SAME resolved runtime it
+            // reports on `startHarnessServer().runtime`, so an operator's
+            // HARNESS_THREAD_EXECUTION=worker is what the sessions actually get.
+            runtime
         }
     );
 
@@ -201,6 +222,7 @@ export const startHarnessServer = async (options: StartServerOptions = {}): Prom
         host,
         url: `http://${host === '0.0.0.0' ? 'localhost' : host}:${port}`,
         store,
+        runtime,
         ...(persistence === undefined ? {} : { persistence }),
         close: () =>
             new Promise<void>((resolve, reject) => {

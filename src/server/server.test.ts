@@ -8,6 +8,10 @@
 
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { ALL_PRESET_TEMPLATES, createHarnessRegistry } from './harnesses';
+// The runtime config error type is re-exported by the server barrel; asserting the
+// class (not just the message) is what proves a bad deployment value is a
+// DEPLOYMENT error rather than a client 400.
+import { ServerRuntimeError } from './index';
 import { startHarnessServer } from './index';
 import type { HarnessServer } from './index';
 import type {
@@ -246,5 +250,151 @@ describe('harness server', () => {
         });
 
         expect(response.status).toBe(403);
+    });
+});
+
+describe('server runtime configuration', () => {
+    // R3: the execution model is deployment configuration that the RUNNING server
+    // reports, and a configured-but-unsupported model fails at startup instead of
+    // degrading into an inline server the operator did not ask for.
+    const RUNTIME_DEFAULTS = {
+        threadExecution: 'inline',
+        workerIdleMs: 120_000,
+        maxLaneWorkers: 16,
+        workerHandshakeMs: 60_000
+    } as const;
+
+    // The four runtime variables, saved and cleared so a developer's shell cannot
+    // move the expected defaults (same isolation idiom as ./environment.test.ts).
+    const RUNTIME_KEYS = [
+        'HARNESS_THREAD_EXECUTION',
+        'HARNESS_WORKER_IDLE_MS',
+        'HARNESS_MAX_LANE_WORKERS',
+        'HARNESS_WORKER_HANDSHAKE_MS',
+        'HARNESS_WORKER_ENTRY'
+    ] as const;
+
+    const withRuntimeEnvironment = async (
+        values: Partial<Record<(typeof RUNTIME_KEYS)[number], string>>,
+        run: () => Promise<void>
+    ): Promise<void> => {
+        const saved: Record<string, string | undefined> = {};
+
+        for (const key of RUNTIME_KEYS) {
+            saved[key] = process.env[key];
+            delete process.env[key];
+        }
+
+        for (const [key, value] of Object.entries(values)) process.env[key] = value;
+
+        try {
+            await run();
+        } finally {
+            for (const key of RUNTIME_KEYS) {
+                if (saved[key] === undefined) delete process.env[key];
+                else process.env[key] = saved[key];
+            }
+        }
+    };
+
+    it('reports the resolved runtime on a started server', async () => {
+        await withRuntimeEnvironment({}, async () => {
+            const started = await startHarnessServer({ port: 0, staticRoot: null });
+
+            try {
+                expect(started.runtime).toEqual(RUNTIME_DEFAULTS);
+            } finally {
+                await started.close();
+            }
+        });
+    });
+
+    it('starts with worker execution and reports it as the resolved runtime', async () => {
+        // T5 replaced the "substrate only" refusal: `threadExecution: 'worker'` now runs
+        // lanes, so startup must SUCCEED and report the mode. The promise an operator checks
+        // from the running process is exactly this field - not an inferred default.
+        const started = await startHarnessServer({ port: 0, staticRoot: null, runtime: { threadExecution: 'worker' } });
+
+        try {
+            expect(started.runtime).toEqual({ ...RUNTIME_DEFAULTS, threadExecution: 'worker' });
+            expect(started.store.workerExecution).toBe(true);
+
+            // No lane has been spawned yet: the host exists only once a session actually runs
+            // something, so configuring worker mode costs an idle server nothing. (The HTTP
+            // surface itself is unchanged in worker mode, and ./workers/lane-worker.test.ts
+            // measures that this process keeps answering reads and 10 ms timer ticks while a
+            // lane burns CPU - which is what a request depends on.)
+            expect((started.store as unknown as { host?: unknown }).host).toBeUndefined();
+        } finally {
+            await started.close();
+        }
+    });
+
+    it('refuses an out-of-range worker bound instead of clamping it', async () => {
+        await expect(
+            startHarnessServer({ port: 0, staticRoot: null, runtime: { maxLaneWorkers: 65 } })
+        ).rejects.toThrowError(new ServerRuntimeError('maxLaneWorkers must be an integer between 1 and 64.'));
+
+        await expect(
+            startHarnessServer({ port: 0, staticRoot: null, runtime: { workerIdleMs: -1 } })
+        ).rejects.toThrowError(new ServerRuntimeError('workerIdleMs must be an integer between 0 and 3600000.'));
+    });
+
+    it('honours the HARNESS_* variables and lets explicit options win per field', async () => {
+        const saved = {
+            mode: process.env.HARNESS_THREAD_EXECUTION,
+            idle: process.env.HARNESS_WORKER_IDLE_MS,
+            max: process.env.HARNESS_MAX_LANE_WORKERS,
+            handshake: process.env.HARNESS_WORKER_HANDSHAKE_MS
+        };
+
+        process.env.HARNESS_THREAD_EXECUTION = 'inline';
+        process.env.HARNESS_WORKER_IDLE_MS = '1000';
+        process.env.HARNESS_MAX_LANE_WORKERS = '2';
+        process.env.HARNESS_WORKER_HANDSHAKE_MS = '2000';
+
+        let fromEnvironment: HarnessServer | undefined;
+
+        try {
+            fromEnvironment = await startHarnessServer({ port: 0, staticRoot: null });
+
+            expect(fromEnvironment.runtime).toEqual({
+                threadExecution: 'inline',
+                workerIdleMs: 1000,
+                maxLaneWorkers: 2,
+                workerHandshakeMs: 2000
+            });
+
+            // An explicit field replaces only itself; the other environment values
+            // stay, which is what a service host passing `variables` expects.
+            const overridden = await startHarnessServer({
+                port: 0,
+                staticRoot: null,
+                runtime: { maxLaneWorkers: 3 }
+            });
+
+            try {
+                expect(overridden.runtime).toEqual({
+                    threadExecution: 'inline',
+                    workerIdleMs: 1000,
+                    maxLaneWorkers: 3,
+                    workerHandshakeMs: 2000
+                });
+            } finally {
+                await overridden.close();
+            }
+        } finally {
+            if (fromEnvironment !== undefined) await fromEnvironment.close();
+
+            for (const [key, value] of Object.entries({
+                HARNESS_THREAD_EXECUTION: saved.mode,
+                HARNESS_WORKER_IDLE_MS: saved.idle,
+                HARNESS_MAX_LANE_WORKERS: saved.max,
+                HARNESS_WORKER_HANDSHAKE_MS: saved.handshake
+            })) {
+                if (value === undefined) delete process.env[key];
+                else process.env[key] = value;
+            }
+        }
     });
 });

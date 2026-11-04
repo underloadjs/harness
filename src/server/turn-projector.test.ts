@@ -785,6 +785,45 @@ describe('pending, wakeups and tokens', () => {
 
         expect(result.summary()).toMatchObject({ latestInput: 1_000, cachedInput: 400, usage: { total: 1_020 } });
     });
+
+    it('mirrors both token scopes onto every compiled section so a full-document read repaints them', () => {
+        // The row and the ops already carry the two scopes; the DOCUMENT is the third
+        // surface, and it is the one a hydrate, a drain frame and the terminal snapshot
+        // paint from (../frontend/ui/turns.ts `renderCompiledDisplay`). A section that
+        // carries neither figure makes the rebuilt header fall back to the cumulative
+        // `usage.input` (the sum of every re-sent transcript, which for a long run is far
+        // past the context window) and leaves a delegated row with no tally at all (T2/R2).
+        const childThread = { id: 'inv-child', parentId: 'inv-root', callId: 'call-1', kind: 'delegation' as const, input: 'sub task' };
+        const result = fold(
+            [
+                { type: 'start', agent: 'one', model: 'gpt-x', thread: { id: 'inv-root' } },
+                toolCall('call-1', 'delegate', JSON.stringify({ agent: 'two', input: 'sub task' })),
+                { type: 'start', agent: 'two', model: 'gpt-y', thread: childThread },
+                // Each request reports its OWN context; the child reports last, so it is
+                // the turn's latest request (the emission-order rule the row publishes).
+                { type: 'usage', agent: 'one', thread: { id: 'inv-root' }, usage: { input: 1_000, output: 20, total: 1_020, cached: 400 } },
+                { type: 'usage', agent: 'two', thread: childThread, usage: { input: 620, output: 8, total: 628, cached: 300 } }
+            ],
+            turnOf({ usage: { input: 1_620, output: 28, total: 1_648, cached: 700 } })
+        );
+
+        const sections = result.display().sections;
+
+        // Per-section, in each block's OWN scope: its latest request and its own cumulative
+        // cached — never the turn's sum.
+        expect(sections.map((section) => [section.id, section.latestInput, section.cachedInput])).toEqual([
+            ['turn-1:0', 1_000, 400],
+            ['turn-1:1', 620, 300]
+        ]);
+
+        // The document agrees with the row shipped beside it, and the cumulative tally that
+        // the accounting surfaces read is untouched.
+        expect(result.summary()).toMatchObject({
+            latestInput: 620,
+            cachedInput: 700,
+            usage: { input: 1_620, output: 28, total: 1_648, cached: 700 }
+        });
+    });
 });
 
 describe('owner questions', () => {

@@ -2093,6 +2093,45 @@ export type HarnessAgentResultSnapshot = {
     error?: string;
 };
 
+// T5 lane-worker seam: ONE terminal invocation the coordinator archives on behalf of a
+// conversation that ran on another thread (see `harness.archiveInvocation`).
+//
+// Identity fields come from the CALLER because the run happened elsewhere; the harness
+// never invents them here. `completedOrder` may be omitted (the harness then takes the
+// next free order), and every supplied value is only ever RAISED, so a lane cannot move
+// the completion high-water mark backwards and an archived result can never sort before
+// a result the harness produced itself.
+export type HarnessInvocationArchiveInput = {
+    invocationId: string;
+    sequence: number;
+    agent: string;
+    role: 'primary' | 'subagent';
+    kind: 'root' | 'delegation' | 'fork' | 'autoanswer';
+    status: 'completed' | 'failed' | 'cancelled';
+    // Completed answer text. Ignored (forced empty) for a failed/cancelled record.
+    content?: string;
+    // Failure/cancellation message; defaulted when a non-completed status omits it.
+    error?: string;
+    // Authority-leased completion order. Omitted means "take the next one".
+    completedOrder?: number;
+    // The persistent conversation this invocation ran in, when one owns it.
+    threadId?: string;
+};
+
+// T5 lane-worker seam: reserve identity high-water marks in one harness (see
+// `harness.reserveIdentity`). Every supplied value only ever RAISES the matching counter,
+// and the call returns the ACTUAL counters afterwards.
+//
+// This is how an authority-issued identity lease lands in a lane replica: a replica mints
+// run and thread ids from its own counters, so without a reservation two replicas rebuilt
+// from one snapshot would mint the same identity for different work.
+export type HarnessIdentityReservation = {
+    runSequence?: number;
+    threadSequence?: number;
+    threadIdSequence?: number;
+    invocationCompletionSequence?: number;
+};
+
 // One HOST thread persisted by snapshot v1 (R2). The agent's DEFAULT thread is
 // deliberately absent: its transcript is `agents.<name>.messages`, and its id is
 // derived from the agent name (`agent:<name>`), so persisting it would duplicate
@@ -2592,6 +2631,40 @@ export type Harness = {
     // Notifies `agent_message` (the existing reason; no new reason is added) and
     // emits NO progress event: this is a host edit, not model output.
     setThreadMessages: (threadId: string, messages: HarnessMessage[]) => void;
+    // T5 lane-worker seam: APPEND the messages one lane committed at a known prefix.
+    //
+    // `fromLength` is the transcript length the lane observed; the canonical length must
+    // match, otherwise the append is refused (nothing is overwritten, and the caller is
+    // handed the canonical transcript length in the error). Unlike `setThreadMessages`
+    // this does NOT refuse a thread whose record says 'running': in worker mode the run
+    // lives on another thread and the local record is a mirror being caught up.
+    //
+    // Returns the detached canonical transcript. Notifies `agent_message`.
+    appendThreadMessages: (
+        threadId: string,
+        messages: HarnessMessage[],
+        fromLength: number
+    ) => HarnessMessage[];
+    // T5 lane-worker seam: mirror a lane conversation's roster state onto the canonical
+    // record (status, and the invocation the roster joins a turn to). Refused when a run
+    // is attached IN THIS harness, because that run owns its own status. Notifies `thread`.
+    setThreadStatus: (
+        threadId: string,
+        status: HarnessThreadStatus,
+        invocationId?: string
+    ) => HarnessThreadRecord;
+    // T5 lane-worker seam: archive ONE terminal invocation for a run that happened on a
+    // lane worker, so `agentResult` / `agentManage` / the results view can address work the
+    // session really did. Identity is the caller's (authority-leased); the completion and
+    // run-sequence high-water marks are only ever RAISED. Throws for an unknown agent, a
+    // blank invocation id, a non-positive sequence, or a 'running' status.
+    archiveInvocation: (
+        input: HarnessInvocationArchiveInput
+    ) => { record: HarnessAgentResultSnapshot; replaced: boolean };
+    // T5 lane-worker seam: RAISE this harness's identity counters so a replica cannot mint
+    // an id the coordinator has already leased to somebody else. Supplied values never lower
+    // a counter; the returned object is the actual state afterwards.
+    reserveIdentity: (input: HarnessIdentityReservation) => HarnessIdentityReservation;
     // Open an independent conversation owned by `agent`. Throws for an unknown
     // agent or an invalid/blank label, and when an `ownerThreadId` names no
     // thread in this harness.

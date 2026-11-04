@@ -713,3 +713,121 @@ describe('reconciling a reconnect', () => {
         expect(tile.element.querySelector('.tile-status-text')?.textContent).toBe('done');
     });
 });
+
+// ---------------------------------------------------------------------------
+// R2 — the header's LATEST-request context survives completion and a replay
+// ---------------------------------------------------------------------------
+//
+// The compact header prints TWO scopes on purpose (ui/tokens.ts): the primary figure
+// is the LATEST model request's input (a context gauge, bounded by the model's window)
+// and the bracket is the turn's cumulative cached input. The cumulative `usage.input`
+// — every re-sent transcript added up (../server/sessions.ts `addUsage`) — is only ever
+// the conservative fallback for a record whose latest request is unknowable.
+//
+// What this pins, because it is what broke (T2): a run paints the latest request while
+// it streams (the projector's `usage` op for `sectionId: 'turn'` carries it), but the
+// frame that ENDS the run — the terminal snapshot `sessions.ts` `mirrorView` publishes
+// as `{ type: 'view' }`, and every reload's `hydrateView` — repaints the tile from the
+// compiled document. That rebuild drops the event-derived figures
+// (`resetCompiled` -> `blockMeta.clearUsage()`) and nothing restored them from the row,
+// so the header fell back to the cumulative sum: a 133-minute task printed 76,645,165
+// beside a 512k context window, and every nested row lost its tally outright.
+//
+//   row (the turn-level authority):   usage.input 410,000 · latestInput 200,000 · cached 330,000
+//   correct header:                   "200,000 (330,000)"
+//   the regression this pins:         "410,000 (330,000)"  (the sum, not the context)
+describe('the latest-request context through a document paint', () => {
+    // The row a completed run carries: the cumulative tally stays on `usage` (accounting,
+    // untouched by this fix) while `latestInput` is the last request's context.
+    const TALLY = { input: 410_000, output: 45, total: 410_045, cached: 330_000 };
+    const LATEST = 200_000;
+
+    const figures = (overrides: Partial<TurnSummary> = {}): TurnSummary => ({
+        ...summary(overrides),
+        usage: TALLY,
+        latestInput: LATEST,
+        cachedInput: TALLY.cached
+    });
+
+    // The live frame for the final request: the emitting section first, then the
+    // turn-level pair (../server/turn-projector.ts:2240 and :2247).
+    const liveUsageOps = (sectionId: string, latestInput: number, cachedInput: number): TurnDisplayOp[] => [
+        { op: 'usage', turnId: 't1', sectionId, latestInput, cachedInput },
+        { op: 'usage', turnId: 't1', sectionId: 'turn', latestInput, usage: TALLY }
+    ];
+
+    it('keeps the latest request on the header after the terminal document frame', () => {
+        const document = documentOf([figures()], {
+            t1: [rootSection({ latestInput: LATEST, cachedInput: 250_000 })]
+        });
+        const { board } = mount();
+        const tile = board.upsertView(figures({ status: 'running', state: 'streaming' }), document);
+
+        frame(board, document, 't1', liveUsageOps('t1:0', LATEST, 250_000));
+
+        expect(tile.tokens()).toBe('200,000 (330,000)');
+
+        // The end of the run: the drain/terminal frame replaces the row AND repaints the
+        // whole tree. The header figure must not move to the cumulative tally.
+        const settled = documentOf([figures({ status: 'done', state: 'done', updatedAt: T + 5_000 })], {
+            t1: [rootSection({ state: 'done', latestInput: LATEST, cachedInput: 250_000 })]
+        });
+        const handles = board.reconcileView(settled);
+
+        expect(handles).toHaveLength(1);
+        expect(handles[0]).toBe(tile);
+        expect(tile.tokens()).toBe('200,000 (330,000)');
+        expect(tile.tokens()).not.toBe('410,000 (330,000)');
+
+        // The scope the title declares is part of the contract: the fallback reads
+        // "Cumulative input (latest request not recorded)", and after this frame the
+        // number IS the latest request.
+        expect(tile.element.querySelector('.tile-tokens')?.getAttribute('title')).toBe(
+            'Latest request context: 200,000 input tokens · Total cached input sent: 330,000 tokens'
+        );
+    });
+
+    it('paints the latest request on a cold open of a document with no per-section figures', () => {
+        // A tree whose sections carry no token figures at all (an older compiled document —
+        // this is exactly what `display()` used to publish): the ROW still knows the latest
+        // request, and that is what the header prints instead of the cumulative sum.
+        const reloaded = documentOf([figures({ status: 'done', state: 'done', updatedAt: T + 5_000 })], {
+            t1: [rootSection({ state: 'done' })]
+        });
+        const { board } = mount();
+        const [tile] = board.hydrateView(reloaded);
+
+        tile.flush();
+
+        expect(tile.tokens()).toBe('200,000 (330,000)');
+    });
+
+    it('restores each delegated row from the figures the document carries', () => {
+        // A nested invocation prints its OWN pair (R1): the child's latest request and the
+        // child's own cumulative cached, never the turn's. The projector mirrors both onto
+        // the section so a full-document read can repaint them.
+        const reloaded = documentOf([figures({ status: 'done', state: 'done', updatedAt: T + 5_000 })], {
+            t1: [
+                rootSection({ state: 'done', latestInput: LATEST, cachedInput: 250_000 }),
+                childSection({
+                    state: 'done',
+                    latestInput: 90_000,
+                    cachedInput: 80_000,
+                    nodes: [{ kind: 'text', id: 'n5', text: 'delegated answer', committed: true }]
+                })
+            ]
+        });
+        const { board } = mount();
+        const [tile] = board.hydrateView(reloaded);
+
+        tile.flush();
+
+        // The delegated row is a SIBLING of the card (`thread-children`), so it is read
+        // from the board, not from `tile.element`.
+        const row = board.element.querySelector<HTMLElement>('.thread-row[data-thread-id="t1:1"]');
+
+        expect(row).not.toBeNull();
+        expect(row?.querySelector('.thread-tokens')?.textContent).toBe('90,000 (80,000)');
+        expect(tile.tokens()).toBe('200,000 (330,000)');
+    });
+});

@@ -34,14 +34,26 @@
 // also makes them serialized: there is no second writer in this process and no
 // cross-process multi-writer support (one server process per database root).
 //
+// R1 (worker IO mode): the identical commit is also executed on the IO worker thread,
+// through the exported primitives below (`serializeHarnessDatabase` +
+// `writeHarnessDatabaseFile`), so a checkpoint's stringify and its syscalls no longer
+// block the coordinator's event loop. One writer of record per root still
+// holds: the session store routes EVERY write through one FIFO queue, and the staging
+// name carries the writer's thread identity so a worker staging file can never collide
+// with a coordinator one. There is still no second PROCESS and no parallel writer.
+//
 // FAILURE POLICY
 // --------------
 // An unknown version, malformed JSON, or a structurally invalid document throws
 // HarnessPersistenceError naming the file. Nothing is reset or deleted: a silent
-// clean slate would let a corrupt file masquerade as "no sessions".
+// clean slate would let a corrupt file masquerade as "no sessions". A write that
+// fails throws on the inline path and produces a failed reply on the worker path;
+// neither mode reports success for a document that is not durable.
 //
 // Cross-references:
 //   - ./sessions.ts              — builds/consumes these records, recovery policy
+//   - ./workers/io-worker.ts     — the same commit, executed off the main thread
+//   - ./workers/io-client.ts     — the coordinator-side queue and durability barrier
 //   - ./harnesses/registry.ts    — presetToRecord / presetFromRecord / registry restore
 //   - ../types/index.ts          — HarnessSnapshot schema (restore validates it)
 //   - ./runtime.ts, ./start.ts   — root resolution and startup wiring
@@ -236,6 +248,16 @@ export class HarnessPersistenceError extends Error {
 }
 
 const messageOf = (error: unknown): string => (error instanceof Error ? error.message : String(error));
+
+// The raw failure behind a `HarnessPersistenceError`. The wrapper carries the
+// operator-facing text; `cause` keeps the underlying message so `lastWriteError`
+// reports the same string it reported before the commit primitive was extracted
+// (see `writeHarnessDatabaseFile`).
+const causeOf = (error: unknown): unknown => {
+    if (error instanceof Error && 'cause' in error) return (error as { cause?: unknown }).cause ?? error;
+
+    return error;
+};
 
 // Absolute root + namespace. `path.resolve` makes two spellings of the same
 // directory ("db/../db", a relative path from a different cwd) share one key.
@@ -1119,14 +1141,153 @@ export const repairInterruptedToolCalls = (snapshot: HarnessSnapshot): HarnessSn
     };
 };
 
+// ---------------------------------------------------------------------------
+// Commit primitives (R1: the same commit, executed off the coordinator)
+// ---------------------------------------------------------------------------
+//
+// WHY THESE ARE SEPARATE EXPORTS
+// ------------------------------
+// The IO worker (./workers/io-worker.ts) has to perform EXACTLY this commit, just on
+// another thread. Duplicating the format there would let the two write modes drift
+// and produce a `state.json` the other mode mis-reads, so the worker calls these
+// functions and byte-identity between modes is a property of the code, not of one
+// test. Both are pure (no instance state), so nothing about them is per-store.
+//
+// What is expensive here, and therefore what moves off the main thread:
+//   - the serialization: a two-space pretty-print of the WHOLE document, i.e. O(all
+//     sessions x all recorded events). On the coordinator this is a synchronous
+//     block of the event loop proportional to the database size.
+//   - the syscalls: mkdir + open + write + fsync + close + rename.
+//
+// What stays on the coordinator no matter what (honest limit, restated in
+// ./workers/io-client.ts): building the `HarnessDatabase` record itself, and the
+// structured clone `postMessage` performs on it. Worker mode moves the stringify and
+// every syscall off the loop; it cannot move the object graph it is handed.
+export const serializeHarnessDatabase = (database: HarnessDatabase, savedAt = Date.now()): string =>
+    JSON.stringify({ ...database, version: HARNESS_DATABASE_VERSION, savedAt }, null, 2);
+
+// Post-increment staging counter: the first write of a writer gets `from`. Hoisted
+// out of the class so the worker keeps its OWN counter (a worker thread shares
+// `process.pid` with the coordinator, so the two writers must not be able to pick the
+// same staging name — see `HarnessDatabaseWriteOptions.owner`).
+export const createHarnessStagingSequence = (from = 0): (() => number) => {
+    let current = from;
+
+    return () => {
+        const value = current;
+        current += 1;
+
+        return value;
+    };
+};
+
+export type HarnessDatabaseWriteOptions = {
+    // Identity baked into the staging file name. The default is the process id —
+    // what the synchronous writer has always used. The IO worker passes
+    // `<pid>.io<threadId>` so its staging name can never collide with a coordinator
+    // staging file in the same process.
+    owner?: string;
+    // Per-writer monotonic suffix source, so a stale staging file from a crashed
+    // write is never reused by the next one. A caller that owns a writer MUST pass
+    // one (`HarnessPersistence` and the IO worker both do): without it every commit
+    // gets suffix `0`, and two writes by the same writer reuse the staging name.
+    sequence?: () => number;
+};
+
+// The atomic full-document commit, as a function of data only.
+//
+// Same rule the class has always enforced: write the complete payload to a sibling
+// staging file, fsync it, then rename over the canonical file. The canonical file is
+// never unlinked first, so a crash leaves either the old complete document or the new
+// complete one, and a partial staging file is removed (never mistaken for a commit).
+//
+// Durability boundary, stated exactly: when this returns, the payload bytes are
+// fsynced and the directory ENTRY is replaced. The directory entry itself is not
+// fsynced, so after a hard power loss the rename may not have survived — the same
+// (deliberate) boundary the synchronous writer has always had.
+//
+// Throws `HarnessPersistenceError` with the file in the message; the raw failure rides
+// along as `cause` so a caller can report the underlying message unchanged.
+//
+// `directory` MUST be the canonical file's own directory: the staging file is created
+// there and the commit is a same-directory rename, which is the whole atomicity
+// guarantee (a cross-directory rename is a copy, and a crash in the middle of one is a
+// half-written database).
+export const writeHarnessDatabaseFile = (
+    directory: string,
+    file: string,
+    payload: string,
+    options: HarnessDatabaseWriteOptions = {}
+): void => {
+    const staging = path.join(
+        directory,
+        `${HARNESS_DATABASE_FILE}.${options.owner ?? process.pid}.${(options.sequence ?? createHarnessStagingSequence())()}.tmp`
+    );
+
+    const failure = (error: unknown, label: string): Error => {
+        const wrapped = new HarnessPersistenceError(file, `${label}: ${messageOf(error)}`);
+
+        // Best effort: an Error created without `cause` still reports the wrapper
+        // text, which is what the HTTP surface shows either way.
+        try {
+            (wrapped as Error & { cause?: unknown }).cause = error;
+        } catch {
+            // Frozen host: the message is the contract, the cause is a bonus.
+        }
+
+        return wrapped;
+    };
+
+    try {
+        fs.mkdirSync(directory, { recursive: true });
+    } catch (error) {
+        throw failure(error, 'Could not create the harness database directory');
+    }
+
+    let handle: number | undefined;
+
+    try {
+        handle = fs.openSync(staging, 'w');
+        fs.writeFileSync(handle, payload, 'utf8');
+        // fsync before rename: the rename may be durable while the bytes are not,
+        // which would publish an empty/truncated canonical file.
+        fs.fsyncSync(handle);
+        fs.closeSync(handle);
+        handle = undefined;
+
+        // Same-directory rename: atomic on the platforms this server targets.
+        fs.renameSync(staging, file);
+    } catch (error) {
+        if (handle !== undefined) {
+            try {
+                fs.closeSync(handle);
+            } catch {
+                // The handle is already unusable; the original error matters.
+            }
+        }
+
+        // A partial staging file is not a commit: remove it so a later run cannot
+        // confuse it with a real document (the canonical file is kept).
+        try {
+            fs.rmSync(staging, { force: true });
+        } catch {
+            // Best effort; the write error below is the actionable failure.
+        }
+
+        throw failure(error, 'Could not write the harness database');
+    }
+};
+
 // Durable document owner for one resolved root.
 export class HarnessPersistence {
     readonly directory: string;
     readonly file: string;
 
     // Post-increment staging suffix: unique per process and write, so a stale
-    // staging file from a crashed write is never reused.
-    private sequence = 0;
+    // staging file from a crashed write is never reused. The counter is a writer
+    // property (not a module one) because the IO worker runs the same primitive in
+    // this process with its own `owner` token — see `writeHarnessDatabaseFile`.
+    private staging = createHarnessStagingSequence();
     private lastError: string | undefined;
 
     constructor(root: string) {
@@ -1183,68 +1344,23 @@ export class HarnessPersistence {
 
     // Atomic full-document commit. Synchronous by design: it serializes writers,
     // and every structural API mutation can be durable before it returns.
+    //
+    // R1: the byte format and the commit sequence live in the exported primitives
+    // above, so the IO worker commits identical bytes on its own thread. This method
+    // is the inline path and stays the compatibility surface: monkey-patchable in
+    // tests (./shutdown-background.test.ts:216), synchronous, and throwing.
     save(database: HarnessDatabase): void {
-        const payload = JSON.stringify(
-            { ...database, version: HARNESS_DATABASE_VERSION, savedAt: Date.now() },
-            null,
-            2
-        );
+        const payload = serializeHarnessDatabase(database);
 
         try {
-            fs.mkdirSync(this.directory, { recursive: true });
-        } catch (error) {
-            this.lastError = messageOf(error);
-
-            throw new HarnessPersistenceError(
-                this.file,
-                `Could not create the harness database directory: ${messageOf(error)}`
-            );
-        }
-
-        const staging = path.join(
-            this.directory,
-            `${HARNESS_DATABASE_FILE}.${process.pid}.${this.sequence++}.tmp`
-        );
-
-        let handle: number | undefined;
-
-        try {
-            handle = fs.openSync(staging, 'w');
-            fs.writeFileSync(handle, payload, 'utf8');
-            // fsync before rename: the rename may be durable while the bytes are
-            // not, which would publish an empty/truncated canonical file.
-            fs.fsyncSync(handle);
-            fs.closeSync(handle);
-            handle = undefined;
-
-            // Same-directory rename: atomic on the platforms this server targets.
-            // The canonical file is never unlinked first, so a crash preserves the
-            // previous complete document.
-            fs.renameSync(staging, this.file);
+            writeHarnessDatabaseFile(this.directory, this.file, payload, { sequence: this.staging });
             this.lastError = undefined;
         } catch (error) {
-            if (handle !== undefined) {
-                try {
-                    fs.closeSync(handle);
-                } catch {
-                    // The handle is already unusable; the original error matters.
-                }
-            }
+            // The underlying message, exactly as before the extraction: this channel
+            // is observability only, and an operator compares it with the syscall.
+            this.lastError = messageOf(causeOf(error));
 
-            // A partial staging file is not a commit: remove it so a later run
-            // cannot confuse it with a real document (the canonical file is kept).
-            try {
-                fs.rmSync(staging, { force: true });
-            } catch {
-                // Best effort; the write error below is the actionable failure.
-            }
-
-            this.lastError = messageOf(error);
-
-            throw new HarnessPersistenceError(
-                this.file,
-                `Could not write the harness database: ${messageOf(error)}`
-            );
+            throw error;
         }
     }
 }

@@ -30,9 +30,38 @@
 //     (`persistOrThrow`, ./sessions.ts:1561), and `flush()`/`rewrite()`/`open()`
 //     record errors the same way instead of throwing at the run.
 //
+// Durability levels, stated exactly (R4):
+//   - `append` is `writeSync` on a held fd: safe across a PROCESS crash, not fenced
+//     against a power loss. This is the level the store has always relied on, and the
+//     store does not call `flush()` except at dispose (./sessions.ts:6954), so worker
+//     mode changes nothing there.
+//   - `flush()` is the fsync fence. A caller that wants "every event of this turn is
+//     on stable storage before the response" awaits a flush (the IO client exposes it
+//     as an operation ordered ahead of the checkpoint that references those events).
+//   - `rewrite()` is now fsync-then-rename: a compaction publishes complete bytes.
+//
+// WORKER MODE (R1): who calls what
+// --------------------------------
+// `threadExecution: 'worker'` routes every WRITE below to one IO worker thread
+// (./workers/io-worker.ts), which instantiates THIS class verbatim and holds the append
+// fd there. Consequences a caller must respect:
+//   - Do not call `open`/`append`/`flush`/`rewrite`/`truncate`/`remove`/`close` on a
+//     coordinator-side instance while a worker owns the same session: two append
+//     handles on one file is a second writer, which is exactly what the FIFO queue
+//     exists to prevent.
+//   - `read()` and `exists()` DO stay on the coordinator (restore runs before the
+//     server serves, and the reader is the checkpoint's owner). They are safe against
+//     a worker-held append fd: Node opens with read sharing, and the worker closes its
+//     handle before a `rewrite()` rename.
+//   - `rewrite()`'s staging name is `<file>.<pid>.<ms>.tmp`. A worker thread shares
+//     `process.pid` with the coordinator, so the one-writer rule above is also what
+//     keeps two staging names from ever colliding.
+//
 // Cross-references:
 //   - ./sessions.ts            — recorder append, restore merge, reset/remove lifecycle
-//   - ./persistence.ts:989     — `directory` (the journal root is `directory/sessions`)
+//   - ./persistence.ts         — `directory` (the journal root is `directory/sessions`)
+//   - ./workers/io-protocol.ts — the append/flush/rewrite frames and their outcomes
+//   - ./workers/io-worker.ts   — the thread that owns the fd in worker mode
 //   - ./turn-projector.ts      — the fold that rebuilds compiled state from these records
 
 import fs from 'node:fs';
@@ -417,7 +446,25 @@ export class HarnessJournal {
                 }) +
                 records.map((record) => journalLine({ ...record, type: 'event', v: HARNESS_JOURNAL_VERSION })).join('');
 
-            fs.writeFileSync(staging, payload, 'utf8');
+            // fsync BEFORE the rename, the checkpoint's rule (./persistence.ts,
+            // `writeHarnessDatabaseFile`): a rename can be durable while the bytes are
+            // not, which would publish an empty or truncated log over the file the
+            // caller just compacted. One syscall per compaction, and `rewrite` is now
+            // able to answer 'durable' honestly (./workers/io-protocol.ts).
+            const handle = fs.openSync(staging, 'w');
+
+            try {
+                fs.writeFileSync(handle, payload, 'utf8');
+                fs.fsyncSync(handle);
+            } finally {
+                try {
+                    fs.closeSync(handle);
+                } catch {
+                    // The handle is already unusable; the write error above is the
+                    // reportable failure (same rule as the checkpoint's writer).
+                }
+            }
+
             fs.renameSync(staging, this.file);
             this.lastError = undefined;
         } catch (error) {

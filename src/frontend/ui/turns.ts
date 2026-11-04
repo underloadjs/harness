@@ -6795,6 +6795,14 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 renderCompiledSection(entry, section);
             }
 
+            // The header's own figures are re-asserted from the row AFTER the tree painted
+            // (see `applyRowFigures`): the rebuild above cleared the event-derived ones, and
+            // the root section shares `blockMeta` with this tile's header, so a section-level
+            // figure painted last would otherwise be the turn's header figure. The live frame
+            // order is the same — the section's `usage` op first, the turn-level one second
+            // (../server/turn-projector.ts:2240 and :2247).
+            if (compiledSummary !== undefined) applyRowFigures(compiledSummary);
+
             // T22 (R23): one pass over every section this tile just painted, deciding which
             // single content block prints. `renderCompiledSection` does it per section; this
             // also covers a section whose entry was refreshed without a rebuild (an
@@ -6862,6 +6870,11 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 // displayed body is re-derived from the same tree the reconcile read.
                 applyEntryContent(entry, section);
             }
+
+            // Same rule as `renderCompiledDisplay`: a document paint ends by re-asserting the
+            // turn-level header figures from the row (see `applyRowFigures`), so an in-place
+            // reconcile cannot leave the tile printing the cumulative sum.
+            if (compiledSummary !== undefined) applyRowFigures(compiledSummary);
 
             // A whole section the document dropped (a deleted invocation) takes its
             // row with it; the view is the authority for what exists.
@@ -7357,6 +7370,31 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
             paintPersistentMarkers();
         };
 
+        // The tile header's token figures, in ONE place: they are TURN-LEVEL facts and the
+        // row is their authority (`TurnSummary.latestInput` / `cachedInput` / `usage`,
+        // ../server/turn-projector.ts `summaryOf` ~2846). Two callers need them:
+        //   - `setCompiledSummary`, a row frame (live `turn` op, a poll, a 202 body);
+        //   - the END of a full-document paint (`renderCompiledDisplay` /
+        //     `syncCompiledDisplay`), which rebuilds the flow from the tree and, in the
+        //     rebuild case, has just dropped every event-derived figure through
+        //     `blockMeta.clearUsage()` (see `resetCompiled`).
+        // Without the second caller a completed turn repaints itself from the SUM:
+        // `contextInput()` falls back to `tally.input`, the cumulative input of every
+        // re-sent transcript (../server/sessions.ts `addUsage` ~868), which for a long run
+        // reads as tens of millions of tokens beside a context window of a few hundred
+        // thousand. The live stream never shows that because its `usage` op for
+        // `sectionId: 'turn'` carries the latest request; this makes a reload, a drain
+        // frame and the terminal snapshot (../server/sessions.ts `mirrorView` ~3292) agree
+        // with it. Only the DISPLAY of the latest request changes — the cumulative tally
+        // keeps travelling on `usage` untouched, and the bracket figure stays `usage.cached`.
+        const applyRowFigures = (summary: TurnSummary): void => {
+            blockMeta.setFigures({
+                ...(summary.latestInput === undefined ? {} : { latestInput: summary.latestInput }),
+                ...(summary.cachedInput === undefined ? {} : { cachedInput: summary.cachedInput }),
+                ...(summary.usage === undefined ? {} : { usage: summary.usage })
+            });
+        };
+
         // The compact row -> the tile header. Status, timing, the token tally, the
         // thread badge, the attachment chips and the copy target all come from the
         // server's figures; `state` is printed verbatim because the projector already
@@ -7391,11 +7429,7 @@ export const createTurnBoard = (options: TurnBoardOptions = {}): TurnBoard => {
                 ...(terminal && summary.updatedAt !== undefined ? { endedAt: summary.updatedAt } : {})
             });
 
-            blockMeta.setFigures({
-                ...(summary.latestInput === undefined ? {} : { latestInput: summary.latestInput }),
-                ...(summary.cachedInput === undefined ? {} : { cachedInput: summary.cachedInput }),
-                ...(summary.usage === undefined ? {} : { usage: summary.usage })
-            });
+            applyRowFigures(summary);
 
             // R1: the state comes from the wire, and `setState` performs the whole
             // terminal cleanup (abandon unsettled cards, expire questions, clear the

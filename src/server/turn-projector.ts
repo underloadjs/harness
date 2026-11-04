@@ -2237,6 +2237,16 @@ export const createTurnProjector = (turn: SessionTurn, context: DisplayProjectCo
                     record.cachedInput = (record.cachedInput ?? 0) + usage.cached;
                 }
 
+                // Mirror the SAME two figures onto the section the ops below publish, so a
+                // full-document read (`display()`, which is what a hydrate, a drain frame and
+                // a terminal snapshot paint from) carries them too. They are declared fields of
+                // `TurnSection` (../shared/turn-display.ts:922) and the live `usage` op already
+                // patches them onto the client's tree; without this, the document is the one
+                // surface that loses them and every block header falls back to whatever else it
+                // holds — a nested row loses its tally outright.
+                if (record.latestInput !== undefined) record.section.latestInput = record.latestInput;
+                if (record.cachedReported) record.section.cachedInput = record.cachedInput ?? 0;
+
                 ops.push({
                     op: 'usage',
                     turnId: turn.id,

@@ -1730,7 +1730,9 @@ await writer('tell me about new year');
 - **Ordering is completion order.** Concurrent calls can interleave side effects
   (two writes/commands), and results are appended as they settle rather than in
   call order. Tools are async promises in ONE Node process: there are no OS worker
-  threads and no CPU isolation, so CPU-bound JavaScript blocks the event loop.
+  threads and no CPU isolation, so CPU-bound JavaScript blocks the event loop. (A
+  server-hosted session may opt out per deployment with
+  `threadExecution: 'worker'`; see [Lane workers](#lane-workers-threadexecution-worker).)
 - **The entry agent is explicit or first.** `primary` names it; without one, the
   first `agents` key wins, so a single-agent config needs nothing. An unknown name
   throws at construction.
@@ -3043,6 +3045,80 @@ stale-entry dropping, and document corruption that still aborts startup),
 `ui/thread-transcript.test.ts` + `ui/thread-transcript-edit.test.ts` (the lossless
 read-only document, the editor, and the unreadable-thread open).
 
+### Lane workers: `threadExecution: 'worker'`
+
+`src/server/workers/` is the subsystem that lets ONE logical thread (a `ThreadLane`
+in `src/server/sessions.ts`) execute its whole turn — agent loop **and** CPU-bound
+tool bodies — on its own OS worker thread, while the session's shared state stays
+owned by one coordinator. The default remains `inline`, so nothing changes shape for
+an existing host.
+
+Layout (each file states its own contract in its header):
+
+| File | Owns |
+|---|---|
+| `protocol.ts` | the frame vocabulary (`hello`/`turn`/`invoke`/`steer`/`interrupt`/`event`+`event.ack`/`mutation`+`mutation.receipt`/`request`+`request.reply`/`turn-done`/`aborted`/`fault`/`dispose`/`broadcast.registry`/`sync.memory`/`lease.grant`) plus the epoch / seq / callId / event-credit rules |
+| `lane-identity.ts` | the authority's id ledger: leases per id space, in the core's own units |
+| `lane-commit.ts` | mutation ops + receipts, the writer-lease ledger, and the journal that decides when a turn may be published |
+| `lane-memory.ts` | `harness.memory` across lanes: faithful transfer, bounded declared windows, compare-and-set, named refusals |
+| `lane-authority.ts` | the COORDINATOR side: answers a lane's routed `runtime` calls on the canonical harness, folds and replays a commit group |
+| `lane-host.ts` | the per-store worker manager: entry resolution, spawn, hello, event relay-then-ack, ordered mutating answers, receipts, crash teardown, idle reclaim |
+| `lane-worker.ts` | the spawned **entry**: source vs built layout, resolve hooks for `.ts` in dev/test |
+| `lane-worker-loop.ts` | the worker loop: rebuild, capability report, runtime interception, operation derivation, commit boundaries |
+| `capability.ts` | what may run in worker mode at all, per harness and per tool, with the reason and the fix |
+
+The three load-bearing decisions:
+
+- **State moves as operations with receipts, never as a merged document.** The first
+  cut let each lane mutate a full harness replica and merged the record diff
+  last-writer-wins; an independent review (`Temp/t3`) reproduced, through the core's
+  own validators, what that lost: a rejected `nextId`, one of two concurrent terminal
+  results, a spent tool budget, a sibling's memory key deleted by a lane that never
+  read it, and mutations silently dropped. So an append carries the prefix length the
+  lane saw, a memory write carries the digest it read, and a terminal invocation
+  carries an authority-leased identity — a collision is a REFUSAL naming the
+  canonical value, never an overwrite.
+- **The authority intercepts the replica's own `harness.runtime` object** (the same
+  reference `src/harness.ts` builds at ~2415 and the core tool sources call), not the
+  `harness.runtime` property. That is what makes the interception total: harness
+  internals call `runtime.*` locally, so a slash command or a manual tool body running
+  on a lane is routed too. `delegate`, `search` and `fetch` stay local — their loop and
+  IO are the work isolation protects.
+- **A commit is applied through targeted core seams, never `restore()` per commit.**
+  `restore()` rebuilds every created tool and thread agent and zeroes each thread's
+  generation, i.e. it spends coordinator CPU and disturbs live handles. The four seams
+  (`appendThreadMessages`, `setThreadStatus`, `archiveInvocation`, `reserveIdentity`;
+  `src/harness.ts` ~3833-4060) are the whole applier surface, and each validates its
+  own input so a rejected lane write mutates nothing.
+
+Node-24 facts this subsystem paid for (all still true, don't re-derive them):
+
+- a worker does **not** service `parentPort` messages while its module body is still
+  evaluating, so the loop must be driven from the message handler, not from a
+  top-level await;
+- `module.registerHooks` must **not** return `format: 'module'` for a `.ts` file —
+  that routes it through the JavaScript compiler and loses Node's type stripping;
+- a source-mode worker needs `execArgv: ['--experimental-transform-types']` for this
+  repo's parameter properties;
+- an unreferenced dynamic import is shaken to an empty namespace by the bundler, so
+  the entry imports the loop AND calls `startLaneWorker()` — that call is what keeps
+  `dist/underload-harness.worker.mjs` alive;
+- `workerData` is read-only and a cloned `AbortSignal` arrives as `{}`, so
+  cancellation is a FRAME (`interrupt`), never a signal copy;
+- the global `Worker` is undefined in this Node build; `node:worker_threads` is used.
+
+Tests: `src/server/workers/lane-authority.test.ts` (19 in-process cases against a
+REAL harness — prefix refusal, one-writer lease, central archive with reassigned
+order, memory CAS, routed `task`/`threadSend`/`threadList`, lease disjointness,
+retired epochs answering nothing), `lane-worker.test.ts` (7 live-worker cases: two
+lanes busy simultaneously, an 800 ms burn while a sibling's event stream grows, a task
+written on one lane read back by a REBUILT lane, cross-thread send/roster from a lane,
+a cancel with events frozen, a terminated worker failing the turn with canonical
+transcripts frozen, and an unrebuildable preset refused at create), plus
+`lane-commit`/`lane-identity`/`lane-memory`/`protocol`/`capability` for the
+primitives, and `config.test.ts`/`environment.test.ts`/`server.test.ts` for the
+runtime surface.
+
 ### Agents and the harness registry
 
 `src/agents/` is the trusted catalogue: one `AgentProfile` per agent with `name`,
@@ -3296,8 +3372,13 @@ In the order they are expected:
 7. **command progress** — related to item 1: a command runs to completion before the
    `202` leaves, so a long host command cannot stream intermediate output or be
    cancelled as a command (it emits no progress events by design, and a command turn is
-   not a lane). A built-in that calls a tool inherits the tool's own limits.
+   not a per-thread lane — in worker mode its body still runs on the session's operator
+   lane, but there is no command-specific cancel or stream). A built-in that calls a
+   tool inherits the tool's own limits.
 
 Parallel tool execution is no longer on this list: calls are scheduled
-concurrently (see “The loop”). There is no thread/CPU isolation and no ordered
-side-effect guarantee — that limitation is documented, not planned away.
+concurrently (see “The loop”). There is no ordered side-effect guarantee, and the
+library itself still has no thread/CPU isolation; a server deployment can now move
+each conversation onto its own worker thread (`threadExecution: 'worker'`, see
+[Lane workers](#lane-workers-threadexecution-worker)), which is documented there
+with the boundaries that stay refused.

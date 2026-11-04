@@ -22,6 +22,11 @@
             "import": "./dist/underload-harness.server.mjs",
             "default": "./dist/underload-harness.server.mjs"
         },
+        "./worker": {
+            "types": "./dist/server/workers/lane-worker.d.ts",
+            "import": "./dist/underload-harness.worker.mjs",
+            "default": "./dist/underload-harness.worker.mjs"
+        },
         "./frontend": {
             "browser": {
                 "types": "./dist/frontend/index.d.ts",

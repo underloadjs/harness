@@ -32,10 +32,15 @@ import type { HarnessRegistry, ToolCatalogue } from './harnesses';
 import type { RunnerSettings } from './harnesses/types';
 import { createHarnessApi } from './api';
 import type { HarnessApi } from './api';
-import { loadConfiguration } from './config';
+import { loadConfiguration, resolveRuntimeConfiguration } from './config';
+import type { ServerRuntimeConfiguration } from './config';
 import { loadEnvironmentFile } from './environment';
 import type { HarnessIndex } from './protocol';
 import { SessionStore } from './sessions';
+// The deployment-level check that a configured worker runtime would REALLY isolate a
+// thread. Importing the workers barrel here (rather than the module directly) is
+// what keeps `src/server/workers` a single subsystem boundary.
+import { assertWorkerRuntimeReady } from './workers';
 import {
     HarnessPersistence,
     HarnessPersistenceError,
@@ -49,6 +54,11 @@ export type HarnessRuntime = {
     store: SessionStore;
     defaults: HarnessIndex['defaults'];
     catalogue: ToolCatalogue;
+    // The RESOLVED server runtime (R3): how logical threads get their CPU, after
+    // `HARNESS_*` variables and explicit options are merged and validated. Reported
+    // rather than inferred, so an operator can prove from the running process which
+    // execution model a session will get.
+    runtime: ServerRuntimeConfiguration;
     // The shared in-memory harness registry, so a canonical route module and the
     // standalone adapter resolve sessions and accept create/patch identically.
     registry: HarnessRegistry;
@@ -70,6 +80,12 @@ export type HarnessRuntimeOptions = {
     // Override the provider settings. When omitted, `loadConfiguration()` reads
     // the process environment AFTER the .env load below.
     settings?: RunnerSettings;
+    // Override the server RUNTIME (R3): `threadExecution` and the worker bounds.
+    // Merged over `HARNESS_THREAD_EXECUTION` / `HARNESS_WORKER_*`, and validated the
+    // same way, so an explicit option cannot smuggle in an unbounded worker count.
+    // NOTE (same singleton rule as `settings`): the first call for a root builds the
+    // runtime, so a later call for that root cannot change the execution model.
+    runtime?: Partial<ServerRuntimeConfiguration>;
     // Override the key-free defaults advertised to clients.
     defaults?: HarnessIndex['defaults'];
     // Inject a prebuilt catalogue/store (tests). A supplied store still owns its
@@ -94,6 +110,13 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
     if (options.loadEnvironment !== false) loadEnvironmentFile();
 
     const configuration = loadConfiguration();
+
+    // R3: resolve and VALIDATE the runtime before anything is built, then assert
+    // that a configured worker mode can really be honoured by this build. A worker
+    // mode that was accepted but not consumed would leave the operator believing
+    // their CPU-heavy tool could no longer block the server, so this fails loudly.
+    const runtime = resolveRuntimeConfiguration(configuration.runtime, options.runtime);
+    assertWorkerRuntimeReady(runtime);
 
     // Catalogue first: the describer below needs it, and it is the runtime
     // snapshot of which credential-backed tools this host can run.
@@ -138,7 +161,10 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
             (preset) => describeHarness(preset, catalogue),
             {
                 ...(persistence === undefined ? {} : { persistence }),
-                ...(database === undefined ? {} : { database })
+                ...(database === undefined ? {} : { database }),
+                // R1/R3: the store gets the RESOLVED runtime, so the execution model it
+                // enforces is the one this process reported - never a second guess.
+                runtime
             }
         );
 
@@ -150,6 +176,7 @@ export const createHarnessRuntime = (options: HarnessRuntimeOptions = {}): Harne
         store,
         defaults,
         catalogue,
+        runtime,
         registry,
         api,
         ...(root === undefined ? {} : { root }),
